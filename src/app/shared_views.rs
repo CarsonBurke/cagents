@@ -1673,6 +1673,9 @@ impl Cagents {
                         if !same_session {
                             // A held title belongs to the replaced session.
                             self.reported_title_save.cards.remove(&pane.id);
+                            if matches!(card.kind, CardKind::Chat(_)) {
+                                self.chat_shown_as_agent_console(pane.id, &pane.kind);
+                            }
                             if let Some(CardRuntime::Terminal(terminal)) =
                                 self.cards.remove(&pane.id)
                             {

@@ -4819,7 +4819,23 @@ fn succession_root(session: &chat::Session) -> TerminalId {
         .unwrap_or(session.id)
 }
 
+/// Why a chat paired with an agent's console can never hand its conversation
+/// to a terminal of its own. Its provider belongs to the agent, which keeps
+/// running it; the only terminal the chat may show is that console.
+const AGENT_CONSOLE_RETURN: &str = "This chat belongs to an agent. It can only show the agent's console, which is not available right now.";
+
+/// The agent whose console `session` is paired with, if it is.
+fn console_paired_agent(session: &chat::Session) -> Option<crate::model::AgentId> {
+    session
+        .terminal
+        .as_ref()
+        .and_then(|terminal| crate::agent_execution::console_agent(&terminal.launch))
+}
+
 fn return_terminal(session: &chat::Session) -> Result<TerminalSession, String> {
+    if console_paired_agent(session).is_some() {
+        return Err(AGENT_CONSOLE_RETURN.into());
+    }
     session.launch.session_id.as_ref().ok_or_else(|| "Waiting for the provider's exact conversation identity. Return is unavailable until it is known.".to_owned())?;
     if session.launch.provider == Provider::Codex
         && let Some(source) = &session.terminal
@@ -4917,6 +4933,9 @@ fn live_codex_source(chat: TerminalId) -> Result<Option<TerminalSession>, String
 /// daemon's own return would start it. Before a conversation has an identity,
 /// open the selected provider's interactive CLI with its account and policy.
 fn local_return_launch(session: &chat::Session) -> Result<LaunchRecipe, String> {
+    if console_paired_agent(session).is_some() {
+        return Err(AGENT_CONSOLE_RETURN.into());
+    }
     if session.launch.session_id.is_none() {
         let mut fresh = session.clone();
         fresh.reset_owned_codex_listener();
@@ -6910,6 +6929,9 @@ impl Cagents {
             None => {}
         }
         match self.card_state(card).map(|state| &state.kind) {
+            Some(CardKind::Chat(session)) if console_paired_agent(session).is_some() => {
+                "Show as console"
+            }
             Some(CardKind::Chat(session)) => {
                 let named = match self.cards.get(&card) {
                     Some(CardRuntime::Chat(runtime)) => {
@@ -6961,14 +6983,30 @@ impl Cagents {
             return Some(Cow::Borrowed("This pane is closed."));
         };
         if let Some((_, shown)) = self.agent_presentation(card) {
-            // Showing the console leaves the chat, so whatever the chat has
-            // not finished sending has to finish first.
             return match (shown, self.cards.get(&card)) {
+                // Showing the console leaves the chat, so whatever the chat
+                // has not finished sending has to finish first.
                 (crate::agent_execution::Surface::Chat, Some(CardRuntime::Chat(runtime))) => {
                     runtime.transition_blocker().map(Cow::Borrowed)
                 }
+                // A console still starting would be torn down by the chat
+                // replacing it, and that would end the agent's console.
+                (crate::agent_execution::Surface::Terminal, _)
+                    if self.terminal_start_in_flight(card) =>
+                {
+                    Some(Cow::Borrowed(
+                        "The agent's console is still opening. Wait for it to finish.",
+                    ))
+                }
                 _ => None,
             };
+        }
+        // A chat paired with an agent's console that cannot be shown right
+        // now still must not return its conversation to a new terminal.
+        if let CardKind::Chat(session) = &state.kind
+            && console_paired_agent(session).is_some()
+        {
+            return Some(Cow::Borrowed(AGENT_CONSOLE_RETURN));
         }
         if self.chat_ui.parked.contains_key(&card) {
             return None;
@@ -7351,6 +7389,23 @@ impl Cagents {
             .as_ref()
             .is_some_and(|source| crate::agent_execution::console_agent(&source.launch).is_some());
         self.retire_terminal_surface(terminal, !console && !retains_source_pty(session));
+    }
+
+    /// Another window showed this agent's chat pane as its console. This
+    /// window keeps its unsent draft for when the chat is shown again, and a
+    /// start still attaching the chat is given up so it only detaches. A
+    /// close or a return in flight keeps the card until it answers.
+    pub(super) fn chat_shown_as_agent_console(&mut self, card: CardId, shown: &CardKind) {
+        let console = matches!(shown, CardKind::Terminal(terminal)
+            if crate::agent_execution::console_agent(&terminal.launch).is_some());
+        if console
+            && !matches!(
+                self.chat_ui.phases.get(&card),
+                Some(Phase::Closing { .. } | Phase::Returning { .. })
+            )
+        {
+            self.chat_forget(card);
+        }
     }
 
     /// Shows an agent's own pane as the other of its two surfaces, in place.
@@ -8855,6 +8910,17 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
+                // The agent's pane went back to its console while this chat
+                // was attaching. That is the newer choice: the attachment
+                // only detaches, so the actor and the console keep running
+                // and the console stays shown.
+                if self.card_state(target.card).is_some_and(|card| {
+                    matches!(&card.kind, CardKind::Terminal(terminal)
+                        if crate::agent_execution::console_agent(&terminal.launch).is_some())
+                }) {
+                    drop(result);
+                    return Task::none();
+                }
                 let recovery = attempt.recovery.take();
                 let automatic_submit = recovery.as_ref().and_then(|recovery| recovery.submit);
                 let account_committed =
@@ -28380,6 +28446,10 @@ mod agent_presentation_tests {
         );
         let attempt = app.chat_ui.attempt(card).expect("the chat attaches");
         assert_eq!(attempt.session, presentation.chat);
+        // A restore with the live proof is an attach to the running actor,
+        // never a start or a return.
+        assert!(matches!(attempt.intent, chat::Intent::Restore));
+        assert!(attempt.session.proof.is_some());
         assert!(
             !app.terminal_runtime_claims(presentation.console.id),
             "this window stops drawing the console"
@@ -28428,5 +28498,117 @@ mod agent_presentation_tests {
         agent.closed = true;
         app.workspace_model.agents = vec![agent];
         assert!(app.agent_presentation(card).is_none());
+    }
+
+    /// Shows the agent as its chat, the way the switch leaves it.
+    fn shown_as_chat(app: &mut Cagents, card: CardId) {
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let ready = ready_message_for_pending_switch(app, card, chat::Snapshot::default());
+        drop(app.update(ready));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))));
+    }
+
+    /// A chat paired with an agent's console never hands its conversation to
+    /// a terminal of its own, even when the console cannot be shown now.
+    #[test]
+    fn an_agent_chat_never_returns_to_a_terminal_of_its_own() {
+        let (mut app, card, mut agent, _directory) = console_agent_app();
+        shown_as_chat(&mut app, card);
+        let CardKind::Chat(session) = app.card_state(card).unwrap().kind.clone() else {
+            panic!("chat");
+        };
+        for unavailable in ["closed", "replaced"] {
+            let mut changed = agent.clone();
+            match unavailable {
+                "closed" => changed.closed = true,
+                _ => {
+                    if let Some(HostedSession::Chat(native)) = &mut changed.session {
+                        native.proof.as_mut().unwrap().host_incarnation =
+                            crate::model::HostIncarnation::new("successor");
+                    }
+                }
+            }
+            app.workspace_model.agents = vec![changed];
+            assert!(app.agent_presentation(card).is_none());
+            assert!(app.chat_switch_available(card));
+            assert_eq!(app.chat_switch_label(card), "Show as console");
+            assert_eq!(
+                app.chat_switch_blocker(card).as_deref(),
+                Some(AGENT_CONSOLE_RETURN)
+            );
+            drop(app.update(Message::ChatUi(Action::Switch(card))));
+            assert!(app.chat_ui.phases.get(&card).is_none(), "nothing started");
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(session.clone())
+            );
+            assert!(app.pending_terminal_handoffs.is_empty());
+        }
+        assert_eq!(return_terminal(&session).unwrap_err(), AGENT_CONSOLE_RETURN);
+        assert_eq!(
+            local_return_launch(&session).unwrap_err(),
+            AGENT_CONSOLE_RETURN
+        );
+        agent.closed = false;
+        app.workspace_model.agents = vec![agent];
+        assert_eq!(app.chat_switch_blocker(card), None);
+    }
+
+    /// A chat still attaching when the pane goes back to the console gives
+    /// up quietly: the console stays shown and the chat is not republished.
+    #[test]
+    fn a_chat_overtaken_by_the_console_only_detaches() {
+        let (mut app, card, agent, _directory) = console_agent_app();
+        let presentation = crate::workspace_model::views::AgentPresentation::of(&agent).unwrap();
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let ready = ready_message_for_pending_switch(&app, card, chat::Snapshot::default());
+        // Another window shows the console again before this attach answers.
+        app.card_state_mut(card).unwrap().kind = CardKind::Terminal(presentation.console.clone());
+        drop(app.update(ready));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Terminal(presentation.console)
+        );
+        assert!(!matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))));
+        assert!(app.chat_ui.phases.get(&card).is_none());
+    }
+
+    /// When another window shows the console, this window keeps the chat's
+    /// unsent draft and gives up a start still attaching.
+    #[test]
+    fn a_console_shown_elsewhere_keeps_this_windows_draft() {
+        let (mut app, card, agent, _directory) = console_agent_app();
+        let presentation = crate::workspace_model::views::AgentPresentation::of(&agent).unwrap();
+        shown_as_chat(&mut app, card);
+        let target = match app.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.target,
+            _ => unreachable!(),
+        };
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("unsent to the agent"));
+        app.chat_shown_as_agent_console(card, &presentation.kind(Surface::Terminal));
+        assert_eq!(
+            app.chat_ui.drafts.get(&card).map(String::as_str),
+            Some("unsent to the agent")
+        );
+        // Any other replacement is not this case.
+        app.chat_ui.drafts.clear();
+        app.chat_shown_as_agent_console(card, &presentation.kind(Surface::Chat));
+        assert!(app.chat_ui.drafts.is_empty());
+    }
+
+    /// A console still opening is not replaced by the chat, which would end
+    /// it.
+    #[test]
+    fn show_as_chat_waits_for_the_console_to_open() {
+        let (mut app, card, _agent, _directory) = console_agent_app();
+        app.begin_terminal_start(card);
+        let blocker = app.chat_switch_blocker(card).expect("blocked");
+        assert!(blocker.contains("still opening"), "{blocker}");
+        let before = app.card_state(card).unwrap().kind.clone();
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        assert_eq!(app.card_state(card).unwrap().kind, before);
+        assert!(app.chat_ui.attempt(card).is_none());
     }
 }
