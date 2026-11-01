@@ -192,6 +192,17 @@ other writers or replacements of the helper and its path ancestors throughout
 the workflow, and retain its independent source/tool qualification. Do not use
 a helper inside an output location that these builds can overwrite.
 
+The internal helper accepts only the builtin `build` and `check` commands, plus
+builtin `test` when an exact standalone `--no-run` occurs before the first Cargo
+`--` separator. Bare `test`, a `--no-run` only after that separator,
+`--no-run=value` forms, aliases and other commands are refused before enrollment
+or execution. Arguments are forwarded unchanged. `test --no-run` can still run
+source build scripts while compiling test executables; it does not execute test
+binaries and does not provide a general test-run mode. Existing runner scripts
+continue to request only `build`.
+A manager peer invisible in the caller's PID namespace or owned by another user
+is a genuine refusal; compiling the helper does not prove enrollment.
+
 Only the original Cargo child enrolls, before same-PID exec. The outer runner,
 artifact reader, evidence owner and later UI/CLI launches remain outside that
 build scope. Arguments, working directory, inherited environment, streams,

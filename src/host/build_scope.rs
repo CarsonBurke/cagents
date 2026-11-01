@@ -1,4 +1,4 @@
-//! Internal build-only entry, before ordinary daemon or account initialization.
+//! Internal compile-only entry, before ordinary daemon or account initialization.
 //!
 //! The shared process-scope implementation requires proof and exact unique
 //! membership before returning its nonconstructible `ConfirmedScope` receipt.
@@ -93,11 +93,34 @@ fn request(arguments: impl IntoIterator<Item = OsString>) -> Option<io::Result<B
         }
         let verb = arguments
             .next()
-            .ok_or_else(|| invalid("Build helper requires the build command"))?;
-        if verb != "build" {
-            return Err(invalid("Build helper accepts only the build command"));
-        }
+            .ok_or_else(|| invalid("Build helper requires a compile command"))?;
         let arguments: Vec<_> = std::iter::once(verb).chain(arguments).collect();
+        match arguments[0].as_os_str() {
+            verb if verb == OsStr::new("build") || verb == OsStr::new("check") => {}
+            verb if verb == OsStr::new("test") => {
+                let options = &arguments[1..];
+                if options
+                    .iter()
+                    .any(|argument| argument.as_bytes().starts_with(b"--no-run="))
+                {
+                    return Err(invalid("Build helper requires an exact --no-run argument"));
+                }
+                if !options
+                    .iter()
+                    .take_while(|argument| argument.as_os_str() != OsStr::new("--"))
+                    .any(|argument| argument.as_os_str() == OsStr::new("--no-run"))
+                {
+                    return Err(invalid(
+                        "Build helper test requires --no-run before the first --",
+                    ));
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    "Build helper accepts only build, check, or test --no-run",
+                ));
+            }
+        }
         if arguments.iter().any(|argument| reserved(argument)) {
             return Err(invalid("Build helper requests cannot be nested"));
         }
@@ -201,6 +224,38 @@ mod tests {
             args(&[ARGUMENT, "--", "/tools/cargo"]),
             args(&[ARGUMENT, "--", "/tools/cargo", "run"]),
             args(&[ARGUMENT, "--", "/tools/cargo", "test"]),
+            args(&[ARGUMENT, "--", "/tools/cargo", "test", "--", "--no-run"]),
+            args(&[
+                ARGUMENT,
+                "--",
+                "/tools/cargo",
+                "test",
+                "--locked",
+                "--",
+                "--no-run",
+            ]),
+            args(&[ARGUMENT, "--", "/tools/cargo", "test", "--no-run=true"]),
+            args(&[ARGUMENT, "--", "/tools/cargo", "test", "--no-run=false"]),
+            args(&[
+                ARGUMENT,
+                "--",
+                "/tools/cargo",
+                "test",
+                "--no-run",
+                "--no-run=true",
+            ]),
+            args(&[
+                ARGUMENT,
+                "--",
+                "/tools/cargo",
+                "test",
+                "--no-run",
+                "--",
+                "--no-run=value",
+            ]),
+            args(&[ARGUMENT, "--", "/tools/cargo", "t", "--no-run"]),
+            args(&[ARGUMENT, "--", "/tools/cargo", "check", ARGUMENT]),
+            args(&[ARGUMENT, "--", "/tools/cargo", "test", "--no-run", ARGUMENT]),
             args(&[ARGUMENT, "--", "/tools/cargo", "build", ARGUMENT]),
             args(&["--help", ARGUMENT]),
             args(&["--internal-build-scope-exec=unexpected"]),
@@ -213,6 +268,46 @@ mod tests {
             .expect("private request must be recognized")
             .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn compile_only_commands_enroll_once_and_preserve_cargo_arguments() {
+        for cargo in [
+            &["check", "--locked"][..],
+            &["test", "--no-run", "--locked"][..],
+            &["test", "--locked", "--no-run", "--", "--ignored"][..],
+        ] {
+            let mut arguments = args(&[ARGUMENT, "--", "/tools/cargo"]);
+            arguments.extend(cargo.iter().map(|value| OsString::from(*value)));
+            let enrollments = Cell::new(0);
+            let executions = Cell::new(0);
+            let error = dispatch(
+                arguments,
+                || {
+                    enrollments.set(enrollments.get() + 1);
+                    Ok(17u32)
+                },
+                |command, confirmed| {
+                    assert_eq!(enrollments.get(), 1);
+                    assert_eq!(confirmed, 17);
+                    executions.set(executions.get() + 1);
+                    assert_eq!(command.get_program(), OsStr::new("/tools/cargo"));
+                    assert_eq!(
+                        command.get_args().collect::<Vec<_>>(),
+                        cargo
+                            .iter()
+                            .map(|value| OsStr::new(*value))
+                            .collect::<Vec<_>>()
+                    );
+                    Err(io::Error::from_raw_os_error(libc::ECANCELED))
+                },
+            )
+            .expect("compile request must be recognized")
+            .unwrap_err();
+            assert_eq!(enrollments.get(), 1);
+            assert_eq!(executions.get(), 1);
+            assert_eq!(error.raw_os_error(), Some(libc::ECANCELED));
         }
     }
 
