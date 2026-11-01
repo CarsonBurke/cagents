@@ -112,6 +112,16 @@ else:
     raise AssertionError(args)
 ''')
         self.tool("readelf", r'''
+if sys.argv[1:3] == ['--wide', '--dyn-syms']:
+    assert len(sys.argv) == 4 and Path(sys.argv[3]).name == 'cagents-ui', sys.argv
+    default = "\nSymbol table '.dynsym' contains 3 entries:\n" + \
+        "   Num: Value Size Type Bind Vis Ndx Name\n" + \
+        "     0: 0000000000000000 0 NOTYPE LOCAL DEFAULT UND\n" + \
+        "     1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND FT_Init_FreeType@FREETYPE_2.0 (2)\n" + \
+        "     2: 0000000000000020 8 FUNC GLOBAL DEFAULT 15 unrelated_runtime_api\n"
+    print(os.environ.get('MOCK_UI_DYNSYM', default), end='')
+    print(os.environ.get('MOCK_UI_DYNSYM_WARNING', ''), end='', file=sys.stderr)
+    sys.exit(int(os.environ.get('MOCK_UI_DYNSYM_EXIT', '0')))
 assert sys.argv[1:3] == ['--wide', '--version-info'], sys.argv
 name = Path(sys.argv[3]).name
 version = {'cagents': '2.2.5', 'cagentsd': '2.36', 'cagents-ui': '2.39'}[name]
@@ -208,7 +218,13 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
             digest, filename = line.split("  ", 1)
             self.assertEqual(hashlib.sha256((self.dist / filename).read_bytes()).hexdigest(), digest)
         self.assertEqual(self.protocol.read_text().splitlines(), ["fresh"])
-        self.assertEqual([Path(args[2]).name for args in self.events("readelf")],
+        inspections = self.events("readelf")
+        if variant == "full":
+            self.assertEqual(inspections[0][:2], ["--wide", "--dyn-syms"])
+            self.assertEqual(Path(inspections[0][2]).name, "cagents-ui")
+            inspections = inspections[1:]
+        self.assertTrue(all(args[:2] == ["--wide", "--version-info"] for args in inspections))
+        self.assertEqual([Path(args[2]).name for args in inspections],
                          ["cagents", "cagents-ui", "cagentsd"])
 
     def test_native_build_uses_exact_artifacts_for_both_variants_and_configured_targets(self):
@@ -262,6 +278,73 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                         self.assertFalse(self.protocol.exists())
                         self.assertEqual(self.events("readelf"), [])
                         self.assertFalse(self.dist.exists())
+
+    @staticmethod
+    def dynamic_symbols(name="unrelated_runtime_api", binding="GLOBAL", index="15"):
+        return (
+            "Symbol table '.dynsym' contains 3 entries:\n"
+            " Num: Value Size Type Bind Vis Ndx Name\n"
+            " 0: 0000000000000000 0 NOTYPE LOCAL DEFAULT UND\n"
+            " 1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND FT_Init_FreeType\n"
+            f" 2: 0000000000000020 8 FUNC {binding} DEFAULT {index} {name}\n"
+        )
+
+    def test_full_package_refuses_bundled_definitions_in_build_and_prebuilt_modes(self):
+        # Future names, weak/versioned definitions and both families must be
+        # rejected without mistaking legitimate undefined FT imports for leaks.
+        for prebuilt in (False, True):
+            for name, binding in (("hb_new_future_api", "GLOBAL"),
+                                  ("FT_New_Face", "GLOBAL"),
+                                  ("hb_blob_destroy@@HB_1.0", "WEAK")):
+                with self.subTest(prebuilt=prebuilt, name=name):
+                    self.reset_outputs()
+                    overrides = {"MOCK_UI_DYNSYM": self.dynamic_symbols(name, binding)}
+                    if prebuilt:
+                        # The original layout contains intentionally failing
+                        # stale binaries. Supply a valid protocol fixture so
+                        # this negative actually reaches the export guard.
+                        for product in PRODUCTS:
+                            body = ('printf "127\n"\n' if product == "cagents" else "exit 93\n")
+                            self.executable(self.target / "release" / product, "#!/bin/sh\n" + body)
+                        overrides.update(CAGENTS_SKIP_BUILD="1", CAGENTS_SKIP_STRIP="1")
+                    result = self.package("full", **overrides)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("forbidden bundled font export: " + name, result.stderr)
+                    self.assertFalse(self.dist.exists())
+                    self.assertEqual(len(self.events("readelf")), 1)
+                    self.assertEqual(self.events("readelf")[0][:2], ["--wide", "--dyn-syms"])
+
+    def test_font_inspector_errors_and_malformed_output_cannot_publish(self):
+        valid = self.dynamic_symbols()
+        faults = (
+            {"MOCK_UI_DYNSYM_EXIT": "7"},
+            {"MOCK_UI_DYNSYM_WARNING": "readelf: Warning: invalid dynamic table\n"},
+            {"MOCK_UI_DYNSYM": ""},
+            {"MOCK_UI_DYNSYM": "tool unexpectedly succeeded\n"},
+            {"MOCK_UI_DYNSYM": valid.rsplit("\n", 2)[0] + "\n"},
+            {"MOCK_UI_DYNSYM": valid.replace("3 entries:", "4 entries:")},
+            {"MOCK_UI_DYNSYM": valid.replace(" 2:", " 1:")},
+            {"MOCK_UI_DYNSYM": valid + valid},
+            {"MOCK_UI_DYNSYM": valid + "unknown trailing record\n"},
+        )
+        for fault in faults:
+            with self.subTest(fault=fault):
+                self.reset_outputs()
+                result = self.package("full", **fault)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("full UI dynamic symbol", result.stderr)
+                self.assertFalse(self.dist.exists())
+                self.assertEqual(len(self.events("readelf")), 1)
+
+    def test_font_imports_remain_valid_and_browserless_does_not_gain_full_link_policy(self):
+        self.reset_outputs()
+        result = self.package("full", MOCK_UI_DYNSYM=self.dynamic_symbols("hb_system_import", index="UND"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_packages("full")
+        self.reset_outputs()
+        result = self.package("browserless", MOCK_UI_DYNSYM="not used", MOCK_UI_DYNSYM_EXIT="7")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_packages("browserless")
 
     def test_prebuilt_layout_does_not_require_python(self):
         for command in ("awk", "date", "gzip", "install", "mktemp", "sed",

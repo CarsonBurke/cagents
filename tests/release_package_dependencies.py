@@ -181,7 +181,20 @@ class PackageDependencies(unittest.TestCase):
         failures = failures or {}
         warnings = warnings or {}
         source = (
-            '#!/bin/sh\n[ "$#" = 3 ] && [ "$1" = --wide ] '
+            '#!/bin/sh\n'
+            # Full UI font visibility is a separate pre-publication inspection.
+            # Keep this log/count dedicated to the existing GLIBC version needs.
+            'if [ "$#" = 3 ] && [ "$1" = --wide ] && [ "$2" = --dyn-syms ]; then\n'
+            '  [ "${3##*/}" = cagents-ui ] || exit 95\n'
+            '  cat <<EOF\n'
+            "Symbol table '.dynsym' contains 2 entries:\n"
+            ' Num: Value Size Type Bind Vis Ndx Name\n'
+            ' 0: 0000000000000000 0 NOTYPE LOCAL DEFAULT UND\n'
+            ' 1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND FT_Init_FreeType\n'
+            'EOF\n'
+            '  exit 0\n'
+            'fi\n'
+            '[ "$#" = 3 ] && [ "$1" = --wide ] '
             '&& [ "$2" = --version-info ] || exit 95\n'
             f'printf "%s\\n" "${{3##*/}}" >> {shlex.quote(str(self.invocations))}\n'
             'case ${3##*/} in\n'
