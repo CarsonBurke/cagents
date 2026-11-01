@@ -8076,7 +8076,8 @@ mod ui_renderer_retry_tests {
             unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
             0,
         );
-        let stdout = unsafe { ChildStdout::from_raw_fd(descriptors[0]) };
+        let stdout =
+            ChildStdout::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptors[0]) });
         let retained = unsafe { fs::File::from_raw_fd(descriptors[1]) };
         let child = Command::new("/bin/sh")
             .args(["-c", "exit 1", "owned-renderer-terminal-fixture"])
