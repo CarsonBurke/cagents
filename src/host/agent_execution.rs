@@ -1402,10 +1402,10 @@ fn console(
 /// Command output, tool payloads and delivered reports stay in that view,
 /// which discloses them on demand.
 ///
-/// A step appears once it settles. The client prints only text that extends
-/// what it already printed, so a step rewritten in place from running to
-/// finished made it print the whole transcript again. Steps that settle out of
-/// order, such as parallel tool calls, still do.
+/// A step appears once it settles, so finishing it adds a line instead of
+/// rewriting one the client already printed. A step that settles after later
+/// text still lands before that text; the client then prints only the lines
+/// it has not shown (`console_delta` in the CLI).
 fn console_line(item: &chat::Item) -> Option<String> {
     use chat::{ChangeKind, CommandAction, DeliveryKind, ItemContent, ToolStatus};
     if item.content.status() == Some(ToolStatus::Running) {

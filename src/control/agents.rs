@@ -2104,6 +2104,24 @@ mod tests {
     }
 
     #[test]
+    fn console_prints_late_settled_steps_without_replaying_the_transcript() {
+        // A background tool still running is not shown; later text is.
+        let t1 = "User: Build it\nAssistant: Started the build.\n";
+        assert_eq!(console_delta("", t1), t1);
+        // The tool settles before that text in transcript order.
+        let t2 = "User: Build it\nCalled Agent\nAssistant: Started the build.\n";
+        assert_eq!(console_delta(t1, t2), "Called Agent\n");
+        // Growth at the end still streams as a plain suffix.
+        let t3 = format!("{t2}Assistant: Done");
+        assert_eq!(console_delta(t2, &t3), "Assistant: Done");
+        // A repeated line counts once per occurrence.
+        let t4 = "User: Build it\nCalled Agent\nCalled Agent\nAssistant: Started the build.\nAssistant: Done";
+        assert_eq!(console_delta(&t3, t4), "\nCalled Agent\n");
+        // Text dropped from the front of a bounded transcript prints nothing.
+        assert_eq!(console_delta(t4, "Called Agent\nAssistant: Done"), "");
+    }
+
+    #[test]
     fn console_answers_require_explicit_request_action_and_structured_fields() {
         use crate::agent_execution::ConsoleCommand;
         let ConsoleCommand::Control(crate::chat::Command::Answer {
@@ -2710,14 +2728,7 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                     .chars()
                     .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
                     .collect();
-                if let Some(delta) = text.strip_prefix(&previous) {
-                    print!("{delta}");
-                } else if text != previous {
-                    print!(
-                        "\n--- Current transcript{} ---\n{text}",
-                        if view.truncated { " (bounded)" } else { "" }
-                    );
-                }
+                print!("{}", console_delta(&previous, &text));
                 previous = text;
                 if last_run != Some((view.run.id, view.run.revision)) {
                     let usage = &view.run.result.usage;
@@ -2794,6 +2805,33 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
         data: json!({ "agent": agent, "detached": true }),
         human: "Console detached; the provider remains hosted until explicitly closed.".into(),
     })
+}
+
+/// What to print so the terminal shows `text` after it already showed
+/// `previous`. Usually the transcript only grew at its end. When an earlier
+/// line changed instead, such as a step that settled after later text was
+/// printed or text dropped from the front of a bounded transcript, a terminal
+/// cannot take back what it printed, so only the lines it has not shown yet
+/// are printed, in order, rather than the whole transcript again.
+fn console_delta(previous: &str, text: &str) -> String {
+    if let Some(delta) = text.strip_prefix(previous) {
+        return delta.to_owned();
+    }
+    let mut shown = std::collections::HashMap::<&str, usize>::new();
+    for line in previous.lines() {
+        *shown.entry(line).or_default() += 1;
+    }
+    let mut delta = String::new();
+    if !previous.is_empty() && !previous.ends_with('\n') {
+        delta.push('\n');
+    }
+    for line in text.split_inclusive('\n') {
+        match shown.get_mut(line.trim_end_matches('\n')) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => delta.push_str(line),
+        }
+    }
+    if delta == "\n" { String::new() } else { delta }
 }
 
 fn console_input(line: &str) -> Result<crate::agent_execution::ConsoleCommand, String> {
