@@ -25,6 +25,8 @@ mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
+#[cfg(feature = "development")]
+mod native_fixture_frames;
 mod notification_ui;
 mod operation_recovery_ui;
 mod palette_ui;
@@ -19071,6 +19073,13 @@ impl Application for Cagents {
                 channel,
             },
         );
+        #[cfg(feature = "development")]
+        if Self::native_chronology_fixture_enabled() {
+            let busy = self.cards.values().any(
+                |runtime| matches!(runtime, CardRuntime::Chat(runtime) if runtime.snapshot.busy),
+            );
+            return native_fixture_frames::instrument(surface, busy);
+        }
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
             surface,

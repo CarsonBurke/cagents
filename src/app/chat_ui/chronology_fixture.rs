@@ -462,16 +462,19 @@ pub(in crate::app) fn update(app: &mut Cagents, message: Message) -> Task<Messag
             let _ = update_workspace_viewport(&mut app.workspace, event);
         }
         Message::WindowCloseRequested(id) => {
+            super::super::native_fixture_frames::flush();
             let _ = crate::performance::chat_stage::flush();
             return iced::window::close(id)
                 .chain(iced::exit())
                 .map(cosmic::Action::App);
         }
         Message::WindowClosed(_) => {
+            super::super::native_fixture_frames::flush();
             let _ = crate::performance::chat_stage::flush();
             return iced::exit().map(cosmic::Action::App);
         }
         Message::ChromeUi(chrome_ui::Action::Close) => {
+            super::super::native_fixture_frames::flush();
             let _ = crate::performance::chat_stage::flush();
             return app.core.main_window_id().map_or_else(Task::none, |id| {
                 iced::window::close(id)

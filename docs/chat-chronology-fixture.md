@@ -312,3 +312,81 @@ production-daemon recovery. Synthetic pacing is not a performance benchmark;
 compare any responsiveness claims on the same realistic workload. If native
 execution or a required state remains unavailable, identify exactly that
 missing evidence; do not replace it with a mockup or fixture stdout screenshot.
+
+## In-memory native projection fixture
+
+Development UI builds also accept the exact environment values
+`CAGENTS_CHAT_CHRONOLOGY_FIXTURE=capacity-chronology-2014` and
+`capacity-chronology-2014-long`. This loads synthetic snapshots into the actual
+cagents chat runtime and native window. It uses no provider account, daemon,
+project registry, saved session, or authenticated host connection. It does not
+change the active Carson account. The inherited authority and account-selection
+environment remain untouched. Ordinary builds do not include this mode.
+
+The selected mode is latched before startup. Its app bootstrap, updates,
+subscriptions, and close path exclude normal account, device, provider,
+persistence, and daemon operations. Local client operations reject before
+writing a request or waiting for a reply. The local snapshots remain resident
+while the UI changes visibility. Do not add a real provider home or a synthetic
+account mapping for this mode.
+
+Use the normal runner with private XDG directories, preserving HOME and any
+inherited authority. Retain the coordinated warm Cargo cache and build slot:
+
+```sh
+fixture_native_root=$(mktemp -d "$PWD/.worktrees/chronology-native.XXXXXX")
+mkdir -m 700 "$fixture_native_root"/{runtime,data,config,cache,metrics}
+env XDG_RUNTIME_DIR="$fixture_native_root/runtime" \
+  XDG_DATA_HOME="$fixture_native_root/data" \
+  XDG_CONFIG_HOME="$fixture_native_root/config" \
+  XDG_CACHE_HOME="$fixture_native_root/cache" \
+  CAGENTS_CHAT_CHRONOLOGY_FIXTURE=capacity-chronology-2014 \
+  CAGENTS_CHAT_STAGE_OUTPUT="$fixture_native_root/metrics/stages.json" \
+  scripts/run-development --browserless --debug \
+    --log-file "$fixture_native_root/ui.log"
+```
+
+Run inside an owned native display. If changing XDG_RUNTIME_DIR beneath an
+existing owned Wayland session, preserve its absolute WAYLAND_DISPLAY socket;
+otherwise use an owned virtual compositor and nested Niri session. Do not use
+another desktop's authentication material. This fixture has no daemon to
+restart: the runner still builds the matched executables separately, while the
+fixture entry path excludes daemon startup. Device and saved-window options
+are rejected. Confirm the visible title says **Offline chronology fixture ·
+renderer only** before interacting.
+
+The first capacity error arrives before any assistant response, matching the
+reported failure boundary. Expand its Details and send `.` through the real
+composer. The fixture clears the draft and publishes paced text and tool
+states through the normal refresh path. Then send `Try the check again.` for a
+second, byte-identical diagnostic, followed by `Continue.` for another recovery.
+Inspect the earlier error during each stream, expand the tool, hover controls,
+select text, copy diagnostics and message/tool text, and scroll while updates
+arrive. Message Copy uses the complete local synthetic body and the normal
+clipboard path; it does not simulate a paged daemon-copy acknowledgement.
+Close the owned window normally to flush the opt-in stage report.
+
+The long mode seeds 40 prior exchanges and four additional synthetic chat
+cards. Peer snapshots receive 16 bounded local updates. Use the same mode,
+input sequence, viewport, scale, theme, sampling interval and instrumentation
+for both revisions; report the actual workload and resources. Software-display
+measurements do not establish the physical FW16 GPU's performance.
+
+On accepted close, a bounded observer writes one
+`cagents_native_fixture_frames=` JSON line to the UI log. It observes actual
+redraw-request timestamps without requesting frames or publishing messages.
+Duplicate replay timestamps are excluded; an idle transition resets the busy
+anchor. Counts and maximum cover the whole run, while percentiles cover at
+most the most recent 4,096 busy gaps. This is UI redraw-request cadence, not
+GPU presentation, scanout, or input latency. Compare it with CPU/RSS and chat
+stage measurements on the same workload and retain the raw observations.
+
+Apply the identical fixture-only harness patch to the pinned before revision
+and candidate. Record both tested heads and the harness hash. Native captures
+from this mode can validate rendering, dynamic grouping, composer interaction,
+diagnostic access, disclosure, selection, clipboard and scrolling. They do not
+exercise provider/daemon command acknowledgements, real capacity admission or
+recovery, authoritative paged copy, append-delta transport, or provider/Store
+history reload. The protocol fixtures and focused Rust regressions retain
+those separate scopes. This documentation and the fixture source are
+preparation until the native flow has actually run.
