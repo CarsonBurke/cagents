@@ -90,6 +90,8 @@ pub fn parse_rate_limits(result: &Value, observed_at: u64) -> UsageSnapshot {
     // from percentages.
     let ordinary_usage_allowed = result["ordinaryUsageAllowed"].as_bool();
     let status = permission_status(&windows, ordinary_usage_allowed, limited);
+    let detail = (status == UsageStatus::Unavailable)
+        .then(|| "Codex did not report usable usage limits".into());
     UsageSnapshot {
         windows,
         credits,
@@ -98,7 +100,31 @@ pub fn parse_rate_limits(result: &Value, observed_at: u64) -> UsageSnapshot {
         observed_at,
         source: UsageSource::Probe,
         plan,
-        detail: None,
+        detail,
+    }
+}
+
+/// A successful RPC frame without quota or explicit backend permission is
+/// not a usable probe answer. Scoped-only windows likewise do not replace
+/// ordinary-account evidence. The existing failure path retains earlier
+/// figures/identity instead of publishing an unavailable replacement.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(super) fn probe_rate_limits(
+    result: &Value,
+    observed_at: u64,
+) -> Result<UsageSnapshot, &'static str> {
+    let snapshot = parse_rate_limits(result, observed_at);
+    let ordinary_quota = snapshot
+        .windows
+        .iter()
+        .any(|window| window.kind != WindowKind::Scoped && window.used.is_finite());
+    if snapshot.ordinary_usage_allowed.is_none()
+        && snapshot.status != UsageStatus::Limited
+        && !ordinary_quota
+    {
+        Err("Codex could not read usage just now")
+    } else {
+        Ok(snapshot)
     }
 }
 
@@ -113,6 +139,9 @@ fn permission_status(
             UsageStatus::Limited => UsageStatus::Warning,
             status => status,
         },
+        // Without explicit permission or rejection, no parsed window means
+        // no account-wide eligibility observation, not an empty allowance.
+        None if windows.is_empty() && !limited => UsageStatus::Unavailable,
         None => status_for(windows, limited, false),
     }
 }
@@ -645,5 +674,117 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn sparse_or_malformed_probe_limits_do_not_authorize_routing() {
+        let now = 1_000;
+        for result in [
+            json!(null),
+            json!({}),
+            json!({"rateLimits": null}),
+            json!({"rateLimits": {}}),
+            json!({"rateLimits": []}),
+            json!({"rateLimits": {"primary": null, "secondary": null}}),
+            json!({"rateLimits": {"primary": {"usedPercent": "0"},
+                "secondary": {"usedPercent": false}}}),
+            json!({"rateLimits": {"primary": {"usedPercent": []},
+                "secondary": {"usedPercent": {}}}}),
+            json!({"rateLimitsByLimitId": {}}),
+            json!({"rateLimitsByLimitId": {"codex": null}}),
+            json!({"rateLimitsByLimitId": {"codex": {"primary": {"usedPercent": null}}}}),
+            json!({"rateLimitsByLimitId": {"codex": [], "future": false}}),
+            json!({"ordinaryUsageAllowed": "true", "rateLimits": {}}),
+            json!({"ordinaryUsageAllowed": 1, "rateLimits": null}),
+        ] {
+            let usage = parse_rate_limits(&result, now);
+            assert_eq!(usage.status, UsageStatus::Unavailable, "{result}");
+            assert!(usage.windows.is_empty(), "{result}");
+            assert_eq!(usage.ordinary_usage_allowed, None, "{result}");
+            assert!(usage.detail.is_some());
+            assert_eq!(usage.observed_at, now);
+            assert!(!super::super::routing::available(&usage, now), "{result}");
+            assert!(
+                !super::super::routing::needs_alternate(&usage, now),
+                "unknown quota cannot claim exhaustion or sign-out: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_permission_without_windows_retains_its_backend_meaning() {
+        for limits in [
+            json!(null),
+            json!({}),
+            json!({"primary": {"usedPercent": "unavailable"}}),
+        ] {
+            for allowed in [true, false] {
+                let mut usage = parse_rate_limits(
+                    &json!({"ordinaryUsageAllowed": allowed, "rateLimits": limits}),
+                    1_000,
+                );
+                assert!(usage.windows.is_empty());
+                assert_eq!(usage.ordinary_usage_allowed, Some(allowed));
+                assert_eq!(
+                    usage.status,
+                    if allowed {
+                        UsageStatus::Ok
+                    } else {
+                        UsageStatus::Limited
+                    }
+                );
+                assert_eq!(super::super::routing::available(&usage, 1_000), allowed);
+                assert_eq!(
+                    super::super::routing::needs_alternate(&usage, 1_000),
+                    !allowed
+                );
+                // Percent-only live updates cannot renew or override the
+                // backend permission, even when its probe had no windows.
+                let update = parse_update(&json!({"rateLimits": {
+                    "primary": {"usedPercent": 10, "windowDurationMins": 300},
+                }}))
+                .unwrap();
+                assert!(!merge_update(&mut usage, update, 1_001));
+                assert_eq!(usage.observed_at, 1_000);
+                assert_eq!(usage.ordinary_usage_allowed, Some(allowed));
+                assert_eq!(super::super::routing::available(&usage, 1_001), allowed);
+            }
+        }
+        let reached = parse_rate_limits(
+            &json!({"rateLimits": {
+                "rateLimitReachedType": "rate_limit_reached",
+            }}),
+            1_000,
+        );
+        assert_eq!(reached.status, UsageStatus::Limited);
+        assert!(super::super::routing::needs_alternate(&reached, 1_000));
+        assert!(!super::super::routing::available(&reached, 1_000));
+    }
+
+    #[test]
+    fn quota_metadata_alone_does_not_authorize_routing_but_finite_windows_do() {
+        let mut result = json!({"rateLimits": {
+            "planType": "pro", "credits": {"hasCredits": true, "balance": "12.50"},
+        }});
+        let unknown = parse_rate_limits(&result, 1_000);
+        assert_eq!(unknown.status, UsageStatus::Unavailable);
+        assert_eq!(unknown.plan.as_deref(), Some("pro"));
+        assert_eq!(unknown.credits.as_ref().unwrap().summary(), "12.50 left");
+        assert!(!super::super::routing::available(&unknown, 1_000));
+        for (percent, status, available) in [
+            (0, UsageStatus::Ok, true),
+            (81, UsageStatus::Warning, true),
+            (100, UsageStatus::Limited, false),
+        ] {
+            result["rateLimits"]["primary"] = json!({"usedPercent": percent});
+            let reported = parse_rate_limits(&result, 1_001);
+            assert_eq!(reported.status, status);
+            assert_eq!(reported.plan, unknown.plan);
+            assert_eq!(reported.credits, unknown.credits);
+            assert_eq!(
+                super::super::routing::available(&reported, 1_001),
+                available
+            );
+        }
     }
 }
