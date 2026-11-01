@@ -9091,6 +9091,9 @@ impl Cagents {
                         if failure.recovery == chat::Recovery::Fresh
                             && attempt.session.launch.session_id.is_none()
                             && attempt.session.terminal.is_none()
+                            // A provider held this one and may have done work,
+                            // so the reader is told rather than handed a draft.
+                            && !attempt.session.native_continuity.retains_provider()
                             && matches!(
                                 self.card_state(target.card).map(|state| &state.kind),
                                 Some(CardKind::Chat(_))
@@ -9118,7 +9121,18 @@ impl Cagents {
                             self.retire_chat(target.card, None, Some(attempt.session)),
                         ]);
                     }
-                    Err(failure) => {
+                    Err(mut failure) => {
+                        // A new conversation in this pane would no longer be
+                        // the agent's, so the agent's own way out is named.
+                        if failure.recovery == chat::Recovery::Fresh
+                            && self.workspace_model.agents.iter().any(|agent| {
+                                !agent.closed
+                                    && CardId::from_uuid(agent.id.as_uuid()) == target.card
+                            })
+                        {
+                            failure.recovery = chat::Recovery::Retry;
+                            failure.message.push_str(" Close the agent to end it.");
+                        }
                         let terminal_switch = matches!(
                             self.card_state(target.card).map(|state| &state.kind),
                             Some(CardKind::Terminal(_))
@@ -9563,6 +9577,10 @@ impl Cagents {
                 let mut session = session.clone();
                 session.launch.session_id = None;
                 session.proof = None;
+                // A provider the old conversation kept is not this one's.
+                if session.native_continuity.retains_provider() {
+                    session.reset_owned_codex_listener();
+                }
                 self.chat_ui.fresh_offers.remove(&card);
                 // A chat runtime whose provider has exited still holds the
                 // daemon's record for the conversation that failed. Closing it
@@ -23833,6 +23851,44 @@ mod tests {
             Err(chat::StartFailure::fresh("fixture: daemon gone")),
         );
         assert!(app.chat_offers_fresh_conversation(card));
+    }
+
+    /// An unnamed conversation a provider held may have done work, so a lost
+    /// holder says so; only the reader's press starts another, under no claim
+    /// on the old one.
+    #[test]
+    fn an_unnamed_provider_lost_with_its_boot_is_explained_not_turned_into_a_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let mut session = chat_runtime(&app, card).session.clone();
+        session.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
+        let target = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure::fresh("fixture: lost with its boot")),
+        );
+        assert!(app.chat_offers_fresh_conversation(card));
+        assert!(
+            !app.chat_ui
+                .phases
+                .values()
+                .any(|phase| matches!(phase, Phase::Starting(_))),
+            "nothing starts on its own"
+        );
+        assert!(!matches!(
+            app.cards.get(&card),
+            Some(CardRuntime::Chat(runtime)) if runtime.choosing()
+        ));
+        let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
+        let attempt = app.chat_ui.attempt(card).unwrap();
+        assert_eq!(attempt.intent, chat::Intent::Start);
+        assert_eq!(attempt.session.launch.session_id, None);
+        assert_eq!(attempt.session.proof, None);
+        assert!(!attempt.session.native_continuity.retains_provider());
     }
 
     #[test]

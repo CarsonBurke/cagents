@@ -1282,6 +1282,11 @@ fn restore(
             Err(message) => refusal = Some(message),
         }
     }
+    if refusal.is_some()
+        && let Some(explanation) = session.lost_holder_explanation(proof)
+    {
+        return Err(StartFailure::fresh(explanation));
+    }
     if session.native_continuity.retains_provider() {
         return Err(StartFailure::from(format!(
             "The saved native conversation could not be reattached. Its uncertain work was not restarted or resubmitted. {}",
@@ -4055,6 +4060,62 @@ mod tests {
             matches!(outcome, Ok(ClientRequest::ChatStart { .. })),
             "a mismatched lineage falls back to resuming, never to attaching"
         );
+    }
+
+    /// A provider lost with an earlier boot gets a plain account of what is
+    /// gone, only where no exact way back exists, and never starts anything.
+    #[test]
+    fn a_provider_lost_with_an_earlier_boot_is_explained_without_starting_one() {
+        let live = host_proof("live");
+        let mut earlier = live.clone();
+        earlier.boot_id = crate::model::BootId::new("earlier");
+        let refused = || {
+            ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+                "No authenticated holder",
+                false,
+            ))
+        };
+        let card = |provider, thread: Option<&str>, proof: &HostSessionProof| {
+            let mut card = omp_card(thread, Some(proof.clone()));
+            card.launch.provider = provider;
+            card.native_continuity = if provider == crate::agent::Provider::Codex {
+                super::super::NativeContinuity::Durable {
+                    provider_version: "test".into(),
+                }
+            } else {
+                super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            };
+            card
+        };
+        use crate::agent::Provider::{Claude, Codex};
+        for (saved, expected) in [
+            (
+                card(Codex, Some(CONVERSATION), &earlier),
+                "Codex conversation's server",
+            ),
+            (card(Claude, None, &earlier), "before Claude reported"),
+        ] {
+            let (outcome, _) = negotiate(&live, saved, refused());
+            let failure = outcome.expect_err("nothing starts");
+            assert_eq!(failure.recovery, crate::chat::Recovery::Fresh);
+            assert!(failure.message.contains(expected), "{}", failure.message);
+            assert!(failure.message.contains("Nothing was restarted"));
+        }
+        // Within one boot a missing holder proves nothing.
+        for saved in [
+            card(Codex, Some(CONVERSATION), &host_proof("old")),
+            card(Claude, None, &host_proof("old")),
+        ] {
+            let (outcome, _) = negotiate(&live, saved, refused());
+            let failure = outcome.expect_err("nothing starts");
+            assert_eq!(failure.recovery, crate::chat::Recovery::Retry);
+            assert!(failure.message.contains("could not be reattached"));
+        }
+        // A named Claude conversation has its reader; a refusal of that stays exact.
+        let (outcome, _) = negotiate(&live, card(Claude, Some(CONVERSATION), &earlier), refused());
+        let failure = outcome.expect_err("nothing starts");
+        assert_eq!(failure.recovery, crate::chat::Recovery::Retry);
     }
 
     /// A conversation that cannot be resumed and cannot be named is the one

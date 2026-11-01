@@ -937,6 +937,34 @@ impl Session {
         reader.is_saved_claude_history().then_some(reader)
     }
 
+    /// Why a provider that held this conversation cannot come back, when it was
+    /// lost with an earlier kernel boot and no exact way back exists: Codex has
+    /// no local reader for its thread here, and an unnamed Claude conversation
+    /// has no identity to read. `None` leaves every other refusal to its caller.
+    pub(crate) fn lost_holder_explanation(
+        &self,
+        live: &crate::model::HostSessionProof,
+    ) -> Option<&'static str> {
+        let earlier = self
+            .proof
+            .as_ref()
+            .is_some_and(|saved| saved.is_complete() && saved.boot_id != live.boot_id);
+        if !earlier || !self.native_continuity.retains_provider() {
+            return None;
+        }
+        if self.launch.provider == Provider::Codex {
+            Some(
+                "This Codex conversation's server stopped when the computer restarted. cagents cannot show its saved transcript here. Nothing was restarted or resent, and the conversation stays on disk.",
+            )
+        } else if self.launch.session_id.is_none() {
+            Some(
+                "This conversation's provider stopped when the computer restarted, before Claude reported a conversation ID, so cagents cannot tell which saved transcript is this one. Nothing was restarted or resent.",
+            )
+        } else {
+            None
+        }
+    }
+
     /// Import an installed capability observed on this exact authenticated
     /// attachment. A missing capability never revokes one already recorded.
     /// Validation applies to the resulting descriptor, including pre-ID
