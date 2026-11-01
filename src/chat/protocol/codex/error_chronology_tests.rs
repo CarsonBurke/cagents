@@ -399,7 +399,7 @@ fn first_delayed_child_completion_preserves_child_turn_order_without_history() {
             "new-b/answer"
         ]
     );
-    assert_eq!(child.status, Some(ToolStatus::Running));
+    assert_eq!(child.status, ToolStatus::Running);
     assert_eq!(
         chat::failure::provider_error_text(Provider::Codex, &child.items[2]),
         Some(raw)

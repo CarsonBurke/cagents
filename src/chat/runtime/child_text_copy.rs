@@ -346,6 +346,98 @@ mod tests {
     }
 
     #[test]
+    fn positioned_child_events_keep_verified_copy_sources_aligned_through_replay() {
+        let mut state = Snapshot::default();
+        // Equal-length bodies expose index swaps that a length check alone
+        // cannot distinguish after either relative insertion shifts an item.
+        full(&mut state, "child", "pivot", "pivot");
+        full(&mut state, "child", "tail", "final");
+        full(&mut state, "other", "pivot", "other");
+        let pivot = source(&state, "child", 0);
+        let tail = source(&state, "child", 1);
+        let other = source(&state, "other", 0);
+        let before = Event::SubagentItemBefore {
+            id: "child".into(),
+            item: item("before", "early"),
+            before: "pivot".into(),
+        };
+        let after = Event::SubagentItemAfter {
+            id: "child".into(),
+            item: item("after", "later"),
+            after: "pivot".into(),
+        };
+        apply(&mut state, before.clone());
+        assert_eq!(source(&state, "child", 1), pivot);
+        assert_eq!(read(&state, &pivot, 0).unwrap().text, "pivot");
+        apply(&mut state, after.clone());
+        assert_eq!(source(&state, "child", 3), tail);
+        assert_eq!(read(&state, &tail, 0).unwrap().text, "final");
+
+        let expected = [
+            ("before", "early"),
+            ("pivot", "pivot"),
+            ("after", "later"),
+            ("tail", "final"),
+        ];
+        let verify = |state: &Snapshot| {
+            let child = state
+                .subagents
+                .iter()
+                .find(|agent| agent.id == "child")
+                .unwrap();
+            assert_eq!(child.items.len(), expected.len());
+            assert_eq!(
+                state.text_copy_sources.children["child"].len(),
+                expected.len()
+            );
+            for (index, (id, body)) in expected.iter().enumerate() {
+                assert_eq!(child.items[index].id, *id);
+                let authority = source(state, "child", index);
+                assert_eq!(
+                    authority.scope,
+                    TextCopyScope::Subagent { id: "child".into() }
+                );
+                let copied = read(state, &authority, 0).unwrap();
+                assert_eq!(copied.source, authority);
+                assert_eq!(copied.text, *body);
+                assert!(copied.done);
+            }
+        };
+        verify(&state);
+        let aligned = state.text_copy_sources.children["child"].clone();
+        // History replay must update the existing identities without moving
+        // or duplicating them or granting a neighboring item's copy source.
+        apply(&mut state, after);
+        apply(&mut state, before);
+        verify(&state);
+        assert_eq!(state.text_copy_sources.children["child"], aligned);
+        assert_eq!(read(&state, &pivot, 0).unwrap().text, "pivot");
+        assert_eq!(read(&state, &tail, 0).unwrap().text, "final");
+        assert_eq!(read(&state, &other, 0).unwrap().text, "other");
+        let mut wrong_child = pivot.clone();
+        wrong_child.scope = other.scope.clone();
+        assert!(read(&state, &wrong_child, 0).is_err());
+
+        let early = source(&state, "child", 0);
+        apply(
+            &mut state,
+            Event::SubagentItemBefore {
+                id: "child".into(),
+                item: item("before", "early more"),
+                before: "pivot".into(),
+            },
+        );
+        assert_eq!(source(&state, "child", 0).cache, early.cache);
+        assert_eq!(read(&state, &early, 0).unwrap().text, "early");
+        assert_eq!(
+            read(&state, &source(&state, "child", 0), 0).unwrap().text,
+            "early more"
+        );
+        assert_eq!(source(&state, "child", 1), pivot);
+        assert_eq!(source(&state, "child", 3), tail);
+    }
+
+    #[test]
     fn unknown_initial_delta_and_actual_large_item_trim_never_authorize_suffixes() {
         let mut state = Snapshot::default();
         delta(&mut state, "child", "same", "suffix");
