@@ -201,6 +201,16 @@ pub(crate) fn has_outstanding_ownership() -> bool {
     }
 }
 
+/// Observe settlement in an isolated fixture without starting the service or
+/// closing admission. This is an idle observation, not a fence against later
+/// reservations; the fixture must exclude unrelated producers itself.
+#[cfg(test)]
+pub(crate) fn wait_until_idle_for_test(timeout: std::time::Duration) -> bool {
+    SERVICE
+        .get()
+        .is_none_or(|service| service.wait_until_idle_for_test(timeout))
+}
+
 /// Preserved originals can outlive their former terminal record. This excludes
 /// ordinary caller-held spawn reservations, which remain covered by the normal
 /// terminal inventory and its explicit shutdown confirmation contract.
@@ -372,6 +382,44 @@ impl Service {
     fn has_outstanding_ownership(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.free.len() != state.entries.len()
+    }
+
+    #[cfg(test)]
+    fn wait_until_idle_for_test(&self, timeout: std::time::Duration) -> bool {
+        self.wait_until_idle_with(timeout, || {})
+    }
+
+    #[cfg(test)]
+    fn wait_until_idle_with(
+        &self,
+        timeout: std::time::Duration,
+        mut before_wait: impl FnMut(),
+    ) -> bool {
+        let started = std::time::Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if state.free.len() == state.entries.len()
+                && state.entries.iter().all(Option::is_none)
+                && state.quarantined.iter().all(Option::is_none)
+            {
+                return true;
+            }
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                return false;
+            };
+            if remaining.is_zero() {
+                return false;
+            }
+            // The predicate and every ownership-release notification share
+            // this mutex, so settlement cannot fall between checking and
+            // waiting. Recheck after timeout and spurious progress wakes.
+            before_wait();
+            let (next, _) = self
+                .progress
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|p| p.into_inner());
+            state = next;
+        }
     }
 
     fn has_retained_ownership(&self) -> bool {
@@ -982,6 +1030,96 @@ mod tests {
                 let _ = child.wait();
             }
         }
+    }
+
+    #[test]
+    fn idle_observer_counts_caller_reservations_without_closing_admission() {
+        let reaper = TestService::new(1);
+        assert!(reaper.service.wait_until_idle_for_test(Duration::ZERO));
+        let reservation = reaper.reserve().unwrap();
+        assert!(
+            !reaper
+                .service
+                .wait_until_idle_for_test(Duration::from_millis(10)),
+            "an unpublished caller-owned original still holds its credit"
+        );
+        assert_eq!(reaper.free(), 0);
+        drop(reservation);
+        assert!(reaper.service.wait_until_idle_for_test(Duration::ZERO));
+
+        let later = reaper.reserve().unwrap();
+        assert!(
+            !reaper.service.wait_until_idle_for_test(Duration::ZERO),
+            "an idle observation must not seal absence or hide later ownership"
+        );
+        drop(later);
+        assert!(reaper.service.wait_until_idle_for_test(Duration::ZERO));
+    }
+
+    #[test]
+    fn idle_observer_keeps_quarantined_original_until_wait_and_credit_release() {
+        let reaper = TestService::new(1);
+        let reservation = reaper.reserve().unwrap();
+        let mut original = DrainChild::spawn();
+        reservation.quarantine();
+        assert!(
+            !reaper
+                .service
+                .wait_until_idle_for_test(Duration::from_millis(10))
+        );
+        drop(original.stdin.take());
+        assert!(original.child.as_mut().unwrap().wait().unwrap().success());
+        original.assert_original_reaped();
+        assert!(
+            !reaper.service.wait_until_idle_for_test(Duration::ZERO),
+            "the exact wait does not release a caller-held quarantine credit"
+        );
+        drop(reservation);
+        assert!(reaper.service.wait_until_idle_for_test(Duration::ZERO));
+        original.armed = false;
+    }
+
+    #[test]
+    fn idle_observer_waits_for_retained_original_reap_and_credit_release() {
+        let reaper = TestService::new(1);
+        let reservation = reaper.reserve().unwrap();
+        let mut original = DrainChild::spawn();
+        let pidfd = original.pidfd.try_clone().unwrap();
+        let child = original.child.take().unwrap();
+        if let Err((error, child, _, reservation)) = reservation.retain(child, pidfd) {
+            original.child = Some(child);
+            drop(reservation);
+            panic!("fixture original transfer failed: {error}");
+        }
+        assert!(
+            !reaper
+                .service
+                .wait_until_idle_for_test(Duration::from_millis(10)),
+            "observation must neither signal nor release a live retained child"
+        );
+        thread::scope(|scope| {
+            let (waiting, ready) = std::sync::mpsc::channel();
+            let observed = scope.spawn(|| {
+                let mut waiting = Some(waiting);
+                reaper
+                    .service
+                    .wait_until_idle_with(Duration::from_secs(5), || {
+                        if let Some(waiting) = waiting.take() {
+                            waiting.send(()).unwrap();
+                        }
+                    })
+            });
+            // The observer still owns the predicate mutex at this signal.
+            // EOF therefore forces the reaper to wake an actual waiting
+            // observer, rather than allowing an already-idle fast path.
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(original.stdin.take());
+            assert!(observed.join().unwrap(), "original custody did not settle");
+        });
+        original.assert_original_reaped();
+        assert_eq!(reaper.free(), 1);
+        original.armed = false;
+        drop(reaper.reserve().unwrap());
     }
 
     #[test]

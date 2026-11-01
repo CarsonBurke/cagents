@@ -14,11 +14,13 @@ use std::{
         unix::fs::PermissionsExt,
     },
     path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
 };
 
 const ROOT: &str = "CAGENTS_RETAINED_CHILD_ADMISSION_ROOT";
 const SCOPE: &str = "CAGENTS_RETAINED_CHILD_ADMISSION_AUTHORITY_PRESENCE";
+const ISOLATED_CONSUMER_TEST: &str = "host::state::retained_child_shutdown_tests::retained_original_refuses_parent_upgrade_but_not_an_isolated_upgrade_consumer";
+const EXPIRY_HANDSHAKE: &str = "expiry-handshake";
 
 struct TestChild(Child);
 
@@ -40,6 +42,37 @@ impl Drop for EvidenceDirectory {
         if let Some(directory) = self.0.take() {
             let _retained = directory.keep();
         }
+    }
+}
+
+fn wait_for_fixture(
+    child: &mut TestChild,
+    test: &str,
+    deadline: Instant,
+    on_expiry: impl FnOnce(),
+) -> Option<ExitStatus> {
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            // A late producer completion cannot extend this fixture's acceptance.
+            break (test != ISOLATED_CONSUMER_TEST || Instant::now() < deadline).then_some(status);
+        }
+        if Instant::now() >= deadline {
+            if test == ISOLATED_CONSUMER_TEST {
+                // Acceptance has expired, but this producer owns a retained
+                // original. Let its guard settle; do not kill its cleanup owner.
+                eprintln!("retained-custody fixture timed out; waiting for its original producer");
+                on_expiry();
+                while let Err(error) = child.0.wait() {
+                    eprintln!("waiting for retained-custody producer: {error}");
+                    thread::sleep(Duration::from_millis(100));
+                }
+                break None;
+            }
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -105,17 +138,7 @@ fn private_runtime(test: &str) -> Option<PathBuf> {
         .stderr(Stdio::from(File::create(&stderr).unwrap()));
     let mut child = TestChild(command.spawn().unwrap());
     let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            break Some(status);
-        }
-        if Instant::now() >= deadline {
-            child.0.kill().unwrap();
-            child.0.wait().unwrap();
-            break None;
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
+    let status = wait_for_fixture(&mut child, test, deadline, || {});
     let stdout = fs::read_to_string(stdout).unwrap();
     let stderr = fs::read_to_string(stderr).unwrap();
     assert!(
@@ -463,6 +486,220 @@ fn retained_original_child_refuses_empty_control_until_exact_reap() {
     assert!(!child_reaper::has_outstanding_ownership());
     assert_empty(&host);
     accepted_empty_stop(&host);
+}
+
+#[test]
+fn retained_original_refuses_parent_upgrade_but_not_an_isolated_upgrade_consumer() {
+    const CONSUMER: &str =
+        "host::state::tests::committed_upgrade_fences_control_and_retains_checkpoint_until_close";
+    let Some(root) = private_runtime(ISOLATED_CONSUMER_TEST) else {
+        return;
+    };
+    let host = host();
+    let capability = preflight(&host);
+    let reservation = child_reaper::reserve().unwrap();
+    let mut original = Original::spawn(&root);
+    original.retain(reservation);
+    original.assert_live();
+    refuse_all(&host, &capability);
+
+    let handshake = root.join(EXPIRY_HANDSHAKE);
+    let expiry_fixture = handshake.is_dir();
+    if expiry_fixture {
+        // Publish only after actual live retained custody and parent refusal.
+        File::options()
+            .write(true)
+            .create_new(true)
+            .open(handshake.join("ready"))
+            .unwrap();
+        loop {
+            match fs::symlink_metadata(handshake.join("release")) {
+                Ok(marker) => {
+                    assert!(marker.is_file());
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("owned expiry release marker: {error}"),
+            }
+        }
+        original.assert_live();
+        refuse_all(&host, &capability);
+    }
+
+    // Keep the original stdin and pidfd throughout the synchronous child run.
+    // Its exact existing consumer must complete prepare/commit using a fresh
+    // reaper, while this producer's global custody keeps parent admission blocked.
+    super::tests::run_upgrade_fixture_in_fresh_process(CONSUMER);
+
+    original.assert_live();
+    refuse_all(&host, &capability);
+    original.finish();
+    assert!(!child_reaper::has_outstanding_ownership());
+    accepted_empty_stop(&host);
+    if expiry_fixture {
+        // This marker cannot bless exit-only cleanup: finish and zero custody
+        // plus the unchanged accepted-stop assertion must already have passed.
+        File::options()
+            .write(true)
+            .create_new(true)
+            .open(handshake.join("done"))
+            .unwrap();
+    }
+}
+
+#[test]
+fn retained_producer_outer_expiry_waits_for_cleanup_and_rejects_late_success() {
+    let directory = tempfile::Builder::new()
+        .prefix("rc-expiry-")
+        .tempdir()
+        .unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let _evidence = EvidenceDirectory(Some(directory));
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    for name in [
+        "home",
+        "run",
+        "data",
+        "config",
+        "cache",
+        "tmp",
+        EXPIRY_HANDSHAKE,
+    ] {
+        fs::create_dir(root.join(name)).unwrap();
+        fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let handshake = root.join(EXPIRY_HANDSHAKE);
+    let release = handshake.join("release");
+    let stdout = root.join("test.stdout");
+    let stderr = root.join("test.stderr");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    for (name, _) in std::env::vars_os() {
+        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
+            command.env_remove(name);
+        }
+    }
+    command
+        .args([
+            "--exact",
+            ISOLATED_CONSUMER_TEST,
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .current_dir(&root)
+        .env(ROOT, &root)
+        .env(
+            SCOPE,
+            if crate::agent_execution::Authority::from_environment()
+                != crate::agent_execution::Authority::default()
+            {
+                "present"
+            } else {
+                "absent"
+            },
+        )
+        .env("HOME", root.join("home"))
+        .env("XDG_RUNTIME_DIR", root.join("run"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("TMPDIR", root.join("tmp"))
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(File::create(&stdout).unwrap()))
+        .stderr(Stdio::from(File::create(&stderr).unwrap()));
+
+    struct Producer {
+        child: TestChild,
+        release: PathBuf,
+    }
+    impl Drop for Producer {
+        fn drop(&mut self) {
+            // Every parent error/panic releases only this owned fixture and
+            // waits before TestChild's ordinary kill-on-drop guard can run.
+            // A failed release or unknown wait remains HOLD, not a kill shortcut.
+            let _ = File::create(&self.release);
+            while self.child.0.wait().is_err() {
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    let mut producer = Producer {
+        release: release.clone(),
+        child: TestChild(command.spawn().unwrap()),
+    };
+    let ready_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match fs::symlink_metadata(handshake.join("ready")) {
+            Ok(marker) => {
+                assert!(marker.is_file());
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                assert!(
+                    producer.child.0.try_wait().unwrap().is_none(),
+                    "owned producer exited before publishing retained custody; {}",
+                    root.display()
+                );
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "producer never became ready"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("owned expiry ready marker: {error}"),
+        }
+    }
+    assert!(producer.child.0.try_wait().unwrap().is_none());
+    assert!(!release.exists());
+    let mut expiry_observed = false;
+    // Readiness, not a sleep, proves the same producer holds retained custody.
+    // Only the actual expired branch may release it to normal owned cleanup.
+    let status = wait_for_fixture(
+        &mut producer.child,
+        ISOLATED_CONSUMER_TEST,
+        Instant::now(),
+        || {
+            File::options()
+                .write(true)
+                .create_new(true)
+                .open(&release)
+                .unwrap();
+            expiry_observed = true;
+        },
+    );
+    assert!(
+        expiry_observed,
+        "the actual expiry branch was not exercised"
+    );
+    assert!(
+        status.is_none(),
+        "late success must remain a timeout failure"
+    );
+    assert!(producer.child.0.try_wait().unwrap().unwrap().success());
+    assert!(
+        fs::symlink_metadata(handshake.join("done"))
+            .unwrap()
+            .is_file()
+    );
+    let stdout = fs::read_to_string(stdout).unwrap();
+    let stderr = fs::read_to_string(stderr).unwrap();
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| *line == format!("test {ISOLATED_CONSUMER_TEST} ... ok"))
+            .count(),
+        1,
+        "missing exact successful producer; {}:\n{stdout}\n{stderr}",
+        root.display()
+    );
+    let summaries: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.starts_with("test result:"))
+        .collect();
+    assert_eq!(summaries.len(), 1);
+    assert!(summaries[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"));
 }
 
 #[test]

@@ -707,6 +707,14 @@ pub(super) struct Holder {
 }
 
 impl Holder {
+    #[cfg(test)]
+    pub(super) fn original_pidfd_for_test(&self) -> io::Result<File> {
+        self.pidfd
+            .as_ref()
+            .ok_or_else(|| io::Error::other("original holder pidfd was not captured"))?
+            .try_clone()
+    }
+
     pub(super) fn original_role(&self) -> Option<&crate::daemon::holder_registry::OriginalRole> {
         self.original_role.as_ref()
     }
