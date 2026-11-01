@@ -14,6 +14,9 @@ import sys
 
 SOCKET_NAME = "native-fixture-broker.sock"
 EXIT_NO_BROKER = 69
+MAX_REPLY_BYTES = 2 * 1024 * 1024
+# Longer than any operation the broker allows, so a hung broker still ends this.
+REPLY_SECONDS = 420
 NO_BROKER = (
     "No native-fixture-broker is listening. Ask the person to run "
     "scripts/native-fixture-broker in a terminal outside cagents; "
@@ -28,11 +31,15 @@ def parse(argv):
     def command(name, help_text):
         sub = commands.add_parser(name, help=help_text)
         sub.add_argument("fixture")
+        if name not in ("start", "clear"):
+            sub.add_argument("--owner", required=True, help="the owner value start returned")
         return sub
 
-    command("start", "start a nested session and sandbox").add_argument(
-        "--checkout", required=True, help="checkout beneath this repository's .worktrees/"
-    )
+    start = command("start", "start a nested session and sandbox")
+    start.add_argument("--checkout", required=True, help="checkout beneath this repository's .worktrees/")
+    start.add_argument("--width", type=int, help="logical width of the app's viewport")
+    command("viewport", "set the logical viewport width").add_argument("--width", type=int, required=True)
+    command("clear", "remove a stopped or left-behind fixture by name")
     command("run-ui", "build and launch through scripts/run-development --browserless")
     command("cli", "run the fixture's own cagents").add_argument("args", nargs=argparse.REMAINDER)
     command("click", "click a label or X,Y").add_argument("target")
@@ -62,19 +69,27 @@ def request_from(parsed):
     command = parsed.command
     fixture = parsed.fixture
     if command == "start":
-        return {"op": "start", "fixture": fixture, "checkout": str(Path(parsed.checkout).absolute())}
+        request = {"op": "start", "fixture": fixture, "checkout": str(Path(parsed.checkout).absolute())}
+        if parsed.width is not None:
+            request["width"] = parsed.width
+        return request
+    if command == "clear":
+        return {"op": "clear", "fixture": fixture}
+    owned = {"fixture": fixture, "owner": parsed.owner}
     if command == "run-ui":
-        return {"op": "run-ui", "fixture": fixture}
+        return {"op": "run-ui", **owned}
+    if command == "viewport":
+        return {"op": "viewport", **owned, "width": parsed.width}
     if command == "cli":
         args = parsed.args[1:] if parsed.args[:1] == ["--"] else parsed.args
-        return {"op": "cli", "fixture": fixture, "args": args}
+        return {"op": "cli", **owned, "args": args}
     if command == "screenshot":
-        return {"op": "screenshot", "fixture": fixture, "name": parsed.name}
+        return {"op": "screenshot", **owned, "name": parsed.name}
     if command == "status":
-        return {"op": "status", "fixture": fixture}
+        return {"op": "status", **owned}
     if command == "stop":
-        return {"op": "stop", "fixture": fixture, "keep": parsed.keep}
-    request = {"op": "input", "fixture": fixture, "action": command}
+        return {"op": "stop", **owned, "keep": parsed.keep}
+    request = {"op": "input", **owned, "action": command}
     if command in ("click", "move"):
         request["target"] = parsed.target
         if command == "click":
@@ -105,6 +120,7 @@ def main(argv=None):
         print(NO_BROKER, file=sys.stderr)
         return EXIT_NO_BROKER
     connection = socket.socket(socket.AF_UNIX)
+    connection.settimeout(REPLY_SECONDS)
     try:
         connection.connect(str(Path(runtime) / SOCKET_NAME))
     except OSError:
@@ -113,15 +129,20 @@ def main(argv=None):
     with connection, connection.makefile("rwb") as stream:
         stream.write(json.dumps(request).encode() + b"\n")
         stream.flush()
-        reply = stream.readline()
-    if not reply:
-        print("The broker closed the connection without replying.", file=sys.stderr)
+        try:
+            reply = stream.readline(MAX_REPLY_BYTES)
+        except TimeoutError:
+            print("The broker did not reply in time.", file=sys.stderr)
+            return 1
+    if not reply.endswith(b"\n"):
+        print("The broker closed the connection without a complete reply.", file=sys.stderr)
         return 1
     print(reply.decode().rstrip("\n"))
     decoded = json.loads(reply)
     if not decoded.get("ok"):
         return 1
-    return decoded.get("result", {}).get("exit_code", 0)
+    code = decoded.get("result", {}).get("exit_code", 0)
+    return min(abs(code), 125) if isinstance(code, int) else 1
 
 
 if __name__ == "__main__":

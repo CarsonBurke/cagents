@@ -23,11 +23,9 @@ scripts/native-fixture-broker
 
 It exits 77 if agent authority is present in its environment or in any ancestor
 process's. It listens on `$XDG_RUNTIME_DIR/native-fixture-broker.sock` (mode
-0600) until stopped with Ctrl-C, which stops its fixtures and keeps their
-directories. Start it from a commit you have reviewed, because it runs with your
-full authority; it prints its path and SHA-256 when it starts. If this terminal
-has a `CARGO_TARGET_DIR`, or you pass `--cargo-target-dir`, sandboxed builds can
-write there.
+0600). Start it from a commit you have reviewed, because it runs with your full
+authority; it prints its path and SHA-256 when it starts. Ctrl-C, SIGTERM or
+closing the terminal stops its fixtures and keeps their directories.
 
 An agent then drives a named fixture from any shell, with its environment
 unchanged. The client sends one structured request and never reads or forwards
@@ -35,43 +33,81 @@ the capability. If no broker is listening it says so and exits 69; do not start
 one yourself.
 
 ```sh
-scripts/native-fixture start composer --checkout "$repo/.worktrees/my-branch"
-scripts/native-fixture run-ui composer
-scripts/native-fixture status composer
-scripts/native-fixture cli composer -- project open "$fixture/sandbox/project"
-scripts/native-fixture cli composer -- --json agent spawn --provider claude \
-  --model haiku --surface chat --repository "$fixture/sandbox/project" \
+scripts/native-fixture start composer --checkout "$repo/.worktrees/my-branch" --width 1600
+# Prints owner and root. Later commands need --owner; put it before the name.
+scripts/native-fixture run-ui --owner "$owner" composer
+scripts/native-fixture status --owner "$owner" composer
+scripts/native-fixture cli --owner "$owner" composer -- project open "$root/sandbox/project"
+scripts/native-fixture cli --owner "$owner" composer -- --json agent spawn --provider claude \
+  --model haiku --surface chat --repository "$root/sandbox/project" \
   --prompt 'Can you investigate why the Kaggle submission failed?'
-scripts/native-fixture wait composer 'Kaggle' --timeout 60
-scripts/native-fixture click composer 'Steer'
-scripts/native-fixture type composer 'a literal message'
-scripts/native-fixture key composer ctrl+Return
-scripts/native-fixture screenshot composer after-queued-steer
-scripts/native-fixture stop composer --keep
+scripts/native-fixture wait --owner "$owner" composer 'Kaggle' --timeout 60
+scripts/native-fixture click --owner "$owner" composer 'Steer'
+scripts/native-fixture type --owner "$owner" composer 'a literal message'
+scripts/native-fixture viewport --owner "$owner" composer --width 480
+scripts/native-fixture screenshot --owner "$owner" composer after-queued-steer
+scripts/native-fixture stop --owner "$owner" composer --keep
 ```
 
-`start` prints `root`, written as `$fixture` above. The checkout must be beneath
-this repository's `.worktrees/`, so add one with `git worktree add` if you work
-elsewhere. `run-ui` runs `scripts/run-development --browserless` and returns
-while it builds; follow `sandbox/runner.log` and `sandbox/ui.log` under the
-root. Screenshots land in `niri/shots/` under the root as PNG; convert them to
-WebP for a PR. `stop` removes the fixture directory unless given `--keep`. A
-stale directory blocks a new `start` of that name until you remove it. Also
-`move`, `scroll` and `observe`; see `scripts/native-fixture --help`.
+The checkout must be beneath this repository's `.worktrees/`, so add one with
+`git worktree add` if you work elsewhere. At most two fixtures run at once.
+
+- **Building:** `run-ui` runs `scripts/run-development --browserless` and returns
+  while it builds; follow `sandbox/runner.log` and `sandbox/ui.log` under the
+  root. Each checkout builds into its own target under
+  `.worktrees/native-fixture-targets/`, because sandboxed build scripts can write
+  there. The first build of each checkout is cold, and these directories stay
+  until you delete them. `cli` is refused until this fixture's runner has built a
+  binary whose Cargo dep-info names this checkout.
+- **Viewport:** `start --width` and `viewport --width` set the app's logical width
+  from 320 to 3840, through the nested output's scale. The host lays out the
+  nested window, so its framebuffer and height are not chosen here. `start`,
+  `viewport` and `screenshot` report what was reached, and `matches` is false when
+  the width could not be. Compare those values across a before/after pair, and
+  keep the host window the same size between them.
+- **Screenshots** land in `shots/` under the root as PNG; convert them to WebP for
+  a PR.
+- **Stopping:** `stop` removes the fixture directory unless given `--keep`. A kept
+  directory, or one left by a killed broker, blocks a new `start` of that name
+  until `scripts/native-fixture clear NAME`. A failed `start` frees its name
+  itself. If the broker is killed outright, its sandboxes die with it, but its
+  nested niri windows stay until the broker next starts or `clear` runs.
+- **Owner:** the owner value only stops agents using each other's fixtures by
+  accident. It is not a security control.
+
+The optional behaviors below use `sandbox/home/.claude` under the root, which you
+can write from your own shell. Also `move`, `key`, `scroll` and `observe`; see
+`scripts/native-fixture --help`.
+
+### What the sandbox can reach
 
 Each fixture runs in a bubblewrap sandbox with its own HOME, XDG directories,
-runtime directory, daemon and project. The sandbox has no network, so builds use
-only what is cached, and it sees none of your real HOME, credentials,
-`~/.local/share/cagents*` or `$XDG_RUNTIME_DIR/cagents*`. It binds the toolchain,
-the Cargo registry and Zig package caches and the checkout read-only, and only
-the Cargo target, fixture directory and nested Wayland socket for writing.
-`claude` there is this fixture script. Only `niri-harness` runs outside the
-sandbox, driving its own nested session. The optional behaviors below use
-`sandbox/home/.claude` under the root, which you can write from your own shell.
+runtime directory, daemon and project. It has no network, so builds use only what
+is cached. It sees none of your real HOME, credentials, `~/.local/share/cagents*`
+or `$XDG_RUNTIME_DIR/cagents*`. `claude` there is this fixture script.
 
-This is a supported route, not a security boundary against a process of the same
-user. It keeps fixture work away from real state, and does not make an agent's
-own shell any less able to reach it.
+- **Read-only:** `/usr`, `/etc`, `/sys`, the Rust toolchain, Zig, Cargo's `bin`,
+  `registry` and `git` directories, Zig's package cache, the checkout, and this
+  repository's `.git`.
+- **Writable:** the checkout's Cargo target, the fixture's `sandbox/` directory and
+  runtime directory, tmpfs at `/tmp`, `/var` and Cargo's home, and the nested
+  Wayland socket. `/dev/dri` is also bound, for the GPU.
+- **Limits:** per-process address space (128 GiB) and file size (32 GiB), 8192
+  processes, and no core files. Total memory is not capped, because that needs a
+  cgroup, which this does not set up. Several fixtures building at once can still
+  exhaust the host's memory.
+
+On the host side only the broker, `niri-harness` and `niri` run. Nested niri runs
+nothing from a checkout. Commands reach the sandbox over an inherited socket, not
+a path, and its replies are bounded and treated as untrusted. A sandbox can forge
+what its own commands appear to have done, including its own `status`, so treat
+fixture output as evidence about that checkout only.
+
+The broker protects you from code running inside the sandbox. It does not protect
+you from an agent's shell of the same user, which can already reach the same files
+and sockets, including `.worktrees/` and the broker's state under
+`$XDG_RUNTIME_DIR/native-fixture-broker/`. It is a supported route that removes
+the need for a workaround, not a boundary against that shell.
 
 ## Directly: from a person's own terminal
 
