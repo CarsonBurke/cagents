@@ -26,14 +26,21 @@ class FakePorts:
         self.child_status = None
         self.cancel = False
         self.bind_error = self.pin_error = self.wait_error = None
+        self.prepare_error = self.spawn_error = None
+        self.outputs_reply = {"Outputs": {"fake-owned-output": {}}}
         self.record_error = False
         self.pause_count = 0
+        self.records = []
 
     def prepare(self):
         self.events.append("prepare")
+        if self.prepare_error:
+            raise self.prepare_error
 
     def spawn(self):
         self.events.append("spawn-original")
+        if self.spawn_error:
+            raise self.spawn_error
         return self.child
 
     def pin(self, child):
@@ -54,6 +61,7 @@ class FakePorts:
 
     def register(self, child, peer, registration):
         assert child is self.child and peer is self.peer
+        carrier.one_output(self.outputs_reply)
         self.events.append("register-private")
 
     def release_runner(self):
@@ -91,6 +99,7 @@ class FakePorts:
         if self.record_error and state["cleanup_complete"]:
             self.record_error = False
             raise OSError("fake evidence failure")
+        self.records.append(dict(state))
 
     def pause(self):
         self.pause_count += 1
@@ -159,6 +168,7 @@ class CustodyContracts(unittest.TestCase):
         self.assertEqual(owner.state["child_status"], 0)
         self.assertTrue(owner.state["cleanup_complete"])
         self.assertEqual(owner.state["quit_ack"], "missing-eof")
+        self.assertEqual(owner.state["exit_code"], 2)
 
     def test_wrong_peer_holds_original_without_releasing_or_quitting(self):
         ports = FakePorts()
@@ -216,7 +226,7 @@ class CustodyContracts(unittest.TestCase):
         self.assertEqual(owner.state["exit_code"], 2)
         self.assertEqual(owner.state["quit_ack"], "error")
 
-    def test_nonzero_original_exit_stays_negative_hold(self):
+    def test_nonzero_original_exit_settles_negative_after_owned_close(self):
         ports = FakePorts()
         owner = self.started(ports)
         ports.status = 0
@@ -224,8 +234,10 @@ class CustodyContracts(unittest.TestCase):
         ports.child_status = 7
         owner.step()
         self.assertEqual(owner.state["child_status"], 7)
-        self.assertEqual(owner.state["phase"], "HOLD")
-        self.assertFalse(owner.state["cleanup_complete"])
+        self.assertEqual(owner.state["phase"], "owned-cleanup-settled")
+        self.assertTrue(owner.state["cleanup_complete"])
+        self.assertEqual(owner.state["exit_code"], 2)
+        self.assertEqual(ports.events[-2:], ["wait-original", "close-after-wait"])
 
     def test_real_loop_body_progresses_original_after_eof_without_blind_hold(self):
         ports = FakePorts(carrier.MissingAck("fake EOF"))
@@ -234,7 +246,7 @@ class CustodyContracts(unittest.TestCase):
         for _ in range(3):
             owner.turn()
         self.assertTrue(owner.state["cleanup_complete"])
-        self.assertEqual(owner.state["exit_code"], 0)
+        self.assertEqual(owner.state["exit_code"], 2)
         self.assertEqual(ports.pause_count, 2)
         self.assertTrue(owner.state["child_wait_complete"])
 
@@ -250,8 +262,90 @@ class CustodyContracts(unittest.TestCase):
         self.assertFalse(owner.state["cleanup_complete"])
         self.assertIsNone(owner.state["exit_code"])
 
+    def test_prepare_refusal_returns_recorded_negative_without_spawn(self):
+        ports = FakePorts()
+        ports.prepare_error = OSError("fake private preparation refusal")
+        owner = carrier.Carrier(ports)
+        self.assertEqual(owner.run(), 2)
+        self.assertEqual(ports.events, ["prepare"])
+        self.assertTrue(owner.state["pre_spawn_refused"])
+        self.assertIsNone(owner.child)
+        self.assertFalse(owner.state["child_wait_complete"])
+        self.assertEqual(ports.records[-1]["exit_code"], 2)
+
+    def test_spawn_uncertainty_cannot_be_promoted_to_no_child_refusal(self):
+        ports = FakePorts()
+        ports.spawn_error = OSError("fake ambiguous spawn failure")
+        owner = carrier.Carrier(ports)
+        owner.start()
+        owner.owner_turn()
+        self.assertEqual(owner.state["phase"], "HOLD")
+        self.assertFalse(owner.state["pre_spawn_refused"])
+        self.assertFalse(owner.state["cleanup_complete"])
+        self.assertIsNone(owner.state["exit_code"])
+
+    def test_no_spawn_refusal_stays_negative_if_diagnostic_write_fails(self):
+        ports = FakePorts()
+        ports.prepare_error = OSError("fake private preparation refusal")
+        ports.record_error = True
+        owner = carrier.Carrier(ports)
+        self.assertEqual(owner.run(), 2)
+        self.assertEqual(ports.events, ["prepare"])
+        self.assertTrue(owner.state["pre_spawn_refused"])
+        self.assertFalse(owner.state["blocked"])
+        self.assertTrue(any("evidence:" in item for item in owner.state["errors"]))
+
+    def test_interruption_at_turn_boundary_retains_owner_and_observes_original(self):
+        ports = FakePorts()
+        owner = self.started(ports)
+        original_turn = owner.turn
+
+        def interrupted_turn():
+            raise KeyboardInterrupt("fake interruption outside adapter catches")
+
+        owner.turn = interrupted_turn
+        owner.owner_turn()
+        self.assertEqual(owner.state["phase"], "HOLD")
+        self.assertIs(owner.child, ports.child)
+        self.assertIs(owner.peer, ports.peer)
+        self.assertIs(owner.pin, ports.pin_value)
+        owner.turn = original_turn
+        ports.child_status = 0
+        owner.owner_turn()
+        self.assertTrue(owner.state["child_wait_complete"])
+        self.assertEqual(ports.events.count("spawn-original"), 1)
+        self.assertFalse(owner.state["cleanup_complete"])
+        self.assertNotIn("close-after-wait", ports.events)
+
+    def test_invalid_output_variant_or_count_cannot_release_runner(self):
+        for response in [{"Outputs": {}}, {"Outputs": {"a": {}, "b": {}}},
+                         {"Windows": []}, {"Outputs": []}]:
+            with self.subTest(response=response):
+                ports = FakePorts()
+                ports.outputs_reply = response
+                owner = self.started(ports)
+                self.assertEqual(owner.state["phase"], "HOLD")
+                self.assertNotIn("register-private", ports.events)
+                self.assertNotIn("release-once", ports.events)
+                self.assertNotIn("quit-same-peer", ports.events)
+
 
 class PeerContracts(unittest.TestCase):
+    def test_actual_outputs_reply_is_unwrapped_and_counted(self):
+        stream = FakeStream(b'{"Ok":{"Outputs":{"owned":{"logical":{}}}}}\n')
+        peer = carrier.Peer(stream, 41, 1000)
+        self.assertEqual(carrier.one_output(peer.request("Outputs")), {"owned": {"logical": {}}})
+        self.assertEqual(stream.sent, [b'"Outputs"\n'])
+
+    def test_actual_outputs_parser_rejects_empty_multiple_or_wrong_variant(self):
+        for reply in [b'{"Ok":{"Outputs":{}}}\n',
+                      b'{"Ok":{"Outputs":{"a":{},"b":{}}}}\n',
+                      b'{"Ok":{"Windows":[]}}\n']:
+            with self.subTest(reply=reply):
+                peer = carrier.Peer(FakeStream(reply), 41, 1000)
+                with self.assertRaises(RuntimeError):
+                    carrier.one_output(peer.request("Outputs"))
+
     def test_normal_quit_wire_uses_existing_bound_stream(self):
         stream = FakeStream()
         peer = carrier.Peer(stream, 41, 1000)

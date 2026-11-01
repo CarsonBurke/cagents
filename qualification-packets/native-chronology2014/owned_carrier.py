@@ -6,6 +6,8 @@ private dbus-run-session / KWin --exit-with-session route. That caller still
 owns source/context/resource admission and the outer wait. Product source is
 the frozen SOURCE below; standard run-development, jobs1 and the warm target
 are unchanged. Only the designated native input owner drives the saved session.
+The future caller must set NIRI_HARNESS_STATE to CASE/harness-state; the frozen
+future request records the exact executable carrier and private context.
 
 This file owns Niri directly instead of the short-lived harness session-start
 CLI. EOF from normal Quit is missing ACK, not process death: only the retained
@@ -37,6 +39,16 @@ HARNESS_SHA256 = "b9c278ed2e496f68a12e5bafdc0f04d9deb299ca6b8294dbc95630d61ce2e7
 CONFIG_SHA256 = "dac9fc580743713f13bc43718c16d61841d0596ddc149050eefb6871fd7d7173"
 SESSION = "issue2014-future-owned-after-13ed"
 QUIT = {"Action": {"Quit": {"skip_confirmation": True}}}
+
+
+def one_output(response):
+    """Validate the actual Outputs response variant before releasing the runner."""
+    if not isinstance(response, dict) or set(response) != {"Outputs"}:
+        raise RuntimeError("expected the private Outputs response variant")
+    outputs = response["Outputs"]
+    if not isinstance(outputs, dict) or len(outputs) != 1:
+        raise RuntimeError("expected exactly one owned nested output")
+    return outputs
 
 
 class MissingAck(Exception):
@@ -80,12 +92,13 @@ class Carrier:
     def __init__(self, ports):
         self.ports = ports
         self.child = self.pin = self.peer = None
+        self.start_attempted = False
         self.state = dict(
             phase="not-started", source_head=SOURCE_HEAD, peer_bound=False,
             runner_released=False, runner_status=None, native_status=None,
             quit_attempted=False, quit_ack="not-attempted", child_wait_complete=False,
             child_status=None, cancelled=False, blocked=False, errors=[],
-            cleanup_complete=False, exit_code=None,
+            cleanup_complete=False, exit_code=None, pre_spawn_refused=False,
         )
 
     def hold(self, where, error):
@@ -95,8 +108,20 @@ class Carrier:
             self.state["errors"].append(item)
 
     def start(self):
+        self.start_attempted = True
         try:
             self.ports.prepare()
+        except BaseException as error:
+            # prepare cannot launch a child or open the retained output owners.
+            # Record this known refusal on the original outer stream even when
+            # preparation never created a writable private evidence directory.
+            self.state.update(
+                phase="pre-spawn-refused", pre_spawn_refused=True,
+                cleanup_complete=True, exit_code=2,
+            )
+            self.state["errors"].append("prepare: " + type(error).__name__ + ": " + str(error))
+            return
+        try:
             # Assignment immediately retains the returned original object.
             self.child = self.ports.spawn()
             self.state.update(phase="original-child-retained", original_pid=self.child.pid)
@@ -160,10 +185,10 @@ class Carrier:
                 # Both error cases still reach the original wait on the next step.
             self.state["phase"] = "waiting-original-niri"
             if self.state["child_wait_complete"]:
-                if self.state["child_status"] != 0:
-                    raise RuntimeError("original Niri returned a nonzero status")
                 self.ports.close_owned(self.peer, self.pin)
-                negative = self.state["cancelled"] or self.state["quit_ack"] == "error"
+                negative = (self.state["cancelled"]
+                            or self.state["quit_ack"] != "acknowledged"
+                            or self.state["child_status"] != 0)
                 self.state.update(
                     cleanup_complete=True, phase="owned-cleanup-settled",
                     exit_code=(2 if negative else self.state["runner_status"] or self.state["native_status"]),
@@ -173,22 +198,44 @@ class Carrier:
 
     def turn(self):
         """The actual bounded loop body is also the offline failure seam."""
-        self.step()
+        if not self.state["cleanup_complete"]:
+            self.step()
         try:
             self.ports.record(self.state)
         except BaseException as error:
-            self.hold("evidence", error)
+            if self.state["pre_spawn_refused"]:
+                # No process/output owner was created. A failed diagnostic
+                # cannot turn this proven no-spawn refusal into retained custody.
+                self.state["errors"].append("evidence: " + type(error).__name__ + ": " + str(error))
+            else:
+                self.hold("evidence", error)
         if not self.state["cleanup_complete"]:
             try:
                 self.ports.pause()
             except BaseException as error:
                 self.hold("owner-interrupted", error)
 
-    def run(self):
-        self.start()
-        while not self.state["cleanup_complete"]:
+    def owner_turn(self):
+        """Retain the owner for catchable interruption outside adapter catches."""
+        try:
             self.turn()
-        return self.state["exit_code"]
+        except BaseException as error:
+            self.hold("owner-loop", error)
+
+    def run(self):
+        while True:
+            try:
+                if not self.start_attempted and not self.state["blocked"]:
+                    self.start_attempted = True
+                    self.start()
+                self.owner_turn()
+                if self.state["cleanup_complete"]:
+                    return self.state["exit_code"]
+            except BaseException as error:
+                # Keep this same owner even at startup/loop/return boundaries.
+                # Uncatchable termination and the absent platform controller
+                # remain outside this cooperative process's guarantees.
+                self.hold("owner-loop", error)
 
 
 class LivePorts:
@@ -288,9 +335,7 @@ printf %s "$?" > {CASE}/niri/session.rc
         return Peer(self.pending_stream, child.pid, os.getuid())
 
     def register(self, child, peer, registration):
-        outputs = peer.request("Outputs")
-        if not isinstance(outputs, dict) or len(outputs) != 1:
-            raise RuntimeError("expected exactly one owned nested output")
+        one_output(peer.request("Outputs"))
         self.registration_value = dict(registration, child_pid=child.pid)
         value = dict(name=SESSION, display=registration["WAYLAND_DISPLAY"],
                      socket=registration["NIRI_SOCKET"], pid=child.pid, root=str(CASE / "niri"))
@@ -368,6 +413,8 @@ printf %s "$?" > {CASE}/niri/session.rc
 
     def record(self, state):
         print(json.dumps(state), flush=True)  # Original outer stream also sees HOLD.
+        if state["pre_spawn_refused"]:
+            return  # No child exists; private preparation may itself have failed.
         path = CASE / "carrier/state.json"
         temporary = CASE / "carrier/.state-next"
         with temporary.open("w", encoding="utf-8") as stream:
