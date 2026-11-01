@@ -57,7 +57,9 @@ class Fixture:
     def record(self, value):
         row = dict(value, sessionId=self.session, parentUuid=self.parent, cwd=str(Path.cwd().resolve()))
         with self.history.open("a") as history:
-            history.write(json.dumps(row, ensure_ascii=False) + "\n")
+            # The native resume catalog uses compact wire-key prefilters
+            # before parsing candidate provider records.
+            history.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
         self.parent = value["uuid"]
         emit(value)
 

@@ -41,7 +41,10 @@ class ChatChronologyFixture(unittest.TestCase):
             root = Path(directory)
             first = self.run_turns(root, (1, 2))
             resumed = self.run_turns(root, (3, 4), resume=True)
-            records = [json.loads(line) for line in next((root / "account/projects").glob("*/*.jsonl")).read_text().splitlines()]
+            catalog = next((root / "account/projects").glob("*/*.jsonl")).read_text().splitlines()
+            self.assertIn('"sessionId"', catalog[0])
+            self.assertIn('"type":"user"', catalog[0])
+            records = [json.loads(line) for line in catalog]
             failures = [row for row in records if row.get("error") == "overloaded_error"]
             self.assertEqual([row["uuid"] for row in failures], ["chronology-capacity-1", "chronology-capacity-3"])
             self.assertEqual(failures[0]["message"]["content"], failures[1]["message"]["content"])

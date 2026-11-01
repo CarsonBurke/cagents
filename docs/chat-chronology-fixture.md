@@ -37,17 +37,19 @@ does not log in to a real provider account or change the current agent's
 account. Coordinate the runner's build slot with the lead and reuse the
 configured Cargo cache. Do not run another development session concurrently.
 
-Before switching to a baseline checkout, retain the absolute path to this
-fixture so both revisions can run the same provider executable:
+Before switching to a baseline checkout, retain the absolute paths to the
+fixtures so both revisions can run the same provider executables:
 
 ```sh
 fixture_source=$(realpath tests/fixtures/chat-chronology-claude.py)
+fixture_codex_source=$(realpath tests/fixtures/chat-chronology-codex.py)
 ```
 
 From the checkout under test, prepare a fresh ignored directory. Each run needs
 its own fresh isolated state and the same synthetic prompts.
 
 ```sh
+mkdir -p "$PWD/.worktrees"
 fixture_root=$(mktemp -d "$PWD/.worktrees/chronology2014.XXXXXX")
 fixture_runtime=$(mktemp -d "$XDG_RUNTIME_DIR/chron2014.XXXXXX")
 mkdir -p "$fixture_root"/{home,data,config,cache,bin,project}
@@ -147,11 +149,16 @@ Never put that marker in a real provider account home.
 
 Use a separate fresh root/runtime from the Claude scenario. In the same genuine
 operator shell, keep the `fixture_env` authority guard and isolation above,
-replace the `claude` symlink with this `codex` executable, and explicitly select
-its synthetic home:
+create this `codex` executable symlink, and explicitly select its synthetic
+home. The `fixture_codex_source` path must still point to the pinned source
+checkout above, including when the runner checkout is the before revision:
 
 ```sh
-fixture_codex_source=$(realpath tests/fixtures/chat-chronology-codex.py)
+mkdir -p "$PWD/.worktrees"
+fixture_root=$(mktemp -d "$PWD/.worktrees/chronology2014-codex.XXXXXX")
+fixture_runtime=$(mktemp -d "$XDG_RUNTIME_DIR/chron2014.XXXXXX")
+mkdir -p "$fixture_root"/{home,data,config,cache,bin,project}
+git init --initial-branch=main "$fixture_root/project"
 fixture_codex_home="$fixture_root/home/.codex"
 mkdir -m 700 "$fixture_codex_home"
 touch "$fixture_codex_home/fixture-chronology-enabled"
@@ -168,23 +175,26 @@ or any other real provider account. For this user's Codex native run, the only
 permitted real account selector is:
 
 ```sh
+fixture_target=$(fixture_codex_env cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+fixture_cli="$fixture_target/dev-runtime/cagents"
+fixture_codex_env "$fixture_cli" project open "$fixture_root/project"
 fixture_codex_env "$fixture_cli" --json agent spawn --provider codex \
   --account codex/4de66f88-ee20-4294-b771-29123ab25166 \
   --model gpt-5.4-mini --reasoning-effort low --surface chat \
   --repository "$fixture_root/project" 'Check the saved state.'
 ```
 
-An isolated development registry does not automatically contain that managed
-account. Before running this command, the native operator must establish the
-selected fixture registry/account mapping through supported account controls
-and verify the provider sees the private synthetic home. A managed account may
-override inherited `CODEX_HOME`; the enable-marker check then refuses the
-wrong home. Do not forge an account UUID, copy credentials, mark a real account
-home as synthetic, switch to another real account, or bypass that refusal. If
-the exact allowed selector cannot be used safely in the isolated fixture, that
-native setup remains missing evidence; the standalone fixture checks still run
-without any account or provider session. No native account mapping has been
-established by this documentation.
+This spawn command is an unexecuted operator recipe. An isolated development
+registry does not automatically contain that managed account. Normal linking
+creates a new account ID; it does not assign Carson's existing managed UUID to
+a synthetic home. No supported mapping of the exact allowed selector to this
+private fixture home has been established, so that Codex native setup remains
+missing evidence. A managed account can override inherited `CODEX_HOME`; the
+enable-marker check then refuses the wrong home. Do not forge an account UUID,
+copy credentials, mark a real account home as synthetic, switch to another real
+account, or bypass that refusal. The standalone fixture checks run without any
+account or provider session. The synthetic fixture registry and provider files
+never establish or override the active Carson identity.
 
 Follow the same prompt sequence and interaction checklist as the Claude
 scenario, observing Codex command **output** while it streams. For a fresh
@@ -202,11 +212,25 @@ ln -s "$fixture_runtime/codex.sock" \
   "$fixture_codex_home/app-server-control/app-server-control.sock"
 ```
 
-Close the owned synthetic writer before reopening its saved conversation; the
-shared fixture reads the completed provider file on attach. Keep the shared
-fixture process alive for the cold-history check. It is an owned offline
-provider process, separate from the matched development daemon. Record the
-actual endpoint, account mapping, and saved thread ID used by native attach.
+After the four-turn prompt sequence, close only the owned synthetic writer and
+its isolated UI, then stop its isolated daemon through the same supported
+empty-stop operation:
+
+```sh
+fixture_codex_env "$fixture_cli" agent close OWNED-AGENT-ID
+fixture_codex_env "$fixture_cli" daemon stop --require-empty
+fixture_codex_env scripts/run-development --browserless --debug --log-file "$fixture_root/ui-reopened.log"
+```
+
+Keep the shared fixture process alive across this cold-history check. In a
+native Codex pane, invoke `/resume`, select the exact saved synthetic thread,
+and compare both failures, their diagnostics, and completed command output.
+Send `Continue after reopening.` and confirm turn 5 appends after the restored
+turn 4. The shared fixture reads the completed provider file on attach; merely
+reopening a resident pane does not establish that path. The shared endpoint is
+an owned offline provider process, separate from the matched development
+daemon. Record the actual endpoint, account mapping, and saved thread ID used
+by native attach. These steps have not been executed natively.
 Cleanup must address only this owned fixture process/session, through the
 operator's normal process ownership controls; do not signal unrelated jobs or
 restart production. A stale or absent shared endpoint is a failed history
