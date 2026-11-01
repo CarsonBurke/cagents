@@ -2278,6 +2278,8 @@ impl ClientHandle {
                             let mut snapshot = (*base.snapshot).clone();
                             if error.code == ipc::ProtocolErrorCode::TerminalUnavailable { snapshot.ready = false; }
                             snapshot.error = Some(error.message.clone());
+                            snapshot.error_item = None;
+                            snapshot.error_generation = 0;
                             let mut proposed = Some(if base.resident {
                                 Publication::resident(snapshot, base.clock, base.lineage.clone(), base.source_thread.clone())
                             } else {
@@ -6504,6 +6506,9 @@ mod tests {
         let initial = Snapshot {
             generation: 7,
             ready: true,
+            error: Some("retained presentation is unavailable".into()),
+            error_generation: 41,
+            error_item: Some("original-provider-diagnostic".into()),
             session_id: source.launch.session_id.clone(),
             items: vec![body.clone()],
             text_copy_sources: super::super::TextCopySources {
@@ -6637,7 +6642,9 @@ mod tests {
             handle.snapshot().ready,
             "request-specific refusal must not disable presentation"
         );
-        assert_eq!(handle.snapshot().error, None);
+        assert_eq!(handle.snapshot().error, before.error);
+        assert_eq!(handle.snapshot().error_generation, before.error_generation);
+        assert_eq!(handle.snapshot().error_item, before.error_item);
         handle.set_visible(true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let after = loop {
@@ -6657,6 +6664,11 @@ mod tests {
             Some("retained presentation is unavailable")
         );
         assert_eq!(after.generation, before.generation);
+        assert_eq!(
+            after.error_generation, 0,
+            "transport overlays do not retain provider receipts"
+        );
+        assert_eq!(after.error_item, None);
         assert_eq!(after.items, before.items);
         assert!(Arc::ptr_eq(&after.items[0], &decoded_body));
         assert_eq!(after.text_copy_sources, before.text_copy_sources);

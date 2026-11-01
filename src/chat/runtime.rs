@@ -23,6 +23,8 @@ use std::{
 mod child_text_copy;
 #[cfg(test)]
 pub(crate) mod courier_tests;
+#[cfg(test)]
+mod error_receipt_tests;
 mod execution;
 mod handle;
 pub use handle::Handle;
@@ -199,6 +201,7 @@ struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
+    publication_error: Mutex<Option<u64>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -438,6 +441,7 @@ impl LocalHandle {
             commands,
             wake: Mutex::new(wake),
             state: state.clone(),
+            publication_error: Mutex::new(None),
             confirmed_session: confirmed_session.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
@@ -1009,9 +1013,10 @@ impl LocalHandle {
         if after.is_some_and(|generation| generation >= state.generation) && !store.dirty {
             return None;
         }
-        if let Err(error) = store.publish_files(&mut state) {
-            state.error = Some(format!("Cannot read reported edits: {error}"));
-        }
+        let mut read_error = store
+            .publish_files(&mut state)
+            .err()
+            .map(|error| format!("Cannot read reported edits: {error}"));
         let refresh_publication =
             store.presented_generation != Some(state.generation) || store.dirty;
         if store.dirty {
@@ -1022,11 +1027,22 @@ impl LocalHandle {
                     state.has_later = window.has_later;
                 }
                 Err(error) => {
-                    state.error = Some(format!("Cannot page owned transcript cache: {error}"))
+                    read_error = Some(format!("Cannot page owned transcript cache: {error}"))
                 }
             }
         }
-        if refresh_publication {
+        if let Some(error) = read_error {
+            publish_read_error(
+                &mut state,
+                &mut self
+                    .0
+                    .publication_error
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+                error,
+            );
+        }
+        if refresh_publication || store.presented_generation != Some(state.generation) {
             store.publish_copy_sources(&mut state);
             store.presented_generation = Some(state.generation);
             store.presented_file_changes = Some((
@@ -1057,9 +1073,10 @@ impl LocalHandle {
             return None;
         }
         if store.presented_generation != Some(state.generation) || store.dirty {
-            if let Err(error) = store.publish_files(&mut state) {
-                state.error = Some(format!("Cannot read reported edits: {error}"));
-            }
+            let mut read_error = store
+                .publish_files(&mut state)
+                .err()
+                .map(|error| format!("Cannot read reported edits: {error}"));
             let baseline = store.presented_generation;
             let changes = if store.dirty {
                 match store.window_reusing(&mut state.items) {
@@ -1070,13 +1087,24 @@ impl LocalHandle {
                         window.changes
                     }
                     Err(error) => {
-                        state.error = Some(format!("Cannot page owned transcript cache: {error}"));
+                        read_error = Some(format!("Cannot page owned transcript cache: {error}"));
                         Vec::new()
                     }
                 }
             } else {
                 Vec::new()
             };
+            if let Some(error) = read_error {
+                publish_read_error(
+                    &mut state,
+                    &mut self
+                        .0
+                        .publication_error
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()),
+                    error,
+                );
+            }
             store.publish_copy_sources(&mut state);
             store.presentation = baseline
                 .filter(|generation| *generation < state.generation)
@@ -2724,7 +2752,21 @@ impl Actor {
         // Stop further Store writes, then report the original error after
         // this bounded frame's semantic proof has been published.
         let mut frame_error = None;
-        for event in step.events {
+        let mut step_events = step.events.into_iter().peekable();
+        while let Some(event) = step_events.next() {
+            // Only adjacency in this decoded frame proves which scalar this
+            // source belongs to. Carry its small ID through Store, then publish
+            // the pair under one state lock so readers cannot interleave.
+            let mut error_source = if matches!(&event, Event::Error { .. } | Event::HistoryError(_))
+                && matches!(step_events.peek(), Some(Event::ErrorSource { .. }))
+            {
+                let Some(Event::ErrorSource { item_id }) = step_events.next() else {
+                    unreachable!()
+                };
+                Some(item_id)
+            } else {
+                None
+            };
             if let Event::Execution { run, event } = event {
                 if let crate::agent_execution::ProviderEvent::Started { key } = event {
                     let update = self.execution.start(run, key)?;
@@ -2763,6 +2805,19 @@ impl Actor {
             } else {
                 event
             };
+            if let (Some(run), Some(item_id)) = (execution_scope, error_source.as_ref()) {
+                self.execution.observe(
+                    run,
+                    &Event::ErrorSource {
+                        item_id: item_id.clone(),
+                    },
+                );
+            }
+            // An isolated source cannot safely claim an intervening scalar,
+            // including a read/cache error published by another reader.
+            if matches!(&event, Event::ErrorSource { .. }) {
+                continue;
+            }
             if let Event::AccountUsage(report) = event {
                 (self.notify)(Update::AccountUsage {
                     report,
@@ -2824,7 +2879,8 @@ impl Actor {
                 if events.is_empty() || suppress_current_notification {
                     self.touch();
                 }
-                for event in events {
+                let last = events.len().saturating_sub(1);
+                for (index, event) in events.into_iter().enumerate() {
                     // Preserve history and independently identified children
                     // and requests. Old parent-turn scalar metadata cannot
                     // replace the current turn's state or notification input.
@@ -2847,7 +2903,8 @@ impl Actor {
                     let content = matches!(&event, Event::TurnFinished { .. })
                         .then(|| frame_contents.pop_front())
                         .flatten();
-                    self.apply_with_attention(event, content, true);
+                    let source = (index == last).then(|| error_source.take()).flatten();
+                    self.apply_with_attention_source(event, source, content, true);
                 }
             } else if let Some(event) = authority {
                 if suppress_current_notification {
@@ -2924,6 +2981,15 @@ impl Actor {
         content: Option<crate::notifications::Content>,
         preview_observed: bool,
     ) {
+        self.apply_with_attention_source(event, None, content, preview_observed);
+    }
+    fn apply_with_attention_source(
+        &mut self,
+        event: Event,
+        error_source: Option<String>,
+        content: Option<crate::notifications::Content>,
+        preview_observed: bool,
+    ) {
         if matches!(
             event,
             Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
@@ -2946,6 +3012,14 @@ impl Actor {
         recover_login_error(&mut state.error, &mut self.login_recovery, &event);
         recover_history_error(&mut state.error, &mut self.history_error, &event);
         apply_projected_event(&mut state, &mut self.indices, event, preview_observed);
+        if let Some(item_id) = error_source {
+            apply_projected_event(
+                &mut state,
+                &mut self.indices,
+                Event::ErrorSource { item_id },
+                true,
+            );
+        }
         // Only metadata is resident independently of the disk-backed window.
         let items = std::mem::take(&mut state.items);
         let child_items: Vec<_> = state
@@ -3037,6 +3111,27 @@ fn page_command(store: &Mutex<Store>, command: &Command) -> Result<bool, String>
         }
         _ => Ok(false),
     }
+}
+
+/// Local publication failures replace provider receipts, including a same-text
+/// provider failure. Repeated reads of the same already-unlinked error are one
+/// receipt rather than new incidents on every poll.
+fn replace_unlinked_error(state: &mut Snapshot, message: String) {
+    state.error_generation = state.error_generation.saturating_add(1);
+    state.error_item = None;
+    state.error = Some(message);
+}
+
+fn publish_read_error(state: &mut Snapshot, previous: &mut Option<u64>, message: String) {
+    if *previous == Some(state.error_generation)
+        && state.error.as_deref() == Some(message.as_str())
+        && state.error_item.is_none()
+    {
+        return;
+    }
+    replace_unlinked_error(state, message);
+    *previous = Some(state.error_generation);
+    state.generation = state.generation.saturating_add(1);
 }
 fn reserve_frame(bytes: &mut Vec<u8>, additional: usize) -> Result<(), String> {
     let required = bytes
@@ -3569,9 +3664,10 @@ fn apply_projected_event(
                     item.started_at = item.started_at.or(item.at).or(at);
                     item.at = at;
                 } else {
-                    state.error = Some(format!(
-                        "Provider reused non-text item ID {id} for a text delta"
-                    ));
+                    replace_unlinked_error(
+                        state,
+                        format!("Provider reused non-text item ID {id} for a text delta"),
+                    );
                 }
             } else {
                 indices.insert(id.clone(), state.items.len());

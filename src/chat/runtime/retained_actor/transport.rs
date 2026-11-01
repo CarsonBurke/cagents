@@ -2643,6 +2643,8 @@ impl Server {
                         .continuity_loss()?
                 {
                     snapshot.error = Some(loss.reason.clone());
+                    snapshot.error_item = None;
+                    snapshot.error_generation = 0;
                     snapshot.ready = false;
                 }
                 if let Some(snapshot) = &snapshot {
@@ -2925,6 +2927,8 @@ impl Server {
                 .continuity_loss()?
             {
                 snapshot.error = Some(loss.reason.clone());
+                snapshot.error_item = None;
+                snapshot.error_generation = 0;
             }
             snapshot
         };
@@ -3777,6 +3781,13 @@ while IFS= read -r frame; do :; done
         let body = "Retained answer λ\n  preserve source and copy";
         let mut fixture = resident_fixture_with_body(Some(body.into()));
         let server = &mut fixture.server;
+        let loss = "Retained outcome journal commit failed; run outcome is unconfirmed";
+        {
+            let mut metadata = server.actor.0.state.lock().unwrap();
+            metadata.error = Some(loss.into());
+            metadata.error_generation = 41;
+            metadata.error_item = Some("original-provider-diagnostic".into());
+        }
         let source = server.source.clone();
         let proof = server.proof.clone();
         let epoch = server.epoch;
@@ -3806,7 +3817,6 @@ while IFS= read -r frame; do :; done
                 .unwrap(),
             Value::Null,
         );
-        let loss = "Retained outcome journal commit failed; run outcome is unconfirmed";
         server.journal.lock().unwrap().record_loss(loss).unwrap();
         // FULL, matching, and lagged cursors all report the same loss before
         // the reducer can suppress reads or hydrate a transcript window.
@@ -3826,6 +3836,11 @@ while IFS= read -r frame; do :; done
             "loss invents no transcript revision"
         );
         assert_eq!(after.error.as_deref(), Some(loss));
+        assert_eq!(
+            after.error_generation, 0,
+            "a clone overlay is not a provider receipt"
+        );
+        assert_eq!(after.error_item, None);
         assert!(!after.ready);
         assert_eq!(after.items, before.items);
         assert_eq!(after.text_copy_sources, before.text_copy_sources);
@@ -3836,6 +3851,11 @@ while IFS= read -r frame; do :; done
         assert!(!server.actor.is_completed());
         assert!(!server.session_stopping);
         assert!(server.closed_snapshot.is_none());
+        let actor = server.actor.snapshot(None).unwrap();
+        assert_eq!(actor.error_generation, before.error_generation);
+        assert_eq!(actor.error_item, before.error_item);
+        assert_eq!(actor.generation, before.generation);
+        assert_eq!(actor.text_copy_sources, before.text_copy_sources);
         let copied: chat::TextCopyPage = serde_json::from_value(
             server
                 .invoke(request("text_copy", json!([copy, 0])))
