@@ -271,6 +271,86 @@ impl Registry {
         Ok(blockers)
     }
 
+    /// Whether every durable claim on `reader`'s allocation is its own record
+    /// from an earlier kernel boot, so opening a page reader contradicts none
+    /// of them. An unconfirmed launch and a scheduled agent stay refused: those
+    /// are not a conversation a person chose to read.
+    pub(in crate::host) fn lost_holder_reader_admitted(
+        &self,
+        reader: &HostedSession,
+    ) -> Result<bool, String> {
+        let pending: bool = self
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_launches WHERE session_id = ?1)",
+                [reader.id().to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if pending
+            || self
+                .agent_for_session(reader.id())?
+                .is_some_and(|agent| matches!(agent.origin, Origin::Automation { .. }))
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .retained_agent_sources(reader.id())?
+            .iter()
+            .all(|source| earlier_boot_self_authority(source, reader)))
+    }
+
+    /// What a person reading a lost agent's saved transcript should know about
+    /// the work around it. Reads only: every record named here stays as it is.
+    pub(in crate::host) fn lost_holder_agent_summary(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Result<Option<String>, String> {
+        let Some(agent) = self.agent_for_session(id)? else {
+            return Ok(None);
+        };
+        let run = self.latest_agent_run(agent.id)?;
+        let lineage: String = self
+            .db
+            .query_row(
+                "SELECT coalesce((SELECT lineage FROM session_lineages WHERE session_id=?1), ?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let parent = Lineage(
+            lineage
+                .parse()
+                .map_err(|_| "Stored session lineage is invalid")?,
+        );
+        let children: i64 = self
+            .db
+            .query_row(
+                "SELECT count(*) FROM agents WHERE origin=?1 AND closed=0",
+                [encode(&Origin::Child { parent })?],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let mut summary = format!(
+            "{} Its saved conversation is read-only; no provider was started.",
+            crate::chat::LOST_AGENT_REASON
+        );
+        if run.state == State::Interrupted {
+            summary.push_str(
+                " Its last prompt has no confirmed outcome and may have had effects; it was not resent.",
+            );
+        }
+        match children {
+            0 => {}
+            1 => summary.push_str(" It still owns 1 open agent, which is unchanged."),
+            count => summary.push_str(&format!(
+                " It still owns {count} open agents, which are unchanged."
+            )),
+        }
+        summary.push_str(" Resume reopens this conversation and sends nothing. Closing the agent ends it instead.");
+        Ok(Some(summary))
+    }
+
     /// Caller has authenticated every retained descriptor with the actual
     /// holder. A same-ID recipe is not sufficient evidence for this operation.
     /// Authority and public/private ownership advance in one transaction; a
@@ -309,10 +389,16 @@ impl Registry {
                 return Err("A retired agent cannot regain process authority".into());
             }
             if let Some(source) = &agent.session {
-                if !recognizes(source) {
+                // An authenticated holder under this allocation, in place of
+                // one from a boot that cannot still be running, is its resume,
+                // whether or not the daemon lived to record that.
+                let lost = earlier_boot_self_authority(source, successor);
+                if !recognizes(source) && !lost {
                     return Err("The durable agent belongs to another session lineage".into());
                 }
-                if let Some(console) = &agent.console {
+                // A resumed provider has no console yet. The record of the
+                // earlier one stays for its pane, which relaunches it on request.
+                if let Some(console) = agent.console.as_ref().filter(|_| !lost) {
                     let HostedSession::Chat(next) = successor else {
                         return Err("A provider console needs its retained native actor".into());
                     };

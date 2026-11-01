@@ -699,6 +699,18 @@ pub(super) fn preflight_retirement(
     result
 }
 
+/// The saved reader resident for an agent left by an earlier boot.
+fn lost_holder_reader<'a>(
+    state: &'a super::state::HostState,
+    session: &chat::Session,
+) -> Option<&'a super::chat::Record> {
+    state.chats.get(&session.id).filter(|record| {
+        record.handle.is_read_only_history()
+            && !record.handle.owns_work()
+            && session.lost_holder_history(state.proof()).as_ref() == Some(&record.session)
+    })
+}
+
 fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     // A holder or waiter keeps its Arc alive, so pruning cannot split an
@@ -746,19 +758,27 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     if let Some(source) = agent.session.as_ref().or(pending.as_ref()) {
         match source {
             HostedSession::Chat(session) => {
-                let hosted = {
+                let (hosted, earlier_boot) = {
                     let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                    state
-                        .chats
-                        .get(&session.id)
-                        .map(|record| {
+                    let earlier_boot = session.proof.as_ref().is_some_and(|saved| {
+                        saved.is_complete() && saved.boot_id != state.proof().boot_id
+                    });
+                    let hosted = match lost_holder_reader(&state, session) {
+                        // Only the page reader stands here; nothing else ran.
+                        Some(reader) => Some(super::chat::CloseTarget::capture(&state, reader)),
+                        None => state.chats.get(&session.id).map(|record| {
                             super::chat::CloseTarget::for_execution(&state, record, session)
-                        })
-                        .transpose()
-                        .map_err(|error| error.message)?
+                        }),
+                    }
+                    .transpose()
+                    .map_err(|error| error.message)?;
+                    (hosted, earlier_boot)
                 };
                 if let Some(target) = hosted {
                     super::chat::close_captured(host, target).map_err(|error| error.message)?;
+                } else if earlier_boot {
+                    // A changed kernel boot proves its process is gone, and this
+                    // daemon started no other under the same agent.
                 } else {
                     let startup = host
                         .lock()

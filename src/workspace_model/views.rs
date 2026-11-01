@@ -396,10 +396,25 @@ pub fn archived_console_matches(
     original == *current
 }
 
+/// A pane reading the saved transcript of the agent's own provider, lost with
+/// an earlier boot, still shows that agent. Grants no process authority.
+pub(crate) fn lost_holder_reader_matches(
+    session: &crate::chat::Session,
+    reader: &crate::chat::Session,
+) -> bool {
+    crate::chat::is_lost_holder_history(session, reader)
+}
+
 pub(crate) fn managed_pane_matches(agent: &crate::agent_execution::Agent, pane: &Pane) -> bool {
     use crate::agent_execution::HostedSession;
     if let CardKind::Terminal(current) = &pane.kind
         && archived_console_matches(agent, current)
+    {
+        return true;
+    }
+    if let (CardKind::Chat(reader), Some(HostedSession::Chat(session))) =
+        (&pane.kind, &agent.session)
+        && lost_holder_reader_matches(session, reader)
     {
         return true;
     }
@@ -962,6 +977,45 @@ mod managed_display_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_lost_agents_saved_reader_is_still_its_pane_and_a_stranger_is_not() {
+        let (mut agent, native, _) = fixture();
+        let crate::agent_execution::HostedSession::Chat(session) = agent.session.as_mut().unwrap()
+        else {
+            panic!("native fixture")
+        };
+        session.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
+        session.native_continuity =
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        let mut live = session.proof.clone().unwrap();
+        live.boot_id = crate::model::BootId::new("after-restart");
+        let reader = session.lost_holder_history(&live).unwrap();
+        let mut same_boot = session.clone();
+        let session = session.clone();
+        let pane = |kind| Pane {
+            kind,
+            ..native.clone()
+        };
+        assert!(managed_pane_matches(
+            &agent,
+            &pane(CardKind::Chat(reader.clone()))
+        ));
+
+        let mut other = reader.clone();
+        other.launch.session_id = Some("22345678-1234-4234-8234-123456789abc".into());
+        assert!(!managed_pane_matches(&agent, &pane(CardKind::Chat(other))));
+
+        // A reader claiming the agent's own boot proves nothing.
+        same_boot.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+        same_boot.proof.as_mut().unwrap().host_incarnation =
+            crate::model::HostIncarnation::new("other-incarnation");
+        assert_eq!(session.launch, same_boot.launch);
+        assert!(!managed_pane_matches(
+            &agent,
+            &pane(CardKind::Chat(same_boot))
+        ));
     }
 
     #[test]

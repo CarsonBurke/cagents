@@ -3173,7 +3173,7 @@ pub(super) struct CloseTarget {
 }
 
 impl CloseTarget {
-    fn capture(state: &HostState, record: &Record) -> Result<Self, ProtocolError> {
+    pub(super) fn capture(state: &HostState, record: &Record) -> Result<Self, ProtocolError> {
         if state.shutting_down || state.chat_handoffs.contains_key(&record.session.id) {
             return Err(unavailable(
                 "Native ownership is shutting down or returning to terminal",

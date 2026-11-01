@@ -603,6 +603,11 @@ impl NativeContinuity {
     }
 }
 
+/// How a lost agent's reader opens its read-only reason, which already says
+/// what is known about the agent's unfinished work.
+pub(crate) const LOST_AGENT_REASON: &str =
+    "This agent's provider stopped when the computer restarted.";
+
 /// Whether `replacement` is exactly the reader of `source`'s lost holder.
 pub(crate) fn is_lost_holder_history(source: &Session, replacement: &Session) -> bool {
     replacement

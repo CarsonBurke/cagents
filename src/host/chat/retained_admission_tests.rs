@@ -639,7 +639,18 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
 /// provider aborts on any second prompt.
 #[test]
 fn named_claude_resume_after_lost_holder_sends_nothing() {
-    let name = "named_claude_resume_after_lost_holder_sends_nothing";
+    lost_holder_case("named_claude_resume_after_lost_holder_sends_nothing", false);
+}
+
+#[test]
+fn named_claude_resume_of_lost_agent_rebinds_and_sends_nothing() {
+    lost_holder_case(
+        "named_claude_resume_of_lost_agent_rebinds_and_sends_nothing",
+        true,
+    );
+}
+
+fn lost_holder_case(name: &str, managed: bool) {
     let Some(root) = isolated(name) else { return };
     let provider = root.join("bin/claude");
     fs::write(
@@ -713,6 +724,50 @@ fn named_claude_resume_after_lost_holder_sends_nothing() {
             .find(|session| session.id == initial_id)
             .unwrap();
         assert!(original.native_continuity.retains_provider());
+        if managed {
+            let registry = super::super::agent_execution::registry(&host).unwrap();
+            let mut registry = registry.lock().unwrap();
+            registry
+                .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                    repository: project.clone(),
+                    name: "Fixture".into(),
+                    kind: crate::model::ProjectKind::Folder,
+                })
+                .unwrap();
+            let accepted = registry
+                .submit_agent(
+                    &crate::agent_execution::Origin::User,
+                    &crate::agent_execution::Submit {
+                        name: None,
+                        destination: crate::agent_execution::Destination::New(
+                            crate::agent_execution::Spec {
+                                provider: Provider::Claude,
+                                account: None,
+                                target: crate::agent_execution::Target {
+                                    repository: project.clone(),
+                                    directory: project.clone(),
+                                    placement: None,
+                                },
+                                surface: crate::agent_execution::Surface::Chat,
+                                model: None,
+                                permission_mode: None,
+                                reasoning_effort: None,
+                            },
+                        ),
+                        prompt: "LIVE_WORK_1513".into(),
+                        idempotency_key: "lost-holder-agent".into(),
+                    },
+                    1,
+                )
+                .unwrap();
+            registry
+                .bind_agent(
+                    accepted.agent.id,
+                    None,
+                    crate::agent_execution::HostedSession::Chat(original.clone()),
+                )
+                .unwrap();
+        }
 
         // A live holder still attaches as itself.
         let (attached, worker) = serve(&host, 80, original.clone());
@@ -793,12 +848,19 @@ fn named_claude_resume_after_lost_holder_sends_nothing() {
     // including the ownership row's owner.
     let fixture = rusqlite::Connection::open(root.join("registry.sqlite3")).unwrap();
     let live_boot = proof.boot_id.to_string();
-    for table in ["agent_authorities", "native_actor_ownerships"] {
-        let column = if table == "agent_authorities" {
-            "source"
-        } else {
-            "ownership"
-        };
+    let tables: &[(&str, &str)] = if managed {
+        &[
+            ("agent_authorities", "source"),
+            ("native_actor_ownerships", "ownership"),
+            ("agents", "record"),
+        ]
+    } else {
+        &[
+            ("agent_authorities", "source"),
+            ("native_actor_ownerships", "ownership"),
+        ]
+    };
+    for (table, column) in tables {
         let changed = fixture
             .execute(
                 &format!(
@@ -829,6 +891,24 @@ fn named_claude_resume_after_lost_holder_sends_nothing() {
             .unwrap()
     };
     let authority_before = authority_row();
+    let agent_state = || {
+        let registry = super::super::agent_execution::registry(&host).unwrap();
+        let registry = registry.lock().unwrap();
+        registry.agent_for_session(saved.id).unwrap().map(|agent| {
+            let run = registry.latest_agent_run(agent.id).unwrap();
+            (agent, run)
+        })
+    };
+    if managed {
+        // What daemon startup does to a run it cannot prove finished.
+        super::super::agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .interrupt_unproven_agent_runs(2)
+            .unwrap();
+    }
+    let lost_agent = agent_state();
 
     // A home remapped under the recorded launch is another account.
     let account_moved = root.join("fixture-inputs/workload/account-moved");
@@ -875,6 +955,26 @@ fn named_claude_resume_after_lost_holder_sends_nothing() {
     assert_eq!(fs::read(&history).unwrap(), history_before);
 
     assert_eq!(authority_row(), authority_before, "reading revokes nothing");
+    assert_eq!(agent_state(), lost_agent, "reading changes no agent record");
+    if let Some((agent, run)) = &lost_agent {
+        assert_eq!(run.state, crate::agent_execution::State::Interrupted);
+        assert!(
+            snapshot
+                .read_only_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no confirmed outcome")),
+            "{:?}",
+            snapshot.read_only_reason
+        );
+        // A reader is not this agent's provider to address.
+        let refused = super::super::agent_execution::process(
+            &host,
+            Default::default(),
+            crate::agent_execution::Operation::Requests(agent.id),
+        )
+        .unwrap_err();
+        assert!(refused.contains("no longer live"), "{refused}");
+    }
     assert!(
         !super::super::agent_execution::registry(&host)
             .unwrap()
@@ -940,6 +1040,41 @@ fn named_claude_resume_after_lost_holder_sends_nothing() {
     );
     // Start's own fresh capability replaced the dead row.
     assert_ne!(authority_row().0, authority_before.0);
+    if let Some((before, run)) = &lost_agent {
+        let (agent, after) = agent_state().unwrap();
+        assert_eq!(
+            agent.session,
+            Some(crate::agent_execution::HostedSession::Chat(session.clone())),
+            "later prompts reach the provider now running"
+        );
+        assert_eq!(&after, run, "the interrupted run stays interrupted");
+        assert_eq!(agent.id, before.id);
+        // The provider is the agent's, and closes as the agent.
+        super::super::agent_execution::process(
+            &host,
+            Default::default(),
+            crate::agent_execution::Operation::Requests(agent.id),
+        )
+        .unwrap();
+        let reply = super::super::agent_execution::process(
+            &host,
+            Default::default(),
+            crate::agent_execution::Operation::Close(agent.id),
+        )
+        .unwrap();
+        assert!(
+            matches!(reply, crate::agent_execution::Reply::Closed(agent) if agent.closed),
+            "the agent closes"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("prompts")).unwrap(),
+            prompts_before
+        );
+        drop(resumed);
+        drop(restored);
+        drop(worker);
+        return;
+    }
 
     // The kept allocation is not poisoned by the older owner's unreadable row.
     let closing = resumed.session();

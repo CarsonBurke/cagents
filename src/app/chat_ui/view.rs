@@ -1048,6 +1048,13 @@ fn empty_transcript_text(saved_history: bool, loading: bool) -> &'static str {
 /// What a saved transcript's reader is told beside its Resume action. The
 /// uncertainty is only claimed from the newest page of the transcript.
 fn saved_history_caption(snapshot: &chat::Snapshot) -> &str {
+    if let Some(reason) = snapshot
+        .read_only_reason
+        .as_deref()
+        .filter(|reason| reason.starts_with(chat::LOST_AGENT_REASON))
+    {
+        return reason;
+    }
     if !snapshot.history_loading
         && !snapshot.has_later
         && chat::last_turn_uncertain(&snapshot.items)
