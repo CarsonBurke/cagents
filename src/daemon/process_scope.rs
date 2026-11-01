@@ -128,10 +128,14 @@ struct Procfs(OwnedFd);
 
 impl Procfs {
     fn open() -> io::Result<Self> {
-        // SAFETY: the path is a static NUL-terminated string.
+        Self::open_at(c"/proc")
+    }
+
+    fn open_at(path: &std::ffi::CStr) -> io::Result<Self> {
+        // SAFETY: the path is NUL-terminated and outlives the call.
         let root = unsafe {
             libc::open(
-                c"/proc".as_ptr(),
+                path.as_ptr(),
                 libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
             )
         };
@@ -267,7 +271,9 @@ fn with_verified_manager(
         io::Error::new(error.kind(), format!("user manager proof failed: {error}"))
     })?;
     if !peer_alive(&proof.peer) {
-        return Err(io::Error::other("manager peer is no longer live"));
+        return Err(io::Error::other(
+            "user manager proof failed: manager peer is no longer live",
+        ));
     }
     // Existing trust contract: this fixed OS manager owns the well-known
     // org.freedesktop.systemd1 service on the fixed OS user bus. We do not
@@ -472,6 +478,94 @@ pub(crate) mod tests {
                     .starts_with("user manager proof failed: ")
             );
         }
+    }
+
+    #[test]
+    fn a_manager_that_exited_after_its_proof_receives_no_request() {
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        // SAFETY: pidfd_open returns a new descriptor for this unreaped child.
+        let peer = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+        assert!(peer >= 0);
+        // SAFETY: the successful syscall transferred this new owned descriptor.
+        let peer = unsafe { OwnedFd::from_raw_fd(peer as i32) };
+        child.wait().unwrap();
+        let proof = ManagerNamespace {
+            _connection: UnixStream::pair().unwrap().0,
+            peer,
+        };
+        let refused = with_verified_manager(Ok(proof), || panic!("dead manager request"));
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            "user manager proof failed: manager peer is no longer live"
+        );
+    }
+
+    #[test]
+    fn a_directory_outside_procfs_cannot_supply_namespace_reports() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = std::ffi::CString::new(directory.path().as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            Procfs::open_at(&path).err().unwrap().to_string(),
+            "/proc is not procfs"
+        );
+    }
+
+    /// Binds a forged report over a real entry, in a mount namespace of a child
+    /// test process where unprivileged namespaces allow.
+    #[test]
+    fn a_report_bind_mounted_over_procfs_is_refused() {
+        const CHILD: &str = "CAGENTS_SCOPE_PROCFS_MOUNT_TEST";
+        let unshare = || {
+            let mut command = Command::new("unshare");
+            command.args(["--user", "--map-root-user", "--mount"]);
+            command
+        };
+        if std::env::var_os(CHILD).is_none() {
+            if !unshare()
+                .arg("true")
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                eprintln!("skipped: no unprivileged mount namespace");
+                return;
+            }
+            let name = module_path!().split_once("::").unwrap().1;
+            let output = unshare()
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("{name}::a_report_bind_mounted_over_procfs_is_refused"),
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "the namespaced fixture failed: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let forged = directory.path().join("status");
+        fs::write(&forged, "NSpid:\t1\n").unwrap();
+        let entry = format!("{}/status", std::process::id());
+        let status = Command::new("mount")
+            .arg("--bind")
+            .arg(&forged)
+            .arg(format!("/proc/{entry}"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            Procfs::open()
+                .unwrap()
+                .read(&entry)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EXDEV)
+        );
     }
 
     #[test]
