@@ -4307,6 +4307,11 @@ pub enum Message {
         terminal: TerminalId,
         result: Result<Option<TerminalSurface>, String>,
     },
+    /// Whether the daemon still hosts the console a pane was asked to show.
+    AgentConsoleChecked {
+        card: CardId,
+        hosted: Result<bool, String>,
+    },
     /// `None` when the terminal is no longer hosted and would have to be
     /// launched again, which waits until its card is opened.
     RestoredAgentAttached {
@@ -14651,6 +14656,9 @@ impl Application for Cagents {
                 terminal,
                 result,
             } => self.retained_terminal_attached(card, terminal, result),
+            Message::AgentConsoleChecked { card, hosted } => {
+                self.agent_console_checked(card, hosted)
+            }
             Message::RestoredAgentAttached {
                 card,
                 terminal,

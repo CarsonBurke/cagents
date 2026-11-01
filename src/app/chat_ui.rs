@@ -4824,6 +4824,20 @@ fn succession_root(session: &chat::Session) -> TerminalId {
 /// running it; the only terminal the chat may show is that console.
 const AGENT_CONSOLE_RETURN: &str = "This chat belongs to an agent. It can only show the agent's console, which is not available right now.";
 
+/// Why a pane stays on the chat when the agent's console is no longer running.
+const AGENT_CONSOLE_ENDED: &str = "This agent's console has ended, so the pane stays on its chat.";
+
+/// Whether the daemon still hosts this exact console process.
+fn console_still_hosted(console: &TerminalSession) -> Result<bool, String> {
+    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+    let mut client =
+        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    let hosted = client.list().map_err(|error| error.to_string())?;
+    Ok(hosted
+        .iter()
+        .any(|hosted| crate::agent_execution::same_terminal_process(&hosted.session, console)))
+}
+
 /// The agent whose console `session` is paired with, if it is.
 fn console_paired_agent(session: &chat::Session) -> Option<crate::model::AgentId> {
     session
@@ -7434,38 +7448,82 @@ impl Cagents {
                 self.open_chat(card, session, chat::Intent::Restore)
             }
             Surface::Chat => {
-                let Some(state) = self.card_state(card).cloned() else {
-                    return Task::none();
-                };
                 let console = presentation.console;
-                // Keeps the unsent draft for the next time the chat is shown.
-                // Dropping the runtime detaches this window; the provider runs on.
-                self.chat_forget(card);
-                self.cards.remove(&card);
-                let residency = Residency::Hydrating {
-                    epoch: unix_millis().max(1) as u64,
-                };
-                self.lifecycle
-                    .register(card, state.exposure, residency.clone(), Instant::now());
-                if let Some(state) = self.card_state_mut(card) {
-                    state.kind = CardKind::Terminal(console.clone());
-                    state.residency = residency;
-                }
-                self.closed_terminal_cards.remove(&card);
-                self.cards.insert(card, CardRuntime::Loading);
-                self.card_chrome.remove(&card);
-                let saved = self.shared_window_snapshot();
-                if let Some(writer) = &self.session {
-                    writer.snapshot_conversion(saved);
-                }
-                self.start_terminal(
-                    card,
-                    console,
-                    state.exposure == Exposure::Visible && self.workspace_surfaces_visible(),
-                    false,
-                )
+                cosmic::task::future(async move {
+                    let hosted =
+                        tokio::task::spawn_blocking(move || console_still_hosted(&console))
+                            .await
+                            .map_err(|error| format!("console check join failed: {error}"))
+                            .and_then(|result| result);
+                    Message::AgentConsoleChecked { card, hosted }
+                })
             }
         }
+    }
+
+    /// The daemon answered whether this agent's console still runs. The pane
+    /// changes only if it does: a console that ended cannot be attached, and
+    /// its recipe opens nothing outside the daemon's own pairing, so the pane
+    /// keeps the chat rather than trading it for a dead terminal.
+    pub(super) fn agent_console_checked(
+        &mut self,
+        card: CardId,
+        hosted: Result<bool, String>,
+    ) -> Task<Message> {
+        use crate::agent_execution::Surface;
+        // The person may have moved on while the daemon answered.
+        let Some((presentation, Surface::Chat)) = self.agent_presentation(card) else {
+            return Task::none();
+        };
+        if let Some(reason) = self.chat_switch_blocker(card) {
+            self.status = Some(TransientNotice::error(reason.into_owned()));
+            return Task::none();
+        }
+        match hosted {
+            Ok(true) => self.show_agent_console(card, presentation.console),
+            Ok(false) => {
+                self.status = Some(TransientNotice::warning(AGENT_CONSOLE_ENDED));
+                Task::none()
+            }
+            Err(error) => {
+                self.status = Some(TransientNotice::error(format!(
+                    "Could not check the agent's console, so this pane stays on its chat. {error}"
+                )));
+                Task::none()
+            }
+        }
+    }
+
+    fn show_agent_console(&mut self, card: CardId, console: TerminalSession) -> Task<Message> {
+        let Some(state) = self.card_state(card).cloned() else {
+            return Task::none();
+        };
+        // Keeps the unsent draft for the next time the chat is shown.
+        // Dropping the runtime detaches this window; the provider runs on.
+        self.chat_forget(card);
+        self.cards.remove(&card);
+        let residency = Residency::Hydrating {
+            epoch: unix_millis().max(1) as u64,
+        };
+        self.lifecycle
+            .register(card, state.exposure, residency.clone(), Instant::now());
+        if let Some(state) = self.card_state_mut(card) {
+            state.kind = CardKind::Terminal(console.clone());
+            state.residency = residency;
+        }
+        self.closed_terminal_cards.remove(&card);
+        self.cards.insert(card, CardRuntime::Loading);
+        self.card_chrome.remove(&card);
+        let saved = self.shared_window_snapshot();
+        if let Some(writer) = &self.session {
+            writer.snapshot_conversion(saved);
+        }
+        self.start_terminal(
+            card,
+            console,
+            state.exposure == Exposure::Visible && self.workspace_surfaces_visible(),
+            false,
+        )
     }
 
     /// Hands the models the conversation in `card` lists to the catalog a
@@ -28469,6 +28527,14 @@ mod agent_presentation_tests {
         );
 
         drop(app.update(Message::ChatUi(Action::Switch(card))));
+        assert!(
+            matches!(app.card_state(card).unwrap().kind, CardKind::Chat(_)),
+            "the pane waits for the daemon's answer"
+        );
+        drop(app.update(Message::AgentConsoleChecked {
+            card,
+            hosted: Ok(true),
+        }));
         assert_eq!(
             app.card_state(card).unwrap().kind,
             CardKind::Terminal(presentation.console.clone())
@@ -28480,6 +28546,55 @@ mod agent_presentation_tests {
             "showing the console is not a handoff back to a terminal"
         );
         assert_eq!(app.chat_switch_label(card), "Show as chat");
+    }
+
+    /// A console that has ended, or that the daemon cannot vouch for, leaves
+    /// the working chat on screen with the reason. A late answer changes
+    /// nothing once the pane has moved on.
+    #[test]
+    fn show_as_console_keeps_the_chat_when_the_console_is_gone() {
+        for (hosted, expected) in [
+            (Ok(false), AGENT_CONSOLE_ENDED.to_owned()),
+            (
+                Err("daemon unavailable".to_owned()),
+                "Could not check the agent's console, so this pane stays on its chat. daemon unavailable"
+                    .to_owned(),
+            ),
+        ] {
+            let (mut app, card, agent, _directory) = console_agent_app();
+            let presentation =
+                crate::workspace_model::views::AgentPresentation::of(&agent).unwrap();
+            shown_as_chat(&mut app, card);
+            drop(app.update(Message::ChatUi(Action::Switch(card))));
+            drop(app.update(Message::AgentConsoleChecked { card, hosted }));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(presentation.chat.clone())
+            );
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))));
+            assert!(
+                app.notices
+                    .recent()
+                    .any(|logged| logged.notice.message == expected)
+            );
+        }
+
+        let (mut app, card, agent, _directory) = console_agent_app();
+        let presentation = crate::workspace_model::views::AgentPresentation::of(&agent).unwrap();
+        drop(app.update(Message::AgentConsoleChecked {
+            card,
+            hosted: Ok(false),
+        }));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Terminal(presentation.console)
+        );
+        assert!(
+            !app.notices
+                .recent()
+                .any(|logged| logged.notice.message == AGENT_CONSOLE_ENDED),
+            "the pane already shows the console"
+        );
     }
 
     /// Only the agent's own pane switches. A console card that is not the
