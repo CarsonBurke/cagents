@@ -8651,6 +8651,9 @@ mod app_tests {
                 let id = app.account_ui.add_managed_fixture(provider, 1938);
                 let now = now_ms();
                 let before_rollback = now + 10 * schedule::CLOCK_SLACK;
+                // The window's last event still belongs to the old clock;
+                // every actual callback must supply its own fresh event time.
+                app.account_ui.now_ms = before_rollback;
                 assert!(app.account_ui.take_catalog(
                     provider,
                     catalog(before_rollback, "pre-rollback"),
