@@ -1,3 +1,4 @@
+mod managed_idle_admission;
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
 #[cfg(target_os = "linux")]

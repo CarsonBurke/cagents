@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 
 const REQUEST: &str = "courier-race-request";
 const TIMEOUT: Duration = Duration::from_secs(5);
+const NATIVE_PARENT: &str = "fixture native parent";
+const BACKGROUND_CHILD: &str = "fixture-running-background-child";
 
 #[derive(Default)]
 struct Observed {
@@ -19,6 +21,7 @@ struct GatedAdapter {
     entered: Sender<()>,
     release: Receiver<()>,
     observed: Arc<Observed>,
+    managed_lifecycle: bool,
 }
 
 impl Adapter for GatedAdapter {
@@ -31,6 +34,29 @@ impl Adapter for GatedAdapter {
 
     fn command(&mut self, command: Command) -> Result<Step, String> {
         let events = match command {
+            Command::Prompt {
+                text,
+                attachments,
+                mode: super::super::PromptMode::Send,
+            } if self.managed_lifecycle && text == NATIVE_PARENT && attachments.is_empty() => {
+                vec![
+                    Event::TurnStarted,
+                    Event::Status {
+                        busy: true,
+                        detail: String::new(),
+                    },
+                    Event::Subagent {
+                        id: BACKGROUND_CHILD.into(),
+                        kind: "fixture".into(),
+                        description: "Still running after its native parent settles".into(),
+                        status: Some(ToolStatus::Running),
+                        background: Some(true),
+                        model: None,
+                        waiting: Some(false),
+                        detail: None,
+                    },
+                ]
+            }
             Command::Compact => {
                 self.entered.send(()).map_err(|error| error.to_string())?;
                 self.release
@@ -70,6 +96,17 @@ impl Adapter for GatedAdapter {
                 Event::Waiting(false),
             ],
             Command::SetModel { model, .. } => match model.as_str() {
+                "settle native parent" if self.managed_lifecycle => vec![
+                    Event::Status {
+                        busy: false,
+                        detail: String::new(),
+                    },
+                    Event::TurnSettled,
+                    Event::TurnFinished {
+                        key: None,
+                        outcome: crate::notifications::Kind::Succeeded,
+                    },
+                ],
                 "busy" => vec![Event::Status {
                     busy: true,
                     detail: String::new(),
@@ -116,6 +153,36 @@ impl Adapter for GatedAdapter {
                 ..Step::default()
             });
         }
+        if self.managed_lifecycle
+            && let Command::Prompt {
+                text,
+                attachments,
+                mode: super::super::PromptMode::Send,
+            } = &command
+            && attachments.is_empty()
+        {
+            self.observed.prompts.lock().unwrap().push(text.clone());
+            return Ok(Step {
+                writes: vec![json!({
+                    "courier_fixture_prompt": text,
+                    "managed_fixture_run": run,
+                })],
+                events: vec![
+                    Event::Execution {
+                        run,
+                        event: crate::agent_execution::ProviderEvent::Started {
+                            key: format!("managed-fixture-{run}"),
+                        },
+                    },
+                    Event::TurnStarted,
+                    Event::Status {
+                        busy: true,
+                        detail: String::new(),
+                    },
+                ],
+                ..Step::default()
+            });
+        }
         self.command(command)
     }
 
@@ -124,6 +191,50 @@ impl Adapter for GatedAdapter {
             .as_str()
             .ok_or("unexpected fixture pipe frame")?;
         self.observed.echoed.lock().unwrap().push(text.into());
+        if self.managed_lifecycle && !frame["managed_fixture_run"].is_null() {
+            let run: crate::model::RunId =
+                serde_json::from_value(frame["managed_fixture_run"].clone())
+                    .map_err(|error| error.to_string())?;
+            return Ok(Step {
+                events: vec![
+                    Event::Execution {
+                        run,
+                        event: crate::agent_execution::ProviderEvent::Scope,
+                    },
+                    Event::Item(super::super::Item {
+                        id: format!("managed-fixture-{run}"),
+                        role: super::super::Role::Assistant,
+                        started_at: None,
+                        at: None,
+                        content: ItemContent::Text {
+                            text: format!("Managed result: {text}"),
+                            thinking: false,
+                            phase: Phase::Final,
+                        },
+                    }),
+                    Event::Status {
+                        busy: false,
+                        detail: String::new(),
+                    },
+                    Event::TurnSettled,
+                    Event::TurnFinished {
+                        key: Some(format!("managed-fixture-{run}")),
+                        outcome: crate::notifications::Kind::Succeeded,
+                    },
+                    Event::Execution {
+                        run,
+                        event: crate::agent_execution::ProviderEvent::Settled,
+                    },
+                    Event::Execution {
+                        run,
+                        event: crate::agent_execution::ProviderEvent::Finished {
+                            outcome: crate::notifications::Kind::Succeeded,
+                        },
+                    },
+                ],
+                ..Step::default()
+            });
+        }
         Ok(Step::default())
     }
 }
@@ -137,11 +248,22 @@ pub(crate) struct RequestRaceFixture {
     request: Option<JoinHandle<Result<(), String>>>,
     attempts: Vec<JoinHandle<()>>,
     observed: Arc<Observed>,
+    recipe: crate::model::LaunchRecipe,
     _directory: tempfile::TempDir,
 }
 
 impl RequestRaceFixture {
     pub(crate) fn new() -> Self {
+        Self::build(|_| {}, false)
+    }
+
+    /// HOST-only construction mode: real actor events drive the supplied
+    /// observer. The ordinary courier constructor keeps its old semantics.
+    pub(crate) fn with_execution_notify(notify: impl Fn(Update) + Send + Sync + 'static) -> Self {
+        Self::build(notify, true)
+    }
+
+    fn build(notify: impl Fn(Update) + Send + Sync + 'static, managed_lifecycle: bool) -> Self {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let home = directory.path().join("home");
         let cache = directory.path().join("cache");
@@ -163,6 +285,13 @@ impl RequestRaceFixture {
                 ),
             ]),
         };
+        let recipe = crate::model::LaunchRecipe {
+            program: spec.program.clone(),
+            arguments: spec.arguments.clone(),
+            working_directory: spec.working_directory.clone(),
+            environment: spec.environment.clone(),
+            unset_environment: spec.unset_environment.clone(),
+        };
         let (entered_tx, entered) = crossbeam_channel::bounded(1);
         let (release, release_rx) = crossbeam_channel::bounded(1);
         let observed = Arc::new(Observed::default());
@@ -170,12 +299,13 @@ impl RequestRaceFixture {
             entered: entered_tx,
             release: release_rx,
             observed: observed.clone(),
+            managed_lifecycle,
         };
         let mut initial = adapter.initialize().unwrap();
         // Follow real preflight. Its cfg(test) Store owns a unique private
         // temporary cache; ProcessSpec does not override that cache's root.
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(adapter), initial, store, None, |_| {}).unwrap();
+        let handle = Handle::start(spec, Box::new(adapter), initial, store, None, notify).unwrap();
         let fixture = Self {
             handle,
             entered,
@@ -183,6 +313,7 @@ impl RequestRaceFixture {
             request: None,
             attempts: Vec::new(),
             observed,
+            recipe,
             _directory: directory,
         };
         assert_eq!(
@@ -192,6 +323,60 @@ impl RequestRaceFixture {
         );
         assert!(fixture.handle.is_idle());
         fixture
+    }
+
+    pub(crate) fn recipe(&self) -> &crate::model::LaunchRecipe {
+        &self.recipe
+    }
+
+    pub(crate) fn start_native_parent(&self) {
+        self.handle
+            .command(Command::Prompt {
+                text: NATIVE_PARENT.into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+    }
+
+    pub(crate) fn settle_native_parent(&self) {
+        self.handle
+            .command(Command::SetModel {
+                model: "settle native parent".into(),
+                reasoning: None,
+            })
+            .unwrap();
+    }
+
+    /// Release fixture barriers before HOST teardown, including unwind. The
+    /// existing Drop remains the owner of actor close and exact worker joins.
+    pub(crate) fn release_host_barriers(&mut self) -> Result<(), String> {
+        let _ = self.release.try_send(());
+        if let Some(request) = self.request.take() {
+            request
+                .join()
+                .map_err(|_| "fixture Compact worker panicked".to_owned())??;
+        }
+        if self.handle.is_completed() {
+            return Ok(());
+        }
+        self.handle.command(Command::SetModel {
+            model: "settle native parent".into(),
+            reasoning: None,
+        })?;
+        if self
+            .handle
+            .requests()
+            .iter()
+            .any(|request| request.id == REQUEST)
+        {
+            self.handle.command(Command::Answer {
+                request_id: REQUEST.into(),
+                action: "resolve".into(),
+                answers: Vec::new(),
+            })?;
+        }
+        Ok(())
     }
 
     /// Return only once Compact is dequeued and blocked inside the adapter.
