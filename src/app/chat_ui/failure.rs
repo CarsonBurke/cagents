@@ -24,6 +24,10 @@ pub(super) struct Note {
     /// a group key, which paging can change.
     pub after: Option<String>,
     pub text: String,
+    pub turn_generation: u64,
+    /// Proven provider occurrence, captured while its source is loaded. Keep
+    /// this across paging so Details and selection retain the same identity.
+    pub event_key: Option<String>,
 }
 
 pub(super) struct Incident {
@@ -192,6 +196,75 @@ fn prompt_scope(provider: Provider, id: &str) -> String {
         Some(carrier) => format!("message\0{carrier}"),
         None => format!("item\0{id}"),
     }
+}
+
+/// An explicit diagnostic owns its occurrence, independently of which prompt
+/// happens to be loaded. Multipart provider messages share their proven carrier.
+fn event_scope(provider: Provider, item: &chat::Item) -> String {
+    match chat::failure::provider_error_carrier(provider, item) {
+        Some(carrier) => format!("event\0carrier\0{carrier}"),
+        None => format!("event\0item\0{}", item.id),
+    }
+}
+
+/// Notices are inserted between groups. Close a group at the recorded item so
+/// later prompts or streamed prose cannot grow across an earlier failure.
+pub(super) fn boundaries(asked_after: &HashSet<String>, notes: &[Note]) -> HashSet<String> {
+    let mut boundaries = asked_after.clone();
+    boundaries.extend(notes.iter().filter_map(|note| note.after.clone()));
+    boundaries
+}
+
+/// A scalar failure can repeat an explicit diagnostic carried in the same
+/// publication. Join only the recorded item and its proven multipart carrier,
+/// with the complete body the adapter used, never another equal-text incident.
+pub(super) fn notice_key(
+    provider: Provider,
+    snapshot: &Snapshot,
+    after: Option<&str>,
+    notice: &str,
+) -> Option<String> {
+    let item = snapshot
+        .items
+        .iter()
+        .find(|item| Some(item.id.as_str()) == after)?;
+    provider_item_text(provider, item)?;
+    let scope = event_scope(provider, item);
+    let carrier = chat::failure::provider_error_carrier(provider, item);
+    let sources: Vec<_> = snapshot
+        .items
+        .iter()
+        .filter(|source| {
+            source.id == item.id
+                || carrier.is_some_and(|carrier| {
+                    chat::failure::provider_error_carrier(provider, source) == Some(carrier)
+                })
+        })
+        .filter_map(|source| provider_item_text(provider, source))
+        .collect();
+    let body = sources.join("\n");
+    let scalar_body = if provider == Provider::Claude {
+        notice
+            .strip_prefix("Claude: ")
+            .and_then(|text| text.split_once('\n'))
+            .map_or(notice, |(_, body)| body)
+    } else {
+        notice
+    };
+    if scalar_body != body {
+        return None;
+    }
+    let mut chosen = None;
+    for text in sources {
+        if let Some(meta) = State::metadata(provider, text, false, &scope)
+            && chosen
+                .as_ref()
+                .is_none_or(|previous: &Metadata| previous.kind.is_none() && meta.kind.is_some())
+        {
+            chosen = Some(meta);
+        }
+    }
+    chosen.map(|meta| meta.key)
 }
 
 /// Where a retained note is drawn: after the group containing the item it
@@ -412,17 +485,14 @@ impl State {
             runtime,
             &runtime.snapshot.items,
             |item| Source::Item(item.id.clone()),
-            |item| contexts.get(item.id.as_str()).cloned().unwrap_or_default(),
+            |item| event_scope(provider, item),
         );
         for item in &runtime.snapshot.items {
             state.push_item(
                 runtime,
                 item,
                 Source::Item(item.id.clone()),
-                contexts
-                    .get(item.id.as_str())
-                    .map(String::as_str)
-                    .unwrap_or(""),
+                &event_scope(provider, item),
                 &causes,
             );
         }
@@ -516,30 +586,35 @@ impl State {
         let note_contexts: Vec<String> = runtime
             .failures
             .iter()
-            .map(|note| match note.message.as_deref() {
-                Some(id) => contexts
-                    .get(id)
-                    .cloned()
-                    .unwrap_or_else(|| prompt_scope(provider, id)),
-                None => String::new(),
+            .map(|note| {
+                format!(
+                    "note\0{}\0{}\0{}",
+                    note.message
+                        .as_deref()
+                        .map(|id| prompt_scope(provider, id))
+                        .unwrap_or_default(),
+                    note.after.as_deref().unwrap_or(""),
+                    note.turn_generation
+                )
             })
             .collect();
         for (index, note) in runtime.failures.iter().enumerate() {
             if !runtime.expected_remote_close_error(&note.text) {
-                state.push(
-                    provider,
-                    &note.text,
-                    Source::Note(index),
-                    false,
-                    &note_contexts[index],
-                );
+                if let Some(mut meta) =
+                    Self::metadata(provider, &note.text, false, &note_contexts[index])
+                {
+                    if let Some(key) = &note.event_key {
+                        meta.key.clone_from(key);
+                    }
+                    state.push_metadata(meta, Source::Note(index));
+                }
             }
         }
         // The current error joins the note recorded for it, wherever paging
         // has left that note's message, but only a note drawn here: an error
         // still awaiting the latest page has no note yet, and must not adopt
         // an older one with the same text.
-        let snapshot_context = runtime
+        let snapshot_note = runtime
             .snapshot
             .error
             .as_deref()
@@ -554,8 +629,9 @@ impl State {
                     note.text == error
                         && note_destination(runtime, note, &item_groups, &user_carriers).is_some()
                 })
-            })
-            .map_or(context.as_str(), |index| note_contexts[index].as_str());
+            });
+        let snapshot_context =
+            snapshot_note.map_or(context.as_str(), |index| note_contexts[index].as_str());
         state.local_error = if runtime.failure_ui.local_error.as_deref() == runtime.error.as_deref()
         {
             runtime.failure_ui.local_error.clone()
@@ -580,7 +656,15 @@ impl State {
                     Source::Snapshot => snapshot_context,
                     _ => context.as_str(),
                 };
-                state.push(provider, text, source, false, scope);
+                if let Some(mut meta) = Self::metadata(provider, text, false, scope) {
+                    if matches!(source, Source::Snapshot)
+                        && let Some(key) = snapshot_note
+                            .and_then(|index| runtime.failures[index].event_key.as_ref())
+                    {
+                        meta.key.clone_from(key);
+                    }
+                    state.push_metadata(meta, source);
+                }
             }
         }
         let recovering = runtime.auth_error().is_some();
@@ -593,9 +677,9 @@ impl State {
                         let note = &runtime.failures[*index];
                         runtime.active_auth_notice(&note.message, &note.text)
                     }
-                    Source::Item(id) => contexts
-                        .get(id.as_str())
-                        .is_some_and(|owner| owner == &context),
+                    // A historical item in the same prompt is not the active
+                    // failure. Its proven scalar/note source owns recovery.
+                    Source::Item(_) => false,
                     _ => false,
                 });
             let child_history_only = incident
@@ -1030,6 +1114,9 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
+    mod chronology_tests {
+        include!("failure/chronology_tests.rs");
+    }
     use super::*;
 
     fn text(id: &str, role: chat::Role, body: &str) -> chat::Item {
@@ -1261,8 +1348,8 @@ mod tests {
             "below the delivery's work, where the reader is"
         );
 
-        // The same failure recurring after more delivered work stays one
-        // notice and moves below that work.
+        // The same failure after more work is another occurrence. The old
+        // notice remains beside the work that originally failed.
         publish(&mut runtime, &handle, |next| {
             next.error = None;
             next.items.extend([
@@ -1271,10 +1358,14 @@ mod tests {
             ]);
         });
         publish_error(&mut runtime, &handle, raw);
-        assert_eq!(runtime.failures.len(), 1);
-        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(runtime.failures.len(), 2);
+        assert_eq!(runtime.failure_ui.incidents.len(), 2);
         assert_eq!(
             runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("finished")
+        );
+        assert_eq!(
+            runtime.failure_ui.incidents[1].anchor.as_deref(),
             Some("finished-again")
         );
 
@@ -1286,7 +1377,7 @@ mod tests {
         });
         assert_eq!(
             runtime.failure_ui.incidents[0].anchor.as_deref(),
-            Some("finished-again")
+            Some("finished")
         );
     }
 
@@ -1387,7 +1478,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cause_recurring_with_new_wording_is_drawn_after_its_newest_work() {
+    fn a_cause_recurring_with_new_wording_preserves_each_occurrence() {
         let provider = Provider::Claude;
         let message = "abababab-abab-4bab-8bab-abababababab";
         let first =
@@ -1404,13 +1495,13 @@ mod tests {
         });
         publish_error(&mut runtime, &handle, second);
         assert_eq!(runtime.failures.len(), 2);
-        assert_eq!(runtime.failure_ui.incidents.len(), 1, "one account limit");
+        assert_eq!(runtime.failure_ui.incidents.len(), 2, "two occurrences");
         assert_eq!(
             runtime.failure_ui.incidents[0].anchor.as_deref(),
-            Some("finished-again")
+            Some("finished")
         );
 
-        // The first wording recurring after still more work moves there too.
+        // The first wording after still more work is a third occurrence.
         publish(&mut runtime, &handle, |next| {
             next.error = None;
             next.items.extend([
@@ -1419,10 +1510,14 @@ mod tests {
             ]);
         });
         publish_error(&mut runtime, &handle, first);
-        assert_eq!(runtime.failures.len(), 2);
-        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(runtime.failures.len(), 3);
+        assert_eq!(runtime.failure_ui.incidents.len(), 3);
         assert_eq!(
             runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("finished")
+        );
+        assert_eq!(
+            runtime.failure_ui.incidents[2].anchor.as_deref(),
             Some("finished-third")
         );
     }

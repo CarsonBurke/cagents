@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::{collections::BTreeMap, path::PathBuf};
 
+#[cfg(test)]
+mod error_chronology_tests;
 mod images;
 
 /// The Codex configuration key for a thread's reasoning effort. A launch
@@ -838,9 +840,10 @@ impl Codex {
                 step.events
                     .extend(parse_item(value, true, id)?.into_iter().map(Event::Item));
             }
-            if let Some(message) = turn["error"]["message"].as_str() {
+            if let Some(message) = turn_error_message(turn) {
+                step.events.push(Event::Item(turn_error_item(id, &message)));
                 step.events.push(Event::Error {
-                    message: message.into(),
+                    message,
                     fatal: false,
                 });
             }
@@ -1294,6 +1297,9 @@ impl Codex {
                     }
                     items.push(item);
                 }
+            }
+            if let Some(message) = turn_error_message(turn) {
+                items.push(turn_error_item(turn_id, &message));
             }
         }
         if !earlier {
@@ -2582,10 +2588,16 @@ impl Adapter for Codex {
                             }
                         } else {
                             for turn in result["thread"]["turns"].as_array().into_iter().flatten() {
+                                let turn_id = string(turn, "id")?;
                                 for value in turn["items"].as_array().into_iter().flatten() {
-                                    for item in parse_item(value, true, string(turn, "id")?)? {
+                                    for item in parse_item(value, true, turn_id)? {
                                         content.events.push(Event::Item(item));
                                     }
+                                }
+                                if let Some(message) = turn_error_message(turn) {
+                                    content
+                                        .events
+                                        .push(Event::Item(turn_error_item(turn_id, &message)));
                                 }
                             }
                             child.child_history_outcome(
@@ -2934,12 +2946,11 @@ impl Adapter for Codex {
                         detail: turn_detail(&turn["status"]),
                     });
                 }
-                if turn["error"].is_object() {
+                if let Some(message) = turn_error_message(turn) {
+                    step.events
+                        .push(Event::Item(turn_error_item(turn_id, &message)));
                     step.events.push(Event::Error {
-                        message: turn["error"]["message"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| turn["error"].to_string()),
+                        message,
                         fatal: false,
                     });
                 }
@@ -3176,6 +3187,13 @@ impl Adapter for Codex {
                     }
                     step.events.push(notice);
                 } else {
+                    // Only the provider's explicit turn ID can bind a failure
+                    // to durable history. The current turn may already have
+                    // changed when this notification arrives.
+                    if let Some(turn_id) = params["turnId"].as_str().filter(|id| !id.is_empty()) {
+                        step.events
+                            .push(Event::Item(turn_error_item(turn_id, &message)));
+                    }
                     step.events.push(Event::Error {
                         message,
                         fatal: false,
@@ -3269,6 +3287,42 @@ fn session_notice(text: String) -> Event {
         started_at: None,
         at: None,
     })
+}
+
+fn turn_error_message(turn: &Value) -> Option<String> {
+    let error = &turn["error"];
+    error.is_object().then(|| {
+        error["message"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| error.to_string())
+    })
+}
+
+/// Terminal provider errors are durable transcript incidents. Notification,
+/// completion and reloaded history describe the same incident when the exact
+/// provider turn and diagnostic match. A later turn with the same text remains
+/// a separate failure. Length framing keeps arbitrary provider IDs unambiguous;
+/// hashing bounds the cache identity without truncating the diagnostic.
+fn turn_error_item(turn: &str, message: &str) -> Item {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update((turn.len() as u64).to_be_bytes());
+    digest.update(turn.as_bytes());
+    digest.update(message.as_bytes());
+    let mut item = Item {
+        id: format!("codex-turn-error:{:x}", digest.finalize()),
+        role: Role::System,
+        content: ItemContent::Text {
+            text: message.into(),
+            thinking: false,
+            phase: Phase::Commentary,
+        },
+        started_at: None,
+        at: None,
+    };
+    chat::failure::mark_provider_error(crate::agent::Provider::Codex, &mut item);
+    item
 }
 impl Codex {
     fn observe_thread_status(&mut self, status: &Value) {
@@ -5807,7 +5861,7 @@ mod tests {
         );
     }
 
-    fn adapter() -> Codex {
+    pub(super) fn adapter() -> Codex {
         Codex {
             server_identity: None,
             retained_identity: None,
@@ -5941,10 +5995,16 @@ mod tests {
         for will_retry in [json!(false), Value::Null] {
             let mut failed = frame.clone();
             failed["params"]["willRetry"] = will_retry;
-            assert!(matches!(
-                adapter.receive(failed).unwrap().events.as_slice(),
-                [Event::Error { fatal: false, .. }]
-            ));
+            let failed = adapter.receive(failed).unwrap();
+            let [Event::Item(item), Event::Error { fatal: false, .. }] = failed.events.as_slice()
+            else {
+                panic!("terminal errors retain both transcript and active error state");
+            };
+            assert_eq!(
+                chat::failure::provider_error_text(Provider::Codex, item),
+                Some("Reconnecting... 1/2")
+            );
+            assert!(item.id.starts_with("codex-turn-error:"));
         }
         let mut foreign = frame;
         foreign["params"]["threadId"] = json!("another-thread");
@@ -6999,6 +7059,18 @@ mod tests {
                     .count(),
                 1,
                 "{:?}",
+                final_step.events
+            );
+            assert_eq!(
+                final_step
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event,
+                        Event::Item(item) if item == &turn_error_item("owned", "Exact failure")
+                    ))
+                    .count(),
+                1,
+                "the exact early completion retains one durable failure item: {:?}",
                 final_step.events
             );
             assert_eq!(final_step.events.iter().filter(|event| matches!(event,

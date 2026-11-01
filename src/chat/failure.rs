@@ -130,6 +130,7 @@ impl<'a> Failure<'a> {
         } else if contains(&[
             "overloaded_error",
             "provider is at capacity",
+            "selected model is at capacity",
             "server is overloaded",
             "temporarily overloaded",
         ]) {
@@ -297,6 +298,16 @@ fn reported_reset(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reported_selected_model_capacity_keeps_original_details() {
+        let raw = "Selected model is at capacity. Please try a different model.";
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            let failure = Failure::parse(provider, raw).unwrap();
+            assert_eq!(failure.kind, FailureKind::Capacity);
+            assert_eq!(failure.details, raw);
+        }
+    }
 
     #[test]
     fn explicit_provenance_requires_full_provider_tuple_and_preserves_original_item_identity() {

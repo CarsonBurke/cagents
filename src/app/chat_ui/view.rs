@@ -10925,6 +10925,8 @@ mod tests {
                 message: Some(key.clone()),
                 after: Some(key.clone()),
                 text: raw.clone(),
+                event_key: None,
+                turn_generation: 0,
             })
             .into();
         runtime.error = Some("Current failure".into());

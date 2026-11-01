@@ -314,7 +314,14 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         if !renders(&item.content) {
             continue;
         }
-        let asked = asked_after.contains(item.id.as_str());
+        let asked = asked_after.contains(item.id.as_str())
+            || [
+                crate::agent::Provider::Claude,
+                crate::agent::Provider::Codex,
+                crate::agent::Provider::Omp,
+            ]
+            .into_iter()
+            .any(|provider| super::failure::diagnostic_item(provider, item));
         // A message from outside this stretch of work - the reader's own
         // prompt, a steering message, anything the harness delivers on their
         // behalf - is a new instruction, so the work that follows it is

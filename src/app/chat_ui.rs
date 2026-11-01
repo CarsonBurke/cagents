@@ -3119,7 +3119,13 @@ impl Runtime {
             .notice_anchor(&self.snapshot, &self.turns)
             .map(str::to_owned);
         let after = failure::closing_item(&self.snapshot, &self.turns).map(str::to_owned);
-        if self.note_at(anchor, after, notice) {
+        let key = failure::notice_key(
+            self.session.launch.provider,
+            &self.snapshot,
+            after.as_deref(),
+            &notice,
+        );
+        if self.note_at(anchor, after, notice, key, self.snapshot.turn_generation) {
             self.refresh_failure_ui();
         }
     }
@@ -3135,32 +3141,47 @@ impl Runtime {
     /// group containing the item `after`: work a delivery started after that
     /// prompt still precedes the notice. Returns whether the notes changed;
     /// the caller refreshes their presentation once its inputs agree.
-    fn note_at(&mut self, anchor: Option<String>, after: Option<String>, notice: String) -> bool {
+    fn note_at(
+        &mut self,
+        anchor: Option<String>,
+        after: Option<String>,
+        notice: String,
+        mut event_key: Option<String>,
+        turn_generation: u64,
+    ) -> bool {
         let provider = self.session.launch.provider;
         let mut changed = false;
         if chat::requires_sign_in(provider, &notice) {
+            if event_key.is_none() {
+                event_key = self
+                    .failures
+                    .iter()
+                    .find(|note| {
+                        failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
+                            && note.after == after
+                            && note.turn_generation == turn_generation
+                            && chat::requires_sign_in(provider, &note.text)
+                    })
+                    .and_then(|note| note.event_key.clone());
+            }
             // An updated verification failure replaces this exchange's active
             // auth warning; other exchanges and tool failures remain history.
             let before = self.failures.len();
             self.failures.retain(|note| {
                 !failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
+                    || note.after != after
+                    || note.turn_generation != turn_generation
                     || !chat::requires_sign_in(provider, &note.text)
             });
             changed = self.failures.len() != before;
         }
-        if let Some(index) = self.failures.iter().position(|note| {
+        if self.failures.iter().any(|note| {
             failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
                 && note.text == notice
+                && note.after == after
+                && note.turn_generation == turn_generation
         }) {
-            // The same failure recurring later in this exchange is still one
-            // notice, now after the work that produced it again. It becomes
-            // the latest note, which places an incident it shares.
-            if after.is_some() && self.failures[index].after != after {
-                let mut note = self.failures.remove(index);
-                note.after = after;
-                self.failures.push(note);
-                changed = true;
-            }
+            // Replaying the same occurrence does not change its placement.
             return changed;
         }
         if self.failures.len() == 32 {
@@ -3170,6 +3191,8 @@ impl Runtime {
             message: anchor,
             after,
             text: notice,
+            event_key,
+            turn_generation,
         });
         true
     }
@@ -3891,7 +3914,8 @@ impl Runtime {
         prepared.install(cached, managed, expanded);
         self.resume_preparation();
         if regroup && self.selected_subagent.is_none() {
-            let turns = turn::group(&self.snapshot.items, &self.asked_after, |item| {
+            let boundaries = failure::boundaries(&self.asked_after, &self.failures);
+            let turns = turn::group(&self.snapshot.items, &boundaries, |item| {
                 self.cache.get(&item.id)?.coordination.as_deref()
             });
             carry_step_disclosures(
@@ -4296,10 +4320,22 @@ impl Runtime {
         }
         self.source_clock = source_clock;
         let cache = &self.cache;
+        let mut boundaries = failure::boundaries(&self.asked_after, &self.failures);
+        // Install the incoming scalar error's boundary in this grouping pass,
+        // before recording its note below. A later publication may already
+        // contain another prompt even when the error has since cleared.
+        if (snapshot.error != self.snapshot.error || snapshot.turn_generation != self.snapshot.turn_generation)
+            && snapshot.error.is_some() && !snapshot.has_later
+            && let Some(last) = snapshot.items.iter().rev().find(|item| {
+                !matches!(&item.content, ItemContent::Text { text, .. } if text.trim().is_empty())
+            })
+        {
+            grouping_dirty |= boundaries.insert(last.id.clone());
+        }
         let turns = (grouping_dirty
             || !turn::same_structure(&self.snapshot.items, &snapshot.items))
         .then(|| {
-            turn::group(&snapshot.items, &self.asked_after, |item| {
+            turn::group(&snapshot.items, &boundaries, |item| {
                 cache.get(&item.id)?.coordination.as_deref()
             })
         });
@@ -4348,18 +4384,67 @@ impl Runtime {
                 .retain(&self.expanded, &self.unfolded, &self.opened);
         }
         // Presentation refreshes below, once the snapshot is installed.
-        if snapshot.error != self.snapshot.error
+        let new_error_item = snapshot.items.last().is_some_and(|item| {
+            self.snapshot
+                .items
+                .last()
+                .is_none_or(|previous| previous.id != item.id)
+                && !self
+                    .snapshot
+                    .items
+                    .iter()
+                    .any(|previous| previous.id == item.id)
+                && snapshot.error.as_deref().is_some_and(|error| {
+                    failure::notice_key(
+                        self.session.launch.provider,
+                        &snapshot,
+                        Some(&item.id),
+                        error,
+                    )
+                    .is_some()
+                })
+        });
+        // TurnStarted clears a non-history scalar error in the actor. A new
+        // turn that still publishes the same text therefore reports another
+        // occurrence, even if the intermediate clear was coalesced.
+        if (snapshot.error != self.snapshot.error
+            || new_error_item
+            || snapshot.turn_generation != self.snapshot.turn_generation)
             && let Some(error) = &snapshot.error
         {
             if snapshot.has_later {
                 self.defer_note(error.clone());
             } else {
-                self.note_at(next_anchor.clone(), next_after.clone(), error.clone());
+                let key = failure::notice_key(
+                    self.session.launch.provider,
+                    &snapshot,
+                    next_after.as_deref(),
+                    error,
+                );
+                self.note_at(
+                    next_anchor.clone(),
+                    next_after.clone(),
+                    error.clone(),
+                    key,
+                    snapshot.turn_generation,
+                );
             }
         }
         if !snapshot.has_later {
             for notice in std::mem::take(&mut self.unplaced_failures) {
-                self.note_at(next_anchor.clone(), next_after.clone(), notice);
+                let key = failure::notice_key(
+                    self.session.launch.provider,
+                    &snapshot,
+                    next_after.as_deref(),
+                    &notice,
+                );
+                self.note_at(
+                    next_anchor.clone(),
+                    next_after.clone(),
+                    notice,
+                    key,
+                    snapshot.turn_generation,
+                );
             }
         }
         // A cancel armed for one turn must not carry over to the next.
@@ -25665,6 +25750,8 @@ mod tests {
             message: Some("older-exchange".into()),
             after: Some("older-exchange".into()),
             text: failure.into(),
+            event_key: None,
+            turn_generation: 0,
         };
         runtime.failures.insert(0, older.clone());
         runtime.note("Tool deployment failed with HTTP 401".into());
