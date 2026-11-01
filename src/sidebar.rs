@@ -14716,14 +14716,32 @@ pub(crate) mod tests {
                                 .iter()
                                 .any(|name| name.contains("owned fixture failure"))
                         );
-                        assert!(names.iter().any(|name| name.contains("agent needs input")
-                            || name.contains("agent is waiting for input")));
-                        assert!(slots.len() >= 4 && slots[3].width > 0.0);
                         let title = if merged {
                             &*worktree.chrome.label
                         } else {
                             &channel.title
                         };
+                        let waiting_name = if merged {
+                            "agent needs input"
+                        } else {
+                            "1 waiting for input"
+                        };
+                        let kind = if merged { "worktree" } else { "channel" };
+                        let identity = format!("Open {kind} {title}, ");
+                        let primary_name = names
+                            .iter()
+                            .find(|name| name.starts_with(&identity))
+                            .unwrap_or_else(|| {
+                                panic!("the failed row keeps its identity: {names:?}")
+                            });
+                        assert!(
+                            primary_name.contains(&format!(", {waiting_name}")),
+                            "the failed row retains its live status: {primary_name}"
+                        );
+                        assert!(
+                            primary_name.ends_with(", could not be deleted: owned fixture failure")
+                        );
+                        assert!(slots.len() >= 4 && slots[3].width > 0.0);
                         let label = format!("Retry deleting {title}");
                         let (retry, _) = icon_glyphs_in_control(row(false), size, hover, &label);
                         assert_eq!(
@@ -16525,6 +16543,9 @@ pub(crate) mod tests {
             sidebar.model.mode = SidebarMode::Compact;
             // The menu belongs to the complete window, not the narrow rail.
             sidebar.bounds.width = 760.0;
+            // Keep the row's commands within this fixture's viewport. The
+            // scrolling-menu fixtures below retain their extra editor rows.
+            sidebar.model.external_editors.clear();
             if merged_worktree {
                 let entry = &mut sidebar.model.projects[0];
                 entry.worktrees[0].path = entry.repository.clone();
