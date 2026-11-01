@@ -24,6 +24,36 @@ const RETAINED_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 /// must not launch a new one.
 const ENTER_RELAUNCH_GRACE_MS: i64 = 750;
 
+/// The terminal and saved output shown when an open action was rendered.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct OutputIntent {
+    card: CardId,
+    terminal: TerminalId,
+    launch: LaunchRecipe,
+    path: PathBuf,
+}
+
+impl OutputIntent {
+    fn capture(card: CardId, session: &TerminalSession) -> Option<Self> {
+        Some(Self {
+            card,
+            terminal: session.id,
+            launch: session.launch.clone(),
+            path: session.transcript_path.clone()?,
+        })
+    }
+}
+
+impl std::fmt::Debug for OutputIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Launch recipes and saved paths are not diagnostic log content.
+        f.debug_struct("OutputIntent")
+            .field("card", &self.card)
+            .field("terminal", &self.terminal)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Where a restored ended card stands in getting its final screen back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RetainedOutput {
@@ -209,6 +239,26 @@ fn enter_relaunches(ended_at_unix_ms: i64, now_unix_ms: i64) -> bool {
 }
 
 impl Cagents {
+    fn terminal_output_intent(&self, card: CardId) -> Option<OutputIntent> {
+        let state = self
+            .card_state(card)
+            .filter(|state| state.existence.is_open())?;
+        if self.pane_close_owned(card) {
+            return None;
+        }
+        OutputIntent::capture(card, ended_terminal(Some(state))?)
+    }
+
+    pub(super) fn open_terminal_output(&mut self, intent: OutputIntent) -> Task<Message> {
+        if self.terminal_output_intent(intent.card).as_ref() != Some(&intent) {
+            return Task::none();
+        }
+        let Ok(url) = Url::from_file_path(&intent.path) else {
+            return Task::none();
+        };
+        self.open_document_link(Some(intent.card), url.as_str())
+    }
+
     /// The primary action an ended terminal's card offers.
     pub(super) fn terminal_relaunch(
         &self,
@@ -372,13 +422,13 @@ impl Cagents {
             .align_y(Alignment::Center);
 
         let mut actions: Vec<Element<'a, Message>> = Vec::with_capacity(3);
-        if session.transcript_path.is_some() {
-            actions.push(
+        if let Some(intent) = OutputIntent::capture(card, session) {
+            actions.push(crate::ui_controls::owned(
+                intent.clone(),
                 crate::ui_controls::icon_button(Icon::OpenFile, "Open saved output")
-                    .on_press(Message::OpenTerminalOutput(card))
-                    .id(card_control_id(card, "ended.output"))
-                    .into(),
-            );
+                    .on_press(Message::OpenTerminalOutput(intent))
+                    .id(card_control_id(card, "ended.output")),
+            ));
         }
         actions.push(
             crate::ui_controls::button::secondary("Close")
@@ -461,7 +511,6 @@ impl Cagents {
                     .into();
             }
         };
-        let saved = session.is_some_and(|session| session.transcript_path.is_some());
         let mut children: Vec<Element<'a, Message>> = vec![
             crate::ui_controls::passive_icon(Icon::Terminal, design::STATUS_ICON_SIZE),
             design::heading("Output not available").into(),
@@ -470,12 +519,12 @@ impl Cagents {
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
         ];
-        if saved {
-            children.push(
+        if let Some(intent) = session.and_then(|session| OutputIntent::capture(card, session)) {
+            children.push(crate::ui_controls::owned(
+                intent.clone(),
                 crate::ui_controls::button::quiet("Open saved output")
-                    .on_press_maybe(session.map(|_| Message::OpenTerminalOutput(card)))
-                    .into(),
-            );
+                    .on_press(Message::OpenTerminalOutput(intent)),
+            ));
         }
         widget::container(
             widget::column::with_children(children)
@@ -590,6 +639,222 @@ mod tests {
         let terminal = session.id;
         app.cards.insert(card, CardRuntime::Completed);
         (app, card, terminal)
+    }
+
+    fn saved_output_card() -> (Cagents, CardId) {
+        let (mut app, card, terminal) = restored_ended_card();
+        app.context_inspector_open = false;
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!("terminal fixture");
+        };
+        session.transcript_path = Some(PathBuf::from("/saved/original.log"));
+        app.retained_outputs
+            .insert(terminal, RetainedOutput::Discarded);
+        (app, card)
+    }
+
+    #[test]
+    fn saved_output_native_press_cannot_move_to_replacement_evidence() {
+        use iced::advanced::clipboard;
+        use iced::runtime::user_interface::{Cache, UserInterface};
+
+        fn frame(
+            app: &Cagents,
+            card: CardId,
+            placeholder: bool,
+            cache: &mut Cache,
+            renderer: &mut cosmic::Renderer,
+            events: &[iced::mouse::Event],
+        ) -> Vec<Message> {
+            let session = ended_terminal(app.card_state(card)).unwrap();
+            let content = if placeholder {
+                app.ended_terminal_placeholder(card, Some(session))
+            } else {
+                app.ended_terminal_footer(card, session)
+            };
+            let mut ui = UserInterface::build(
+                content,
+                iced::Size::new(900.0, 240.0),
+                std::mem::replace(cache, Cache::new()),
+                renderer,
+            );
+            let tree = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            let buttons: Vec<_> = tree
+                .root()
+                .iter()
+                .chain(tree.children())
+                .filter(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some("Open saved output")
+                        && !node.node().is_hidden()
+                })
+                .filter_map(|node| node.node().bounds())
+                .collect();
+            assert_eq!(buttons.len(), 1, "one actual saved-output control");
+            let bounds = buttons[0];
+            let pointer = iced::Point::new(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            let events: Vec<_> = events.iter().copied().map(iced::Event::Mouse).collect();
+            let mut messages = Vec::new();
+            ui.update(
+                &events,
+                iced::mouse::Cursor::Available(pointer),
+                renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            *cache = ui.into_cache();
+            messages
+        }
+
+        let press = iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left);
+        let release = iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left);
+        let mut renderer = super::super::tests::headless_renderer();
+        for placeholder in [false, true] {
+            for change in ["unchanged", "terminal", "path", "launch", "metadata"] {
+                let (mut app, card) = saved_output_card();
+                let mut cache = Cache::new();
+                assert!(
+                    frame(&app, card, placeholder, &mut cache, &mut renderer, &[press]).is_empty()
+                );
+                let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind
+                else {
+                    panic!("terminal fixture");
+                };
+                match change {
+                    "terminal" => session.id = TerminalId::new(),
+                    "path" => session.transcript_path = Some("/saved/replacement.log".into()),
+                    "launch" => session.launch.arguments.push("replacement".into()),
+                    "metadata" => session.resume_hint = Some("enriched metadata".into()),
+                    _ => {}
+                }
+                let terminal = session.id;
+                app.retained_outputs
+                    .insert(terminal, RetainedOutput::Discarded);
+                let mut messages = frame(
+                    &app,
+                    card,
+                    placeholder,
+                    &mut cache,
+                    &mut renderer,
+                    &[release],
+                );
+                if matches!(change, "unchanged" | "metadata") {
+                    assert_eq!(messages.len(), 1, "same output keeps its native press");
+                } else {
+                    assert!(messages.is_empty(), "held press followed {change}");
+                    messages = frame(
+                        &app,
+                        card,
+                        placeholder,
+                        &mut cache,
+                        &mut renderer,
+                        &[press, release],
+                    );
+                    assert_eq!(messages.len(), 1, "fresh click opens the replacement");
+                }
+                let Message::OpenTerminalOutput(intent) = messages.pop().unwrap() else {
+                    panic!("saved-output action");
+                };
+                assert_eq!(app.terminal_output_intent(card).as_ref(), Some(&intent));
+            }
+        }
+    }
+
+    #[test]
+    fn queued_saved_output_cannot_follow_a_replaced_or_unavailable_source() {
+        for change in [
+            "relaunch",
+            "terminal",
+            "path",
+            "launch",
+            "missing-output",
+            "starting",
+            "not-ended",
+            "closing",
+        ] {
+            let (mut app, card) = saved_output_card();
+            let intent = app.terminal_output_intent(card).unwrap();
+            let state = app.card_state_mut(card).unwrap();
+            let CardKind::Terminal(session) = &mut state.kind else {
+                panic!("terminal fixture");
+            };
+            match change {
+                "relaunch" => *session = fresh_terminal_relaunch(session),
+                "terminal" => session.id = TerminalId::new(),
+                "path" => session.transcript_path = Some("/saved/replacement.log".into()),
+                "launch" => session.launch.arguments.push("replacement".into()),
+                "missing-output" => session.transcript_path = None,
+                "starting" => state.residency = Residency::Hydrating { epoch: 1 },
+                "not-ended" => {
+                    session.continuity = TerminalContinuity::RelaunchAvailable {
+                        recipe: session.launch.clone(),
+                        last_exit: None,
+                    };
+                }
+                "closing" => {
+                    state.existence = Existence::Closing {
+                        operation_id: crate::model::OperationId::new(),
+                    };
+                }
+                _ => unreachable!(),
+            }
+            let count = app.workspace.cards().len();
+            assert!(
+                iced::runtime::task::into_stream(app.open_terminal_output(intent.clone()))
+                    .is_none()
+            );
+            // Dispatch the same queued action through the actual App arm too.
+            // Drop all update-tail tasks without contacting a host or file worker.
+            drop(app.update(Message::OpenTerminalOutput(intent)));
+            assert_eq!(app.workspace.cards().len(), count, "stale action: {change}");
+            assert_eq!(app.workspace.focused(), Some(card));
+        }
+    }
+
+    #[test]
+    fn saved_output_opens_beside_its_source_even_after_focus_moves() {
+        let (mut app, card) = saved_output_card();
+        let scope = PathBuf::from("/source-worktree");
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(card, scope.clone());
+        app.worktree_owners.insert(card, scope.clone());
+        let intent = app.terminal_output_intent(card).unwrap();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!("terminal fixture");
+        };
+        session.resume_hint = Some("enriched metadata".into());
+        drop(app.add_repository_card(
+            ProjectId::new(),
+            PathBuf::from("/other-worktree"),
+            PathBuf::from("/other-worktree"),
+        ));
+        let other = app.workspace.focused().unwrap();
+        assert_ne!(other, card);
+        // Opening creates the real file pane synchronously. Dropping its task
+        // keeps this ownership test independent of file I/O and the daemon.
+        drop(app.update(Message::OpenTerminalOutput(intent)));
+        let output = app.workspace.focused().unwrap();
+        assert_ne!(output, card);
+        assert_ne!(output, other);
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            vec![card, output, other]
+        );
+        assert_eq!(app.durable.card_scopes.get(&output), Some(&scope));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&output) else {
+            panic!("saved output opens as a file");
+        };
+        assert_eq!(
+            runtime
+                .descriptor
+                .worktree
+                .join(runtime.selected_path().unwrap()),
+            PathBuf::from("/saved/original.log")
+        );
     }
 
     #[test]
