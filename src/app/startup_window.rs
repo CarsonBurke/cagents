@@ -331,12 +331,14 @@ enum BootMessage {
     Surface(Result<window::Id, window::OpenError>),
     Loaded,
     Native(window::Id, window::Event),
+    PendingFocus(window::Id, cosmic::keyboard_nav::Action),
     Close,
     App(cosmic::Action<Message>),
 }
 
 struct DeferredWindow {
     window: window::Id,
+    pending_controls: iced::advanced::widget::Id,
     phase: Phase,
     geometry: Geometry,
     request: Option<Request>,
@@ -361,6 +363,7 @@ impl DeferredWindow {
         (
             Self {
                 window,
+                pending_controls: iced::advanced::widget::Id::unique(),
                 phase: Phase::AwaitSurface,
                 geometry: Geometry::default(),
                 request: Some(request),
@@ -438,6 +441,12 @@ impl DeferredWindow {
         }
         match message {
             BootMessage::Close => self.close_pending(),
+            BootMessage::PendingFocus(id, action)
+                if id == self.window
+                    && matches!(self.phase, Phase::AwaitSurface | Phase::Loading) =>
+            {
+                self.focus_pending(action)
+            }
             BootMessage::Native(id, event) if id == self.window => {
                 if matches!(event, window::Event::CloseRequested | window::Event::Closed) {
                     return self.close_pending();
@@ -598,7 +607,15 @@ impl DeferredWindow {
         if let Some(shell) = &self.shell {
             return shell.subscription().map(BootMessage::App);
         }
-        iced::event::listen_with(|event, _, id| match event {
+        iced::event::listen_with(Self::pending_event)
+    }
+
+    fn pending_event(
+        event: iced::Event,
+        status: iced::event::Status,
+        id: window::Id,
+    ) -> Option<BootMessage> {
+        match event {
             iced::Event::Window(
                 event @ (window::Event::Opened { .. }
                 | window::Event::Resized(_)
@@ -608,8 +625,41 @@ impl DeferredWindow {
                 | window::Event::CloseRequested
                 | window::Event::Closed),
             ) => Some(BootMessage::Native(id, event)),
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+                modifiers,
+                ..
+            }) if status == iced::event::Status::Ignored && !modifiers.control() => {
+                Some(BootMessage::PendingFocus(
+                    id,
+                    if modifiers.shift() {
+                        cosmic::keyboard_nav::Action::FocusPrevious
+                    } else {
+                        cosmic::keyboard_nav::Action::FocusNext
+                    },
+                ))
+            }
             _ => None,
-        })
+        }
+    }
+
+    fn focus_pending(&self, action: cosmic::keyboard_nav::Action) -> Task<BootMessage> {
+        use iced::advanced::widget::{Operation, operation};
+        let traversal: Box<dyn Operation> = match action {
+            cosmic::keyboard_nav::Action::FocusNext => {
+                Box::new(operation::focusable::focus_next::<()>())
+            }
+            cosmic::keyboard_nav::Action::FocusPrevious => {
+                Box::new(operation::focusable::focus_previous::<()>())
+            }
+            _ => return Task::none(),
+        };
+        // A queued traversal must not focus restored app controls after the
+        // pending container has been replaced, even if its Task was issued.
+        iced::runtime::task::effect(iced::runtime::Action::widget(operation::scoped(
+            self.pending_controls.clone(),
+            traversal,
+        )))
     }
     fn title(&self, id: window::Id) -> String {
         self.shell
@@ -647,7 +697,10 @@ impl DeferredWindow {
                 .into(),
         ])
         .spacing(16);
-        cosmic::widget::container(content).padding(24).into()
+        cosmic::widget::container(content)
+            .id(self.pending_controls.clone())
+            .padding(24)
+            .into()
     }
 }
 
@@ -890,5 +943,194 @@ mod tests {
         is_send::<Startup>();
         is_send::<PreparedWindow>();
         is_send::<LoadResult>();
+    }
+
+    fn keyboard_event(
+        named: iced::keyboard::key::Named,
+        modifiers: iced::keyboard::Modifiers,
+    ) -> iced::Event {
+        let key = iced::keyboard::Key::Named(named);
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: iced::keyboard::key::Physical::Unidentified(
+                iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            location: iced::keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    fn headless_renderer() -> cosmic::Renderer {
+        use iced::advanced::renderer::Headless;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                iced::Font::DEFAULT,
+                iced::Pixels(16.0),
+                Some("tiny-skia"),
+            ))
+            .expect("create the existing headless software renderer")
+    }
+
+    fn apply_widget_task(
+        task: Task<BootMessage>,
+        element: &mut cosmic::Element<'_, BootMessage>,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+    ) {
+        use iced::{advanced::widget::operation::Outcome, futures::StreamExt};
+        let mut stream = iced::runtime::task::into_stream(task).expect("widget focus task");
+        let action = iced::futures::executor::block_on(stream.next()).expect("focus operation");
+        let iced::runtime::Action::Widget(mut operation) = action else {
+            panic!("pending navigation must use a real widget operation")
+        };
+        let node = element.as_widget_mut().layout(
+            tree,
+            renderer,
+            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 600.0)),
+        );
+        loop {
+            element.as_widget_mut().operate(
+                tree,
+                iced::advanced::Layout::new(&node),
+                renderer,
+                operation.as_mut(),
+            );
+            match operation.finish() {
+                Outcome::None => break,
+                Outcome::Chain(next) => operation = next,
+                Outcome::Some(()) => panic!("focus traversal must not inject a reducer message"),
+            }
+        }
+        assert!(iced::futures::executor::block_on(stream.next()).is_none());
+    }
+
+    fn enter_widget(
+        element: &mut cosmic::Element<'_, BootMessage>,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+    ) -> Vec<BootMessage> {
+        use iced::advanced::{Layout, Shell, clipboard, layout, mouse};
+        let node = element.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 600.0)),
+        );
+        let layout = Layout::new(&node);
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            tree,
+            &keyboard_event(
+                iced::keyboard::key::Named::Enter,
+                iced::keyboard::Modifiers::empty(),
+            ),
+            layout,
+            mouse::Cursor::Unavailable,
+            renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &layout.bounds(),
+        );
+        messages
+    }
+
+    #[test]
+    fn pending_tab_and_shift_tab_focus_the_real_close_button_for_enter() {
+        let renderer = headless_renderer();
+        for (modifiers, expected) in [
+            (
+                iced::keyboard::Modifiers::empty(),
+                cosmic::keyboard_nav::Action::FocusNext,
+            ),
+            (
+                iced::keyboard::Modifiers::SHIFT,
+                cosmic::keyboard_nav::Action::FocusPrevious,
+            ),
+        ] {
+            let (mut pending, owner) = pending();
+            let _finalize = Finalize(owner.clone());
+            let mut tree = {
+                let mut element = pending.view(pending.window);
+                let mut tree = iced::advanced::widget::Tree::new(element.as_widget());
+                assert!(enter_widget(&mut element, &mut tree, &renderer).is_empty());
+                tree
+            };
+            let event = keyboard_event(iced::keyboard::key::Named::Tab, modifiers);
+            let message =
+                DeferredWindow::pending_event(event, iced::event::Status::Ignored, pending.window)
+                    .expect("actual ignored Tab enters pending navigation");
+            assert!(matches!(&message, BootMessage::PendingFocus(id, action)
+                if *id == pending.window && *action == expected));
+            let task = pending.update(message);
+            let mut element = pending.view(pending.window);
+            tree.diff(element.as_widget_mut());
+            apply_widget_task(task, &mut element, &mut tree, &renderer);
+            let messages = enter_widget(&mut element, &mut tree, &renderer);
+            assert!(matches!(messages.as_slice(), [BootMessage::Close]));
+            assert!(!owner.worker.state_entered.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn pending_keyboard_navigation_cannot_replay_into_ready_controls() {
+        let renderer = headless_renderer();
+        let (mut pending, owner) = pending();
+        let _finalize = Finalize(owner.clone());
+        let tab = keyboard_event(
+            iced::keyboard::key::Named::Tab,
+            iced::keyboard::Modifiers::empty(),
+        );
+        let message = DeferredWindow::pending_event(
+            tab.clone(),
+            iced::event::Status::Ignored,
+            pending.window,
+        )
+        .unwrap();
+        let issued = pending.update(message.clone());
+        // A different widget scope stands for the replacement view; this is a
+        // widget-operation contract, not a fabricated Ready app/native proof.
+        let mut replacement: cosmic::Element<'_, BootMessage> = cosmic::widget::container(
+            cosmic::widget::button::text("Restored action").on_press(BootMessage::Close),
+        )
+        .id(iced::advanced::widget::Id::unique())
+        .into();
+        let mut tree = iced::advanced::widget::Tree::new(replacement.as_widget());
+        assert!(enter_widget(&mut replacement, &mut tree, &renderer).is_empty());
+        apply_widget_task(issued, &mut replacement, &mut tree, &renderer);
+        assert!(enter_widget(&mut replacement, &mut tree, &renderer).is_empty());
+        // Exercise only the actual phase guard: no saved-state app is created.
+        pending.phase = Phase::Ready;
+        assert!(iced::runtime::task::into_stream(pending.update(message)).is_none());
+        assert!(
+            DeferredWindow::pending_event(tab, iced::event::Status::Captured, pending.window)
+                .is_none()
+        );
+        assert!(
+            DeferredWindow::pending_event(
+                keyboard_event(
+                    iced::keyboard::key::Named::Enter,
+                    iced::keyboard::Modifiers::empty()
+                ),
+                iced::event::Status::Ignored,
+                pending.window,
+            )
+            .is_none()
+        );
+        assert!(
+            DeferredWindow::pending_event(
+                keyboard_event(
+                    iced::keyboard::key::Named::Tab,
+                    iced::keyboard::Modifiers::CTRL
+                ),
+                iced::event::Status::Ignored,
+                pending.window,
+            )
+            .is_none()
+        );
     }
 }
