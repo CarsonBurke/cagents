@@ -341,9 +341,11 @@ nonzero peer PID, a hardcoded namespace inode or a numeric `/proc/PID` lookup.
 This relies on the existing trusted OS manager and its well-known user-bus
 service routing; it does not protect against a hostile same-user replacement
 of those OS services. The request's routing and launch authority are unchanged.
-If the peer or its namespace cannot be proved, no scope
-request is attempted and ordinary launch is retained without claiming separate
-OOM isolation. An actual request or membership failure in a proved context
+Both namespace reports are read with `openat2` beneath one `/proc` descriptor
+verified as procfs, without crossing mounts or magic links. If the peer or its
+namespace cannot be proved, no scope request is attempted, ordinary launch is
+retained without claiming separate OOM isolation, and the refusal's reason is
+returned to the caller. An actual request or membership failure in a proved context
 still reports failure. Scope-dependent tests report unqualified isolation when
 that same proof is unavailable, and keep their strict membership assertions
 when it is available. Kernel-peer regressions use private Unix sockets without

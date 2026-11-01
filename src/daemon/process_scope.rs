@@ -105,8 +105,9 @@ impl ManagerNamespace {
         if size as usize != std::mem::size_of::<i32>() || !peer_alive(&peer) {
             return Err(io::Error::other("manager peer is no longer live"));
         }
-        let own = read_procfs("/proc/self/status")?;
-        let peer_info = read_procfs(&format!("/proc/self/fdinfo/{}", peer.as_raw_fd()))?;
+        let procfs = Procfs::open()?;
+        let own = procfs.read("self/status")?;
+        let peer_info = procfs.read(&format!("self/fdinfo/{}", peer.as_raw_fd()))?;
         if !same_namespace(&own, std::process::id(), &peer_info, credentials.pid)
             || !peer_alive(&peer)
         {
@@ -119,22 +120,75 @@ impl ManagerNamespace {
     }
 }
 
-/// Only the kernel's procfs reports namespaces; another filesystem mounted on
-/// /proc could claim any.
-fn read_procfs(path: &str) -> io::Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut statfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: the open file and correctly sized output remain live.
-    if unsafe { libc::fstatfs(file.as_raw_fd(), statfs.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
+/// One procfs instance that every namespace report is read from. Only the
+/// kernel's procfs reports namespaces, and entries bind-mounted over it from
+/// another instance could disagree, so every entry resolves beneath this one
+/// mount without crossing into another.
+struct Procfs(OwnedFd);
+
+impl Procfs {
+    fn open() -> io::Result<Self> {
+        Self::open_at(c"/proc")
     }
-    // SAFETY: fstatfs initialized the complete statfs above.
-    if unsafe { statfs.assume_init() }.f_type != libc::PROC_SUPER_MAGIC {
-        return Err(io::Error::other("/proc is not procfs"));
+
+    fn open_at(path: &std::ffi::CStr) -> io::Result<Self> {
+        // SAFETY: the path is NUL-terminated and outlives the call.
+        let root = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if root < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful open transferred this new owned descriptor.
+        let root = unsafe { OwnedFd::from_raw_fd(root) };
+        let mut statfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: the owned descriptor and correctly sized output remain live.
+        if unsafe { libc::fstatfs(root.as_raw_fd(), statfs.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fstatfs initialized the complete statfs above.
+        if unsafe { statfs.assume_init() }.f_type != libc::PROC_SUPER_MAGIC {
+            return Err(io::Error::other("/proc is not procfs"));
+        }
+        Ok(Self(root))
     }
-    let mut contents = String::new();
-    io::Read::read_to_string(&mut file, &mut contents)?;
-    Ok(contents)
+
+    fn read(&self, entry: &str) -> io::Result<String> {
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: libc::RESOLVE_BENEATH | libc::RESOLVE_NO_XDEV | libc::RESOLVE_NO_MAGICLINKS,
+        };
+        let entry = std::ffi::CString::new(entry).map_err(io::Error::other)?;
+        // SAFETY: the root descriptor, NUL-terminated entry and open_how of the
+        // stated size remain live for the call.
+        let file = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                self.0.as_raw_fd(),
+                entry.as_ptr(),
+                &how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if file < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful openat2 transferred this new owned descriptor.
+        let mut file = unsafe { fs::File::from_raw_fd(file as i32) };
+        let mut contents = String::new();
+        io::Read::read_to_string(&mut file, &mut contents)?;
+        Ok(contents)
+    }
 }
 
 /// procfs lists NSpid from its own PID namespace down to the process's. One
@@ -143,14 +197,15 @@ fn read_procfs(path: &str) -> io::Result<String> {
 /// translated into our namespace, proves the peer shares it.
 fn same_namespace(own: &str, own_pid: u32, peer: &str, peer_pid: i32) -> bool {
     let nspid = |status: &str| {
-        status
+        let mut fields = status
             .lines()
-            .find_map(|line| line.strip_prefix("NSpid:"))
-            .map(|pids| {
-                pids.split_whitespace()
-                    .map(str::parse::<i64>)
-                    .collect::<Result<Vec<_>, _>>()
-            })
+            .filter_map(|line| line.strip_prefix("NSpid:"));
+        let field = fields.next().filter(|_| fields.next().is_none());
+        field.map(|pids| {
+            pids.split_whitespace()
+                .map(str::parse::<i64>)
+                .collect::<Result<Vec<_>, _>>()
+        })
     };
     matches!(nspid(own), Some(Ok(pids)) if pids == [i64::from(own_pid)])
         && matches!(nspid(peer), Some(Ok(pids)) if pids == [i64::from(peer_pid)])
@@ -210,11 +265,15 @@ fn with_verified_manager(
     proof: io::Result<ManagerNamespace>,
     request: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
-    let Ok(proof) = proof else {
-        return Ok(());
-    };
+    // An unproved manager receives no request. Its reason still reaches the
+    // caller, which keeps the existing launch and reports the lost isolation.
+    let proof = proof.map_err(|error| {
+        io::Error::new(error.kind(), format!("user manager proof failed: {error}"))
+    })?;
     if !peer_alive(&proof.peer) {
-        return Ok(());
+        return Err(io::Error::other(
+            "user manager proof failed: manager peer is no longer live",
+        ));
     }
     // Existing trust contract: this fixed OS manager owns the well-known
     // org.freedesktop.systemd1 service on the fixed OS user bus. We do not
@@ -409,11 +468,104 @@ pub(crate) mod tests {
     #[test]
     fn unproved_manager_never_attempts_numeric_pid_enrollment() {
         for error in [libc::ENOPROTOOPT, libc::EPERM, libc::EACCES, libc::ENOENT] {
-            with_verified_manager(Err(io::Error::from_raw_os_error(error)), || {
+            let refused = with_verified_manager(Err(io::Error::from_raw_os_error(error)), || {
                 panic!("unproved manager must not receive a scope request")
             })
-            .unwrap();
+            .unwrap_err();
+            assert!(
+                refused
+                    .to_string()
+                    .starts_with("user manager proof failed: ")
+            );
         }
+    }
+
+    #[test]
+    fn a_manager_that_exited_after_its_proof_receives_no_request() {
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        // SAFETY: pidfd_open returns a new descriptor for this unreaped child.
+        let peer = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+        assert!(peer >= 0);
+        // SAFETY: the successful syscall transferred this new owned descriptor.
+        let peer = unsafe { OwnedFd::from_raw_fd(peer as i32) };
+        child.wait().unwrap();
+        let proof = ManagerNamespace {
+            _connection: UnixStream::pair().unwrap().0,
+            peer,
+        };
+        let refused = with_verified_manager(Ok(proof), || panic!("dead manager request"));
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            "user manager proof failed: manager peer is no longer live"
+        );
+    }
+
+    #[test]
+    fn a_directory_outside_procfs_cannot_supply_namespace_reports() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = std::ffi::CString::new(directory.path().as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            Procfs::open_at(&path).err().unwrap().to_string(),
+            "/proc is not procfs"
+        );
+    }
+
+    /// Binds a forged report over a real entry, in a mount namespace of a child
+    /// test process where unprivileged namespaces allow.
+    #[test]
+    fn a_report_bind_mounted_over_procfs_is_refused() {
+        const CHILD: &str = "CAGENTS_SCOPE_PROCFS_MOUNT_TEST";
+        let unshare = || {
+            let mut command = Command::new("unshare");
+            command.args(["--user", "--map-root-user", "--mount"]);
+            command
+        };
+        if std::env::var_os(CHILD).is_none() {
+            if !unshare()
+                .arg("true")
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                eprintln!("skipped: no unprivileged mount namespace");
+                return;
+            }
+            let name = module_path!().split_once("::").unwrap().1;
+            let output = unshare()
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("{name}::a_report_bind_mounted_over_procfs_is_refused"),
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "the namespaced fixture failed: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let forged = directory.path().join("status");
+        fs::write(&forged, "NSpid:\t1\n").unwrap();
+        let entry = format!("{}/status", std::process::id());
+        let status = Command::new("mount")
+            .arg("--bind")
+            .arg(&forged)
+            .arg(format!("/proc/{entry}"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            Procfs::open()
+                .unwrap()
+                .read(&entry)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EXDEV)
+        );
     }
 
     #[test]
@@ -432,6 +584,7 @@ pub(crate) mod tests {
             (own, 40, "pos:\t0\nPid:\t7\n", 7, false),
             (own, 41, peer, 7, false),
             ("Name:\tcagentsd\n", 40, peer, 7, false),
+            ("NSpid:\t40\nNSpid:\t40\n", 40, peer, 7, false),
         ];
         for (own, own_pid, peer, peer_pid, proved) in cases {
             assert_eq!(
@@ -443,17 +596,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn namespace_reports_are_read_only_from_procfs() {
-        let directory = tempfile::tempdir().unwrap();
-        let forged = directory.path().join("status");
-        fs::write(&forged, "NSpid:\t1\n").unwrap();
+    fn namespace_reports_resolve_only_within_one_procfs_mount() {
+        let procfs = Procfs::open().unwrap();
+        assert!(procfs.read("self/status").unwrap().contains("NSpid:"));
         assert_eq!(
-            read_procfs(forged.to_str().unwrap())
-                .unwrap_err()
-                .to_string(),
-            "/proc is not procfs"
+            procfs.read("../etc/hostname").unwrap_err().raw_os_error(),
+            Some(libc::EXDEV)
         );
-        assert!(read_procfs("/proc/self/status").unwrap().contains("NSpid:"));
+        // A magic link leads out of this mount just as a bind mount would.
+        assert_eq!(
+            procfs
+                .read("self/cwd/Cargo.toml")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
     }
 
     #[test]
@@ -462,7 +619,7 @@ pub(crate) mod tests {
             eprintln!("no OS user manager; scope isolation unqualified here");
             return;
         }
-        let own = read_procfs("/proc/self/status").unwrap();
+        let own = Procfs::open().unwrap().read("self/status").unwrap();
         if !own.lines().any(|line| {
             line.strip_prefix("NSpid:")
                 .is_some_and(|pids| pids.split_whitespace().count() == 1)
@@ -486,7 +643,8 @@ pub(crate) mod tests {
         let wrong_uid = super::super::current_uid().wrapping_add(1);
         let proof = ManagerNamespace::from_connection(connection, wrong_uid);
         assert!(proof.is_err());
-        with_verified_manager(proof, || panic!("wrong peer must not receive a request")).unwrap();
+        with_verified_manager(proof, || panic!("wrong peer must not receive a request"))
+            .unwrap_err();
     }
 
     #[test]
@@ -519,7 +677,7 @@ pub(crate) mod tests {
                 // Verify real refusal, not a fictional positive manager proof.
                 assert!(matches!(error.raw_os_error(), Some(libc::ENOPROTOOPT)));
                 eprintln!("kernel manager proof unavailable; no scope request: {error}");
-                with_verified_manager(Err(error), || panic!("unproved peer request")).unwrap();
+                with_verified_manager(Err(error), || panic!("unproved peer request")).unwrap_err();
             }
         }
     }
