@@ -11578,6 +11578,7 @@ mod row_interaction {
         modifiers: keyboard::Modifiers,
         selection_bounds: Option<Rectangle>,
         selection_exclusion: Option<Rectangle>,
+        action_bounds: Option<Rectangle>,
         origin: Option<(super::SelectionRow, Point)>,
         dragging: bool,
         drop: Option<(Option<super::SelectionRow>, f32)>,
@@ -11623,7 +11624,11 @@ mod row_interaction {
         ) {
             if self.1.as_ref().is_none_or(|target| Some(target) == id) {
                 self.0 |= state.is_focused();
-                self.2 = Some(bounds);
+                self.2 = Some(if self.1.is_none() {
+                    self.2.map_or(bounds, |previous| previous.union(&bounds))
+                } else {
+                    bounds
+                });
             } else if let Some(primary) = self.2
                 && let Some(overlap) = primary.intersection(&bounds)
             {
@@ -11734,8 +11739,9 @@ mod row_interaction {
         }
 
         /// `reserve` is how much of the row's trailing edge `actions` covers
-        /// once it is visible; pass `0.0` when the strip paints its own
-        /// background and the base row may run underneath it.
+        /// once it is visible; pass `0.0` when the base row has its own content
+        /// inset or may run underneath the commands. Their actual control
+        /// bounds still keep primary and command releases separate.
         pub(super) fn actions(
             base: Element<'a, SidebarAction>,
             actions: Element<'a, SidebarAction>,
@@ -11757,26 +11763,34 @@ mod row_interaction {
 
         fn focus(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer) {
             let mut focus = FocusWithin::default();
+            let mut actions = FocusWithin::default();
             match self.kind {
                 Kind::Selectable { row, .. } => focus.1 = Some(super::selection_row_focus_id(row)),
                 Kind::Actions { .. } => {}
                 Kind::Search { .. } => focus.1 = Some(super::search_focus_id()),
                 _ => return,
             }
-            for ((child, tree), layout) in self
+            for (index, ((child, tree), layout)) in self
                 .children
                 .iter_mut()
                 .zip(&mut tree.children)
                 .zip(layout.children())
+                .enumerate()
             {
+                let operation = if index == 1 && matches!(self.kind, Kind::Actions { .. }) {
+                    &mut actions
+                } else {
+                    &mut focus
+                };
                 child
                     .as_widget_mut()
-                    .operate(tree, layout, renderer, &mut focus);
+                    .operate(tree, layout, renderer, operation);
             }
             let state = tree.state.downcast_mut::<State>();
-            state.focused = focus.0;
+            state.focused = focus.0 || actions.0;
             state.selection_bounds = focus.2;
             state.selection_exclusion = focus.3;
+            state.action_bounds = actions.2;
         }
 
         fn header_at(&self, layout: Layout<'_>, point: Point) -> Option<super::SelectionRow> {
@@ -12314,6 +12328,15 @@ mod row_interaction {
                 }
             }
             let show_actions = state.hovered || state.focused;
+            let release_over_action = show_actions
+                && matches!(
+                    event,
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                        | Event::Touch(cosmic::iced::touch::Event::FingerLifted { .. })
+                )
+                && state
+                    .action_bounds
+                    .is_some_and(|bounds| cursor.is_over(bounds));
             let group = matches!(self.kind, Kind::Group { .. });
             let header_bounds = child_layouts(&self.kind, state, layout)
                 .next()
@@ -12342,6 +12365,13 @@ mod row_interaction {
                     && matches!(self.kind, Kind::Actions { .. })
                     && !show_actions
                     && matches!(event, Event::Touch(_))
+                    && !matches!(
+                        event,
+                        Event::Touch(
+                            cosmic::iced::touch::Event::FingerLifted { .. }
+                                | cosmic::iced::touch::Event::FingerLost { .. }
+                        )
+                    )
                 {
                     continue;
                 }
@@ -12350,12 +12380,17 @@ mod row_interaction {
                 } else {
                     viewport
                 };
-                let cursor =
-                    if (index == 1 && !show_actions && !group) || !cursor.is_over(*viewport) {
-                        mouse::Cursor::Unavailable
-                    } else {
-                        cursor
-                    };
+                // A primary press released on a command must reset the primary
+                // button without activating it. Other events retain the real
+                // cursor so the row's hover surface still spans the command.
+                let cursor = if (index == 0 && release_over_action)
+                    || (index == 1 && !show_actions && !group)
+                    || !cursor.is_over(*viewport)
+                {
+                    mouse::Cursor::Unavailable
+                } else {
+                    cursor
+                };
                 child.as_widget_mut().update(
                     tree, event, layout, cursor, renderer, clipboard, shell, viewport,
                 );
@@ -14225,6 +14260,462 @@ pub(crate) mod tests {
                         resting,
                         "keyboard focus must not reflow the row"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_row_presses_cannot_finish_on_the_other_control() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Shell, clipboard},
+            mouse,
+        };
+        let renderer = headless_renderer();
+        let channel = SidebarChannel::new(
+            ChannelId::new(),
+            "Similar prefix: the intended session".into(),
+            true,
+            Some(crate::agent::ActivityState::Waiting),
+            false,
+            1,
+            true,
+            1,
+        );
+        let mut worktree = worktree(3, "similar-prefix-merged-worktree", false);
+        let mut pr = project().pull_requests.remove(0);
+        pr.state = Some(WorktreePullRequestState::Merged);
+        worktree.set_pull_request(pr);
+        for width in [148.0, 240.0, 380.0] {
+            for merged_worktree in [false, true] {
+                for press_action in [false, true] {
+                    for release_action in [false, true] {
+                        let mut element = if merged_worktree {
+                            worktree_view(
+                                project_id(1),
+                                &worktree,
+                                false,
+                                false,
+                                None,
+                                false,
+                                true,
+                                &[],
+                                WorktreeRowState::default(),
+                                false,
+                                Some(1),
+                                "",
+                                true,
+                            )
+                        } else {
+                            channel_view(&channel, Listing::Live, false, false, Some(1), "")
+                        };
+                        let mut tree = Tree::new(&element);
+                        let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
+                        let node = element.as_widget_mut().layout(
+                            &mut tree,
+                            &renderer,
+                            &layout::Limits::new(Size::ZERO, viewport.size()),
+                        );
+                        let at = |action| {
+                            Point::new(
+                                if action { width - 8.0 } else { width / 3.0 },
+                                WORKTREE_ROW_HEIGHT / 2.0,
+                            )
+                        };
+                        let from = at(press_action);
+                        let to = at(release_action);
+                        let mut messages = Vec::new();
+                        let mut captured_release = false;
+                        for (event, position) in [
+                            (
+                                Event::Mouse(mouse::Event::CursorMoved { position: from }),
+                                from,
+                            ),
+                            (
+                                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                                from,
+                            ),
+                            (Event::Mouse(mouse::Event::CursorMoved { position: to }), to),
+                            (
+                                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                                to,
+                            ),
+                        ] {
+                            let mut shell = Shell::new(&mut messages);
+                            element.as_widget_mut().update(
+                                &mut tree,
+                                &event,
+                                Layout::new(&node),
+                                mouse::Cursor::Available(position),
+                                &renderer,
+                                &mut clipboard::Null,
+                                &mut shell,
+                                &viewport,
+                            );
+                            if matches!(event, Event::Mouse(mouse::Event::ButtonReleased(_))) {
+                                captured_release = shell.is_event_captured();
+                            }
+                        }
+                        let expected = if press_action != release_action {
+                            Vec::new()
+                        } else if merged_worktree {
+                            vec![if press_action {
+                                SidebarAction::ProjectCommand {
+                                    project_id: project_id(1),
+                                    worktree_id: Some(worktree.id),
+                                    command: ProjectCommand::Delete,
+                                }
+                            } else {
+                                worktree_primary_action(project_id(1), &worktree, false)
+                            }]
+                        } else {
+                            vec![if press_action {
+                                SidebarAction::DeleteChannel {
+                                    channel_id: channel.id,
+                                }
+                            } else {
+                                SidebarAction::OpenChannel {
+                                    channel_id: channel.id,
+                                }
+                            }]
+                        };
+                        assert_eq!(
+                            messages, expected,
+                            "width={width}, merged={merged_worktree}, press_action={press_action}, release_action={release_action}"
+                        );
+                        assert!(
+                            captured_release,
+                            "the original owner consumes even a canceled release"
+                        );
+                        // A canceled release must retire the press, rather than
+                        // merely suppressing its callback until another release.
+                        messages.clear();
+                        element.as_widget_mut().update(
+                            &mut tree,
+                            &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                            Layout::new(&node),
+                            mouse::Cursor::Available(from),
+                            &renderer,
+                            &mut clipboard::Null,
+                            &mut Shell::new(&mut messages),
+                            &viewport,
+                        );
+                        assert!(messages.is_empty(), "a retired press cannot activate later");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_row_actions_clear_touch_presses_before_the_next_gesture() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Shell, clipboard},
+            mouse, touch,
+        };
+        let renderer = headless_renderer();
+        let channel = SidebarChannel::new(
+            ChannelId::new(),
+            "Touch target".into(),
+            false,
+            None,
+            false,
+            1,
+            true,
+            1,
+        );
+        let action = Point::new(232.0, WORKTREE_ROW_HEIGHT / 2.0);
+        let primary = Point::new(80.0, WORKTREE_ROW_HEIGHT / 2.0);
+        let outside = Point::new(260.0, WORKTREE_ROW_HEIGHT / 2.0);
+        for lost in [false, true] {
+            let mut element = channel_view(&channel, Listing::Live, false, false, Some(1), "");
+            let mut tree = Tree::new(&element);
+            let viewport = Rectangle::with_size(Size::new(240.0, WORKTREE_ROW_HEIGHT));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let finger = touch::Finger(1);
+            let ending = if lost {
+                touch::Event::FingerLost {
+                    id: finger,
+                    position: outside,
+                }
+            } else {
+                touch::Event::FingerLifted {
+                    id: finger,
+                    position: outside,
+                }
+            };
+            let mut messages = Vec::new();
+            for (event, position) in [
+                (
+                    Event::Mouse(mouse::Event::CursorMoved { position: action }),
+                    action,
+                ),
+                (
+                    Event::Touch(touch::Event::FingerPressed {
+                        id: finger,
+                        position: action,
+                    }),
+                    action,
+                ),
+                (
+                    Event::Mouse(mouse::Event::CursorMoved { position: outside }),
+                    outside,
+                ),
+                (Event::Touch(ending), outside),
+                (
+                    Event::Mouse(mouse::Event::CursorMoved { position: action }),
+                    action,
+                ),
+                (
+                    Event::Touch(touch::Event::FingerLifted {
+                        id: finger,
+                        position: action,
+                    }),
+                    action,
+                ),
+                (
+                    Event::Mouse(mouse::Event::CursorMoved { position: primary }),
+                    primary,
+                ),
+                (
+                    Event::Touch(touch::Event::FingerPressed {
+                        id: touch::Finger(2),
+                        position: primary,
+                    }),
+                    primary,
+                ),
+                (
+                    Event::Touch(touch::Event::FingerLifted {
+                        id: touch::Finger(2),
+                        position: primary,
+                    }),
+                    primary,
+                ),
+            ] {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Available(position),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+            assert_eq!(
+                messages,
+                vec![SidebarAction::OpenChannel {
+                    channel_id: channel.id
+                }],
+                "hidden cleanup (lost={lost}) must retire Delete and allow a fresh primary gesture"
+            );
+        }
+    }
+
+    #[test]
+    fn section_commands_cancel_primary_releases_over_each_actual_target() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Shell, clipboard},
+            mouse,
+        };
+        let renderer = headless_renderer();
+        for width in [148.0, 240.0] {
+            for target in [width - 45.0, width - 15.0] {
+                let actions = widget::container(widget::row::with_children(vec![
+                    icon_action(
+                        Icon::Refresh,
+                        "Refresh",
+                        Some(SidebarAction::Refresh),
+                        Id::new("test.refresh"),
+                    ),
+                    icon_action(
+                        Icon::Settings,
+                        "Settings",
+                        Some(SidebarAction::OpenSettings),
+                        Id::new("test.settings"),
+                    ),
+                ]))
+                .align_right(Length::Fill)
+                .into();
+                let mut element = panel_section(
+                    &main_key(),
+                    PanelSection::Files,
+                    Id::new("test.section"),
+                    None,
+                    false,
+                    false,
+                    Some(actions),
+                    || cosmic::iced::widget::Space::new().height(0).into(),
+                );
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(width, PANEL_ROW_HEIGHT));
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                let primary = Point::new(20.0, PANEL_ROW_HEIGHT / 2.0);
+                let command = Point::new(target, PANEL_ROW_HEIGHT / 2.0);
+                let mut messages = Vec::new();
+                for (event, position) in [
+                    (
+                        Event::Mouse(mouse::Event::CursorMoved { position: primary }),
+                        primary,
+                    ),
+                    (
+                        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        primary,
+                    ),
+                    (
+                        Event::Mouse(mouse::Event::CursorMoved { position: command }),
+                        command,
+                    ),
+                    (
+                        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                        command,
+                    ),
+                ] {
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        Layout::new(&node),
+                        mouse::Cursor::Available(position),
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &viewport,
+                    );
+                }
+                assert!(
+                    messages.is_empty(),
+                    "a section press cannot finish on either command"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_deletion_rows_keep_identity_status_and_a_usable_retry() {
+        use cosmic::iced::{Point, Rectangle};
+
+        let renderer = headless_renderer();
+        for width in [148.0, 240.0, 380.0] {
+            for merged in [false, true] {
+                for deletion in [
+                    RowDeletion::Deleting,
+                    RowDeletion::Failed("owned fixture failure".into()),
+                ] {
+                    let deleting = deletion == RowDeletion::Deleting;
+                    let mut entry = grid_fixture().projects.remove(0);
+                    let waiting = Some(crate::agent::ActivityState::Waiting);
+                    let mut channel = entry.channels.remove(0);
+                    channel = channel.with_attention(AttentionSummary::card(waiting, false, false));
+                    channel.deletion = Some(deletion.clone());
+                    let mut worktree = entry.worktrees.remove(1);
+                    let mut pr = worktree.pull_request().unwrap().clone();
+                    pr.state = Some(WorktreePullRequestState::Merged);
+                    worktree.set_pull_request(pr);
+                    worktree.deletion = Some(deletion);
+                    let row = |modal| {
+                        if merged {
+                            worktree_view(
+                                entry.id,
+                                &worktree,
+                                false,
+                                false,
+                                None,
+                                modal,
+                                true,
+                                &[],
+                                WorktreeRowState {
+                                    activity: waiting,
+                                    has_panes: true,
+                                    ..Default::default()
+                                },
+                                false,
+                                Some(1),
+                                "",
+                                false,
+                            )
+                        } else {
+                            channel_view(&channel, Listing::Live, modal, false, Some(1), "")
+                        }
+                    };
+                    let size = Size::new(width, WORKTREE_ROW_HEIGHT);
+                    let viewport = Rectangle::with_size(size);
+                    let hover = Point::new(width - 8.0, WORKTREE_ROW_HEIGHT / 2.0);
+                    let mut element = row(false);
+                    let mut tree = Tree::new(&element);
+                    let node = element.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(Size::ZERO, size),
+                    );
+                    let mut rows = Vec::new();
+                    navigation_rows(Layout::new(&node), &mut rows);
+                    assert_eq!(rows.len(), 1);
+                    let slots = &rows[0].1;
+                    assert!(slots[1].width > 0.0, "title: {width}/{merged}/{deleting}");
+                    assert_eq!(slots[2].width, ROW_STATUS_WIDTH);
+                    for pair in slots.windows(2) {
+                        assert!(pair[0].x + pair[0].width <= pair[1].x + 0.1);
+                    }
+                    let delete_label = if merged {
+                        &worktree.chrome.delete_name
+                    } else {
+                        &channel.delete_name
+                    };
+                    let (delete, _) = icon_glyphs_in_control(row(false), size, hover, delete_label);
+                    assert_eq!(delete.size(), Size::new(30.0, 32.0));
+                    assert!(delete.is_within(&viewport));
+                    let mut action_start = delete.x;
+                    let names = accessible_names(&renderer, row(false));
+                    let actions = frame_enter_presses_at_width(&renderer, row(false), width);
+                    if deleting {
+                        assert!(names.iter().any(|name| name.starts_with("Deleting ")));
+                        assert!(actions.is_empty(), "deleting: {width}/{merged}");
+                    } else {
+                        assert!(
+                            names
+                                .iter()
+                                .any(|name| name.contains("owned fixture failure"))
+                        );
+                        assert!(names.iter().any(|name| name.contains("agent needs input")
+                            || name.contains("agent is waiting for input")));
+                        assert!(slots.len() >= 4 && slots[3].width > 0.0);
+                        let title = if merged {
+                            &*worktree.chrome.label
+                        } else {
+                            &channel.title
+                        };
+                        let label = format!("Retry deleting {title}");
+                        let (retry, _) = icon_glyphs_in_control(row(false), size, hover, &label);
+                        assert_eq!(
+                            retry.size(),
+                            Size::new(ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
+                        );
+                        assert!(retry.is_within(&viewport));
+                        action_start = action_start.min(retry.x);
+                        assert!(actions.iter().any(|action| matches!(
+                            action,
+                            SidebarAction::RetryWorktreeDeletion { .. }
+                                | SidebarAction::RetryChannelDeletion { .. }
+                        )));
+                    }
+                    let last = slots.last().unwrap();
+                    assert!(
+                        last.x + last.width <= action_start + 0.1,
+                        "status/action overlap: {width}/{merged}/{deleting}: {slots:?}"
+                    );
+                    assert!(frame_enter_presses_at_width(&renderer, row(true), width).is_empty());
                 }
             }
         }
