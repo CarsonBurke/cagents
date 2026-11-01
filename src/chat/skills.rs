@@ -24,6 +24,9 @@ pub fn discover(launch: &Launch) -> Vec<Skill> {
 }
 
 fn discover_at(launch: &Launch, home: &Path, root: &Path) -> Vec<Skill> {
+    if launch.provider == Provider::Antigravity {
+        return Vec::new();
+    }
     if launch.provider == Provider::Claude
         && launch
             .recipe
@@ -61,6 +64,9 @@ fn discover_at(launch: &Launch, home: &Path, root: &Path) -> Vec<Skill> {
                     commands.push(directory.join(".claude/commands"));
                 }
             }
+            // Slash and skill expansion are unavailable in a streaming session,
+            // so a picker entry would promise what it cannot do.
+            Provider::Antigravity => {}
             Provider::Omp => {
                 roots.push((directory.join(".omp/skills"), true));
                 roots.push((directory.join(".agents/skills"), false));
@@ -377,6 +383,7 @@ fn parse_skill(path: &Path, provider: Provider, require_description: bool) -> Op
             format!("[${name}]({path})")
         }
         Provider::Claude => format!("/{name}"),
+        Provider::Antigravity => return None,
         Provider::Omp => format!("/skill:{name}"),
     };
     Some(Skill {
@@ -412,6 +419,7 @@ mod tests {
         let key = match provider {
             Provider::Codex => "CODEX_HOME",
             Provider::Claude => "CLAUDE_CONFIG_DIR",
+            Provider::Antigravity => "HOME",
             Provider::Omp => "PI_CODING_AGENT_DIR",
         };
         Launch {

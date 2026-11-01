@@ -250,6 +250,7 @@ pub fn may_recognize(item: &Item, provider: Provider) -> bool {
                     | "resume_agent"
             ),
             Provider::Omp => name == "task",
+            Provider::Antigravity => false,
         },
         _ => false,
     }
@@ -437,6 +438,7 @@ fn native(
         Provider::Claude => claude(id, name, input, output),
         Provider::Codex => codex(name, input, output),
         Provider::Omp => omp(name, input),
+        Provider::Antigravity => None,
     }
 }
 

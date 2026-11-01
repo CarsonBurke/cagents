@@ -400,7 +400,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let environment =
             BTreeMap::from([("HOME".into(), directory.path().to_str().unwrap().into())]);
-        for provider in Provider::ALL {
+        // Antigravity's chats cannot expand a skill, so nothing lists one.
+        for provider in Provider::ALL
+            .into_iter()
+            .filter(|provider| *provider != Provider::Antigravity)
+        {
             install(Some(provider), &environment, directory.path());
             let launch = crate::chat::Launch {
                 provider,

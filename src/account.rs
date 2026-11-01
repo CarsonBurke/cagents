@@ -183,7 +183,7 @@ pub fn home_variable(provider: Provider) -> Option<&'static str> {
     match provider {
         Provider::Claude => Some("CLAUDE_CONFIG_DIR"),
         Provider::Codex => Some("CODEX_HOME"),
-        Provider::Omp => None,
+        Provider::Antigravity | Provider::Omp => None,
     }
 }
 
@@ -216,7 +216,7 @@ pub(crate) fn credential_overrides(provider: Provider) -> &'static [&'static str
             "OPENAI_IDENTITY_TOKEN_FILE",
             "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
         ],
-        Provider::Omp => &[],
+        Provider::Antigravity | Provider::Omp => &[],
     }
 }
 
@@ -387,10 +387,11 @@ impl Account {
     /// The system accounts, which every installation reports on whether or
     /// not it added any account of its own. Omp brokers its own accounts,
     /// which are found in its usage record rather than listed here.
-    pub fn system_accounts() -> [Self; 2] {
+    pub fn system_accounts() -> [Self; 3] {
         [
             Self::system(Provider::Claude),
             Self::system(Provider::Codex),
+            Self::system(Provider::Antigravity),
         ]
     }
 
@@ -399,7 +400,12 @@ impl Account {
     pub const PROVIDERS: [Provider; 2] = [Provider::Claude, Provider::Codex];
 
     /// The providers whose usage is reported, in the order they are listed.
-    pub const REPORTED: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Omp];
+    pub const REPORTED: [Provider; 4] = [
+        Provider::Claude,
+        Provider::Codex,
+        Provider::Antigravity,
+        Provider::Omp,
+    ];
 
     pub fn id(&self) -> AccountId {
         let provider = self.provider.executable();
@@ -482,8 +488,8 @@ impl Account {
             | AccountHome::Managed { path, .. }
             | AccountHome::Linked { path, .. } => Some(path.clone()),
             AccountHome::System => {
-                let variable = home_variable(self.provider)?;
-                if let Some(explicit) = environment(variable).filter(|value| !value.is_empty())
+                if let Some(variable) = home_variable(self.provider)
+                    && let Some(explicit) = environment(variable).filter(|value| !value.is_empty())
                     && !inherited_selections(environment).contains(&variable)
                 {
                     return Some(PathBuf::from(explicit));
@@ -492,6 +498,7 @@ impl Account {
                 let directory = match self.provider {
                     Provider::Claude => ".claude",
                     Provider::Codex => ".codex",
+                    Provider::Antigravity => ".gemini/antigravity-cli",
                     Provider::Omp => return None,
                 };
                 Some(Path::new(&home).join(directory))
@@ -1244,6 +1251,12 @@ mod tests {
             Some(PathBuf::from("/home/a/.codex"))
         );
         assert_eq!(codex.home_directory(&environment(&[])), None);
+        // No selecting variable, yet its default home is still where it lives.
+        assert_eq!(
+            Account::system(Provider::Antigravity)
+                .home_directory(&environment(&[("HOME", "/home/a")])),
+            Some(PathBuf::from("/home/a/.gemini/antigravity-cli"))
+        );
         assert_eq!(claude.probe_environment(), None);
         let key = uuid::Uuid::from_u128(1);
         let managed = Account::managed(Provider::Codex, key, "/data/accounts/codex/1".into());

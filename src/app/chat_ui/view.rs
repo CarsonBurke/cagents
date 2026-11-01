@@ -1078,7 +1078,12 @@ fn reasoning_finished(items: &[Arc<chat::Item>], busy: bool, id: &str) -> bool {
 
 /// The providers a draft offers, in the order its picker lists them after
 /// its own.
-const MODEL_FAMILIES: [Provider; 3] = [Provider::Codex, Provider::Claude, Provider::Omp];
+const MODEL_FAMILIES: [Provider; 4] = [
+    Provider::Codex,
+    Provider::Claude,
+    Provider::Antigravity,
+    Provider::Omp,
+];
 
 /// One provider's models, as a draft's picker offers them.
 struct Offer<'a> {
@@ -1093,6 +1098,7 @@ fn family_label(provider: Provider) -> &'static str {
     match provider {
         Provider::Codex => "ChatGPT",
         Provider::Claude => "Claude",
+        Provider::Antigravity => "Antigravity",
         Provider::Omp => "Other models",
     }
 }
@@ -1147,6 +1153,7 @@ impl Runtime {
         let provider = match self.session.launch.provider {
             Provider::Codex => "Codex",
             Provider::Claude => "Claude",
+            Provider::Antigravity => "Antigravity",
             Provider::Omp => "OMP",
         };
         let model = agent
@@ -1688,6 +1695,7 @@ impl Runtime {
             let provider = match self.session.launch.provider {
                 Provider::Codex => "Codex",
                 Provider::Claude => "Claude",
+                Provider::Antigravity => "Antigravity",
                 Provider::Omp => "OMP",
             };
             let model = agent
@@ -3378,6 +3386,13 @@ impl Runtime {
             controls.push(self.account_picker(accounts, transitioning, shortcuts));
         }
         let draft = self.is_draft();
+        // Chosen once at launch, so there is nothing to pick from here.
+        if !draft
+            && self.session.launch.provider == Provider::Antigravity
+            && let Some(model) = &snapshot.selected_model
+        {
+            controls.push(design::caption(model.clone()).into());
+        }
         if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft {
             let label: Cow<'a, str> = match snapshot
                 .models
@@ -3476,32 +3491,33 @@ impl Runtime {
                 .position(|mode| Some(mode) == snapshot.permission_mode.as_ref());
             if transitioning || (self.session.launch.provider == Provider::Codex && snapshot.busy) {
                 controls.push(
-                    design::caption(
-                        selected
-                            .map_or("Permissions", |index| permission_mode_label(&modes[index])),
-                    )
+                    design::caption(selected.map_or("Permissions", |index| {
+                        provider_permission_mode_label(self.session.launch.provider, &modes[index])
+                    }))
                     .into(),
                 );
             } else {
                 let open = self.permission_picker;
-                let anchor =
-                    widget::button::custom(
-                        widget::row::with_children(vec![
-                            design::caption(selected.map_or("Permissions", |index| {
-                                permission_mode_label(&modes[index])
-                            }))
+                let anchor = widget::button::custom(
+                    widget::row::with_children(vec![
+                        design::caption(selected.map_or("Permissions", |index| {
+                            provider_permission_mode_label(
+                                self.session.launch.provider,
+                                &modes[index],
+                            )
+                        }))
+                        .into(),
+                        widget::icon(Icon::PanDown.handle())
+                            .size(design::COMPACT_ICON_SIZE)
                             .into(),
-                            widget::icon(Icon::PanDown.handle())
-                                .size(design::COMPACT_ICON_SIZE)
-                                .into(),
-                        ])
-                        .spacing(step::GAP_XS)
-                        .align_y(Alignment::Center),
-                    )
-                    .name("Choose permission mode")
-                    .class(crate::ui_controls::control_style(open, None))
-                    .padding(CONTROL_PADDING)
-                    .on_press(action(Action::PermissionPicker(target, !open)));
+                    ])
+                    .spacing(step::GAP_XS)
+                    .align_y(Alignment::Center),
+                )
+                .name("Choose permission mode")
+                .class(crate::ui_controls::control_style(open, None))
+                .padding(CONTROL_PADDING)
+                .on_press(action(Action::PermissionPicker(target, !open)));
                 controls.push(crate::interaction::tooltip(
                     anchor,
                     crate::workspace_widget::shortcut_tooltip(
@@ -5013,12 +5029,19 @@ impl Runtime {
     }
 }
 
+pub(super) fn provider_permission_mode_label(provider: Provider, mode: &str) -> &str {
+    match (provider, mode) {
+        (Provider::Antigravity, "default") => "Default",
+        _ => permission_mode_label(mode),
+    }
+}
+
 pub(super) fn permission_mode_label(mode: &str) -> &str {
     match mode {
         "default" | "manual" => "Ask before edits",
         "readOnly" => "Read only",
         "workspaceWrite" => "Workspace write",
-        "acceptEdits" => "Auto-accept edits",
+        "acceptEdits" | "accept-edits" => "Auto-accept edits",
         "auto" => "Auto",
         "plan" => "Plan",
         "dontAsk" => "Don't ask",
@@ -5504,6 +5527,7 @@ fn names_provider(provider: Provider, needle: &str) -> bool {
     let names: &[&str] = match provider {
         Provider::Codex => &["chatgpt", "codex", "openai"],
         Provider::Claude => &["claude", "anthropic"],
+        Provider::Antigravity => &["antigravity", "agy", "gemini", "google"],
         Provider::Omp => &["other models", "omp"],
     };
     names.iter().any(|name| {

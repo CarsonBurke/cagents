@@ -1456,7 +1456,7 @@ mod tests {
         assert!(reloaded.is_default(&default));
         assert!(!reloaded.is_default(&Account::system(Provider::Claude)));
         assert!(reloaded.is_default(&Account::system(Provider::Codex)));
-        assert_eq!(reloaded.accounts(Some(&homes)).len(), 3);
+        assert_eq!(reloaded.accounts(Some(&homes)).len(), 4);
     }
 
     #[test]

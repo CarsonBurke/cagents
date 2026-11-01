@@ -57,6 +57,9 @@ fn transfer(source: &Session, replacement: &Session, commit: bool) -> Result<(),
             }
             found.pop().unwrap()
         }
+        Provider::Antigravity => {
+            return Err("Antigravity has one sign-in on this computer".into());
+        }
         Provider::Omp => return Err("Omp manages its own account rotation".into()),
     };
     let relative = path

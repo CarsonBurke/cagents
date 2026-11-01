@@ -124,3 +124,16 @@ provider home; `CAGENTS_FIXTURE_IMAGE` overrides the path when the script runs
 directly. Each turn then also returns that image as a provider-produced base64
 image block, recorded in the synthetic history like other frames. Paste an image into the composer to
 cover a user-attached image in the same transcript. Use synthetic images only.
+
+## Antigravity
+
+`tests/fixtures/chat-composer-agy.py` is the same kind of stand-in for `agy`'s
+stream-json mode, linked as `bin/agy`. A prompt's first word chooses the turn:
+`deny` ends with a refused tool, `slow` streams until interrupted, `fail` reports
+an error. Native chat needs a non-personal sign-in, so give the fixture home a
+`.gemini/antigravity-cli/settings.json` containing `{"modelProvider":"gemini"}`.
+`AGY_FIXTURE_SIGNED_OUT=1` refuses `agy models`. It checks this application's
+handling, not Google's service or the real CLI's behavior. A terminal running the
+linked script is seen as `python3`, not `agy`, so it isn't recognized as an agent.
+To check terminal recognition, use a small compiled `bin/agy` that executes the
+script.

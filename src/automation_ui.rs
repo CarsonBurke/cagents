@@ -30,7 +30,7 @@ const LIST_WIDTH: f32 = 240.0;
 /// The most of a narrow pane's height the stacked list takes from the
 /// selection below it, including short split panes.
 const STACKED_LIST_SHARE: f32 = 0.4;
-const PROVIDERS: [&str; 3] = ["Claude", "Codex", "Omp"];
+const PROVIDERS: [&str; 4] = ["Claude", "Codex", "Omp", "Antigravity"];
 const SCHEDULES: [&str; 5] = ["Hourly", "Daily", "Weekdays", "Weekly", "Cron"];
 const WEEKDAYS: [&str; 7] = [
     "Monday",
@@ -3311,16 +3311,22 @@ fn timestamp(milliseconds: u64) -> String {
 }
 
 fn provider(index: usize) -> Provider {
-    [Provider::Claude, Provider::Codex, Provider::Omp]
-        .get(index)
-        .copied()
-        .unwrap_or(Provider::Claude)
+    [
+        Provider::Claude,
+        Provider::Codex,
+        Provider::Omp,
+        Provider::Antigravity,
+    ]
+    .get(index)
+    .copied()
+    .unwrap_or(Provider::Claude)
 }
 fn provider_index(provider: Provider) -> usize {
     match provider {
         Provider::Claude => 0,
         Provider::Codex => 1,
         Provider::Omp => 2,
+        Provider::Antigravity => 3,
     }
 }
 /// Every timezone the schedule can name, read once from the system database.

@@ -141,7 +141,7 @@ fn replacement(edit: &Value) -> Option<String> {
 ///
 /// The ranges count from the start of the text given, which for an edit is
 /// the text it looks for and not the file.
-fn unified(before: &str, after: &str, section: &str) -> String {
+pub(super) fn unified(before: &str, after: &str, section: &str) -> String {
     // Text that stops short of a newline is still a last line, and comparing
     // it as written would report that line changed whenever one side went on.
     let ended = |text: &str| {
