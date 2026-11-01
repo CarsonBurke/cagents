@@ -22,6 +22,8 @@ pub use accounts::AccountCommand;
 #[cfg(test)]
 mod agent_start_authority_tests;
 mod agents;
+mod caller_context;
+pub(crate) use caller_context::{CallerContext, NativeReadiness};
 
 #[cfg(test)]
 mod automation_work_authority_tests;

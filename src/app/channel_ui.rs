@@ -8,14 +8,21 @@ use std::collections::BTreeMap;
 /// daemon itself reports rather than the saved descriptors, together with the
 /// source terminal a converted chat keeps running.
 pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
+    close_sessions_as(&crate::control::CallerContext::capture(), sessions)
+}
+
+pub(super) fn close_sessions_as(
+    caller: &crate::control::CallerContext,
+    sessions: Vec<CardKind>,
+) -> Result<(), String> {
     if !sessions
         .iter()
         .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
     {
         return Ok(());
     }
-    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let Some(mut client) = connect(&socket)? else {
+    let socket = caller.socket(crate::control::NativeReadiness::Existing)?;
+    let Some(mut client) = connect(&socket, caller)? else {
         return no_daemon_close_result(&sessions);
     };
     // Query live identities: a saved descriptor can predate an upgrade or handoff.
@@ -37,7 +44,7 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
                 // Only a fresh inventory may turn a close error into success,
                 // read on a fresh connection: a failed request can leave this
                 // one out of step with the daemon.
-                let Some(fresh) = connect(&socket)? else {
+                let Some(fresh) = connect(&socket, caller)? else {
                     return if may_have_retained_owner(live) {
                         Err(error.to_string())
                     } else {
@@ -75,7 +82,7 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
                 other => Err(format!("Channel terminal could not be closed: {other:?}")),
             });
         if let Err(error) = result {
-            let Some(fresh) = connect(&socket)? else {
+            let Some(fresh) = connect(&socket, caller)? else {
                 return no_daemon_close_result(&sessions);
             };
             client = fresh;
@@ -116,14 +123,25 @@ fn no_daemon_close_result(sessions: &[CardKind]) -> Result<(), String> {
 
 /// A connection to the daemon, or `None` when no daemon is running. Retained
 /// native owners can outlive it, so callers must not treat this as their exit.
-fn connect(socket: &std::path::Path) -> Result<Option<crate::control::ControlClient>, String> {
+fn connect(
+    socket: &std::path::Path,
+    caller: &crate::control::CallerContext,
+) -> Result<Option<crate::control::ControlClient>, String> {
     match crate::control::ControlClient::connect(socket) {
-        Ok(client) => Ok(Some(client)),
+        Ok(mut client) => {
+            if let Some(authority) = caller.authentication() {
+                client
+                    .authenticate(authority)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(Some(client))
+        }
         Err(crate::control::ControlError::Connect(error))
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
+            if caller.authentication().is_none()
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
         {
             Ok(None)
         }
@@ -182,7 +200,7 @@ pub enum Action {
     ConfirmDelete,
     Dismiss,
     SessionsClosed(ChannelId, uuid::Uuid, Result<(), String>),
-    RetryDelete(ChannelId),
+    RetryDelete(ChannelId, crate::control::CallerContext),
     /// Runs a deletion that failed again, from the channel's row.
     RetryFailed(ChannelId),
 }
@@ -196,7 +214,7 @@ impl Action {
     pub fn answers_own_dialog(&self) -> bool {
         matches!(
             self,
-            Self::ConfirmDelete | Self::Dismiss | Self::SessionsClosed(..) | Self::RetryDelete(_)
+            Self::ConfirmDelete | Self::Dismiss | Self::SessionsClosed(..) | Self::RetryDelete(..)
         )
     }
 }
@@ -225,6 +243,7 @@ pub struct State {
 #[derive(Debug)]
 struct ChannelCloseAttempt {
     operation: uuid::Uuid,
+    caller: crate::control::CallerContext,
     registry: uuid::Uuid,
     project: ProjectId,
     members: Vec<CardId>,
@@ -359,12 +378,12 @@ impl Cagents {
     }
 
     pub(super) fn handle_channel_ui(&mut self, action: Action) -> Task<Message> {
-        if let Action::RetryDelete(id) = action {
+        if let Action::RetryDelete(id, caller) = action {
             if self.channel_ui.closing.contains_key(&id) {
                 return Task::none();
             }
             self.channel_ui.deleting.remove(&id);
-            return self.delete_channel(id);
+            return self.delete_channel_as(caller, id);
         }
         if let Action::SessionsClosed(id, operation, result) = action {
             if !self
@@ -413,7 +432,7 @@ impl Cagents {
             return Task::none();
         }
         match action {
-            Action::SessionsClosed(..) | Action::RetryDelete(_) => unreachable!(),
+            Action::SessionsClosed(..) | Action::RetryDelete(..) => unreachable!(),
             Action::RetryFailed(id) => {
                 if !self.channel_ui.failed.contains_key(&id) {
                     return Task::none();
@@ -638,6 +657,14 @@ impl Cagents {
     /// show - the same treatment worktree deletion gives the cards of the
     /// directory it removes.
     pub(super) fn delete_channel(&mut self, id: ChannelId) -> Task<Message> {
+        self.delete_channel_as(crate::control::CallerContext::capture(), id)
+    }
+
+    fn delete_channel_as(
+        &mut self,
+        caller: crate::control::CallerContext,
+        id: ChannelId,
+    ) -> Task<Message> {
         let Some(cards) = self
             .durable
             .channels
@@ -647,6 +674,12 @@ impl Cagents {
         else {
             return Task::none();
         };
+        if cards.iter().any(|card| self.pane_is_quarantined(*card)) {
+            self.status = Some(TransientNotice::warning(
+                "Remove the unverified saved panes from this channel before deleting it. Their saved sessions and drafts will remain stored.",
+            ));
+            return Task::none();
+        }
         if cards.iter().any(|card| self.pane_transfer_pending(*card)) {
             self.status = Some(TransientNotice::warning(
                 "Wait for the pane move to finish before deleting this channel.",
@@ -680,7 +713,7 @@ impl Cagents {
         {
             let retry = cosmic::task::future(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                Message::ChannelUi(Action::RetryDelete(id))
+                Message::ChannelUi(Action::RetryDelete(id, caller))
             });
             return Task::batch([leave, retry]);
         }
@@ -734,6 +767,7 @@ impl Cagents {
             id,
             ChannelCloseAttempt {
                 operation,
+                caller,
                 registry: self.workspace_model.identity,
                 project,
                 members: cards,
@@ -741,8 +775,9 @@ impl Cagents {
                 panes,
             },
         );
+        let caller = self.channel_ui.closing.get(&id).unwrap().caller.clone();
         let close = cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || close_sessions(sessions))
+            let result = tokio::task::spawn_blocking(move || close_sessions_as(&caller, sessions))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
@@ -786,6 +821,7 @@ impl Cagents {
                 _ => false,
             };
             !self.pane_transfer_pending(*card)
+                && !self.pane_is_quarantined(*card)
                 && !self
                     .durable
                     .channels
@@ -837,11 +873,14 @@ impl Cagents {
                 freed_utility = true;
                 continue;
             }
-            if passive
-                && (self.shared_chat_has_local_work(card)
-                    || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving()))
+            if self.pane_is_quarantined(card)
+                || (passive
+                    && (self.shared_chat_has_local_work(card)
+                        || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving())))
             {
-                self.retain_local_pane(card);
+                if !self.pane_is_quarantined(card) {
+                    self.retain_local_pane(card);
+                }
                 let scope = self
                     .durable
                     .card_scopes
@@ -1260,6 +1299,32 @@ fn default_channel_title(project: Option<&SidebarProject>) -> Cow<'static, str> 
 mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    #[test]
+    fn deferred_channel_deletion_keeps_the_original_caller_before_session_dispatch() {
+        let (mut app, channel, _survivor, card) = channel_with_a_conversation();
+        let original = app.card_state(card).unwrap().kind.clone();
+        let expected =
+            crate::agent_execution::Authority::session("synthetic-channel-caller".into());
+        let caller = crate::control::CallerContext::for_test(expected.clone(), false, true);
+        app.channel_ui.deleting.insert(channel);
+        // Exercise the real deferred continuation; its background session
+        // cleanup is deliberately not executed by this reducer test.
+        drop(app.handle_channel_ui(Action::RetryDelete(channel, caller)));
+        let attempt = app
+            .channel_ui
+            .closing
+            .get(&channel)
+            .expect("session close is staged");
+        assert_eq!(attempt.caller.authentication(), Some(expected));
+        assert!(
+            attempt
+                .panes
+                .iter()
+                .any(|(id, source, _)| *id == card && source == &original)
+        );
+        assert_eq!(app.card_state(card).unwrap().kind, original);
+    }
 
     #[test]
     fn deletion_opens_on_cancel_and_enter_or_escape_keeps_the_channel_and_cards() {
@@ -1959,6 +2024,50 @@ mod tests {
     /// A channel's conversations are reachable nowhere else, so deleting one
     /// has to take them with it, say so first, and leave the workspace on a
     /// scope that still exists.
+    #[test]
+    fn quarantine_arriving_during_channel_close_preserves_source_and_payload_on_success() {
+        let (mut app, channel, _, card) = channel_with_a_conversation();
+        let source = app.card_state(card).unwrap().kind.clone();
+        let image = crate::chat::Attachment {
+            path: "/saved/channel-close.png".into(),
+            reference: Some(crate::chat::ImageReference {
+                id: uuid::Uuid::new_v4(),
+                number: 1,
+                device: uuid::Uuid::new_v4(),
+                name: "channel-close.png".into(),
+                sha256: "0".repeat(64),
+                extension: "png".into(),
+            }),
+        };
+        app.chat_ui = chat_ui::State::with_draft_attachments(
+            HashMap::from([(card, "Keep the racing channel draft".into())]),
+            HashMap::from([(card, vec![image.clone()])]),
+        );
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.delete_channel(channel));
+        let operation = app.channel_ui.close_operation(channel);
+        while rx.try_recv().is_ok() {}
+        app.shared_views.quarantined.insert(card);
+        Arc::make_mut(&mut app.durable)
+            .quarantined_panes
+            .insert(card, source.clone());
+        app.present_quarantined_pane(card);
+        let denied = app.handle_channel_ui(Action::SessionsClosed(channel, operation, Ok(())));
+        assert!(iced::runtime::task::into_stream(denied).is_none());
+        assert!(app.durable.channels.iter().any(|row| row.id == channel));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(app.card_state(card).unwrap().kind, source);
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.chat_drafts[&card], "Keep the racing channel draft");
+        assert_eq!(saved.chat_draft_attachments[&card], vec![image]);
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|edit| matches!(edit, ModelEdit::DeleteChannel { id } if id == channel))
+        );
+    }
+
     #[test]
     fn deleting_the_active_channel_retires_its_chats_and_lands_on_a_survivor() {
         let (mut app, doomed, survivor, conversation) = channel_with_a_conversation();

@@ -3,6 +3,7 @@ use super::{Command, Intent, Session, Snapshot, StartFailure};
 use crate::{
     account::LiveReport,
     agent::ActivityState,
+    control::{CallerContext, NativeReadiness},
     model::{HostSessionProof, TerminalId},
     terminal_ipc::{
         self as ipc, ClientEnvelope, ClientRequest, FrameCodec, PROTOCOL_VERSION, ServerEnvelope,
@@ -27,6 +28,7 @@ use std::{
 // another 30 seconds receiving the reply. Leave room for the daemon response
 // and a busy desktop scheduler.
 mod append;
+mod caller;
 
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
@@ -1554,8 +1556,25 @@ impl ClientHandle {
         session: Session,
         source: HostSessionProof,
     ) -> Result<super::BindingPreview, String> {
-        let socket = ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-        let mut stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        Self::preview_as(&CallerContext::capture(), session, source)
+    }
+
+    fn preview_as(
+        caller: &CallerContext,
+        session: Session,
+        source: HostSessionProof,
+    ) -> Result<super::BindingPreview, String> {
+        let socket = caller.socket(NativeReadiness::Existing)?;
+        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        Self::preview_on(caller, stream, session, source)
+    }
+
+    fn preview_on(
+        caller: &CallerContext,
+        mut stream: UnixStream,
+        session: Session,
+        source: HostSessionProof,
+    ) -> Result<super::BindingPreview, String> {
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
             .map_err(|error| error.to_string())?;
@@ -1581,12 +1600,14 @@ impl ClientHandle {
             ServerResponse::Connected { proof, .. } if proof == source => {}
             _ => return Err("The source daemon did not confirm its identity".into()),
         }
+        let mut request_id = 2;
+        caller::authenticate(&mut stream, &mut codec, &source, &mut request_id, caller)?;
         codec
             .write(
                 &mut stream,
                 &ClientEnvelope {
                     version: PROTOCOL_VERSION,
-                    request_id: 2,
+                    request_id,
                     proof: Some(source.clone()),
                     request: ClientRequest::ChatPreview {
                         session,
@@ -1595,7 +1616,7 @@ impl ClientHandle {
                 },
             )
             .map_err(|error| error.to_string())?;
-        match receive(&mut stream, &mut codec, 2, Some(&source))? {
+        match receive(&mut stream, &mut codec, request_id, Some(&source))? {
             ServerResponse::ChatPreviewed { preview } => Ok(preview),
             _ => Err("The daemon did not return a verified conversation preview".into()),
         }
@@ -1607,8 +1628,25 @@ impl ClientHandle {
         session: Session,
         source: HostSessionProof,
     ) -> Result<Vec<super::BindingCandidate>, String> {
-        let socket = ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-        let mut stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        Self::candidates_as(&CallerContext::capture(), session, source)
+    }
+
+    fn candidates_as(
+        caller: &CallerContext,
+        session: Session,
+        source: HostSessionProof,
+    ) -> Result<Vec<super::BindingCandidate>, String> {
+        let socket = caller.socket(NativeReadiness::Existing)?;
+        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        Self::candidates_on(caller, stream, session, source)
+    }
+
+    fn candidates_on(
+        caller: &CallerContext,
+        mut stream: UnixStream,
+        session: Session,
+        source: HostSessionProof,
+    ) -> Result<Vec<super::BindingCandidate>, String> {
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
             .map_err(|error| error.to_string())?;
@@ -1634,12 +1672,14 @@ impl ClientHandle {
             ServerResponse::Connected { proof, .. } if proof == source => {}
             _ => return Err("The source daemon did not confirm its identity".into()),
         }
+        let mut request_id = 2;
+        caller::authenticate(&mut stream, &mut codec, &source, &mut request_id, caller)?;
         codec
             .write(
                 &mut stream,
                 &ClientEnvelope {
                     version: PROTOCOL_VERSION,
-                    request_id: 2,
+                    request_id,
                     proof: Some(source.clone()),
                     request: ClientRequest::ChatCandidates {
                         session,
@@ -1648,7 +1688,7 @@ impl ClientHandle {
                 },
             )
             .map_err(|error| error.to_string())?;
-        match receive(&mut stream, &mut codec, 2, Some(&source))? {
+        match receive(&mut stream, &mut codec, request_id, Some(&source))? {
             ServerResponse::ChatCandidates { candidates } => Ok(candidates),
             _ => Err("The daemon did not return a verified conversation list".into()),
         }
@@ -1662,13 +1702,35 @@ impl ClientHandle {
         selection: Option<String>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
+        let caller = CallerContext::capture();
+        Self::connect_as(
+            caller,
+            session,
+            intent,
+            source,
+            terminate_source,
+            selection,
+            wake,
+        )
+    }
+
+    pub(crate) fn connect_as(
+        caller: CallerContext,
+        session: Session,
+        intent: Intent,
+        source: Option<HostSessionProof>,
+        terminate_source: bool,
+        selection: Option<String>,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
         // A restore runs right after an application update has stopped the
         // daemon it is about to ask for, so it starts one for the same reason a
         // new conversation does instead of failing on an absent socket.
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|e| e.to_string())?;
+        let socket = caller.socket(NativeReadiness::UserReady)?;
         let stream = connect_daemon(&socket)
             .map_err(|e| format!("Cannot connect to the proven chat daemon: {e}"))?;
         Self::connect_on(
+            &caller,
             stream,
             session,
             intent,
@@ -1688,12 +1750,23 @@ impl ClientHandle {
         expected: Session,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
+        let caller = CallerContext::capture();
+        Self::connect_upgrade_as(caller, source, expected, wake)
+    }
+
+    pub(crate) fn connect_upgrade_as(
+        caller: CallerContext,
+        source: Session,
+        expected: Session,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
         if UpgradeRecovery::candidate(&source, &expected).is_none() {
             return Err("The canonical chat is not an exact upgrade of the saved source".into());
         }
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let socket = caller.socket(NativeReadiness::UserReady)?;
         let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
+            &caller,
             stream,
             source,
             Intent::Restore,
@@ -1711,12 +1784,23 @@ impl ClientHandle {
         replacement: Session,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
+        let caller = CallerContext::capture();
+        Self::recover_account_as(caller, source, replacement, wake)
+    }
+
+    pub(crate) fn recover_account_as(
+        caller: CallerContext,
+        source: Session,
+        replacement: Session,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
         if !super::is_account_recovery(&source, &replacement) {
             return Err("Account recovery changed the saved conversation".into());
         }
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let socket = caller.socket(NativeReadiness::UserReady)?;
         let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
+            &caller,
             stream,
             replacement,
             Intent::Start,
@@ -1735,12 +1819,24 @@ impl ClientHandle {
         generation: u64,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
+        let caller = CallerContext::capture();
+        Self::switch_account_as(caller, source, replacement, generation, wake)
+    }
+
+    pub(crate) fn switch_account_as(
+        caller: CallerContext,
+        source: Session,
+        replacement: Session,
+        generation: u64,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
         if !super::is_account_recovery(&source, &replacement) {
             return Err("Account switch changed the saved conversation".into());
         }
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let socket = caller.socket(NativeReadiness::UserReady)?;
         let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
+            &caller,
             stream,
             replacement,
             Intent::Start,
@@ -1761,6 +1857,7 @@ impl ClientHandle {
         session: Session,
     ) -> Result<Self, StartFailure> {
         Self::connect_on(
+            &CallerContext::for_test(crate::agent_execution::Authority::default(), false, false),
             stream,
             session,
             Intent::Restore,
@@ -1774,6 +1871,7 @@ impl ClientHandle {
     }
 
     fn connect_on(
+        caller: &CallerContext,
         mut stream: UnixStream,
         session: Session,
         intent: Intent,
@@ -1840,6 +1938,8 @@ impl ClientHandle {
         if !proof.is_complete() {
             return Err("Daemon returned an incomplete native chat ownership proof".into());
         }
+        let mut attach_request = 2;
+        caller::authenticate(&mut stream, &mut codec, &proof, &mut attach_request, caller)?;
         let mut session = session;
         if intent == Intent::Start
             && source.is_none()
@@ -1851,7 +1951,6 @@ impl ClientHandle {
             session.proof = Some(proof.clone());
         }
         let id = session.id;
-        let mut attach_request = 2;
         let mut upgrade_recovery = None;
         let request = if let Some(expected) = upgrade_expected {
             if expected.proof.as_ref() != Some(&proof) {
@@ -2852,6 +2951,7 @@ impl Drop for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("client/caller_scope_tests.rs");
 
     static REPLACEMENT_GATES: Mutex<
         BTreeMap<usize, (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
@@ -3629,6 +3729,7 @@ mod tests {
             assert!(extra.is_none(), "a failed restore must not send ChatStart");
         });
         let result = ClientHandle::connect_on(
+            &CallerContext::for_test(crate::agent_execution::Authority::default(), false, false),
             stream,
             source,
             Intent::Restore,
@@ -4157,6 +4258,7 @@ mod tests {
             );
         });
         let result = ClientHandle::connect_on(
+            &CallerContext::for_test(crate::agent_execution::Authority::default(), false, false),
             client,
             session,
             Intent::Restore,
@@ -4283,6 +4385,11 @@ mod tests {
                 requests
             });
             let result = ClientHandle::connect_on(
+                &CallerContext::for_test(
+                    crate::agent_execution::Authority::default(),
+                    false,
+                    false,
+                ),
                 client,
                 source.clone(),
                 Intent::Restore,
@@ -4640,6 +4747,7 @@ mod tests {
         });
         let (wake_tx, wake_rx) = std::sync::mpsc::channel();
         let handle = ClientHandle::connect_on(
+            &CallerContext::for_test(crate::agent_execution::Authority::default(), false, false),
             client,
             omp_card(None, None),
             Intent::Start,
@@ -4976,6 +5084,7 @@ mod tests {
         });
         let (wake_tx, wake_rx) = std::sync::mpsc::channel();
         let handle = ClientHandle::connect_on(
+            &CallerContext::for_test(crate::agent_execution::Authority::default(), false, false),
             client,
             omp_card(None, None),
             Intent::Start,
@@ -5204,6 +5313,7 @@ mod tests {
         });
         let (wake_tx, wake_rx) = std::sync::mpsc::channel();
         let handle = ClientHandle::connect_on(
+            &CallerContext::for_test(crate::agent_execution::Authority::default(), false, false),
             client,
             card,
             Intent::Start,
@@ -5483,6 +5593,7 @@ mod tests {
         });
         let (wake_tx, wake_rx) = std::sync::mpsc::channel();
         let handle = ClientHandle::connect_on(
+            &CallerContext::for_test(crate::agent_execution::Authority::default(), false, false),
             client,
             card,
             Intent::Start,
@@ -5748,6 +5859,7 @@ mod tests {
         });
         let (wake_tx, wake_rx) = std::sync::mpsc::channel();
         let handle = ClientHandle::connect_on(
+            &CallerContext::for_test(crate::agent_execution::Authority::default(), false, false),
             client,
             omp_card(None, None),
             Intent::Start,
@@ -6009,6 +6121,11 @@ mod tests {
                 // EOF otherwise exercises the reader's disconnect drain.
             });
             let client = ClientHandle::connect_on(
+                &CallerContext::for_test(
+                    crate::agent_execution::Authority::default(),
+                    false,
+                    false,
+                ),
                 client,
                 omp_card(None, None),
                 Intent::Start,
@@ -6184,6 +6301,11 @@ mod tests {
             }));
             clients.push(
                 ClientHandle::connect_on(
+                    &CallerContext::for_test(
+                        crate::agent_execution::Authority::default(),
+                        false,
+                        false,
+                    ),
                     client,
                     omp_card(None, None),
                     Intent::Start,
@@ -6372,6 +6494,11 @@ mod tests {
             }));
             handles.push(
                 ClientHandle::connect_on(
+                    &CallerContext::for_test(
+                        crate::agent_execution::Authority::default(),
+                        false,
+                        false,
+                    ),
                     client,
                     omp_card(None, None),
                     Intent::Start,
@@ -6613,6 +6740,7 @@ mod tests {
             release.recv_timeout(Duration::from_secs(5)).unwrap();
         });
         let handle = ClientHandle::connect_on(
+            &CallerContext::for_test(crate::agent_execution::Authority::default(), false, false),
             client,
             source.clone(),
             Intent::Start,
@@ -6748,6 +6876,7 @@ mod tests {
             }
         });
         let client = ClientHandle::connect_on(
+            &CallerContext::for_test(crate::agent_execution::Authority::default(), false, false),
             client,
             session,
             Intent::Start,
@@ -6981,6 +7110,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let result = ClientHandle::connect_on(
+            &CallerContext::for_test(crate::agent_execution::Authority::default(), false, false),
             client,
             session,
             Intent::Start,
@@ -7098,6 +7228,7 @@ mod tests {
             while codec.read::<ClientEnvelope>(&mut server).unwrap().is_some() {}
         });
         let handle = ClientHandle::connect_on(
+            &CallerContext::for_test(crate::agent_execution::Authority::default(), false, false),
             client,
             session,
             Intent::Start,

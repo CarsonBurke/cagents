@@ -62,6 +62,7 @@ impl Cagents {
                         title: card.title.clone(),
                         session: session.clone(),
                         open: false,
+                        quarantined: self.pane_is_quarantined(card.id),
                         updated_at_unix_ms: 0,
                     }),
                 ));
