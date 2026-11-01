@@ -787,6 +787,9 @@ class Isolation(SandboxCase):
         # Proves the run kept the inherited environment rather than shedding it.
         self.assertEqual(report["token_present"], AUTHORITY in os.environ)
         self.assertEqual(report["routes"], [])
+        # The decoy test's paths can sit under /tmp's tmpfs; this one is on the read-only root.
+        self.assertFalse(report["root_writable"])
+        self.assertTrue(report["cargo_home_writable"], "Cargo needs its lock file there")
         if AUTHORITY in os.environ:
             # A hosted run can only be on a real host, so the proof is not vacuous.
             self.assertTrue(any("cagents" in path.name for path in existing))
@@ -1262,7 +1265,6 @@ class Lifecycle(SandboxCase):
         self.assertIn("recovery failed", problems[0])
 
     def test_clear_holds_its_name_until_it_has_finished(self):
-        (self.repo / ".worktrees/native-fixture/demo").mkdir(parents=True)
         entered, proceed = threading.Event(), threading.Event()
         original = self.fixtures._discard
 
@@ -1375,9 +1377,10 @@ class Lifecycle(SandboxCase):
         original = broker.STOP_ALL_LOCK_SECONDS
         broker.STOP_ALL_LOCK_SECONDS = 0.2
         self.addCleanup(setattr, broker, "STOP_ALL_LOCK_SECONDS", original)
-        started = time.monotonic()
-        self.fixtures.stop_all()
-        self.assertLess(time.monotonic() - started, 8)
+        thread = threading.Thread(target=self.fixtures.stop_all, daemon=True)
+        thread.start()
+        thread.join(8)
+        self.assertFalse(thread.is_alive(), "stop_all must not wait forever on a held lock")
         self.assertTrue(self.await_gone(holder))
 
     def test_a_binary_from_another_checkout_does_not_count_as_built(self):
