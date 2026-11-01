@@ -967,6 +967,155 @@ mod tests {
         }
     }
 
+    /// The authority and launch rows exactly as the registry stored them.
+    fn authority_rows(directory: &std::path::Path, id: TerminalId) -> Vec<(String, String)> {
+        let db = rusqlite::Connection::open(directory.join("capacity-model.sqlite")).unwrap();
+        let mut rows = db
+            .prepare("SELECT token,source FROM agent_authorities WHERE session_id=?1")
+            .unwrap();
+        rows.query_map([id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn register_authority(host: &SharedHost, source: &Session) {
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        registry
+            .lock()
+            .unwrap()
+            .register_agent_authority(&crate::agent_execution::HostedSession::Chat(source.clone()))
+            .unwrap();
+    }
+
+    fn add_launch_record(directory: &std::path::Path, source: &Session) {
+        let db = rusqlite::Connection::open(directory.join("capacity-model.sqlite")).unwrap();
+        db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        db.execute(
+            "INSERT INTO agent_launches(agent,session_id,source) VALUES (?1,?2,?3)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                source.id.to_string(),
+                serde_json::to_string(&crate::agent_execution::HostedSession::Chat(source.clone()))
+                    .unwrap()
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_dead_capability_stays_recorded_and_opens_the_reader() {
+        let host = host();
+        let rows = [user_row("u1", "lost holder question", None)];
+        let (directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+        register_authority(&host, &source);
+        let before = authority_rows(directory.path(), source.id);
+        assert_eq!(before.len(), 1);
+
+        // A reader that then fails leaves it too.
+        let history = provider_history_path(&source);
+        let saved = std::fs::read(&history).unwrap();
+        std::fs::remove_file(&history).unwrap();
+        let (failed, server) = restore_client(&host, source.clone(), 74);
+        let failure = match failed {
+            Err(failure) => failure,
+            Ok(_) => panic!("a missing transcript opened a reader"),
+        };
+        assert!(failure.message.contains("could not be reattached"));
+        server.join().unwrap();
+        assert_eq!(authority_rows(directory.path(), source.id), before);
+
+        std::fs::write(&history, saved).unwrap();
+        let live = host.lock().unwrap().proof().clone();
+        let reader = source.lost_holder_history(&live).unwrap();
+        let (restored, server) = restore_client(&host, source.clone(), 75);
+        let restored = restored.unwrap();
+        assert_eq!(restored.session(), reader);
+        assert_eq!(authority_rows(directory.path(), source.id), before);
+        assert!(!marker.exists());
+
+        // Releasing that reader neither refuses nor revokes.
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        let hosted = crate::agent_execution::HostedSession::Chat(reader.clone());
+        registry
+            .lock()
+            .unwrap()
+            .inspect_resident_release(
+                &hosted,
+                crate::host::model::ResidentRelease::ReadOnlyHistory,
+            )
+            .unwrap();
+        registry
+            .lock()
+            .unwrap()
+            .retire_resident_release(
+                &hosted,
+                crate::host::model::ResidentRelease::ReadOnlyHistory,
+            )
+            .unwrap();
+        assert_eq!(authority_rows(directory.path(), source.id), before);
+        drop(restored);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_capability_that_may_still_mean_something_refuses_the_reader() {
+        const MANAGED: &str = "The actor belongs to a managed agent";
+        for case in ["current-boot", "multiple", "managed", "undecodable"] {
+            let host = host();
+            let rows = [user_row("u1", "lost holder question", None)];
+            let (directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+            let mut current = source.clone();
+            current.proof = Some(host.lock().unwrap().proof().clone());
+            match case {
+                "current-boot" => register_authority(&host, &current),
+                "multiple" => {
+                    register_authority(&host, &source);
+                    add_launch_record(directory.path(), &source);
+                }
+                "managed" => add_launch_record(directory.path(), &source),
+                _ => {
+                    register_authority(&host, &source);
+                    rusqlite::Connection::open(directory.path().join("capacity-model.sqlite"))
+                        .unwrap()
+                        .execute("UPDATE agent_authorities SET source='not json'", [])
+                        .unwrap();
+                }
+            }
+            let before = authority_rows(directory.path(), source.id);
+            let (refused, server) = restore_client(&host, source.clone(), 76);
+            let failure = match refused {
+                Err(failure) => failure,
+                Ok(_) => panic!("{case}: opened a reader"),
+            };
+            assert!(
+                failure.message.contains("could not be reattached"),
+                "{case}: {}",
+                failure.message
+            );
+            if case != "undecodable" {
+                assert!(
+                    failure.message.contains(MANAGED),
+                    "{case}: {}",
+                    failure.message
+                );
+            } else {
+                assert!(!failure.message.contains(MANAGED), "{}", failure.message);
+            }
+            server.join().unwrap();
+            assert!(
+                !host.lock().unwrap().chats.contains_key(&source.id),
+                "{case}"
+            );
+            assert_eq!(
+                authority_rows(directory.path(), source.id),
+                before,
+                "{case}"
+            );
+            assert!(!marker.exists(), "{case}");
+        }
+    }
+
     #[test]
     fn missing_holder_without_a_changed_boot_keeps_the_refusal() {
         let host = host();
@@ -1960,14 +2109,18 @@ fn load_history(session: &Session) -> Result<LoadedHistory, String> {
     Ok((spec, adapter, initial))
 }
 
-fn require_unmanaged(host: &SharedHost, id: TerminalId) -> Result<(), String> {
+fn require_unmanaged(host: &SharedHost, session: &Session) -> Result<(), String> {
     let registry = super::super::agent_execution::registry(host)?;
-    if registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retained_agent_sources(id)?
-        .is_empty()
-    {
+    let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let sources = registry.retained_agent_sources(session.id)?;
+    let authority = registry.retained_agent_authority_source(session.id)?;
+    // Every retained chat holds a capability for its own provider. One left by
+    // an earlier boot has no living holder and is not a managed agent; it stays
+    // in place until an explicit Start replaces it. Anything more is managed.
+    let reader = crate::agent_execution::HostedSession::Chat(session.clone());
+    let own_dead_capability = matches!((sources.as_slice(), &authority), ([only], Some(stored))
+        if only == stored && super::super::model::earlier_boot_self_authority(stored, &reader));
+    if sources.is_empty() || own_dead_capability {
         Ok(())
     } else {
         Err(
@@ -2011,7 +2164,7 @@ pub(super) fn restore_saved_history(
         }
     }
     super::super::account_lifecycle::ensure_idle(host)?;
-    require_unmanaged(host, session.id).map_err(unavailable)?;
+    require_unmanaged(host, &session).map_err(unavailable)?;
     let (mut spec, adapter, mut initial) = load_history(&session).map_err(unavailable)?;
     spec.messages = host
         .lock()
@@ -2136,34 +2289,12 @@ pub(super) fn lost_holder_history(
         Some((session, true)) if session == reader => Ok(Some(reader)),
         Some(_) => Ok(None),
         None => {
-            revoke_lost_holder_authority(host, source, &proof).map_err(unavailable)?;
+            super::retained_resume::ensure_prior_boot_account(host, &reader)
+                .map_err(unavailable)?;
             restore_saved_history(host, 0, reader.clone())?;
             Ok(Some(reader))
         }
     }
-}
-
-/// Every ordinary retained chat holds an execution capability for its provider
-/// and tools. A changed boot proves each holder of that token is gone, so the
-/// row no longer describes an owner. A managed agent's own records remain and
-/// keep its supported route; this removes only that one dead capability.
-fn revoke_lost_holder_authority(
-    host: &SharedHost,
-    source: &Session,
-    proof: &HostSessionProof,
-) -> Result<(), String> {
-    let registry = super::super::agent_execution::registry(host)?;
-    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-    let sources = registry.retained_agent_sources(source.id)?;
-    let authority = registry.retained_agent_authority_source(source.id)?;
-    if let ([only], Some(authority)) = (sources.as_slice(), authority)
-        && *only == authority
-        && matches!(&authority, crate::agent_execution::HostedSession::Chat(chat)
-            if chat.proof.as_ref().is_some_and(|saved| saved.is_complete() && saved.boot_id != proof.boot_id))
-    {
-        registry.retire_agent_authority(&authority)?;
-    }
-    Ok(())
 }
 
 /// Classify an already authenticated paging reader for an explicit Retry.

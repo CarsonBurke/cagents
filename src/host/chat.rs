@@ -903,6 +903,14 @@ fn start_with_execution(
     }
     // A failed pre-discovery helper still owns its exact cleanup context.
     retained_actor::reconcile_startup(host, &session).map_err(unavailable)?;
+    // A reader's explicit Resume runs under the account its earlier holder used.
+    if session.launch.provider == Provider::Claude
+        && session.launch.session_id.is_some()
+        && !session.native_continuity.retains_provider()
+        && super::agent_execution::registry(host).is_ok()
+    {
+        retained_resume::ensure_prior_boot_account(host, &session).map_err(unavailable)?;
+    }
     // Reserve before provider/account initialization. Pending owners recovered above
     // use their own exact reservation through restore.
     let mut admission = capacity::Reservation::new_with_source(host, &session, source.as_ref())?;

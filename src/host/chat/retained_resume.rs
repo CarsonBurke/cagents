@@ -199,7 +199,9 @@ pub(super) fn inspect_resume_retirement(
         }
         for ownership in page {
             after = Some(ownership.actor());
-            if ownership.source().id != source.id {
+            // Runtime receipts from another boot are unavailable evidence, and
+            // that owner cannot be running. The row itself stays recorded.
+            if ownership.source().id != source.id || ownership.owner().boot != proof.boot_id {
                 continue;
             }
             if ownership.is_pending() {
@@ -237,6 +239,68 @@ pub(super) fn inspect_resume_retirement(
                         );
                     }
                 }
+            }
+        }
+    }
+}
+
+/// A pane keeps its allocation across a lost holder, so its earlier-boot rows
+/// still name the account that conversation ran under. Refuse if the recorded
+/// launch now selects a different physical home. A pane with no such row has
+/// nothing to compare, and the launch's own account checks still apply.
+pub(super) fn ensure_prior_boot_account(host: &SharedHost, source: &Session) -> Result<(), String> {
+    let boot = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .boot_id
+        .clone();
+    let registry = super::super::agent_execution::registry(host)?;
+    let mut selected = None;
+    let mut after = None;
+    loop {
+        let page = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_actor_ownerships(after, 128)?;
+        if page.is_empty() {
+            return Ok(());
+        }
+        for ownership in page {
+            after = Some(ownership.actor());
+            if ownership.source().id != source.id || ownership.owner().boot == boot {
+                continue;
+            }
+            let captured = ownership.scope().map_err(|_| {
+                "The earlier Claude actor has no captured physical account identity".to_owned()
+            })?;
+            if selected.is_none() {
+                let launch = super::prepare_native_process_launch(
+                    &source.launch,
+                    Some(crate::model::agent_recovery::fresh_native_environment(
+                        Provider::Claude,
+                        false,
+                    )),
+                    &Default::default(),
+                    None,
+                )
+                .map_err(|e| e.message)?;
+                selected = Some(LaunchAccountScope::resolve(
+                    Provider::Claude,
+                    &launch.recipe.working_directory,
+                    |name| {
+                        launch
+                            .recipe
+                            .environment
+                            .get(name)
+                            .map(std::ffi::OsString::from)
+                    },
+                )?);
+            }
+            if !same_scope(captured, selected.as_ref().expect("resolved above")) {
+                return Err(
+                    "Claude disk resume would select a different physical account home".into(),
+                );
             }
         }
     }
@@ -296,6 +360,11 @@ pub(super) fn prepare_resume_verified(
         }
         for ownership in page {
             after = Some(ownership.actor());
+            // An owner from another boot is not running and has no readable
+            // receipt, so it is neither this pane's evidence nor a second writer.
+            if ownership.owner().boot != proof.boot_id {
+                continue;
+            }
             if ownership.source().id != source.id
                 && !super::same_conversation(&ownership.source().launch, &source.launch)
             {

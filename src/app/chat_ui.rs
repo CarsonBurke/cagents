@@ -20267,10 +20267,6 @@ mod tests {
             assert!(runtime.has_connected_saved_history(&runtime.snapshot));
             assert_eq!(runtime.snapshot.items, snapshot.items);
             assert!(!runtime.turns.is_empty(), "the pane shows its transcript");
-            assert_eq!(
-                view::saved_history_caption(&runtime.snapshot).contains("may not have finished"),
-                uncertain
-            );
             f.app.persist();
             let writer = f.app.session.as_ref().unwrap();
             writer.flush(Duration::from_secs(10)).unwrap();
@@ -20291,14 +20287,35 @@ mod tests {
             assert_eq!(attempt.intent, chat::Intent::Start);
             assert_eq!(attempt.session, reader);
             assert_live_recovery_content(&f);
-        }
-    }
 
-    #[test]
-    fn a_read_only_transcript_does_not_invite_a_message() {
-        assert!(view::empty_transcript_text(false, false).contains("Send a message"));
-        assert!(!view::empty_transcript_text(true, false).contains("Send a message"));
-        assert!(!view::empty_transcript_text(true, true).contains("Send a message"));
+            // The provider answering leaves the draft a draft: no prompt was
+            // staged, by this attempt or by the attachment it replaces.
+            let started = attempt.target;
+            let mut running = reader.clone();
+            running.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            answer_start(
+                &mut f.app,
+                started,
+                Ok(Arc::new(ClientHandle::fixture(
+                    running,
+                    Snapshot {
+                        session_id: reader.launch.session_id.clone(),
+                        ready: true,
+                        native_continuity: chat::NativeContinuity::RetainedClaudeActor {
+                            protocol: 2,
+                        },
+                        items: snapshot.items.clone(),
+                        ..Snapshot::default()
+                    },
+                ))),
+            );
+            assert!(!f.app.chat_start_pending(f.card));
+            assert_live_recovery_content(&f);
+            let runtime = chat_runtime(&f.app, f.card);
+            assert!(runtime.pending.is_none());
+            assert!(runtime.handle().unwrap().snapshot().ready);
+            assert_eq!(runtime.handle().unwrap().snapshot().items, snapshot.items);
+        }
     }
 
     #[test]

@@ -613,15 +613,16 @@ pub(crate) fn is_lost_holder_history(source: &Session, replacement: &Session) ->
         == Some(replacement)
 }
 
-/// Whether a saved transcript stops before its provider's closing answer. A
-/// transcript records no separate end-of-turn mark, so this is a question to
-/// put to the reader, not a statement about what the provider did.
+/// Whether a saved transcript gives no sign its last turn closed. A transcript
+/// records no end-of-turn mark, so this only asks the reader to check: it cannot
+/// see text saved just before a tool call that never ran, or a background job
+/// a finished-looking turn had started. An empty transcript shows nothing either.
 pub(crate) fn last_turn_uncertain(items: &[std::sync::Arc<Item>]) -> bool {
     items
         .iter()
         .rev()
         .find(|item| item.role != Role::System)
-        .is_some_and(|item| {
+        .is_none_or(|item| {
             !(item.role == Role::Assistant
                 && matches!(
                     &item.content,
