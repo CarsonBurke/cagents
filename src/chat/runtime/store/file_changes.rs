@@ -382,34 +382,39 @@ impl Store {
                 .map(|id| self.child_file_item_ordinal(source, id))
                 .transpose()?
                 .flatten();
-            let bounds =
-                if let Some(right) = before {
-                    let left = self.db.query_row(
-                    "SELECT MAX(ordinal) FROM child_file_items WHERE source=?1 AND ordinal<?2",
-                    params![source, right],
-                    |row| row.get(0),
-                ).map_err(|e| e.to_string())?;
-                    (left, Some(right))
-                } else if let Some(left) = after {
-                    let right = self.db.query_row(
-                    "SELECT MIN(ordinal) FROM child_file_items WHERE source=?1 AND ordinal>?2",
-                    params![source, left],
-                    |row| row.get(0),
-                ).map_err(|e| e.to_string())?;
-                    (Some(left), right)
-                } else {
-                    // Missing anchors follow the transcript projection's append
-                    // fallback. Replacements retain their original position above.
-                    let left = self
-                        .db
-                        .query_row(
-                            "SELECT MAX(ordinal) FROM child_file_items WHERE source=?1",
-                            [source],
-                            |row| row.get(0),
-                        )
-                        .map_err(|e| e.to_string())?;
-                    (left, None)
-                };
+            let bounds = if let Some(right) = before {
+                let left = self
+                    .db
+                    .query_row(
+                        "SELECT MAX(ordinal) FROM child_file_items WHERE source=?1 AND ordinal<?2",
+                        params![source, right],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                (left, Some(right))
+            } else if let Some(left) = after {
+                let right = self
+                    .db
+                    .query_row(
+                        "SELECT MIN(ordinal) FROM child_file_items WHERE source=?1 AND ordinal>?2",
+                        params![source, left],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                (Some(left), right)
+            } else {
+                // Missing anchors follow the transcript projection's append
+                // fallback. Replacements retain their original position above.
+                let left = self
+                    .db
+                    .query_row(
+                        "SELECT MAX(ordinal) FROM child_file_items WHERE source=?1",
+                        [source],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                (left, None)
+            };
             if let Some(ordinals) = Self::spaced(bounds.0, bounds.1, 1) {
                 let ordinal = ordinals[0];
                 self.db
@@ -1279,6 +1284,7 @@ mod tests {
             Some(prior_cursor),
             prior.revision,
         );
+        assert_ne!(stale.revision, prior.revision);
         assert!(stale.error.is_some());
         assert!(stale.patches.is_empty());
         let continued = page(
