@@ -6595,6 +6595,16 @@ for line in sys.stdin:
                     settled: false,
                 }
             }
+            fn reaped(pidfd: &fs::File) -> bool {
+                fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd())).is_ok_and(
+                    |info| {
+                        info.lines().any(|line| {
+                            line.strip_prefix("Pid:")
+                                .is_some_and(|pid| pid.trim() == "-1")
+                        })
+                    },
+                )
+            }
             fn finish(&mut self) {
                 assert!(
                     crate::daemon::child_reaper::wait_until_idle_for_test(Duration::from_secs(5)),
@@ -6620,25 +6630,36 @@ for line in sys.stdin:
                 // Assertion cleanup can reach only this fixture's original
                 // root and holder, including after anonymous detach. The
                 // existing child reaper keeps sole ownership of Child::wait.
-                for pidfd in [&self.root, &self.holder] {
-                    unsafe {
-                        libc::syscall(
-                            libc::SYS_pidfd_send_signal,
-                            pidfd.as_raw_fd(),
-                            libc::SIGKILL,
-                            std::ptr::null::<libc::siginfo_t>(),
-                            0,
-                        );
-                    }
+                let signal = |pidfd: &fs::File| unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                };
+                signal(&self.root);
+                // The holder remains the root's sole waitpid owner. Let it
+                // consume that status before terminating the detached holder;
+                // an exited pidfd alone would still permit an orphan zombie.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !Self::reaped(&self.root) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
                 }
+                if !Self::reaped(&self.root) {
+                    eprintln!("carried fixture root reap remains unconfirmed");
+                }
+                signal(&self.holder);
                 if !crate::daemon::child_reaper::wait_until_idle_for_test(Duration::from_secs(5)) {
                     eprintln!("carried fixture still owns original child custody after cleanup");
                 }
             }
         }
-        // Exercise both the successful carry and failure after original adoption.
-        // Failed recovery retains its live original instead of authorizing replay.
-        for invalid_successor in [false, true] {
+        // Exercise successful carry, failure after adoption, and unwinding
+        // before a successor exists. Recovery failure must preserve the live
+        // original; assertion cleanup must settle only the owned test family.
+        for (invalid_successor, panic_cleanup) in [(false, false), (true, false), (false, true)] {
             let mut directory = tempfile::tempdir().unwrap();
             // Preserve the exact detached socket/checkpoint namespace on success
             // and panic until the outer original-family guardian has settled it.
@@ -6712,6 +6733,28 @@ for line in sys.stdin:
             );
             finish_upgrade(&host).unwrap();
             assert!(old.is_completed());
+            if panic_cleanup {
+                let root = original.root.try_clone().unwrap();
+                let holder = original.holder.try_clone().unwrap();
+                let failure = std::panic::catch_unwind(move || {
+                    let _original = original;
+                    panic!("exercise original carried-family assertion cleanup");
+                });
+                assert!(failure.is_err());
+                assert!(crate::daemon::child_reaper::wait_until_idle_for_test(
+                    Duration::from_secs(5)
+                ));
+                assert!(
+                    OriginalFamily::reaped(&root),
+                    "unwind left the original root unreaped"
+                );
+                assert!(
+                    OriginalFamily::reaped(&holder),
+                    "unwind left the original holder unreaped"
+                );
+                directory.close().unwrap();
+                continue;
+            }
             let saved = Store::open(directory.path())
                 .unwrap()
                 .load()
