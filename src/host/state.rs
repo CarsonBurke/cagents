@@ -5003,7 +5003,7 @@ mod retained_child_shutdown_tests;
 mod strict_upgrade_tests;
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
@@ -5777,6 +5777,9 @@ mod tests {
 
     #[test]
     fn upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_restore() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::upgrade::handoff::Store;
         let directory = tempfile::tempdir().unwrap();
         // A real foreground process, recognized by its provider argv. Its
@@ -5794,10 +5797,20 @@ mod tests {
             program: executable.to_string_lossy().into_owned(),
             arguments: Vec::new(),
             working_directory: directory.path().into(),
-            environment: BTreeMap::from([(
-                "HOME".into(),
-                directory.path().to_string_lossy().into_owned(),
-            )]),
+            environment: BTreeMap::from([
+                (
+                    "HOME".into(),
+                    directory.path().to_string_lossy().into_owned(),
+                ),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    directory
+                        .path()
+                        .join(".claude")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ]),
         };
         let source = TerminalSession {
             owned_codex_listener: None,
@@ -5887,6 +5900,9 @@ mod tests {
     /// one that already ended may hold an update hostage.
     #[test]
     fn idle_and_ended_claude_conversations_do_not_block_an_upgrade() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{Command, Launch, Session},
@@ -6040,6 +6056,9 @@ for line in sys.stdin:
 
     #[test]
     fn native_upgrade_retains_hidden_lineage_and_restarts_final_claude_conversation_once() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{Command, Launch, Session},
@@ -6280,9 +6299,9 @@ for line in sys.stdin:
         restored_handle.close().unwrap();
     }
 
-    fn upgrade_fixture_in_fresh_process() -> bool {
+    pub(in crate::host) fn upgrade_fixture_in_fresh_process() -> bool {
         // Capability validation consults process-global retained child custody.
-        // These metadata-only fixtures need a fresh service, not another test's
+        // These upgrade fixtures need a fresh service, not another test's
         // legitimate retained ownership. Preserve the caller's environment.
         const SELECTOR_ENV: &str = "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR";
         let current = std::thread::current();
@@ -6303,6 +6322,15 @@ for line in sys.stdin:
                 let mut output = tempfile::tempdir().unwrap();
                 output.disable_cleanup(true);
                 eprintln!("Upgrade fixture output: {}", output.path().display());
+                let mut runtime = tempfile::Builder::new()
+                    .prefix("cagents-upgrade-runtime-")
+                    .tempdir()
+                    .unwrap();
+                // Child exit alone does not establish descendant settlement.
+                runtime.disable_cleanup(true);
+                let runtime_path = runtime.path().canonicalize().unwrap();
+                crate::secure_file::prepare_private_directory(&runtime_path).unwrap();
+                eprintln!("Upgrade fixture runtime: {}", runtime_path.display());
                 let stdout_path = output.path().join("stdout");
                 let stderr_path = output.path().join("stderr");
                 let mut child = OriginalChild(
@@ -6315,6 +6343,11 @@ for line in sys.stdin:
                             "--color=never",
                         ])
                         .env(SELECTOR_ENV, selector)
+                        // Update inspection reads the real application-data store.
+                        // Give each fresh fixture child its own private storage.
+                        .env("XDG_DATA_HOME", output.path().join("data"))
+                        .env("XDG_CONFIG_HOME", output.path().join("config"))
+                        .env("XDG_RUNTIME_DIR", &runtime_path)
                         .stdout(fs::File::create(&stdout_path).unwrap())
                         .stderr(fs::File::create(&stderr_path).unwrap())
                         .spawn()
@@ -6540,8 +6573,69 @@ for line in sys.stdin:
 
     #[test]
     fn a_carried_terminal_keeps_its_process_across_an_upgrade() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::upgrade::handoff::{Phase, Store};
         use std::os::fd::AsRawFd;
+
+        // These simulated daemons intentionally share their original Child
+        // ownership inside this one fixture process. Keep both kernel
+        // capabilities until the reaper, rather than only the root, settles.
+        struct OriginalFamily {
+            root: fs::File,
+            holder: fs::File,
+            settled: bool,
+        }
+        impl OriginalFamily {
+            fn new(handle: &crate::terminal::TerminalHandle) -> Self {
+                Self {
+                    root: handle.original_root_pidfd_for_test().unwrap(),
+                    holder: handle.original_holder_pidfd_for_test().unwrap(),
+                    settled: false,
+                }
+            }
+            fn finish(&mut self) {
+                assert!(
+                    crate::daemon::child_reaper::wait_until_idle_for_test(Duration::from_secs(5)),
+                    "the original holder was not reaped before the next simulated daemon"
+                );
+                for pidfd in [&self.root, &self.holder] {
+                    let mut ready = libc::pollfd {
+                        fd: pidfd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    assert_eq!(unsafe { libc::poll(&mut ready, 1, 0) }, 1);
+                    assert_ne!(ready.revents & libc::POLLIN, 0);
+                }
+                self.settled = true;
+            }
+        }
+        impl Drop for OriginalFamily {
+            fn drop(&mut self) {
+                if self.settled {
+                    return;
+                }
+                // Assertion cleanup can reach only this fixture's original
+                // root and holder, including after anonymous detach. The
+                // existing child reaper keeps sole ownership of Child::wait.
+                for pidfd in [&self.root, &self.holder] {
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            pidfd.as_raw_fd(),
+                            libc::SIGKILL,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0,
+                        );
+                    }
+                }
+                if !crate::daemon::child_reaper::wait_until_idle_for_test(Duration::from_secs(5)) {
+                    eprintln!("carried fixture still owns original child custody after cleanup");
+                }
+            }
+        }
         // Exercise both the successful carry and failure after original adoption.
         // Failed recovery retains its live original instead of authorizing replay.
         for invalid_successor in [false, true] {
@@ -6582,6 +6676,8 @@ for line in sys.stdin:
             };
             let host = Arc::new(crate::host::state::HostLock::new(test_host()));
             spawn_terminal(&host, 0, source.clone(), TerminalSpawnOptions::default()).unwrap();
+            let old = host.lock().unwrap().terminals[&source.id].handle.clone();
+            let mut original = OriginalFamily::new(&old);
             let deadline = Instant::now() + Duration::from_secs(5);
             let pid = loop {
                 if let Some(pid) = fs::read_to_string(&pid_file)
@@ -6594,7 +6690,6 @@ for line in sys.stdin:
                 thread::sleep(Duration::from_millis(10));
             };
             let original_root = crate::terminal::holder::Process::read(pid).unwrap();
-            let old = host.lock().unwrap().terminals[&source.id].handle.clone();
             let carried_source = host
                 .lock()
                 .unwrap()
@@ -6734,6 +6829,8 @@ for line in sys.stdin:
                     crate::terminal_ipc::TerminalCloseResult::Closed
                 );
                 assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+                original.finish();
+                directory.close().unwrap();
                 continue;
             }
 
@@ -6803,6 +6900,8 @@ for line in sys.stdin:
                 crate::terminal_ipc::TerminalCloseResult::Closed
             );
             assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+            original.finish();
+            directory.close().unwrap();
         }
     }
 
@@ -6865,6 +6964,9 @@ for line in sys.stdin:
 
     #[test]
     fn restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::upgrade::handoff::{Checkpoint, Phase, Store, Terminal};
         let directory = tempfile::tempdir().unwrap();
         let empty_proc = directory.path().join("proc");

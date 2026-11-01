@@ -476,6 +476,8 @@ struct PublishedState {
     close_inspection_gate: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     #[cfg(test)]
     test_input_root_pidfd: OnceLock<File>,
+    #[cfg(test)]
+    test_holder_pidfd: OnceLock<File>,
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
     holder_identity: OnceLock<super::holder::Record>,
@@ -574,6 +576,8 @@ impl PublishedState {
             close_inspection_gate: Mutex::new(None),
             #[cfg(test)]
             test_input_root_pidfd: OnceLock::new(),
+            #[cfg(test)]
+            test_holder_pidfd: OnceLock::new(),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
             launch_directory: OnceLock::new(),
@@ -1012,6 +1016,15 @@ impl TerminalHandle {
             .test_input_root_pidfd
             .get()
             .ok_or_else(|| std::io::Error::other("original root pidfd was not captured"))?
+            .try_clone()
+    }
+    #[cfg(test)]
+    pub(crate) fn original_holder_pidfd_for_test(&self) -> std::io::Result<File> {
+        self.inner
+            .published
+            .test_holder_pidfd
+            .get()
+            .ok_or_else(|| std::io::Error::other("original holder pidfd was not captured"))?
             .try_clone()
     }
     /// Physical provenance of the original PTY launch, not caller authority.
@@ -2848,6 +2861,11 @@ impl Worker {
         };
         #[cfg(test)]
         {
+            // Preserve the original holder capability for fixture teardown
+            // even after detach transfers its Child to the daemon reaper.
+            if let Ok(descriptor) = held.holder.original_pidfd_for_test() {
+                let _ = published.test_holder_pidfd.set(descriptor);
+            }
             // The existing holder pidfd must still reach its original root
             // after opening the fixture capability. A reaped/reused PID never
             // reaches the failure guard. Quick natural exits need no fallback.
