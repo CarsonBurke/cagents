@@ -37,7 +37,7 @@ def event(kind, **fields):
 
 if name == 'zig':
     assert args == ['env']
-    print(json.dumps(dict(zig_exe=sys.argv[0], version='0.15.2')))
+    print(json.dumps(dict(zig_exe=sys.argv[0], version='0.15.2'), indent=2))
 elif name == 'scope-helper':
     event('helper')
     if os.environ.get('FIXTURE_HELPER_REFUSE'):
@@ -157,20 +157,31 @@ class RequiredBuildScope(unittest.TestCase):
         fifo = self.directory / "helper-fifo"
         os.mkfifo(fifo)
         cases = [
-            ["--build-scope-helper", str(self.helper)],
-            ["--build-scope-sha256", self.digest],
-            ["--build-scope-helper", "relative/helper", "--build-scope-sha256", self.digest],
-            ["--build-scope-helper", str(self.helper), "--build-scope-sha256", "not-a-hash"],
-            ["--build-scope-helper", str(self.helper), "--build-scope-sha256", "0" * 64],
-            ["--build-scope-helper", str(self.directory / "absent"), "--build-scope-sha256", self.digest],
-            ["--build-scope-helper", str(alias), "--build-scope-sha256", self.digest],
-            ["--build-scope-helper", str(fifo), "--build-scope-sha256", self.digest],
-            [*self.flags(), "--build-scope-helper", str(self.helper)],
+            (["--build-scope-helper", str(self.helper)], 2,
+             ["Build isolation requires both helper path and SHA256"]),
+            (["--build-scope-sha256", self.digest], 2,
+             ["Build isolation requires both helper path and SHA256"]),
+            (["--build-scope-helper", "relative/helper", "--build-scope-sha256", self.digest], 1,
+             ["Build scope helper must be an absolute stable path"]),
+            (["--build-scope-helper", str(self.helper), "--build-scope-sha256", "not-a-hash"], 1,
+             ["Build scope SHA256 must be 64 lowercase hexadecimal characters"]),
+            (["--build-scope-helper", str(self.helper), "--build-scope-sha256", "0" * 64], 1,
+             ["Build scope helper SHA256 does not match"]),
+            (["--build-scope-helper", str(self.directory / "absent"), "--build-scope-sha256", self.digest], 1,
+             ["Could not build ceditor product: [Errno 2]", str(self.directory / "absent")]),
+            (["--build-scope-helper", str(alias), "--build-scope-sha256", self.digest], 1,
+             ["Could not build ceditor product: [Errno 40]", str(alias)]),
+            (["--build-scope-helper", str(fifo), "--build-scope-sha256", self.digest], 1,
+             ["Build scope helper must be a regular executable"]),
+            ([*self.flags(), "--build-scope-helper", str(self.helper)], 2,
+             ["--build-scope-helper cannot be repeated"]),
         ]
-        for flags in cases:
+        for flags, status, causes in cases:
             with self.subTest(flags=flags):
                 result, events = self.invoke("run-development", ["--browserless", *flags])
-                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.returncode, status, result.stderr)
+                for cause in causes:
+                    self.assertIn(cause, result.stderr)
                 self.assertEqual(events, [])
 
     def test_three_isolated_graphs_launch_selected_ui_without_rebuilding(self):
