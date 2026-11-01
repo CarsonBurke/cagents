@@ -66,6 +66,15 @@ pub(super) fn runtime_error_code(message: &str, default: &'static str) -> &'stat
         default
     }
 }
+const RECONNECT: &str = "Reconnect to the existing terminal.";
+const RETRY_REFUSED: &str = "Retry did not restore this terminal. The notice says why.";
+fn new_terminal_consequence(session: &TerminalSession) -> &'static str {
+    if session.agent_resume_recipe().is_some() {
+        "Resume the saved conversation in a new terminal."
+    } else {
+        "Run the saved command from the beginning in a new terminal."
+    }
+}
 fn known_failure(code: &str) -> (&'static str, &'static str) {
     match code {
         "terminal_not_hosted" => ("terminal_not_hosted", "This terminal is no longer running."),
@@ -130,11 +139,9 @@ impl Details {
         };
         let consequence =
             if code != "terminal_not_hosted" && session.continuity.live_proof().is_some() {
-                "Reconnect to the existing terminal."
-            } else if session.agent_resume_recipe().is_some() {
-                "Resume the saved conversation in a new terminal."
+                RECONNECT
             } else {
-                "Run the saved command from the beginning in a new terminal."
+                new_terminal_consequence(session)
             };
         Self {
             code,
@@ -309,6 +316,14 @@ fn fresh_transcript(
     };
     let mut client = ControlClient::connect(&socket).map_err(|_| Unavailable::MetadataMissing)?;
     let descriptors = client.list().map_err(|_| Unavailable::MetadataMissing)?;
+    // The daemon answered and has never heard of this identity: it restarted
+    // and took nothing over. A listed identity keeps its receipt requirement.
+    if !descriptors
+        .iter()
+        .any(|descriptor| descriptor.session.id == session.id)
+    {
+        return transcript_location::open_without_host(session.id);
+    }
     let metadata: TranscriptMetadata = descriptors
         .into_iter()
         .find(|descriptor| {
@@ -365,6 +380,16 @@ impl Cagents {
         let Some(mut details) = self.capture_terminal_details(card, true) else {
             return generic.into();
         };
+        // Captured before the residency records this failure, so the capture
+        // above cannot have seen the code and promises a reconnect.
+        if generic == TERMINAL_NOT_HOSTED {
+            (details.code, details.message) = known_failure("terminal_not_hosted");
+            if let Some(CardKind::Terminal(session)) =
+                self.card_state(card).map(|state| &state.kind)
+            {
+                details.consequence = new_terminal_consequence(session);
+            }
+        }
         if self.card_state(card).is_some_and(|state| matches!(&state.kind, CardKind::Terminal(session) if account::login::is_codex_browser(&session.launch)))
             && account::login::callback_failed(&generic)
         {
@@ -765,7 +790,18 @@ impl Cagents {
                 // Existing identity/close checks retire stale spawned handles
                 // and decrement the actual start count even after presentation
                 // was replaced or its card was closed.
-                self.terminal_started_for_operation(card, terminal, result, current_operation)
+                let refused = current_operation && result.is_err();
+                let task =
+                    self.terminal_started_for_operation(card, terminal, result, current_operation);
+                // Having just failed to reattach, it must not suggest doing so.
+                if refused
+                    && let Some(CardRuntime::Failed(Failure::Terminal(details))) =
+                        self.cards.get_mut(&card)
+                    && details.consequence == RECONNECT
+                {
+                    details.consequence = RETRY_REFUSED;
+                }
+                task
             }
         }
     }
@@ -863,11 +899,49 @@ mod tests {
     #[test]
     fn a_terminal_the_daemon_lost_does_not_promise_reconnecting() {
         let (mut app, card, _) = app_and_session();
+        // The saved proof from before the restart is what made this misleading.
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("old-host"),
+            boot_id: crate::model::BootId::new("old-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("old"),
+        };
         app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
         let details = app.terminal_details(card).unwrap();
         assert_eq!(details.code, "terminal_not_hosted");
         assert_eq!(details.message, "This terminal is no longer running.");
-        assert_ne!(details.consequence, "Reconnect to the existing terminal.");
+        assert_eq!(
+            details.consequence,
+            "Run the saved command from the beginning in a new terminal."
+        );
+    }
+    #[test]
+    fn a_refused_retry_does_not_suggest_reconnecting() {
+        let (mut app, card, _) = app_and_session();
+        let live = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("old-host"),
+            boot_id: crate::model::BootId::new("old-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("old"),
+        };
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.continuity = live;
+        let terminal = session.id;
+        drop(app.retry_card(card));
+        let operation = app.terminal_failure.attempts[&card].operation;
+        drop(app.update_terminal_failure(Action::RetryFinished {
+            card,
+            operation,
+            terminal,
+            result: Err("cannot serialize terminal recovery".into()),
+        }));
+        assert_eq!(
+            app.terminal_details(card).unwrap().consequence,
+            RETRY_REFUSED
+        );
     }
     #[test]
     fn new_failure_on_same_identity_captures_current_typed_state() {

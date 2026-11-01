@@ -5895,7 +5895,7 @@ impl Cagents {
                             }
                         }
                     }
-                    let hosted=hosted.ok_or(terminal_failure::TERMINAL_NOT_HOSTED)?;
+                    let hosted=hosted.ok_or(if reserved { "This shared terminal has not started; another client must complete it" } else { terminal_failure::TERMINAL_NOT_HOSTED })?;
                     let proof = client.proof().clone();
                     (daemon_recovery::RecoveredTerminal { session: hosted.session,
                         expected_host: Some(proof.clone()), attach_completed: false, recovery_lease: None },
