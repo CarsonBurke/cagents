@@ -55,18 +55,17 @@ class ClaudeUpgradeFixtureContract(unittest.TestCase):
         with self.executable.open("xb") as destination:
             destination.write(self.source)
         self.executable.chmod(0o700)
-        # Keep opaque inherited authority intact; only fixture path inputs vary.
-        self.environment = os.environ.copy()
-        self.environment.update({
-            "HOME": str(self.root / "home"),
-            "CLAUDE_CONFIG_DIR": str(self.account),
-            "TMPDIR": str(self.root / "tmp"),
-            "XDG_CONFIG_HOME": str(self.root / "xdg/config"),
-            "XDG_DATA_HOME": str(self.root / "xdg/data"),
-            "XDG_CACHE_HOME": str(self.root / "xdg/cache"),
-            "XDG_STATE_HOME": str(self.root / "xdg/state"),
-            "XDG_RUNTIME_DIR": str(self.root / "xdg/runtime"),
-        })
+        # Overlay only synthetic paths on natural child inheritance.
+        self.path_overlays = [
+            f"HOME={self.root / 'home'}",
+            f"CLAUDE_CONFIG_DIR={self.account}",
+            f"TMPDIR={self.root / 'tmp'}",
+            f"XDG_CONFIG_HOME={self.root / 'xdg/config'}",
+            f"XDG_DATA_HOME={self.root / 'xdg/data'}",
+            f"XDG_CACHE_HOME={self.root / 'xdg/cache'}",
+            f"XDG_STATE_HOME={self.root / 'xdg/state'}",
+            f"XDG_RUNTIME_DIR={self.root / 'xdg/runtime'}",
+        ]
         self.thread = str(uuid.uuid4())
         self.prompt = str(uuid.uuid4())
         self.initialize = {
@@ -138,8 +137,9 @@ class ClaudeUpgradeFixtureContract(unittest.TestCase):
             os.fchmod(stdout.fileno(), 0o600)
             os.fchmod(stderr.fileno(), 0o600)
             child = subprocess.Popen(
-                ["/usr/bin/python3", "-I", "-B", str(self.executable), argument, self.thread],
-                cwd=self.project, env=self.environment, stdin=subprocess.PIPE,
+                ["/usr/bin/env", *self.path_overlays, "/usr/bin/python3", "-I", "-B",
+                 str(self.executable), argument, self.thread],
+                cwd=self.project, env=None, stdin=subprocess.PIPE,
                 stdout=stdout, stderr=stderr, bufsize=0, close_fds=True,
                 preexec_fn=cap_child_files,
             )
