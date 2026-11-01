@@ -918,7 +918,8 @@ impl Cagents {
                     .into(),
             ])
             .spacing(space::XS);
-            rows.push(
+            rows.push(crate::ui_controls::owned(
+                row.card,
                 widget::button::custom(contents)
                     .name(format!("Resume {}", row.title))
                     .width(Length::Fill)
@@ -928,9 +929,8 @@ impl Cagents {
                     .on_press_maybe(
                         (!state.loading)
                             .then_some(Message::ResumeConversation(Action::Resume(row.card))),
-                    )
-                    .into(),
-            );
+                    ),
+            ));
         }
         if state.visible.len() > state.limit {
             rows.push(
@@ -1087,6 +1087,287 @@ mod tests {
             },
         ));
         let _ = app.update_resume(Action::Indexed(generation, Progress::Counted(0)));
+    }
+
+    fn result_picker(entries: Vec<SavedConversation>) -> Cagents {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
+        app.resume_ui.limit = PAGE;
+        let generation = app.resume_ui.generation;
+        let seeds = entries.iter().map(|entry| entry.session.clone()).collect();
+        drop(app.update_resume(Action::Indexed(
+            generation,
+            Progress::Saved {
+                entries,
+                seeds,
+                error: None,
+            },
+        )));
+        drop(app.update_resume(Action::Indexed(generation, Progress::Counted(2))));
+        app
+    }
+
+    /// Retain the production dialog's native widget cache across index updates,
+    /// including the runtime's named-state extraction and restoration.
+    struct ResultFrames {
+        cache: iced::runtime::user_interface::Cache,
+        renderer: cosmic::Renderer,
+        size: iced::Size,
+    }
+
+    impl ResultFrames {
+        fn new(size: iced::Size) -> Self {
+            Self {
+                cache: iced::runtime::user_interface::Cache::new(),
+                renderer: crate::app::tests::headless_renderer(),
+                size,
+            }
+        }
+
+        fn step(
+            &mut self,
+            app: &Cagents,
+            card: CardId,
+            event: Option<iced::mouse::Event>,
+            held_point: Option<iced::Point>,
+        ) -> (iced::Point, Vec<Message>) {
+            use iced::advanced::clipboard;
+            use iced::{Event, mouse, runtime::UserInterface};
+            use iced_accessibility::accesskit::{Action as A11yAction, Role};
+
+            let title = &app
+                .resume_ui
+                .rows
+                .iter()
+                .find(|row| row.card == card)
+                .unwrap()
+                .title;
+            let label = format!("Resume {title}");
+            let mut ui = UserInterface::build(
+                app.resume_dialog().unwrap(),
+                self.size,
+                std::mem::replace(&mut self.cache, iced::runtime::user_interface::Cache::new()),
+                &mut self.renderer,
+            );
+            let cursor = held_point.map_or(mouse::Cursor::Unavailable, mouse::Cursor::Available);
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[],
+                cursor,
+                &mut self.renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert!(messages.is_empty());
+            ui.draw(
+                &mut self.renderer,
+                &cosmic::theme::active(),
+                &iced::advanced::renderer::Style::default(),
+                cursor,
+            );
+            let nodes = ui.a11y_nodes(cursor);
+            let button = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| {
+                    node.node().role() == Role::Button
+                        && node.node().label() == Some(label.as_str())
+                })
+                .expect("the complete result button keeps its accessible name");
+            assert!(button.node().supports_action(A11yAction::Click));
+            assert!(button.node().supports_action(A11yAction::Focus));
+            let bounds = button.node().bounds().unwrap();
+            assert!((bounds.y1 - bounds.y0 - f64::from(ROW_HEIGHT)).abs() < 0.5);
+            assert!(bounds.x1 - bounds.x0 > f64::from(self.size.width.min(800.0) - 128.0));
+            // Use the fill-width part beyond the text, through the real scroller.
+            let point = iced::Point::new(
+                bounds.x1 as f32 - 16.0,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            if let Some(held) = held_point {
+                assert_eq!(point, held, "the current result occupies the pressed slot");
+            }
+            let events = event.map(Event::Mouse).into_iter().collect::<Vec<_>>();
+            let _ = ui.update(
+                &events,
+                mouse::Cursor::Available(point),
+                &mut self.renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            self.cache = ui.into_cache();
+            (point, messages)
+        }
+
+        fn press(&mut self, app: &Cagents, card: CardId) -> iced::Point {
+            let (point, messages) = self.step(
+                app,
+                card,
+                Some(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                None,
+            );
+            assert!(
+                messages.is_empty(),
+                "press alone cannot resume a conversation"
+            );
+            point
+        }
+
+        fn release(&mut self, app: &Cagents, card: CardId, point: iced::Point) -> Vec<Message> {
+            self.step(
+                app,
+                card,
+                Some(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+                Some(point),
+            )
+            .1
+        }
+    }
+
+    fn apply_result_click(app: &mut Cagents, messages: Vec<Message>, expected: CardId) {
+        assert_eq!(
+            messages.len(),
+            1,
+            "a fresh click resumes exactly one result"
+        );
+        let Message::ResumeConversation(Action::Resume(card)) =
+            messages.into_iter().next().unwrap()
+        else {
+            panic!("the actual result button emits a resume action");
+        };
+        assert_eq!(card, expected);
+        drop(app.update_resume(Action::Resume(card)));
+        assert!(!app.resume_ui.open);
+        assert_eq!(app.durable.cards.len(), 1);
+    }
+
+    #[test]
+    fn resume_result_press_cannot_transfer_to_a_newer_indexed_conversation() {
+        for size in [
+            iced::Size::new(1100.0, 900.0),
+            iced::Size::new(600.0, 600.0),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let original = saved(directory.path());
+            let mut app = result_picker(vec![original.clone()]);
+            let generation = app.resume_ui.generation;
+            let mut frames = ResultFrames::new(size);
+            let point = frames.press(&app, original.card);
+            let found = catalog::Found {
+                seed: 0,
+                path: directory.path().join("newer-transcript.jsonl"),
+                id: uuid::Uuid::new_v4().to_string(),
+                directory: directory.path().into(),
+                title: "Newer indexed conversation".into(),
+                titled: true,
+                named: true,
+                updated_at_unix_ms: original.updated_at_unix_ms + 1,
+            };
+            let expected = catalog::session(&original.session, &found).unwrap().launch;
+            drop(app.update_resume(Action::Indexed(
+                generation,
+                Progress::Found {
+                    conversations: vec![found],
+                    titles: Vec::new(),
+                    read: 1,
+                },
+            )));
+            let replacement = app.resume_ui.rows[app.resume_ui.visible[0]].card;
+            assert_ne!(replacement, original.card);
+            assert_eq!(
+                app.resume_ui.rows[app.resume_ui.visible[1]].card,
+                original.card
+            );
+            assert_eq!(
+                app.resume_ui.selected, 0,
+                "no keyboard navigation or reveal"
+            );
+            assert!(
+                frames.release(&app, replacement, point).is_empty(),
+                "the old press cannot activate the newly indexed result"
+            );
+            assert!(app.durable.cards.is_empty());
+            let point = frames.press(&app, replacement);
+            let messages = frames.release(&app, replacement, point);
+            apply_result_click(&mut app, messages, replacement);
+            let CardKind::Chat(session) = &app.durable.cards[0].kind else {
+                panic!("the exact indexed conversation was resumed");
+            };
+            assert_eq!(session.launch, expected);
+            assert_eq!(app.durable.cards[0].title, "Newer indexed conversation");
+        }
+    }
+
+    #[test]
+    fn resume_result_press_cannot_transfer_when_indexed_titles_replace_a_filtered_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut original = saved(directory.path());
+        original.title = "Review original".into();
+        let mut replacement = saved(directory.path());
+        replacement.title = "Unrelated conversation".into();
+        replacement.session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let mut app = result_picker(vec![original.clone(), replacement.clone()]);
+        drop(app.update_resume(Action::Query("review".into())));
+        assert_eq!(app.resume_ui.visible, [0]);
+        let mut frames = ResultFrames::new(iced::Size::new(600.0, 600.0));
+        let point = frames.press(&app, original.card);
+        let generation = app.resume_ui.generation;
+        drop(app.update_resume(Action::Indexed(
+            generation,
+            Progress::Found {
+                conversations: Vec::new(),
+                titles: vec![
+                    (original.card, "Archived original".into()),
+                    (replacement.card, "Review replacement".into()),
+                ],
+                read: 1,
+            },
+        )));
+        assert_eq!(app.resume_ui.rows.len(), 2, "a title-only publication");
+        assert_eq!(app.resume_ui.visible, [1], "one result replaces one result");
+        assert!(
+            frames.release(&app, replacement.card, point).is_empty(),
+            "provider title updates cannot lend a held press to another result"
+        );
+        assert!(app.durable.cards.is_empty());
+        let point = frames.press(&app, replacement.card);
+        let messages = frames.release(&app, replacement.card, point);
+        apply_result_click(&mut app, messages, replacement.card);
+        let CardKind::Chat(session) = &app.durable.cards[0].kind else {
+            panic!("the exact filtered conversation was resumed");
+        };
+        assert_eq!(session.launch, replacement.session.launch);
+        assert_eq!(app.durable.cards[0].title, "Review replacement");
+    }
+
+    #[test]
+    fn resume_result_press_survives_an_indexed_title_update_for_the_same_conversation() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = saved(directory.path());
+        let mut app = result_picker(vec![original.clone()]);
+        let mut frames = ResultFrames::new(iced::Size::new(1100.0, 900.0));
+        let point = frames.press(&app, original.card);
+        let generation = app.resume_ui.generation;
+        drop(app.update_resume(Action::Indexed(
+            generation,
+            Progress::Found {
+                conversations: Vec::new(),
+                titles: vec![(
+                    original.card,
+                    "Provider's updated conversation title".into(),
+                )],
+                read: 1,
+            },
+        )));
+        let messages = frames.release(&app, original.card, point);
+        apply_result_click(&mut app, messages, original.card);
+        assert_eq!(
+            app.durable.cards[0].title,
+            "Provider's updated conversation title"
+        );
     }
 
     #[test]
