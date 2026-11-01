@@ -15367,6 +15367,8 @@ impl Application for Cagents {
                 if self.modal_is_open() && !repository_action_allowed_while_modal(&action) {
                     return Task::none();
                 }
+                #[cfg(all(feature = "development", target_os = "linux"))]
+                let native_save_dispatch = project_ui::native_close_fixture::save_dispatch_token(self, &action);
                 let card = action.card();
                 let find_preferences_changed = matches!(
                     &action,
@@ -15428,6 +15430,10 @@ impl Application for Cagents {
                     }
                     _ => Task::none(),
                 };
+                #[cfg(all(feature = "development", target_os = "linux"))]
+                if let Some(token) = native_save_dispatch {
+                    project_ui::native_close_fixture::acknowledge_save_dispatch(self, token);
+                }
                 // Every buffer transition the action caused is recorded on the
                 // runtime and has so far reached nothing. Draining here rather
                 // than at the individual actions is what makes that true of all
