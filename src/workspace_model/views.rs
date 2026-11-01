@@ -341,7 +341,7 @@ fn pane_resource(kind: &CardKind) -> Option<(u8, crate::model::TerminalId)> {
 
 /// An observed terminal exit may be displayed without granting live process
 /// authority. Every issued descriptor field except that end state must match.
-fn ended_managed_terminal_matches(
+pub(crate) fn ended_managed_terminal_matches(
     agent: &crate::agent_execution::Agent,
     current: &crate::model::TerminalSession,
 ) -> bool {
@@ -430,6 +430,75 @@ pub(crate) fn managed_pane_matches(agent: &crate::agent_execution::Agent, pane: 
             .console
             .as_ref()
             .is_some_and(|session| HostedSession::Terminal(session.clone()).same_process(&current))
+}
+
+/// The two ways an open agent with a console can be shown in its own pane:
+/// its native chat, or the console the daemon runs over that same provider.
+/// Switching between them changes only the pane. The provider keeps running,
+/// no prompt is sent again, and the console stays hosted while hidden.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentPresentation {
+    /// The agent's native session, naming its console as the terminal it pairs
+    /// with, exactly as the daemon's actor records it.
+    pub chat: crate::chat::Session,
+    pub console: crate::model::TerminalSession,
+}
+
+impl AgentPresentation {
+    /// `None` unless the agent is open and both its native session and its
+    /// console carry complete daemon proofs.
+    pub fn of(agent: &crate::agent_execution::Agent) -> Option<Self> {
+        use crate::agent_execution::HostedSession;
+        let (Some(HostedSession::Chat(session)), Some(console)) = (&agent.session, &agent.console)
+        else {
+            return None;
+        };
+        if agent.closed
+            || !HostedSession::Chat(session.clone()).has_complete_proof()
+            || !HostedSession::Terminal(console.clone()).has_complete_proof()
+            || console.id != session.id
+        {
+            return None;
+        }
+        let mut chat = session.clone();
+        chat.terminal = Some(console.clone());
+        Some(Self {
+            chat,
+            console: console.clone(),
+        })
+    }
+
+    /// The pane kind that shows this agent on `surface`.
+    pub fn kind(&self, surface: crate::agent_execution::Surface) -> CardKind {
+        match surface {
+            crate::agent_execution::Surface::Chat => CardKind::Chat(self.chat.clone()),
+            crate::agent_execution::Surface::Terminal => CardKind::Terminal(self.console.clone()),
+        }
+    }
+
+    /// Which surface `kind` shows, when it shows this agent's own provider or
+    /// console. A console the user ended still shows the console.
+    pub fn shown(
+        &self,
+        agent: &crate::agent_execution::Agent,
+        kind: &CardKind,
+    ) -> Option<crate::agent_execution::Surface> {
+        use crate::agent_execution::Surface;
+        match kind {
+            CardKind::Chat(session)
+                if crate::agent_execution::same_chat_process(session, &self.chat) =>
+            {
+                Some(Surface::Chat)
+            }
+            CardKind::Terminal(session)
+                if crate::agent_execution::same_terminal_process(session, &self.console)
+                    || ended_managed_terminal_matches(agent, session) =>
+            {
+                Some(Surface::Terminal)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -927,6 +996,105 @@ mod managed_display_tests {
             ..pane.clone()
         };
         (agent, pane, terminal)
+    }
+
+    /// A console agent's pane shows either surface of the same provider, and
+    /// nothing else counts as that agent.
+    #[test]
+    fn an_agent_with_a_console_is_shown_as_its_own_chat_or_console() {
+        let (mut agent, native, terminal) = fixture();
+        agent.spec.surface = Surface::Terminal;
+        let presentation = AgentPresentation::of(&agent).unwrap();
+        let CardKind::Chat(chat) = presentation.kind(Surface::Chat) else {
+            panic!("chat");
+        };
+        assert_eq!(chat.terminal.as_ref(), agent.console.as_ref());
+        assert_eq!(
+            presentation.kind(Surface::Terminal),
+            CardKind::Terminal(agent.console.clone().unwrap())
+        );
+        // The pane the daemon published names no console; it is the same chat.
+        assert_eq!(
+            presentation.shown(&agent, &native.kind),
+            Some(Surface::Chat)
+        );
+        assert_eq!(
+            presentation.shown(&agent, &presentation.kind(Surface::Chat)),
+            Some(Surface::Chat)
+        );
+        assert_eq!(
+            presentation.shown(&agent, &terminal.kind),
+            Some(Surface::Terminal)
+        );
+        let mut ended = agent.console.clone().unwrap();
+        ended.continuity = TerminalContinuity::Exited {
+            last_exit: TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            },
+        };
+        assert_eq!(
+            presentation.shown(&agent, &CardKind::Terminal(ended)),
+            Some(Surface::Terminal),
+            "a console the user ended still shows the console"
+        );
+        let mut other = agent.console.clone().unwrap();
+        other.id = TerminalId::new();
+        assert_eq!(presentation.shown(&agent, &CardKind::Terminal(other)), None);
+        let mut stale = chat.clone();
+        stale.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("stale");
+        assert_eq!(presentation.shown(&agent, &CardKind::Chat(stale)), None);
+
+        let mut closed = agent.clone();
+        closed.closed = true;
+        assert!(AgentPresentation::of(&closed).is_none());
+        let mut chat_only = agent.clone();
+        chat_only.console = None;
+        assert!(AgentPresentation::of(&chat_only).is_none());
+        let mut unproved = agent.clone();
+        if let Some(HostedSession::Chat(session)) = &mut unproved.session {
+            session.proof = None;
+        }
+        assert!(AgentPresentation::of(&unproved).is_none());
+        let mut terminal_only = agent;
+        terminal_only.session = Some(HostedSession::Terminal(
+            terminal_only.console.clone().unwrap(),
+        ));
+        assert!(AgentPresentation::of(&terminal_only).is_none());
+    }
+
+    /// An agent spawned onto its console and since shown as its chat is found
+    /// where that chat pane is saved, not left looking for its console.
+    #[test]
+    fn a_console_agent_shown_as_chat_is_displayed_in_its_saved_chat_pane() {
+        let (mut agent, native, _) = fixture();
+        agent.spec.surface = Surface::Terminal;
+        let pane = Pane {
+            kind: AgentPresentation::of(&agent).unwrap().kind(Surface::Chat),
+            ..native
+        };
+        let scope = Scope::Worktree {
+            repository: "/shown/.git".into(),
+            path: "/shown/worktree".into(),
+        };
+        let mut placement = View::empty(agent.placement.clone());
+        placement.retired.push(pane.id);
+        let model = super::super::WorkspaceModel {
+            views: vec![
+                placement,
+                View {
+                    scope: scope.clone(),
+                    revision: 3,
+                    panes: vec![pane.clone()],
+                    retired: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        let display = managed_display(&model, &agent).unwrap();
+        assert_eq!(display.scope, scope);
+        assert_eq!(display.pane, Some(pane));
     }
 
     #[test]

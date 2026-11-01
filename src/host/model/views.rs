@@ -212,6 +212,9 @@ pub(super) fn refusal(
     scope: &Scope,
     change: &Change,
 ) -> Result<Option<String>, String> {
+    if let Change::Update { pane, .. } = change {
+        return Ok(agent_pane_kind(db, scope, pane)?.err());
+    }
     let Change::Transfer {
         id, destination, ..
     } = change
@@ -240,6 +243,117 @@ pub(super) fn refusal(
     }
     Ok((project(db, scope)? != project(db, destination)?)
         .then(|| "Panes can only move between views of the same project".into()))
+}
+
+/// The open agent whose canonical card `id` is.
+fn canonical_agent(
+    db: &Connection,
+    id: crate::model::CardId,
+) -> Result<Option<crate::agent_execution::Agent>, String> {
+    db.query_row(
+        "SELECT record FROM agents WHERE closed=0 AND id=?1",
+        [crate::model::AgentId::from_uuid(id.as_uuid()).to_string()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .map(|record| serde_json::from_str(&record).map_err(|error| error.to_string()))
+    .transpose()
+}
+
+/// Whether an update turns an open agent's own pane into another kind of
+/// pane. Its descriptor may otherwise change as it always could; only this
+/// switch is fenced here.
+///
+/// `Ok(true)` is a switch between the agent's native chat and its console,
+/// `Ok(false)` any other accepted update, and `Err` a switch that would put
+/// something else behind the agent's card: a pane that is not a conversation
+/// at all, another agent's console, or, while the pane shows this agent's own
+/// provider, a chat that is not that provider. Returning the agent's chat to
+/// its provider's terminal, and whatever that terminal is switched to later,
+/// stay as they were: the pane then no longer shows the agent's process.
+fn agent_pane_kind(
+    db: &Connection,
+    scope: &Scope,
+    pane: &crate::workspace_model::views::Pane,
+) -> Result<Result<bool, String>, String> {
+    use crate::{agent_execution::HostedSession, model::CardKind};
+    if !exists(db, scope)? {
+        return Ok(Ok(false));
+    }
+    let view = read(db, scope)?;
+    let Some(current) = view.panes.iter().find(|current| current.id == pane.id) else {
+        return Ok(Ok(false));
+    };
+    if std::mem::discriminant(&current.kind) == std::mem::discriminant(&pane.kind) {
+        return Ok(Ok(false));
+    }
+    let Some(agent) = canonical_agent(db, pane.id)? else {
+        return Ok(Ok(false));
+    };
+    let refused = || {
+        Ok(Err(
+            "This pane belongs to an agent; it can only show that agent's own chat or console"
+                .into(),
+        ))
+    };
+    if let Some(presentation) = crate::workspace_model::views::AgentPresentation::of(&agent)
+        && presentation.shown(&agent, &current.kind).is_some()
+        && presentation.shown(&agent, &pane.kind).is_some()
+    {
+        return Ok(Ok(true));
+    }
+    let own = |kind: &CardKind| {
+        let candidate = crate::workspace_model::views::Pane {
+            kind: kind.clone(),
+            ..pane.clone()
+        };
+        crate::workspace_model::views::managed_pane_matches(&agent, &candidate)
+            || matches!(kind, CardKind::Terminal(terminal)
+                if crate::workspace_model::views::ended_managed_terminal_matches(&agent, terminal))
+            // A Codex agent's CLI view, which the daemon opens over that same
+            // provider under its session's identity, is the agent too.
+            || match (&agent.session, kind) {
+                (Some(HostedSession::Chat(session)), CardKind::Terminal(view)) => {
+                    view.id == session.id
+                        && HostedSession::Terminal(view.clone()).has_complete_proof()
+                        && view.continuity.live_proof().as_ref() == session.proof.as_ref()
+                }
+                _ => false,
+            }
+    };
+    match &pane.kind {
+        CardKind::Terminal(terminal) => {
+            if crate::agent_execution::console_agent(&terminal.launch)
+                .is_some_and(|console| console != agent.id)
+            {
+                return refused();
+            }
+        }
+        CardKind::Chat(_) => {
+            if own(&current.kind) && !own(&pane.kind) {
+                return refused();
+            }
+        }
+        _ => return refused(),
+    }
+    Ok(Ok(false))
+}
+
+/// Publish a view whose panes changed only in how they show the same work.
+/// The channel's naming choice and every other view field stay as they are.
+fn write_presentation(db: &Connection, before: &View, view: &View) -> Result<(), String> {
+    channel_work::placement::observe_view_transition(db, before, view)?;
+    db.execute(
+        "UPDATE shared_views SET revision=?2, panes=?3 WHERE scope=?1",
+        params![
+            key(&view.scope)?,
+            view.revision,
+            serde_json::to_string(&view.panes).map_err(|error| error.to_string())?
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 /// The session index finds the owner, but does not authenticate a process:
@@ -497,6 +611,7 @@ pub(super) fn apply(
     register(transaction, scope)?;
     let mut view = read(transaction, scope)?;
     let mut changed = false;
+    let mut presentation = false;
     let mut deferred_target = None;
     match edit {
         ModelEdit::SeedView { panes, closed, .. } => {
@@ -613,6 +728,7 @@ pub(super) fn apply(
                     {
                         return Err(Registry::VIEW_SOURCE_CONFLICT.into());
                     }
+                    presentation = agent_pane_kind(transaction, scope, pane)??;
                     if resource_owner(transaction, pane)?.is_some() {
                         false
                     } else {
@@ -674,7 +790,13 @@ pub(super) fn apply(
             .revision
             .checked_add(1)
             .ok_or("view revision exhausted")?;
-        write(transaction, &view)?;
+        if presentation && existed {
+            // Showing an agent's chat instead of its console is not a new
+            // conversation, so the channel keeps its name.
+            write_presentation(transaction, &read(transaction, scope)?, &view)?;
+        } else {
+            write(transaction, &view)?;
+        }
     }
     if let Some(target) = deferred_target {
         write(transaction, &target)?;
