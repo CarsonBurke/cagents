@@ -73,6 +73,11 @@ pub use conversation_titles::{channel_title, channel_title_from_prompt};
 /// where nothing local counts as shared and therefore nothing is retired.
 pub const NO_REGISTRY: Uuid = Uuid::nil();
 
+/// How a daemon that could not open its shared-model store refuses a request
+/// for the model. Clients compare it to tell a daemon without a registry from
+/// one whose registry failed a single read.
+pub const REGISTRY_UNAVAILABLE: &str = "the shared workspace model store is unavailable";
+
 /// Stable identities in a project's manually arranged navigation list.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NavigationItem {
