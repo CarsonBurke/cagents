@@ -67,7 +67,8 @@ struct SourceFingerprint {
     changed: (i64, i64),
 }
 
-fn source_fingerprint(metadata: &fs::Metadata) -> SourceFingerprint {
+fn source_fingerprint(metadata: impl Into<fs_safety::EntryMetadata>) -> SourceFingerprint {
+    let metadata = metadata.into();
     SourceFingerprint {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -256,14 +257,17 @@ impl SetupCheckout {
         index.check(&self.admin)?;
         check_cancel(cancel)?;
         let spec = RepositoryService::system("git")
-            .git_base(&self.target.process_path(), true)
-            .arg(format!("--git-dir={}", self.admin.process_path().display()))
+            .git_base(&self.target.process_path().map_err(error)?, true)
+            .arg(format!(
+                "--git-dir={}",
+                self.admin.process_path().map_err(error)?.display()
+            ))
             .arg(format!(
                 "--work-tree={}",
-                self.target.process_path().display()
+                self.target.process_path().map_err(error)?.display()
             ))
             .args(["-c", "core.hooksPath=/dev/null"])
-            .env("GIT_COMMON_DIR", self.common.process_path())
+            .env("GIT_COMMON_DIR", self.common.process_path().map_err(error)?)
             .env(
                 "GIT_INDEX_FILE",
                 format!("/proc/{}/fd/{}", std::process::id(), index.file.as_raw_fd()),

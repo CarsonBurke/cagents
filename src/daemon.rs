@@ -14,7 +14,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Seek, SeekFrom},
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::AsRawFd,
         unix::{
             fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
             net::UnixStream,
@@ -37,6 +37,10 @@ use std::{
     },
 };
 
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+
+#[cfg(target_os = "linux")]
 use serde::Deserialize;
 #[cfg(feature = "host")]
 use serde::Serialize;
@@ -435,6 +439,7 @@ fn write_lock_metadata(lock: &mut File, proof: &HostSessionProof) -> Result<(), 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Deserialize)]
 struct StoredLockMetadata {
     pid: u32,
@@ -442,6 +447,7 @@ struct StoredLockMetadata {
 
 /// Locate the executable of this instance's live, kernel-verified lock owner.
 /// Update coordination uses its sibling CLI to speak the owner's own protocol.
+#[cfg(target_os = "linux")]
 pub(crate) fn running_executable() -> Result<Option<PathBuf>, PlatformError> {
     let paths = RuntimePaths::discover()?;
     let mut lock = match OpenOptions::new()
@@ -466,6 +472,7 @@ pub(crate) fn running_executable() -> Result<Option<PathBuf>, PlatformError> {
 /// Authenticate the current socket against the daemon's exclusive lease before
 /// using a new incarnation as evidence that an old owner has been replaced.
 /// Merely reaching a socket (or receiving a proof mismatch) is not authority.
+#[cfg(target_os = "linux")]
 pub(crate) fn replacement_owner(
     socket: &Path,
     proof: &HostSessionProof,
@@ -495,6 +502,7 @@ pub(crate) fn replacement_owner(
 
 /// Validate the exclusive owner before its public listener exists. Holders use
 /// this during startup adoption, and compare it to the connecting peer's PID.
+#[cfg(target_os = "linux")]
 pub(crate) fn lease_owner(
     lock_path: &Path,
     proof: &HostSessionProof,
@@ -532,6 +540,7 @@ pub(crate) fn lease_owner(
 ///
 /// The pidfd is opened before `/proc` validation, so PID reuse cannot redirect
 /// the signal after the lock owner has been authenticated.
+#[cfg(target_os = "linux")]
 pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
     let paths = RuntimePaths::discover()?;
     let mut lock = match OpenOptions::new()
@@ -574,16 +583,20 @@ pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
 #[cfg(feature = "ui")]
 #[derive(Debug)]
 pub(crate) struct RestartTarget {
+    #[cfg(target_os = "linux")]
     process: File,
+    #[cfg(target_os = "linux")]
     proof: HostSessionProof,
 }
 
 #[cfg(feature = "ui")]
+#[cfg(target_os = "linux")]
 pub(crate) fn restart_target() -> Result<RestartTarget, PlatformError> {
     restart_target_at(&RuntimePaths::discover()?)
 }
 
 #[cfg(feature = "ui")]
+#[cfg(target_os = "linux")]
 fn restart_target_at(paths: &RuntimePaths) -> Result<RestartTarget, PlatformError> {
     #[derive(Deserialize)]
     struct Metadata {
@@ -609,6 +622,7 @@ fn restart_target_at(paths: &RuntimePaths) -> Result<RestartTarget, PlatformErro
 }
 
 #[cfg(feature = "ui")]
+#[cfg(target_os = "linux")]
 impl RestartTarget {
     /// Try graceful termination, then finish the same confirmed process if it
     /// cannot respond. The kernel descriptor fences PID reuse throughout.
@@ -643,6 +657,7 @@ impl RestartTarget {
 }
 
 #[cfg(feature = "ui")]
+#[cfg(target_os = "linux")]
 fn signal_process(process: &File, signal: c_int) -> io::Result<()> {
     // SAFETY: the owned descriptor is a validated pidfd; the caller supplies
     // SIGTERM or SIGKILL. No PID lookup occurs after authentication.
@@ -665,6 +680,7 @@ fn signal_process(process: &File, signal: c_int) -> io::Result<()> {
 }
 
 #[cfg(feature = "ui")]
+#[cfg(target_os = "linux")]
 fn wait_process(process: &File, duration: std::time::Duration) -> io::Result<bool> {
     let deadline = std::time::Instant::now() + duration;
     loop {
@@ -696,6 +712,7 @@ fn wait_process(process: &File, duration: std::time::Duration) -> io::Result<boo
     }
 }
 
+#[cfg(target_os = "linux")]
 fn daemon_pidfd_from_lock(
     lock: &mut File,
     paths: &RuntimePaths,
@@ -720,6 +737,7 @@ fn daemon_pidfd_from_lock(
     open_daemon_pidfd_or_recover(lock, paths, stored.pid)
 }
 
+#[cfg(target_os = "linux")]
 fn open_daemon_pidfd_or_recover(
     lock: &File,
     paths: &RuntimePaths,
@@ -743,6 +761,7 @@ fn open_daemon_pidfd_or_recover(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn open_validated_pidfd(lock: &File, pid: u32, proc_root: &Path) -> io::Result<File> {
     let pid = i32::try_from(pid)
         .ok()
@@ -776,6 +795,68 @@ fn open_validated_pidfd(lock: &File, pid: u32, proc_root: &Path) -> io::Result<F
         ));
     }
     Ok(pidfd)
+}
+
+// No pathname, lease or process observation can substitute for the missing
+// kernel identity primitives. Refuse before entering the recovery graph.
+#[cfg(not(target_os = "linux"))]
+fn unsupported_process_identity() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Kernel-verified daemon ownership is unavailable on this platform",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn running_executable() -> Result<Option<PathBuf>, PlatformError> {
+    Err(unsupported_process_identity().into())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn replacement_owner(_: &Path, _: &HostSessionProof) -> Result<u32, PlatformError> {
+    Err(unsupported_process_identity().into())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn lease_owner(_: &Path, _: &HostSessionProof) -> Result<u32, PlatformError> {
+    Err(unsupported_process_identity().into())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
+    Err(unsupported_process_identity().into())
+}
+
+#[cfg(all(feature = "ui", not(target_os = "linux")))]
+pub(crate) fn restart_target() -> Result<RestartTarget, PlatformError> {
+    Err(unsupported_process_identity().into())
+}
+
+#[cfg(all(feature = "ui", not(target_os = "linux")))]
+fn restart_target_at(_: &RuntimePaths) -> Result<RestartTarget, PlatformError> {
+    Err(unsupported_process_identity().into())
+}
+
+#[cfg(all(feature = "ui", not(target_os = "linux")))]
+impl RestartTarget {
+    pub(crate) fn terminate(&self) -> Result<(), PlatformError> {
+        Err(unsupported_process_identity().into())
+    }
+
+    fn terminate_at(&self, _: &RuntimePaths, _: std::time::Duration) -> Result<(), PlatformError> {
+        Err(unsupported_process_identity().into())
+    }
+}
+
+// pre_exec must not allocate; preserve the errno through Rust's spawn pipe.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn seal_inherited_descriptors() -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+}
+
+#[cfg(all(feature = "host", not(target_os = "linux")))]
+pub(crate) fn peer_uid(_: &UnixStream) -> io::Result<u32> {
+    Err(unsupported_process_identity())
 }
 
 #[cfg(feature = "host")]
@@ -870,6 +951,7 @@ pub(crate) fn current_uid() -> u32 {
 
 /// Called only in a child's pre-exec hook. Long-lived sibling processes must
 /// not retain installer assets, update leases, or other inherited descriptors.
+#[cfg(target_os = "linux")]
 pub(crate) fn seal_inherited_descriptors() -> io::Result<()> {
     // SAFETY: close_range takes scalar bounds and only changes descriptor flags.
     if unsafe { libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as libc::c_int) } != 0 {
@@ -879,6 +961,7 @@ pub(crate) fn seal_inherited_descriptors() -> io::Result<()> {
 }
 
 #[cfg(feature = "host")]
+#[cfg(target_os = "linux")]
 pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     // SAFETY: zero is valid for every scalar field of the kernel credential buffer.
     let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
@@ -975,6 +1058,7 @@ mod tests {
 
     #[cfg(feature = "host")]
     #[test]
+    #[cfg(target_os = "linux")]
     fn socket_peer_identity_uses_the_kernel_effective_uid() {
         let (client, server) = UnixStream::pair().unwrap();
         // SAFETY: geteuid has no preconditions. Both sockets are real owned
@@ -1053,6 +1137,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn special_daemon_locks_are_rejected_before_blocking_open() {
         use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
         use std::process::{Command, Stdio};
@@ -1187,6 +1272,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn child_exec_seals_inherited_assets_without_closing_standard_output() {
         use std::os::unix::process::CommandExt;
 
@@ -1309,6 +1395,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn hardlinked_lock_read_paths_refuse_without_recovering_the_socket() {
         let (_root, paths, target) = hardlinked_lock_fixture();
         let before = fs::metadata(&target).unwrap();
@@ -1385,6 +1472,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn validated_pidfd_pins_the_process_that_owns_the_lock() {
         let root = tempdir().unwrap();
         let lock = File::create(root.path().join("lock")).unwrap();
@@ -1405,6 +1493,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn dead_daemon_lock_recovers_its_stale_socket() {
         let root = tempdir().unwrap();
         let paths = paths(root.path().to_path_buf());
@@ -1418,6 +1507,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn unheld_corrupt_lock_recovers_without_parsing_metadata() {
         let root = tempdir().unwrap();
         let paths = paths(root.path().to_path_buf());
@@ -1472,6 +1562,7 @@ mod tests {
 
     #[cfg(feature = "ui")]
     #[test]
+    #[cfg(target_os = "linux")]
     fn confirmed_restart_refuses_changed_proof_and_terminates_only_its_pinned_process() {
         use std::{
             io::BufRead,
@@ -1582,5 +1673,110 @@ while True: time.sleep(1)
             .is_err()
         );
         assert_eq!(fs::read(&target).unwrap(), b"untouched");
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod unsupported_platform_tests {
+    use super::*;
+    use std::os::unix::{fs::MetadataExt, process::CommandExt};
+
+    fn unsupported<T: std::fmt::Debug>(result: Result<T, PlatformError>) {
+        assert!(
+            matches!(result.unwrap_err(), PlatformError::Io(error) if error.kind() == io::ErrorKind::Unsupported)
+        );
+    }
+
+    #[test]
+    fn ownership_refusal_precedes_runtime_discovery_and_socket_or_lease_access() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("socket-sentinel");
+        let lock = root.path().join("lock-sentinel");
+        fs::write(&socket, b"socket must not be inspected or removed").unwrap();
+        fs::write(&lock, b"lock must not be parsed or acquired").unwrap();
+        let socket_inode = fs::metadata(&socket).unwrap().ino();
+        let lock_inode = fs::metadata(&lock).unwrap().ino();
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("unsupported-fixture"),
+            boot_id: BootId::new("unsupported-fixture"),
+            host_incarnation: crate::model::HostIncarnation::new("unsupported-fixture"),
+        };
+        unsupported(running_executable());
+        unsupported(terminate_daemon_from_lock());
+        unsupported(replacement_owner(&socket, &proof));
+        unsupported(lease_owner(&lock, &proof));
+        unsupported(replacement_owner(&root.path().join("missing"), &proof));
+        assert_eq!(fs::metadata(&socket).unwrap().ino(), socket_inode);
+        assert_eq!(fs::metadata(&lock).unwrap().ino(), lock_inode);
+        assert_eq!(
+            fs::read(&socket).unwrap(),
+            b"socket must not be inspected or removed"
+        );
+        assert_eq!(
+            fs::read(&lock).unwrap(),
+            b"lock must not be parsed or acquired"
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn unsupported_descriptor_sealing_preserves_errno_without_executing_child() {
+        let root = tempfile::tempdir().unwrap();
+        let file = File::create(root.path().join("retained")).unwrap();
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            seal_inherited_descriptors().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) },
+            flags
+        );
+        let marker = root.path().join("executed");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "printf executed > \"$1\"", "fixture"])
+            .arg(&marker);
+        // The owned fixture is rejected before exec; no application/provider runs.
+        unsafe {
+            command.pre_exec(seal_inherited_descriptors);
+        }
+        assert_eq!(
+            command.spawn().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn unsupported_peer_credentials_never_substitute_current_uid() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        assert_eq!(
+            peer_uid(&stream).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn unsupported_restart_confirmation_cannot_inspect_or_change_a_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths {
+            directory: root.path().into(),
+            socket: root.path().join("socket"),
+            lock: root.path().join("lock"),
+        };
+        fs::write(&paths.lock, b"unchanged lease").unwrap();
+        let inode = fs::metadata(&paths.lock).unwrap().ino();
+        unsupported(restart_target());
+        unsupported(restart_target_at(&paths));
+        let target = RestartTarget {};
+        unsupported(target.terminate());
+        unsupported(target.terminate_at(&paths, std::time::Duration::ZERO));
+        assert_eq!(fs::metadata(&paths.lock).unwrap().ino(), inode);
+        assert_eq!(fs::read(&paths.lock).unwrap(), b"unchanged lease");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }
