@@ -2141,7 +2141,7 @@ pub(super) struct Runtime {
     /// Notices raised while an earlier page is shown. That page holds
     /// neither the latest prompt nor the latest work, so they are recorded
     /// when the latest page next arrives.
-    unplaced_failures: Vec<String>,
+    unplaced_failures: Vec<failure::Deferred>,
     failure_ui: failure::State,
     reasoning_picker: bool,
     permission_picker: bool,
@@ -3111,7 +3111,7 @@ impl Runtime {
     /// Records a notice in the transcript, after the message it concerns.
     fn note(&mut self, notice: String) {
         if self.snapshot.has_later {
-            self.defer_note(notice);
+            self.defer_note(failure::Deferred::new(notice, &self.snapshot));
             self.refresh_failure_ui();
             return;
         }
@@ -3129,8 +3129,12 @@ impl Runtime {
             self.refresh_failure_ui();
         }
     }
-    fn defer_note(&mut self, notice: String) {
-        if !self.unplaced_failures.contains(&notice) {
+    fn defer_note(&mut self, notice: failure::Deferred) {
+        if !self
+            .unplaced_failures
+            .iter()
+            .any(|prior| prior.same_event(&notice))
+        {
             if self.unplaced_failures.len() == 32 {
                 self.unplaced_failures.remove(0);
             }
@@ -3180,6 +3184,7 @@ impl Runtime {
                 && note.text == notice
                 && note.after == after
                 && note.turn_generation == turn_generation
+                && note.event_key == event_key
         }) {
             // Replaying the same occurrence does not change its placement.
             return changed;
@@ -4324,11 +4329,19 @@ impl Runtime {
         // Install the incoming scalar error's boundary in this grouping pass,
         // before recording its note below. A later publication may already
         // contain another prompt even when the error has since cleared.
-        if (snapshot.error != self.snapshot.error || snapshot.turn_generation != self.snapshot.turn_generation)
-            && snapshot.error.is_some() && !snapshot.has_later
-            && let Some(last) = snapshot.items.iter().rev().find(|item| {
+        if (snapshot.error != self.snapshot.error
+            || snapshot.error_generation != self.snapshot.error_generation)
+            && snapshot.error.is_some()
+            && !snapshot.has_later
+            && let Some(last) = snapshot
+                .error_item
+                .as_ref()
+                .and_then(|id| snapshot.items.iter().find(|item| &item.id == id))
+                .or_else(|| {
+                    snapshot.items.iter().rev().find(|item| {
                 !matches!(&item.content, ItemContent::Text { text, .. } if text.trim().is_empty())
             })
+                })
         {
             grouping_dirty |= boundaries.insert(last.id.clone());
         }
@@ -4350,7 +4363,15 @@ impl Runtime {
             );
         }
         let current_anchor = self.notice_anchor(&self.snapshot, &self.turns);
-        let next_anchor = self.notice_anchor(&snapshot, turns.as_deref().unwrap_or(&self.turns));
+        let next_anchor = snapshot
+            .error_item
+            .as_ref()
+            .filter(|_| snapshot.error.is_some())
+            .and_then(|id| snapshot.items.iter().position(|item| &item.id == id))
+            .and_then(|index| {
+                failure::prompt_anchor(self.session.launch.provider, &snapshot.items[..=index])
+            })
+            .or_else(|| self.notice_anchor(&snapshot, turns.as_deref().unwrap_or(&self.turns)));
         if self
             .snapshot
             .error
@@ -4372,8 +4393,14 @@ impl Runtime {
             });
         }
         let next_anchor = next_anchor.map(str::to_owned);
-        let next_after = failure::closing_item(&snapshot, turns.as_deref().unwrap_or(&self.turns))
-            .map(str::to_owned);
+        let next_after = snapshot
+            .error_item
+            .clone()
+            .filter(|_| snapshot.error.is_some())
+            .or_else(|| {
+                failure::closing_item(&snapshot, turns.as_deref().unwrap_or(&self.turns))
+                    .map(str::to_owned)
+            });
         let parent_turns_pruned = self.opened.len() > 4096;
         if let Some(turns) = turns {
             self.turns = turns;
@@ -4384,43 +4411,28 @@ impl Runtime {
                 .retain(&self.expanded, &self.unfolded, &self.opened);
         }
         // Presentation refreshes below, once the snapshot is installed.
-        let new_error_item = snapshot.items.last().is_some_and(|item| {
-            self.snapshot
-                .items
-                .last()
-                .is_none_or(|previous| previous.id != item.id)
-                && !self
-                    .snapshot
-                    .items
-                    .iter()
-                    .any(|previous| previous.id == item.id)
-                && snapshot.error.as_deref().is_some_and(|error| {
-                    failure::notice_key(
-                        self.session.launch.provider,
-                        &snapshot,
-                        Some(&item.id),
-                        error,
-                    )
-                    .is_some()
-                })
-        });
-        // TurnStarted clears a non-history scalar error in the actor. A new
-        // turn that still publishes the same text therefore reports another
-        // occurrence, even if the intermediate clear was coalesced.
+        // An actual error receipt can survive coalescing with the same text.
+        // Turn changes alone are not proof: a failed history load remains
+        // active across TurnStarted until its own successful retry.
         if (snapshot.error != self.snapshot.error
-            || new_error_item
-            || snapshot.turn_generation != self.snapshot.turn_generation)
+            || snapshot.error_generation != self.snapshot.error_generation)
             && let Some(error) = &snapshot.error
         {
             if snapshot.has_later {
-                self.defer_note(error.clone());
+                self.defer_note(failure::Deferred::new(error.clone(), &snapshot));
             } else {
-                let key = failure::notice_key(
-                    self.session.launch.provider,
-                    &snapshot,
-                    next_after.as_deref(),
-                    error,
-                );
+                let key = snapshot
+                    .error_item
+                    .as_deref()
+                    .and_then(|id| failure::item_key(self.session.launch.provider, &snapshot, id))
+                    .or_else(|| {
+                        failure::notice_key(
+                            self.session.launch.provider,
+                            &snapshot,
+                            next_after.as_deref(),
+                            error,
+                        )
+                    });
                 self.note_at(
                     next_anchor.clone(),
                     next_after.clone(),
@@ -4432,19 +4444,47 @@ impl Runtime {
         }
         if !snapshot.has_later {
             for notice in std::mem::take(&mut self.unplaced_failures) {
-                let key = failure::notice_key(
-                    self.session.launch.provider,
-                    &snapshot,
-                    next_after.as_deref(),
-                    &notice,
-                );
-                self.note_at(
-                    next_anchor.clone(),
-                    next_after.clone(),
-                    notice,
-                    key,
-                    snapshot.turn_generation,
-                );
+                let current_receipt = notice.matches_snapshot(&snapshot);
+                let source = notice.error_item.as_ref().or_else(|| {
+                    current_receipt
+                        .then_some(snapshot.error_item.as_ref())
+                        .flatten()
+                });
+                let source_index =
+                    source.and_then(|id| snapshot.items.iter().position(|item| &item.id == id));
+                let (anchor, after, key) = if let Some(index) = source_index {
+                    let id = &snapshot.items[index].id;
+                    (
+                        failure::prompt_anchor(
+                            self.session.launch.provider,
+                            &snapshot.items[..=index],
+                        )
+                        .map(str::to_owned),
+                        Some(id.clone()),
+                        failure::item_key(self.session.launch.provider, &snapshot, id),
+                    )
+                } else if let Some(source) = source {
+                    // Keep the actual source for a future page containing it;
+                    // never replace it with the current error's source.
+                    (None, Some(source.clone()), Some(notice.unresolved_key()))
+                } else if current_receipt {
+                    // A still-current scalar receipt can be placed only when
+                    // its latest page is restored. A superseded receipt has
+                    // no evidence that it belongs after this page's work.
+                    (
+                        next_anchor.clone(),
+                        next_after.clone(),
+                        failure::notice_key(
+                            self.session.launch.provider,
+                            &snapshot,
+                            next_after.as_deref(),
+                            &notice.text,
+                        ),
+                    )
+                } else {
+                    (None, None, Some(notice.unresolved_key()))
+                };
+                self.note_at(anchor, after, notice.text, key, notice.turn_generation);
             }
         }
         // A cancel armed for one turn must not carry over to the next.

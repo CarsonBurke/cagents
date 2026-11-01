@@ -2734,9 +2734,35 @@ impl Actor {
                 }
                 continue;
             }
-            if let Some(run) = execution_scope {
-                self.execution.observe(run, &event);
-            }
+            // Relative placement changes storage order, not the content seen
+            // by the existing exact-run observer. Move through its Item form
+            // without cloning a potentially large assistant/tool body.
+            let event = if let Some(run) = execution_scope {
+                match event {
+                    Event::ItemAfter { item, after } => {
+                        let observed = Event::Item(item);
+                        self.execution.observe(run, &observed);
+                        let Event::Item(item) = observed else {
+                            unreachable!()
+                        };
+                        Event::ItemAfter { item, after }
+                    }
+                    Event::ItemBefore { item, before } => {
+                        let observed = Event::Item(item);
+                        self.execution.observe(run, &observed);
+                        let Event::Item(item) = observed else {
+                            unreachable!()
+                        };
+                        Event::ItemBefore { item, before }
+                    }
+                    event => {
+                        self.execution.observe(run, &event);
+                        event
+                    }
+                }
+            } else {
+                event
+            };
             if let Event::AccountUsage(report) = event {
                 (self.notify)(Update::AccountUsage {
                     report,
@@ -2758,6 +2784,8 @@ impl Actor {
                 && matches!(
                     &event,
                     Event::Item(_)
+                        | Event::ItemAfter { .. }
+                        | Event::ItemBefore { .. }
                         | Event::TextDelta { .. }
                         | Event::TurnStarted
                         | Event::Reset { .. }
@@ -2804,6 +2832,7 @@ impl Actor {
                         && matches!(
                             &event,
                             Event::Error { .. }
+                                | Event::ErrorSource { .. }
                                 | Event::Usage(_)
                                 | Event::Plan { .. }
                                 | Event::Status { .. }
@@ -3120,17 +3149,36 @@ fn apply_projected_event(
     event: Event,
     preview_observed: bool,
 ) {
+    // Recovery helpers clear the scalar before this projection. Its source
+    // cannot outlive it or be adopted by an unrelated deferred notice.
+    if state.error.is_none() {
+        state.error_item = None;
+    }
     // Frame events have already reached the resident preview before Store.
     // Do not consume a restored start boundary or append a delta twice.
     if !preview_observed {
         Arc::make_mut(&mut state.notification_preview).observe(&event);
     }
     let child_copy_update = child_text_copy::prepare(state, &event);
+    let placement_after = match &event {
+        Event::ItemAfter { after, .. } | Event::SubagentItemAfter { after, .. } => {
+            Some(after.clone())
+        }
+        _ => None,
+    };
+    let placement_before = match &event {
+        Event::ItemBefore { before, .. } | Event::SubagentItemBefore { before, .. } => {
+            Some(before.clone())
+        }
+        _ => None,
+    };
     let latest_history = matches!(&event, Event::LatestHistory { .. });
     let child_changed = matches!(
         &event,
         Event::Subagent { .. }
             | Event::SubagentItem { .. }
+            | Event::SubagentItemAfter { .. }
+            | Event::SubagentItemBefore { .. }
             | Event::SubagentTextDelta { .. }
             | Event::SubagentOutputDelta { .. }
             | Event::SubagentItemsRemoved { .. }
@@ -3182,7 +3230,11 @@ fn apply_projected_event(
         }
         Event::HistoryLoading(loading) => state.history_loading = loading,
         Event::LatestHistoryStarted => state.history_loading = true,
-        Event::HistoryError(message) => state.error = Some(message),
+        Event::HistoryError(message) => {
+            state.error_generation = state.error_generation.saturating_add(1);
+            state.error_item = None;
+            state.error = Some(message);
+        }
         Event::HistoryRecovered => {}
         Event::InterruptMode(mode) => state.interrupt_mode = Some(mode),
         Event::BranchPoints(points) => state.branch_points = points,
@@ -3209,6 +3261,7 @@ fn apply_projected_event(
             state.busy = false;
             state.waiting = false;
             state.error = None;
+            state.error_item = None;
             state.read_only_reason = None;
             state.plan.clear();
             state.permission_mode = None;
@@ -3281,7 +3334,9 @@ fn apply_projected_event(
         Event::FastMode(value) => state.fast_mode = Some(value),
         Event::Commands(value) => state.commands = value,
         Event::Skills(value) => state.skills = value,
-        Event::Item(mut item) => {
+        Event::Item(mut item)
+        | Event::ItemAfter { mut item, .. }
+        | Event::ItemBefore { mut item, .. } => {
             // The adapters do not know wall-clock time, so the item is stamped
             // here, where the daemon actually observes the change.
             item.at = observed_at();
@@ -3309,8 +3364,30 @@ fn apply_projected_event(
                 }
                 state.items[index] = Arc::new(item);
             } else {
-                indices.insert(item.id.clone(), state.items.len());
-                state.items.push(Arc::new(item));
+                let insertion = placement_before
+                    .as_ref()
+                    .and_then(|id| indices.get(id))
+                    .copied()
+                    .or_else(|| {
+                        placement_after
+                            .as_ref()
+                            .and_then(|id| indices.get(id))
+                            .map(|index| index + 1)
+                    });
+                if let Some(index) = insertion {
+                    state.items.insert(index, Arc::new(item));
+                    indices.clear();
+                    indices.extend(
+                        state
+                            .items
+                            .iter()
+                            .enumerate()
+                            .map(|(index, item)| (item.id.clone(), index)),
+                    );
+                } else {
+                    indices.insert(item.id.clone(), state.items.len());
+                    state.items.push(Arc::new(item));
+                }
             }
         }
         Event::Subagent {
@@ -3353,7 +3430,9 @@ fn apply_projected_event(
                 }
             }
         }
-        Event::SubagentItem { id, mut item } => {
+        Event::SubagentItem { id, mut item }
+        | Event::SubagentItemAfter { id, mut item, .. }
+        | Event::SubagentItemBefore { id, mut item, .. } => {
             item.at = observed_at();
             item.started_at = item.at;
             let agent = subagent(state, &id);
@@ -3361,7 +3440,20 @@ fn apply_projected_event(
                 item.started_at = old.started_at.or(old.at).or(item.at);
                 *old = Arc::new(item);
             } else {
-                agent.items.push(Arc::new(item));
+                let insertion = placement_before
+                    .as_ref()
+                    .and_then(|id| agent.items.iter().position(|item| &item.id == id))
+                    .or_else(|| {
+                        placement_after
+                            .as_ref()
+                            .and_then(|id| agent.items.iter().position(|item| &item.id == id))
+                            .map(|index| index + 1)
+                    });
+                if let Some(index) = insertion {
+                    agent.items.insert(index, Arc::new(item));
+                } else {
+                    agent.items.push(Arc::new(item));
+                }
             }
             trim_subagent(agent);
         }
@@ -3557,11 +3649,18 @@ fn apply_projected_event(
         Event::Composer { text } => state.composer = Some(text),
         Event::OpenUrl { url, instructions } => state.open_url = Some((url, instructions)),
         Event::Error { message, fatal } => {
+            state.error_generation = state.error_generation.saturating_add(1);
+            state.error_item = None;
             state.error = Some(message);
             if fatal {
                 state.prompt_suggestion = None;
                 state.busy = false;
                 state.history_loading = false;
+            }
+        }
+        Event::ErrorSource { item_id } => {
+            if state.error.is_some() {
+                state.error_item = Some(item_id);
             }
         }
         Event::Exited { .. } => {
@@ -5473,6 +5572,14 @@ mod tests {
         assert_eq!(state.error.as_deref(), Some("Prior turn failed"));
         apply(
             &mut state,
+            Event::ErrorSource {
+                item_id: "prior-diagnostic".into(),
+            },
+        );
+        assert_eq!(state.error_item.as_deref(), Some("prior-diagnostic"));
+        let first_receipt = state.error_generation;
+        apply(
+            &mut state,
             Event::Status {
                 busy: false,
                 detail: String::new(),
@@ -5488,6 +5595,8 @@ mod tests {
             },
         );
         assert_eq!(state.error, None);
+        assert_eq!(state.error_item, None);
+        assert_eq!(state.error_generation, first_receipt);
         assert_eq!(state.activity(), ActivityState::Working);
         apply(&mut state, Event::TurnSettled);
         apply(
@@ -5503,10 +5612,20 @@ mod tests {
             &mut state,
             Event::HistoryError("History page failed".into()),
         );
+        let history_receipt = state.error_generation;
         apply(&mut state, Event::TurnStarted);
         assert_eq!(state.error.as_deref(), Some("History page failed"));
+        assert_eq!(state.error_generation, history_receipt);
         apply(&mut state, Event::HistoryRecovered);
         assert_eq!(state.error, None);
+        apply(
+            &mut state,
+            Event::Error {
+                message: "Prior turn failed".into(),
+                fatal: false,
+            },
+        );
+        assert!(state.error_generation > history_receipt);
     }
 
     #[test]

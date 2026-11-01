@@ -237,10 +237,10 @@ fn coalesced_new_turn_same_scalar_text_records_a_later_occurrence() {
         let original = runtime.failures[0].clone();
         let original_key = runtime.failure_ui.incidents[0].key.clone();
         publish(&mut runtime, &handle, |next| {
-            // Production recover_history_error clears the preceding scalar
-            // on Event::TurnStarted. If that clear and the next same-text
-            // failure coalesce, turn_generation still proves the boundary.
+            // A real later error receipt survives coalescing even when the
+            // intermediate clear and new turn were not separately published.
             next.turn_generation += 1;
+            next.error_generation += 1;
             next.items.push(Arc::new(text(
                 &second,
                 chat::Role::User,
@@ -406,4 +406,351 @@ fn opaque_event_id_never_aliases_a_proven_claude_carrier() {
         runtime.failure_ui.incidents[0].key,
         runtime.failure_ui.incidents[1].key
     );
+}
+
+#[test]
+fn retained_history_error_does_not_recur_on_a_new_turn_without_a_receipt() {
+    let (mut runtime, handle) = live_fixture(
+        Provider::Codex,
+        vec![text("p1", chat::Role::User, "Inspect")],
+    );
+    publish_error(&mut runtime, &handle, "History page failed");
+    let original = runtime.failures.clone();
+    let key = runtime.failure_ui.incidents[0].key.clone();
+    publish(&mut runtime, &handle, |next| {
+        next.turn_generation += 1;
+        next.items.push(Arc::new(text("p2", chat::Role::User, ".")));
+        next.items
+            .push(Arc::new(text("reply", chat::Role::Assistant, "Resumed")));
+    });
+    assert_eq!(runtime.failures, original);
+    let blocks = catalog(&mut runtime);
+    assert!(failure_position(&blocks, &key) < prompt_position(&blocks, "p2"));
+}
+
+#[test]
+fn explicit_source_bridges_a_scalar_even_when_later_prose_coalesces() {
+    let (mut runtime, handle) = live_fixture(
+        Provider::Claude,
+        vec![text("p1:0", chat::Role::User, "Inspect")],
+    );
+    publish(&mut runtime, &handle, |next| {
+        next.items.push(Arc::new(provider_error(
+            Provider::Claude,
+            "failure:0",
+            CAPACITY,
+        )));
+        next.items.push(Arc::new(text(
+            "later-prose",
+            chat::Role::Assistant,
+            "Resumed after failure",
+        )));
+        next.error = Some(format!("Claude: overloaded_error\n{CAPACITY}"));
+        next.error_generation += 1;
+        next.error_item = Some("failure:0".into());
+    });
+    assert_eq!(runtime.failure_ui.incidents.len(), 1);
+    let key = runtime.failure_ui.incidents[0].key.clone();
+    assert_eq!(runtime.failures[0].after.as_deref(), Some("failure:0"));
+    let blocks = catalog(&mut runtime);
+    let prose = blocks
+        .iter()
+        .position(|(_, text)| text.contains("Resumed after failure"))
+        .unwrap();
+    assert!(failure_position(&blocks, &key) < prose);
+}
+
+#[test]
+fn paging_out_a_multipart_cause_keeps_raw_sibling_in_the_same_incident() {
+    let (mut runtime, handle) = live_fixture(
+        Provider::Claude,
+        vec![
+            text("p:0", chat::Role::User, "Inspect"),
+            provider_error(Provider::Claude, "failure:0", CAPACITY),
+            provider_error(Provider::Claude, "failure:1", "request-id: exact-original"),
+        ],
+    );
+    publish_error(
+        &mut runtime,
+        &handle,
+        &format!("Claude: overloaded_error\n{CAPACITY}\nrequest-id: exact-original"),
+    );
+    let key = runtime.failure_ui.incidents[0].key.clone();
+    catalog(&mut runtime);
+    publish(&mut runtime, &handle, |next| {
+        next.has_earlier = true;
+        next.items.retain(|item| item.id != "failure:0");
+    });
+    assert_eq!(runtime.failure_ui.incidents.len(), 1);
+    assert_eq!(runtime.failure_ui.incidents[0].key, key);
+    assert_eq!(
+        runtime
+            .failure_ui
+            .item("failure:1")
+            .map(|incident| &incident.key),
+        Some(&key)
+    );
+    assert!(runtime.failure_ui.expanded.contains(&key));
+    let details = runtime.failure_details(&key).unwrap();
+    assert!(details.contains(CAPACITY));
+    assert!(details.contains("request-id: exact-original"));
+}
+
+#[test]
+fn deferred_distinct_provider_sources_keep_their_own_prompts_and_same_text_occurrences() {
+    let provider = Provider::Claude;
+    let connection = "Connection reset by peer\noriginal connection diagnostics";
+    let receipts = [
+        ("deferred-a:0", "attempt-a:0", CAPACITY),
+        ("deferred-b:0", "attempt-b:0", connection),
+        ("deferred-c:0", "attempt-c:0", CAPACITY),
+    ];
+    let (mut runtime, handle) = live_fixture(
+        provider,
+        vec![text("older:0", chat::Role::User, "Earlier page")],
+    );
+    for (index, (source, _, raw)) in receipts.iter().enumerate() {
+        publish(&mut runtime, &handle, |next| {
+            next.has_later = true;
+            next.turn_generation += 1;
+            next.error_generation += 1;
+            next.error = Some((*raw).into());
+            next.error_item = Some((*source).into());
+        });
+        assert_eq!(runtime.unplaced_failures.len(), index + 1);
+        assert!(runtime.failures.is_empty());
+        // Another receipt carrying the exact same proven source is replay,
+        // even if the provider publishes the error again.
+        publish(&mut runtime, &handle, |next| next.error_generation += 1);
+        assert_eq!(runtime.unplaced_failures.len(), index + 1);
+    }
+    publish(&mut runtime, &handle, |next| {
+        next.has_later = false;
+        next.items.push(Arc::new(text(
+            "older-answer",
+            chat::Role::Assistant,
+            "The earlier page finished.",
+        )));
+        for (source, prompt, raw) in receipts {
+            next.items.extend([
+                Arc::new(text(prompt, chat::Role::User, "Try this request")),
+                Arc::new(provider_error(provider, source, raw)),
+            ]);
+        }
+    });
+    assert!(runtime.unplaced_failures.is_empty());
+    assert_eq!(runtime.failures.len(), receipts.len());
+    assert_eq!(runtime.failure_ui.incidents.len(), receipts.len());
+    for (index, (source, prompt, raw)) in receipts.iter().enumerate() {
+        let note = &runtime.failures[index];
+        assert_eq!(note.after.as_deref(), Some(*source));
+        assert_eq!(note.message.as_deref(), Some(*prompt));
+        assert_eq!(note.turn_generation, (index + 1) as u64);
+        let incident = runtime.failure_ui.item(source).unwrap();
+        assert_eq!(note.event_key.as_deref(), Some(incident.key.as_str()));
+        assert_eq!(
+            runtime.failure_details(&incident.key).as_deref(),
+            Some(*raw)
+        );
+    }
+    let first = runtime.failure_ui.item("deferred-a:0").unwrap().key.clone();
+    let last = runtime.failure_ui.item("deferred-c:0").unwrap().key.clone();
+    assert_ne!(
+        first, last,
+        "equal text in different receipts remains separate"
+    );
+    let blocks = catalog(&mut runtime);
+    assert!(failure_position(&blocks, &first) < prompt_position(&blocks, "attempt-b:0"));
+    assert!(prompt_position(&blocks, "attempt-c:0") < failure_position(&blocks, &last));
+}
+
+#[test]
+fn deferred_same_text_scalar_receipts_without_sources_stay_distinct_and_unplaced() {
+    let (mut runtime, handle) = live_fixture(
+        Provider::Codex,
+        vec![text("older", chat::Role::User, "Earlier page")],
+    );
+    for _ in 0..2 {
+        publish(&mut runtime, &handle, |next| {
+            next.has_later = true;
+            next.error_generation += 1;
+            next.error = Some(CAPACITY.into());
+            next.error_item = None;
+        });
+    }
+    assert_eq!(runtime.unplaced_failures.len(), 2);
+    publish(&mut runtime, &handle, |next| {
+        next.has_later = false;
+        next.error = None;
+        next.items = vec![Arc::new(text(
+            "unrelated-latest",
+            chat::Role::User,
+            "Unrelated later work",
+        ))];
+    });
+    assert_eq!(runtime.failures.len(), 2);
+    assert!(
+        runtime
+            .failures
+            .iter()
+            .all(|note| note.message.is_none() && note.after.is_none())
+    );
+    assert_ne!(runtime.failures[0].event_key, runtime.failures[1].event_key);
+    assert_eq!(runtime.failure_ui.incidents.len(), 2);
+    let keys: Vec<_> = runtime
+        .failure_ui
+        .incidents
+        .iter()
+        .map(|incident| incident.key.clone())
+        .collect();
+    let blocks = catalog(&mut runtime);
+    for key in keys {
+        assert_eq!(runtime.failure_details(&key).as_deref(), Some(CAPACITY));
+        assert!(
+            blocks
+                .iter()
+                .any(|(id, _)| *id == diagnostic_preview_identity(&key))
+        );
+    }
+}
+
+#[test]
+fn deferred_local_notice_does_not_adopt_an_unrelated_provider_source() {
+    let provider = Provider::Claude;
+    let (mut runtime, handle) = live_fixture(
+        provider,
+        vec![text("older:0", chat::Role::User, "Earlier page")],
+    );
+    publish(&mut runtime, &handle, |next| {
+        next.has_later = true;
+        next.error_generation += 1;
+        next.error = Some(CAPACITY.into());
+        next.error_item = Some("provider-failure:0".into());
+    });
+    let local = "Local saved-history validation failed";
+    runtime.note(local.into());
+    assert_eq!(runtime.unplaced_failures.len(), 2);
+    assert!(runtime.unplaced_failures[1].error_item.is_none());
+    publish(&mut runtime, &handle, |next| {
+        next.has_later = false;
+        next.items.extend([
+            Arc::new(text("latest:0", chat::Role::User, "Latest request")),
+            Arc::new(provider_error(provider, "provider-failure:0", CAPACITY)),
+        ]);
+    });
+    let note = runtime
+        .failures
+        .iter()
+        .find(|note| note.text == local)
+        .unwrap();
+    assert!(note.message.is_none());
+    assert!(note.after.is_none());
+    assert_ne!(
+        note.event_key.as_deref(),
+        Some(
+            runtime
+                .failure_ui
+                .item("provider-failure:0")
+                .unwrap()
+                .key
+                .as_str()
+        )
+    );
+    let key = note.event_key.clone().unwrap();
+    assert_eq!(runtime.failure_details(&key).as_deref(), Some(local));
+    let blocks = catalog(&mut runtime);
+    assert!(
+        blocks
+            .iter()
+            .any(|(id, _)| *id == diagnostic_preview_identity(&key))
+    );
+}
+
+#[test]
+fn deferred_missing_source_keeps_its_own_source_instead_of_the_latest_error() {
+    let provider = Provider::Claude;
+    let (mut runtime, handle) = live_fixture(
+        provider,
+        vec![text("older:0", chat::Role::User, "Earlier page")],
+    );
+    for source in ["missing-error:0", "latest-error:0"] {
+        publish(&mut runtime, &handle, |next| {
+            next.has_later = true;
+            next.turn_generation += 1;
+            next.error_generation += 1;
+            next.error = Some(CAPACITY.into());
+            next.error_item = Some(source.into());
+        });
+    }
+    publish(&mut runtime, &handle, |next| {
+        next.has_later = false;
+        next.items = vec![
+            Arc::new(text("latest:0", chat::Role::User, "Latest request")),
+            Arc::new(provider_error(provider, "latest-error:0", CAPACITY)),
+        ];
+    });
+    assert_eq!(runtime.failures.len(), 2);
+    assert_eq!(
+        runtime.failures[0].after.as_deref(),
+        Some("missing-error:0")
+    );
+    assert!(runtime.failures[0].message.is_none());
+    assert_eq!(runtime.failures[1].after.as_deref(), Some("latest-error:0"));
+    assert_eq!(runtime.failures[1].message.as_deref(), Some("latest:0"));
+    assert_ne!(runtime.failures[0].event_key, runtime.failures[1].event_key);
+    for note in &runtime.failures {
+        assert_eq!(
+            runtime
+                .failure_details(note.event_key.as_deref().unwrap())
+                .as_deref(),
+            Some(CAPACITY)
+        );
+    }
+}
+
+#[test]
+fn same_prompt_authentication_incidents_retain_history_and_only_latest_recovery() {
+    let provider = Provider::Codex;
+    let raw = "Authentication required. Please sign in again.";
+    let (mut runtime, handle) = live_fixture(
+        provider,
+        vec![text("prompt/input/0", chat::Role::User, "Inspect")],
+    );
+    publish(&mut runtime, &handle, |next| {
+        next.items
+            .push(Arc::new(provider_error(provider, "auth-a", raw)));
+        next.error = Some(raw.into());
+        next.error_generation += 1;
+        next.error_item = Some("auth-a".into());
+    });
+    let earlier_key = runtime.failure_ui.item("auth-a").unwrap().key.clone();
+    publish(&mut runtime, &handle, |next| {
+        next.error = None;
+        next.error_item = None;
+        next.items.push(Arc::new(text(
+            "resumed-work",
+            chat::Role::Assistant,
+            "Resumed the same request.",
+        )));
+    });
+    publish(&mut runtime, &handle, |next| {
+        next.items
+            .push(Arc::new(provider_error(provider, "auth-b", raw)));
+        next.error = Some(raw.into());
+        next.error_generation += 1;
+        next.error_item = Some("auth-b".into());
+    });
+    // A local command/recovery publication carrying the same active error
+    // must join B rather than creating a third sign-in card or reviving A.
+    runtime.error = Some(raw.into());
+    runtime.refresh_failure_ui();
+    assert_eq!(runtime.failure_ui.incidents.len(), 2);
+    let earlier = runtime.failure_ui.item("auth-a").unwrap();
+    let latest = runtime.failure_ui.item("auth-b").unwrap();
+    assert_eq!(earlier.key, earlier_key);
+    assert_ne!(earlier.key, latest.key);
+    assert!(!earlier.active_recovery);
+    assert!(latest.active_recovery);
+    assert_eq!(runtime.failure_details(&earlier.key).as_deref(), Some(raw));
+    assert_eq!(runtime.failure_details(&latest.key).as_deref(), Some(raw));
 }

@@ -366,6 +366,15 @@ struct Stream {
     truncated: bool,
 }
 
+/// Only the latest live parent failure can explain the following result.
+/// Retain complete-body digests, never a diagnostic prefix or a text history.
+struct ParentErrorSource {
+    carrier: String,
+    item_id: String,
+    body: [u8; 32],
+    wrapper: [u8; 32],
+}
+
 struct Submission {
     preview: chat::QueuedMessage,
     mode: PromptMode,
@@ -450,6 +459,7 @@ struct Claude {
     /// Exact successful child failure/result and task-notification receipts,
     /// not bodies or running work. Changed payloads remain observable.
     failure_receipts: VecDeque<[u8; 32]>,
+    parent_error_source: Option<ParentErrorSource>,
     /// Agents whose report was handed back as a peer message, newest last,
     /// so the notification that follows it does not show it again.
     handed_back: VecDeque<String>,
@@ -581,6 +591,7 @@ impl Claude {
     }
     fn start_turn(&mut self, step: &mut Step) {
         if self.started_generation != Some(self.attention_generation) {
+            self.parent_error_source = None;
             self.suggestion_turn = None;
             step.events.push(Event::PromptSuggestionCleared);
             self.started_generation = Some(self.attention_generation);
@@ -785,7 +796,18 @@ impl Claude {
         }
         self.suggestion_turn = None;
         step.events.push(Event::PromptSuggestionCleared);
-        self.message(&frame, &mut step)?;
+        // Deferred input has not entered the parent transcript yet. Staging
+        // its preview must not sever the active turn's diagnostic/result pair.
+        let parent_error_source = if mode != PromptMode::Send {
+            self.parent_error_source.take()
+        } else {
+            None
+        };
+        let staged = self.message(&frame, &mut step);
+        if mode != PromptMode::Send {
+            self.parent_error_source = parent_error_source;
+        }
+        staged?;
         if self.async_input {
             let mut preview = chat::QueuedMessage::new(id.clone(), text);
             preview.attachments = attachments;
@@ -1210,17 +1232,31 @@ impl Claude {
         history_calls: &HistoryCalls,
         history: bool,
     ) -> Result<(), String> {
-        let carrier = required(frame, "uuid")?;
+        let child = frame["parent_tool_use_id"]
+            .as_str()
+            .filter(|id| !id.is_empty());
+        let carrier = match required(frame, "uuid") {
+            Ok(carrier) => carrier,
+            Err(error) => {
+                if !history && child.is_none() {
+                    self.parent_error_source = None;
+                }
+                return Err(error);
+            }
+        };
         if self.retracted.contains(carrier) {
             return Ok(());
+        }
+        // A parent message breaks the consecutive assistant/result proof,
+        // even if its remaining payload turns out to be malformed. Historical
+        // pages and child activity do not alter the live parent.
+        if !history && child.is_none() {
+            self.parent_error_source = None;
         }
         // Capture provenance before this carrier updates correlation state.
         // Replaying an old answer is not evidence that a blocked child resumed.
         let fresh_live_carrier = !history && !self.carrier_items.contains_key(carrier);
         self.retract(&frame["supersedes"], step)?;
-        let child = frame["parent_tool_use_id"]
-            .as_str()
-            .filter(|id| !id.is_empty());
         let event_start = step.events.len();
         let mut global_task_removals = Vec::new();
         let role = if string(frame, "type") == "user" {
@@ -1674,17 +1710,45 @@ impl Claude {
                 step.events.push(Event::Usage(self.usage.clone()));
             }
             if let Some(error) = frame["error"].as_str() {
-                step.events.push(Event::Error {
-                    message: {
-                        let body = content_text(&message["content"]);
-                        if body.is_empty() {
-                            format!("Claude: {error}")
+                let body = content_text(&message["content"]);
+                let diagnosis = if body.is_empty() {
+                    format!("Claude: {error}")
+                } else {
+                    format!("Claude: {error}\n{body}")
+                };
+                // Use an item actually emitted and marked above. Multipart
+                // diagnostics anchor at their last visible block, including
+                // blocks whose stream indices differ from array positions.
+                let source = (frame["parent_tool_use_id"].is_null()
+                    || frame["parent_tool_use_id"].as_str() == Some(""))
+                .then(|| {
+                    step.events[event_start..].iter().rev().find_map(|event| {
+                        if let Event::Item(item) = event
+                            && chat::failure::provider_error_text(Provider::Claude, item)
+                                .is_some_and(|text| !text.is_empty())
+                        {
+                            Some(item.id.clone())
                         } else {
-                            format!("Claude: {error}\n{body}")
+                            None
                         }
-                    },
+                    })
+                })
+                .flatten();
+                if !history && let Some(item_id) = &source {
+                    self.parent_error_source = Some(ParentErrorSource {
+                        carrier: carrier.into(),
+                        item_id: item_id.clone(),
+                        body: diagnostic_digest(&body),
+                        wrapper: diagnostic_digest(&diagnosis),
+                    });
+                }
+                step.events.push(Event::Error {
+                    message: diagnosis,
                     fatal: false,
                 });
+                if let Some(item_id) = source {
+                    step.events.push(Event::ErrorSource { item_id });
+                }
             }
             if child.is_none() {
                 self.update_usage(&message["usage"], step);
@@ -2336,6 +2400,7 @@ impl Adapter for Claude {
                 self.tasks.clear();
                 self.report_tasks.clear();
                 self.failure_receipts.clear();
+                self.parent_error_source = None;
                 self.agent_task_calls.clear();
                 self.ended_agents.clear();
                 self.handed_back.clear();
@@ -2767,6 +2832,7 @@ impl Adapter for Claude {
                 step.events.push(Event::Usage(self.usage.clone()));
                 if frame["is_error"].as_bool() == Some(true) {
                     let errors = content_text(&frame["errors"]);
+                    let has_body = !errors.is_empty() || !string(&frame, "result").is_empty();
                     let message = if !errors.is_empty() {
                         errors
                     } else if !string(&frame, "result").is_empty() {
@@ -2774,10 +2840,35 @@ impl Adapter for Claude {
                     } else {
                         format!("Claude result: {}", string(&frame, "subtype"))
                     };
+                    let digest = diagnostic_digest(&message);
+                    let source = self
+                        .parent_error_source
+                        .as_ref()
+                        .filter(|source| {
+                            has_body
+                                && (frame["parent_tool_use_id"].is_null()
+                                    || frame["parent_tool_use_id"].as_str() == Some(""))
+                                && (source.body == digest || source.wrapper == digest)
+                                && !self.retracted.contains(&source.carrier)
+                                && !self.carrier_parent.contains_key(&source.carrier)
+                                && self
+                                    .carrier_items
+                                    .get(&source.carrier)
+                                    .is_some_and(|items| items.contains(&source.item_id))
+                        })
+                        .map(|source| source.item_id.clone());
+                    if source.is_none() {
+                        self.parent_error_source = None;
+                    }
                     step.events.push(Event::Error {
                         message,
                         fatal: false,
                     });
+                    if let Some(item_id) = source {
+                        step.events.push(Event::ErrorSource { item_id });
+                    }
+                } else {
+                    self.parent_error_source = None;
                 }
             }
             "system" => self.system(&frame, &mut step)?,
@@ -2820,6 +2911,7 @@ impl Adapter for Claude {
                             && let Some(items) = submission.deferred
                         {
                             if matches!(state, "started" | "completed") {
+                                self.parent_error_source = None;
                                 step.events.extend(items.into_iter().map(Event::Item));
                             } else {
                                 // A delayed replay acknowledgement must not
@@ -3054,6 +3146,9 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("Claude protocol frame is missing {key}"))
+}
+fn diagnostic_digest(text: &str) -> [u8; 32] {
+    <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes()).into()
 }
 /// Explicit child API/result failures retain their original diagnostic in
 /// history as well as transient status. A carrier identifies exact replay;
@@ -4076,6 +4171,9 @@ impl Claude {
         let parent = string(frame, "parent_tool_use_id").to_owned();
         match string(event, "type") {
             "message_start" => {
+                if parent.is_empty() {
+                    self.parent_error_source = None;
+                }
                 if self.streams.len() >= MAX_PENDING && !self.streams.contains_key(&parent) {
                     return Err("Too many simultaneous Claude streams".into());
                 }
@@ -4308,7 +4406,9 @@ impl Claude {
             "ping" => {}
             "error" => {
                 let message = content_text(&event["error"]);
-                if !parent.is_empty() {
+                if parent.is_empty() {
+                    self.parent_error_source = None;
+                } else {
                     // Transient child detail is cleared by terminal task
                     // notifications. Keep explicit API failures in that child's
                     // transcript as well, with the same exact original cause.
@@ -6423,6 +6523,336 @@ mod tests {
             event,
             Event::Status { .. } | Event::TurnStarted | Event::TurnSettled
         )));
+    }
+
+    #[test]
+    fn parent_error_source_follows_the_actual_multipart_item_and_duplicate_result() {
+        let mut adapter = Claude::default();
+        let bodies = [
+            "The provider is at capacity",
+            "request-id: original-diagnostic",
+        ];
+        let failure = adapter.receive(json!({"type":"assistant","uuid":"failure-carrier","error":"overloaded_error","message":{"id":"failure-message","content":[{"type":"text","text":bodies[0]},{"type":"text","text":bodies[1]}]}})).unwrap();
+        let error_at = failure
+            .events
+            .iter()
+            .position(|event| matches!(event, Event::Error { .. }))
+            .unwrap();
+        assert!(
+            matches!(&failure.events[error_at + 1], Event::ErrorSource { item_id } if item_id == "failure-message:1")
+        );
+        assert!(failure.events[..error_at].iter().any(|event| matches!(event, Event::Item(item) if item.id == "failure-message:1" && chat::failure::provider_error_text(Provider::Claude, item) == Some(bodies[1]))));
+        for (id, value) in [
+            ("body-result", json!({"errors":bodies})),
+            (
+                "wrapper-result",
+                json!({"result":format!("Claude: overloaded_error\n{}", bodies.join("\n"))}),
+            ),
+        ] {
+            let mut frame = json!({"type":"result","uuid":id,"is_error":true});
+            frame
+                .as_object_mut()
+                .unwrap()
+                .extend(value.as_object().unwrap().clone());
+            let result = adapter.receive(frame).unwrap();
+            let at = result
+                .events
+                .iter()
+                .position(|event| matches!(event, Event::Error { .. }))
+                .unwrap();
+            assert!(
+                matches!(&result.events[at + 1], Event::ErrorSource { item_id } if item_id == "failure-message:1")
+            );
+            assert!(
+                !result
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Item(_))),
+                "A duplicate result does not invent another diagnostic item"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_error_source_requires_the_complete_latest_diagnostic() {
+        let mut adapter = Claude::default();
+        let body = format!(
+            "The provider is at capacity\n{}\nfirst-tail",
+            "x".repeat(16 * 1024)
+        );
+        let fail = |id: &str| json!({"type":"assistant","uuid":id,"error":"overloaded_error","message":{"id":id,"content":[{"type":"text","text":body}]}});
+        for (index, mismatch) in [
+            "The provider is at capacity".to_owned(),
+            body.replace("first-tail", "different-tail"),
+            format!("{body}\n"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            adapter
+                .receive(fail(&format!("full-body-{index}")))
+                .unwrap();
+            let result = adapter
+                .receive(json!({"type":"result","is_error":true,"result":mismatch}))
+                .unwrap();
+            assert!(result.events.iter().any(
+                |event| matches!(event, Event::Error { message, .. } if message == &mismatch)
+            ));
+            assert!(
+                !result
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::ErrorSource { .. }))
+            );
+            let late = adapter
+                .receive(json!({"type":"result","is_error":true,"result":body}))
+                .unwrap();
+            assert!(
+                !late
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::ErrorSource { .. })),
+                "A later matching body cannot recover association after a different result"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_error_source_repeated_text_belongs_to_its_own_turn_and_carrier() {
+        let mut adapter = Claude::default();
+        let body = "The provider is at capacity";
+        let failure = |id: &str| json!({"type":"assistant","uuid":id,"error":"overloaded_error","message":{"id":id,"content":[{"type":"text","text":body}]}});
+        adapter.receive(failure("first-incident")).unwrap();
+        adapter
+            .receive(json!({"type":"result","is_error":true,"result":body}))
+            .unwrap();
+        adapter.start_turn(&mut Step::default());
+        let unmatched = adapter
+            .receive(json!({"type":"result","is_error":true,"result":body}))
+            .unwrap();
+        assert!(
+            !unmatched
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::ErrorSource { .. })),
+            "The same text on a new turn is not the previous failure"
+        );
+        let later = adapter.receive(failure("later-incident")).unwrap();
+        assert!(later.events.iter().any(
+            |event| matches!(event, Event::ErrorSource { item_id } if item_id == "later-incident:0")
+        ));
+        let result = adapter
+            .receive(json!({"type":"result","is_error":true,"result":body}))
+            .unwrap();
+        assert!(result.events.iter().any(
+            |event| matches!(event, Event::ErrorSource { item_id } if item_id == "later-incident:0")
+        ));
+        for resumed in [
+            json!({"type":"user","uuid":"next-prompt","message":{"content":"Try again"}}),
+            json!({"type":"assistant","uuid":"recovered","message":{"content":"The request succeeded"}}),
+            stream(json!({"type":"message_start","message":{"id":"new-stream"}})),
+            stream(json!({"type":"error","error":{"type":"overloaded_error","message":body}})),
+            json!({"type":"conversation_reset"}),
+        ] {
+            adapter.receive(failure("current-incident")).unwrap();
+            adapter.receive(resumed).unwrap();
+            let result = adapter
+                .receive(json!({"type":"result","is_error":true,"result":body}))
+                .unwrap();
+            assert!(
+                !result
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::ErrorSource { .. })),
+                "Resumed parent activity invalidates the old consecutive-result proof"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_error_source_uses_the_final_stream_block_identity() {
+        let mut adapter = Claude::default();
+        let body = "The provider is at capacity";
+        adapter
+            .receive(stream(
+                json!({"type":"message_start","message":{"id":"stream-message"}}),
+            ))
+            .unwrap();
+        adapter.receive(stream(json!({"type":"content_block_start","index":4,"content_block":{"type":"text","text":""}}))).unwrap();
+        adapter.receive(stream(json!({"type":"content_block_delta","index":4,"delta":{"type":"text_delta","text":body}}))).unwrap();
+        let failure = adapter.receive(json!({"type":"assistant","uuid":"stream-carrier","error":"overloaded_error","message":{"id":"stream-message","content":[{"type":"text","text":body}]}})).unwrap();
+        assert!(failure.events.iter().any(|event| matches!(event, Event::Item(item) if item.id == "stream-message:4" && chat::failure::provider_error_text(Provider::Claude, item) == Some(body))));
+        assert!(failure.events.iter().any(
+            |event| matches!(event, Event::ErrorSource { item_id } if item_id == "stream-message:4")
+        ));
+        adapter
+            .receive(stream(json!({"type":"message_stop"})))
+            .unwrap();
+        let result = adapter
+            .receive(json!({"type":"result","is_error":true,"result":body}))
+            .unwrap();
+        assert!(result.events.iter().any(
+            |event| matches!(event, Event::ErrorSource { item_id } if item_id == "stream-message:4")
+        ));
+    }
+
+    #[test]
+    fn parent_error_source_survives_queue_staging_until_input_is_consumed() {
+        for mode in [PromptMode::Queue, PromptMode::Steer] {
+            let mut adapter = Claude {
+                ready: true,
+                async_input: true,
+                busy: true,
+                started_generation: Some(0),
+                ..Default::default()
+            };
+            let body = "The provider is at capacity";
+            let failure = || json!({"type":"assistant","uuid":"active-failure","error":"overloaded_error","message":{"content":body}});
+            adapter.receive(failure()).unwrap();
+            let queued = adapter
+                .send_prompt("Try again".into(), vec![], mode)
+                .unwrap();
+            assert!(
+                !queued
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Item(_)))
+            );
+            let result = adapter
+                .receive(json!({"type":"result","is_error":true,"result":body}))
+                .unwrap();
+            assert!(result.events.iter().any(|event| matches!(event, Event::ErrorSource { item_id } if item_id == "active-failure:0")), "A queued prompt preview has not resumed the transcript");
+            // Also exercise steering consumed within the same generation:
+            // start_turn alone does not clear that active generation.
+            adapter.started_generation = Some(adapter.attention_generation);
+            adapter.receive(failure()).unwrap();
+            adapter.receive(json!({"type":"command_lifecycle","command_uuid":queued.writes[0]["uuid"],"state":"started"})).unwrap();
+            let after_delivery = adapter
+                .receive(json!({"type":"result","is_error":true,"result":body}))
+                .unwrap();
+            assert!(
+                !after_delivery
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::ErrorSource { .. })),
+                "Consumed queued input breaks the previous incident's association"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_error_source_does_not_escape_child_or_malformed_frames() {
+        let mut adapter = Claude::default();
+        let body = "The provider is at capacity";
+        let failure = |id: &str| json!({"type":"assistant","uuid":id,"error":"overloaded_error","message":{"id":id,"content":[{"type":"text","text":body}]}});
+        let mut child = failure("child-failure");
+        child["parent_tool_use_id"] = json!("child-agent");
+        for parent_first in [false, true] {
+            if parent_first {
+                adapter.receive(failure("parent-failure")).unwrap();
+            }
+            for frame in [
+                child.clone(),
+                json!({"type":"stream_event","parent_tool_use_id":"child-agent","event":{"type":"error","error":{"type":"overloaded_error","message":body}}}),
+                json!({"type":"result","parent_tool_use_id":"child-agent","is_error":true,"result":body}),
+            ] {
+                let scoped = adapter.receive(frame).unwrap();
+                assert!(
+                    !scoped.events.iter().any(|event| matches!(
+                        event,
+                        Event::Error { .. } | Event::ErrorSource { .. }
+                    ))
+                );
+            }
+            let result = adapter
+                .receive(json!({"type":"result","is_error":true,"result":body}))
+                .unwrap();
+            let source = result.events.iter().find_map(|event| match event {
+                Event::ErrorSource { item_id } => Some(item_id.as_str()),
+                _ => None,
+            });
+            assert_eq!(source, parent_first.then_some("parent-failure:0"));
+        }
+        for frame in [
+            json!({"type":"assistant","uuid":"missing-content","error":"overloaded_error","message":{}}),
+            json!({"type":"assistant","uuid":"empty-content","error":"overloaded_error","message":{"content":""}}),
+            json!({"type":"assistant","uuid":"invalid-error","error":true,"message":{"content":body}}),
+            json!({"type":"assistant","uuid":"malformed-scope","parent_tool_use_id":42,"error":"overloaded_error","message":{"content":body}}),
+        ] {
+            let step = adapter.receive(frame).unwrap();
+            assert!(
+                !step
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::ErrorSource { .. }))
+            );
+        }
+        for frame in [
+            json!({"type":"assistant","error":"overloaded_error","message":{"content":body}}),
+            json!({"type":"assistant","uuid":"invalid-retraction","supersedes":[42],"message":{"content":body}}),
+            stream(json!({"type":"message_start","message":{}})),
+        ] {
+            adapter.receive(failure("before-malformed-frame")).unwrap();
+            assert!(adapter.receive(frame).is_err());
+            let result = adapter
+                .receive(json!({"type":"result","is_error":true,"result":body}))
+                .unwrap();
+            assert!(
+                !result
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::ErrorSource { .. })),
+                "Rejected parent payloads cannot leave a stale source proof"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_error_source_history_and_retractions_require_live_carrier_proof() {
+        let mut adapter = Claude::default();
+        let body = "The provider is at capacity";
+        let failure = |id: &str| json!({"type":"assistant","uuid":id,"error":"overloaded_error","message":{"id":id,"content":[{"type":"text","text":body}]}});
+        let mut history = Step::default();
+        adapter
+            .message_with_tools(
+                &failure("historical-incident"),
+                &mut history,
+                &HashMap::new(),
+                true,
+            )
+            .unwrap();
+        assert!(history.events.iter().any(|event| matches!(event, Event::Item(item) if item.id == "historical-incident:0" && chat::failure::provider_error_text(Provider::Claude, item) == Some(body))));
+        assert!(history.events.iter().any(|event| matches!(event, Event::ErrorSource { item_id } if item_id == "historical-incident:0")));
+        let result = adapter
+            .receive(json!({"type":"result","is_error":true,"result":body}))
+            .unwrap();
+        assert!(
+            !result
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::ErrorSource { .. })),
+            "Importing old history cannot explain a new live result"
+        );
+        for retract in [false, true] {
+            adapter.receive(failure("live-incident")).unwrap();
+            if retract {
+                adapter
+                    .retract(&json!(["live-incident"]), &mut Step::default())
+                    .unwrap();
+            } else {
+                adapter.carrier_items.remove("live-incident");
+            }
+            let result = adapter
+                .receive(json!({"type":"result","is_error":true,"result":body}))
+                .unwrap();
+            assert!(
+                !result
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::ErrorSource { .. })),
+                "Retracted or expired carrier metadata cannot authorize a source"
+            );
+        }
     }
 
     #[test]

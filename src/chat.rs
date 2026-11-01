@@ -1153,6 +1153,15 @@ pub struct Snapshot {
     pub native_continuity: NativeContinuity,
     pub title: Option<String>,
     pub error: Option<String>,
+    /// Monotonic error receipts observed by this actor, including identical
+    /// text after a coalesced recovery. Ordinary refreshes and retained history
+    /// errors do not advance it. Older peers leave it at zero.
+    #[serde(default)]
+    pub error_generation: u64,
+    /// Explicit diagnostic item that produced the current scalar error. This
+    /// is provider provenance, not a text or timestamp match.
+    #[serde(default)]
+    pub error_item: Option<String>,
     /// Why this snapshot shows saved history without an executable provider.
     /// Carried over IPC so every client explains the same read-only state.
     #[serde(default)]
@@ -1321,6 +1330,16 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
             Event::Item(item) => vec![Event::SubagentItem {
                 id: id.into(),
                 item,
+            }],
+            Event::ItemAfter { item, after } => vec![Event::SubagentItemAfter {
+                id: id.into(),
+                item,
+                after,
+            }],
+            Event::ItemBefore { item, before } => vec![Event::SubagentItemBefore {
+                id: id.into(),
+                item,
+                before,
             }],
             Event::TextDelta {
                 id: item_id,
@@ -2275,6 +2294,17 @@ pub enum Event {
     Skills(Vec<Skill>),
     /// Upsert a completed/history item without duplicating a streamed item.
     Item(Item),
+    /// Insert a first observation after a proven transcript item, even when
+    /// another turn has since started. Replays retain their original position.
+    ItemAfter {
+        item: Item,
+        after: String,
+    },
+    /// A provider's authoritative prefix precedes content observed early.
+    ItemBefore {
+        item: Item,
+        before: String,
+    },
     /// An append to a tracked command/tool output, never an authoritative rewrite.
     OutputDelta {
         id: String,
@@ -2295,6 +2325,16 @@ pub enum Event {
     SubagentItem {
         id: String,
         item: Item,
+    },
+    SubagentItemAfter {
+        id: String,
+        item: Item,
+        after: String,
+    },
+    SubagentItemBefore {
+        id: String,
+        item: Item,
+        before: String,
     },
     SubagentOutputDelta {
         id: String,
@@ -2346,6 +2386,11 @@ pub enum Event {
     Error {
         message: String,
         fatal: bool,
+    },
+    /// Link the preceding scalar error to its exact provider diagnostic item.
+    /// This follows Error in the same decoded frame; unscoped errors omit it.
+    ErrorSource {
+        item_id: String,
     },
     Exited {
         code: Option<i32>,

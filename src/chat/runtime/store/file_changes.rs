@@ -18,6 +18,8 @@ CREATE TABLE file_edits(source TEXT NOT NULL,item_id TEXT NOT NULL,file_index IN
  PRIMARY KEY(source,item_id,file_index));
 CREATE INDEX file_edits_path ON file_edits(source,path,ordinal,file_index);
 CREATE INDEX file_edits_status ON file_edits(source,path,status,ordinal,file_index);
+CREATE TABLE child_file_items(source TEXT NOT NULL,item_id TEXT NOT NULL,ordinal INTEGER NOT NULL,
+ PRIMARY KEY(source,item_id),UNIQUE(source,ordinal));
 CREATE TABLE file_totals(source TEXT NOT NULL,path TEXT NOT NULL,succeeded INTEGER NOT NULL,
  pending INTEGER NOT NULL,failed INTEGER NOT NULL,imported INTEGER NOT NULL,
  additions INTEGER NOT NULL,deletions INTEGER NOT NULL,unknown INTEGER NOT NULL,revision INTEGER NOT NULL,resolved TEXT,
@@ -349,32 +351,176 @@ impl Store {
         }
         Ok(())
     }
+    fn child_file_item_ordinal(&self, source: &str, id: &str) -> Result<Option<i64>, String> {
+        self.db
+            .query_row(
+                "SELECT ordinal FROM child_file_items WHERE source=?1 AND item_id=?2",
+                params![source, id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+    /// Keep every child identity, not its body, so a text item can anchor a
+    /// delayed edit even after the resident child transcript has been trimmed.
+    fn child_file_ordinal(
+        &mut self,
+        source: &str,
+        id: &str,
+        before: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<i64, String> {
+        if let Some(ordinal) = self.child_file_item_ordinal(source, id)? {
+            return Ok(ordinal);
+        }
+        for _ in 0..2 {
+            let before = before
+                .map(|id| self.child_file_item_ordinal(source, id))
+                .transpose()?
+                .flatten();
+            let after = after
+                .map(|id| self.child_file_item_ordinal(source, id))
+                .transpose()?
+                .flatten();
+            let bounds =
+                if let Some(right) = before {
+                    let left = self.db.query_row(
+                    "SELECT MAX(ordinal) FROM child_file_items WHERE source=?1 AND ordinal<?2",
+                    params![source, right],
+                    |row| row.get(0),
+                ).map_err(|e| e.to_string())?;
+                    (left, Some(right))
+                } else if let Some(left) = after {
+                    let right = self.db.query_row(
+                    "SELECT MIN(ordinal) FROM child_file_items WHERE source=?1 AND ordinal>?2",
+                    params![source, left],
+                    |row| row.get(0),
+                ).map_err(|e| e.to_string())?;
+                    (Some(left), right)
+                } else {
+                    // Missing anchors follow the transcript projection's append
+                    // fallback. Replacements retain their original position above.
+                    let left = self
+                        .db
+                        .query_row(
+                            "SELECT MAX(ordinal) FROM child_file_items WHERE source=?1",
+                            [source],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    (left, None)
+                };
+            if let Some(ordinals) = Self::spaced(bounds.0, bounds.1, 1) {
+                let ordinal = ordinals[0];
+                self.db
+                    .execute(
+                        "INSERT INTO child_file_items VALUES(?1,?2,?3)",
+                        params![source, id, ordinal],
+                    )
+                    .map_err(|e| e.to_string())?;
+                return Ok(ordinal);
+            }
+            self.rebalance_child_file_items(source)?;
+        }
+        Err("Delegated item order exceeds cache capacity".into())
+    }
+    /// Called inside the child event savepoint. The disjoint temporary range
+    /// preserves uniqueness while both the identity order and patch cursors move.
+    fn rebalance_child_file_items(&mut self, source: &str) -> Result<(), String> {
+        let count: i64 = self
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM child_file_items WHERE source=?1",
+                [source],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if count > super::ORDINAL_LIMIT / super::ORDINAL_STRIDE {
+            return Err("Delegated item order exceeds cache capacity".into());
+        }
+        self.db.execute_batch("CREATE TEMP TABLE child_file_ordinal_remap(old INTEGER PRIMARY KEY, temporary INTEGER UNIQUE NOT NULL, new INTEGER UNIQUE NOT NULL);").map_err(|e| e.to_string())?;
+        self.db.execute("INSERT INTO child_file_ordinal_remap SELECT ordinal,?2+ROW_NUMBER() OVER(ORDER BY ordinal),?3*ROW_NUMBER() OVER(ORDER BY ordinal) FROM child_file_items WHERE source=?1",
+            params![source, i64::MIN, super::ORDINAL_STRIDE]).map_err(|e| e.to_string())?;
+        self.db.execute("UPDATE child_file_items SET ordinal=(SELECT temporary FROM child_file_ordinal_remap WHERE old=child_file_items.ordinal) WHERE source=?1", [source]).map_err(|e| e.to_string())?;
+        self.db.execute("UPDATE child_file_items SET ordinal=(SELECT new FROM child_file_ordinal_remap WHERE temporary=child_file_items.ordinal) WHERE source=?1", [source]).map_err(|e| e.to_string())?;
+        let changed = self.db.execute("UPDATE file_edits SET ordinal=(SELECT new FROM child_file_ordinal_remap WHERE old=file_edits.ordinal) WHERE source=?1", [source]).map_err(|e| e.to_string())?;
+        self.db
+            .execute_batch("DROP TABLE child_file_ordinal_remap;")
+            .map_err(|e| e.to_string())?;
+        if changed > 0 {
+            self.file_revision = self.file_revision.saturating_add(1);
+            self.db
+                .execute(
+                    "UPDATE file_totals SET revision=?2 WHERE source=?1",
+                    params![source, self.file_revision],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
     pub(super) fn index_child_event(&mut self, event: &Event) -> Result<(), String> {
+        if !matches!(
+            event,
+            Event::SubagentItem { .. }
+                | Event::SubagentItemAfter { .. }
+                | Event::SubagentItemBefore { .. }
+                | Event::SubagentTextDelta { .. }
+                | Event::SubagentItemsRemoved { .. }
+        ) {
+            return Ok(());
+        }
+        self.db
+            .execute_batch("SAVEPOINT child_file_event")
+            .map_err(|e| e.to_string())?;
+        let revision = self.file_revision;
+        let counts = (self.file_keys, self.applied_files);
+        let coverage = (self.child_files_seen, self.file_index_incomplete);
+        let result = self.index_child_event_inner(event);
+        match result {
+            Ok(()) => self
+                .db
+                .execute_batch("RELEASE child_file_event")
+                .map_err(|e| e.to_string()),
+            Err(error) => {
+                let _ = self
+                    .db
+                    .execute_batch("ROLLBACK TO child_file_event; RELEASE child_file_event");
+                self.file_revision = revision;
+                (self.file_keys, self.applied_files) = counts;
+                (self.child_files_seen, self.file_index_incomplete) = coverage;
+                Err(error)
+            }
+        }
+    }
+    fn index_child_event_inner(&mut self, event: &Event) -> Result<(), String> {
         match event {
-            Event::SubagentItem { id, item } => {
+            Event::SubagentItem { id, item }
+            | Event::SubagentItemAfter { id, item, .. }
+            | Event::SubagentItemBefore { id, item, .. } => {
                 self.child_files_seen = true;
                 let key = format!("c:{id}");
-                let old: Option<i64> = self
-                    .db
-                    .query_row(
-                        "SELECT ordinal FROM file_edits WHERE source=?1 AND item_id=?2 LIMIT 1",
-                        params![key, item.id],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .map_err(|e| e.to_string())?;
-                let ordinal = match old {
-                    Some(value) => value,
-                    None => {
-                        self.child_file_ordinal = self.child_file_ordinal.saturating_add(1);
-                        self.child_file_ordinal
-                    }
+                let (before, after) = match event {
+                    Event::SubagentItemBefore { before, .. } => (Some(before.as_str()), None),
+                    Event::SubagentItemAfter { after, .. } => (None, Some(after.as_str())),
+                    _ => (None, None),
                 };
+                let ordinal = self.child_file_ordinal(&key, &item.id, before, after)?;
                 self.index_file_item(item, &key, ordinal, false, "", &[])?;
             }
+            Event::SubagentTextDelta { id, item_id, .. } => {
+                self.child_files_seen = true;
+                self.child_file_ordinal(&format!("c:{id}"), item_id, None, None)?;
+            }
             Event::SubagentItemsRemoved { id, ids } => {
+                let key = format!("c:{id}");
                 for item in ids {
-                    if self.remove_file_item(&format!("c:{id}"), item)? {
+                    self.db
+                        .execute(
+                            "DELETE FROM child_file_items WHERE source=?1 AND item_id=?2",
+                            params![key, item],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if self.remove_file_item(&key, item)? {
                         self.file_revision = self.file_revision.saturating_add(1);
                     }
                 }
@@ -392,6 +538,9 @@ impl Store {
         Ok(())
     }
     pub(super) fn files_reset(&mut self) -> Result<(), String> {
+        self.db
+            .execute("DELETE FROM child_file_items", [])
+            .map_err(|e| e.to_string())?;
         self.db
             .execute("DELETE FROM file_edits", [])
             .map_err(|e| e.to_string())?;
@@ -884,6 +1033,291 @@ mod tests {
             })
             .unwrap();
         assert_eq!(summary(&mut store).total_files, 1);
+    }
+    #[test]
+    fn child_file_changes_follow_anchored_order_through_replacement_removal_and_reset() {
+        let mut store = Store::new().unwrap();
+        let child_key = FileChangeKey {
+            source: FileChangeSource::Subagent { id: "child".into() },
+            path: "a.rs".into(),
+        };
+        store
+            .apply(Event::SubagentItem {
+                id: "child".into(),
+                item: item(
+                    "delete",
+                    "a.rs",
+                    DIFF,
+                    ToolStatus::Succeeded,
+                    ChangeKind::Deleted,
+                ),
+            })
+            .unwrap();
+        store
+            .apply(Event::SubagentItemBefore {
+                id: "child".into(),
+                item: item(
+                    "add",
+                    "a.rs",
+                    DIFF,
+                    ToolStatus::Succeeded,
+                    ChangeKind::Added,
+                ),
+                before: "delete".into(),
+            })
+            .unwrap();
+        assert_eq!(summary(&mut store).files[0].kind, ChangeKind::Deleted);
+        let patches = page(&mut store, child_key.clone(), None, 0);
+        assert_eq!(
+            patches
+                .patches
+                .iter()
+                .map(|patch| patch.item_id.as_str())
+                .collect::<Vec<_>>(),
+            ["add", "delete"]
+        );
+
+        // Replayed/streamed replacements retain identity and position even if
+        // their later event carries another relative placement.
+        for status in [ToolStatus::Running, ToolStatus::Succeeded] {
+            store
+                .apply(Event::SubagentItemAfter {
+                    id: "child".into(),
+                    item: item("add", "a.rs", DIFF, status, ChangeKind::Added),
+                    after: "delete".into(),
+                })
+                .unwrap();
+        }
+        assert_eq!(summary(&mut store).files[0].kind, ChangeKind::Deleted);
+        let patches = page(&mut store, child_key.clone(), None, 0);
+        assert_eq!(
+            patches
+                .patches
+                .iter()
+                .map(|patch| patch.item_id.as_str())
+                .collect::<Vec<_>>(),
+            ["add", "delete"]
+        );
+        assert_eq!(summary(&mut store).files[0].succeeded, 2);
+
+        store
+            .apply(Event::SubagentItemsRemoved {
+                id: "child".into(),
+                ids: vec!["add".into()],
+            })
+            .unwrap();
+        store
+            .apply(Event::SubagentItemAfter {
+                id: "child".into(),
+                item: item(
+                    "add",
+                    "a.rs",
+                    DIFF,
+                    ToolStatus::Succeeded,
+                    ChangeKind::Added,
+                ),
+                after: "missing".into(),
+            })
+            .unwrap();
+        assert_eq!(summary(&mut store).files[0].kind, ChangeKind::Added);
+        let patches = page(&mut store, child_key, None, 0);
+        assert_eq!(
+            patches
+                .patches
+                .iter()
+                .map(|patch| patch.item_id.as_str())
+                .collect::<Vec<_>>(),
+            ["delete", "add"]
+        );
+        store
+            .apply(Event::Reset {
+                reason: "reset".into(),
+            })
+            .unwrap();
+        assert_eq!(summary(&mut store).total_files, 0);
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT COUNT(*) FROM child_file_items", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn child_file_changes_anchor_to_plain_and_streamed_non_file_items() {
+        for streamed in [false, true] {
+            for before in [false, true] {
+                let mut store = Store::new().unwrap();
+                store
+                    .apply(if streamed {
+                        Event::SubagentTextDelta {
+                            id: "child".into(),
+                            item_id: "text".into(),
+                            role: Role::Assistant,
+                            thinking: false,
+                            delta: "anchor".into(),
+                        }
+                    } else {
+                        Event::SubagentItem {
+                            id: "child".into(),
+                            item: Item {
+                                id: "text".into(),
+                                role: Role::Assistant,
+                                started_at: None,
+                                at: None,
+                                content: ItemContent::Text {
+                                    text: "anchor".into(),
+                                    thinking: false,
+                                    phase: crate::chat::Phase::Final,
+                                },
+                            },
+                        }
+                    })
+                    .unwrap();
+                store
+                    .apply(Event::SubagentItem {
+                        id: "child".into(),
+                        item: item(
+                            "delete",
+                            "a.rs",
+                            DIFF,
+                            ToolStatus::Succeeded,
+                            ChangeKind::Deleted,
+                        ),
+                    })
+                    .unwrap();
+                let add = item(
+                    "add",
+                    "a.rs",
+                    DIFF,
+                    ToolStatus::Succeeded,
+                    ChangeKind::Added,
+                );
+                store
+                    .apply(if before {
+                        Event::SubagentItemBefore {
+                            id: "child".into(),
+                            item: add,
+                            before: "text".into(),
+                        }
+                    } else {
+                        Event::SubagentItemAfter {
+                            id: "child".into(),
+                            item: add,
+                            after: "text".into(),
+                        }
+                    })
+                    .unwrap();
+                assert_eq!(summary(&mut store).files[0].kind, ChangeKind::Deleted);
+                let patches = page(
+                    &mut store,
+                    FileChangeKey {
+                        source: FileChangeSource::Subagent { id: "child".into() },
+                        path: "a.rs".into(),
+                    },
+                    None,
+                    0,
+                );
+                assert_eq!(
+                    patches
+                        .patches
+                        .iter()
+                        .map(|patch| patch.item_id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["add", "delete"]
+                );
+            }
+        }
+    }
+    #[test]
+    fn child_file_changes_rebalance_invalidates_only_affected_source_patch_cursors() {
+        let mut store = Store::new().unwrap();
+        let child_key = |id: &str| FileChangeKey {
+            source: FileChangeSource::Subagent { id: id.into() },
+            path: "a.rs".into(),
+        };
+        let large = "λ".repeat(PATCH_BYTES);
+        for id in ["child", "other"] {
+            for (item_id, kind) in [("one", ChangeKind::Added), ("two", ChangeKind::Deleted)] {
+                store
+                    .apply(Event::SubagentItem {
+                        id: id.into(),
+                        item: item(item_id, "a.rs", &large, ToolStatus::Succeeded, kind),
+                    })
+                    .unwrap();
+            }
+        }
+        let prior = page(&mut store, child_key("child"), None, 0);
+        let unrelated = page(&mut store, child_key("other"), None, 0);
+        let prior_cursor = prior.next.clone().unwrap();
+        let unrelated_cursor = unrelated.next.clone().unwrap();
+        // Exhaust the gap as repeated relative insertions eventually do. The
+        // next Store.apply must remap both identities and the patch index.
+        store.db.execute("UPDATE child_file_items SET ordinal=CASE item_id WHEN 'one' THEN 1 ELSE 2 END WHERE source='c:child'", []).unwrap();
+        store.db.execute("UPDATE file_edits SET ordinal=CASE item_id WHEN 'one' THEN 1 ELSE 2 END WHERE source='c:child'", []).unwrap();
+        store
+            .apply(Event::SubagentItemBefore {
+                id: "child".into(),
+                before: "two".into(),
+                item: Item {
+                    id: "middle".into(),
+                    role: Role::Assistant,
+                    started_at: None,
+                    at: None,
+                    content: ItemContent::Text {
+                        text: "non-file insertion".into(),
+                        thinking: false,
+                        phase: crate::chat::Phase::Final,
+                    },
+                },
+            })
+            .unwrap();
+        let stale = page(
+            &mut store,
+            child_key("child"),
+            Some(prior_cursor),
+            prior.revision,
+        );
+        assert!(stale.error.is_some());
+        assert!(stale.patches.is_empty());
+        let continued = page(
+            &mut store,
+            child_key("other"),
+            Some(unrelated_cursor),
+            unrelated.revision,
+        );
+        assert!(continued.error.is_none());
+
+        // The text insertion changed no a.rs contribution: its stale cursor
+        // above must be rejected by remapping alone. Replacing the same child
+        // identity with edit content must now retain that middle position.
+        store
+            .apply(Event::SubagentItem {
+                id: "child".into(),
+                item: item(
+                    "middle",
+                    "a.rs",
+                    DIFF,
+                    ToolStatus::Succeeded,
+                    ChangeKind::Updated,
+                ),
+            })
+            .unwrap();
+        let mut current = page(&mut store, child_key("child"), None, 0);
+        let mut ids = Vec::new();
+        loop {
+            assert!(current.error.is_none());
+            for patch in &current.patches {
+                if ids.last() != Some(&patch.item_id) {
+                    ids.push(patch.item_id.clone());
+                }
+            }
+            let Some(next) = current.next else { break };
+            current = page(&mut store, child_key("child"), Some(next), current.revision);
+        }
+        assert_eq!(ids, ["one", "middle", "two"]);
+        assert_eq!(summary(&mut store).files[0].kind, ChangeKind::Deleted);
     }
     #[test]
     fn file_changes_continuations_ignore_unrelated_edits_but_reject_replacement() {

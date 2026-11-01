@@ -38,7 +38,9 @@ impl Preview {
                 };
             }
             Event::Reset { .. } => *self = Self::default(),
-            Event::Item(item) if item.role == Role::User => {
+            Event::Item(item) | Event::ItemAfter { item, .. } | Event::ItemBefore { item, .. }
+                if item.role == Role::User =>
+            {
                 if let ItemContent::Text {
                     text,
                     thinking: false,
@@ -52,40 +54,44 @@ impl Preview {
                     self.topic = presentation::title(&presentation::preview(text));
                 }
             }
-            Event::Item(item) if item.role == Role::Assistant => match &item.content {
-                ItemContent::Text {
-                    text,
-                    thinking: false,
-                    phase,
-                } => {
-                    if self.final_response && *phase != Phase::Final {
-                        return;
-                    }
-                    self.id = bounded(&item.id, 1024);
-                    self.text = bounded(text, RETAINED_BYTES);
-                    self.final_response = *phase == Phase::Final;
-                }
-                ItemContent::Command { label, status, .. } => {
-                    let label = presentation::preview(label);
-                    self.fallback = format!(
-                        "{}{}",
-                        tool_verb(*status, "Command"),
-                        if label.is_empty() {
-                            String::new()
-                        } else {
-                            format!(": {label}")
+            Event::Item(item) | Event::ItemAfter { item, .. } | Event::ItemBefore { item, .. }
+                if item.role == Role::Assistant =>
+            {
+                match &item.content {
+                    ItemContent::Text {
+                        text,
+                        thinking: false,
+                        phase,
+                    } => {
+                        if self.final_response && *phase != Phase::Final {
+                            return;
                         }
-                    );
+                        self.id = bounded(&item.id, 1024);
+                        self.text = bounded(text, RETAINED_BYTES);
+                        self.final_response = *phase == Phase::Final;
+                    }
+                    ItemContent::Command { label, status, .. } => {
+                        let label = presentation::preview(label);
+                        self.fallback = format!(
+                            "{}{}",
+                            tool_verb(*status, "Command"),
+                            if label.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {label}")
+                            }
+                        );
+                    }
+                    ItemContent::Tool { name, status, .. } => {
+                        self.fallback = format!(
+                            "{}: {}",
+                            tool_verb(*status, "Tool"),
+                            presentation::title(name)
+                        );
+                    }
+                    _ => {}
                 }
-                ItemContent::Tool { name, status, .. } => {
-                    self.fallback = format!(
-                        "{}: {}",
-                        tool_verb(*status, "Tool"),
-                        presentation::title(name)
-                    );
-                }
-                _ => {}
-            },
+            }
             Event::TextDelta {
                 id,
                 role: Role::Assistant,
@@ -478,6 +484,40 @@ mod tests {
                 .conversation
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn positioned_live_items_keep_notification_topic_and_response_context() {
+        let mut state = Snapshot::default();
+        let item = |id: &str, role, body: &str| super::super::Item {
+            id: id.into(),
+            role,
+            at: None,
+            started_at: None,
+            content: ItemContent::Text {
+                text: body.into(),
+                thinking: false,
+                phase: Phase::Final,
+            },
+        };
+        let preview = Arc::make_mut(&mut state.notification_preview);
+        preview.observe(&Event::TextDelta {
+            id: "early-answer".into(),
+            role: Role::Assistant,
+            thinking: false,
+            delta: "Checking".into(),
+        });
+        preview.observe(&Event::ItemBefore {
+            item: item("prompt", Role::User, "Check the saved state"),
+            before: "early-answer".into(),
+        });
+        preview.observe(&Event::ItemAfter {
+            item: item("answer", Role::Assistant, "Recovered response"),
+            after: "prompt".into(),
+        });
+        let content = state.notification_content(Kind::Succeeded);
+        assert_eq!(content.conversation, "Check the saved state");
+        assert_eq!(content.preview, "Recovered response");
     }
 
     #[test]

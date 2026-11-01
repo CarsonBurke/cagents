@@ -1,6 +1,353 @@
 use super::{tests::adapter, *};
 use crate::agent::Provider;
 
+#[test]
+fn delayed_standalone_items_and_retry_receipts_keep_the_originating_turn_position() {
+    for method in ["item/started", "item/completed"] {
+        let raw = "Provider is temporarily at capacity";
+        let start = |turn: &str, text: &str| {
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":turn,"status":"inProgress","items":[{"id":"prompt","type":"userMessage",
+                "content":[{"type":"text","text":text}]}]}}})
+        };
+        let retry = json!({"method":"error","params":{"threadId":"thread-exact","turnId":"old-a",
+            "willRetry":true,"error":{"message":raw}}});
+        let (_, snapshot) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter()),
+            vec![
+                json!({"method":"turn/started","params":{"threadId":"thread-exact",
+                    "turn":{"id":"fixture-settle","status":"inProgress","items":[]}}}),
+                json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+                    "turn":{"id":"fixture-settle","status":"completed","items":[]}}}),
+                start("old-a", "First request"),
+                start("new-b", "Continue"),
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact",
+                    "turnId":"new-b","itemId":"answer","delta":"Recovered "}}),
+                json!({"method":method,"params":{"threadId":"thread-exact","turnId":"old-a",
+                    "item":{"id":"answer","type":"agentMessage","text":"Partial answer"}}}),
+                retry.clone(),
+                retry,
+                json!({"method":"error","params":{"threadId":"thread-exact","turnId":"old-a",
+                    "willRetry":false,"error":{"message":raw}}}),
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact",
+                    "turnId":"new-b","itemId":"answer","delta":"answer"}}),
+            ],
+            false,
+        );
+        assert_eq!(snapshot.items.len(), 7, "{method}");
+        assert_eq!(snapshot.items[0].id, "old-a/prompt");
+        assert_eq!(snapshot.items[1].id, "old-a/answer");
+        assert!(snapshot.items[2].id.starts_with("codex-notice:"));
+        assert!(snapshot.items[3].id.starts_with("codex-notice:"));
+        assert_ne!(
+            snapshot.items[2].id, snapshot.items[3].id,
+            "retry receipts retain distinct UUID identities"
+        );
+        assert_eq!(snapshot.items[4].id, turn_error_item("old-a", raw).id);
+        assert_eq!(snapshot.items[5].id, "new-b/prompt");
+        assert_eq!(snapshot.items[6].id, "new-b/answer");
+        for index in 2..5 {
+            assert_eq!(
+                chat::failure::provider_error_text(Provider::Codex, &snapshot.items[index]),
+                Some(raw)
+            );
+        }
+        assert!(snapshot.busy);
+        assert_eq!(snapshot.error_generation, 0);
+        assert!(snapshot.error.is_none());
+        assert!(matches!(&snapshot.items[6].content,
+            ItemContent::Text { text, .. } if text == "Recovered answer"));
+    }
+}
+
+#[test]
+fn partial_overlap_history_preserves_the_last_known_item_for_a_later_error() {
+    let mut adapter = adapter();
+    let mut request = Step::default();
+    adapter.history(&mut request, None).unwrap();
+    let raw = "Provider is temporarily at capacity";
+    let user = |text: &str| json!({"id":"prompt","type":"userMessage","content":[{"type":"text","text":text}]});
+    let (_, snapshot) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+        Box::new(adapter),
+        vec![
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+                "turn":{"id":"fixture-settle","status":"inProgress","items":[]}}}),
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+                "turn":{"id":"fixture-settle","status":"completed","items":[]}}}),
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact",
+                "turnId":"old-a","itemId":"answer","delta":"Partial answer"}}),
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+                "turn":{"id":"new-b","status":"inProgress","items":[user("Continue")]}}}),
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact",
+                "turnId":"new-b","itemId":"answer","delta":"Recovered "}}),
+            json!({"id":request.writes[0]["id"],"result":{"data":[
+                {"id":"new-b","status":"inProgress","items":[user("Continue"),
+                    {"id":"answer","type":"agentMessage","text":"Recovered "}]},
+                {"id":"old-a","status":"failed","items":[user("First request"),
+                    {"id":"answer","type":"agentMessage","text":"Partial answer"}]}
+            ],"nextCursor":null}}),
+            json!({"method":"error","params":{"threadId":"thread-exact","turnId":"old-a",
+                "willRetry":false,"error":{"message":raw}}}),
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact",
+                "turnId":"new-b","itemId":"answer","delta":"answer"}}),
+        ],
+        false,
+    );
+    let error_id = turn_error_item("old-a", raw).id;
+    assert_eq!(
+        snapshot
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "old-a/prompt",
+            "old-a/answer",
+            &error_id,
+            "new-b/prompt",
+            "new-b/answer"
+        ]
+    );
+    assert_eq!(snapshot.error_generation, 0);
+    assert!(snapshot.busy);
+}
+
+#[test]
+fn first_delayed_terminal_error_is_inserted_before_the_new_turn_without_history() {
+    let raw = "Provider is temporarily at capacity\nretained original diagnostics";
+    let user = |text: &str| json!({"id":"prompt","type":"userMessage","content":[{"type":"text","text":text}]});
+    let start = |id: &str, items: Value| {
+        json!({"method":"turn/started","params":{
+            "threadId":"thread-exact","turn":{"id":id,"status":"inProgress","items":items}
+        }})
+    };
+    for (completion, early, unseen) in [
+        (false, false, false),
+        (true, false, false),
+        (true, false, true),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let late_failure = if completion {
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{
+                "id":"old-a","status":"failed","error":{"message":raw},"items":[
+                    user("First request"), {"id":"answer","type":"agentMessage","text":"Partial answer"}
+                ]
+            }}})
+        } else {
+            json!({"method":"error","params":{"threadId":"thread-exact","turnId":"old-a",
+                "willRetry":false,"error":{"message":raw}}})
+        };
+        // The actor fixture requires one outcome callback. This empty
+        // completed turn contributes no conversation items or errors.
+        let mut frames = vec![
+            start("fixture-settle", json!([])),
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+                "turn":{"id":"fixture-settle","status":"completed","items":[]}}}),
+        ];
+        let partial = json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact",
+            "turnId":"old-a","itemId":"answer","delta":"Partial answer"}});
+        if early {
+            frames.push(partial.clone());
+        }
+        frames.push(start("old-a", json!([user("First request")])));
+        if !early && !unseen {
+            frames.push(partial.clone());
+        }
+        frames.extend([
+            start("new-b", json!([user("Continue")])),
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact",
+                    "turnId":"new-b","itemId":"answer","delta":"Recovered "}}),
+        ]);
+        if !completion && unseen {
+            frames.push(partial);
+        }
+        frames.extend([
+            // An older item completing cannot rewind A's last item proof.
+            json!({"method":"item/completed","params":{"threadId":"thread-exact",
+                    "turnId":"old-a","item":user("First request")}}),
+            late_failure,
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact",
+                    "turnId":"new-b","itemId":"answer","delta":"answer"}}),
+        ]);
+        let (_, snapshot) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter()),
+            frames,
+            false,
+        );
+        let error_id = turn_error_item("old-a", raw).id;
+        assert_eq!(
+            snapshot
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "old-a/prompt",
+                "old-a/answer",
+                &error_id,
+                "new-b/prompt",
+                "new-b/answer"
+            ],
+            "first late error must precede B before any history: completion={completion}, early={early}, unseen={unseen}"
+        );
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Codex, &snapshot.items[2]),
+            Some(raw)
+        );
+        assert!(snapshot.busy);
+        assert!(snapshot.error.is_none());
+        assert_eq!(
+            snapshot.error_generation, 0,
+            "an old turn cannot issue a scalar error into B"
+        );
+        assert!(snapshot.error_item.is_none());
+        assert!(matches!(&snapshot.items[4].content,
+            ItemContent::Text { text, .. } if text == "Recovered answer"));
+    }
+}
+
+#[test]
+fn terminal_error_placement_retains_exact_anchors_and_bounds_unproved_order() {
+    let mut adapter = adapter();
+    adapter.observe_turn_item("turn", "turn/prompt", false);
+    adapter.observe_turn_item("turn", "turn/answer", false);
+    adapter.observe_turn_item("turn", "turn/prompt", false);
+    let mut step = Step::default();
+    adapter.terminal_error("turn", "at capacity".into(), &mut step, true);
+    let [
+        Event::ItemAfter { item, after },
+        Event::Error { .. },
+        Event::ErrorSource { item_id },
+    ] = step.events.as_slice()
+    else {
+        panic!("{:?}", step.events);
+    };
+    assert_eq!(after, "turn/answer");
+    assert_eq!(item_id, &item.id);
+
+    for index in 0..MAX_TURN_ANCHORS {
+        let turn = format!("later-{index}");
+        adapter.observe_turn_item(&turn, &format!("{turn}/prompt"), false);
+    }
+    assert_eq!(adapter.turn_anchors.len(), MAX_TURN_ANCHORS);
+    let mut unproved = Step::default();
+    adapter.terminal_error("turn", "different diagnostics".into(), &mut unproved, false);
+    assert!(
+        matches!(unproved.events.as_slice(), [Event::Item(_)]),
+        "evicted turn evidence cannot borrow another turn's anchor"
+    );
+
+    let mut anchor = TurnAnchor::default();
+    for index in 0..MAX_TURN_ANCHOR_ITEMS {
+        anchor.observe(&index.to_string(), false);
+    }
+    anchor.observe("unknown-after-budget", false);
+    assert!(anchor.last.is_none());
+    assert_eq!(anchor.seen.len(), MAX_TURN_ANCHOR_ITEMS);
+    anchor.observe("provider-ordered-last-item", true);
+    assert_eq!(anchor.last.as_deref(), Some("provider-ordered-last-item"));
+    anchor.observe("0", false);
+    assert_eq!(anchor.last.as_deref(), Some("provider-ordered-last-item"));
+}
+
+#[test]
+fn newly_completed_output_keeps_an_earlier_retry_receipt_before_it() {
+    let mut adapter = adapter();
+    adapter.observe_turn_item("turn", "turn/prompt", false);
+    adapter.observe_turn_item("turn", "codex-notice:retry-receipt", false);
+    let item = Item {
+        id: "turn/answer".into(),
+        role: Role::Assistant,
+        content: ItemContent::Text {
+            text: "Recovered answer".into(),
+            thinking: false,
+            phase: Phase::Final,
+        },
+        started_at: None,
+        at: None,
+    };
+    let mut step = Step::default();
+    adapter.snapshot_item("turn", item, Some("turn/prompt"), &mut step);
+    assert!(
+        matches!(step.events.as_slice(), [Event::ItemAfter { after, .. }]
+        if after == "codex-notice:retry-receipt")
+    );
+    assert_eq!(
+        adapter.turn_anchors.back().unwrap().last.as_deref(),
+        Some("turn/answer")
+    );
+}
+
+#[test]
+fn first_delayed_child_completion_preserves_child_turn_order_without_history() {
+    let mut parent = adapter();
+    let mut child = adapter();
+    child.thread = Some("child".into());
+    child.is_child = true;
+    parent.children.insert("child".into(), Box::new(child));
+    let raw = "Provider is temporarily at capacity";
+    let user = |text: &str| json!({"id":"prompt","type":"userMessage","content":[{"type":"text","text":text}]});
+    let child_start = |turn: &str, prompt: &str| {
+        json!({"method":"turn/started","params":{
+            "threadId":"child","turn":{"id":turn,"status":"inProgress","items":[user(prompt)]}
+        }})
+    };
+    let (_, snapshot) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+        Box::new(parent),
+        vec![
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+                "turn":{"id":"fixture-settle","status":"inProgress","items":[]}}}),
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+                "turn":{"id":"fixture-settle","status":"completed","items":[]}}}),
+            child_start("old-a", "First child request"),
+            child_start("new-b", "Continue child work"),
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"child",
+                "turnId":"new-b","itemId":"answer","delta":"Recovered child "}}),
+            json!({"method":"turn/completed","params":{"threadId":"child","turn":{
+                "id":"old-a","status":"failed","error":{"message":raw},"items":[
+                    user("First child request"), {"id":"answer","type":"agentMessage","text":"Partial child answer"}
+                ]
+            }}}),
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"child",
+                "turnId":"new-b","itemId":"answer","delta":"answer"}}),
+        ],
+        false,
+    );
+    assert!(
+        snapshot.items.is_empty(),
+        "child diagnostics never enter the parent transcript"
+    );
+    assert!(snapshot.error.is_none());
+    let child = snapshot
+        .subagents
+        .iter()
+        .find(|child| child.id == "child")
+        .unwrap();
+    let error_id = turn_error_item("old-a", raw).id;
+    assert_eq!(
+        child
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "old-a/prompt",
+            "old-a/answer",
+            &error_id,
+            "new-b/prompt",
+            "new-b/answer"
+        ]
+    );
+    assert_eq!(child.status, Some(ToolStatus::Running));
+    assert_eq!(
+        chat::failure::provider_error_text(Provider::Codex, &child.items[2]),
+        Some(raw)
+    );
+    assert!(matches!(&child.items[4].content,
+        ItemContent::Text { text, .. } if text == "Recovered child answer"));
+}
+
 /// These tests feed real provider frames through Codex, the actor and its
 /// private transcript store. Provider I/O is replaced by the existing local
 /// actor fixture; item ordering and live/history dedup use production code.
@@ -146,16 +493,9 @@ fn terminal_error_identity_uses_explicit_turn_scope_and_retains_raw_diagnostics(
                 step.suppress_current_notification,
                 "an old turn's failure cannot fail the new turn"
             );
-            let [
-                Event::Item(item),
-                Event::Error {
-                    message,
-                    fatal: false,
-                },
-            ] = step.events.as_slice()
-            else {
+            let [Event::Item(item)] = step.events.as_slice() else {
                 panic!(
-                    "scoped failure retains history and active error semantics: {:?}",
+                    "an old scoped failure retains only its own history: {:?}",
                     step.events
                 );
             };
@@ -164,7 +504,6 @@ fn terminal_error_identity_uses_explicit_turn_scope_and_retains_raw_diagnostics(
                 chat::failure::provider_error_text(Provider::Codex, item),
                 Some(raw)
             );
-            assert_eq!(message, raw);
         } else {
             assert!(
                 matches!(step.events.as_slice(), [Event::Error { message, fatal: false }] if message == raw)

@@ -36,6 +36,8 @@ fn fresh(child: &str, bytes: usize) -> TextCopySource {
 pub(super) fn prepare(state: &mut Snapshot, event: &Event) -> Update {
     let child = match event {
         Event::SubagentItem { id, .. }
+        | Event::SubagentItemAfter { id, .. }
+        | Event::SubagentItemBefore { id, .. }
         | Event::SubagentTextDelta { id, .. }
         | Event::SubagentOutputDelta { id, .. }
         | Event::SubagentItemsRemoved { id, .. } => id,
@@ -66,7 +68,9 @@ pub(super) fn prepare(state: &mut Snapshot, event: &Event) -> Update {
         })
         .collect();
     match event {
-        Event::SubagentItem { item, .. } => {
+        Event::SubagentItem { item, .. }
+        | Event::SubagentItemAfter { item, .. }
+        | Event::SubagentItemBefore { item, .. } => {
             let next = text(item)
                 .filter(|body| body.len() <= MAX_BYTES)
                 .map(|body| {

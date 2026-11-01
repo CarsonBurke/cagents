@@ -50,7 +50,6 @@ pub(crate) struct Store {
     copy_revision: u64,
     copy_projection: Vec<Option<crate::chat::TextCopySource>>,
     file_revision: u64,
-    child_file_ordinal: i64,
     child_files_seen: bool,
     file_index_incomplete: bool,
     file_keys: usize,
@@ -239,7 +238,6 @@ impl Store {
                 copy_revision: 0,
                 copy_projection: Default::default(),
                 file_revision: 0,
-                child_file_ordinal: 0,
                 child_files_seen: false,
                 file_index_incomplete: false,
                 file_keys: 0,
@@ -754,7 +752,9 @@ impl Store {
     pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
         if let Some(seal) = &self.messages {
             match &mut event {
-                Event::Item(item) => seal.recognize(item),
+                Event::Item(item)
+                | Event::ItemAfter { item, .. }
+                | Event::ItemBefore { item, .. } => seal.recognize(item),
                 Event::History { items, .. } | Event::LatestHistory { items, .. } => {
                     items.iter_mut().for_each(|item| seal.recognize(item));
                 }
@@ -820,6 +820,26 @@ impl Store {
             }
             Event::Item(item) => {
                 if let Some(warning) = self.put(item, false)? {
+                    out.push(nonfatal(warning));
+                }
+            }
+            Event::ItemAfter { item, after } => {
+                let assigned = if !self.exists(&item.id)? && self.exists(&after)? {
+                    Some(self.history_ordinals(None, Some(&after), 1)?[0])
+                } else {
+                    None
+                };
+                if let Some(warning) = self.put_at(item, false, assigned)? {
+                    out.push(nonfatal(warning));
+                }
+            }
+            Event::ItemBefore { item, before } => {
+                let assigned = if !self.exists(&item.id)? && self.exists(&before)? {
+                    Some(self.history_ordinals(Some(&before), None, 1)?[0])
+                } else {
+                    None
+                };
+                if let Some(warning) = self.put_at(item, false, assigned)? {
                     out.push(nonfatal(warning));
                 }
             }

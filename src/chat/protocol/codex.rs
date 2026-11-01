@@ -62,6 +62,9 @@ fn skill_source<'a>(path: &str, others: impl Iterator<Item = &'a str>) -> String
 const MAX_PENDING: usize = 128;
 const MAX_MODELS: usize = 512;
 const MAX_ACTIVE_ITEMS: usize = 128;
+const MAX_TURN_ANCHORS: usize = 64;
+const MAX_TURN_ANCHOR_ITEMS: usize = 4096;
+const MAX_TURN_ANCHOR_ID_BYTES: usize = 1024;
 const MAX_ITEM_BYTES: usize = 512 * 1024;
 // Reserve for every possible byte count, leaving the rest for real output.
 const OUTPUT_MARKER_BYTES: usize =
@@ -72,6 +75,41 @@ const OUTPUT_MARKER_BYTES: usize =
 struct OutputWindow {
     omitted: usize,
     head: usize,
+}
+
+/// A bounded record of provider item order, independent of update arrival
+/// order. Repeated deltas/completions for an earlier item cannot rewind it.
+#[derive(Default)]
+struct TurnAnchor {
+    turn: String,
+    seen: std::collections::BTreeSet<[u8; 32]>,
+    first: Option<String>,
+    last: Option<String>,
+    overflowed: bool,
+}
+
+impl TurnAnchor {
+    fn observe(&mut self, id: &str, ordered_snapshot: bool) {
+        use sha2::{Digest, Sha256};
+        let digest: [u8; 32] = Sha256::digest(id.as_bytes()).into();
+        if !ordered_snapshot && self.seen.contains(&digest) {
+            return;
+        }
+        if self.seen.len() < MAX_TURN_ANCHOR_ITEMS {
+            self.seen.insert(digest);
+        } else {
+            self.overflowed = true;
+        }
+        // A complete ordered snapshot still proves its last item's position.
+        // After the identity budget is exhausted, an unseen incremental update
+        // cannot distinguish a new item from an older item being updated.
+        self.last = ((ordered_snapshot || !self.overflowed)
+            && id.len() <= MAX_TURN_ANCHOR_ID_BYTES)
+            .then(|| id.to_owned());
+        if self.first.is_none() && id.len() <= MAX_TURN_ANCHOR_ID_BYTES {
+            self.first = Some(id.into());
+        }
+    }
 }
 
 fn append_display_output(
@@ -431,6 +469,7 @@ fn create_inner(
             pending: BTreeMap::new(),
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
+            turn_anchors: Default::default(),
             output_streams: BTreeMap::new(),
             output_windows: BTreeMap::new(),
             models: Vec::new(),
@@ -576,6 +615,7 @@ struct Codex {
     pending: BTreeMap<String, Pending>,
     requests: BTreeMap<String, PendingRequest>,
     active_items: BTreeMap<String, Item>,
+    turn_anchors: std::collections::VecDeque<TurnAnchor>,
     /// What is held of each running command's output between deltas: the
     /// start of an escape sequence the next delta finishes. An entry exists
     /// only for an item in `active_items`, and goes when the item does.
@@ -661,6 +701,110 @@ impl Drop for Codex {
     }
 }
 impl Codex {
+    fn turn_anchor_mut(&mut self, turn: &str) -> Option<&mut TurnAnchor> {
+        if turn.is_empty() || turn.len() > MAX_TURN_ANCHOR_ID_BYTES {
+            return None;
+        }
+        if let Some(index) = self
+            .turn_anchors
+            .iter()
+            .position(|anchor| anchor.turn == turn)
+        {
+            return self.turn_anchors.get_mut(index);
+        }
+        if self.turn_anchors.len() == MAX_TURN_ANCHORS {
+            self.turn_anchors.pop_front();
+        }
+        self.turn_anchors.push_back(TurnAnchor {
+            turn: turn.into(),
+            ..Default::default()
+        });
+        self.turn_anchors.back_mut()
+    }
+
+    fn observe_turn_item(&mut self, turn: &str, item: &str, ordered_snapshot: bool) {
+        if let Some(anchor) = self.turn_anchor_mut(turn) {
+            anchor.observe(item, ordered_snapshot);
+        }
+    }
+
+    /// Merge an explicitly ordered provider snapshot around items that may
+    /// already have streamed. New prefix content precedes the proven first
+    /// item; new content after a known predecessor enters that exact gap.
+    fn snapshot_item(&mut self, turn: &str, item: Item, previous: Option<&str>, step: &mut Step) {
+        use sha2::{Digest, Sha256};
+        let digest: [u8; 32] = Sha256::digest(item.id.as_bytes()).into();
+        let anchor = self.turn_anchors.iter().find(|anchor| anchor.turn == turn);
+        let known = anchor.is_some_and(|anchor| anchor.seen.contains(&digest));
+        let first = anchor.and_then(|anchor| anchor.first.clone());
+        let last = anchor.and_then(|anchor| anchor.last.clone());
+        // Retry receipts describe attempts before later output. They are not
+        // included in provider item arrays, so a newly delivered answer must
+        // follow the retained retry rather than fill a gap ahead of it.
+        let placement_after = if previous.is_some()
+            && last
+                .as_deref()
+                .is_some_and(|id| id.starts_with("codex-notice:"))
+        {
+            last.clone()
+        } else {
+            previous.map(str::to_owned)
+        };
+        let previous = placement_after.as_deref();
+        let id = item.id.clone();
+        let appends_current = self.notification_turn.as_deref() == Some(turn)
+            && previous.is_some()
+            && previous == last.as_deref();
+        step.events.push(if known || appends_current {
+            Event::Item(item)
+        } else if let Some(after) = previous {
+            Event::ItemAfter {
+                item,
+                after: after.into(),
+            }
+        } else if let Some(before) = &first {
+            Event::ItemBefore {
+                item,
+                before: before.clone(),
+            }
+        } else {
+            Event::Item(item)
+        });
+        self.observe_turn_item(turn, &id, false);
+        if !known && last.is_some() && previous != last.as_deref() {
+            // Filling a prefix/middle gap cannot replace the proven last
+            // item with an earlier newly hydrated item.
+            if let Some(anchor) = self.turn_anchor_mut(turn) {
+                anchor.last = last;
+                if previous.is_none() && first.is_some() && id.len() <= MAX_TURN_ANCHOR_ID_BYTES {
+                    anchor.first = Some(id);
+                }
+            }
+        }
+    }
+
+    fn terminal_error(&mut self, turn: &str, message: String, step: &mut Step, current: bool) {
+        let item = turn_error_item(turn, &message);
+        let item_id = item.id.clone();
+        let after = self
+            .turn_anchors
+            .iter()
+            .find(|anchor| anchor.turn == turn)
+            .and_then(|anchor| anchor.last.clone());
+        step.events.push(match after {
+            Some(after) if after != item_id => Event::ItemAfter { item, after },
+            _ => Event::Item(item),
+        });
+        self.observe_turn_item(turn, &item_id, false);
+        if current {
+            step.events.push(Event::Error {
+                message,
+                fatal: false,
+            });
+            step.events.push(Event::ErrorSource { item_id });
+        }
+    }
+
     fn discover_child(
         &mut self,
         id: &str,
@@ -836,16 +980,17 @@ impl Codex {
         // An ACK can recover a completion whose content arrived before exact
         // execution binding. Ordinary completed frames already publish it.
         if publish_content {
+            let mut previous = None;
             for value in array(turn, "items")? {
-                step.events
-                    .extend(parse_item(value, true, id)?.into_iter().map(Event::Item));
+                for item in parse_item(value, true, id)? {
+                    let item_id = item.id.clone();
+                    self.snapshot_item(id, item, previous.as_deref(), step);
+                    previous = Some(item_id);
+                }
             }
             if let Some(message) = turn_error_message(turn) {
-                step.events.push(Event::Item(turn_error_item(id, &message)));
-                step.events.push(Event::Error {
-                    message,
-                    fatal: false,
-                });
+                let current = !step.suppress_current_notification;
+                self.terminal_error(id, message, step, current);
             }
         }
         execution_end(execution.run, outcome, step);
@@ -1236,6 +1381,15 @@ impl Codex {
         for turn in array(page, "data")?.iter().rev() {
             let turn_id = string(turn, "id")?;
             let active = turn["status"] == "inProgress";
+            let known_anchor = self
+                .turn_anchors
+                .iter()
+                .any(|anchor| anchor.turn == turn_id);
+            // Active history cannot rewind a newer live stream. Older paging
+            // must not evict placement evidence for recent live turns.
+            let track_anchor = !earlier
+                && (!active || !known_anchor)
+                && (known_anchor || self.turn_anchors.len() < MAX_TURN_ANCHORS);
             if active && self.busy && self.turn.is_none() {
                 self.turn = Some(turn_id.into());
             }
@@ -1290,6 +1444,9 @@ impl Codex {
                     windows.insert(id.to_owned(), window);
                 })?;
                 for item in parsed {
+                    if track_anchor {
+                        self.observe_turn_item(turn_id, &item.id, true);
+                    }
                     if active && self.busy {
                         // Completed history releases an unseen completion;
                         // live history cannot replace a more recent stream.
@@ -1299,7 +1456,11 @@ impl Codex {
                 }
             }
             if let Some(message) = turn_error_message(turn) {
-                items.push(turn_error_item(turn_id, &message));
+                let item = turn_error_item(turn_id, &message);
+                if track_anchor {
+                    self.observe_turn_item(turn_id, &item.id, true);
+                }
+                items.push(item);
             }
         }
         if !earlier {
@@ -2591,13 +2752,14 @@ impl Adapter for Codex {
                                 let turn_id = string(turn, "id")?;
                                 for value in turn["items"].as_array().into_iter().flatten() {
                                     for item in parse_item(value, true, turn_id)? {
+                                        child.observe_turn_item(turn_id, &item.id, true);
                                         content.events.push(Event::Item(item));
                                     }
                                 }
                                 if let Some(message) = turn_error_message(turn) {
-                                    content
-                                        .events
-                                        .push(Event::Item(turn_error_item(turn_id, &message)));
+                                    let item = turn_error_item(turn_id, &message);
+                                    child.observe_turn_item(turn_id, &item.id, true);
+                                    content.events.push(Event::Item(item));
                                 }
                             }
                             child.child_history_outcome(
@@ -2916,6 +3078,7 @@ impl Adapter for Codex {
                     step.events.push(Event::Waiting(false));
                     self.turn = self.busy.then(|| turn_id.to_owned());
                 }
+                let mut previous = None;
                 for value in array(turn, "items")? {
                     let mut windows = BTreeMap::new();
                     let parsed = parse_item_with_windows(
@@ -2930,7 +3093,9 @@ impl Adapter for Codex {
                         if method == "turn/started" {
                             self.track_snapshot_item(value, &item, windows.remove(&item.id), true);
                         }
-                        step.events.push(Event::Item(item));
+                        let item_id = item.id.clone();
+                        self.snapshot_item(turn_id, item, previous.as_deref(), &mut step);
+                        previous = Some(item_id);
                     }
                 }
                 // Non-blocking questions can outlive their originating turn.
@@ -2947,12 +3112,7 @@ impl Adapter for Codex {
                     });
                 }
                 if let Some(message) = turn_error_message(turn) {
-                    step.events
-                        .push(Event::Item(turn_error_item(turn_id, &message)));
-                    step.events.push(Event::Error {
-                        message,
-                        fatal: false,
-                    });
+                    self.terminal_error(turn_id, message, &mut step, current);
                 }
                 if method == "turn/completed" {
                     self.finish_execution(turn, &mut step, false)?;
@@ -2996,14 +3156,11 @@ impl Adapter for Codex {
                     }
                 }
                 let mut windows = BTreeMap::new();
-                let parsed = parse_item_with_windows(
-                    &params["item"],
-                    done,
-                    string(params, "turnId")?,
-                    |id, window| {
+                let turn_id = string(params, "turnId")?;
+                let parsed =
+                    parse_item_with_windows(&params["item"], done, turn_id, |id, window| {
                         windows.insert(id.to_owned(), window);
-                    },
-                )?;
+                    })?;
                 for item in parsed {
                     if done {
                         self.active_items.remove(&item.id);
@@ -3017,14 +3174,20 @@ impl Adapter for Codex {
                             true,
                         );
                     }
-                    step.events.push(Event::Item(item));
+                    let previous = self
+                        .turn_anchors
+                        .iter()
+                        .find(|anchor| anchor.turn == turn_id)
+                        .and_then(|anchor| anchor.last.clone());
+                    self.snapshot_item(turn_id, item, previous.as_deref(), &mut step);
                 }
             }
             "item/agentMessage/delta"
             | "item/plan/delta"
             | "item/reasoning/summaryTextDelta"
             | "item/reasoning/textDelta" => {
-                let base = item_key(string(params, "turnId")?, string(params, "itemId")?);
+                let turn_id = string(params, "turnId")?;
+                let base = item_key(turn_id, string(params, "itemId")?);
                 let thinking = method.contains("reasoning");
                 let id = if thinking {
                     let (kind, index) = if method.ends_with("summaryTextDelta") {
@@ -3046,6 +3209,34 @@ impl Adapter for Codex {
                 } else {
                     base.into()
                 };
+                if step.suppress_current_notification {
+                    use sha2::{Digest, Sha256};
+                    let digest: [u8; 32] = Sha256::digest(id.as_bytes()).into();
+                    if let Some(anchor) = self
+                        .turn_anchors
+                        .iter()
+                        .find(|anchor| anchor.turn == turn_id && !anchor.seen.contains(&digest))
+                        && let Some(after) = &anchor.last
+                    {
+                        // A first delayed delta needs a row at its originating
+                        // turn before the byte append reaches the store.
+                        step.events.push(Event::ItemAfter {
+                            item: Item {
+                                id: id.clone(),
+                                role: Role::Assistant,
+                                content: ItemContent::Text {
+                                    text: String::new(),
+                                    thinking,
+                                    phase: Phase::Final,
+                                },
+                                started_at: None,
+                                at: None,
+                            },
+                            after: after.clone(),
+                        });
+                    }
+                }
+                self.observe_turn_item(turn_id, &id, false);
                 step.events.push(Event::TextDelta {
                     id,
                     role: Role::Assistant,
@@ -3181,23 +3372,40 @@ impl Adapter for Codex {
                 // A retry describes work still in progress. Putting it in
                 // Snapshot.error leaves a recovered turn marked as failed.
                 if params["willRetry"] == true {
-                    let mut notice = session_notice(message);
-                    if let Event::Item(item) = &mut notice {
-                        chat::failure::mark_provider_error(crate::agent::Provider::Codex, item);
+                    let Event::Item(mut item) = session_notice(message) else {
+                        unreachable!()
+                    };
+                    chat::failure::mark_provider_error(crate::agent::Provider::Codex, &mut item);
+                    if let Some(turn_id) = params["turnId"].as_str().filter(|id| !id.is_empty()) {
+                        let after = self
+                            .turn_anchors
+                            .iter()
+                            .find(|anchor| anchor.turn == turn_id)
+                            .and_then(|anchor| anchor.last.clone());
+                        self.observe_turn_item(turn_id, &item.id, false);
+                        if step.suppress_current_notification
+                            && let Some(after) = after
+                        {
+                            step.events.push(Event::ItemAfter { item, after });
+                        } else {
+                            step.events.push(Event::Item(item));
+                        }
+                    } else {
+                        step.events.push(Event::Item(item));
                     }
-                    step.events.push(notice);
                 } else {
                     // Only the provider's explicit turn ID can bind a failure
                     // to durable history. The current turn may already have
                     // changed when this notification arrives.
                     if let Some(turn_id) = params["turnId"].as_str().filter(|id| !id.is_empty()) {
-                        step.events
-                            .push(Event::Item(turn_error_item(turn_id, &message)));
+                        let current = !step.suppress_current_notification;
+                        self.terminal_error(turn_id, message, &mut step, current);
+                    } else {
+                        step.events.push(Event::Error {
+                            message,
+                            fatal: false,
+                        });
                     }
-                    step.events.push(Event::Error {
-                        message,
-                        fatal: false,
-                    });
                 }
             }
             "warning" | "configWarning" | "guardianWarning" | "deprecationNotice" => {
@@ -5874,6 +6082,7 @@ mod tests {
             pending: BTreeMap::new(),
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
+            turn_anchors: Default::default(),
             output_streams: BTreeMap::new(),
             output_windows: BTreeMap::new(),
             models: vec![Model {
@@ -5940,7 +6149,8 @@ mod tests {
             Some("Reconnecting... 1/2")
         );
         assert!(chat::failure::provider_error_text(Provider::Claude, item).is_none());
-        let [Event::Item(next)] = second.events.as_slice() else {
+        let [Event::Item(next) | Event::ItemAfter { item: next, .. }] = second.events.as_slice()
+        else {
             panic!("{:?}", second.events)
         };
         assert_ne!(item.id, next.id);
@@ -5966,7 +6176,9 @@ mod tests {
             let mut retry = frame.clone();
             retry["params"]["error"]["message"] = json!(raw);
             let retry = adapter.receive(retry).unwrap();
-            let [Event::Item(error)] = retry.events.as_slice() else {
+            let [Event::Item(error) | Event::ItemAfter { item: error, .. }] =
+                retry.events.as_slice()
+            else {
                 panic!("retry must remain only a timeline item");
             };
             assert!(error.id.starts_with("codex-notice:"));
@@ -5992,11 +6204,16 @@ mod tests {
             assert!(chat::failure::provider_error_text(Provider::Codex, warning).is_none());
             assert!(matches!(&warning.content, ItemContent::Text { text, .. } if text == &raw));
         }
+        adapter.notification_turn = Some("turn".into());
         for will_retry in [json!(false), Value::Null] {
             let mut failed = frame.clone();
             failed["params"]["willRetry"] = will_retry;
             let failed = adapter.receive(failed).unwrap();
-            let [Event::Item(item), Event::Error { fatal: false, .. }] = failed.events.as_slice()
+            let [
+                Event::Item(item) | Event::ItemAfter { item, .. },
+                Event::Error { fatal: false, .. },
+                Event::ErrorSource { item_id },
+            ] = failed.events.as_slice()
             else {
                 panic!("terminal errors retain both transcript and active error state");
             };
@@ -6005,6 +6222,7 @@ mod tests {
                 Some("Reconnecting... 1/2")
             );
             assert!(item.id.starts_with("codex-turn-error:"));
+            assert_eq!(item_id, &item.id);
         }
         let mut foreign = frame;
         foreign["params"]["threadId"] = json!("another-thread");
@@ -7066,12 +7284,25 @@ mod tests {
                     .events
                     .iter()
                     .filter(|event| matches!(event,
-                        Event::Item(item) if item == &turn_error_item("owned", "Exact failure")
+                        Event::Item(item) | Event::ItemAfter { item, .. }
+                            if item == &turn_error_item("owned", "Exact failure")
                     ))
                     .count(),
                 1,
                 "the exact early completion retains one durable failure item: {:?}",
                 final_step.events
+            );
+            assert_eq!(
+                final_step
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event,
+                        Event::ErrorSource { item_id }
+                            if item_id == &turn_error_item("owned", "Exact failure").id
+                    ))
+                    .count(),
+                1,
+                "the scalar failure links to the exact incident in either ACK order"
             );
             assert_eq!(final_step.events.iter().filter(|event| matches!(event,
                 Event::Execution { run: actual, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Failed } } if *actual == run

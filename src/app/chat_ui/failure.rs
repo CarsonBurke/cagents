@@ -12,6 +12,68 @@ enum Source {
     Snapshot,
 }
 
+/// A failure received while the reader is looking at an earlier page. Its
+/// provider source and receipt belong to that publication, not the page that
+/// eventually becomes visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Deferred {
+    pub text: String,
+    pub error_item: Option<String>,
+    pub error_generation: u64,
+    pub turn_generation: u64,
+}
+
+impl Deferred {
+    pub fn new(text: String, snapshot: &Snapshot) -> Self {
+        Self {
+            error_item: (snapshot.error.as_deref() == Some(text.as_str()))
+                .then(|| snapshot.error_item.clone())
+                .flatten(),
+            text,
+            error_generation: snapshot.error_generation,
+            turn_generation: snapshot.turn_generation,
+        }
+    }
+
+    pub fn same_event(&self, other: &Self) -> bool {
+        self.text == other.text
+            && match (&self.error_item, &other.error_item) {
+                (Some(left), Some(right)) => left == right,
+                (None, None) => {
+                    self.error_generation == other.error_generation
+                        && self.turn_generation == other.turn_generation
+                }
+                _ => false,
+            }
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &Snapshot) -> bool {
+        snapshot.error.as_deref() == Some(self.text.as_str())
+            && snapshot.error_generation == self.error_generation
+            && snapshot.turn_generation == self.turn_generation
+            && self
+                .error_item
+                .as_ref()
+                .is_none_or(|source| snapshot.error_item.as_ref() == Some(source))
+    }
+
+    /// An unresolved receipt still has an identity, but no proven transcript
+    /// position. Keep its diagnostics distinct without borrowing a later
+    /// source or manufacturing a prompt/item to place it after.
+    pub fn unresolved_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"deferred-receipt\0");
+        let source = self.error_item.as_deref().unwrap_or_default();
+        digest.update((source.len() as u64).to_be_bytes());
+        digest.update(source.as_bytes());
+        digest.update(self.error_generation.to_be_bytes());
+        digest.update(self.turn_generation.to_be_bytes());
+        digest.update(self.text.as_bytes());
+        format!("{:x}", digest.finalize())
+    }
+}
+
 /// A notice kept in the transcript after its live source has gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Note {
@@ -229,7 +291,6 @@ pub(super) fn notice_key(
         .iter()
         .find(|item| Some(item.id.as_str()) == after)?;
     provider_item_text(provider, item)?;
-    let scope = event_scope(provider, item);
     let carrier = chat::failure::provider_error_carrier(provider, item);
     let sources: Vec<_> = snapshot
         .items
@@ -254,7 +315,26 @@ pub(super) fn notice_key(
     if scalar_body != body {
         return None;
     }
+    item_key(provider, snapshot, &item.id)
+}
+
+/// Canonical metadata for an explicitly linked provider occurrence.
+pub(super) fn item_key(provider: Provider, snapshot: &Snapshot, id: &str) -> Option<String> {
+    let item = snapshot.items.iter().find(|item| item.id == id)?;
+    provider_item_text(provider, item)?;
+    let scope = event_scope(provider, item);
+    let carrier = chat::failure::provider_error_carrier(provider, item);
     let mut chosen = None;
+    let sources = snapshot
+        .items
+        .iter()
+        .filter(|source| {
+            source.id == id
+                || carrier.is_some_and(|carrier| {
+                    chat::failure::provider_error_carrier(provider, source) == Some(carrier)
+                })
+        })
+        .filter_map(|source| provider_item_text(provider, source));
     for text in sources {
         if let Some(meta) = State::metadata(provider, text, false, &scope)
             && chosen
@@ -418,6 +498,27 @@ impl State {
                 && let Some(meta) =
                     Self::metadata_for_item(runtime, item, &source(item), &context(item))
             {
+                let meta = if meta.kind.is_none()
+                    && matches!(source(item), Source::Item(_))
+                    && runtime
+                        .failure_ui
+                        .item_metadata
+                        .get(&source(item))
+                        .is_some_and(|(_, old_context, _)| old_context == &context(item))
+                    && let Some(incident) = runtime
+                        .failure_ui
+                        .item(&item.id)
+                        .filter(|incident| incident.kind.is_some())
+                {
+                    Metadata {
+                        key: incident.key.clone(),
+                        summary: incident.summary.clone(),
+                        guidance: incident.guidance,
+                        kind: incident.kind,
+                    }
+                } else {
+                    meta
+                };
                 let prior = causes
                     .entry(carrier.to_owned())
                     .or_insert_with(|| meta.clone());
@@ -488,6 +589,9 @@ impl State {
             |item| event_scope(provider, item),
         );
         for item in &runtime.snapshot.items {
+            if provider_item_text(provider, item).is_none() {
+                continue;
+            }
             state.push_item(
                 runtime,
                 item,
@@ -618,11 +722,11 @@ impl State {
             .snapshot
             .error
             .as_deref()
-            .filter(|error| {
+            .filter(|_| {
                 !runtime
                     .unplaced_failures
                     .iter()
-                    .any(|notice| notice == error)
+                    .any(|notice| notice.matches_snapshot(&runtime.snapshot))
             })
             .and_then(|error| {
                 runtime.failures.iter().rposition(|note| {
@@ -632,6 +736,18 @@ impl State {
             });
         let snapshot_context =
             snapshot_note.map_or(context.as_str(), |index| note_contexts[index].as_str());
+        let snapshot_key = runtime
+            .snapshot
+            .error_item
+            .as_deref()
+            .and_then(|id| state.item(id).map(|incident| incident.key.clone()))
+            .or_else(|| snapshot_note.and_then(|index| runtime.failures[index].event_key.clone()));
+        let local_note = runtime.error.as_deref().and_then(|error| {
+            runtime.failures.iter().rposition(|note| {
+                note.text == error
+                    && note_destination(runtime, note, &item_groups, &user_carriers).is_some()
+            })
+        });
         state.local_error = if runtime.failure_ui.local_error.as_deref() == runtime.error.as_deref()
         {
             runtime.failure_ui.local_error.clone()
@@ -654,12 +770,20 @@ impl State {
             {
                 let scope = match source {
                     Source::Snapshot => snapshot_context,
+                    Source::Local(_) => {
+                        local_note.map_or(context.as_str(), |index| note_contexts[index].as_str())
+                    }
                     _ => context.as_str(),
                 };
                 if let Some(mut meta) = Self::metadata(provider, text, false, scope) {
                     if matches!(source, Source::Snapshot)
-                        && let Some(key) = snapshot_note
-                            .and_then(|index| runtime.failures[index].event_key.as_ref())
+                        && let Some(key) = &snapshot_key
+                    {
+                        meta.key.clone_from(key);
+                    }
+                    if matches!(source, Source::Local(_))
+                        && let Some(key) =
+                            local_note.and_then(|index| runtime.failures[index].event_key.as_ref())
                     {
                         meta.key.clone_from(key);
                     }
@@ -667,15 +791,17 @@ impl State {
                 }
             }
         }
-        let recovering = runtime.auth_error().is_some();
+        let recovering = runtime.auth_error();
         for incident in &mut state.incidents {
-            incident.active_recovery = recovering
+            incident.active_recovery = recovering.is_some()
                 && incident.kind == Some(FailureKind::Authentication)
                 && incident.sources.iter().any(|source| match source {
-                    Source::Local(_) | Source::Snapshot => true,
+                    Source::Local(_) => recovering == runtime.error.as_deref(),
+                    Source::Snapshot => recovering == runtime.snapshot.error.as_deref(),
                     Source::Note(index) => {
                         let note = &runtime.failures[*index];
-                        runtime.active_auth_notice(&note.message, &note.text)
+                        (snapshot_note == Some(*index) || local_note == Some(*index))
+                            && runtime.active_auth_notice(&note.message, &note.text)
                     }
                     // A historical item in the same prompt is not the active
                     // failure. Its proven scalar/note source owns recovery.
@@ -1221,7 +1347,11 @@ mod tests {
     }
 
     fn publish_error(runtime: &mut Runtime, handle: &ClientHandle, error: &str) {
-        publish(runtime, handle, |next| next.error = Some(error.into()));
+        publish(runtime, handle, |next| {
+            next.error = Some(error.into());
+            next.error_generation += 1;
+            next.error_item = None;
+        });
     }
 
     /// Whether the incident's notice is part of the visible transcript.

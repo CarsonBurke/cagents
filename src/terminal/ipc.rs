@@ -195,7 +195,10 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 128 adds explicit error receipt/source metadata to chat snapshots.
+/// Postcard peers must use the matched CLI, daemon and UI; JSON history defaults
+/// remain readable. This does not migrate or restart a running daemon.
+pub const PROTOCOL_VERSION: u16 = 128;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -2825,8 +2828,23 @@ mod tests {
         }
         let mut legacy = serde_json::to_value(Snapshot::default()).unwrap();
         legacy.as_object_mut().unwrap().remove("file_changes");
+        legacy.as_object_mut().unwrap().remove("error_generation");
+        legacy.as_object_mut().unwrap().remove("error_item");
         let restored: Snapshot = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.file_changes.total_files, 0);
+        assert_eq!(restored.error_generation, 0);
+        assert_eq!(restored.error_item, None);
+        let current = Snapshot {
+            error: Some("Selected model is at capacity".into()),
+            error_generation: 3,
+            error_item: Some("exact-diagnostic".into()),
+            ..Snapshot::default()
+        };
+        let restored: Snapshot =
+            postcard::from_bytes(&postcard::to_stdvec(&current).unwrap()).unwrap();
+        assert_eq!(restored.error, current.error);
+        assert_eq!(restored.error_generation, 3);
+        assert_eq!(restored.error_item, current.error_item);
     }
     #[test]
     fn framing_round_trips_and_rejects_oversized_prefixes() {
