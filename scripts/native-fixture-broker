@@ -85,6 +85,9 @@ ACCOUNTS_XDG = (
     ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state"),
     ("XDG_RUNTIME_DIR", "runtime"),
 )
+PROJECT_CLOSE_SCENES = ("edit", "unchanged", "reopen", "saving")
+PROJECT_CLOSE_WIDTHS = {"wide": 1600, "narrow": 900}
+PROJECT_CLOSE_DIRECTORIES = ("home", "data", "config", "cache", "state", "runtime")
 SYSTEM_PATH = "/usr/bin:/usr/sbin"
 TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 # Per process, except nproc. Aggregate memory needs a cgroup, which needs systemd.
@@ -313,11 +316,20 @@ def validate_request(request, repo):
         selected = ACCOUNTS_FIELDS.intersection(request)
         if selected:
             if selected != ACCOUNTS_FIELDS or "width" not in request:
-                raise Refusal("invalid_request", "Accounts recipe needs recipe, scene, layout, side and explicit width")
-            if (request["recipe"] != "accounts-quota" or request["scene"] not in ACCOUNTS_SCENES
-                    or request["layout"] not in ("wide", "narrow") or request["side"] not in ("before", "after")):
-                raise Refusal("invalid_request", "unknown fixed Accounts recipe, scene, layout or side")
-            result["recipe"] = AccountsRecipe(request["scene"], request["layout"], request["side"], result["width"])
+                label = "Project-close" if request.get("recipe") == "project-close" else "Accounts"
+                raise Refusal("invalid_request", f"{label} recipe needs recipe, scene, layout, side and explicit width")
+            if request["recipe"] == "project-close":
+                if (request["scene"] not in PROJECT_CLOSE_SCENES
+                        or request["layout"] not in ("wide", "narrow") or request["side"] not in ("before", "after")):
+                    raise Refusal("invalid_request", "unknown fixed project-close scene, layout or side")
+                if result["width"] != PROJECT_CLOSE_WIDTHS[request["layout"]]:
+                    raise Refusal("invalid_request", "project-close needs width1600 for wide or width900 for narrow")
+                result["recipe"] = ProjectCloseRecipe(request["scene"], request["layout"], request["side"], result["width"])
+            else:
+                if (request["recipe"] != "accounts-quota" or request["scene"] not in ACCOUNTS_SCENES
+                        or request["layout"] not in ("wide", "narrow") or request["side"] not in ("before", "after")):
+                    raise Refusal("invalid_request", "unknown fixed Accounts recipe, scene, layout or side")
+                result["recipe"] = AccountsRecipe(request["scene"], request["layout"], request["side"], result["width"])
     elif op == "cli":
         args = request.get("args")
         if not isinstance(args, list) or not 1 <= len(args) <= MAX_ARGS:
@@ -482,12 +494,25 @@ class AccountsRecipe:
 
 
 @dataclass(frozen=True)
+class ProjectCloseRecipe:
+    scene: str
+    layout: str
+    side: str
+    width: int
+
+    @property
+    def root(self):
+        return Path("/tmp") / f"cagents-1937-native-{self.scene}-{self.layout}-{self.side}"
+
+
+@dataclass(frozen=True)
 class Layout:
     host: Host
     name: str
     checkout: Path
     zig_dir: Path
     accounts: AccountsRecipe = None
+    project_close: ProjectCloseRecipe = None
 
     @property
     def root_parts(self):
@@ -552,10 +577,14 @@ class Layout:
 
     @property
     def runtime_destination(self):
+        if self.project_close is not None:
+            return self.project_close.root
         return self.accounts.root if self.accounts is not None else self.host.runtime_dir
 
     @property
     def command_runtime(self):
+        if self.project_close is not None:
+            return self.project_close.root / "runtime"
         return self.accounts.root / "runtime" if self.accounts is not None else self.host.runtime_dir
 
     @property
@@ -732,6 +761,10 @@ def sandbox_env(layout):
     if layout.accounts is not None:
         environment.update({name: str(layout.accounts.root / child) for name, child in ACCOUNTS_XDG})
         environment["CAGENTS_DEVELOPMENT_ACCOUNT_FIXTURE"] = layout.accounts.scene
+    elif layout.project_close is not None:
+        environment["HOME"] = str(layout.project_close.root / "home")
+        environment.update({name: str(layout.project_close.root / child) for name, child in ACCOUNTS_XDG})
+        environment["CAGENTS_DEVELOPMENT_PROJECT_CLOSE_FIXTURE"] = layout.project_close.scene
     return environment
 
 
@@ -1218,7 +1251,10 @@ class Fixtures:
                 raise Refusal("too_many_fixtures", f"at most {MAX_LIVE_FIXTURES} fixtures can run at once")
             layout = self.layout_for(name, request["checkout"])
             if "recipe" in request:
-                layout = Layout(layout.host, layout.name, layout.checkout, layout.zig_dir, request["recipe"])
+                if isinstance(request["recipe"], ProjectCloseRecipe):
+                    layout = Layout(layout.host, layout.name, layout.checkout, layout.zig_dir, project_close=request["recipe"])
+                else:
+                    layout = Layout(layout.host, layout.name, layout.checkout, layout.zig_dir, request["recipe"])
             if os.path.lexists(layout.root):
                 raise Refusal("fixture_exists", f"run `scripts/native-fixture clear {name}` first")
             fixture = Fixture(layout, secrets.token_hex(16))
@@ -1248,6 +1284,11 @@ class Fixtures:
             result["recipe"] = {"name": "accounts-quota", "scene": layout.accounts.scene,
                                 "layout": layout.accounts.layout, "side": layout.accounts.side,
                                 "root": str(layout.accounts.root), "width": layout.accounts.width}
+        elif layout.project_close is not None:
+            result["fixture_home"] = str(layout.project_close.root / "home")
+            result["recipe"] = {"name": "project-close", "scene": layout.project_close.scene,
+                                "layout": layout.project_close.layout, "side": layout.project_close.side,
+                                "root": str(layout.project_close.root), "width": layout.project_close.width}
         return result
 
     def _create(self, fixture, width):
@@ -1260,6 +1301,8 @@ class Fixtures:
                                     "private_root_owned", ("niri", "state"))
             if layout.accounts is not None:
                 self._create_accounts_runtime(fixture)
+            elif layout.project_close is not None:
+                self._create_project_close_runtime(fixture)
             else:
                 self._create_owned_root(fixture, self.host.runtime_dir, (layout.runtime_name,), "runtime_root_owned")
             self._create_owned_root(fixture, repo, layout.root_parts, "repository_root_owned")
@@ -1322,6 +1365,11 @@ class Fixtures:
         """One new fixed namespace, backed by the original held runtime bind."""
         self._create_owned_root(fixture, self.host.runtime_dir, (fixture.layout.runtime_name,),
                                 "runtime_root_owned", tuple(child for _name, child in ACCOUNTS_XDG))
+
+    def _create_project_close_runtime(self, fixture):
+        """Six fixed children, after the same original exclusive runtime mkdir."""
+        self._create_owned_root(fixture, self.host.runtime_dir, (fixture.layout.runtime_name,),
+                                "runtime_root_owned", PROJECT_CLOSE_DIRECTORIES)
 
     def _create_owned_root(self, fixture, base, parts, ownership, children=()):
         """Exclusive creation for the three fixed internal fixture-root roles."""
@@ -1622,6 +1670,8 @@ class Fixtures:
     def viewport(self, fixture, request):
         if fixture.layout.accounts is not None and request["width"] != fixture.layout.accounts.width:
             raise Refusal("invalid_request", "a fixed Accounts layout needs its original width; start a fresh fixture to change it")
+        if fixture.layout.project_close is not None and request["width"] != fixture.layout.project_close.width:
+            raise Refusal("invalid_request", "a fixed project-close layout needs its original width; start a fresh fixture to change it")
         return self._apply_viewport(fixture, request["width"])
 
     def _in_sandbox(self, fixture, command, timeout=CLI_SECONDS):
@@ -1678,6 +1728,8 @@ class Fixtures:
     def _start_runner(self, fixture):
         if fixture.layout.accounts is not None and fixture.runner_attempted:
             raise Refusal("fixture_used", "Accounts recipe is single-use; stop it and create a fresh fixture")
+        if fixture.layout.project_close is not None and fixture.runner_attempted:
+            raise Refusal("fixture_used", "project-close recipe is single-use; stop it and create a fresh fixture")
         if self._runner_state(fixture) == "running":
             raise Refusal("runner_active", "the development runner is already running")
         layout = fixture.layout

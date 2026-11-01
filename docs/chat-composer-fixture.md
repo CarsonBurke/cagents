@@ -103,6 +103,101 @@ The optional behaviors below use `sandbox/home/.claude` under the root, which yo
 can write from your own shell. Also `move`, `key`, `scroll` and `observe`; see
 `scripts/native-fixture --help`.
 
+### Fixed project-close scenes
+
+The optional `project-close` recipe supplies only the PR1937 `edit`,
+`unchanged`, `reopen`, and `saving` scenes. Choose the scene, layout and source-side label
+at `start`, with all four recipe fields and an explicit width. Wide requires
+1600 and narrow requires 900; incompatible widths refuse before dispatch.
+The scene needs an actual native viewport of at least 900x600. A label or a
+requested width does not establish the reached viewport, height, scale or pixels;
+inspect the existing viewport report and native frames.
+
+```sh
+scripts/native-fixture start close-before --checkout "$before_checkout" \
+  --width 900 --recipe project-close --scene edit --layout narrow --side before
+scripts/native-fixture run-ui --owner "$owner" close-before
+```
+
+Use the owner returned by this start. The same original held private runtime
+bind is mounted at the literal
+`/tmp/cagents-1937-native-<edit|unchanged|reopen|saving>-<wide|narrow>-<before|after>`.
+It has exactly six original mode0700 children: `home`, `data`, `config`,
+`cache`, `state`, and `runtime`. HOME and all five XDG variables point to those
+children; the only scene selector is
+`CAGENTS_DEVELOPMENT_PROJECT_CLOSE_FIXTURE=<scene>`. The held nested Wayland
+socket is mounted at `runtime/nested-wayland`. No environment, root/prefix,
+argv, cwd, executable, source-head, clock or callback override is accepted.
+Cargo/Rustup/target/PATH/Zig/network/limits and the original caller/opaque
+authority policy remain unchanged. Ordinary and Accounts recipes retain their
+existing behavior.
+
+The original exclusive root-creation helper records ownership before any child
+is created. Existing roots or children are refused, never adopted, reset or
+cleared to make a start appear fresh. The consumer permits the reviewed
+prelaunch build contents in its private HOME/cache and the declared nested
+Wayland socket; it still refuses a consumed scene marker or an existing seed.
+Do not delete either or alter directory contents to force freshness. This
+recipe is single-use even when the original launch reply is lost. `viewport`
+can only re-fit the original width; use a fresh fixture to change a label or
+width. The existing original wait/host-stop/close uncertainty still retains
+ownership and can keep shutdown incomplete. These creation records do not
+prove ownership against arbitrary same-user changes.
+
+The source consumer seeds a private editor file at `<literal-root>/project/notes.txt`.
+After actual `PR1937_NATIVE` scene readiness, use the fixture's ordinary matched
+CLI to close that literal project. The fixture holds the original successful
+completion **after** its real cleanup/IPC work has finished. For `edit`, click
+the actual editor and type synthetic text only after the original callback is
+held; for `unchanged`, keep it clean; for `reopen`, use ordinary CLI project open
+for the same literal path and wait for the actual peer-reopen observation.
+Release that original callback only through the existing native `key ... F9`
+input with no modifiers; keep the editor focused for the edit comparison.
+There is no callback/release RPC or manufactured reducer message.
+
+For `saving`, first close the **clean** project and wait until that original
+successful callback is held after actual cleanup/IPC. Then use the mounted
+native editor to edit, perform ordinary Save, and use ordinary Undo to restore
+the baseline while the original save owner remains pending. This fixed source
+consumer has auto-save off. It retains only the original unpolled filesystem
+save Task, never the full App/runtime batch. Starting Save before the clean
+close admission exercises a refusal, not this delayed-callback scene.
+
+Use bare native F9 to deliver the original close callback once. Only after that
+callback has been consumed, use the existing `key ... F10` with no modifiers to
+release the **same** original save Task once. Neither key overrides captured
+events or establishes widget focus; verify actual native input and frames.
+The original result must pass the ordinary local Repository retention/guards
+and per-card branch (including the missing-card branch), with a matching
+same-dispatch acknowledgement before the shared postlude records observation.
+A raw result or later unrelated frame cannot provide that acknowledgement.
+Held, released-but-unobserved or refused/unknown work keeps the window-close
+fence. Errors remain errors; do not replay a callback or force cleanup. This
+carrier adds no writer fault, warning or recovery producer.
+Maintained runner stdout and stderr go to the original `ui.log`, not runner
+stdout. A receipt alone is not native input, rendered pixels, retirement or
+process-settlement evidence.
+
+Use separately bound reviewed Before and After fixture sources, fresh roots,
+matched executables and actual native captures; side labels do not check Git or
+ELF identity. An older checkout may ignore an unknown selector, so require the
+actual scene readiness receipt and independently bound consumer source instead
+of accepting an ordinary UI as the fixture. The intended comparison is late
+edit retention versus the old completed-callback retirement, with clean
+retirement and peer reopen as controls. The fourth scene carries the bounded
+original-unpolled-save consumer only; use separately bound reviewed G3 Before
+and After sources. It does not supply a writer fault, durability-warning or
+complete recovery flow, active-census hold, provider jobs or complete PR1937
+acceptance. Private editor data also does not establish runtime/protection-lock
+support or ordinary caller readiness for Save; those remain actual prerequisites.
+
+This is source preparation, not native or build admission. A genuine User must
+start a separately reviewed broker after stable resource/build admission. No
+helper/operator/display qualification, current runtime, native screenshots,
+independent UX, performance or cleanup outcome is supplied here. Existing
+per-process limits are not an aggregate memory cgroup, and this recipe does not
+change target/cache policy or permissions.
+
 ### Fixed Accounts scenes
 
 The optional `accounts-quota` recipe selects only these inert scenes:

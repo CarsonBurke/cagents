@@ -2569,6 +2569,446 @@ class AccountsContracts(TemporaryRepository):
             apply.assert_called_once_with(fixture, 480)
 
 
+class ProjectCloseContracts(unittest.TestCase):
+    """Fixed project-close carrier only; no broker entry point or native child.
+
+    This class deliberately inherits no existing contract TestCase. All paths
+    are private fixture data; descriptor/native operations are explicitly mocked.
+    It neither reads nor replaces the inherited environment or opaque authority.
+    """
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="nf-project-close-")
+        self.addCleanup(directory.cleanup)
+        self.base = Path(directory.name).resolve()
+        self.repo = self.base / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        self.checkout = self.repo / ".worktrees/wt"
+        (self.checkout / "scripts").mkdir(parents=True)
+        (self.checkout / "tests/fixtures").mkdir(parents=True)
+        (self.checkout / "scripts/run-development").write_text("#!/bin/sh\n")
+        (self.checkout / "tests/fixtures/chat-composer-claude.sh").write_text("#!/bin/sh\n")
+        (self.checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
+        self.host = broker.Host(
+            repo=self.repo, home=self.base / "home", runtime_dir=self.base / "runtime",
+            cargo_home=self.base / "cargo", rustup_home=self.base / "rustup",
+            mise_data=self.base / "mise", harness="synthetic-harness", niri="synthetic-niri",
+        )
+        self.manager = object.__new__(broker.Fixtures)
+        self.manager.host = self.host
+        self.manager.harness_env = {"SYNTHETIC_FIXTURE": "mock only; no child executes"}
+        self.manager.lock = threading.Lock()
+        self.manager.build_lock = threading.Lock()
+        self.manager.closing = False
+        self.manager.clearing = set()
+        self.manager.host_operations = []
+        self.manager.spawner = mock.Mock()
+        self.manager.spawner.close.return_value = []
+        self.manager.live = {}
+
+    def request(self, **changes):
+        return {"op": "start", "fixture": "project-close", "checkout": str(self.checkout),
+                "width": 900, "recipe": "project-close", "scene": "edit",
+                "layout": "narrow", "side": "before", **changes}
+
+    def fixture(self, **changes):
+        request = broker.validate_request(self.request(**changes), self.repo)
+        layout = broker.Layout(self.host, "project-close", self.checkout, self.base / "zig",
+                               project_close=request["recipe"])
+        fixture = broker.Fixture(layout, OWNER, width=request["width"])
+        fixture.channel = mock.Mock()
+        self.manager.live[layout.name] = fixture
+        return fixture
+
+    @staticmethod
+    def metadata(**changes):
+        return mock.Mock(**{"st_mode": stat.S_IFDIR | 0o700, "st_uid": 1000, **changes})
+
+    def test_all_sixteen_scenes_sides_and_native_compatible_widths_have_literal_roots(self):
+        self.assertEqual(broker.PROJECT_CLOSE_SCENES, ("edit", "unchanged", "reopen", "saving"))
+        self.assertEqual(broker.PROJECT_CLOSE_WIDTHS, {"wide": 1600, "narrow": 900})
+        roots = set()
+        for scene in ("edit", "unchanged", "reopen", "saving"):
+            for layout, width in (("wide", 1600), ("narrow", 900)):
+                for side in ("before", "after"):
+                    with self.subTest(scene=scene, layout=layout, side=side):
+                        request = broker.validate_request(self.request(scene=scene, layout=layout, side=side, width=width), self.repo)
+                        recipe = request["recipe"]
+                        self.assertIsInstance(recipe, broker.ProjectCloseRecipe)
+                        self.assertEqual((recipe.scene, recipe.layout, recipe.side, recipe.width),
+                                         (scene, layout, side, width))
+                        self.assertEqual(recipe.root, Path(f"/tmp/cagents-1937-native-{scene}-{layout}-{side}"))
+                        roots.add(recipe.root)
+        self.assertEqual(len(roots), 16)
+        longest = max(len(str(root)) for root in roots)
+        self.assertLess(longest + len("/runtime/cagents-development/cagentsd.sock") + 1, 108)
+        self.assertLess(longest + len("/runtime/nested-wayland") + 1, 108)
+
+    def test_partial_mixed_width_and_gateway_fields_refuse_before_dispatch(self):
+        requests = []
+        fields = ("recipe", "scene", "layout", "side")
+        for mask in range(1, 15):
+            request = self.request()
+            for index, field in enumerate(fields):
+                if not mask & (1 << index):
+                    del request[field]
+            requests.append(request)
+        missing = self.request()
+        del missing["width"]
+        requests.append(missing)
+        for field, value in (("scene", "claude-sparse"), ("recipe", "accounts-quota"),
+                             ("recipe", "other"), ("scene", "../edit"), ("scene", None),
+                             ("layout", "medium"), ("side", "live"), ("width", 480),
+                             ("width", 1600), ("width", True), ("width", 900.0)):
+            requests.append(self.request(**{field: value}))
+        requests.append(self.request(layout="wide", width=900))
+        for field in ("env", "environment", "root", "path", "prefix", "argv", "cwd",
+                      "executable", "head", "clock", "callback", "authority", "extra_args"):
+            requests.append(self.request(**{field: "not an interface"}))
+        for request in requests:
+            with self.subTest(request=request):
+                dispatch = mock.Mock()
+                response = broker.answer(json.dumps(request).encode(), self.repo, dispatch)
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["code"], "invalid_request")
+                dispatch.assert_not_called()
+
+    def test_client_literal_fields_roundtrip_without_a_new_transport(self):
+        tree = ast.parse(CLIENT.read_text())
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name in ("parse", "request_from")]
+        scenes = next(ast.literal_eval(node.value) for node in tree.body
+                      if isinstance(node, ast.Assign)
+                      and any(isinstance(name, ast.Name) and name.id == "ACCOUNTS_SCENES" for name in node.targets))
+        namespace = {"argparse": argparse, "Path": Path, "__doc__": "fixed input mock", "ACCOUNTS_SCENES": scenes}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), "<project-close-input-mock>", "exec"), namespace)
+        for scene in ("edit", "unchanged", "reopen", "saving"):
+            for layout, width in (("wide", 1600), ("narrow", 900)):
+                for side in ("before", "after"):
+                    args = ["start", "project-close", "--checkout", str(self.checkout),
+                            "--recipe", "project-close", "--scene", scene, "--layout", layout,
+                            "--side", side, "--width", str(width)]
+                    request = namespace["request_from"](namespace["parse"](args))
+                    self.assertEqual(request, self.request(scene=scene, layout=layout, side=side, width=width))
+                    self.assertIsInstance(broker.validate_request(request, self.repo)["recipe"], broker.ProjectCloseRecipe)
+        ordinary = namespace["request_from"](namespace["parse"](["start", "ordinary", "--checkout", str(self.checkout)]))
+        self.assertEqual(ordinary, {"op": "start", "fixture": "ordinary", "checkout": str(self.checkout)})
+        for flag in ("--env", "--root", "--argv", "--clock"):
+            with self.subTest(flag=flag), mock.patch.object(sys, "stderr", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    namespace["parse"](["start", "project-close", "--checkout", str(self.checkout), flag, "not an interface"])
+
+    def test_only_fixed_home_xdg_selector_and_socket_destinations_change(self):
+        profile = self.fixture().layout
+        ordinary = broker.Layout(self.host, profile.name, profile.checkout, profile.zig_dir)
+        binds = broker.Binds(11, 12, 13, 14, 15)
+        with mock.patch.object(broker, "git_common_dir", return_value=None), mock.patch.object(
+                Path, "is_symlink", return_value=False), mock.patch.object(Path, "is_dir", return_value=True):
+            previous = broker.sandbox_args(ordinary, binds)
+            current = broker.sandbox_args(profile, binds)
+        expected = list(previous)
+        for descriptor, destination in (("14", profile.project_close.root),
+                                        ("15", profile.project_close.root / "runtime/nested-wayland")):
+            index = next(i for i in range(len(expected) - 2) if expected[i:i + 2] == ["--bind-fd", descriptor])
+            expected[index + 2] = str(destination)
+        self.assertEqual(current, expected)
+        self.assertEqual(binds.fds(), (11, 12, 13, 14, 15))
+        old_env = broker.sandbox_env(ordinary)
+        expected_env = {**old_env, "HOME": str(profile.project_close.root / "home"),
+                        **{name: str(profile.project_close.root / child) for name, child in broker.ACCOUNTS_XDG},
+                        "CAGENTS_DEVELOPMENT_PROJECT_CLOSE_FIXTURE": "edit"}
+        self.assertEqual(broker.sandbox_env(profile), expected_env)
+        self.assertNotIn("CAGENTS_DEVELOPMENT_ACCOUNT_FIXTURE", expected_env)
+        self.assertEqual(broker.runner_command(profile), broker.runner_command(ordinary))
+        self.assertEqual(profile.runtime, self.host.runtime_dir / "nf-project-close")
+        self.assertEqual(profile.command_runtime, profile.project_close.root / "runtime")
+
+    def test_start_returns_literal_recipe_and_home_without_claiming_native_readiness(self):
+        ordinary = broker.Layout(self.host, "project-close", self.checkout, self.base / "zig")
+        seen = []
+        def create(fixture, width):
+            seen.append(fixture)
+            self.assertEqual(width, 900)
+            return {"matches": False, "requested_width": width}
+        with mock.patch.object(self.manager, "layout_for", return_value=ordinary), mock.patch.object(
+                self.manager, "_create", side_effect=create), mock.patch.object(broker.subprocess, "Popen") as child:
+            result = self.manager.start(broker.validate_request(self.request(), self.repo))
+        fixture, = seen
+        self.assertEqual(result["fixture_home"], "/tmp/cagents-1937-native-edit-narrow-before/home")
+        self.assertEqual(result["recipe"], {"name": "project-close", "scene": "edit", "layout": "narrow", "side": "before",
+                                          "root": "/tmp/cagents-1937-native-edit-narrow-before", "width": 900})
+        self.assertFalse(result["viewport"]["matches"])
+        self.assertIsNone(fixture.layout.accounts)
+        self.assertFalse(fixture.private_root_owned or fixture.runtime_root_owned or fixture.repository_root_owned)
+        child.assert_not_called()
+
+    def test_original_exclusive_runtime_root_precedes_all_six_literal_children(self):
+        fixture = self.fixture()
+        def mkdir(name, **_kwargs):
+            if name != "nf-project-close":
+                self.assertTrue(fixture.runtime_root_owned)
+        with mock.patch.object(broker.os, "geteuid", return_value=1000), mock.patch.object(
+                broker, "hold_directory", return_value=100), mock.patch.object(broker.os, "mkdir", side_effect=mkdir) as made, mock.patch.object(
+                broker.os, "open", side_effect=range(101, 108)) as opened, mock.patch.object(
+                broker.os, "fstat", side_effect=lambda _fd: self.metadata()), mock.patch.object(broker.os, "close") as close:
+            self.manager._create_project_close_runtime(fixture)
+        children = ("home", "data", "config", "cache", "state", "runtime")
+        self.assertEqual(broker.PROJECT_CLOSE_DIRECTORIES, children)
+        self.assertEqual(made.call_args_list, [mock.call("nf-project-close", mode=0o700, dir_fd=100)]
+                         + [mock.call(name, mode=0o700, dir_fd=101) for name in children])
+        self.assertEqual(opened.call_args_list, [mock.call("nf-project-close", broker.NO_FOLLOW_DIRECTORY, dir_fd=100)]
+                         + [mock.call(name, broker.NO_FOLLOW_DIRECTORY, dir_fd=101) for name in children])
+        self.assertEqual(close.call_args_list, [mock.call(value) for value in range(102, 108)] + [mock.call(101), mock.call(100)])
+        self.assertEqual(fixture.spawn_resources, {})
+        self.assertEqual(fixture.resource_errors, [])
+
+    def test_all_three_positive_root_roles_precede_native_dispatch(self):
+        fixture = self.fixture()
+        events = []
+        def owned(current, _base, _parts, role, children=()):
+            self.assertIs(current, fixture)
+            events.append((role, children))
+            setattr(current, role, True)
+        def provider(*_args, **_kwargs):
+            self.assertEqual(events, [("private_root_owned", ("niri", "state")),
+                                      ("runtime_root_owned", ("home", "data", "config", "cache", "state", "runtime")),
+                                      ("repository_root_owned", ())])
+        with mock.patch.object(self.manager, "_create_owned_root", side_effect=owned), mock.patch.object(
+                broker, "hold_directory", return_value=100), mock.patch.object(broker.os, "close"), mock.patch.object(
+                broker.os, "symlink", side_effect=provider), mock.patch.object(self.manager, "_host_focus", return_value=(None, set())), mock.patch.object(
+                self.manager, "_restore_host_focus"), mock.patch.object(self.manager, "harness", return_value=subprocess.CompletedProcess([], 0, b"", b"")), mock.patch.object(
+                self.manager, "_nested_session", return_value=("synthetic-wayland", "synthetic-socket")), mock.patch.object(
+                self.manager, "_spawn_holder") as holder, mock.patch.object(self.manager, "_in_sandbox", return_value={"exit_code": 0}), mock.patch.object(
+                self.manager, "_apply_viewport", return_value={"matches": True}):
+            self.assertEqual(self.manager._create(fixture, 900), {"matches": True})
+        holder.assert_called_once_with(fixture, "synthetic-wayland")
+        self.assertTrue(fixture.private_root_owned and fixture.runtime_root_owned and fixture.repository_root_owned)
+
+    def test_unowned_runtime_collision_preserves_its_sentinel_and_has_no_child(self):
+        self.host.runtime_dir.mkdir(mode=0o700)
+        runtime = self.host.runtime_dir / "nf-project-close"
+        runtime.mkdir(mode=0o700)
+        sentinel = runtime / "unowned-original"
+        sentinel.write_bytes(b"keep this original")
+        ordinary = broker.Layout(self.host, "project-close", self.checkout, self.base / "zig")
+        retained = []
+        def create(fixture, _width):
+            retained.append(fixture)
+            return self.manager._create_project_close_runtime(fixture)
+        with mock.patch.object(self.manager, "layout_for", return_value=ordinary), mock.patch.object(
+                self.manager, "_create", side_effect=create), mock.patch.object(broker, "remove_beneath", wraps=broker.remove_beneath) as remove, mock.patch.object(
+                self.manager, "harness") as harness, mock.patch.object(broker.subprocess, "Popen") as child:
+            with self.assertRaises(broker.Refusal) as caught:
+                self.manager.start(broker.validate_request(self.request(), self.repo))
+        self.assertEqual(caught.exception.code, "fixture_exists")
+        self.assertFalse(retained[0].runtime_root_owned)
+        self.assertEqual(sentinel.read_bytes(), b"keep this original")
+        self.assertNotIn(mock.call(self.host.runtime_dir, ("nf-project-close",)), remove.call_args_list)
+        self.assertEqual(self.manager.live, {})
+        harness.assert_not_called()
+        child.assert_not_called()
+
+    def test_bad_runtime_root_or_child_refuses_before_holder_or_provider(self):
+        for child in (False, True):
+            for bad in (self.metadata(st_uid=1001), self.metadata(st_mode=stat.S_IFDIR | 0o755),
+                        self.metadata(st_mode=stat.S_IFREG | 0o700), OSError("synthetic metadata refusal")):
+                with self.subTest(child=child, bad=bad):
+                    fixture = self.fixture()
+                    original = self.manager._create_owned_root
+                    def owned(current, base, parts, role, children=()):
+                        if role == "runtime_root_owned":
+                            return original(current, base, parts, role, children)
+                        setattr(current, role, True)  # Other root roles are explicitly synthetic here.
+                    metadata = [self.metadata(), bad] if child else [bad]
+                    with mock.patch.object(self.manager, "_create_owned_root", side_effect=owned), mock.patch.object(
+                            broker.os, "geteuid", return_value=1000), mock.patch.object(broker, "hold_directory", return_value=100), mock.patch.object(
+                            broker.os, "mkdir"), mock.patch.object(broker.os, "open", side_effect=range(101, 108)), mock.patch.object(
+                            broker.os, "fstat", side_effect=metadata), mock.patch.object(broker.os, "close"), mock.patch.object(
+                            broker.os, "symlink") as provider, mock.patch.object(self.manager, "_host_focus") as focus, mock.patch.object(
+                            self.manager, "harness") as harness, mock.patch.object(self.manager, "_spawn_holder") as holder:
+                        with self.assertRaises((broker.Refusal, OSError)):
+                            self.manager._create(fixture, 900)
+                    provider.assert_not_called()
+                    focus.assert_not_called()
+                    harness.assert_not_called()
+                    holder.assert_not_called()
+
+    def test_close_uncertainty_preserves_the_first_refusal_and_owned_fixture(self):
+        ordinary = broker.Layout(self.host, "project-close", self.checkout, self.base / "zig")
+        retained = []
+        def create(fixture, _width):
+            retained.append(fixture)
+            return self.manager._create_project_close_runtime(fixture)
+        with mock.patch.object(self.manager, "layout_for", return_value=ordinary), mock.patch.object(
+                self.manager, "_create", side_effect=create), mock.patch.object(broker.os.path, "lexists", return_value=False), mock.patch.object(
+                broker.os, "geteuid", return_value=1000), mock.patch.object(broker, "hold_directory", return_value=100), mock.patch.object(
+                broker.os, "mkdir"), mock.patch.object(broker.os, "open", side_effect=[101, 102]), mock.patch.object(
+                broker.os, "fstat", side_effect=[self.metadata(), self.metadata(st_uid=1001)]), mock.patch.object(
+                broker.os, "close", side_effect=[OSError("synthetic uncertain child close"), None, None]) as close, mock.patch.object(
+                broker, "remove_beneath") as remove, mock.patch.object(broker, "stopping"):
+            with self.assertRaises(broker.Refusal) as caught:
+                self.manager.start(broker.validate_request(self.request(), self.repo))
+        self.assertEqual(caught.exception.code, "invalid_fixture_roots")
+        fixture, = retained
+        self.assertTrue(fixture.runtime_root_owned)
+        self.assertIs(self.manager.live["project-close"], fixture)
+        self.assertTrue(fixture.resource_errors)
+        self.assertEqual(fixture.spawn_resources, {})
+        self.assertEqual(close.call_args_list, [mock.call(102), mock.call(101), mock.call(100)])
+        remove.assert_not_called()
+
+    def test_single_use_lost_ack_preserves_the_original_runner_argv_and_log(self):
+        for reply in ({"state": "running"}, {"state": "invalid"}, broker.Refusal("timeout", "synthetic lost ACK")):
+            with self.subTest(reply=reply):
+                fixture = self.fixture()
+                fixture.channel.call.side_effect = [{"state": "not_started"}, reply]
+                if isinstance(reply, broker.Refusal) or reply["state"] != "running":
+                    with self.assertRaises(broker.Refusal):
+                        self.manager.run_ui(fixture, {})
+                else:
+                    self.manager.run_ui(fixture, {})
+                self.assertTrue(fixture.runner_attempted)
+                self.assertEqual(fixture.runner_started, isinstance(reply, dict) and reply["state"] == "running")
+                self.assertEqual(fixture.runner_attempt, 1)
+                calls = list(fixture.channel.call.call_args_list)
+                launch = calls[-1].args[0]
+                self.assertEqual(launch["argv"], broker.runner_command(fixture.layout))
+                self.assertEqual(launch["log"], str(fixture.runner_log))
+                self.assertEqual(launch["background"], "runner")
+                with self.assertRaises(broker.Refusal) as caught:
+                    self.manager.run_ui(fixture, {})
+                self.assertEqual(caught.exception.code, "fixture_used")
+                self.assertEqual(fixture.channel.call.call_args_list, calls)
+                self.assertEqual(fixture.runner_attempt, 1)
+
+    def test_viewport_can_only_refit_the_original_fixed_layout_width(self):
+        for layout, width, other in (("wide", 1600, 900), ("narrow", 900, 1600)):
+            with self.subTest(layout=layout):
+                fixture = self.fixture(layout=layout, width=width)
+                with mock.patch.object(self.manager, "_apply_viewport", return_value={"matches": False}) as apply:
+                    self.assertEqual(self.manager.viewport(fixture, {"width": width}), {"matches": False})
+                    apply.assert_called_once_with(fixture, width)
+                    with self.assertRaises(broker.Refusal) as caught:
+                        self.manager.viewport(fixture, {"width": other})
+                    self.assertEqual(caught.exception.code, "invalid_request")
+                    apply.assert_called_once_with(fixture, width)
+
+    def test_saving_changes_only_fixed_private_namespace_selector_and_original_socket_mount(self):
+        for layout, width in (("wide", 1600), ("narrow", 900)):
+            for side in ("before", "after"):
+                with self.subTest(layout=layout, side=side):
+                    fixture = self.fixture(scene="saving", layout=layout, side=side, width=width)
+                    profile = fixture.layout
+                    root = Path(f"/tmp/cagents-1937-native-saving-{layout}-{side}")
+                    self.assertEqual(profile.project_close.root, root)
+                    ordinary = broker.Layout(self.host, profile.name, profile.checkout, profile.zig_dir)
+                    binds = broker.Binds(11, 12, 13, 14, 15)
+                    with mock.patch.object(broker, "git_common_dir", return_value=None), mock.patch.object(
+                            Path, "is_symlink", return_value=False), mock.patch.object(Path, "is_dir", return_value=True):
+                        previous = broker.sandbox_args(ordinary, binds)
+                        current = broker.sandbox_args(profile, binds)
+                    expected = list(previous)
+                    for descriptor, destination in (("14", root), ("15", root / "runtime/nested-wayland")):
+                        index = next(i for i in range(len(expected) - 2)
+                                     if expected[i:i + 2] == ["--bind-fd", descriptor])
+                        expected[index + 2] = str(destination)
+                    self.assertEqual(current, expected)
+                    self.assertEqual(binds.fds(), (11, 12, 13, 14, 15))
+                    previous_env = broker.sandbox_env(ordinary)
+                    expected_env = {**previous_env, "HOME": str(root / "home"),
+                                    **{name: str(root / child) for name, child in broker.ACCOUNTS_XDG},
+                                    "CAGENTS_DEVELOPMENT_PROJECT_CLOSE_FIXTURE": "saving"}
+                    self.assertEqual(broker.sandbox_env(profile), expected_env)
+                    self.assertNotIn("CAGENTS_DEVELOPMENT_ACCOUNT_FIXTURE", expected_env)
+                    self.assertEqual(profile.command_runtime, root / "runtime")
+                    self.assertEqual(broker.runner_command(profile), broker.runner_command(ordinary))
+                    # All original root/descriptor effects are mocked. Verify
+                    # ownership is recorded BEFORE any of the six children.
+                    def mkdir(name, **_kwargs):
+                        if name != "nf-project-close":
+                            self.assertTrue(fixture.runtime_root_owned)
+                    with mock.patch.object(broker.os, "geteuid", return_value=1000), mock.patch.object(
+                            broker, "hold_directory", return_value=100), mock.patch.object(
+                            broker.os, "mkdir", side_effect=mkdir) as made, mock.patch.object(
+                            broker.os, "open", side_effect=range(101, 108)), mock.patch.object(
+                            broker.os, "fstat", side_effect=lambda _fd: self.metadata()), mock.patch.object(
+                            broker.os, "close") as close, mock.patch.object(broker.subprocess, "Popen") as child, mock.patch.object(
+                            self.manager, "harness") as harness:
+                        self.manager._create_project_close_runtime(fixture)
+                    children = ("home", "data", "config", "cache", "state", "runtime")
+                    self.assertEqual(made.call_args_list, [mock.call("nf-project-close", mode=0o700, dir_fd=100)]
+                                     + [mock.call(name, mode=0o700, dir_fd=101) for name in children])
+                    self.assertEqual(close.call_args_list, [mock.call(value) for value in range(102, 108)]
+                                     + [mock.call(101), mock.call(100)])
+                    self.assertTrue(fixture.runtime_root_owned)
+                    self.assertFalse(fixture.private_root_owned or fixture.repository_root_owned)
+                    self.assertEqual(fixture.spawn_resources, {})
+                    self.assertEqual(fixture.resource_errors, [])
+                    child.assert_not_called()
+                    harness.assert_not_called()
+
+    def test_saving_uses_existing_key_requests_and_preserves_one_use_width_refusals(self):
+        tree = ast.parse(CLIENT.read_text())
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name in ("parse", "request_from")]
+        self.assertEqual([node.name for node in functions], ["parse", "request_from"])
+        scenes = next(ast.literal_eval(node.value) for node in tree.body
+                      if isinstance(node, ast.Assign)
+                      and any(isinstance(name, ast.Name) and name.id == "ACCOUNTS_SCENES" for name in node.targets))
+        namespace = {"argparse": argparse, "Path": Path, "__doc__": "fixed input mock", "ACCOUNTS_SCENES": scenes}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), "<saving-input-mock>", "exec"), namespace)
+        for key in ("F9", "F10"):
+            request = namespace["request_from"](namespace["parse"](
+                ["key", "project-close", "--owner", OWNER, key]))
+            self.assertEqual(request, {"op": "input", "fixture": "project-close", "owner": OWNER,
+                                       "action": "key", "chords": [key]})
+            valid = broker.validate_request(request, self.repo)
+            self.assertEqual(broker.input_argv(valid), ["key", "--", key])
+        for changes in ({"recipe": "accounts-quota", "scene": "saving"}, {"scene": "Saving"},
+                        {"scene": "../saving"}, {"scene": "save"}, {"env": "not an interface"}):
+            dispatch = mock.Mock()
+            response = broker.answer(json.dumps(self.request(**changes)).encode(), self.repo, dispatch)
+            self.assertFalse(response["ok"])
+            self.assertEqual(response["code"], "invalid_request")
+            dispatch.assert_not_called()
+        # Original channel/runner methods, with every child/native seam mocked:
+        # lost ACK still consumes this one-use fixture and retains its identity.
+        for reply in ({"state": "running"}, {"state": "invalid"}, broker.Refusal("timeout", "synthetic lost saving ACK")):
+            with self.subTest(reply=reply):
+                fixture = self.fixture(scene="saving")
+                fixture.channel.call.side_effect = [{"state": "not_started"}, reply]
+                with mock.patch.object(broker.subprocess, "Popen") as child, mock.patch.object(self.manager, "harness") as harness:
+                    if isinstance(reply, broker.Refusal) or reply["state"] != "running":
+                        with self.assertRaises(broker.Refusal):
+                            self.manager.run_ui(fixture, {})
+                    else:
+                        self.manager.run_ui(fixture, {})
+                    self.assertTrue(fixture.runner_attempted)
+                    self.assertEqual(fixture.runner_started, isinstance(reply, dict) and reply["state"] == "running")
+                    self.assertEqual(fixture.runner_attempt, 1)
+                    self.assertIs(self.manager.live["project-close"], fixture)
+                    calls = list(fixture.channel.call.call_args_list)
+                    launch = calls[-1].args[0]
+                    self.assertEqual(launch, {"argv": broker.runner_command(fixture.layout),
+                                              "cwd": str(fixture.layout.checkout),
+                                              "env": broker.sandbox_env(fixture.layout),
+                                              "background": "runner", "log": str(fixture.runner_log)})
+                    with self.assertRaises(broker.Refusal) as caught:
+                        self.manager.run_ui(fixture, {})
+                    self.assertEqual(caught.exception.code, "fixture_used")
+                    self.assertEqual(fixture.channel.call.call_args_list, calls)
+                    self.assertEqual(fixture.runner_attempt, 1)
+                    with mock.patch.object(self.manager, "_apply_viewport") as apply:
+                        with self.assertRaises(broker.Refusal) as caught:
+                            self.manager.viewport(fixture, {"width": 1600})
+                        self.assertEqual(caught.exception.code, "invalid_request")
+                        apply.assert_not_called()
+                    self.assertIs(self.manager.live["project-close"], fixture)
+                    child.assert_not_called()
+                    harness.assert_not_called()
+
+
+
 class RootCustodyContracts(TemporaryRepository):
     """Actual start/create/discard flow with private files and native seams mocked.
 
