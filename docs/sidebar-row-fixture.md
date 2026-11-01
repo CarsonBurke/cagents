@@ -16,6 +16,16 @@ separately. Do not reuse the older sidebar harness branches or their evidence.
 The separate `da517` to `8ca` component comparison explains popup identity; it
 does not replace this whole-feature comparison.
 
+Common startup-isolation provenance is 066's frozen, independently reviewed
+`af224df26e92f331812afddf2d762e97d2c8ee59`. Only its `src/app.rs` and
+`src/bin/cagents-ui.rs` changes are reused: the predicate is consistently named
+`native_validation_fixture_enabled`, leaf calls target `sidebar_fixture`, and
+the chronology-only Tick enum and no-op match hunks are omitted. There is no
+chat-client fixture or combined dispatcher. Both qualification branches have
+identical startup files and identical latched fixture selection. Ordinary
+production startup follows its original guards. This provenance transfers
+source structure, not another lane's compile, native or operator evidence.
+
 The source step has not built or launched these qualification heads. Cargo,
 native input, display probes, helpers, screenshots, deletion execution, and
 native UX review are all unrun. Source review cannot supply those results.
