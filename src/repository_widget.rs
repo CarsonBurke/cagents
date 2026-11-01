@@ -10626,7 +10626,9 @@ fn diff_surface<'a>(
     }
     match &runtime.basis_resolution {
         Some(BasisResolution::Resolving(_)) => loading(),
-        Some(BasisResolution::NeedsBase(candidates)) => base_choice_view(card, candidates),
+        Some(BasisResolution::NeedsBase(candidates)) => {
+            base_choice_view(card, &runtime.descriptor, candidates)
+        }
         Some(BasisResolution::NoCommits) => information_state(
             "Comparison unavailable",
             "This branch has no commits yet, so there is nothing to compare.",
@@ -10737,6 +10739,7 @@ fn no_text_view_height(
 /// name is never guessed: the refs that could serve are offered instead.
 fn base_choice_view(
     card: CardId,
+    descriptor: &RepositoryView,
     candidates: &[ValidatedRefName],
 ) -> Element<'static, RepositoryAction> {
     let mut rows: Vec<Element<'static, RepositoryAction>> = vec![
@@ -10762,13 +10765,20 @@ fn base_choice_view(
             .collect();
         let refs = candidates.to_vec();
         rows.push(
-            crate::ui_controls::field::select(labels, None, move |index| {
-                // The dropdown reports an index into the very list it was given.
-                RepositoryAction::SelectBranchBase {
-                    card,
-                    base_ref: refs[index].clone(),
-                }
-            })
+            crate::ui_controls::field::select(
+                "Branch comparison base",
+                format!("repository.{card:?}.{:?}.branch-base", descriptor.worktree),
+                format!("{descriptor:?}:{refs:?}"),
+                labels,
+                None,
+                move |index| {
+                    // The dropdown reports an index into the very list it was given.
+                    RepositoryAction::SelectBranchBase {
+                        card,
+                        base_ref: refs[index].clone(),
+                    }
+                },
+            )
             .into(),
         );
     }
@@ -12293,6 +12303,55 @@ fn information_state_height<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn branch_base_dropdown_retires_same_card_same_refs_for_another_worktree() {
+        use cosmic::iced::advanced::{layout, widget::Tree};
+        use cosmic::iced::{Size, mouse};
+        use iced_accessibility::accesskit::{NodeId, Role};
+        let renderer = headless_renderer();
+        let card = CardId::new();
+        let first = RepositoryView {
+            project: ProjectId::new(),
+            repository: "/private/repository".into(),
+            worktree: "/private/worktree-a".into(),
+            selected_file: Some("notes.txt".into()),
+        };
+        let mut second = first.clone();
+        second.worktree = "/private/worktree-b".into();
+        let candidates = vec![ValidatedRefName::parse("refs/heads/main").unwrap()];
+        let mut before = base_choice_view(card, &first, &candidates);
+        let mut tree = Tree::new(before.as_widget());
+        tree.diff(before.as_widget_mut());
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0));
+        let node = before.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let nodes =
+            before
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let dropdown_id = |nodes: &iced_accessibility::A11yTree| {
+            let node = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| node.node().role() == Role::ComboBox)
+                .expect("actual branch-base dropdown exported");
+            NodeId::from(node.id().clone())
+        };
+        let old = dropdown_id(&nodes);
+        let mut after = base_choice_view(card, &second, &candidates);
+        tree.diff(after.as_widget_mut());
+        let node = after.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let nodes =
+            after
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        assert_ne!(
+            dropdown_id(&nodes),
+            old,
+            "identical ref names do not authorize an old root in a replacement worktree"
+        );
+    }
+
     use super::retained_save_tests::Checkout;
     /// Only Save-owning tests use this physical read fixture. The returned
     /// Checkout owns the original checkout and its recovery parent throughout every lazy Task lifetime.
