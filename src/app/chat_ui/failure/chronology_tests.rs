@@ -1073,3 +1073,81 @@ fn legacy_counter_and_changed_text_never_replace_an_unrelated_receipt() {
         2
     );
 }
+
+#[test]
+fn retained_unscoped_deferred_receipt_never_borrows_a_later_turns_tail() {
+    let provider = Provider::Codex;
+    let raw = "History page failed before the next turn";
+    let (mut runtime, handle) = live_fixture(
+        provider,
+        vec![text("earlier/input/0", chat::Role::User, "Earlier page")],
+    );
+    publish(&mut runtime, &handle, |next| {
+        next.has_later = true;
+        next.turn_generation = 1;
+        next.error_generation = 1;
+        next.error = Some(raw.into());
+        next.error_item = None;
+    });
+    let key = runtime.unplaced_failures[0].unresolved_key();
+    publish(&mut runtime, &handle, |next| {
+        // A retained history failure can survive TurnStarted without another
+        // error receipt. Its identity does not locate it after this new work.
+        next.has_later = false;
+        next.turn_generation = 2;
+        next.items = vec![
+            Arc::new(text("later/input/0", chat::Role::User, "Later request")),
+            Arc::new(text(
+                "later-answer",
+                chat::Role::Assistant,
+                "Later resumed work.",
+            )),
+        ];
+    });
+    assert!(runtime.unplaced_failures.is_empty());
+    assert_eq!(runtime.failures.len(), 1);
+    assert_eq!(runtime.failures[0].error_generation, Some(1));
+    assert_eq!(runtime.failures[0].turn_generation, 1);
+    assert!(runtime.failures[0].after.is_none());
+    assert!(runtime.failures[0].message.is_none());
+    assert_eq!(runtime.failures[0].event_key.as_deref(), Some(key.as_str()));
+    assert_eq!(runtime.failure_ui.incidents.len(), 1);
+    assert!(runtime.failure_ui.incidents[0].anchor.is_none());
+    let blocks = catalog(&mut runtime);
+    assert!(failure_position(&blocks, &key) < prompt_position(&blocks, "later/input/0"));
+
+    // Exact source proof may arrive after the turn changes. It resolves the
+    // original receipt instead of minting a later incident or losing Details.
+    publish(&mut runtime, &handle, |next| {
+        next.items.splice(
+            0..0,
+            [
+                Arc::new(text(
+                    "original/input/0",
+                    chat::Role::User,
+                    "Original request",
+                )),
+                Arc::new(provider_error(provider, "original-failure", raw)),
+            ],
+        );
+        next.error_item = Some("original-failure".into());
+    });
+    assert_eq!(runtime.failures.len(), 1);
+    assert_eq!(
+        runtime.failures[0].after.as_deref(),
+        Some("original-failure")
+    );
+    assert_eq!(
+        runtime.failures[0].message.as_deref(),
+        Some("original/input/0")
+    );
+    assert_eq!(runtime.failures[0].event_key.as_deref(), Some(key.as_str()));
+    assert_eq!(
+        runtime.failure_ui.item("original-failure").unwrap().key,
+        key
+    );
+    assert!(runtime.failure_ui.expanded.contains(&key));
+    assert_eq!(runtime.failure_details(&key).as_deref(), Some(raw));
+    let blocks = catalog(&mut runtime);
+    assert!(failure_position(&blocks, &key) < prompt_position(&blocks, "later/input/0"));
+}

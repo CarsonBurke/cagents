@@ -63,6 +63,8 @@ impl Deferred {
 
     pub fn matches_snapshot(&self, snapshot: &Snapshot) -> bool {
         self.error_generation == Some(snapshot.error_generation)
+            // Receipt identity alone cannot place an unscoped failure after
+            // another turn's work. Explicit source enrichment is independent.
             && self.turn_generation == snapshot.turn_generation
             && snapshot.error.as_deref() == Some(self.text.as_str())
     }
@@ -1974,7 +1976,8 @@ mod tests {
         publish_error(&mut runtime, &handle, raw);
         let first_note = runtime.failures[0].clone();
 
-        // A changed error after B joins the same visual turn must not replace A.
+        // A's retained diagnostic ends its group before B. B's changed error
+        // belongs to B and must not replace A's historical warning.
         publish(&mut runtime, &handle, |next| {
             next.items.push(Arc::new(text(
                 &part(provider, b, 0),
@@ -1987,7 +1990,30 @@ mod tests {
                 "Synthetic verification failure",
             ));
         });
-        assert_eq!(runtime.turns.len(), 1);
+        assert_eq!(runtime.turns.len(), 2);
+        assert_eq!(runtime.turns[0].key, part(provider, a, 0));
+        assert_eq!(runtime.turns[1].key, part(provider, b, 0));
+        let first_key = first_note.event_key.clone().unwrap();
+        let first_incident = runtime
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.key == first_key)
+            .unwrap();
+        assert_eq!(
+            first_incident.anchor.as_deref(),
+            Some(runtime.turns[0].key.as_str())
+        );
+        assert!(!first_incident.active_recovery);
+        assert_eq!(
+            runtime
+                .failure_ui
+                .incidents
+                .iter()
+                .filter(|incident| incident.active_recovery)
+                .count(),
+            1
+        );
         assert_eq!(runtime.failures.len(), 2);
         assert_eq!(runtime.failures[0], first_note);
         let active = |runtime: &Runtime, index: usize| {
@@ -2005,11 +2031,24 @@ mod tests {
         assert!(active(&runtime, 1));
         runtime.note(runtime.failures[1].text.clone());
         assert_eq!(runtime.failures.len(), 2);
+        assert_eq!(
+            runtime
+                .failure_ui
+                .incidents
+                .iter()
+                .filter(|incident| incident.active_recovery)
+                .count(),
+            1
+        );
 
         publish(&mut runtime, &handle, |next| {
             next.error = None;
             next.busy = false;
         });
         assert_eq!(runtime.failures, vec![first_note]);
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(runtime.failure_ui.incidents[0].key, first_key);
+        assert!(!runtime.failure_ui.incidents[0].active_recovery);
+        assert_eq!(runtime.failure_details(&first_key).as_deref(), Some(raw));
     }
 }
