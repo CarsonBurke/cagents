@@ -29,8 +29,10 @@ class FakePorts:
         self.prepare_error = self.spawn_error = None
         self.outputs_reply = {"Outputs": {"fake-owned-output": {}}}
         self.record_error = False
+        self.publish_error = False
         self.pause_count = 0
         self.records = []
+        self.persisted = []
 
     def prepare(self):
         self.events.append("prepare")
@@ -96,10 +98,19 @@ class FakePorts:
         self.events.append("close-after-wait")
 
     def record(self, state):
-        if self.record_error and state["cleanup_complete"]:
+        carrier.record_observation(state, self)
+
+    def persist_state(self, observation):
+        if self.record_error and observation["cleanup_complete"]:
             self.record_error = False
             raise OSError("fake evidence failure")
-        self.records.append(dict(state))
+        self.persisted.append(dict(observation))
+
+    def publish_state(self, observation):
+        if self.publish_error and observation["cleanup_complete"]:
+            self.publish_error = False
+            raise OSError("fake original-stream failure")
+        self.records.append(dict(observation))
 
     def pause(self):
         self.pause_count += 1
@@ -261,6 +272,37 @@ class CustodyContracts(unittest.TestCase):
         self.assertEqual(owner.state["phase"], "HOLD")
         self.assertFalse(owner.state["cleanup_complete"])
         self.assertIsNone(owner.state["exit_code"])
+        self.assertTrue(owner.state["owned_close_complete"])
+        self.assertTrue(owner.state["child_wait_complete"])
+        self.assertEqual(ports.events.count("close-after-wait"), 1)
+        self.assertFalse(any(record["cleanup_complete"] for record in ports.records))
+        self.assertFalse(any(record["cleanup_complete"] for record in ports.persisted))
+        owner.turn()
+        self.assertEqual(ports.events.count("close-after-wait"), 1)
+        self.assertTrue(ports.records[-1]["owned_close_complete"])
+        self.assertFalse(ports.records[-1]["cleanup_complete"])
+
+    def test_stream_failure_after_persistence_never_publishes_terminal_success(self):
+        ports = FakePorts()
+        ports.publish_error = True
+        owner = carrier.Carrier(ports)
+        owner.start()
+        for _ in range(3):
+            owner.turn()
+        self.assertEqual(owner.state["phase"], "HOLD")
+        self.assertTrue(owner.state["owned_close_complete"])
+        self.assertTrue(owner.state["child_wait_complete"])
+        self.assertIsNone(owner.state["exit_code"])
+        self.assertFalse(any(record["cleanup_complete"] for record in ports.records))
+        candidate = ports.persisted[-1]
+        self.assertTrue(candidate["owned_close_complete"])
+        self.assertEqual(candidate["proposed_exit_code"], 0)
+        self.assertFalse(candidate["terminal_return_confirmed"])
+        self.assertNotIn("exit_code", candidate)
+        owner.turn()
+        self.assertEqual(ports.events.count("close-after-wait"), 1)
+        self.assertEqual(ports.records[-1]["phase"], "HOLD")
+        self.assertFalse(ports.records[-1]["terminal_return_confirmed"])
 
     def test_prepare_refusal_returns_recorded_negative_without_spawn(self):
         ports = FakePorts()
@@ -271,7 +313,9 @@ class CustodyContracts(unittest.TestCase):
         self.assertTrue(owner.state["pre_spawn_refused"])
         self.assertIsNone(owner.child)
         self.assertFalse(owner.state["child_wait_complete"])
-        self.assertEqual(ports.records[-1]["exit_code"], 2)
+        self.assertEqual(ports.records[-1]["proposed_exit_code"], 2)
+        self.assertFalse(ports.records[-1]["terminal_return_confirmed"])
+        self.assertEqual(ports.persisted, [])
 
     def test_spawn_uncertainty_cannot_be_promoted_to_no_child_refusal(self):
         ports = FakePorts()
@@ -287,7 +331,7 @@ class CustodyContracts(unittest.TestCase):
     def test_no_spawn_refusal_stays_negative_if_diagnostic_write_fails(self):
         ports = FakePorts()
         ports.prepare_error = OSError("fake private preparation refusal")
-        ports.record_error = True
+        ports.publish_error = True
         owner = carrier.Carrier(ports)
         self.assertEqual(owner.run(), 2)
         self.assertEqual(ports.events, ["prepare"])

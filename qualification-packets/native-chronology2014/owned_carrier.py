@@ -51,6 +51,16 @@ def one_output(response):
     return outputs
 
 
+def record_observation(state, output):
+    """Persist before publishing; neither observation is a terminal return."""
+    observation = dict(state)
+    observation["proposed_exit_code"] = observation.pop("exit_code")
+    observation["terminal_return_confirmed"] = False
+    if not state["pre_spawn_refused"]:
+        output.persist_state(observation)
+    output.publish_state(observation)
+
+
 class MissingAck(Exception):
     pass
 
@@ -98,7 +108,8 @@ class Carrier:
             runner_released=False, runner_status=None, native_status=None,
             quit_attempted=False, quit_ack="not-attempted", child_wait_complete=False,
             child_status=None, cancelled=False, blocked=False, errors=[],
-            cleanup_complete=False, exit_code=None, pre_spawn_refused=False,
+            cleanup_complete=False, owned_close_complete=False,
+            exit_code=None, pre_spawn_refused=False,
         )
 
     def hold(self, where, error):
@@ -186,6 +197,7 @@ class Carrier:
             self.state["phase"] = "waiting-original-niri"
             if self.state["child_wait_complete"]:
                 self.ports.close_owned(self.peer, self.pin)
+                self.state["owned_close_complete"] = True  # Irreversible fact.
                 negative = (self.state["cancelled"]
                             or self.state["quit_ack"] != "acknowledged"
                             or self.state["child_status"] != 0)
@@ -412,15 +424,18 @@ printf %s "$?" > {CASE}/niri/session.rc
             output.close()
 
     def record(self, state):
-        print(json.dumps(state), flush=True)  # Original outer stream also sees HOLD.
-        if state["pre_spawn_refused"]:
-            return  # No child exists; private preparation may itself have failed.
+        record_observation(state, self)
+
+    def persist_state(self, observation):
         path = CASE / "carrier/state.json"
         temporary = CASE / "carrier/.state-next"
         with temporary.open("w", encoding="utf-8") as stream:
-            json.dump(state, stream, indent=2)
+            json.dump(observation, stream, indent=2)
             stream.write("\n")
         temporary.replace(path)
+
+    def publish_state(self, observation):
+        print(json.dumps(observation), flush=True)  # Original stream sees HOLD too.
 
     def pause(self):
         time.sleep(0.2)  # Next tick observes retained originals, not a blind HOLD.
