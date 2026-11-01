@@ -347,7 +347,7 @@ mod tests {
         let mut replacement = crate::workspace_model::WorkspaceModel::default();
         replacement.identity = uuid::Uuid::new_v4();
         drop(app.apply_workspace_model_update(
-            crate::app::workspace_model_sync::ModelUpdate::Connected(replacement),
+            crate::app::workspace_model_sync::ModelUpdate::connected_fixture(replacement),
         ));
         assert!(!runtime(&app, target).closed_elsewhere);
         assert!(!app.chat_closed_elsewhere(target.card));

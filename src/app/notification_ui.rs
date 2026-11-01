@@ -3201,6 +3201,9 @@ mod tests {
                     Arc::make_mut(&mut app.durable).workspace_model_identity =
                         Some(app.workspace_model.identity);
                     let mut model = std::mem::take(&mut app.workspace_model);
+                    if !connected {
+                        app.workspace_model.identity = model.identity;
+                    }
                     let mut snapshot = attention_snapshot(session);
                     // A cold, already-completed source need not emit another runtime
                     // activity transition or another identical broker snapshot.
@@ -3225,7 +3228,7 @@ mod tests {
                         };
                     }
                     let update = if connected {
-                        ModelUpdate::Connected(model)
+                        ModelUpdate::connected_fixture(model)
                     } else {
                         ModelUpdate::Read(model)
                     };
