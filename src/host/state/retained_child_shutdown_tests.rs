@@ -466,6 +466,34 @@ fn retained_original_child_refuses_empty_control_until_exact_reap() {
 }
 
 #[test]
+fn retained_original_refuses_parent_upgrade_but_not_an_isolated_upgrade_consumer() {
+    const NAME: &str = "host::state::retained_child_shutdown_tests::retained_original_refuses_parent_upgrade_but_not_an_isolated_upgrade_consumer";
+    const CONSUMER: &str =
+        "host::state::tests::committed_upgrade_fences_control_and_retains_checkpoint_until_close";
+    let Some(root) = private_runtime(NAME) else {
+        return;
+    };
+    let host = host();
+    let capability = preflight(&host);
+    let reservation = child_reaper::reserve().unwrap();
+    let mut original = Original::spawn(&root);
+    original.retain(reservation);
+    original.assert_live();
+    refuse_all(&host, &capability);
+
+    // Keep the original stdin and pidfd throughout the synchronous child run.
+    // Its exact existing consumer must complete prepare/commit using a fresh
+    // reaper, while this producer's global custody keeps parent admission blocked.
+    super::tests::run_upgrade_fixture_in_fresh_process(CONSUMER);
+
+    original.assert_live();
+    refuse_all(&host, &capability);
+    original.finish();
+    assert!(!child_reaper::has_outstanding_ownership());
+    accepted_empty_stop(&host);
+}
+
+#[test]
 fn quarantined_and_suspended_originals_keep_the_empty_inventory_refused() {
     const NAME: &str = "host::state::retained_child_shutdown_tests::quarantined_and_suspended_originals_keep_the_empty_inventory_refused";
     let Some(root) = private_runtime(NAME) else {

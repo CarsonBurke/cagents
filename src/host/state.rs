@@ -6299,102 +6299,109 @@ for line in sys.stdin:
         restored_handle.close().unwrap();
     }
 
+    const UPGRADE_FIXTURE_SELECTOR_ENV: &str = "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR";
+
     pub(in crate::host) fn upgrade_fixture_in_fresh_process() -> bool {
         // Capability validation consults process-global retained child custody.
         // These upgrade fixtures need a fresh service, not another test's
         // legitimate retained ownership. Preserve the caller's environment.
-        const SELECTOR_ENV: &str = "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR";
         let current = std::thread::current();
         let selector = current.name().expect("named test thread");
-        match std::env::var_os(SELECTOR_ENV) {
+        match std::env::var_os(UPGRADE_FIXTURE_SELECTOR_ENV) {
             Some(value) => {
                 assert_eq!(value, selector, "unexpected fixture selector");
                 true
             }
             None => {
-                struct OriginalChild(std::process::Child);
-                impl Drop for OriginalChild {
-                    fn drop(&mut self) {
-                        let _ = self.0.kill();
-                        let _ = self.0.wait();
-                    }
-                }
-                let mut output = tempfile::tempdir().unwrap();
-                output.disable_cleanup(true);
-                eprintln!("Upgrade fixture output: {}", output.path().display());
-                let mut runtime = tempfile::Builder::new()
-                    .prefix("cagents-upgrade-runtime-")
-                    .tempdir()
-                    .unwrap();
-                // Child exit alone does not establish descendant settlement.
-                runtime.disable_cleanup(true);
-                let runtime_path = runtime.path().canonicalize().unwrap();
-                crate::secure_file::prepare_private_directory(&runtime_path).unwrap();
-                eprintln!("Upgrade fixture runtime: {}", runtime_path.display());
-                let stdout_path = output.path().join("stdout");
-                let stderr_path = output.path().join("stderr");
-                let mut child = OriginalChild(
-                    std::process::Command::new(std::env::current_exe().unwrap())
-                        .args([
-                            "--exact",
-                            selector,
-                            "--nocapture",
-                            "--test-threads=1",
-                            "--color=never",
-                        ])
-                        .env(SELECTOR_ENV, selector)
-                        // Update inspection reads the real application-data store.
-                        // Give each fresh fixture child its own private storage.
-                        .env("XDG_DATA_HOME", output.path().join("data"))
-                        .env("XDG_CONFIG_HOME", output.path().join("config"))
-                        .env("XDG_RUNTIME_DIR", &runtime_path)
-                        .stdout(fs::File::create(&stdout_path).unwrap())
-                        .stderr(fs::File::create(&stderr_path).unwrap())
-                        .spawn()
-                        .unwrap(),
-                );
-                let deadline = Instant::now() + Duration::from_secs(30);
-                let status = loop {
-                    if let Some(status) = child.0.try_wait().unwrap() {
-                        break status;
-                    }
-                    if Instant::now() >= deadline {
-                        let _ = child.0.kill();
-                        let _ = child.0.wait();
-                        let retained = output.keep();
-                        panic!(
-                            "upgrade fixture timed out; retained at {}; stdout: {}; stderr: {}",
-                            retained.display(),
-                            fs::read_to_string(&stdout_path).unwrap_or_default(),
-                            fs::read_to_string(&stderr_path).unwrap_or_default()
-                        );
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                };
-                let stdout = fs::read_to_string(stdout_path).unwrap();
-                let stderr = fs::read_to_string(stderr_path).unwrap();
-                let named = stdout
-                    .lines()
-                    .filter(|line| *line == format!("test {selector} ... ok"))
-                    .count()
-                    == 1;
-                let summaries = stdout
-                    .lines()
-                    .filter(|line| line.starts_with("test result:"))
-                    .collect::<Vec<_>>();
-                let qualified = summaries.len() == 1
-                    && summaries[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;");
-                if !status.success() || !named || !qualified {
-                    let retained = output.keep();
-                    panic!(
-                        "upgrade fixture child failed: {status}; retained at {}; stdout: {stdout}; stderr: {stderr}",
-                        retained.display()
-                    );
-                }
-                output.close().unwrap();
+                run_upgrade_fixture_in_fresh_process(selector);
                 false
             }
         }
+    }
+
+    // Also used by the retained-custody fixture to exercise an existing
+    // consumer while its own process deliberately keeps a live original.
+    pub(super) fn run_upgrade_fixture_in_fresh_process(selector: &str) {
+        struct OriginalChild(std::process::Child);
+        impl Drop for OriginalChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut output = tempfile::tempdir().unwrap();
+        output.disable_cleanup(true);
+        eprintln!("Upgrade fixture output: {}", output.path().display());
+        let mut runtime = tempfile::Builder::new()
+            .prefix("cagents-upgrade-runtime-")
+            .tempdir()
+            .unwrap();
+        // Child exit alone does not establish descendant settlement.
+        runtime.disable_cleanup(true);
+        let runtime_path = runtime.path().canonicalize().unwrap();
+        crate::secure_file::prepare_private_directory(&runtime_path).unwrap();
+        eprintln!("Upgrade fixture runtime: {}", runtime_path.display());
+        let stdout_path = output.path().join("stdout");
+        let stderr_path = output.path().join("stderr");
+        let mut child = OriginalChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    selector,
+                    "--nocapture",
+                    "--test-threads=1",
+                    "--color=never",
+                ])
+                .env(UPGRADE_FIXTURE_SELECTOR_ENV, selector)
+                // Update inspection reads the real application-data store.
+                // Give each fresh fixture child its own private storage.
+                .env("XDG_DATA_HOME", output.path().join("data"))
+                .env("XDG_CONFIG_HOME", output.path().join("config"))
+                .env("XDG_RUNTIME_DIR", &runtime_path)
+                .stdout(fs::File::create(&stdout_path).unwrap())
+                .stderr(fs::File::create(&stderr_path).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.0.kill();
+                let _ = child.0.wait();
+                let retained = output.keep();
+                panic!(
+                    "upgrade fixture timed out; retained at {}; stdout: {}; stderr: {}",
+                    retained.display(),
+                    fs::read_to_string(&stdout_path).unwrap_or_default(),
+                    fs::read_to_string(&stderr_path).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = fs::read_to_string(stdout_path).unwrap();
+        let stderr = fs::read_to_string(stderr_path).unwrap();
+        let named = stdout
+            .lines()
+            .filter(|line| *line == format!("test {selector} ... ok"))
+            .count()
+            == 1;
+        let summaries = stdout
+            .lines()
+            .filter(|line| line.starts_with("test result:"))
+            .collect::<Vec<_>>();
+        let qualified = summaries.len() == 1
+            && summaries[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;");
+        if !status.success() || !named || !qualified {
+            let retained = output.keep();
+            panic!(
+                "upgrade fixture child failed: {status}; retained at {}; stdout: {stdout}; stderr: {stderr}",
+                retained.display()
+            );
+        }
+        output.close().unwrap();
     }
 
     #[test]
