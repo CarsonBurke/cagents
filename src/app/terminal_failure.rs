@@ -68,10 +68,7 @@ pub(super) fn runtime_error_code(message: &str, default: &'static str) -> &'stat
 }
 fn known_failure(code: &str) -> (&'static str, &'static str) {
     match code {
-        "terminal_not_hosted" => (
-            "terminal_not_hosted",
-            "This terminal is no longer running.",
-        ),
+        "terminal_not_hosted" => ("terminal_not_hosted", "This terminal is no longer running."),
         "start_failed" => ("start_failed", "The terminal could not be started."),
         "runtime_hydration_failed" => (
             "runtime_hydration_failed",
@@ -131,13 +128,14 @@ impl Details {
         } else {
             known_failure(typed.unwrap_or(""))
         };
-        let consequence = if code != "terminal_not_hosted" && session.continuity.live_proof().is_some() {
-            "Reconnect to the existing terminal."
-        } else if session.agent_resume_recipe().is_some() {
-            "Resume the saved conversation in a new terminal."
-        } else {
-            "Run the saved command from the beginning in a new terminal."
-        };
+        let consequence =
+            if code != "terminal_not_hosted" && session.continuity.live_proof().is_some() {
+                "Reconnect to the existing terminal."
+            } else if session.agent_resume_recipe().is_some() {
+                "Resume the saved conversation in a new terminal."
+            } else {
+                "Run the saved command from the beginning in a new terminal."
+            };
         Self {
             code,
             message,
