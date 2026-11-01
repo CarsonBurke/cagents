@@ -532,16 +532,71 @@ mod tests {
         runtime: &mut Runtime,
         original: &failure::Note,
         key: &str,
+        anchor: &Option<String>,
         resumed: bool,
     ) {
         assert_eq!(runtime.failures.first(), Some(original));
-        assert_eq!(runtime.failure_ui.incidents[0].key, key);
+        let original_incidents: Vec<_> = runtime
+            .failure_ui
+            .incidents
+            .iter()
+            .filter(|incident| incident.key == key)
+            .collect();
+        assert_eq!(original_incidents.len(), 1);
+        assert_eq!(&original_incidents[0].anchor, anchor);
         assert_eq!(runtime.failure_details(key).as_deref(), Some(DIAGNOSTIC));
+        let later = runtime
+            .snapshot
+            .items
+            .iter()
+            .any(|item| item.id == "fixture-turn-3/error:0")
+            .then(|| {
+                let incident = runtime.failure_ui.item("fixture-turn-3/error:0").unwrap();
+                assert_ne!(incident.key, key);
+                assert_eq!(
+                    runtime
+                        .failure_ui
+                        .incidents
+                        .iter()
+                        .filter(|found| found.key == incident.key)
+                        .count(),
+                    1
+                );
+                assert_eq!(runtime.failure_ui.incidents.len(), 2);
+                let prompt_turn = runtime
+                    .turns
+                    .iter()
+                    .find(|turn| {
+                        turn.prompt.iter().any(|index| {
+                            runtime.snapshot.items[*index].id == "fixture-turn-3/prompt"
+                        })
+                    })
+                    .expect("the later error retains its submitted prompt");
+                assert_eq!(incident.anchor.as_deref(), Some(prompt_turn.key.as_str()));
+                let later_key = incident.key.clone();
+                assert_eq!(
+                    runtime.failure_details(&later_key).as_deref(),
+                    Some(DIAGNOSTIC)
+                );
+                later_key
+            });
         preparation::drain_fixture(runtime);
         runtime.failure_ui.expanded.insert(key.into());
         runtime.cache_failure_preview(key);
+        if let Some(later) = &later {
+            runtime.failure_ui.expanded.insert(later.clone());
+            runtime.cache_failure_preview(later);
+        }
         let catalog = runtime.selection_document().0.search_blocks();
         let position = |identity| {
+            assert_eq!(
+                catalog
+                    .iter()
+                    .filter(|(found, _)| *found == identity)
+                    .count(),
+                1,
+                "catalog identity must occur exactly once"
+            );
             catalog
                 .iter()
                 .position(|(found, _)| *found == identity)
@@ -553,6 +608,24 @@ mod tests {
             assert!(
                 diagnostic < position(selection::logical_identity("fixture-turn-2/prompt", &[2]))
             );
+        }
+        if let Some(later) = later {
+            let later_diagnostic = position(failure::diagnostic_preview_identity(&later));
+            assert!(
+                position(selection::logical_identity("fixture-turn-3/prompt", &[2]))
+                    < later_diagnostic
+            );
+            if runtime
+                .snapshot
+                .items
+                .iter()
+                .any(|item| item.id == "fixture-turn-4/prompt")
+            {
+                assert!(
+                    later_diagnostic
+                        < position(selection::logical_identity("fixture-turn-4/prompt", &[2]))
+                );
+            }
         }
     }
 
@@ -618,15 +691,17 @@ mod tests {
         );
         let original = runtime.failures[0].clone();
         let key = runtime.failure_ui.incidents[0].key.clone();
-        original_failure_stays_before_resume(&mut runtime, &original, &key, false);
+        let anchor = runtime.failure_ui.incidents[0].anchor.clone();
+        assert!(anchor.is_some());
+        original_failure_stays_before_resume(&mut runtime, &original, &key, &anchor, false);
         for draft in [".", "Try the check again.", "Continue."] {
             runtime.replace_draft(text_editor::Content::with_text(draft));
             state.submit(&mut runtime);
             assert!(runtime.composer.text().trim().is_empty());
-            original_failure_stays_before_resume(&mut runtime, &original, &key, true);
+            original_failure_stays_before_resume(&mut runtime, &original, &key, &anchor, true);
             while state.step.is_some() {
                 state.tick(&mut runtime);
-                original_failure_stays_before_resume(&mut runtime, &original, &key, true);
+                original_failure_stays_before_resume(&mut runtime, &original, &key, &anchor, true);
             }
             assert!(runtime.pending.is_none());
         }
