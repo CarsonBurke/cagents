@@ -94,6 +94,12 @@ if resume:
             assert os.write(fd, payload) == len(payload)
         finally:
             os.close(fd)
+        # Drain initialize before refusing; never confirm this conversation.
+        line = sys.stdin.readline()
+        assert line, 'missing initialize before fixture refusal'
+        initialize = json.loads(line)
+        assert initialize.get('type') == 'control_request'
+        assert initialize.get('request', {}).get('subtype') == 'initialize'
         trace({'event': 'owned-fixture-resume-refused-once', 'thread': session})
         raise SystemExit(75)
     # Same supported no-prompt init pattern as the executed119/d95 fixture.
