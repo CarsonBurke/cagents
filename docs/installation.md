@@ -273,6 +273,48 @@ offers the reviewed apply/reopen flow. Resolve any save blockers before applying
 staging makes the candidate available but does not complete the application handoff.
 This option cannot be combined with restart, relaunch, uninstall or purge options.
 
+#### Withdraw or re-select a staged build
+
+Every installed version stays under `versions/`. To change which one `current`
+serves without applying it, add `--select VERSION` to `--stage-only`:
+
+```sh
+CAGENTS_ARCHIVE=dist/cagents-RELEASE-x86_64-unknown-linux-gnu.tar.gz \
+CAGENTS_CHECKSUMS=dist/SHA256SUMS \
+sh dist/install.sh --select 0.1.3+local.582a054bc --stage-only
+```
+
+Select the version your windows and daemon already run to withdraw a staged
+build: the windows stop offering **Update and reopen**, and launching cagents
+opens that same version. Select the staged build again to restore its offer
+exactly as staging left it. Selection installs nothing and removes no version;
+it does not close windows, start, stop or checkpoint the daemon.
+
+The installer and archive only provide a verified coordinator, so the installed
+builds do not need to support selection. Run it from a release that does,
+either a local `dist/` directory or a downloaded release (`--version` names that
+release, not the selected one). Selection holds the same launch fence and
+ownership checks as `--stage-only`, and it refuses when:
+
+- the version is not a complete matched set in this installation's `versions/`;
+- the daemon and the live windows run different versions, for example after
+  windows reopened on a compatible build that shares an older daemon. Selection
+  never closes windows, so it cannot withdraw that build;
+- windows or a daemon are running, and the version is neither the one they run
+  nor a build staged over it;
+- the staged build was recorded as sharing the running daemon, and that daemon
+  has since stopped. Start the original version's daemon before re-selecting
+  the staged build;
+- an application update is in progress;
+- `current` changed while the selection was being prepared.
+
+With no window or daemon running, any complete installed version can be selected.
+
+Run it from your own terminal; an agent session cannot select. A window
+rechecks the installation when it is focused, so an unfocused window can keep
+showing a withdrawn offer until then. Clicking it is refused with "the installed
+candidate changed" and changes nothing.
+
 For an explicitly authorized direct daemon replacement, append
 `--restart-daemon` to the installer invocation. The coordinator saves and closes
 application windows before checkpointing. Supported holders retain live
@@ -284,6 +326,7 @@ session-by-session preview and waiting for native turns.
 | Option | Effect |
 | --- | --- |
 | `--stage-only` | Publish a verified candidate without closing windows or changing the daemon |
+| `--select VERSION` | With `--stage-only`, serve an installed version instead of publishing this release |
 | `--restart-daemon` | Checkpoint supported sessions and replace the running daemon |
 | `--require-empty-daemon` | With `--restart-daemon`, refuse rather than interrupt live sessions |
 | `--relaunch-agents` | With `--restart-daemon`, relaunch agents that have no exact resume identity into their resume picker (requires an installed CLI that can record this) |
