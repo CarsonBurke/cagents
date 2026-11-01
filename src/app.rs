@@ -5895,7 +5895,7 @@ impl Cagents {
                             }
                         }
                     }
-                    let hosted=hosted.ok_or("This shared terminal is disconnected; another client must restore its hosted session")?;
+                    let hosted=hosted.ok_or(if reserved { "This shared terminal has not started; another client must complete it" } else { terminal_failure::TERMINAL_NOT_HOSTED })?;
                     let proof = client.proof().clone();
                     (daemon_recovery::RecoveredTerminal { session: hosted.session,
                         expected_host: Some(proof.clone()), attach_completed: false, recovery_lease: None },
@@ -8424,7 +8424,7 @@ impl Cagents {
         };
         let succeeded = result.is_ok();
         let result = result.map_err(|message| RuntimeError {
-            code: "runtime_hydration_failed".into(),
+            code: terminal_failure::runtime_error_code(&message, "runtime_hydration_failed").into(),
             message,
         });
         if !self.lifecycle.hydration_finished(card, epoch, result) {
@@ -8454,7 +8454,7 @@ impl Cagents {
         };
         let residency = Residency::Failed {
             typed_error: RuntimeError {
-                code: "runtime_failed".into(),
+                code: terminal_failure::runtime_error_code(&message, "runtime_failed").into(),
                 message,
             },
             retryable: true,
