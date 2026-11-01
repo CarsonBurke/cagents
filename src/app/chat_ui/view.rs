@@ -970,6 +970,12 @@ impl Cagents {
 
     pub(in crate::app) fn chat_view(&self, card: CardId) -> Element<'_, Message> {
         match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime))
+                if runtime.awaiting_admission()
+                    && self.shared_views.quarantined.contains(&card) =>
+            {
+                runtime.pending_admission_view(true)
+            }
             Some(CardRuntime::Chat(runtime)) => {
                 let place = self.chat_place(&runtime.session.launch.recipe.working_directory, card);
                 let accounts = self.chat_accounts(
@@ -1657,7 +1663,7 @@ impl Runtime {
         offers: Vec<Offer<'a>>,
     ) -> Element<'a, Message> {
         if self.awaiting_admission() {
-            return self.pending_admission_view();
+            return self.pending_admission_view(false);
         }
         let target = self.target;
         // Nothing is sent past a first message still waiting to go.

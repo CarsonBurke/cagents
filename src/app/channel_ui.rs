@@ -627,6 +627,22 @@ impl Cagents {
             .count()
     }
 
+    /// The saved sessions deleting a channel of `cards` asks the daemon to
+    /// close. A fenced pane's saved session is unconfirmed, so nothing is
+    /// asked of its agent: deleting the channel retires only the pane.
+    pub(super) fn channel_sessions_to_close(&self, cards: &[CardId]) -> Vec<CardKind> {
+        self.durable
+            .cards
+            .iter()
+            .filter(|card| {
+                cards.contains(&card.id)
+                    && card.existence.is_open()
+                    && !self.shared_views.quarantined.contains(&card.id)
+            })
+            .map(|card| card.kind.clone())
+            .collect()
+    }
+
     pub(super) fn delete_channels(&mut self, ids: Vec<ChannelId>) -> Task<Message> {
         Task::batch(ids.into_iter().map(|id| self.delete_channel(id)))
     }
@@ -684,13 +700,7 @@ impl Cagents {
             });
             return Task::batch([leave, retry]);
         }
-        let sessions: Vec<_> = self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| cards.contains(&card.id) && card.existence.is_open())
-            .map(|card| card.kind.clone())
-            .collect();
+        let sessions = self.channel_sessions_to_close(&cards);
         if !sessions
             .iter()
             .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
@@ -703,7 +713,11 @@ impl Cagents {
             .durable
             .cards
             .iter()
-            .filter(|card| cards.contains(&card.id) && card.existence.is_open())
+            .filter(|card| {
+                cards.contains(&card.id)
+                    && card.existence.is_open()
+                    && !self.shared_views.quarantined.contains(&card.id)
+            })
             .map(|card| {
                 (
                     card.id,

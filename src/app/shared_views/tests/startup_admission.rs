@@ -764,6 +764,94 @@ fn retired_cached_draft_stays_readable_and_cannot_start_provider() {
 }
 
 #[test]
+fn fenced_managed_chat_keeps_its_text_and_closes_without_stopping_a_session() {
+    if isolated("fenced_managed_chat_keeps_its_text_and_closes_without_stopping_a_session") {
+        return;
+    }
+    use crate::agent_execution::{Agent, HostedSession, Origin, Placement, Spec, Target};
+    let daemon = ScriptedDaemon::start();
+    let (mut app, active, hidden, pane, identity) = cached_chat();
+    let text = "Unsent text beside a stale session";
+    Arc::make_mut(&mut app.durable).active_channel = Some(hidden);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(pane.id, text.into())]));
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    let CardKind::Chat(mut reported) = pane.kind.clone() else {
+        unreachable!()
+    };
+    reported.proof.as_mut().unwrap().boot_id = "a later boot".into();
+    let agent = Agent {
+        id: crate::model::AgentId::from_uuid(pane.id.as_uuid()),
+        name: None,
+        origin: Origin::User,
+        spec: Spec {
+            provider: crate::agent::Provider::Claude,
+            account: None,
+            target: Target {
+                repository: PathBuf::from("/fixture-project"),
+                directory: PathBuf::from("/fixture-project"),
+                placement: Some(Placement::Channel(hidden)),
+            },
+            surface: Default::default(),
+            model: None,
+            permission_mode: None,
+            reasoning_effort: None,
+        },
+        placement: Placement::Channel(hidden),
+        session: Some(HostedSession::Chat(reported)),
+        console: None,
+        created_ms: 0,
+        closed: false,
+    };
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    let mut model = model(identity, active, hidden, view);
+    model.agents = vec![agent];
+    admit(&mut app, active, hidden, model.clone());
+    assert!(app.shared_views.quarantined.contains(&pane.id));
+    assert!(app.chat_awaiting_admission(pane.id));
+    let visible = visible_text(&app, pane.id);
+    assert!(
+        visible.contains(text)
+            && visible.contains(crate::app::shared_views::FENCED_PANE_EXPLANATION)
+            && visible.contains("Agent connection unavailable")
+            && visible.contains("Close"),
+        "{visible}"
+    );
+    // The tab's close button routes a chat through the chat close. A fenced
+    // pane closes like any other, but no session is asked to stop.
+    let task = app.update(Message::CloseCard(pane.id));
+    settle(&mut app, task);
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    assert!(!app.workspace.order().any(|id| id == pane.id));
+    assert!(!app.durable.pending_chat_admissions.contains_key(&pane.id));
+    assert!(
+        app.recently_closed
+            .iter()
+            .any(|(card, _)| card.id == pane.id)
+    );
+    assert!(app.shared_views.pending.iter().any(|(_, scope, change)| {
+        *scope == Scope::Channel(hidden) && *change == Change::Remove { id: pane.id }
+    }));
+    // Snapshots that still hold it before the removal is acknowledged leave
+    // it closed.
+    for _ in 0..2 {
+        model.sequence += 1;
+        let read = app.apply_workspace_model_update(
+            crate::app::workspace_model_sync::ModelUpdate::Read(model.clone()),
+        );
+        settle(&mut app, read);
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.workspace.order().any(|id| id == pane.id));
+    }
+    assert!(
+        daemon.requests().is_empty(),
+        "a fenced pane must not reconnect or close its stale session"
+    );
+}
+
+#[test]
 fn replacement_admission_keeps_old_draft_beside_exact_canonical_chat() {
     if isolated("replacement_admission_keeps_old_draft_beside_exact_canonical_chat") {
         return;
