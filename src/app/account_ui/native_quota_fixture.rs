@@ -17,6 +17,7 @@ const SCENES: &[&str] = &[
     "codex-ticket",
     "claude-startup",
     "codex-startup",
+    "claude-catalog",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +27,7 @@ enum Scenario {
     Delayed,
     Ticket,
     Startup,
+    Catalog,
 }
 
 pub(in crate::app) struct Context {
@@ -111,6 +113,7 @@ pub(in crate::app) fn context() -> Result<Option<Context>, String> {
         "delayed" => Scenario::Delayed,
         "ticket" => Scenario::Ticket,
         "startup" => Scenario::Startup,
+        "catalog" => Scenario::Catalog,
         _ => unreachable!(),
     };
     Ok(Some(Context {
@@ -217,6 +220,7 @@ pub(in crate::app) struct Fixture {
     works: Vec<Work>,
     error: Option<String>,
     startup: Option<Startup>,
+    catalog: Option<CatalogScene>,
 }
 
 struct StartupAdmission {
@@ -256,6 +260,9 @@ fn fail(app: &mut Cagents, message: &str) {
 }
 
 pub(in crate::app) fn install(app: &mut Cagents, context: Context) -> Task<Message> {
+    if context.scenario == Scenario::Catalog {
+        return install_catalog(app, context);
+    }
     if context.scenario == Scenario::Startup {
         return install_startup(app, context);
     }
@@ -334,6 +341,7 @@ pub(in crate::app) fn install(app: &mut Cagents, context: Context) -> Task<Messa
         works: Vec::new(),
         error: None,
         startup: None,
+        catalog: None,
     });
     app.account_ui = state;
     app.active_workspace = Some(
@@ -520,6 +528,7 @@ fn install_startup(app: &mut Cagents, context: Context) -> Task<Message> {
         phase: "startup-unready",
         works: Vec::new(),
         error: None,
+        catalog: None,
         startup: Some(Startup {
             original_accounts,
             original_revision,
@@ -1257,6 +1266,7 @@ fn completed(
                 Scenario::Delayed => Kind::Delayed,
                 Scenario::Ticket => Kind::OldA,
                 Scenario::Startup => unreachable!("startup never constructs a collector"),
+                Scenario::Catalog => unreachable!("catalog never constructs a collector"),
             });
         }
         Kind::Sparse => f.phase = "failed-retained",
@@ -1275,6 +1285,52 @@ pub(in crate::app) fn update(app: &mut Cagents, message: Message) -> Task<Messag
     let message = match message {
         Message::UtilityPaneUi(message) => *message,
         message => message,
+    };
+    let message = if app
+        .account_ui
+        .native_fixture
+        .as_ref()
+        .is_some_and(|f| f.context.scenario == Scenario::Catalog)
+    {
+        match message {
+            Message::AccountUi(Action::Loaded(loaded)) => return catalog_loaded(app, loaded),
+            Message::AccountUi(_) => return Task::none(),
+            Message::ChatUi(action) => return catalog_chat(app, action),
+            Message::KeyEvent {
+                event:
+                    keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::F8),
+                        modifiers,
+                        ..
+                    },
+                captured: false,
+            } if modifiers.is_empty() => return queue_catalog(app),
+            Message::KeyEvent {
+                event:
+                    keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        modifiers,
+                        ..
+                    },
+                captured: false,
+            } if modifiers.is_empty() => {
+                if let Some(view) = catalog_observation(app) {
+                    if view.picker_open {
+                        return catalog_chat(app, chat_ui::Action::ModelPicker(view.target, false));
+                    }
+                    if view.footer_open {
+                        return catalog_chat(
+                            app,
+                            chat_ui::Action::FooterPicker(view.target, false),
+                        );
+                    }
+                }
+                return Task::none();
+            }
+            message => message,
+        }
+    } else {
+        message
     };
     let startup = app
         .account_ui
@@ -1492,4 +1548,374 @@ pub(in crate::app) fn subscription(app: &Cagents) -> Subscription<Message> {
         subscriptions.push(workspace_widget::animation_frames(window, Message::Frame));
     }
     Subscription::batch(subscriptions)
+}
+
+// Matched Before/After data. These are logical observations, not an OS clock
+// change or a cache/provider execution. Expiration requires a new reviewed seed.
+const CATALOG_CURRENT_AT: Millis = 1_793_491_200_000; // 2026-11-01T00:00:00Z
+const CATALOG_WINDOW_END: Millis = 1_793_577_600_000; // 2026-11-02T00:00:00Z
+const CATALOG_OLD_AT: Millis = 4_102_444_800_000; // already-known pre-rollback 2100
+const CATALOG_EXPECTS_CURRENT: bool = true;
+
+struct CatalogScene {
+    card: CardId,
+}
+
+fn catalog_capture_valid(now: Millis) -> bool {
+    (CATALOG_CURRENT_AT..CATALOG_WINDOW_END).contains(&now)
+        && CATALOG_OLD_AT > now.saturating_add(schedule::CLOCK_SLACK)
+}
+
+fn catalog_models(current: bool) -> Vec<crate::chat::Model> {
+    vec![crate::chat::Model {
+        id: if current {
+            "fixture-current-model"
+        } else {
+            "fixture-old-model"
+        }
+        .into(),
+        label: if current {
+            "Current catalog model"
+        } else {
+            "Older cached model"
+        }
+        .into(),
+        reasoning: Vec::new(),
+    }]
+}
+
+fn catalog_payload() -> Loaded {
+    Loaded {
+        registry: Ok(Registry::default()),
+        restored: Vec::new(),
+        catalogs: BTreeMap::from([(
+            Provider::Claude,
+            Catalog {
+                observed_at: CATALOG_CURRENT_AT,
+                models: catalog_models(true),
+            },
+        )]),
+        installed: Account::PROVIDERS
+            .into_iter()
+            .map(|p| (p, p == Provider::Claude))
+            .collect(),
+        provisional: false,
+    }
+}
+
+fn catalog_observation(app: &Cagents) -> Option<chat_ui::native_catalog_fixture::Observation> {
+    let card = app
+        .account_ui
+        .native_fixture
+        .as_ref()?
+        .catalog
+        .as_ref()?
+        .card;
+    chat_ui::native_catalog_fixture::observe(app, card)
+}
+
+fn catalog_draft(app: &Cagents) -> serde_json::Value {
+    catalog_observation(app).map_or(serde_json::Value::Null, |view| serde_json::json!({
+        "card":view.target.card,"generation":view.target.generation,
+        "models":view.models,"selected_model":view.selected,"picker_open":view.picker_open,"footer_open":view.footer_open,
+        "unstarted_without_client_or_pending_command":view.unstarted,
+        "widget_focus_or_pixels_proven":false,
+    }))
+}
+
+fn install_catalog(app: &mut Cagents, context: Context) -> Task<Message> {
+    let directory = context.root.join("public-project");
+    let system = Account {
+        provider: Provider::Claude,
+        home: account::AccountHome::SystemAt {
+            path: context.root.join("synthetic-system-never-read"),
+        },
+    };
+    let mut state = State::default();
+    state
+        .remote_system_homes
+        .insert(Provider::Claude, system.resolved_home().unwrap());
+    state.accounts = vec![AccountState::new(system.clone())];
+    state.registry_ready = true;
+    state.installed = Account::PROVIDERS
+        .into_iter()
+        .map(|p| (p, p == Provider::Claude))
+        .collect();
+    state.now_ms = CATALOG_OLD_AT;
+    // This row was known before the simulated rollback. Cache::catalogs would
+    // filter its future stamp from a NEW load; no such producer is claimed.
+    state.catalogs.insert(
+        Provider::Claude,
+        Catalog {
+            observed_at: CATALOG_OLD_AT,
+            models: catalog_models(false),
+        },
+    );
+    state.native_fixture = Some(Fixture {
+        context,
+        source: system.clone(),
+        system,
+        baseline: CATALOG_CURRENT_AT,
+        logical_now: CATALOG_OLD_AT,
+        next: None,
+        phase: "catalog-old-visible",
+        works: Vec::new(),
+        error: None,
+        startup: None,
+        catalog: None,
+    });
+    app.account_ui = state;
+    app.active_workspace = Some(directory.clone());
+    app.context_inspector_open = false;
+    if !catalog_capture_valid(now_ms()) {
+        fail(
+            app,
+            "fixed catalog capture window expired or not reached; use a new reviewed shared seed",
+        );
+        return Task::none();
+    }
+    let (card, presentation) = match chat_ui::native_catalog_fixture::mount(app, directory) {
+        Ok(value) => value,
+        Err(error) => {
+            fail(app, &error);
+            return Task::none();
+        }
+    };
+    app.account_ui.native_fixture.as_mut().unwrap().catalog = Some(CatalogScene { card });
+    if !catalog_observation(app).is_some_and(|v| v.unstarted && v.models == catalog_models(false)) {
+        fail(
+            app,
+            "original mounted draft did not consume the old known catalog",
+        );
+        return Task::none();
+    }
+    app.notices.record(TransientNotice::warning("INERT catalog · open the model picker, then F8 supplies one fixed Loaded callback · no provider or cache producer"));
+    app.refresh_sidebar_channels();
+    app.synchronize_sidebar_selection();
+    let sidebar = sidebar::effective_width(app.projects_sidebar_mode(), app.settings.sidebar_width);
+    let _ = app
+        .workspace
+        .resize_viewport((app.content_width() - sidebar).max(0.0));
+    receipt(
+        serde_json::json!({"event":"catalog_installed","scene":"claude-catalog",
+        "capture_window_utc":["2026-11-01T00:00:00Z","2026-11-02T00:00:00Z"],
+        "old_observed_at":CATALOG_OLD_AT,"incoming_observed_at":CATALOG_CURRENT_AT,
+        "stale_presentation_clock":app.account_ui.now_ms,"draft":catalog_draft(app),
+        "cache_provider_or_native_input_executed":false}),
+    );
+    let theme = app.settings.app_theme.resolve(app.core.system_theme());
+    Task::batch([
+        presentation,
+        app.sync_chrome(),
+        cosmic::command::set_theme(theme),
+    ])
+}
+
+fn queue_catalog(app: &mut Cagents) -> Task<Message> {
+    let f = app.account_ui.native_fixture.as_ref().unwrap();
+    if f.error.is_some()
+        || f.phase != "catalog-old-visible"
+        || app.account_ui.now_ms != CATALOG_OLD_AT
+        || !catalog_capture_valid(now_ms())
+        || !catalog_observation(app).is_some_and(|v| {
+            v.unstarted
+                && v.picker_open
+                && v.selected.is_none()
+                && v.models == catalog_models(false)
+        })
+    {
+        fail(
+            app,
+            "catalog delivery needs its original old-model picker and valid fixed capture window",
+        );
+        return Task::none();
+    }
+    app.account_ui.native_fixture.as_mut().unwrap().phase = "catalog-loaded-queued";
+    receipt(
+        serde_json::json!({"event":"catalog_loaded_queued","draft":catalog_draft(app),
+        "input_origin_requires_native_evidence":true}),
+    );
+    cosmic::task::message(Message::AccountUi(Action::Loaded(catalog_payload())))
+}
+
+fn catalog_loaded(app: &mut Cagents, loaded: Loaded) -> Task<Message> {
+    let f = app.account_ui.native_fixture.as_ref().unwrap();
+    let fresh_event_now = now_ms();
+    if f.error.is_some()
+        || f.phase != "catalog-loaded-queued"
+        || app.account_ui.now_ms != CATALOG_OLD_AT
+        || !catalog_capture_valid(fresh_event_now)
+        || loaded.catalogs != catalog_payload().catalogs
+        || loaded.installed != catalog_payload().installed
+        || !loaded.restored.is_empty()
+        || loaded.provisional
+        || loaded.registry.is_err()
+        || app.account_ui.cache.is_some()
+        || app.account_ui.store.is_some()
+        || !app.account_ui.logins.is_empty()
+    {
+        fail(
+            app,
+            "catalog callback was not the original fixed, writer-free Loaded scene",
+        );
+        return Task::none();
+    }
+    // Invoke the real Loaded reducer and refresh_chat_drafts. Its unrelated
+    // asynchronous work is not polled; this scene claims only model consumption.
+    drop(app.update_account_ui(Action::Loaded(loaded)));
+    let expected = catalog_models(CATALOG_EXPECTS_CURRENT);
+    let expected_at = if CATALOG_EXPECTS_CURRENT {
+        CATALOG_CURRENT_AT
+    } else {
+        CATALOG_OLD_AT
+    };
+    let correct = app
+        .account_ui
+        .catalog(Provider::Claude)
+        .is_some_and(|c| c.models == expected && c.observed_at == expected_at)
+        && catalog_observation(app)
+            .is_some_and(|v| v.unstarted && v.picker_open && v.models == expected);
+    if !correct {
+        fail(
+            app,
+            "Loaded catalog or actual draft snapshot disagreed with this source side",
+        );
+        return Task::none();
+    }
+    app.account_ui.native_fixture.as_mut().unwrap().phase = "catalog-callback-complete";
+    receipt(
+        serde_json::json!({"event":"catalog_loaded_callback","source":"actual Loaded reducer",
+        "payload_is_synthetic":true,"producer_cache_provider_execution":false,
+        "fresh_event_now":fresh_event_now,"old_presentation_now":CATALOG_OLD_AT,
+        "expected_current_catalog":CATALOG_EXPECTS_CURRENT,"catalog":app.account_ui.catalog(Provider::Claude),
+        "draft":catalog_draft(app),"async_operational_tasks_polled":false}),
+    );
+    app.sync_chrome()
+}
+
+fn catalog_chat(app: &mut Cagents, action: chat_ui::Action) -> Task<Message> {
+    let Some(view) = catalog_observation(app) else {
+        return Task::none();
+    };
+    if !view.unstarted
+        || app
+            .account_ui
+            .native_fixture
+            .as_ref()
+            .unwrap()
+            .error
+            .is_some()
+    {
+        return Task::none();
+    }
+    let allowed = match &action {
+        chat_ui::Action::ModelPicker(target, _) | chat_ui::Action::FooterPicker(target, _) => {
+            *target == view.target
+        }
+        chat_ui::Action::ModelQuery(target, query) => *target == view.target && query.len() <= 128,
+        chat_ui::Action::DraftModel(target, provider, model) => {
+            *target == view.target
+                && *provider == Provider::Claude
+                && model
+                    .as_ref()
+                    .is_none_or(|id| view.models.iter().any(|m| &m.id == id))
+        }
+        _ => false,
+    };
+    if !allowed {
+        return Task::none();
+    }
+    // These exact same-provider picker actions return only normal widget focus
+    // work. No Submit, Composer, account/provider switch or global key dispatch.
+    let task = app.handle_chat_ui(action);
+    receipt(
+        serde_json::json!({"event":"catalog_picker_callback","draft":catalog_draft(app),
+        "input_origin_requires_native_evidence":true}),
+    );
+    Task::batch([task, app.sync_chrome()])
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[test]
+    fn loaded_catalog_refreshes_the_actual_unstarted_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let temporary = tempfile::tempdir().unwrap();
+        let models = |id: &str| {
+            vec![crate::chat::Model {
+                id: id.into(),
+                label: id.into(),
+                reasoning: Vec::new(),
+            }]
+        };
+        let load = |models, observed_at| {
+            Action::Loaded(Loaded {
+                registry: Err("inert consumer test; no registry producer".into()),
+                restored: Vec::new(),
+                catalogs: BTreeMap::from([(
+                    Provider::Claude,
+                    Catalog {
+                        models,
+                        observed_at,
+                    },
+                )]),
+                installed: BTreeMap::new(),
+                provisional: false,
+            })
+        };
+        drop(app.update_account_ui(load(models("fixture-old"), 1)));
+        let (card, presentation) =
+            chat_ui::native_catalog_fixture::mount(&mut app, temporary.path().to_path_buf())
+                .unwrap();
+        drop(presentation);
+        assert_eq!(
+            chat_ui::native_catalog_fixture::observe(&app, card)
+                .unwrap()
+                .models,
+            models("fixture-old")
+        );
+        drop(app.update_account_ui(load(models("fixture-current"), 2)));
+        let current = chat_ui::native_catalog_fixture::observe(&app, card).unwrap();
+        assert!(current.unstarted);
+        assert_eq!(current.models, models("fixture-current"));
+        drop(app.handle_chat_ui(chat_ui::Action::FooterPicker(current.target, true)));
+        assert!(
+            chat_ui::native_catalog_fixture::observe(&app, card)
+                .unwrap()
+                .footer_open
+        );
+        drop(app.handle_chat_ui(chat_ui::Action::ModelPicker(current.target, true)));
+        assert!(
+            chat_ui::native_catalog_fixture::observe(&app, card)
+                .unwrap()
+                .picker_open
+        );
+        drop(app.handle_chat_ui(chat_ui::Action::ModelPicker(current.target, false)));
+        assert!(
+            !chat_ui::native_catalog_fixture::observe(&app, card)
+                .unwrap()
+                .picker_open
+        );
+        assert!(
+            chat_ui::native_catalog_fixture::observe(&app, card)
+                .unwrap()
+                .unstarted
+        );
+    }
+
+    #[test]
+    fn fixed_catalog_data_refuses_outside_its_matched_capture_window() {
+        assert!(!catalog_capture_valid(CATALOG_CURRENT_AT - 1));
+        assert!(catalog_capture_valid(CATALOG_CURRENT_AT));
+        assert!(catalog_capture_valid(CATALOG_WINDOW_END - 1));
+        assert!(!catalog_capture_valid(CATALOG_WINDOW_END));
+        assert_eq!(
+            catalog_payload().catalogs[&Provider::Claude].observed_at,
+            CATALOG_CURRENT_AT
+        );
+        assert_ne!(catalog_models(false), catalog_models(true));
+        assert!(CATALOG_OLD_AT > CATALOG_WINDOW_END + schedule::CLOCK_SLACK);
+    }
 }
