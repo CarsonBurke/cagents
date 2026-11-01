@@ -2491,19 +2491,41 @@ mod tests {
         Accepted,
         crate::workspace_model::views::Pane,
     ) {
+        console_pane_fixture_running(false)
+    }
+    /// `console` gives the console the `cagents agent console <id>` command
+    /// the daemon actually runs; otherwise it keeps the provider's recipe.
+    fn console_pane_fixture_running(
+        console: bool,
+    ) -> (
+        Registry,
+        tempfile::TempDir,
+        Accepted,
+        crate::workspace_model::views::Pane,
+    ) {
         use crate::model::{TerminalContinuity, TerminalSession};
         let (mut registry, directory, accepted, mut pane) = closed_pane_fixture();
+        let shown_console = console;
         let retained = registry.agent(accepted.agent.id).unwrap().session.unwrap();
         let HostedSession::Chat(chat) = &retained else {
             unreachable!()
         };
         let proof = chat.proof.clone().unwrap();
+        let mut launch = chat.launch.recipe.clone();
+        if shown_console {
+            launch.program = "cagents".into();
+            launch.arguments = vec![
+                "agent".into(),
+                "console".into(),
+                accepted.agent.id.to_string(),
+            ];
+        }
         let console = TerminalSession {
             id: chat.id,
             owned_codex_listener: None,
             recovery_origin: None,
             predecessor: None,
-            launch: chat.launch.recipe.clone(),
+            launch,
             transcript_path: None,
             resume_hint: None,
             continuity: TerminalContinuity::Live {
@@ -2562,7 +2584,7 @@ mod tests {
         crate::workspace_model::views::Scope,
     ) {
         use crate::workspace_model::views::Scope;
-        let (mut registry, directory, accepted, pane) = console_pane_fixture();
+        let (mut registry, directory, accepted, pane) = console_pane_fixture_running(true);
         let channel = accepted.agent.channel().unwrap();
         let scope = Scope::Channel(channel);
         registry
