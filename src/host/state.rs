@@ -62,6 +62,80 @@ pub(crate) type ClientId = u64;
 pub(crate) type HostLock = super::lock::HostMutex<HostState>;
 pub(crate) type SharedHost = Arc<HostLock>;
 
+/// Live startup custody, never reconstructed from CodeOwner metadata. Retaining
+/// the admission also retains the original created root/parent and caller.
+struct BoundStartupSlot {
+    admission: Arc<super::fresh_code::SpawnAdmission>,
+    source: TerminalSession,
+    handle: TerminalHandle,
+    close_proved: bool,
+}
+
+/// Separate explicitly authorized Close of the same retained actor. The Host
+/// lock is never held during family inspection, holder receipt wait or join.
+/// Incomplete bound starts without issued root evidence return Unknown through
+/// the existing checked-close path; they never fall back to Holder::drop.
+pub(super) fn close_bound_start(
+    shared: &SharedHost,
+    client: ClientId,
+    owner: &crate::account::fresh_code::CodeOwner,
+    expected: &TerminalHandle,
+) -> Result<(), String> {
+    let gate = shared
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .control_gate
+        .clone();
+    let _reader = gate.read().unwrap_or_else(|p| p.into_inner());
+    let request = crate::terminal_ipc::ClientRequest::CloseTerminalChecked {
+        terminal_id: owner.attempt.terminal_id,
+        allow_active: true,
+    };
+    super::agent_execution::terminals::admit(shared, client, &request)
+        .map_err(|error| error.message)?;
+    let (source, proof) = {
+        let state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.clients.contains_key(&client) {
+            return Err("The explicitly admitted Close connection is unavailable".into());
+        }
+        let admitted = state
+            .handle(client, owner.attempt.terminal_id)
+            .map_err(|error| error.message)?;
+        if !admitted.same_worker(expected) {
+            return Err("The explicitly admitted Close targets a different worker".into());
+        }
+        let handle = state
+            .bound_start_handle(owner)
+            .filter(|handle| handle.same_worker(expected))
+            .ok_or("The original bound startup owner changed")?;
+        let slot = state.bound_startup.get(&owner.attempt.terminal_id).unwrap();
+        if handle.bound_start_no_thread() {
+            return Err("No terminal thread was created; retire its unused startup slot".into());
+        }
+        (slot.source.clone(), (*state.proof).clone())
+    };
+    expected.close_with_receipt(&source, &proof)?;
+    let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+    let handle = state
+        .bound_start_handle(owner)
+        .filter(|handle| handle.same_worker(expected))
+        .ok_or("The original bound startup owner changed after checked Close")?;
+    state
+        .bound_startup
+        .get_mut(&owner.attempt.terminal_id)
+        .unwrap()
+        .close_proved = true;
+    if !handle.bound_start_cleanup_settled() {
+        return Err(
+            "Original checked Close is proved; actual join/native settlement is still retained"
+                .into(),
+        );
+    }
+    state.startup_closed(owner.attempt.terminal_id, &handle);
+    state.retire_terminal(owner.attempt.terminal_id);
+    Ok(())
+}
+
 pub(crate) struct TerminalRecord {
     screen_lost_after_crash: bool,
     pub(super) session: TerminalSession,
@@ -257,6 +331,7 @@ pub(crate) struct HostState {
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
     startup_custody: BTreeSet<TerminalId>,
+    bound_startup: BTreeMap<TerminalId, BoundStartupSlot>,
     startup_recovery: Option<String>,
     /// Immutable accepted inventory survives a failed final unlink/fsync as
     /// well as its Store handle. This is live custody, not a durable retry or
@@ -284,6 +359,10 @@ pub(crate) struct HostState {
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
+    /// Retained setup requires explicit User authentication on this exact
+    /// connection, with no fallback after any delegated authentication attempt.
+    pub(super) account_preparation_callers:
+        BTreeMap<ClientId, super::agent_execution::terminals::AccountPreparationCaller>,
     pub(super) automations: Option<super::automations::Handle>,
     /// Answers Work board reads; absent before startup and after shutdown.
     pub(super) work: Option<super::work::Handle>,
@@ -420,6 +499,7 @@ impl HostState {
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
             startup_custody: BTreeSet::new(),
+            bound_startup: BTreeMap::new(),
             startup_recovery: None,
             retained_startup_checkpoint: None,
             #[cfg(test)]
@@ -432,6 +512,7 @@ impl HostState {
             model: None,
             execution_registry: None,
             agent_clients: BTreeMap::new(),
+            account_preparation_callers: BTreeMap::new(),
             automations: None,
             work: None,
             mailbox: None,
@@ -485,6 +566,7 @@ impl HostState {
     }
 
     pub(crate) fn register_client(&mut self, client_id: ClientId) -> Arc<DeliveryQueue> {
+        self.account_preparation_callers.remove(&client_id);
         let delivery = Arc::new(DeliveryQueue::new(client_id, DEFAULT_CLIENT_QUEUE_CAPACITY));
         if self.ordinary_exit_registration_closed {
             // The existing writer closes both stream directions when this
@@ -523,6 +605,7 @@ impl HostState {
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
+        self.account_preparation_callers.remove(&client_id);
     }
 
     /// Installs the durable shared sidebar model.
@@ -935,6 +1018,7 @@ impl HostState {
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
+        self.account_preparation_callers.remove(&client_id);
         handles
     }
 
@@ -1216,6 +1300,19 @@ impl HostState {
     }
 
     pub(super) fn retire_terminal(&mut self, terminal_id: TerminalId) -> Option<TerminalRecord> {
+        if let Some(slot) = self.bound_startup.get(&terminal_id) {
+            if !slot.handle.bound_start_cleanup_settled()
+                || (!slot.handle.bound_start_no_thread() && !slot.close_proved)
+                || self
+                    .terminals
+                    .get(&terminal_id)
+                    .is_some_and(|record| !record.handle.same_worker(&slot.handle))
+            {
+                return None;
+            }
+            self.bound_startup.remove(&terminal_id);
+            self.startup_custody.remove(&terminal_id);
+        }
         let record = self.terminals.remove(&terminal_id)?;
         self.notification_closed.remove(&terminal_id);
         if let Some(notifications) = &self.notifications {
@@ -1303,14 +1400,24 @@ impl HostState {
                 false,
             ));
         }
-        if self.terminals.len() + self.spawning.len() >= MAX_TERMINALS {
+        // A failed pre-thread publication may have only its independent slot;
+        // it still consumes finite admission until positive NoThread retirement.
+        let unpublished_bound = self
+            .bound_startup
+            .keys()
+            .filter(|id| !self.terminals.contains_key(id) && !self.spawning.contains(id))
+            .count();
+        if self.terminals.len() + self.spawning.len() + unpublished_bound >= MAX_TERMINALS {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::TerminalUnavailable,
                 "the cagents daemon reached its terminal limit",
                 true,
             ));
         }
-        if self.terminals.contains_key(&terminal_id) || !self.spawning.insert(terminal_id) {
+        if self.terminals.contains_key(&terminal_id)
+            || self.bound_startup.contains_key(&terminal_id)
+            || !self.spawning.insert(terminal_id)
+        {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::TerminalAlreadyExists,
                 format!("terminal {terminal_id} already exists"),
@@ -1342,6 +1449,7 @@ impl HostState {
             .get(id)
             .is_some_and(|record| record.running || !record.handle.is_completed())
             || self.spawning.contains(id)
+            || self.bound_startup.contains_key(id)
             || self
                 .chats
                 .get(id)
@@ -1992,9 +2100,95 @@ impl HostState {
 
     pub(super) fn startup_recovery(&self) -> Option<&str> {
         self.startup_recovery.as_deref().or_else(|| {
-            (!self.startup_custody.is_empty())
+            (!self.startup_custody.is_empty() || !self.bound_startup.is_empty())
                 .then_some("Original terminal ownership is awaiting its startup outcome")
         })
+    }
+
+    /// Internal pre-thread callback only. The fixed login is the issued launch;
+    /// it never enters Recovery.execution_recipe's exact-conversation policy.
+    pub(super) fn install_bound_start(
+        &mut self,
+        client: ClientId,
+        session: TerminalSession,
+        handle: &TerminalHandle,
+        admission: Arc<super::fresh_code::SpawnAdmission>,
+    ) -> Result<(), ProtocolError> {
+        let owner = admission.owner();
+        let id = session.id;
+        if self.shutting_down
+            || !self.spawning.contains(&id)
+            || self.terminals.contains_key(&id)
+            || self.bound_startup.contains_key(&id)
+            || owner.host != *self.proof
+            || owner.attempt.terminal_id != id
+            || &session.launch != admission.recipe()
+            || session.continuity.live_proof().as_ref() != Some(&owner.host)
+            || !handle.bound_start_matches(owner)
+            || !handle.bound_start_uses(&admission)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "The original bound startup slot changed before installation",
+                false,
+            ));
+        }
+        self.bound_startup.insert(
+            id,
+            BoundStartupSlot {
+                admission,
+                source: session.clone(),
+                handle: handle.clone(),
+                close_proved: false,
+            },
+        );
+        self.startup_custody.insert(id);
+        // Failure after insertion leaves the independently owned exact slot.
+        self.finish_spawn_with_execution(client, session, handle.clone(), false, None, None)?;
+        Ok(())
+    }
+
+    /// Observation returns only the original retained Handle. It performs no
+    /// constructor, registry phase mutation, probe, retry or cleanup.
+    pub(super) fn bound_start_handle(
+        &self,
+        owner: &crate::account::fresh_code::CodeOwner,
+    ) -> Option<TerminalHandle> {
+        let slot = self.bound_startup.get(&owner.attempt.terminal_id)?;
+        if !slot.handle.bound_start_matches(owner)
+            || !slot.handle.bound_start_uses(&slot.admission)
+            || self
+                .terminals
+                .get(&owner.attempt.terminal_id)
+                .is_some_and(|record| !record.handle.same_worker(&slot.handle))
+        {
+            return None;
+        }
+        Some(slot.handle.clone())
+    }
+
+    /// NoThread retires unused capacity; completed=true or an absent PID does
+    /// not enter this path. Durable owner/home history is deliberately retained.
+    pub(super) fn retire_bound_no_thread(
+        &mut self,
+        owner: &crate::account::fresh_code::CodeOwner,
+        expected: &TerminalHandle,
+    ) -> bool {
+        let Some(handle) = self.bound_start_handle(owner) else {
+            return false;
+        };
+        if !handle.same_worker(expected)
+            || !handle.bound_start_no_thread()
+            || !handle.bound_start_cleanup_settled()
+        {
+            return false;
+        }
+        let id = owner.attempt.terminal_id;
+        self.bound_startup.remove(&id);
+        self.startup_custody.remove(&id);
+        self.cancel_spawn(id);
+        self.retire_terminal(id);
+        true
     }
 
     pub(super) fn retain_startup_recovery(&mut self, message: String) {
@@ -2009,6 +2203,13 @@ impl HostState {
     }
 
     pub(super) fn startup_closed(&mut self, id: TerminalId, handle: &TerminalHandle) {
+        if self.bound_startup.get(&id).is_some_and(|slot| {
+            !slot.handle.same_worker(handle)
+                || !slot.close_proved
+                || !handle.bound_start_cleanup_settled()
+        }) {
+            return;
+        }
         if handle.is_completed()
             && self
                 .terminals
@@ -2035,7 +2236,9 @@ impl HostState {
     }
 
     pub(super) fn startup_blocks_shutdown(&self) -> bool {
-        !self.startup_custody.is_empty() || self.recovery_owns_work()
+        !self.startup_custody.is_empty()
+            || !self.bound_startup.is_empty()
+            || self.recovery_owns_work()
     }
 
     pub(crate) fn request_shutdown(&mut self) {

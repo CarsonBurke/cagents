@@ -1209,18 +1209,27 @@ fn login_caption(login: &Login) -> &'static str {
         LoginPhase::Verifying => "Checking which account signed in…",
         LoginPhase::Settling => "Saving…",
         LoginPhase::CallbackBlocked => account::login::PORT_BUSY,
+        LoginPhase::PreparingCode(_) => "Preparing a code sign-in…",
+        LoginPhase::CodeStarted => {
+            "Code sign-in opened. This failed browser sign-in can be dismissed."
+        }
+        LoginPhase::Dismissing(_) => "Removing cancelled sign-in…",
+        LoginPhase::DismissFailed => "Could not remove the cancelled sign-in. Retry dismissing it.",
     }
 }
 
 fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
     let phase = login_caption(login);
-    let account = widget::row::with_children(vec![
-        if login.phase == LoginPhase::CallbackBlocked {
+    let account: Element<'a, Message> = widget::row::with_children(vec![
+        if matches!(
+            login.phase,
+            LoginPhase::CallbackBlocked | LoginPhase::CodeStarted | LoginPhase::DismissFailed
+        ) {
             widget::icon(Icon::Warning.handle())
                 .size(design::ROW_ICON_SIZE)
                 .into()
         } else {
-            crate::ui_controls::activity_spinner(
+            crate::ui_controls::activity_spinner::<Message>(
                 f32::from(design::ROW_ICON_SIZE),
                 design::accent_color,
             )
@@ -1243,34 +1252,1080 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
     .spacing(design::GRID_UNIT * 2.5)
     .align_y(Alignment::Center)
     .into();
-    let cancel: Element<'a, Message> = if login.phase == LoginPhase::CallbackBlocked {
-        widget::row::with_children(vec![
-            crate::ui_controls::button::quiet("Use code")
-                .on_press(Message::AccountUi(Action::Add {
-                    provider: Provider::Codex,
-                    device: true,
-                }))
-                .into(),
-            crate::ui_controls::icon_button(Icon::Close, "Dismiss failed sign-in")
+    let cancel: Element<'a, Message> =
+        if login.phase == LoginPhase::CallbackBlocked && login.provider == Provider::Codex {
+            widget::row::with_children(vec![
+                crate::ui_controls::button::quiet("Use code")
+                    .on_press(Message::AccountUi(Action::UseCodeForBlockedLogin(
+                        login.key,
+                    )))
+                    .into(),
+                crate::ui_controls::icon_button(Icon::Close, "Dismiss failed sign-in")
+                    .compact()
+                    .on_press(Message::AccountUi(Action::CancelLogin(login.key)))
+                    .into(),
+            ])
+            .into()
+        } else if matches!(
+            login.phase,
+            LoginPhase::Waiting
+                | LoginPhase::PreparingCode(_)
+                | LoginPhase::CallbackBlocked
+                | LoginPhase::CodeStarted
+                | LoginPhase::DismissFailed
+        ) {
+            let label = match login.phase {
+                LoginPhase::DismissFailed => "Retry dismissing sign-in",
+                LoginPhase::CallbackBlocked | LoginPhase::CodeStarted => "Dismiss failed sign-in",
+                _ => "Cancel sign-in",
+            };
+            crate::ui_controls::icon_button(Icon::Close, label)
                 .compact()
                 .on_press(Message::AccountUi(Action::CancelLogin(login.key)))
+                .into()
+        } else {
+            iced::widget::Space::new().into()
+        };
+    // Recovery controls need their intrinsic width. Ordinary account rows
+    // keep the table's fixed action column.
+    let row = widget::container(
+        widget::row::with_children(vec![
+            widget::container(account)
+                .width(Length::Fill)
+                .center_y(Length::Fill)
+                .into(),
+            widget::container(cancel)
+                .width(Length::Shrink)
+                .center_y(Length::Fill)
                 .into(),
         ])
-        .into()
-    } else if login.phase == LoginPhase::Waiting {
-        crate::ui_controls::icon_button(Icon::Close, "Cancel sign-in")
-            .compact()
-            .on_press(Message::AccountUi(Action::CancelLogin(login.key)))
-            .into()
-    } else {
-        iced::widget::Space::new().into()
-    };
-    line(account, Vec::new(), cancel, ROW_HEIGHT)
+        .spacing(COLUMN_SPACING)
+        .height(ROW_HEIGHT),
+    )
+    .padding([0.0, space::M]);
+    crate::ui_controls::owned((login.key, login.phase, login.provider), row)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Completion messages below are explicit component fixtures. Every real
+    // preparation, cleanup and terminal task is kept unpolled; these tests
+    // establish reducer/widget custody, not discovery or authentication.
+    fn blocked_login(key: u128) -> Login {
+        let key = uuid::Uuid::from_u128(key);
+        Login {
+            provider: Provider::Codex,
+            key,
+            home: PathBuf::from("/cagents-fixture/accounts/codex").join(key.to_string()),
+            phase: LoginPhase::CallbackBlocked,
+            attempts: 0,
+            next_check: 0,
+            started_at: 0,
+            recovered: false,
+        }
+    }
+
+    fn recovery_app() -> Cagents {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.account_ui.homes = Some(Homes::at("/cagents-fixture/accounts"));
+        app.account_ui.logins.push(blocked_login(195401));
+        app
+    }
+
+    // Capture the production row's mouse callback, rather than inventing an
+    // action that could conceal an unkeyed Add control in the rendered row.
+    fn click_login_control(login: &Login, label: &str) -> Action {
+        use iced::advanced::clipboard;
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        use iced::{Event, Size, mouse};
+
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut ui = UserInterface::build(
+            login_row(login),
+            Size::new(1000.0, 200.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        ui.draw(
+            &mut renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            mouse::Cursor::Unavailable,
+        );
+        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some(label))
+            .unwrap_or_else(|| panic!("missing actual login control: {label}"))
+            .node()
+            .bounds()
+            .unwrap();
+        assert!(bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0);
+        let point = iced::Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(messages.len(), 1, "actual {label} callback: {messages:?}");
+        match messages.pop().unwrap() {
+            Message::AccountUi(action) => action,
+            message => panic!("unexpected login callback: {message:?}"),
+        }
+    }
+
+    fn phase(app: &Cagents, key: uuid::Uuid) -> LoginPhase {
+        app.account_ui
+            .logins
+            .iter()
+            .find(|login| login.key == key)
+            .unwrap()
+            .phase
+    }
+
+    fn preparation(app: &Cagents, key: uuid::Uuid) -> uuid::Uuid {
+        let LoginPhase::PreparingCode(request) = phase(app, key) else {
+            panic!("expected a reserved code preparation");
+        };
+        request
+    }
+
+    fn dismissal(app: &Cagents, key: uuid::Uuid) -> uuid::Uuid {
+        let LoginPhase::Dismissing(request) = phase(app, key) else {
+            panic!("expected a reserved dismissal");
+        };
+        request
+    }
+
+    fn replacement_popup(app: &mut Cagents) {
+        drop(app.update_account_ui(Action::AddMenu(true)));
+        assert!(app.account_ui.table.add_menu);
+    }
+
+    fn draw_recovery_ui(
+        ui: &mut iced::runtime::UserInterface<'_, Message, cosmic::Theme, cosmic::Renderer>,
+        renderer: &mut cosmic::Renderer,
+    ) {
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            iced::mouse::Cursor::Unavailable,
+        );
+    }
+
+    fn cached_recovery_row<'a>(
+        login: &'a Login,
+        width: f32,
+        cache: iced::runtime::user_interface::Cache,
+        renderer: &mut cosmic::Renderer,
+    ) -> iced::runtime::UserInterface<'a, Message, cosmic::Theme, cosmic::Renderer> {
+        let mut ui = iced::runtime::UserInterface::build(
+            login_row(login),
+            iced::Size::new(width, 200.0),
+            cache,
+            renderer,
+        );
+        draw_recovery_ui(&mut ui, renderer);
+        ui
+    }
+
+    fn recovery_control(
+        ui: &iced::runtime::UserInterface<'_, Message, cosmic::Theme, cosmic::Renderer>,
+        label: &str,
+    ) -> iced::Rectangle {
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some(label))
+            .unwrap_or_else(|| panic!("missing cached recovery control: {label}"))
+            .node()
+            .bounds()
+            .unwrap();
+        iced::Rectangle {
+            x: bounds.x0 as f32,
+            y: bounds.y0 as f32,
+            width: (bounds.x1 - bounds.x0) as f32,
+            height: (bounds.y1 - bounds.y0) as f32,
+        }
+    }
+
+    fn recovery_mouse(
+        ui: &mut iced::runtime::UserInterface<'_, Message, cosmic::Theme, cosmic::Renderer>,
+        renderer: &mut cosmic::Renderer,
+        point: iced::Point,
+        buttons: &[iced::mouse::Event],
+    ) -> Vec<Message> {
+        let events = std::iter::once(iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: point,
+        }))
+        .chain(buttons.iter().cloned().map(iced::Event::Mouse))
+        .collect::<Vec<_>>();
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &events,
+            iced::mouse::Cursor::Available(point),
+            renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        draw_recovery_ui(ui, renderer);
+        messages
+    }
+
+    fn assert_recovery_callback(messages: &[Message], label: &str, key: uuid::Uuid) {
+        if label == "Use code" {
+            assert!(matches!(messages,
+                [Message::AccountUi(Action::UseCodeForBlockedLogin(actual))] if *actual == key));
+        } else {
+            assert!(matches!(messages,
+                [Message::AccountUi(Action::CancelLogin(actual))] if *actual == key));
+        }
+    }
+
+    #[test]
+    fn full_accounts_table_contains_disjoint_recovery_controls_at_narrow_and_wide_widths() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::{UserInterface, user_interface::Cache};
+
+        let mut renderer = crate::app::tests::headless_renderer();
+        let token = uuid::Uuid::from_u128(195420);
+        let cases: [(LoginPhase, &str, &[&str]); 6] = [
+            (
+                LoginPhase::CallbackBlocked,
+                account::login::PORT_BUSY,
+                &["Use code", "Dismiss failed sign-in"],
+            ),
+            (
+                LoginPhase::PreparingCode(token),
+                "Preparing a code sign-in…",
+                &["Cancel sign-in"],
+            ),
+            (
+                LoginPhase::CodeStarted,
+                "Code sign-in opened. This failed browser sign-in can be dismissed.",
+                &["Dismiss failed sign-in"],
+            ),
+            (
+                LoginPhase::Dismissing(token),
+                "Removing cancelled sign-in…",
+                &[],
+            ),
+            (
+                LoginPhase::DismissFailed,
+                "Could not remove the cancelled sign-in. Retry dismissing it.",
+                &["Retry dismissing sign-in"],
+            ),
+            (
+                LoginPhase::Waiting,
+                "Finish signing in in the terminal. Closing it cancels.",
+                &["Cancel sign-in"],
+            ),
+        ];
+        for width in [300.0, 1000.0] {
+            for populated in [false, true] {
+                for (phase, caption, expected) in cases {
+                    let mut app = recovery_app();
+                    app.account_ui.accounts.clear();
+                    if populated {
+                        for (provider, key) in
+                            [(Provider::Claude, 195421), (Provider::Codex, 195422)]
+                        {
+                            let id = app.account_ui.add_managed_fixture(provider, key);
+                            app.account_ui.set_fixture_label(
+                                &id,
+                                Some("A deliberately long healthy account name beside recovery"),
+                            );
+                        }
+                    }
+                    let key = app.account_ui.logins[0].key;
+                    // Static layout fixtures for each state; the surrounding
+                    // component parents exercise their real task admission.
+                    app.account_ui.logins[0].phase = phase;
+                    let size = iced::Size::new(width, 1600.0);
+                    // The production responsive view includes the toolbar,
+                    // provider groups, ordinary rows, and real scrollable.
+                    let mut ui =
+                        UserInterface::build(view(&app), size, Cache::new(), &mut renderer);
+                    draw_recovery_ui(&mut ui, &mut renderer);
+                    let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+                    let nodes = nodes
+                        .root()
+                        .iter()
+                        .chain(nodes.children())
+                        .collect::<Vec<_>>();
+                    assert!(
+                        nodes.iter().any(|node| node.node().label() == Some(caption)
+                            || node.node().value() == Some(caption)),
+                        "missing recovery status {phase:?} at {width}"
+                    );
+                    let buttons = nodes
+                        .iter()
+                        .filter(|node| {
+                            node.node().role() == iced_accessibility::accesskit::Role::Button
+                        })
+                        .map(|node| {
+                            let label = node.node().label().unwrap_or("unlabelled").to_owned();
+                            let bounds = node.node().bounds().unwrap();
+                            (
+                                label,
+                                iced::Rectangle {
+                                    x: bounds.x0 as f32,
+                                    y: bounds.y0 as f32,
+                                    width: (bounds.x1 - bounds.x0) as f32,
+                                    height: (bounds.y1 - bounds.y0) as f32,
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        buttons
+                            .iter()
+                            .filter(|(label, _)| label == "Account actions")
+                            .count(),
+                        if populated { 2 } else { 0 }
+                    );
+                    for (index, (label, bounds)) in buttons.iter().enumerate() {
+                        assert!(
+                            bounds.width > 0.0
+                                && bounds.height > 0.0
+                                && bounds.x >= -0.5
+                                && bounds.y >= -0.5
+                                && bounds.x + bounds.width <= width + 0.5
+                                && bounds.y + bounds.height <= size.height + 0.5,
+                            "full-table target escapes {width}px viewport: {label} {bounds:?}, {phase:?}"
+                        );
+                        for (other, next) in &buttons[index + 1..] {
+                            let overlap_x = (bounds.x + bounds.width).min(next.x + next.width)
+                                - bounds.x.max(next.x);
+                            let overlap_y = (bounds.y + bounds.height).min(next.y + next.height)
+                                - bounds.y.max(next.y);
+                            assert!(
+                                overlap_x <= 0.5 || overlap_y <= 0.5,
+                                "full-table targets overlap at {width}: {label} {bounds:?} / {other} {next:?}"
+                            );
+                        }
+                    }
+                    let control_labels = [
+                        "Use code",
+                        "Dismiss failed sign-in",
+                        "Cancel sign-in",
+                        "Retry dismissing sign-in",
+                    ];
+                    let actual = buttons
+                        .iter()
+                        .filter(|(label, _)| control_labels.contains(&label.as_str()))
+                        .map(|(label, _)| label.as_str())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual, expected,
+                        "recovery actions for {phase:?} at {width}"
+                    );
+                    let mut captured = Vec::new();
+                    for label in expected {
+                        let point = recovery_control(&ui, label).center();
+                        let messages = recovery_mouse(
+                            &mut ui,
+                            &mut renderer,
+                            point,
+                            &[
+                                Event::ButtonPressed(Button::Left),
+                                Event::ButtonReleased(Button::Left),
+                            ],
+                        );
+                        assert_recovery_callback(&messages, label, key);
+                        captured.extend(messages);
+                    }
+                    drop(ui);
+                    let held = captured
+                        .into_iter()
+                        .map(|message| match message {
+                            Message::AccountUi(action) => app.update_account_ui(action),
+                            _ => unreachable!("only row callbacks were captured"),
+                        })
+                        .collect::<Vec<_>>();
+                    // Applying a captured action only constructs its task.
+                    // Neither discovery nor cleanup/authentication is polled.
+                    drop(held);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_held_recovery_press_cannot_transfer_to_another_login_or_provider() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+
+        let mut renderer = crate::app::tests::headless_renderer();
+        for width in [300.0, 1000.0] {
+            let first = blocked_login(195430);
+            let mut other_provider = first.clone();
+            other_provider.provider = Provider::Claude;
+            other_provider.home =
+                PathBuf::from("/cagents-fixture/accounts/claude").join(first.key.to_string());
+            for (next, label, next_label) in [
+                (blocked_login(195431), "Use code", "Use code"),
+                (
+                    blocked_login(195432),
+                    "Dismiss failed sign-in",
+                    "Dismiss failed sign-in",
+                ),
+                (
+                    other_provider,
+                    "Dismiss failed sign-in",
+                    "Dismiss failed sign-in",
+                ),
+            ] {
+                let mut ui = cached_recovery_row(&first, width, Cache::new(), &mut renderer);
+                let point = recovery_control(&ui, label).center();
+                assert!(
+                    recovery_mouse(
+                        &mut ui,
+                        &mut renderer,
+                        point,
+                        &[Event::ButtonPressed(Button::Left)]
+                    )
+                    .is_empty()
+                );
+                let cache = ui.into_cache();
+                let mut ui = cached_recovery_row(&next, width, cache, &mut renderer);
+                let point = recovery_control(&ui, next_label).center();
+                assert!(
+                    recovery_mouse(
+                        &mut ui,
+                        &mut renderer,
+                        point,
+                        &[Event::ButtonReleased(Button::Left)]
+                    )
+                    .is_empty(),
+                    "held {label} transferred ownership at {width}px"
+                );
+                let messages = recovery_mouse(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[
+                        Event::ButtonPressed(Button::Left),
+                        Event::ButtonReleased(Button::Left),
+                    ],
+                );
+                assert_recovery_callback(&messages, next_label, next.key);
+                drop(ui);
+                let mut app = recovery_app();
+                app.account_ui.logins = vec![next];
+                let Message::AccountUi(action) = messages.into_iter().next().unwrap() else {
+                    unreachable!()
+                };
+                let held = app.update_account_ui(action);
+                assert_eq!(held.units(), 1, "fresh replacement press remains usable");
+                drop(held);
+            }
+        }
+    }
+
+    #[test]
+    fn a_held_cancel_press_cannot_transfer_across_code_preparation_retry() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+
+        let mut renderer = crate::app::tests::headless_renderer();
+        for width in [300.0, 1000.0] {
+            let mut app = recovery_app();
+            let key = app.account_ui.logins[0].key;
+            let code = click_login_control(&app.account_ui.logins[0], "Use code");
+            let first_held = app.update_account_ui(code);
+            let first = preparation(&app, key);
+            let mut ui = cached_recovery_row(
+                &app.account_ui.logins[0],
+                width,
+                Cache::new(),
+                &mut renderer,
+            );
+            let point = recovery_control(&ui, "Cancel sign-in").center();
+            assert!(
+                recovery_mouse(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)]
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            // A labeled component failure retires the captured preparation;
+            // neither its held producer nor the retry producer is executed.
+            drop(app.update_account_ui(Action::HomeReady {
+                request: first,
+                result: Err("captured preparation failed during held press".into()),
+            }));
+            let code = click_login_control(&app.account_ui.logins[0], "Use code");
+            let retry_held = app.update_account_ui(code);
+            let retry = preparation(&app, key);
+            assert_ne!(first, retry);
+            let mut ui =
+                cached_recovery_row(&app.account_ui.logins[0], width, cache, &mut renderer);
+            let point = recovery_control(&ui, "Cancel sign-in").center();
+            assert!(
+                recovery_mouse(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonReleased(Button::Left)]
+                )
+                .is_empty(),
+                "the previous preparation's press must not cancel the retry"
+            );
+            assert_eq!(preparation(&app, key), retry);
+            let fresh = recovery_mouse(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[
+                    Event::ButtonPressed(Button::Left),
+                    Event::ButtonReleased(Button::Left),
+                ],
+            );
+            assert_recovery_callback(&fresh, "Cancel sign-in", key);
+            drop(ui);
+            let Message::AccountUi(cancel) = fresh.into_iter().next().unwrap() else {
+                unreachable!()
+            };
+            let cancel_held = app.update_account_ui(cancel);
+            assert!(app.account_ui.home_requests[&retry].cancelled);
+            assert!(matches!(phase(&app, key), LoginPhase::Dismissing(_)));
+            drop((first_held, retry_held, cancel_held));
+        }
+    }
+
+    #[test]
+    fn a_held_recovery_press_cannot_transfer_across_admission_and_dismissal_failure() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+
+        let mut renderer = crate::app::tests::headless_renderer();
+        for width in [300.0, 1000.0] {
+            let mut app = recovery_app();
+            let key = app.account_ui.logins[0].key;
+            let code = click_login_control(&app.account_ui.logins[0], "Use code");
+            let mut ui = cached_recovery_row(
+                &app.account_ui.logins[0],
+                width,
+                Cache::new(),
+                &mut renderer,
+            );
+            let point = recovery_control(&ui, "Dismiss failed sign-in").center();
+            assert!(
+                recovery_mouse(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)]
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            let code_held = app.update_account_ui(code);
+            let preparation = preparation(&app, key);
+            let mut ui =
+                cached_recovery_row(&app.account_ui.logins[0], width, cache, &mut renderer);
+            let point = recovery_control(&ui, "Cancel sign-in").center();
+            assert!(
+                recovery_mouse(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonReleased(Button::Left)]
+                )
+                .is_empty(),
+                "a blocked-row Dismiss press must not transfer to code preparation"
+            );
+            assert!(
+                recovery_mouse(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)]
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            let cancel = click_login_control(&app.account_ui.logins[0], "Cancel sign-in");
+            let cancel_held = app.update_account_ui(cancel);
+            let request = dismissal(&app, key);
+            assert!(app.account_ui.home_requests[&preparation].cancelled);
+            // A fast explicit component failure can arrive before a frame
+            // shows Dismissing. The old press still must not become Retry.
+            drop(app.update_account_ui(Action::LoginDismissed {
+                key,
+                request,
+                result: Err("captured dismissal failed during held press".into()),
+            }));
+            let mut ui =
+                cached_recovery_row(&app.account_ui.logins[0], width, cache, &mut renderer);
+            let point = recovery_control(&ui, "Retry dismissing sign-in").center();
+            assert!(
+                recovery_mouse(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonReleased(Button::Left)]
+                )
+                .is_empty(),
+                "the preparation's Cancel press must not transfer to dismissal Retry"
+            );
+            let retry = recovery_mouse(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[
+                    Event::ButtonPressed(Button::Left),
+                    Event::ButtonReleased(Button::Left),
+                ],
+            );
+            assert_recovery_callback(&retry, "Retry dismissing sign-in", key);
+            drop(ui);
+            let Message::AccountUi(action) = retry.into_iter().next().unwrap() else {
+                unreachable!()
+            };
+            let retry_held = app.update_account_ui(action);
+            assert!(matches!(phase(&app, key), LoginPhase::Dismissing(_)));
+            drop((code_held, cancel_held, retry_held));
+        }
+    }
+
+    #[test]
+    fn an_unchanged_recovery_owner_keeps_a_valid_press_across_cached_rebuilds() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+
+        let mut renderer = crate::app::tests::headless_renderer();
+        for width in [300.0, 1000.0] {
+            for label in ["Use code", "Dismiss failed sign-in"] {
+                let first = blocked_login(195440);
+                let mut next = first.clone();
+                next.attempts = 2;
+                next.next_check = 123;
+                let mut ui = cached_recovery_row(&first, width, Cache::new(), &mut renderer);
+                let point = recovery_control(&ui, label).center();
+                assert!(
+                    recovery_mouse(
+                        &mut ui,
+                        &mut renderer,
+                        point,
+                        &[Event::ButtonPressed(Button::Left)]
+                    )
+                    .is_empty()
+                );
+                let cache = ui.into_cache();
+                let mut ui = cached_recovery_row(&next, width, cache, &mut renderer);
+                assert!(recovery_control(&ui, label).contains(point));
+                let release = recovery_mouse(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonReleased(Button::Left)],
+                );
+                assert_recovery_callback(&release, label, first.key);
+                drop(ui);
+                let mut app = recovery_app();
+                app.account_ui.logins = vec![next];
+                let Message::AccountUi(action) = release.into_iter().next().unwrap() else {
+                    unreachable!()
+                };
+                let held = app.update_account_ui(action);
+                assert_eq!(held.units(), 1);
+                drop(held);
+            }
+        }
+    }
+
+    #[test]
+    fn a_code_recovery_is_reserved_before_its_real_task_is_polled() {
+        let mut app = recovery_app();
+        let key = app.account_ui.logins[0].key;
+        let code = click_login_control(&app.account_ui.logins[0], "Use code");
+        assert!(matches!(code, Action::UseCodeForBlockedLogin(owner) if owner == key));
+        assert!(code.blocked_while_modal());
+        let held = app.update_account_ui(code.clone());
+        assert_eq!(held.units(), 1);
+        let request = preparation(&app, key);
+        assert_eq!(app.account_ui.home_requests.len(), 1);
+        assert_eq!(
+            app.account_ui.home_requests[&request].blocked_login,
+            Some(key)
+        );
+        replacement_popup(&mut app);
+        app.status = Some(TransientNotice::warning("unrelated popup notice"));
+        let notice = app.status.clone();
+        let registry = app.account_ui.registry.clone();
+        let cards = app.durable.cards.len();
+        assert_eq!(app.update_account_ui(code).units(), 0);
+        assert!(app.account_ui.table.add_menu);
+        assert_eq!(app.status, notice);
+        assert_eq!(app.account_ui.registry, registry);
+        assert_eq!(app.durable.cards.len(), cards);
+        assert_eq!(preparation(&app, key), request);
+        assert_eq!(app.account_ui.home_requests.len(), 1);
+        // No discovery, creation, provider or authority checks run: held is
+        // the real action's future, and it is never polled.
+        drop(held);
+    }
+
+    #[test]
+    fn a_code_failure_releases_only_its_request_and_an_old_reply_cannot_end_retry() {
+        let mut app = recovery_app();
+        app.account_ui.logins.push(blocked_login(195402));
+        let key = app.account_ui.logins[0].key;
+        let other = app.account_ui.logins[1].key;
+        let code = click_login_control(&app.account_ui.logins[0], "Use code");
+        let held = app.update_account_ui(code.clone());
+        let request = preparation(&app, key);
+        let other_code = click_login_control(&app.account_ui.logins[1], "Use code");
+        let other_held = app.update_account_ui(other_code);
+        let other_request = preparation(&app, other);
+        replacement_popup(&mut app);
+        // Explicit component completion for the captured request. The held
+        // producer is not executed, so this is not provider failure evidence.
+        drop(app.update_account_ui(Action::HomeReady {
+            request,
+            result: Err("captured first preparation failure".into()),
+        }));
+        assert_eq!(phase(&app, key), LoginPhase::CallbackBlocked);
+        assert_eq!(preparation(&app, other), other_request);
+        assert!(app.account_ui.home_requests.contains_key(&other_request));
+        assert!(!app.account_ui.home_requests.contains_key(&request));
+        assert!(app.account_ui.table.add_menu);
+        let notice = app.status.as_ref().unwrap();
+        assert_eq!(notice.key, Some(NoticeKey::SignIn(key)));
+        assert_eq!(
+            notice.details.as_deref(),
+            Some("captured first preparation failure")
+        );
+        let retry = click_login_control(&app.account_ui.logins[0], "Use code");
+        let retry_held = app.update_account_ui(retry);
+        let retry_request = preparation(&app, key);
+        assert_ne!(retry_request, request);
+        replacement_popup(&mut app);
+        let notice = app.status.clone();
+        assert_eq!(
+            app.update_account_ui(Action::HomeReady {
+                request,
+                result: Err("replayed old failure".into()),
+            })
+            .units(),
+            0
+        );
+        assert_eq!(preparation(&app, key), retry_request);
+        assert_eq!(preparation(&app, other), other_request);
+        assert_eq!(app.account_ui.home_requests.len(), 2);
+        assert!(app.account_ui.table.add_menu);
+        assert_eq!(app.status, notice);
+        drop((held, other_held, retry_held));
+    }
+
+    #[test]
+    fn dismissal_reserves_before_settlement_and_failed_cleanup_is_explicitly_retryable() {
+        let mut app = recovery_app();
+        let key = app.account_ui.logins[0].key;
+        let code = click_login_control(&app.account_ui.logins[0], "Use code");
+        let cancel = click_login_control(&app.account_ui.logins[0], "Dismiss failed sign-in");
+        let held = app.update_account_ui(cancel.clone());
+        assert_eq!(held.units(), 1);
+        let request = dismissal(&app, key);
+        replacement_popup(&mut app);
+        assert_eq!(app.update_account_ui(code.clone()).units(), 0);
+        assert_eq!(app.update_account_ui(cancel).units(), 0);
+        // Older unscoped verification/settlement callbacks cannot take this
+        // new dismissal's custody or turn it back into automatic probing.
+        assert_eq!(
+            app.update_account_ui(Action::LoginVerified {
+                key,
+                outcome: Outcome::Busy
+            })
+            .units(),
+            0
+        );
+        assert_eq!(
+            app.update_account_ui(Action::LoginSettled {
+                key,
+                result: Ok(Settled::Abandoned(None)),
+            })
+            .units(),
+            0
+        );
+        assert_eq!(dismissal(&app, key), request);
+        assert_eq!(app.update_account_ui(Action::LoginTick).units(), 0);
+        assert!(app.account_ui.table.add_menu);
+        drop(app.update_account_ui(Action::LoginDismissed {
+            key,
+            request,
+            result: Err("captured dismissal failure".into()),
+        }));
+        assert_eq!(phase(&app, key), LoginPhase::DismissFailed);
+        assert_eq!(
+            app.status.as_ref().unwrap().details.as_deref(),
+            Some("captured dismissal failure")
+        );
+        assert_eq!(app.update_account_ui(code).units(), 0);
+        assert_eq!(app.update_account_ui(Action::LoginTick).units(), 0);
+        let retry = click_login_control(&app.account_ui.logins[0], "Retry dismissing sign-in");
+        let retry_held = app.update_account_ui(retry);
+        assert_eq!(retry_held.units(), 1);
+        let retry_request = dismissal(&app, key);
+        assert_ne!(retry_request, request);
+        let notice = app.status.clone();
+        drop(app.update_account_ui(Action::LoginDismissed {
+            key,
+            request,
+            result: Ok(None),
+        }));
+        assert_eq!(dismissal(&app, key), retry_request);
+        assert_eq!(app.status, notice);
+        assert!(app.account_ui.table.add_menu);
+        drop(app.update_account_ui(Action::LoginDismissed {
+            key,
+            request: retry_request,
+            result: Ok(None),
+        }));
+        assert!(app.account_ui.logins.is_empty());
+        assert!(app.account_ui.home_requests.is_empty());
+        assert!(app.account_ui.table.add_menu);
+        drop((held, retry_held));
+    }
+
+    #[test]
+    fn a_cancelled_code_success_keeps_its_late_home_cleanup_owned_and_retryable() {
+        let mut app = recovery_app();
+        let key = app.account_ui.logins[0].key;
+        let code = click_login_control(&app.account_ui.logins[0], "Use code");
+        let held = app.update_account_ui(code.clone());
+        let request = preparation(&app, key);
+        let cancel = click_login_control(&app.account_ui.logins[0], "Cancel sign-in");
+        let dismissal_held = app.update_account_ui(cancel);
+        let dismiss_request = dismissal(&app, key);
+        assert!(app.account_ui.home_requests[&request].cancelled);
+        assert_eq!(app.update_account_ui(code).units(), 0);
+        drop(app.update_account_ui(Action::LoginDismissed {
+            key,
+            request: dismiss_request,
+            result: Ok(None),
+        }));
+        assert!(app.account_ui.logins.is_empty());
+        assert!(app.account_ui.home_requests.contains_key(&request));
+        app.account_ui.logins.push(blocked_login(195403));
+        let other = app.account_ui.logins[0].key;
+        replacement_popup(&mut app);
+        let late = blocked_login(195404);
+        let prepared = (late.key, late.home.clone(), PathBuf::from("/fixture/codex"));
+        let cards = app.durable.cards.len();
+        let cleanup_held = app.update_account_ui(Action::HomeReady {
+            request,
+            result: Ok(prepared.clone()),
+        });
+        assert_eq!(cleanup_held.units(), 1);
+        let cleanup_request = dismissal(&app, late.key);
+        assert_eq!(phase(&app, other), LoginPhase::CallbackBlocked);
+        assert_eq!(
+            app.durable.cards.len(),
+            cards,
+            "cancelled success cannot open a terminal"
+        );
+        assert!(app.account_ui.home_requests.is_empty());
+        assert!(app.account_ui.table.add_menu);
+        assert_eq!(
+            app.update_account_ui(Action::HomeReady {
+                request,
+                result: Ok(prepared)
+            })
+            .units(),
+            0
+        );
+        assert_eq!(dismissal(&app, late.key), cleanup_request);
+        assert_eq!(app.account_ui.logins.len(), 2);
+        drop(app.update_account_ui(Action::LoginDismissed {
+            key: late.key,
+            request: cleanup_request,
+            result: Err("captured late-home cleanup failure".into()),
+        }));
+        assert_eq!(phase(&app, late.key), LoginPhase::DismissFailed);
+        assert_eq!(
+            app.status.as_ref().unwrap().key,
+            Some(NoticeKey::SignIn(late.key))
+        );
+        assert_eq!(
+            app.status.as_ref().unwrap().details.as_deref(),
+            Some("captured late-home cleanup failure")
+        );
+        assert_eq!(app.update_account_ui(Action::LoginTick).units(), 0);
+        let retry = click_login_control(
+            app.account_ui
+                .logins
+                .iter()
+                .find(|login| login.key == late.key)
+                .unwrap(),
+            "Retry dismissing sign-in",
+        );
+        let retry_held = app.update_account_ui(retry);
+        let retry_request = dismissal(&app, late.key);
+        drop(app.update_account_ui(Action::LoginDismissed {
+            key: late.key,
+            request: cleanup_request,
+            result: Ok(None),
+        }));
+        assert_eq!(dismissal(&app, late.key), retry_request);
+        drop(app.update_account_ui(Action::LoginDismissed {
+            key: late.key,
+            request: retry_request,
+            result: Ok(None),
+        }));
+        assert_eq!(app.account_ui.logins.len(), 1);
+        assert_eq!(phase(&app, other), LoginPhase::CallbackBlocked);
+        assert!(app.account_ui.table.add_menu);
+        assert_eq!(app.durable.cards.len(), cards);
+        drop((held, dismissal_held, cleanup_held, retry_held));
+    }
+
+    #[test]
+    fn home_callbacks_keep_the_same_request_and_consumed_login_custody() {
+        for remote_completion in [false, true] {
+            let mut app = recovery_app();
+            let key = app.account_ui.logins[0].key;
+            let code = click_login_control(&app.account_ui.logins[0], "Use code");
+            let held = app.update_account_ui(code.clone());
+            let request = preparation(&app, key);
+            // Both completion adapters are component inputs. Neither local
+            // discovery nor remote Create/service authentication is executed.
+            let failure = if remote_completion {
+                Action::RemoteHomeReady {
+                    request,
+                    result: Err("captured remote preparation failure".into()),
+                }
+            } else {
+                Action::HomeReady {
+                    request,
+                    result: Err("captured local preparation failure".into()),
+                }
+            };
+            drop(app.update_account_ui(failure));
+            assert_eq!(phase(&app, key), LoginPhase::CallbackBlocked);
+            assert_eq!(
+                app.status.as_ref().unwrap().key,
+                Some(NoticeKey::SignIn(key))
+            );
+            let retry = click_login_control(&app.account_ui.logins[0], "Use code");
+            let retry_held = app.update_account_ui(retry);
+            let retry_request = preparation(&app, key);
+            replacement_popup(&mut app);
+            let ready = blocked_login(195405);
+            let recipe = login_launch(
+                &ready.account(),
+                Path::new("/fixture/codex"),
+                PathBuf::from("/fixture/reader"),
+                true,
+            )
+            .unwrap();
+            let success = |request| {
+                if remote_completion {
+                    Action::RemoteHomeReady {
+                        request,
+                        result: Ok(crate::account::remote::Created {
+                            key: ready.key,
+                            home: ready.home.clone(),
+                            recipe: recipe.clone(),
+                        }),
+                    }
+                } else {
+                    Action::HomeReady {
+                        request,
+                        result: Ok((
+                            ready.key,
+                            ready.home.clone(),
+                            PathBuf::from("/fixture/codex"),
+                        )),
+                    }
+                }
+            };
+            let cards = app.durable.cards.len();
+            assert_eq!(app.update_account_ui(success(request)).units(), 0);
+            assert_eq!(preparation(&app, key), retry_request);
+            assert_eq!(app.durable.cards.len(), cards);
+            assert!(app.account_ui.table.add_menu);
+            let launch_held = app.update_account_ui(success(retry_request));
+            assert_eq!(phase(&app, key), LoginPhase::CodeStarted);
+            assert!(!app.notice_stands(NoticeKey::SignIn(key)));
+            assert_eq!(phase(&app, ready.key), LoginPhase::Waiting);
+            assert_eq!(app.durable.cards.len(), cards + 1);
+            assert!(app.account_ui.home_requests.is_empty());
+            assert!(app.account_ui.table.add_menu);
+            let card = app.sign_in_card(Provider::Codex, &ready.home).unwrap();
+            let CardKind::Terminal(session) = &app.card_state(card).unwrap().kind else {
+                panic!("component completion must prepare a sign-in terminal");
+            };
+            assert_eq!(session.launch.arguments, ["login", "--device-auth"]);
+            assert_eq!(
+                session.launch.environment["CODEX_HOME"],
+                ready.home.display().to_string()
+            );
+            assert_eq!(app.update_account_ui(code).units(), 0);
+            assert_eq!(app.update_account_ui(success(retry_request)).units(), 0);
+            assert_eq!(app.durable.cards.len(), cards + 1);
+            let dismiss = click_login_control(
+                app.account_ui
+                    .logins
+                    .iter()
+                    .find(|login| login.key == key)
+                    .unwrap(),
+                "Dismiss failed sign-in",
+            );
+            let dismiss_held = app.update_account_ui(dismiss);
+            assert!(matches!(phase(&app, key), LoginPhase::Dismissing(_)));
+            assert_eq!(phase(&app, ready.key), LoginPhase::Waiting);
+            drop((held, retry_held, launch_held, dismiss_held));
+        }
+    }
+
+    #[test]
+    fn a_blocked_code_callback_requires_its_current_login_provider_and_phase() {
+        let mut app = recovery_app();
+        let code = click_login_control(&app.account_ui.logins[0], "Use code");
+        let original = app.account_ui.logins[0].clone();
+        let cards = app.durable.cards.len();
+        for replacement in [
+            blocked_login(195499),
+            Login {
+                provider: Provider::Claude,
+                ..original.clone()
+            },
+            Login {
+                phase: LoginPhase::Waiting,
+                ..original.clone()
+            },
+        ] {
+            app.account_ui.logins = vec![replacement];
+            replacement_popup(&mut app);
+            assert_eq!(app.update_account_ui(code.clone()).units(), 0);
+            assert!(app.account_ui.home_requests.is_empty());
+            assert!(app.account_ui.table.add_menu);
+            assert_eq!(app.durable.cards.len(), cards);
+        }
+    }
 
     #[test]
     fn a_sign_in_waiting_to_be_asked_again_no_longer_points_at_its_terminal() {
