@@ -430,10 +430,11 @@ esac
         } else if matches!(failure, "outer-signal" | "outer-signal-invalid-target") {
             r#"target=$(cat "$FIXTURE_OUTER_PID_FILE") || exit 97
 if [ "$FIXTURE_REJECT_SIGNAL" = true ]; then target=not-a-pid; fi
+send_term() { [ "$FIXTURE_REJECT_SIGNAL" != true ] || return 1; kill -TERM "$target"; }
 # Successful delivery makes the outer installer cancel this tool's group.
 # Keep that TERM from interrupting the builtin send-and-record section.
 trap '' TERM
-if ! kill -TERM "$target"; then
+if ! send_term; then
   printf '%s\n' "$target" > "$FIXTURE_SIGNAL_REJECTED"
   exit 97
 fi
