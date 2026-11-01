@@ -12,6 +12,7 @@ enum Scene {
     Edit,
     Unchanged,
     Reopen,
+    Saving,
 }
 
 fn scene(value: &str) -> Result<Scene, String> {
@@ -19,6 +20,7 @@ fn scene(value: &str) -> Result<Scene, String> {
         "edit" => Ok(Scene::Edit),
         "unchanged" => Ok(Scene::Unchanged),
         "reopen" => Ok(Scene::Reopen),
+        "saving" => Ok(Scene::Saving),
         _ => Err("unknown fixed project-close fixture scene".into()),
     }
 }
@@ -79,7 +81,7 @@ pub(in crate::app) fn context() -> Result<Option<Context>, String> {
             })
         })
     {
-        return Err("fixture requires its fixed /tmp/cagents-1937-native-<edit|unchanged|reopen>-<wide|narrow>-<before|after>/home".into());
+        return Err("fixture requires its fixed /tmp/cagents-1937-native-<edit|unchanged|reopen|saving>-<wide|narrow>-<before|after>/home".into());
     }
     private_directory(&root)?;
     for (name, leaf) in [
@@ -195,6 +197,7 @@ enum Phase {
 
 #[derive(Debug)]
 pub(in crate::app) struct Fixture {
+    save: Option<SaveCustody>,
     context: Context,
     phase: Phase,
     project: Option<ProjectId>,
@@ -208,6 +211,148 @@ pub(in crate::app) struct Fixture {
     files_loaded: bool,
     reopened: bool,
     delivering: bool,
+}
+
+#[derive(Debug)]
+struct SaveCustody {
+    original: crate::repository_widget::NativeSaveIdentity,
+    held: Option<crate::repository_widget::NativeHeldSave>,
+    released: bool,
+    observed: bool,
+    pending: Option<Result<(), String>>,
+    recovery: Option<crate::recovery_authority::RecoveryAuthority>,
+}
+
+pub(in crate::app) fn wants_save_hold(app: &Cagents, action: &RepositoryAction) -> bool {
+    app.project_ui.native_fixture.as_ref().is_some_and(|f| {
+        f.context.scene == Scene::Saving && f.phase == Phase::Held && f.held.is_some()
+            && f.save.is_none() && f.error.is_none()
+            && matches!(action, RepositoryAction::Save { card, overwrite: false } if f.card == Some(*card))
+    })
+}
+
+pub(in crate::app) fn accept_save(
+    app: &mut Cagents,
+    held: Option<crate::repository_widget::NativeHeldSave>,
+) -> Task<Message> {
+    let Some(held) = held else {
+        fail(
+            app,
+            "original Save was not admitted into fixed unpolled custody",
+        );
+        return Task::none();
+    };
+    let accepted = app.project_ui.native_fixture.as_ref().is_some_and(|f| {
+        f.context.scene == Scene::Saving
+            && f.phase == Phase::Held
+            && f.held.is_some()
+            && f.save.is_none()
+            && f.card == Some(held.original.identity.card)
+            && held.original.identity.worktree == f.context.project()
+            && held.original.identity.path == Path::new("notes.txt")
+            && held.original.snapshot != BASELINE
+    });
+    if !accepted {
+        fail(
+            app,
+            "unexpected or occupied save handoff; original work forwarded normally",
+        );
+        return crate::app::repository_task(held.into_task());
+    }
+    receipt(
+        serde_json::json!({"event":"original_save_task_held","ticket":held.original.ticket,
+        "revision":held.original.revision,"worker_polled":false,"native_input_proven":false}),
+    );
+    let original = held.original.clone();
+    app.project_ui.native_fixture.as_mut().unwrap().save = Some(SaveCustody {
+        original,
+        held: Some(held),
+        released: false,
+        observed: false,
+        pending: None,
+        recovery: None,
+    });
+    Task::none()
+}
+
+fn release_save(app: &mut Cagents) -> Task<Message> {
+    let f = app.project_ui.native_fixture.as_mut().unwrap();
+    if f.context.scene != Scene::Saving || f.phase != Phase::Finished {
+        return Task::none();
+    }
+    let Some(save) = f.save.as_mut() else {
+        return Task::none();
+    };
+    if save.released || save.observed {
+        return Task::none();
+    }
+    let Some(original) = save.held.take() else {
+        return Task::none();
+    };
+    save.released = true;
+    receipt(
+        serde_json::json!({"event":"original_save_task_released","ticket":save.original.ticket,
+        "revision":save.original.revision,"same_task_moved":true,"native_input_proven":false}),
+    );
+    crate::app::repository_task(original.into_task())
+}
+
+fn observe_save_result(app: &mut Cagents, message: &Message) {
+    let Message::Repository(RepositoryAction::RetainedSaveFinished {
+        identity,
+        ticket,
+        revision,
+        saved_text,
+        result,
+    }) = message
+    else {
+        return;
+    };
+    let f = app.project_ui.native_fixture.as_mut().unwrap();
+    let Some(save) = f.save.as_mut() else {
+        return;
+    };
+    if !save.released
+        || save.observed
+        || save.pending.is_some()
+        || save.original.identity != *identity
+        || save.original.ticket != *ticket
+        || save.original.revision != *revision
+        || save.original.snapshot != *saved_text
+    {
+        return;
+    }
+    save.recovery = match result {
+        Ok(outcome) => outcome.recovery_authority(),
+        Err(error) => error.recovery_authority(),
+    }
+    .cloned();
+    // Observation only: the entire original result continues unchanged through
+    // normal retain_repository_operation and dispatch, including a missing card.
+    save.pending = Some(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+}
+
+fn finish_save_observation(app: &mut Cagents) {
+    let f = app.project_ui.native_fixture.as_mut().unwrap();
+    let Some(save) = f.save.as_mut() else {
+        return;
+    };
+    let Some(result) = save.pending.take() else {
+        return;
+    };
+    save.observed = true;
+    if let Err(error) = &result {
+        f.error
+            .get_or_insert_with(|| format!("original Save failed: {error}"));
+    }
+    receipt(
+        serde_json::json!({"event":"original_save_result_observed","ticket":save.original.ticket,
+        "revision":save.original.revision,"result_ok":result.is_ok(),"error":result.as_ref().err(),
+        "recovery_retained":save.recovery.is_some(),"native_input_or_ux_qualified":false}),
+    );
+    if let Err(error) = result {
+        fail(app, &format!("original Save failed: {error}"));
+    }
 }
 
 fn receipt(value: serde_json::Value) {
@@ -227,6 +372,7 @@ fn fail(app: &mut Cagents, error: &str) {
 pub(in crate::app) fn install(app: &mut Cagents, context: Context) -> Task<Message> {
     let project = context.project();
     app.project_ui.native_fixture = Some(Fixture {
+        save: None,
         context,
         phase: Phase::Project,
         project: None,
@@ -258,6 +404,17 @@ pub(in crate::app) fn install(app: &mut Cagents, context: Context) -> Task<Messa
     app.lsp = LspManager::new(Vec::new());
     app.context_inspector_open = false;
     app.notices.record(TransientNotice::warning("INERT editor scene · peer closes this private project; F9 delivers the original callback AFTER cleanup has finished · no active-census claim"));
+    if app
+        .project_ui
+        .native_fixture
+        .as_ref()
+        .unwrap()
+        .context
+        .scene
+        == Scene::Saving
+    {
+        app.notices.record(TransientNotice::warning("INERT saving scene · first hold the clean peer-close callback, then edit, Save and Undo · F9 delivers that callback; F10 releases the same unpolled Save task"));
+    }
     receipt(serde_json::json!({"event":"installed","project":project,
         "mode":"ORIGINAL_COMPLETION_DELAY","provider_started":false,"native_input_proven":false}));
     // Normal folder discovery/publication, without select_worktree's default
@@ -418,7 +575,18 @@ fn release(app: &mut Cagents) -> Task<Message> {
                     !e.blocks_navigation() && e.editor_text().as_deref() == Some(BASELINE)
                 })
         }
+        Scene::Saving => {
+            f.save
+                .as_ref()
+                .is_some_and(|save| save.held.is_some() && !save.released)
+                && current.is_some_and(|e| {
+                    e.is_saving() && !e.is_dirty() && e.editor_text().as_deref() == Some(BASELINE)
+                })
+        }
     };
+    if f.context.scene == Scene::Saving && !acceptable {
+        return Task::none();
+    }
     if !acceptable && f.error.is_none() {
         receipt(
             serde_json::json!({"event":"release_refused","reason":"fixed native scene prerequisite not observed"}),
@@ -478,7 +646,7 @@ fn completed(app: &mut Cagents) {
     let card_present = app.cards.contains_key(&card);
     let row_present = app.sidebar_model.project(project).is_some();
     let retained = match f.context.scene {
-        Scene::Edit => EXPECTS_EDIT_RETAINED,
+        Scene::Edit | Scene::Saving => EXPECTS_EDIT_RETAINED,
         Scene::Unchanged => false,
         Scene::Reopen => true,
     };
@@ -510,6 +678,31 @@ fn completed(app: &mut Cagents) {
 
 fn allowed(app: &Cagents, message: &Message) -> bool {
     let f = app.project_ui.native_fixture.as_ref().unwrap();
+    if f.context.scene == Scene::Saving
+        && matches!(
+            message,
+            Message::Repository(RepositoryAction::RetainedSaveFinished { .. })
+        )
+    {
+        // Rejected handoffs still deliver their real results/authority through
+        // normal per-card fences; only the bound tuple earns fixture credit.
+        return true;
+    }
+    if f.context.scene == Scene::Saving
+        && let Some(save) = &f.save
+        && let Some(original) = &save.recovery
+    {
+        match message {
+            Message::OperationRecovery(crate::operation_recovery::Action::Retry(authority)) => {
+                return authority == original;
+            }
+            // State's unchanged original RetryReceipt fence owns acceptance.
+            Message::OperationRecovery(crate::operation_recovery::Action::Finished { .. }) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
     match inner(message) {
         Message::RepositoryLoaded { .. }
         | Message::WorkspaceModelObserved(_)
@@ -595,6 +788,12 @@ pub(in crate::app) fn before_update(
     f.reopened = false;
     f.delivering = false;
     if matches!(&message, Message::KeyEvent { captured: false, event: keyboard::Event::KeyPressed {
+        key: keyboard::Key::Named(keyboard::key::Named::F10), modifiers, ..
+    }} if modifiers.is_empty())
+    {
+        return (Message::ProjectCloseFixtureCheckpoint, release_save(app));
+    }
+    if matches!(&message, Message::KeyEvent { captured: false, event: keyboard::Event::KeyPressed {
         key: keyboard::Key::Named(keyboard::key::Named::F9), modifiers, ..
     }} if modifiers.is_empty())
     {
@@ -603,11 +802,19 @@ pub(in crate::app) fn before_update(
     let f = app.project_ui.native_fixture.as_ref().unwrap();
     if matches!(&message, Message::WindowCloseRequested(_))
         && (f.held.is_some()
+            || f.save.as_ref().is_some_and(|save| !save.observed)
             || (f.original.is_some() && f.error.is_none() && f.phase != Phase::Finished))
     {
-        app.notices.record(TransientNotice::warning(
-            "Finish the original fixture callback with F9 before closing this private window.",
-        ));
+        let message = if let Some(save) = f.save.as_ref().filter(|save| !save.observed) {
+            if save.released {
+                "Wait for the original Save result before closing this private window."
+            } else {
+                "Finish the original close callback with F9, then release its Save with F10 before closing this private window."
+            }
+        } else {
+            "Finish the original fixture callback with F9 before closing this private window."
+        };
+        app.notices.record(TransientNotice::warning(message));
         return (Message::ProjectCloseFixtureCheckpoint, Task::none());
     }
     let message = match capture(app, message) {
@@ -617,6 +824,7 @@ pub(in crate::app) fn before_update(
     if !allowed(app, &message) {
         return (Message::ProjectCloseFixtureCheckpoint, Task::none());
     }
+    observe_save_result(app, &message);
     let f = app.project_ui.native_fixture.as_ref().unwrap();
     let view = inner(&message);
     let project_loaded = matches!(view, Message::RepositoryLoaded { result: Ok(loaded), .. }
@@ -649,6 +857,7 @@ pub(in crate::app) fn after_update(app: &mut Cagents) -> Task<Message> {
     if delivering {
         completed(app);
     }
+    finish_save_observation(app);
     observe(app, project_loaded, files_loaded, reopened)
 }
 
@@ -702,6 +911,7 @@ mod tests {
         // In-memory gate inputs only. These are not daemon/caller/proof or
         // successful production cleanup fixtures, and perform no actor work.
         app.project_ui.native_fixture = Some(Fixture {
+            save: None,
             context: Context {
                 root: PathBuf::from("/unused-gate-unit-data"),
                 scene: Scene::Edit,
@@ -1139,5 +1349,330 @@ mod tests {
                 .held
                 .is_none()
         );
+    }
+
+    // Private real file/read/save producers; the old close slot is Err-only
+    // plumbing data and supplies no successful cleanup or native evidence.
+    async fn save_app() -> (tempfile::TempDir, Cagents, CardId) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("notes.txt"), BASELINE).unwrap();
+        let project = ProjectId::new();
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project,
+            repository: root.clone(),
+            worktree: root.clone(),
+            selected_file: Some("notes.txt".into()),
+        });
+        runtime.set_auto_save(false);
+        let mut load = iced::runtime::task::into_stream(runtime.initial_load(card)).unwrap();
+        while let Some(action) = load.next().await {
+            if let iced::runtime::Action::Output(action) = action {
+                drop(runtime.update(action));
+            }
+        }
+        assert_eq!(runtime.editor_text().as_deref(), Some(BASELINE));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert(
+                'x',
+            )),
+        }));
+        let mut app = gate_app(project);
+        app.settings.language_servers.clear();
+        app.lsp = LspManager::new(Vec::new());
+        let f = app.project_ui.native_fixture.as_mut().unwrap();
+        f.context.root = directory.path().to_owned();
+        f.context.scene = Scene::Saving;
+        f.card = Some(card);
+        f.phase = Phase::Held;
+        f.held = Some(Box::new(Message::ProjectUi(Action::ProjectSessionsClosed(
+            project,
+            7,
+            Err("negative close-slot plumbing only".into()),
+        ))));
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        (directory, app, card)
+    }
+
+    async fn save_message(task: Task<Message>) -> Message {
+        let mut stream = iced::runtime::task::into_stream(task).expect("original save work");
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(
+                message @ Message::Repository(RepositoryAction::RetainedSaveFinished { .. }),
+            )) = action
+            {
+                return message;
+            }
+        }
+        panic!("original writer must report its own result");
+    }
+
+    fn finish_negative_close_plumbing(app: &mut Cagents) {
+        let f = app.project_ui.native_fixture.as_mut().unwrap();
+        let negative = f.held.take().expect("negative close-slot control");
+        assert!(matches!(
+            *negative,
+            Message::ProjectUi(Action::ProjectSessionsClosed(_, _, Err(_)))
+        ));
+        // This does not run a successful close/reducer or qualify its fence.
+        f.phase = Phase::Finished;
+    }
+
+    fn admit_save(app: &mut Cagents, card: CardId) {
+        // App retains only the exact writer; this returned batch contains the
+        // ordinary unrelated UI effects and no intercepted writer.
+        drop(app.update(Message::Repository(RepositoryAction::Save {
+            card,
+            overwrite: false,
+        })));
+        let f = app.project_ui.native_fixture.as_ref().unwrap();
+        assert!(f.save.as_ref().unwrap().held.is_some());
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(r)) if r.is_saving()));
+    }
+
+    #[tokio::test]
+    async fn pending_native_save_handoff_keeps_the_original_snapshot_unpolled() {
+        let (directory, mut app, card) = save_app().await;
+        admit_save(&mut app, card);
+        let original = app
+            .project_ui
+            .native_fixture
+            .as_ref()
+            .unwrap()
+            .save
+            .as_ref()
+            .unwrap()
+            .original
+            .clone();
+        assert_eq!(original.identity.card, card);
+        assert_ne!(original.snapshot, BASELINE);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("project/notes.txt")).unwrap(),
+            BASELINE
+        );
+        assert!(app.operation_recovery_pending());
+        drop(app.update(Message::Repository(RepositoryAction::Undo { card })));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(r))
+            if r.is_saving() && !r.is_dirty() && r.editor_text().as_deref() == Some(BASELINE))
+        );
+        // Close consumption is not supplied by this unit plumbing control.
+        finish_negative_close_plumbing(&mut app);
+        let message = save_message(release_save(&mut app)).await;
+        assert!(
+            matches!(&message, Message::Repository(RepositoryAction::RetainedSaveFinished {
+            identity, ticket, revision, saved_text, result: Ok(_),
+        }) if identity == &original.identity && *ticket == original.ticket
+            && *revision == original.revision && saved_text == &original.snapshot)
+        );
+        drop(app.update(message));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("project/notes.txt")).unwrap(),
+            original.snapshot
+        );
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(r))
+            if !r.is_saving() && r.is_dirty() && r.editor_text().as_deref() == Some(BASELINE))
+        );
+    }
+
+    #[tokio::test]
+    async fn unarmed_native_save_stays_on_the_original_normal_task_path() {
+        let (directory, mut app, card) = save_app().await;
+        let f = app.project_ui.native_fixture.as_mut().unwrap();
+        f.context.scene = Scene::Edit;
+        assert!(!wants_save_hold(
+            &app,
+            &RepositoryAction::Save {
+                card,
+                overwrite: false
+            }
+        ));
+        assert!(!wants_save_hold(
+            &app,
+            &RepositoryAction::Save {
+                card: CardId::new(),
+                overwrite: false
+            }
+        ));
+        let task = app.update(Message::Repository(RepositoryAction::Save {
+            card,
+            overwrite: false,
+        }));
+        assert!(
+            app.project_ui
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .save
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("project/notes.txt")).unwrap(),
+            BASELINE
+        );
+        let message = save_message(task).await;
+        assert!(matches!(
+            &message,
+            Message::Repository(RepositoryAction::RetainedSaveFinished { result: Ok(_), .. })
+        ));
+        drop(app.update(message));
+        assert_ne!(
+            std::fs::read_to_string(directory.path().join("project/notes.txt")).unwrap(),
+            BASELINE
+        );
+        assert!(!app.operation_recovery_pending());
+    }
+
+    #[tokio::test]
+    async fn original_save_release_survives_card_retirement_and_cannot_duplicate() {
+        let (directory, mut app, card) = save_app().await;
+        admit_save(&mut app, card);
+        let snapshot = app
+            .project_ui
+            .native_fixture
+            .as_ref()
+            .unwrap()
+            .save
+            .as_ref()
+            .unwrap()
+            .original
+            .snapshot
+            .clone();
+        app.cards.remove(&card);
+        finish_negative_close_plumbing(&mut app);
+        let task = release_save(&mut app);
+        assert!(iced::runtime::task::into_stream(release_save(&mut app)).is_none());
+        let message = save_message(task).await;
+        drop(app.update(message));
+        let save = app
+            .project_ui
+            .native_fixture
+            .as_ref()
+            .unwrap()
+            .save
+            .as_ref()
+            .unwrap();
+        assert!(save.observed && save.released && save.held.is_none());
+        assert!(!app.cards.contains_key(&card));
+        assert!(!app.operation_recovery_pending());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("project/notes.txt")).unwrap(),
+            snapshot
+        );
+    }
+
+    #[tokio::test]
+    async fn occupied_native_save_handoff_forwards_work_without_replacing_original() {
+        let (_first, mut app, card) = save_app().await;
+        admit_save(&mut app, card);
+        let original = app
+            .project_ui
+            .native_fixture
+            .as_ref()
+            .unwrap()
+            .save
+            .as_ref()
+            .unwrap()
+            .original
+            .clone();
+        let (second, mut other, other_card) = save_app().await;
+        app.cards
+            .insert(other_card, other.cards.remove(&other_card).unwrap());
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&other_card) else {
+            panic!("real editor");
+        };
+        assert!(runtime.configure_save_recovery(
+            app.operation_recovery.clone(),
+            vec![runtime.descriptor.worktree.clone()]
+        ));
+        assert!(runtime.native_fixture_arm_save(other_card));
+        drop(runtime.update(RepositoryAction::Save {
+            card: other_card,
+            overwrite: false,
+        }));
+        let held = runtime
+            .native_fixture_take_save()
+            .expect("second original task");
+        let task = accept_save(&mut app, Some(held));
+        assert_eq!(
+            app.project_ui
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .save
+                .as_ref()
+                .unwrap()
+                .original,
+            original
+        );
+        assert!(
+            app.project_ui
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .save
+                .as_ref()
+                .unwrap()
+                .held
+                .is_some()
+        );
+        let message = save_message(task).await;
+        drop(app.update(message));
+        assert_ne!(
+            std::fs::read_to_string(second.path().join("project/notes.txt")).unwrap(),
+            BASELINE
+        );
+        assert!(
+            !app.project_ui
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .save
+                .as_ref()
+                .unwrap()
+                .observed
+        );
+        // Still settle the first exact task despite the sticky refusal.
+        finish_negative_close_plumbing(&mut app);
+        let message = save_message(release_save(&mut app)).await;
+        drop(app.update(message));
+        assert!(!app.operation_recovery_pending());
+    }
+
+    #[tokio::test]
+    async fn native_window_close_waits_for_original_save_result_even_after_error() {
+        let (_directory, mut app, card) = save_app().await;
+        admit_save(&mut app, card);
+        finish_negative_close_plumbing(&mut app);
+        app.project_ui.native_fixture.as_mut().unwrap().error =
+            Some("explicit negative close-plumbing state".into());
+        let window = window::Id::unique();
+        let (message, task) = before_update(&mut app, Message::WindowCloseRequested(window));
+        assert!(matches!(message, Message::ProjectCloseFixtureCheckpoint));
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        let task = release_save(&mut app);
+        let (message, blocked) = before_update(&mut app, Message::WindowCloseRequested(window));
+        assert!(matches!(message, Message::ProjectCloseFixtureCheckpoint));
+        assert!(iced::runtime::task::into_stream(blocked).is_none());
+        let message = save_message(task).await;
+        drop(app.update(message));
+        assert!(
+            app.project_ui
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .save
+                .as_ref()
+                .unwrap()
+                .observed
+        );
+        let (message, task) = before_update(&mut app, Message::WindowCloseRequested(window));
+        assert!(matches!(message, Message::WindowCloseRequested(id) if id == window));
+        assert!(iced::runtime::task::into_stream(task).is_none());
     }
 }
