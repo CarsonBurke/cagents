@@ -614,13 +614,14 @@ impl State {
 
     /// Takes what `provider` listed, unless what is known is newer: another
     /// window's list read from the cache can be older than this window's.
+    /// A known stamp beyond the current clock's slack follows a clock rollback
+    /// and must not prevent a current list, just as with quota and disk cache.
     /// Whether it was taken.
-    fn take_catalog(&mut self, provider: Provider, catalog: Catalog) -> bool {
-        if self
-            .catalogs
-            .get(&provider)
-            .is_some_and(|known| known.observed_at > catalog.observed_at)
-        {
+    fn take_catalog(&mut self, provider: Provider, catalog: Catalog, now: Millis) -> bool {
+        if self.catalogs.get(&provider).is_some_and(|known| {
+            known.observed_at > catalog.observed_at
+                && known.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
+        }) {
             return false;
         }
         self.catalogs.insert(provider, catalog);
@@ -2232,11 +2233,12 @@ impl Cagents {
         provider: Provider,
         models: Vec<crate::chat::Model>,
     ) -> Task<Message> {
+        let now = now_ms();
         let catalog = Catalog {
             models,
-            observed_at: now_ms(),
+            observed_at: now,
         };
-        if catalog.models.is_empty() || !self.account_ui.take_catalog(provider, catalog) {
+        if catalog.models.is_empty() || !self.account_ui.take_catalog(provider, catalog, now) {
             return Task::none();
         }
         self.refresh_chat_drafts();
@@ -2373,6 +2375,7 @@ impl Cagents {
             }
             Action::Tick => self.probe_accounts(Trigger::Tick),
             Action::Loaded(loaded) => {
+                let now = now_ms();
                 self.account_ui.installed = loaded.installed;
                 let mut migration = Task::none();
                 match loaded.registry {
@@ -2399,7 +2402,7 @@ impl Cagents {
                 }
                 self.account_ui.restore(loaded.restored);
                 for (provider, catalog) in loaded.catalogs {
-                    self.account_ui.take_catalog(provider, catalog);
+                    self.account_ui.take_catalog(provider, catalog, now);
                 }
                 self.refresh_chat_drafts();
                 let locate = if loaded.provisional {
@@ -2957,7 +2960,7 @@ impl Cagents {
             && let Some(state) = self.account_ui.account(&id)
         {
             let provider = state.account.provider;
-            if self.account_ui.take_catalog(provider, catalog) {
+            if self.account_ui.take_catalog(provider, catalog, now) {
                 self.refresh_chat_drafts();
             }
         }
@@ -7615,7 +7618,10 @@ mod app_tests {
             },
             "fixture-known-model",
         );
-        assert!(app.account_ui.take_catalog(provider, known_catalog.clone()));
+        assert!(
+            app.account_ui
+                .take_catalog(provider, known_catalog.clone(), now)
+        );
         let other_provider = if provider == Provider::Claude {
             Provider::Codex
         } else {
@@ -7624,7 +7630,7 @@ mod app_tests {
         let other_catalog = catalog(now, "fixture-unrelated-model");
         assert!(
             app.account_ui
-                .take_catalog(other_provider, other_catalog.clone())
+                .take_catalog(other_provider, other_catalog.clone(), now)
         );
         let (frames, observations) = match provider {
             Provider::Claude => (
@@ -7974,7 +7980,7 @@ mod app_tests {
         state.schedule.succeed(snapshot.observed_at);
         state.snapshot = Some(snapshot);
         let provider = state.account.provider;
-        app.account_ui.take_catalog(provider, catalog.unwrap());
+        app.account_ui.take_catalog(provider, catalog.unwrap(), now);
     }
 
     fn admit_actual_ticket(app: &mut Cagents, id: &AccountId, now: Millis) -> (u64, ProbeTicket) {
@@ -8584,6 +8590,115 @@ mod app_tests {
         recipe
     }
 
+    #[test]
+    fn model_catalog_clock_rollback_preserves_newer_current_observations() {
+        let now: Millis = 1_000_000;
+        let catalog = |observed_at, id: &str| Catalog {
+            observed_at,
+            models: vec![crate::chat::Model {
+                id: id.into(),
+                label: id.into(),
+                reasoning: Vec::new(),
+            }],
+        };
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            let mut state = State::default();
+            assert!(state.take_catalog(provider, catalog(now - 1, "newer"), now));
+            assert!(!state.take_catalog(
+                provider,
+                catalog(now - schedule::CLOCK_SLACK - 2, "delayed"),
+                now,
+            ));
+            assert_eq!(state.catalog(provider).unwrap().models[0].id, "newer");
+
+            assert!(state.take_catalog(
+                provider,
+                catalog(now + schedule::CLOCK_SLACK, "within-slack"),
+                now,
+            ));
+            assert!(!state.take_catalog(provider, catalog(now, "older"), now));
+            assert_eq!(
+                state.catalog(provider).unwrap().models[0].id,
+                "within-slack"
+            );
+
+            assert!(state.take_catalog(
+                provider,
+                catalog(now + schedule::CLOCK_SLACK + 1, "pre-rollback"),
+                now,
+            ));
+            assert!(state.take_catalog(provider, catalog(now, "current"), now));
+            assert_eq!(state.catalog(provider).unwrap().models[0].id, "current");
+        }
+    }
+
+    #[test]
+    fn model_catalog_clock_rollback_recovers_through_each_admitted_source() {
+        let model = |id: &str| crate::chat::Model {
+            id: id.into(),
+            label: id.into(),
+            reasoning: Vec::new(),
+        };
+        let catalog = |observed_at, id: &str| Catalog {
+            observed_at,
+            models: vec![model(id)],
+        };
+        for provider in [Provider::Claude, Provider::Codex] {
+            for source in ["loaded", "probe", "live"] {
+                let mut app = context_inspector_test_app(false);
+                assert!(app.account_ui.cache.is_none());
+                assert!(app.account_ui.store.is_none());
+                let id = app.account_ui.add_managed_fixture(provider, 1938);
+                let now = now_ms();
+                let before_rollback = now + 10 * schedule::CLOCK_SLACK;
+                assert!(app.account_ui.take_catalog(
+                    provider,
+                    catalog(before_rollback, "pre-rollback"),
+                    before_rollback,
+                ));
+
+                let task = match source {
+                    "loaded" => app.update(Message::AccountUi(Action::Loaded(Loaded {
+                        registry: Ok(app.account_ui.registry.clone()),
+                        restored: Vec::new(),
+                        catalogs: BTreeMap::from([(provider, catalog(now, "current"))]),
+                        installed: BTreeMap::new(),
+                        provisional: false,
+                    }))),
+                    "probe" => {
+                        let (owner, ticket) =
+                            app.account_ui
+                                .begin_probe_for_test(&id, Trigger::Focus, now);
+                        app.update(Message::AccountUi(Action::Probed {
+                            owner,
+                            ticket,
+                            id,
+                            outcome: Outcome::Answered {
+                                identity: None,
+                                snapshot: UsageSnapshot::state(
+                                    UsageStatus::Ok,
+                                    "probe after clock rollback",
+                                    now,
+                                ),
+                                catalog: Some(catalog(now, "current")),
+                            },
+                        }))
+                    }
+                    "live" => app.observe_listed_models(provider, vec![model("current")]),
+                    _ => unreachable!(),
+                };
+                // Apply the actual reducers, but never poll a provider, cache,
+                // registry or other asynchronous effect in this fixture.
+                drop(task);
+                assert_eq!(
+                    app.account_ui.catalog(provider).unwrap().models[0].id,
+                    "current",
+                    "{provider:?} {source}"
+                );
+            }
+        }
+    }
+
     /// The models each provider lists come from the cache at startup, from
     /// probes and from running conversations; the newest list wins, and one a
     /// conversation listed reaches other windows through the cache.
@@ -8640,7 +8755,7 @@ mod app_tests {
         // An older list, from another window's cache, does not rewind it.
         assert!(
             !app.account_ui
-                .take_catalog(Provider::Codex, catalog(1, "older"))
+                .take_catalog(Provider::Codex, catalog(1, "older"), now)
         );
 
         // A conversation's list is newer still, and is queued for the cache.
