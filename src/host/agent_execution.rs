@@ -1368,39 +1368,8 @@ fn console(
             let mut remaining = crate::agent_execution::MAX_RESULT_BYTES;
             let mut truncated = false;
             for item in snapshot.items.iter().rev() {
-                let mut text = match &item.content {
-                    chat::ItemContent::Text {
-                        text,
-                        thinking: false,
-                        ..
-                    } => format!("{:?}: {text}\n", item.role),
-                    chat::ItemContent::Command {
-                        command,
-                        status,
-                        output,
-                        ..
-                    } => format!("Command ({status:?}): {command}\n{output}\n"),
-                    chat::ItemContent::Tool {
-                        name,
-                        status,
-                        output,
-                        ..
-                    } => format!("Tool {name} ({status:?}): {output}\n"),
-                    chat::ItemContent::Delivery {
-                        kind,
-                        from,
-                        sender,
-                        summary,
-                        body,
-                    } => {
-                        let heading = chat::delivery_heading(*kind, from, sender, summary);
-                        if body.is_empty() {
-                            format!("{heading}\n")
-                        } else {
-                            format!("{heading}:\n{body}\n")
-                        }
-                    }
-                    _ => continue,
+                let Some(mut text) = console_line(item) else {
+                    continue;
                 };
                 if text.len() > remaining {
                     crate::agent_execution::truncate(&mut text, remaining);
@@ -1425,6 +1394,104 @@ fn console(
             })))
         }
     }
+}
+
+/// One console line per transcript item. The console is a plain-text view a
+/// person reads, so it shows what the agent said, what it was sent, and a
+/// one-line account of each step, named as the native chat view names it.
+/// Command output, tool payloads and delivered reports stay in that view,
+/// which discloses them on demand.
+///
+/// A step appears once it settles, so finishing it adds a line instead of
+/// rewriting one the client already printed. A step that settles after later
+/// text still lands before that text; the client then prints only the lines
+/// it has not shown (`console_delta` in the CLI).
+fn console_line(item: &chat::Item) -> Option<String> {
+    use chat::{ChangeKind, CommandAction, DeliveryKind, ItemContent, ToolStatus};
+    if item.content.status() == Some(ToolStatus::Running) {
+        return None;
+    }
+    let outcome = |status: &ToolStatus| match status {
+        ToolStatus::Succeeded | ToolStatus::Running => "",
+        ToolStatus::Failed => " (failed)",
+        ToolStatus::Denied => " (denied)",
+        ToolStatus::Stopped => " (stopped)",
+    };
+    let first_line = |text: &str| text.trim().lines().next().unwrap_or_default().to_owned();
+    let line = match &item.content {
+        ItemContent::Text {
+            text,
+            thinking: false,
+            ..
+        } => return Some(format!("{:?}: {text}\n", item.role)),
+        ItemContent::Text { .. } => return None,
+        ItemContent::Command {
+            label,
+            command,
+            action,
+            status,
+            exit_code,
+            ..
+        } => {
+            let (verb, stored) = match action {
+                CommandAction::Run => ("Ran", None),
+                CommandAction::Read => ("Read", Some("Read ")),
+                CommandAction::Search => ("Searched", Some("Search ")),
+                CommandAction::List => ("Listed", Some("List ")),
+            };
+            let label = label.trim();
+            // Transcripts stored before adapters dropped the verb from the
+            // label still carry it, as the native view also allows for.
+            let label = stored
+                .and_then(|verb| label.strip_prefix(verb))
+                .filter(|target| !target.is_empty())
+                .unwrap_or(label);
+            let target = first_line(if label.is_empty() { command } else { label });
+            let exit = match (status, exit_code) {
+                (ToolStatus::Failed, Some(code)) => format!(" (failed, exit {code})"),
+                _ => outcome(status).to_owned(),
+            };
+            format!("{verb} {target}").trim_end().to_owned() + &exit
+        }
+        ItemContent::Changes { changes, status } => match changes.as_slice() {
+            [] => return None,
+            [single] => {
+                let verb = match single.kind {
+                    ChangeKind::Added => "Added",
+                    ChangeKind::Deleted => "Deleted",
+                    ChangeKind::Updated => "Edited",
+                    ChangeKind::Renamed { .. } => "Renamed",
+                };
+                format!("{verb} {}{}", single.path, outcome(status))
+            }
+            many => format!("Edited {} files{}", many.len(), outcome(status)),
+        },
+        ItemContent::WebSearch { query, .. } => {
+            format!("Searched the web for {}", first_line(query))
+        }
+        ItemContent::Tool { name, status, .. } => format!("Called {name}{}", outcome(status)),
+        ItemContent::Image { description, .. } => format!("Viewed {}", first_line(description))
+            .trim_end()
+            .to_owned(),
+        ItemContent::Delivery {
+            kind,
+            from,
+            sender,
+            summary,
+            body,
+        } => {
+            let heading = chat::delivery_heading(*kind, from, sender, summary);
+            // A message from another session is what the agent is asked to
+            // act on, so it stays readable. Reports and notices are payload.
+            match kind {
+                DeliveryKind::Message if !body.trim().is_empty() => {
+                    format!("{heading}:\n{}", body.trim_end())
+                }
+                _ => heading,
+            }
+        }
+    };
+    Some(line + "\n")
 }
 
 #[cfg(test)]

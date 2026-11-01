@@ -1501,8 +1501,104 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
     Ok(answers)
 }
 
+/// How long a console keeps trying before it reports the connection as gone.
+/// A restart adopts retained conversations one at a time before it serves any
+/// client, which can take minutes without anything having gone wrong.
+const CONSOLE_RECONNECT_WINDOW: Duration = Duration::from_secs(300);
+
+/// This connection can no longer be used, which says nothing about the agent:
+/// the daemon is gone, closing, slow, or its replies no longer line up with the
+/// requests on this stream. A proof mismatch or version change is an answer,
+/// and retrying would only hide it.
+fn console_connection_lost(error: &ControlError) -> bool {
+    match error {
+        ControlError::Connect(_)
+        | ControlError::Frame(_)
+        | ControlError::ReplyTimeout { .. }
+        | ControlError::ConnectionClosed
+        | ControlError::RequestIdMismatch { .. } => true,
+        ControlError::Remote { message, .. } => message.contains("upgrade/shutdown is committed"),
+        _ => false,
+    }
+}
+
+/// The daemon answered, but has not adopted this agent's session yet.
+fn console_awaits_adoption(error: &ControlError) -> bool {
+    matches!(error, ControlError::Remote { message, .. }
+        if message.contains("not attached yet")
+            || message.contains("no longer live")
+            || message.contains("paired provider console is unavailable"))
+}
+
+/// What to tell the person when a command they typed failed. Only they can
+/// decide to send it again: the daemon may already have acted on it.
+fn console_command_failure(error: &ControlError) -> String {
+    match error {
+        ControlError::Connect(_) => format!("Not sent: {error}. Send it again once reconnected."),
+        ControlError::Remote { .. } => error.to_string(),
+        error if console_connection_lost(error) => format!(
+            "The daemon may or may not have received this ({error}). Check the agent before sending it again."
+        ),
+        error => error.to_string(),
+    }
+}
+
+fn console_gave_up(error: &ControlError) -> AppError {
+    AppError::new(
+        "agent_console",
+        format!(
+            "Gave up reaching the daemon after {} minutes ({error}). The provider may still be running: use the agent's chat, or reopen this console.",
+            CONSOLE_RECONNECT_WINDOW.as_secs() / 60
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_console_retries_a_lost_connection_but_not_an_answer() {
+        let remote = |message: &str| ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+            message: message.into(),
+            retryable: false,
+        };
+        for lost in [
+            ControlError::ConnectionClosed,
+            ControlError::Connect(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+            // A reply that arrives after its deadline desynchronizes the stream.
+            ControlError::RequestIdMismatch {
+                expected: 2,
+                actual: Some(1),
+            },
+            remote(
+                "Daemon upgrade/shutdown is committed; no further control mutations are accepted",
+            ),
+        ] {
+            assert!(super::console_connection_lost(&lost), "{lost}");
+        }
+        for answer in [
+            ControlError::ProofMismatch,
+            ControlError::UnsupportedVersion { actual: 1 },
+            remote("This session does not own the requested agent console"),
+        ] {
+            assert!(!super::console_connection_lost(&answer), "{answer}");
+        }
+    }
+
+    /// Only a command that never left is reported as unsent. Everything else
+    /// tells the person the daemon may have acted on it, so that retyping it
+    /// is an informed choice and not a silent second run.
+    #[test]
+    fn a_console_command_failure_says_whether_it_may_have_been_received() {
+        let unsent = super::console_command_failure(&ControlError::Connect(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+        assert!(unsent.starts_with("Not sent"), "{unsent}");
+        let unknown = super::console_command_failure(&ControlError::ConnectionClosed);
+        assert!(unknown.contains("may or may not"), "{unknown}");
+        assert!(!unknown.contains("Not sent"), "{unknown}");
+    }
+
     use super::*;
 
     #[test]
@@ -2104,6 +2200,24 @@ mod tests {
     }
 
     #[test]
+    fn console_prints_late_settled_steps_without_replaying_the_transcript() {
+        // A background tool still running is not shown; later text is.
+        let t1 = "User: Build it\nAssistant: Started the build.\n";
+        assert_eq!(console_delta("", t1), t1);
+        // The tool settles before that text in transcript order.
+        let t2 = "User: Build it\nCalled Agent\nAssistant: Started the build.\n";
+        assert_eq!(console_delta(t1, t2), "Called Agent\n");
+        // Growth at the end still streams as a plain suffix.
+        let t3 = format!("{t2}Assistant: Done");
+        assert_eq!(console_delta(t2, &t3), "Assistant: Done");
+        // A repeated line counts once per occurrence.
+        let t4 = "User: Build it\nCalled Agent\nCalled Agent\nAssistant: Started the build.\nAssistant: Done";
+        assert_eq!(console_delta(&t3, t4), "\nCalled Agent\n");
+        // Text dropped from the front of a bounded transcript prints nothing.
+        assert_eq!(console_delta(t4, "Called Agent\nAssistant: Done"), "");
+    }
+
+    #[test]
     fn console_answers_require_explicit_request_action_and_structured_fields() {
         use crate::agent_execution::ConsoleCommand;
         let ConsoleCommand::Control(crate::chat::Command::Answer {
@@ -2650,7 +2764,9 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
         ));
     }
     let socket = terminal::ipc::daemon_socket_path().map_err(|e| AppError::new("daemon", e))?;
-    let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
+    // `None` while no usable connection exists. A stream that failed is never
+    // reused: a late reply on it would answer the wrong request.
+    let mut client = Some(ControlClient::connect(&socket).map_err(protocol_error)?);
     let (sender, input) = std::sync::mpsc::sync_channel(8);
     thread::Builder::new()
         .name("console-input".into())
@@ -2688,44 +2804,54 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
         "cagents provider console — agent {agent}\nPrompts create durable runs. /interrupt [--including-subagents], /answer REQUEST ACTION [ANSWERS_JSON], /quit\nThis is a console over the hosted provider, not its stock TUI.\n"
     );
     let startup = Instant::now() + Duration::from_secs(10);
+    let mut reconnecting: Option<Instant> = None;
     let mut generation = None;
     let mut previous = String::new();
     let mut last_run = None;
     let mut last_requests = Vec::new();
     loop {
-        match client.agent(
-            authority.clone(),
-            Operation::Console {
-                agent,
-                command: ConsoleCommand::Read {
-                    after_generation: generation,
-                    after_run: last_run,
+        let connected = match client.take() {
+            Some(connected) => Ok(connected),
+            None => ControlClient::connect(&socket),
+        };
+        let read = connected.and_then(|mut connected| {
+            let read = connected.agent(
+                authority.clone(),
+                Operation::Console {
+                    agent,
+                    command: ConsoleCommand::Read {
+                        after_generation: generation,
+                        after_run: last_run,
+                    },
                 },
-            },
-        ) {
+            );
+            client = Some(connected);
+            read
+        });
+        match read {
             Ok(Reply::Console(Some(view))) => {
+                if reconnecting.take().is_some() {
+                    eprintln!("Reconnected to the daemon.");
+                }
                 generation = Some(view.generation);
                 let text: String = view
                     .text
                     .chars()
                     .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
                     .collect();
-                if let Some(delta) = text.strip_prefix(&previous) {
-                    print!("{delta}");
-                } else if text != previous {
-                    print!(
-                        "\n--- Current transcript{} ---\n{text}",
-                        if view.truncated { " (bounded)" } else { "" }
-                    );
-                }
+                print!("{}", console_delta(&previous, &text));
                 previous = text;
                 if last_run != Some((view.run.id, view.run.revision)) {
-                    println!(
-                        "\nRun {}: {:?}; usage: {}",
-                        view.run.id,
-                        view.run.state,
-                        serde_json::to_string(&view.run.result.usage).unwrap_or_default()
-                    );
+                    let usage = &view.run.result.usage;
+                    let tokens = if usage.input_tokens + usage.output_tokens == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            " ({} input, {} output tokens)",
+                            usage.input_tokens, usage.output_tokens
+                        )
+                    };
+                    println!("\nRun {}: {:?}{tokens}", view.run.id, view.run.state);
                     if let Some(diagnostic) = &view.run.result.diagnostic {
                         println!("{diagnostic}");
                     }
@@ -2743,19 +2869,41 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                 }
                 let _ = io::stdout().flush();
             }
-            Ok(Reply::Console(None)) => {}
+            Ok(Reply::Console(None)) => {
+                if reconnecting.take().is_some() {
+                    eprintln!("Reconnected to the daemon.");
+                }
+            }
             Ok(_) => {
                 return Err(AppError::new(
                     "agent_console",
                     "Unexpected console response",
                 ));
             }
-            Err(ControlError::Remote { message, .. })
+            Err(error)
                 if generation.is_none()
                     && Instant::now() < startup
-                    && (message.contains("not attached yet")
-                        || message.contains("no longer live")
-                        || message.contains("paired provider console is unavailable")) => {}
+                    && console_awaits_adoption(&error) => {}
+            // A reply that was late or lost says nothing about the agent, so the
+            // console outlives it. Only this idempotent read is ever repeated.
+            Err(error)
+                if console_connection_lost(&error)
+                    || (reconnecting.is_some() && console_awaits_adoption(&error)) =>
+            {
+                if console_connection_lost(&error) {
+                    client = None;
+                }
+                let deadline = *reconnecting.get_or_insert_with(|| {
+                    eprintln!(
+                        "Lost the daemon connection ({error}); reconnecting for up to {} minutes. The provider keeps running.",
+                        CONSOLE_RECONNECT_WINDOW.as_secs() / 60
+                    );
+                    Instant::now() + CONSOLE_RECONNECT_WINDOW
+                });
+                if Instant::now() >= deadline {
+                    return Err(console_gave_up(&error));
+                }
+            }
             Err(error) => return Err(protocol_error(error)),
         }
         match input.recv_timeout(Duration::from_millis(250)) {
@@ -2776,10 +2924,25 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                         continue;
                     }
                 };
-                match client.agent(authority.clone(), Operation::Console { agent, command }) {
+                let connected = match client.take() {
+                    Some(connected) => Ok(connected),
+                    None => ControlClient::connect(&socket),
+                };
+                let sent = connected.and_then(|mut connected| {
+                    let sent =
+                        connected.agent(authority.clone(), Operation::Console { agent, command });
+                    client = Some(connected);
+                    sent
+                });
+                match sent {
                     Ok(Reply::Accepted(accepted)) => println!("Accepted run {}", accepted.run.id),
                     Ok(_) => {}
-                    Err(error) => eprintln!("{error}"),
+                    Err(error) => {
+                        if console_connection_lost(&error) {
+                            client = None;
+                        }
+                        eprintln!("{}", console_command_failure(&error));
+                    }
                 }
                 generation = None;
             }
@@ -2790,6 +2953,33 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
         data: json!({ "agent": agent, "detached": true }),
         human: "Console detached; the provider remains hosted until explicitly closed.".into(),
     })
+}
+
+/// What to print so the terminal shows `text` after it already showed
+/// `previous`. Usually the transcript only grew at its end. When an earlier
+/// line changed instead, such as a step that settled after later text was
+/// printed or text dropped from the front of a bounded transcript, a terminal
+/// cannot take back what it printed, so only the lines it has not shown yet
+/// are printed, in order, rather than the whole transcript again.
+fn console_delta(previous: &str, text: &str) -> String {
+    if let Some(delta) = text.strip_prefix(previous) {
+        return delta.to_owned();
+    }
+    let mut shown = std::collections::HashMap::<&str, usize>::new();
+    for line in previous.lines() {
+        *shown.entry(line).or_default() += 1;
+    }
+    let mut delta = String::new();
+    if !previous.is_empty() && !previous.ends_with('\n') {
+        delta.push('\n');
+    }
+    for line in text.split_inclusive('\n') {
+        match shown.get_mut(line.trim_end_matches('\n')) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => delta.push_str(line),
+        }
+    }
+    if delta == "\n" { String::new() } else { delta }
 }
 
 fn console_input(line: &str) -> Result<crate::agent_execution::ConsoleCommand, String> {
