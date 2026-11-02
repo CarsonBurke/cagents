@@ -1395,6 +1395,106 @@ exit 0
     }
 
     #[test]
+    fn closing_a_lost_childs_pane_ends_only_that_child() {
+        use crate::agent_execution::*;
+        for close_reader in [false, true] {
+            let host = host();
+            let rows = [user_row("u1", "child question", None)];
+            let (directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+            // One history fixture owns the Registry. The parent needs only its
+            // separate durable descriptor; no parent transcript is opened.
+            let mut parent_source = source.clone();
+            parent_source.id = TerminalId::new();
+            parent_source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            let parent = lost_agent(&host, directory.path(), &parent_source);
+            let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+            let (child, child_origin, parent_authority, child_authority) = {
+                let mut registry = registry.lock().unwrap();
+                let parent_authority = registry
+                    .register_agent_authority(&HostedSession::Chat(parent_source.clone()))
+                    .unwrap();
+                let child_origin = registry.execution_origin(&parent_authority).unwrap();
+                assert_eq!(
+                    child_origin,
+                    Origin::Child {
+                        parent: Lineage(parent_source.id)
+                    }
+                );
+                let child = registry
+                    .submit_agent(
+                        &child_origin,
+                        &lost_submit(directory.path(), "lost-child"),
+                        3,
+                    )
+                    .unwrap();
+                registry
+                    .bind_agent(child.agent.id, None, HostedSession::Chat(source.clone()))
+                    .unwrap();
+                let child_authority = registry
+                    .register_agent_authority(&HostedSession::Chat(source.clone()))
+                    .unwrap();
+                registry.interrupt_unproven_agent_runs(4).unwrap();
+                (child, child_origin, parent_authority, child_authority)
+            };
+            let (parent_before, parent_run, child_before, child_run) = {
+                let registry = registry.lock().unwrap();
+                (
+                    registry.agent(parent.agent.id).unwrap(),
+                    registry.agent_run(parent.run.id).unwrap(),
+                    registry.agent(child.agent.id).unwrap(),
+                    registry.agent_run(child.run.id).unwrap(),
+                )
+            };
+            assert_eq!(child_before.origin, child_origin);
+            assert_eq!(parent_run.state, State::Interrupted);
+            assert_eq!(child_run.state, State::Interrupted);
+            let parent_rows = authority_rows(directory.path(), parent_source.id);
+            assert_eq!(parent_rows.len(), 1);
+            assert_eq!(authority_rows(directory.path(), source.id).len(), 1);
+            let history_path = provider_history_path(&source);
+            let history = std::fs::read(&history_path).unwrap();
+            let closing = if close_reader {
+                source
+                    .lost_holder_history(&host.lock().unwrap().proof().clone())
+                    .unwrap()
+            } else {
+                source.clone()
+            };
+
+            // Exercise the post-admission pane lifecycle, without substituting
+            // a User CLI caller for the child's actual parent authority.
+            super::super::close_retained_from_pane(&host, &closing).unwrap();
+
+            {
+                let registry = registry.lock().unwrap();
+                let closed = registry.agent(child.agent.id).unwrap();
+                assert!(closed.closed, "reader: {close_reader}");
+                assert_eq!(closed.origin, child_origin);
+                assert_eq!(closed.session, child_before.session);
+                assert_eq!(registry.agent_run(child.run.id).unwrap(), child_run);
+                assert_eq!(registry.agent(parent.agent.id).unwrap(), parent_before);
+                assert_eq!(registry.agent_run(parent.run.id).unwrap(), parent_run);
+                assert_eq!(
+                    registry.execution_origin(&parent_authority).unwrap(),
+                    child_origin
+                );
+                assert!(registry.execution_origin(&child_authority).is_err());
+            }
+            assert_eq!(
+                authority_rows(directory.path(), parent_source.id),
+                parent_rows
+            );
+            assert!(authority_rows(directory.path(), source.id).is_empty());
+            assert_eq!(std::fs::read(history_path).unwrap(), history);
+            let state = host.lock().unwrap();
+            assert!(state.chats.is_empty());
+            assert!(state.chat_spawning.is_empty());
+            assert!(state.native_actor_startups.is_empty());
+            assert!(!marker.exists(), "pane Close must not start a provider");
+        }
+    }
+
+    #[test]
     fn a_lost_parents_caption_says_its_children_stay_open_and_closing_leaves_them() {
         use crate::agent_execution::*;
         let host = host();
@@ -1481,6 +1581,156 @@ exit 0
         )
         .unwrap_err();
         assert!(failure.contains("Cannot confirm teardown"), "{failure}");
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_native_discovery_owner_refuses_lost_agent_close() {
+        const MODE: &str = "CAGENTS_TEST_LOST_CLOSE_DISCOVERY_ROOT";
+        let Some(root) = std::env::var_os(MODE) else {
+            // Only the owned runtime directory changes. In particular this
+            // subprocess inherits the caller's authority without inspecting it.
+            let directory = tempfile::tempdir().unwrap();
+            let runtime = directory.path().join("run");
+            crate::secure_file::prepare_private_directory(&runtime).unwrap();
+            let stdout = directory.path().join("child.stdout");
+            let stderr = directory.path().join("child.stderr");
+            struct OriginalChild(std::process::Child);
+            impl Drop for OriginalChild {
+                fn drop(&mut self) {
+                    if let Ok(None) = self.0.try_wait() {
+                        let _ = self.0.kill();
+                    }
+                    let _ = self.0.wait();
+                }
+            }
+            let mut child = OriginalChild(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "host::chat::capacity::tests::a_native_discovery_owner_refuses_lost_agent_close",
+                        "--color=never",
+                    ])
+                    .env(MODE, directory.path())
+                    .env("XDG_RUNTIME_DIR", &runtime)
+                    .stdout(std::fs::File::create(&stdout).unwrap())
+                    .stderr(std::fs::File::create(&stderr).unwrap())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "discovery fixture did not settle"
+                );
+                thread::sleep(Duration::from_millis(5));
+            };
+            assert!(
+                status.success(),
+                "private discovery fixture failed:\n{}\n{}",
+                std::fs::read_to_string(stdout).unwrap(),
+                std::fs::read_to_string(stderr).unwrap()
+            );
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        assert_eq!(
+            std::env::var_os("XDG_RUNTIME_DIR"),
+            Some(root.join("run").into_os_string())
+        );
+
+        let host = host();
+        let rows = [user_row("u1", "lost agent with discovery", None)];
+        let (directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+        register_authority(&host, &source);
+        let accepted = lost_agent(&host, directory.path(), &source);
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        let records = || {
+            let registry = registry.lock().unwrap();
+            serde_json::to_value((
+                registry.agent(accepted.agent.id).unwrap(),
+                registry.latest_agent_run(accepted.agent.id).unwrap(),
+            ))
+            .unwrap()
+        };
+        let before_records = records();
+        let before_authority = authority_rows(directory.path(), source.id);
+        assert!(!before_authority.is_empty());
+        let history = provider_history_path(&source);
+        let before_history = std::fs::read(&history).unwrap();
+        let generation = host.lock().unwrap().inventory_generation;
+
+        // This is untrusted discovery naming this test process, not a helper,
+        // adoption proof or an execution source. Its presence alone must fence
+        // Close, even before any authenticated provider connection is possible.
+        use crate::daemon::holder_registry::{self as holders, Kind};
+        let native = holders::directory(Kind::Native).unwrap();
+        crate::secure_file::prepare_private_directory(&native).unwrap();
+        let process = holders::Process::read(std::process::id() as i32).unwrap();
+        let owner = holders::Record {
+            version: 4,
+            build: Some(holders::BuildIdentity::current(Kind::Native)),
+            kind: Kind::Native,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot: crate::daemon::read_boot_id().unwrap(),
+            terminal: source.id,
+            holder: process.clone(),
+            root: process,
+        };
+        owner.create(&native).unwrap();
+        let path = holders::socket(&native, source.id).with_extension("json");
+        let before_discovery = std::fs::read(&path).unwrap();
+        assert!(super::super::has_native_owner(&source).unwrap());
+        assert!(!holders::socket(&native, source.id).exists());
+
+        let refusal = match super::super::fence_lost_holder(&host, &source) {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("native discovery did not fence lost-agent retirement"),
+        };
+        assert!(refusal.contains("may be running"), "{refusal}");
+        let reader = source
+            .lost_holder_history(&host.lock().unwrap().proof().clone())
+            .unwrap();
+        for descriptor in [&source, &reader] {
+            let refusal = super::super::close_retained_from_pane(&host, descriptor).unwrap_err();
+            assert!(refusal.contains("may be running"), "{refusal}");
+            assert_eq!(records(), before_records);
+            assert_eq!(
+                authority_rows(directory.path(), source.id),
+                before_authority
+            );
+            assert_eq!(std::fs::read(&history).unwrap(), before_history);
+            assert_eq!(std::fs::read(&path).unwrap(), before_discovery);
+            let state = host.lock().unwrap();
+            assert_eq!(state.inventory_generation, generation);
+            assert!(state.chats.is_empty());
+            assert!(state.chat_spawning.is_empty());
+            assert!(state.native_actor_startups.is_empty());
+            assert!(!marker.exists());
+        }
+
+        // Removing only this fixture's exact record isolates the blocker:
+        // the same original agent can now close, without starting a provider.
+        owner.remove_record(&native).unwrap();
+        assert!(!super::super::has_native_owner(&source).unwrap());
+        super::super::close_retained_from_pane(&host, &source).unwrap();
+        assert!(!agent_open(&host, accepted.agent.id));
+        assert!(authority_rows(directory.path(), source.id).is_empty());
+        assert_eq!(std::fs::read(&history).unwrap(), before_history);
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .latest_agent_run(accepted.agent.id)
+                .unwrap()
+                .state,
+            crate::agent_execution::State::Interrupted
+        );
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
         assert!(!marker.exists());
     }
 
