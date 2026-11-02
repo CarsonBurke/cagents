@@ -225,6 +225,7 @@ pub(in crate::app) struct Fixture {
     save: Option<SaveCustody>,
     fault_probe: Option<crate::editor::retained_save::NativeSaveFaultPlan>,
     writer_outcome: Option<WriterObservation>,
+    comparison_invalidated: bool,
     recovery_event: bool,
     context: Context,
     phase: Phase,
@@ -613,6 +614,7 @@ pub(in crate::app) fn install(app: &mut Cagents, context: Context) -> Task<Messa
         save: None,
         fault_probe: None,
         writer_outcome: None,
+        comparison_invalidated: false,
         recovery_event: false,
         context,
         phase: Phase::Project,
@@ -829,17 +831,38 @@ fn release(app: &mut Cagents) -> Task<Message> {
                 })
         }
         Scene::Fault | Scene::Warning | Scene::Recovery => {
-            let observed = f
-                .save
-                .as_ref()
-                .is_some_and(|save| save.released && save.observed)
+            let observed = !f.comparison_invalidated
+                && f.save
+                    .as_ref()
+                    .is_some_and(|save| save.released && save.observed)
                 && f.writer_outcome
                     .as_ref()
                     .is_some_and(|outcome| outcome.expected)
                 && f.error.is_none();
             observed
                 && current.is_some_and(|e| match f.context.scene {
-                    Scene::Fault => e.is_dirty() && !e.is_saving(),
+                    Scene::Fault => {
+                        let Some(original) = f.save.as_ref() else {
+                            return false;
+                        };
+                        let Some(raw_error) = f
+                            .writer_outcome
+                            .as_ref()
+                            .and_then(|outcome| outcome.detail.as_ref())
+                        else {
+                            return false;
+                        };
+                        // The ordinary RetainedSaveFinished -> SaveFinished path
+                        // displays FileIoError::Io(raw_error), not the bare text.
+                        let displayed_error =
+                            crate::editor::FileIoError::Io(raw_error.clone()).to_string();
+                        e.is_dirty()
+                            && !e.is_saving()
+                            && !e.has_durability_warning()
+                            && e.editor_text().as_deref()
+                                == Some(original.original.snapshot.as_str())
+                            && e.save_error() == Some(displayed_error.as_str())
+                    }
                     Scene::Warning => !e.is_dirty() && !e.is_saving() && e.has_durability_warning(),
                     Scene::Recovery => {
                         !e.is_dirty()
@@ -1115,6 +1138,32 @@ pub(in crate::app) fn before_update(
     if !allowed(app, &message) {
         return (Message::ProjectCloseFixtureCheckpoint, Task::none());
     }
+    let f = app.project_ui.native_fixture.as_mut().unwrap();
+    if f.context.scene.fault().is_some()
+        && f.phase == Phase::Held
+        && f.save.is_some()
+        && let Message::Repository(action) = inner(&message)
+        && f.card == Some(action.card())
+    {
+        let baseline_action = match action {
+            RepositoryAction::Save { .. } => Some("Save"),
+            RepositoryAction::Reload { .. } => Some("Reload"),
+            RepositoryAction::DiscardEdits { .. } => Some("DiscardEdits"),
+            RepositoryAction::OpenFile { .. } => Some("OpenFile"),
+            _ => None,
+        };
+        if let Some(action) = baseline_action
+            && !f.comparison_invalidated
+        {
+            // Conservative dispatch guard: the ordinary action still runs and
+            // owns its actual outcome. It cannot reuse the first writer's
+            // evidence for this one-use pre-F9 comparison, even if refused.
+            f.comparison_invalidated = true;
+            receipt(serde_json::json!({"event":"comparison_invalidated",
+                "reason":"baseline-changing dispatch after original Save capture",
+                "action":action,"native_qualified":false}));
+        }
+    }
     observe_save_result(app, &message);
     let f = app.project_ui.native_fixture.as_ref().unwrap();
     let view = inner(&message);
@@ -1215,6 +1264,7 @@ mod tests {
             save: None,
             fault_probe: None,
             writer_outcome: None,
+            comparison_invalidated: false,
             recovery_event: false,
             context: Context {
                 root: PathBuf::from("/unused-gate-unit-data"),
@@ -2433,5 +2483,215 @@ mod tests {
             std::fs::read_to_string(directory.path().join("project/notes.txt")).unwrap(),
             BASELINE
         );
+    }
+
+    // These controls keep the existing Err-only close slot. They exercise the
+    // actual writer/result/normal App path, not successful cleanup/native input.
+    async fn acknowledged_fault_app() -> (tempfile::TempDir, Cagents, CardId) {
+        let (directory, mut app, card) = save_app().await;
+        app.project_ui
+            .native_fixture
+            .as_mut()
+            .unwrap()
+            .context
+            .scene = Scene::Fault;
+        admit_save(&mut app, card);
+        let (_, task) = before_update(
+            &mut app,
+            save_key(
+                keyboard::key::Named::F10,
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        let original = save_message(task).await;
+        assert!(matches!(
+            &original,
+            Message::Repository(RepositoryAction::RetainedSaveFinished {
+                result: Err(crate::editor::retained_save::RetainedSaveError::Io(_)),
+                ..
+            })
+        ));
+        drop(app.update(original));
+        let f = app.project_ui.native_fixture.as_ref().unwrap();
+        assert!(f.save.as_ref().unwrap().observed && f.writer_outcome.as_ref().unwrap().expected);
+        assert!(!f.comparison_invalidated && f.phase == Phase::Held);
+        (directory, app, card)
+    }
+
+    #[tokio::test]
+    async fn fault_comparison_refuses_successful_retry_then_new_edit() {
+        let (directory, mut app, card) = acknowledged_fault_app().await;
+        let snapshot = app
+            .project_ui
+            .native_fixture
+            .as_ref()
+            .unwrap()
+            .save
+            .as_ref()
+            .unwrap()
+            .original
+            .snapshot
+            .clone();
+        let retry = app.update(Message::Repository(RepositoryAction::Save {
+            card,
+            overwrite: false,
+        }));
+        let ordinary = save_message(retry).await;
+        assert!(
+            matches!(&ordinary, Message::Repository(RepositoryAction::RetainedSaveFinished {
+            result: Ok(outcome), .. }) if matches!(outcome.outcome(), crate::editor::SaveOutcome::Saved { .. }))
+        );
+        drop(app.update(ordinary));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("project/notes.txt")).unwrap(),
+            snapshot
+        );
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if !runtime.is_dirty() && !runtime.is_saving() && runtime.save_error().is_none())
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card,
+                action: repository_widget::EditorAction::Edit(
+                    repository_widget::EditorEdit::Insert('z'),
+                ),
+            })),
+        );
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.is_dirty() && !runtime.is_saving() && runtime.save_error().is_none()
+                && runtime.editor_text().as_deref() != Some(snapshot.as_str()))
+        );
+        let (_, task) = before_update(
+            &mut app,
+            save_key(
+                keyboard::key::Named::F9,
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        let f = app.project_ui.native_fixture.as_ref().unwrap();
+        assert!(f.comparison_invalidated && f.phase == Phase::Held && f.held.is_some());
+        assert!(
+            f.writer_outcome.as_ref().unwrap().expected,
+            "historical result must not donate current credit"
+        );
+        assert_eq!(f.save.as_ref().unwrap().original.snapshot, snapshot);
+    }
+
+    #[tokio::test]
+    async fn original_failed_snapshot_and_visible_error_release_once_then_allow_normal_save() {
+        let (_directory, mut app, card) = acknowledged_fault_app().await;
+        let f = app.project_ui.native_fixture.as_ref().unwrap();
+        let snapshot = f.save.as_ref().unwrap().original.snapshot.clone();
+        let original_error = f.writer_outcome.as_ref().unwrap().detail.as_ref().unwrap();
+        let displayed = crate::editor::FileIoError::Io(original_error.clone()).to_string();
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.editor_text().as_deref() == Some(snapshot.as_str())
+                && runtime.save_error() == Some(displayed.as_str()) && runtime.is_dirty())
+        );
+        let (_, task) = before_update(
+            &mut app,
+            save_key(
+                keyboard::key::Named::F9,
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        let mut stream =
+            iced::runtime::task::into_stream(task).expect("one original negative close-slot Task");
+        let mut count = 0;
+        while let Some(output) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(message)) = output {
+                assert!(
+                    matches!(message, Message::ProjectUi(Action::ProjectSessionsClosed(_, 7, Err(error)))
+                    if error == "negative close-slot plumbing only")
+                );
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1);
+        let (_, duplicate) = before_update(
+            &mut app,
+            save_key(
+                keyboard::key::Named::F9,
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        assert!(iced::runtime::task::into_stream(duplicate).is_none());
+        // No successful close callback was fabricated or processed. With the
+        // callback emitted, normal Save is still admitted and owns its result.
+        let retry = app.update(Message::Repository(RepositoryAction::Save {
+            card,
+            overwrite: false,
+        }));
+        let ordinary = save_message(retry).await;
+        assert!(matches!(
+            &ordinary,
+            Message::Repository(RepositoryAction::RetainedSaveFinished { result: Ok(_), .. })
+        ));
+        drop(app.update(ordinary));
+        assert!(
+            !app.project_ui
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .comparison_invalidated
+        );
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if !runtime.is_dirty() && !runtime.is_saving() && runtime.save_error().is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn warning_and_recovery_invalidation_preserves_wrappers_and_undo() {
+        for selected in [Scene::Warning, Scene::Recovery] {
+            let (_directory, mut app, card) = save_app().await;
+            app.project_ui
+                .native_fixture
+                .as_mut()
+                .unwrap()
+                .context
+                .scene = selected;
+            admit_save(&mut app, card);
+            drop(app.update(Message::Repository(RepositoryAction::Undo { card })));
+            assert!(
+                !app.project_ui
+                    .native_fixture
+                    .as_ref()
+                    .unwrap()
+                    .comparison_invalidated
+            );
+            let foreign = Message::Repository(RepositoryAction::Reload {
+                card: CardId::new(),
+            });
+            let _ = before_update(&mut app, foreign);
+            assert!(
+                !app.project_ui
+                    .native_fixture
+                    .as_ref()
+                    .unwrap()
+                    .comparison_invalidated
+            );
+            let wrapped = Box::new(Message::Repository(RepositoryAction::Reload { card }));
+            let original_pointer = wrapped.as_ref() as *const Message;
+            let (returned, task) = before_update(&mut app, Message::UtilityPaneUi(wrapped));
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert!(
+                matches!(returned, Message::UtilityPaneUi(inner) if std::ptr::eq(inner.as_ref(), original_pointer))
+            );
+            let f = app.project_ui.native_fixture.as_ref().unwrap();
+            assert!(f.comparison_invalidated && f.phase == Phase::Held && f.held.is_some());
+            assert!(
+                f.save.as_ref().unwrap().held.is_some(),
+                "unpolled original writer custody is unchanged"
+            );
+        }
     }
 }
