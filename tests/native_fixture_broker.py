@@ -763,13 +763,38 @@ class Isolation(SandboxCase):
         runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
         if not runtime.is_dir():
             self.skipTest("no XDG runtime directory on this host")
-        # Mount sources only; nothing under them is opened or written.
+        # Real HOME/toolchains are mount sources only. The runtime being
+        # checked for invisibility must not also receive fixture writes.
         layout, directory, sibling = self.fixture_layout(
-            home, runtime,
+            home, self.base / "fixture-runtime",
             Path(os.environ.get("CARGO_HOME", home / ".cargo")),
             Path(os.environ.get("RUSTUP_HOME", home / ".rustup")),
         )
         return layout, directory, sibling, home, runtime
+
+    def test_real_layout_never_writes_to_the_runtime_it_checks(self):
+        home = self.base / "host-home"
+        runtime = self.base / "host-runtime"
+        home.mkdir()
+        runtime.mkdir()
+        real_mkdir = Path.mkdir
+
+        def private_mkdir(path, *args, **kwargs):
+            if path.is_relative_to(runtime):
+                self.fail(f"fixture attempted to write under the host runtime: {path}")
+            return real_mkdir(path, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, {
+            "HOME": str(home), "XDG_RUNTIME_DIR": str(runtime),
+            "CARGO_HOME": str(home / ".cargo"), "RUSTUP_HOME": str(home / ".rustup"),
+        }), mock.patch.object(Path, "mkdir", private_mkdir):
+            layout, _directory, _sibling, actual_home, actual_runtime = self.real_layout()
+
+        self.assertEqual((actual_home, actual_runtime), (home, runtime))
+        self.assertEqual(list(runtime.iterdir()), [])
+        self.assertTrue(layout.runtime.is_relative_to(self.base))
+        self.assertFalse(layout.runtime.is_relative_to(runtime))
+        self.assertTrue(layout.runtime.is_dir())
 
     def test_real_sockets_and_data_are_invisible_with_token_unchanged(self):
         layout, directory, _sibling, home, runtime = self.real_layout()
