@@ -3035,6 +3035,37 @@ class Protocol(TemporaryRepository):
 
 
 class CleanupCustody(unittest.TestCase):
+    def assert_original_cleanup(self, kill_fails):
+        events = []
+
+        class Original:
+            @property
+            def pid(self):
+                raise AssertionError("cleanup must retain the original process owner")
+
+            def kill(self):
+                events.append("kill-original")
+                if kill_fails:
+                    raise OSError("synthetic kill failure")
+
+            def wait(self):
+                events.append("wait-original")
+
+        probe = unittest.FunctionTestCase(lambda: None)
+        Lifecycle.end_after_test(probe, Original())
+        result = unittest.TestResult()
+        with mock.patch.object(os, "kill", side_effect=AssertionError("numeric PID fallback")):
+            probe.run(result)
+        self.assertEqual(events, ["kill-original", "wait-original"])
+        self.assertEqual(len(result.errors), int(kill_fails))
+        self.assertEqual(result.failures, [])
+
+    def test_cleanup_signals_then_waits_the_captured_original_owner(self):
+        self.assert_original_cleanup(kill_fails=False)
+
+    def test_cleanup_still_waits_the_original_when_kill_fails(self):
+        self.assert_original_cleanup(kill_fails=True)
+
     def test_cleanup_of_a_settled_original_child_never_signals_its_old_pid(self):
         process = subprocess.Popen(["/usr/bin/true"])
         self.addCleanup(process.wait)
