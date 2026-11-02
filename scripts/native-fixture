@@ -36,7 +36,7 @@ def parse(argv):
     def command(name, help_text):
         sub = commands.add_parser(name, help=help_text)
         sub.add_argument("fixture")
-        if name not in ("start", "clear"):
+        if name not in ("start", "start-prebuilt", "clear"):
             sub.add_argument("--owner", required=True, help="the owner value start returned")
         return sub
 
@@ -47,6 +47,10 @@ def parse(argv):
     start.add_argument("--scene", choices=ACCOUNTS_SCENES)
     start.add_argument("--layout", choices=("wide", "narrow"))
     start.add_argument("--side", choices=("before", "after"))
+    command("start-prebuilt", "start the operator-enabled fixed a48 package without a build")
+    command("prebuilt-step", "perform one fixed private lifecycle step").add_argument(
+        "step", choices=("daemon-start", "ready", "daemon-status", "preflight", "ui-start",
+                         "ui-wait", "empty-stop", "checkpoint", "daemon-wait"))
     command("viewport", "set the logical viewport width").add_argument("--width", type=int, required=True)
     command("clear", "remove a stopped or left-behind fixture by name")
     command("run-ui", "build and launch through scripts/run-development --browserless")
@@ -86,9 +90,13 @@ def request_from(parsed):
             if value is not None:
                 request[name] = value
         return request
+    if command == "start-prebuilt":
+        return {"op": "start-prebuilt", "fixture": fixture}
     if command == "clear":
         return {"op": "clear", "fixture": fixture}
     owned = {"fixture": fixture, "owner": parsed.owner}
+    if command == "prebuilt-step":
+        return {"op": "prebuilt-step", **owned, "step": parsed.step}
     if command == "run-ui":
         return {"op": "run-ui", **owned}
     if command == "viewport":

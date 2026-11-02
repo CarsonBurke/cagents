@@ -19,6 +19,7 @@ import errno
 import hashlib
 import hmac
 import json
+import importlib.util
 import os
 from pathlib import Path
 import queue
@@ -279,6 +280,8 @@ INPUT_KEYS = {"op", "fixture", "owner", "action", "target", "button", "double", 
               "chords", "axis", "notches", "at", "gone", "timeout", "no_text"}
 OP_KEYS = {
     "start": {"op", "fixture", "checkout", "width", *ACCOUNTS_FIELDS},
+    "start-prebuilt": {"op", "fixture", "width"},
+    "prebuilt-step": {"op", "fixture", "owner", "step"},
     "run-ui": {"op", "fixture", "owner"},
     "cli": {"op", "fixture", "owner", "args"},
     "input": INPUT_KEYS,
@@ -289,7 +292,7 @@ OP_KEYS = {
     # For a name left behind, whose owner token may be gone with its broker.
     "clear": {"op", "fixture"},
 }
-OPS_WITHOUT_OWNER = ("start", "clear")
+OPS_WITHOUT_OWNER = ("start", "start-prebuilt", "clear")
 
 
 def validate_request(request, repo):
@@ -318,6 +321,15 @@ def validate_request(request, repo):
                     or request["layout"] not in ("wide", "narrow") or request["side"] not in ("before", "after")):
                 raise Refusal("invalid_request", "unknown fixed Accounts recipe, scene, layout or side")
             result["recipe"] = AccountsRecipe(request["scene"], request["layout"], request["side"], result["width"])
+    elif op == "start-prebuilt":
+        result["width"] = _width(request)
+        if result["width"] != 1600:
+            raise Refusal("invalid_request", "fixed a48 recipe uses width1600")
+    elif op == "prebuilt-step":
+        if request.get("step") not in ("daemon-start", "ready", "daemon-status", "preflight", "ui-start",
+                                       "ui-wait", "empty-stop", "checkpoint", "daemon-wait"):
+            raise Refusal("invalid_request", "unknown fixed prebuilt step")
+        result["step"] = request["step"]
     elif op == "cli":
         args = request.get("args")
         if not isinstance(args, list) or not 1 <= len(args) <= MAX_ARGS:
@@ -488,6 +500,7 @@ class Layout:
     checkout: Path
     zig_dir: Path
     accounts: AccountsRecipe = None
+    prebuilt: object = None
 
     @property
     def root_parts(self):
@@ -1083,6 +1096,8 @@ class Fixtures:
 
     def handle(self, request):
         op = request["op"]
+        if op == "start-prebuilt":
+            raise Refusal("prebuilt_disabled", "operator must start the fixed prebuilt broker mode")
         with self.lock:
             if self.closing:
                 raise Refusal("shutting_down", "the broker is stopping; no new requests")
@@ -1368,13 +1383,19 @@ class Fixtures:
             raise Refusal("harness_failed", "the nested session did not report its sockets")
         return display.group(1), nested.group(1)
 
+    def hold_fixture_binds(self, fixture, display):
+        return hold_binds(fixture.layout, self.host.runtime_dir, display)
+
+    def holder_args(self, fixture, binds, info_fd, relay_fd):
+        return holder_argv(fixture.layout, binds, info_fd, relay_fd)
+
     def _spawn_holder(self, fixture, display):
         layout = fixture.layout
         try:
             with self.lock:
                 if self.closing:
                     raise Refusal("shutting_down", "the broker is stopping; no holder resources")
-                binds = hold_binds(layout, self.host.runtime_dir, display)
+                binds = self.hold_fixture_binds(fixture, display)
                 fixture.spawn_resources["binds"] = binds
                 read_info, write_info = os.pipe()
                 fixture.spawn_resources.update(read_info=read_info, write_info=write_info)
@@ -1383,7 +1404,7 @@ class Fixtures:
                 fixture.channel = RelayChannel(ours)
                 del fixture.spawn_resources["ours"]  # Transferred only after construction.
             try:
-                argv = holder_argv(layout, binds, write_info, theirs.fileno())
+                argv = self.holder_args(fixture, binds, write_info, theirs.fileno())
 
                 def spawn_original():
                     with self.lock:
@@ -1707,6 +1728,9 @@ class Fixtures:
         layout = fixture.layout
         dep_info = read_regular(self.host.repo, (*layout.target_parts, "dev-runtime"), "cagents.d", MAX_DEP_INFO_BYTES)
         return fixture.runner_started and binary_belongs_to(dep_info, layout.checkout)
+
+    def prebuilt_step(self, fixture, request):
+        raise Refusal("prebuilt_disabled", "operator must select the fixed prebuilt broker mode")
 
     def cli(self, fixture, request):
         if not self._cli_built(fixture):
@@ -2272,10 +2296,18 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--check-guard", action="store_true",
                         help="report that this shell may start a broker, and exit")
+    parser.add_argument("--prebuilt-a48", action="store_true",
+                        help="serve only the fixed pinned a48 private headless package; no build")
     arguments = parser.parse_args(argv)
     if arguments.check_guard:
         print("No agent authority is present or inherited.")
         return 0
+    if arguments.prebuilt_a48:
+        loader = importlib.util.spec_from_file_location("native_fixture_prebuilt",
+            Path(__file__).with_name("native_fixture_prebuilt.py"))
+        module = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(module)
+        return module.main(sys.modules[__name__])
     missing = missing_requirements()
     if missing:
         print(f"native-fixture-broker needs a niri session and: {', '.join(missing)}", file=sys.stderr)
