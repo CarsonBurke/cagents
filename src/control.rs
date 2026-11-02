@@ -1734,6 +1734,11 @@ impl ControlClient {
                     Ok(()) => {}
                     Err(message)
                         if streaming_terminal.is_some_and(|id| message_targets(&message, id)) => {}
+                    // The daemon is about to close this connection, whatever
+                    // happens to the request still in flight on it.
+                    Err(ServerMessage::HostShuttingDown) => {
+                        return Err(ControlError::ConnectionClosed);
+                    }
                     // The daemon's notice that it is dropping this connection,
                     // such as an overflowing delivery queue, says why.
                     Err(ServerMessage::Error(error)) => {
