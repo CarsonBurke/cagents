@@ -699,6 +699,53 @@ pub(super) fn preflight_retirement(
     result
 }
 
+/// A pane's Close of an agent lost with an earlier boot that has no actor to
+/// close. `false` leaves anything else to the ordinary close.
+pub(super) fn close_lost_agent_from_pane(
+    host: &SharedHost,
+    session: &chat::Session,
+) -> Result<bool, String> {
+    let Ok(registry) = registry(host) else {
+        return Ok(false);
+    };
+    let boot = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .boot_id
+        .clone();
+    let agent = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_for_session(session.id)?;
+    let Some(agent) = agent else {
+        return Ok(false);
+    };
+    let Some(HostedSession::Chat(bound)) = agent.session.clone() else {
+        return Ok(false);
+    };
+    let pending = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pending_agent_launch(agent.id)?;
+    if matches!(agent.origin, Origin::Automation { .. })
+        || pending.is_some()
+        || !bound
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.is_complete() && proof.boot_id != boot)
+        || !(crate::agent_execution::same_chat_process(&bound, session)
+            || chat::is_lost_holder_history(&bound, session))
+    {
+        return Ok(false);
+    }
+    let gate = agent_gate(host, agent.id);
+    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let _fence = super::chat::fence_lost_holder(host, &bound)?;
+    retired(host, &bound)?;
+    Ok(true)
+}
+
 /// The saved reader resident for an agent left by an earlier boot.
 fn lost_holder_reader<'a>(
     state: &'a super::state::HostState,
@@ -755,6 +802,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .pending_agent_launch(id)?;
+    let mut lost_holder_fence = None;
     if let Some(source) = agent.session.as_ref().or(pending.as_ref()) {
         match source {
             HostedSession::Chat(session) => {
@@ -776,9 +824,11 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
                 };
                 if let Some(target) = hosted {
                     super::chat::close_captured(host, target).map_err(|error| error.message)?;
-                } else if earlier_boot {
-                    // A changed kernel boot proves its process is gone, and this
-                    // daemon started no other under the same agent.
+                } else if earlier_boot && agent.session.is_some() && pending.is_none() {
+                    // A changed kernel boot proves that process is gone. An
+                    // unconfirmed launch has no such process to reason about,
+                    // and stays with the refusal below.
+                    lost_holder_fence = Some(super::chat::fence_lost_holder(host, session)?);
                 } else {
                     let startup = host
                         .lock()
@@ -848,6 +898,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     }
     let result = store.close_agent(&origin, id)?;
     drop(store);
+    drop(lost_holder_fence);
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
         .execution_startups

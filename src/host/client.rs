@@ -961,7 +961,7 @@ pub(super) fn process_request(
             ))
         }
         ClientRequest::ChatCloseRetained { session } => {
-            super::chat::close_retained_native(host, &session).map_err(|message| {
+            super::chat::close_retained_from_pane(host, &session).map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
             })?;
             Ok((ServerResponse::Accepted, Vec::new(), false))

@@ -1047,24 +1047,29 @@ fn empty_transcript_text(saved_history: bool, loading: bool) -> &'static str {
 
 /// What a saved transcript's reader is told beside its Resume action. The
 /// uncertainty is only claimed from the newest page of the transcript.
-fn saved_history_caption(snapshot: &chat::Snapshot) -> &str {
+fn saved_history_caption(snapshot: &chat::Snapshot) -> std::borrow::Cow<'_, str> {
+    let uncertain = !snapshot.history_loading
+        && !snapshot.has_later
+        && chat::last_turn_uncertain(&snapshot.items);
     if let Some(reason) = snapshot
         .read_only_reason
         .as_deref()
-        .filter(|reason| reason.starts_with(chat::LOST_AGENT_REASON))
+        .filter(|reason| reason.starts_with(chat::LOST_PROVIDER_REASON))
     {
-        return reason;
+        return if uncertain {
+            format!("{reason} The last turn may not have finished: no final reply was saved, so read it before resuming.").into()
+        } else {
+            reason.into()
+        };
     }
-    if !snapshot.history_loading
-        && !snapshot.has_later
-        && chat::last_turn_uncertain(&snapshot.items)
-    {
-        "The last turn may not have finished: no final reply was saved. Resuming reopens this conversation and sends nothing, so read it first and decide what to ask next. Your draft is retained."
+    if uncertain {
+        "The last turn may not have finished: no final reply was saved. Resuming reopens this conversation without resending anything, though messages waiting from other agents are delivered once it is running, so read it first and decide what to ask next. Your draft is retained.".into()
     } else {
         snapshot
             .read_only_reason
             .as_deref()
             .unwrap_or("Saved conversation history is read-only; no provider was started.")
+            .into()
     }
 }
 
@@ -2294,24 +2299,25 @@ impl Runtime {
                 && self.pastes_pending == 0
                 && (!saved_history || !snapshot.history_loading);
             let mut controls = vec![
-                crate::design::caption(if unresumable {
+                crate::design::caption({ let text: std::borrow::Cow<'_, str> = if unresumable {
                     // The provider's own sentence is already above this line,
                     // so this says what it means for the card, and what the
                     // second control does and does not do: the old
                     // conversation is left alone, but this card stops being
                     // the way back to it.
-                    "The saved conversation did not load. Retry resumes it, or start a new one beside it - the old conversation stays on disk, but this card stops pointing at it."
+                    "The saved conversation did not load. Retry resumes it, or start a new one beside it - the old conversation stays on disk, but this card stops pointing at it.".into()
                 } else if snapshot.exited && self.session.owns_codex_listener() {
-                    "Chat attachment ended. The retained provider may still be running; your draft is retained."
+                    "Chat attachment ended. The retained provider may still be running; your draft is retained.".into()
                 } else if saved_history {
                     saved_history_caption(snapshot)
                 } else if snapshot.exited {
                     snapshot.read_only_reason.as_deref().unwrap_or(
                         "Agent process exited. The transcript and draft are retained.",
-                    )
+                    ).into()
                 } else {
-                    "Disconnected. The daemon may still be working; your draft is retained."
-                })
+                    "Disconnected. The daemon may still be working; your draft is retained.".into()
+                };
+ text })
                 .width(Length::Fill)
                 .into(),
                 if saved_history {
@@ -6090,6 +6096,40 @@ mod tests {
             texts.0.into_iter().map(|(text, _)| text).collect(),
             messages,
         )
+    }
+
+    #[test]
+    fn a_lost_providers_caption_keeps_its_reason_and_the_uncertain_turn() {
+        let question = Arc::new(chat::Item {
+            id: "question".into(),
+            role: chat::Role::User,
+            at: None,
+            started_at: None,
+            content: ItemContent::Text {
+                text: "Saved question".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        });
+        let reason = format!("{} Fixture detail.", chat::LOST_PROVIDER_REASON);
+        let snapshot = Snapshot {
+            read_only_reason: Some(reason.clone()),
+            items: vec![question],
+            ..Default::default()
+        };
+        let caption = saved_history_caption(&snapshot);
+        assert!(caption.contains("Fixture detail"), "{caption}");
+        assert!(caption.contains("may not have finished"), "{caption}");
+        let plain = Snapshot {
+            read_only_reason: Some("Other".into()),
+            ..snapshot.clone()
+        };
+        let caption = saved_history_caption(&plain);
+        assert!(
+            caption.contains("messages waiting from other agents"),
+            "{caption}"
+        );
+        assert!(!caption.contains("sends nothing"), "{caption}");
     }
 
     #[test]

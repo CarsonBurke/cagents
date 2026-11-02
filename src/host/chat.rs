@@ -866,6 +866,82 @@ pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError>
         .map_err(unavailable)
 }
 
+/// Holds a lost agent's allocation while its close commits, once nothing could
+/// be running under it: no owner, no start in flight and no capability issued
+/// in this boot. Start replaces the capability before adoption updates the agent,
+/// so the agent's old proof alone is not enough. A later Start waits on this.
+pub(super) struct LostHolderFence(#[allow(dead_code)] capacity::Reservation);
+
+pub(super) fn fence_lost_holder(
+    host: &SharedHost,
+    session: &Session,
+) -> Result<LostHolderFence, String> {
+    const REFUSED: &str =
+        "A provider may be running for this agent since the computer restarted; it was not closed";
+    if has_native_owner(session).map_err(|error| error.message)? {
+        return Err(REFUSED.into());
+    }
+    let current = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.chats.contains_key(&session.id)
+            || state.native_actor_startups.contains_key(&session.id)
+        {
+            return Err(REFUSED.into());
+        }
+        let fence = capacity::Reservation::closing(host, &mut state, session)
+            .map_err(|_| REFUSED.to_owned())?;
+        let boot = state.proof().boot_id.clone();
+        (fence, boot)
+    };
+    let authority = super::agent_execution::registry(host)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_agent_authority_source(session.id)?;
+    let issued_now = authority.is_some_and(|stored| match stored {
+        crate::agent_execution::HostedSession::Chat(stored) => stored
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.boot_id == current.1),
+        crate::agent_execution::HostedSession::Terminal(_) => true,
+    });
+    if issued_now {
+        return Err(REFUSED.into());
+    }
+    Ok(LostHolderFence(current.0))
+}
+
+/// What a pane's Close asks of a conversation with no resident actor. A lost
+/// agent ends as an agent. A plain retained Claude conversation with no owner
+/// left has nothing to close. Everything else needs its exact close receipt.
+pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> Result<(), String> {
+    if super::agent_execution::close_lost_agent_from_pane(host, session)? {
+        return Ok(());
+    }
+    let unowned = (matches!(
+        session.native_continuity,
+        chat::NativeContinuity::RetainedClaudeActor { .. }
+    ) || session.is_saved_claude_history())
+        && !has_native_owner(session).map_err(|error| error.message)?
+        && !host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .contains_key(&session.id)
+        && super::agent_execution::registry(host).is_ok_and(|registry| {
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            registry
+                .agent_for_session(session.id)
+                .is_ok_and(|agent| agent.is_none())
+                && registry
+                    .has_agent_launch_for_session(session.id)
+                    .is_ok_and(|pending| !pending)
+        });
+    if unowned {
+        return Ok(());
+    }
+    close_retained_native(host, session)
+}
+
 fn start_with_execution(
     host: &SharedHost,
     client: ClientId,
@@ -903,6 +979,20 @@ fn start_with_execution(
     }
     // A failed pre-discovery helper still owns its exact cleanup context.
     retained_actor::reconcile_startup(host, &session).map_err(unavailable)?;
+    // An agent lost with an earlier boot resumes only as its own conversation.
+    if let Ok(registry) = super::agent_execution::registry(host)
+        && registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .start_contradicts_lost_agent(&crate::agent_execution::HostedSession::Chat(
+                session.clone(),
+            ))
+            .map_err(unavailable)?
+    {
+        return Err(unavailable(
+            "This pane no longer matches its agent's saved conversation; no provider was started",
+        ));
+    }
     // A reader's explicit Resume runs under the account its earlier holder used.
     if session.launch.provider == Provider::Claude
         && session.launch.session_id.is_some()

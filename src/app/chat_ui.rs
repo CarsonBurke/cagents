@@ -9131,7 +9131,9 @@ impl Cagents {
                             })
                         {
                             failure.recovery = chat::Recovery::Retry;
-                            failure.message.push_str(" Close the agent to end it.");
+                            failure
+                                .message
+                                .push_str(" Closing this pane ends the agent.");
                         }
                         let terminal_switch = matches!(
                             self.card_state(target.card).map(|state| &state.kind),
