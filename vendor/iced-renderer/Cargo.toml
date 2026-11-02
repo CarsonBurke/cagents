@@ -1,0 +1,41 @@
+
+["package"]
+"name" = "iced_renderer"
+"description" = "The official renderer for iced"
+"version" = "0.14.0"
+"edition" = "2024"
+"authors" = ["Héctor Ramón Jiménez <hector@hecrj.dev>"]
+"license" = "MIT"
+"repository" = "https://github.com/iced-rs/iced"
+"homepage" = "https://iced.rs"
+"categories" = ["gui"]
+"keywords" = ["gui", "ui", "graphics", "interface", "widgets"]
+
+["lints"]
+"rust" = { "rust_2018_idioms" = { "level" = "deny", "priority" = -1 }, "unused_results" = "deny" }
+"clippy" = { "type-complexity" = "allow", "map-entry" = "allow", "large-enum-variant" = "allow", "result_large_err" = "allow", "semicolon_if_nothing_returned" = "deny", "trivially-copy-pass-by-ref" = "deny", "default_trait_access" = "deny", "match-wildcard-for-single-variants" = "deny", "redundant-closure-for-method-calls" = "deny", "filter_map_next" = "deny", "manual_let_else" = "deny", "unused_async" = "deny", "from_over_into" = "deny", "needless_borrow" = "deny", "new_without_default" = "deny", "useless_conversion" = "deny" }
+"rustdoc" = { "broken_intra_doc_links" = "forbid" }
+
+["features"]
+"wgpu" = ["iced_wgpu/default"]
+"wgpu-bare" = ["iced_wgpu"]
+"tiny-skia" = ["iced_tiny_skia"]
+"image" = ["iced_tiny_skia?/image", "iced_wgpu?/image"]
+"svg" = ["iced_tiny_skia?/svg", "iced_wgpu?/svg"]
+"geometry" = ["iced_graphics/geometry", "iced_tiny_skia?/geometry", "iced_wgpu?/geometry"]
+"web-colors" = ["iced_wgpu?/web-colors"]
+"webgl" = ["iced_wgpu?/webgl"]
+"fira-sans" = ["iced_graphics/fira-sans"]
+"strict-assertions" = ["iced_wgpu?/strict-assertions"]
+"x11" = ["iced_tiny_skia?/x11"]
+"wayland" = ["iced_tiny_skia?/wayland"]
+
+["dependencies"]
+"iced_graphics" = { "version" = "0.14.0", "git" = "https://github.com/pop-os/libcosmic.git", "rev" = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+"iced_tiny_skia" = { "version" = "0.14.0", "default-features" = false, "git" = "https://github.com/pop-os/libcosmic.git", "rev" = "caec74c2559924443f12fc6faf97a5bcefe6271d", "optional" = true }
+"iced_wgpu" = { "version" = "0.14.0", "default-features" = false, "git" = "https://github.com/pop-os/libcosmic.git", "rev" = "caec74c2559924443f12fc6faf97a5bcefe6271d", "optional" = true }
+"log" = { "version" = "0.4" }
+"thiserror" = { "version" = "2" }
+raw-window-handle = "0.6"
+
+["workspace"]

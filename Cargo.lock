@@ -4430,12 +4430,12 @@ dependencies = [
 [[package]]
 name = "iced_renderer"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic.git?rev=caec74c2559924443f12fc6faf97a5bcefe6271d#caec74c2559924443f12fc6faf97a5bcefe6271d"
 dependencies = [
  "iced_graphics",
  "iced_tiny_skia",
  "iced_wgpu",
  "log",
+ "raw-window-handle",
  "thiserror 2.0.20",
 ]
 
@@ -4458,7 +4458,6 @@ dependencies = [
 [[package]]
 name = "iced_tiny_skia"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic.git?rev=caec74c2559924443f12fc6faf97a5bcefe6271d#caec74c2559924443f12fc6faf97a5bcefe6271d"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -4475,7 +4474,6 @@ dependencies = [
 [[package]]
 name = "iced_wgpu"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic.git?rev=caec74c2559924443f12fc6faf97a5bcefe6271d#caec74c2559924443f12fc6faf97a5bcefe6271d"
 dependencies = [
  "as-raw-xcb-connection",
  "bitflags 2.13.1",

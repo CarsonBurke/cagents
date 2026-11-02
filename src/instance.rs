@@ -63,6 +63,19 @@ const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents-browserless";
 #[cfg(not(feature = "full"))]
 const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents";
 pub const UI_LAUNCH_HANDSHAKE_ENV: &str = "CAGENTS_UI_LAUNCH_HANDSHAKE";
+/// Private matched CLI/UI startup ABI; ordinary launches keep value "1".
+pub(crate) const UI_LAUNCH_UPDATE_HANDSHAKE: &str = "update-retry-v1";
+pub(crate) const UI_PRESTATE_RENDERER_PREFIX: &str = "renderer-before-state-v1: ";
+static UI_STARTUP_REPORTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RendererBeforeStateRecord {
+    pub version: u8,
+    pub kind: String,
+    pub detail: String,
+}
+
 /// Older launchers understand only the final ready/error response. Progress
 /// requires a separate explicit capability to keep their stdout protocol valid.
 pub const UI_LAUNCH_RECOVERY_PROGRESS_ENV: &str = "CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS";
@@ -352,8 +365,51 @@ impl WindowLease {
     }
 }
 
+fn ui_launch_handshake_mode(value: Option<&std::ffi::OsStr>) -> Option<bool> {
+    match value {
+        Some(value) if value == "1" => Some(false),
+        Some(value) if value == UI_LAUNCH_UPDATE_HANDSHAKE => Some(true),
+        _ => None,
+    }
+}
+
 pub fn ui_launch_handshake_requested() -> bool {
-    env::var_os(UI_LAUNCH_HANDSHAKE_ENV).as_deref() == Some("1".as_ref())
+    ui_launch_handshake_mode(env::var_os(UI_LAUNCH_HANDSHAKE_ENV).as_deref()).is_some()
+}
+
+pub fn ui_launch_update_handshake_requested() -> bool {
+    ui_launch_handshake_mode(env::var_os(UI_LAUNCH_HANDSHAKE_ENV).as_deref()) == Some(true)
+}
+
+/// Only the guarded deferred window's actual before-state graphics failure
+/// uses this record. It shares the final ready/error latch, not a progress ACK.
+pub fn report_ui_renderer_before_state(detail: &str) -> io::Result<()> {
+    if ui_launch_update_handshake_requested() && !UI_STARTUP_REPORTED.swap(true, Ordering::AcqRel) {
+        let encoded = renderer_before_state_record(detail)?;
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{UI_PRESTATE_RENDERER_PREFIX}{encoded}")?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+fn renderer_before_state_record(detail: &str) -> io::Result<String> {
+    // At most 512 UTF-8 bytes => at most 3072 JSON-escaped bytes, below the
+    // existing 4096-byte private startup frame limit including fixed fields.
+    let end = detail
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(detail.len()))
+        .take_while(|i| *i <= 512)
+        .last()
+        .unwrap_or(0);
+    let record = RendererBeforeStateRecord {
+        version: 1,
+        kind: "graphics_initialization".into(),
+        detail: detail[..end].to_owned(),
+    };
+    let encoded = serde_json::to_string(&record).map_err(io::Error::other)?;
+    Ok(encoded)
 }
 
 /// Advertise the saved-pane inventory before the final readiness acknowledgement.
@@ -377,11 +433,11 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
 }
 
 pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
-    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if result.is_ok() {
         crate::diagnostics::record(crate::diagnostics::Event::Ready);
     }
-    if ui_launch_handshake_requested() && !REPORTED.swap(true, std::sync::atomic::Ordering::AcqRel)
+    if ui_launch_handshake_requested()
+        && !UI_STARTUP_REPORTED.swap(true, std::sync::atomic::Ordering::AcqRel)
     {
         let message = match result {
             Ok(()) => UI_LAUNCH_READY.to_owned(),
@@ -1124,8 +1180,10 @@ impl UiUpdateGuard {
         self.closed.clear();
         let mut errors = Vec::new();
         for slot in slots {
-            if let Err(error) = launch_window_at(executable, false, Some(slot), None) {
-                errors.push(format!("{slot}: {error}"));
+            if let Err(error) =
+                launch_window_at_with_policy(executable, false, Some(slot), None, true)
+            {
+                errors.push(ui_relaunch_failure(slot, &error));
             }
         }
         if errors.is_empty() {
@@ -1142,6 +1200,14 @@ impl UiUpdateGuard {
         }
         self.lock.take();
         Ok(())
+    }
+}
+
+fn ui_relaunch_failure(slot: &str, error: &io::Error) -> String {
+    if slot == PRIMARY_WINDOW {
+        format!("Could not reopen the main saved window (primary): {error}")
+    } else {
+        format!("Could not reopen saved window “{slot}”: {error}")
     }
 }
 
@@ -1294,6 +1360,16 @@ fn launch_window_at(
     slot: Option<&str>,
     source: Option<&str>,
 ) -> io::Result<()> {
+    launch_window_at_with_policy(executable, new_window, slot, source, false)
+}
+
+fn launch_window_at_with_policy(
+    executable: &Path,
+    new_window: bool,
+    slot: Option<&str>,
+    source: Option<&str>,
+    update_retry: bool,
+) -> io::Result<()> {
     if let Some(slot) = slot {
         validate_window_slot(slot)?;
     }
@@ -1317,7 +1393,11 @@ fn launch_window_at(
     if let Some(source) = source {
         command.args(["--from-window", source]);
     }
-    crate::control::spawn_ui_process(&mut command)
+    if update_retry {
+        crate::control::spawn_updated_ui_process(&mut command)
+    } else {
+        crate::control::spawn_ui_process(&mut command)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -2886,6 +2966,106 @@ mod tests {
         assert_eq!(activation.token, None);
     }
 
+    #[cfg(feature = "ui")]
+    #[test]
+    fn loading_startup_acknowledges_and_retains_the_original_session_activation() {
+        use crate::app::startup_window::{StartupFailure, prepare_with_activation};
+        use std::sync::{Arc, atomic::AtomicUsize, mpsc};
+
+        struct Prepared(Arc<AtomicUsize>);
+        impl Drop for Prepared {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        type Loaded = Result<
+            (
+                Prepared,
+                UiActivationListener,
+                async_channel::Receiver<UiActivation>,
+            ),
+            StartupFailure,
+        >;
+        struct OriginalLoad {
+            release: Option<mpsc::Sender<()>>,
+            original: Option<JoinHandle<Loaded>>,
+        }
+        impl Drop for OriginalLoad {
+            fn drop(&mut self) {
+                if let Some(release) = self.release.take() {
+                    let _ = release.send(());
+                }
+                if let Some(original) = self.original.take() {
+                    // Drop a late payload/listener only after the exact load
+                    // thread is joined, before the fixture directory disappears.
+                    drop(original.join());
+                }
+            }
+        }
+
+        for cancel in [false, true] {
+            let runtime = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let root = runtime.path().to_owned();
+            let canceled = Arc::new(AtomicBool::new(false));
+            let worker_cancel = canceled.clone();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let prepared_drops = dropped.clone();
+            let (entered, loading) = mpsc::channel();
+            let (release, held) = mpsc::channel();
+            let original = thread::spawn(move || {
+                prepare_with_activation(
+                    &worker_cancel,
+                    |events| UiActivationListener::bind_in(&root, events),
+                    || {
+                        let prepared = Prepared(prepared_drops);
+                        entered.send(()).unwrap();
+                        held.recv().unwrap();
+                        Ok(prepared)
+                    },
+                )
+            });
+            let mut owner = OriginalLoad {
+                release: Some(release),
+                original: Some(original),
+            };
+            loading.recv_timeout(Duration::from_secs(2)).unwrap();
+            let session = crate::model::TerminalId::new();
+            assert!(
+                activate_window_session_in(
+                    runtime.path(),
+                    PRIMARY_WINDOW,
+                    session,
+                    Some("loading-token"),
+                )
+                .unwrap()
+            );
+            assert_eq!(dropped.load(Ordering::Acquire), 0);
+            canceled.store(cancel, Ordering::Release);
+            owner.release.take().unwrap().send(()).unwrap();
+            let loaded = owner.original.take().unwrap().join().unwrap();
+            if cancel {
+                assert!(matches!(loaded, Err(error) if error.is_canceled()));
+            } else {
+                let (prepared, listener, receiver) = loaded.unwrap();
+                let activation = receiver
+                    .try_recv()
+                    .expect("original queued activation after loading");
+                assert_eq!(activation.session, Some(session));
+                assert_eq!(activation.token.as_deref(), Some("loading-token"));
+                assert!(activation.update.is_none());
+                assert!(receiver.try_recv().is_err());
+                drop(prepared);
+                drop(listener);
+                drop(receiver);
+            }
+            assert_eq!(dropped.load(Ordering::Acquire), 1);
+            assert!(!runtime.path().join(ACTIVATION_SOCKET_FILE).exists());
+        }
+    }
+
     #[test]
     fn local_session_links_exclude_device_window_namespaces() {
         assert!(window_matches_selected_device(PRIMARY_WINDOW).unwrap());
@@ -3091,5 +3271,59 @@ mod startup_update_tests {
             )
             .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod renderer_startup_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn updater_mode_is_fixed_and_ordinary_mode_remains_distinct() {
+        assert_eq!(ui_launch_handshake_mode(Some("1".as_ref())), Some(false));
+        assert_eq!(
+            ui_launch_handshake_mode(Some(UI_LAUNCH_UPDATE_HANDSHAKE.as_ref())),
+            Some(true)
+        );
+        for value in [
+            None,
+            Some("".as_ref()),
+            Some("update".as_ref()),
+            Some("2".as_ref()),
+        ] {
+            assert_eq!(ui_launch_handshake_mode(value), None);
+        }
+    }
+
+    #[test]
+    fn typed_renderer_detail_is_utf8_safe_and_bounded_after_json_escaping() {
+        for detail in ["é".repeat(1024), "\0".repeat(1024)] {
+            let encoded = renderer_before_state_record(&detail).unwrap();
+            assert!(UI_PRESTATE_RENDERER_PREFIX.len() + encoded.len() + 1 < 4096);
+            let record: RendererBeforeStateRecord = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(record.version, 1);
+            assert_eq!(record.kind, "graphics_initialization");
+            assert!(record.detail.len() <= 512);
+            assert!(detail.starts_with(&record.detail));
+        }
+    }
+
+    #[test]
+    fn reopen_failure_identifies_the_exact_saved_window_and_original_cause() {
+        let cause = io::Error::new(io::ErrorKind::TimedOut, "fixture original recovery failure");
+        assert_eq!(
+            ui_relaunch_failure(PRIMARY_WINDOW, &cause),
+            "Could not reopen the main saved window (primary): fixture original recovery failure",
+        );
+        for slot in ["workbench", "770e8e78-dc77-4fac-8069-f024344faac8"] {
+            assert_eq!(
+                ui_relaunch_failure(slot, &cause),
+                format!(
+                    "Could not reopen saved window “{slot}”: fixture original recovery failure"
+                ),
+            );
+        }
+        assert_eq!(cause.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(cause.to_string(), "fixture original recovery failure");
     }
 }
