@@ -937,6 +937,30 @@ pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> 
                     .is_ok_and(|pending| !pending)
         });
     if unowned {
+        const CHANGED: &str = "The conversation is starting or changing; it was not closed";
+        // A Start can own this allocation before publishing a resident or a
+        // helper. Hold the same reservation through the final no-op decision;
+        // observing an empty resident map alone does not settle that Start.
+        let _fence = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.chats.contains_key(&session.id)
+                || state.native_actor_startups.contains_key(&session.id)
+            {
+                return Err(CHANGED.into());
+            }
+            capacity::Reservation::closing(host, &mut state, session)
+                .map_err(|error| error.message)?
+        };
+        if has_native_owner(session).map_err(|error| error.message)? {
+            return Err(CHANGED.into());
+        }
+        let registry = super::agent_execution::registry(host)?;
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        if registry.agent_for_session(session.id)?.is_some()
+            || registry.has_agent_launch_for_session(session.id)?
+        {
+            return Err(CHANGED.into());
+        }
         return Ok(());
     }
     close_retained_native(host, session)
