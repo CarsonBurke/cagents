@@ -639,7 +639,11 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
 /// provider aborts on any second prompt.
 #[test]
 fn named_claude_resume_after_lost_holder_sends_nothing() {
-    lost_holder_case("named_claude_resume_after_lost_holder_sends_nothing", false);
+    lost_holder_case(
+        "named_claude_resume_after_lost_holder_sends_nothing",
+        false,
+        false,
+    );
 }
 
 #[test]
@@ -647,10 +651,20 @@ fn named_claude_resume_of_lost_agent_rebinds_and_sends_nothing() {
     lost_holder_case(
         "named_claude_resume_of_lost_agent_rebinds_and_sends_nothing",
         true,
+        false,
     );
 }
 
-fn lost_holder_case(name: &str, managed: bool) {
+#[test]
+fn named_claude_resume_of_lost_agent_delivers_waiting_mail_once() {
+    lost_holder_case(
+        "named_claude_resume_of_lost_agent_delivers_waiting_mail_once",
+        true,
+        true,
+    );
+}
+
+fn lost_holder_case(name: &str, managed: bool, mail: bool) {
     let Some(root) = isolated(name) else { return };
     let provider = root.join("bin/claude");
     fs::write(
@@ -1005,6 +1019,53 @@ fn lost_holder_case(name: &str, managed: bool) {
     unmap();
     assert_eq!(provider_runs(), runs_before);
 
+    // Mail waiting for this lineage does not reach a reader, and the courier
+    // is what delivers it, not Resume.
+    let courier = mail.then(|| {
+        let courier = super::super::agent_execution::mailbox::Courier::start(&host).unwrap();
+        let message = crate::agent_execution::mailbox::Message {
+            id: crate::model::MessageId::new(),
+            from: crate::agent_execution::mailbox::Party {
+                lineage: None,
+                session: None,
+                title: None,
+            },
+            to: crate::agent_execution::mailbox::Party {
+                lineage: Some(crate::agent_execution::Lineage(saved.id)),
+                session: None,
+                title: None,
+            },
+            reply_to: None,
+            body: "LIVE_WORK_1513 WAITING_MAIL".into(),
+            wait_until_ms: None,
+            state: crate::agent_execution::mailbox::State::Pending,
+            created_ms: chat::now_ms().unwrap_or(1),
+        };
+        super::super::agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .post_message(&message)
+            .unwrap();
+        courier.wake_and_wait_for_scan();
+        let stored = super::super::agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .message(message.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.state,
+            crate::agent_execution::mailbox::State::Pending,
+            "a reader takes no mail"
+        );
+        // The fixture takes one prompt per run; the earlier one is on record.
+        fs::remove_file(root.join("prompts")).unwrap();
+        fs::remove_file(root.join("prompt-bodies")).unwrap();
+        (courier, message.id)
+    });
+
     // The one explicit action: normal Start on the exact reader descriptor.
     let resumed = crate::chat::client::ClientHandle::connect(
         reader.clone(),
@@ -1023,6 +1084,38 @@ fn lost_holder_case(name: &str, managed: bool) {
     assert_eq!(session.id, original.id);
     assert_eq!(session.launch, original.launch);
     assert!(session.native_continuity.retains_provider());
+    if let Some((courier, message)) = courier {
+        let delivered = || {
+            super::super::agent_execution::registry(&host)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .message(message)
+                .unwrap()
+                .unwrap()
+                .state
+        };
+        wait("waiting mail", &mut || {
+            courier.wake_and_wait_for_scan();
+            delivered() != crate::agent_execution::mailbox::State::Pending
+                && root.join("prompts").exists()
+        });
+        courier.wake_and_wait_for_scan();
+        courier.wake_and_wait_for_scan();
+        assert_eq!(
+            fs::read_to_string(root.join("prompts")).unwrap(),
+            "prompt\n",
+            "mail arrives at most once"
+        );
+        let bodies = fs::read_to_string(root.join("prompt-bodies")).unwrap();
+        assert_eq!(bodies.lines().count(), 1, "the old prompt is not replayed");
+        assert!(bodies.contains("WAITING_MAIL"), "{bodies}");
+        drop(courier);
+        drop(resumed);
+        drop(restored);
+        drop(worker);
+        return;
+    }
     resumed.set_visible(true).unwrap();
     wait("resumed transcript", &mut || {
         let snapshot = resumed.snapshot();
