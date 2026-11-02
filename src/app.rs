@@ -4327,7 +4327,8 @@ pub enum Message {
     },
     /// Whether the daemon still hosts the console a pane was asked to show.
     AgentConsoleChecked {
-        card: CardId,
+        target: chat_ui::Target,
+        presentation: crate::workspace_model::views::AgentPresentation,
         hosted: Result<bool, String>,
     },
     /// `None` when the terminal is no longer hosted and would have to be
@@ -14669,9 +14670,11 @@ impl Application for Cagents {
                 terminal,
                 result,
             } => self.retained_terminal_attached(card, terminal, result),
-            Message::AgentConsoleChecked { card, hosted } => {
-                self.agent_console_checked(card, hosted)
-            }
+            Message::AgentConsoleChecked {
+                target,
+                presentation,
+                hosted,
+            } => self.agent_console_checked(target, presentation, hosted),
             Message::RestoredAgentAttached {
                 card,
                 terminal,

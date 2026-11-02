@@ -585,8 +585,9 @@ pub(super) struct State {
     receiver: async_channel::Receiver<(Target, Wake)>,
     generation: u64,
     phases: HashMap<CardId, Phase>,
-    /// Panes waiting for the daemon to say whether their agent's console runs.
-    console_checks: HashSet<CardId>,
+    /// The issued check for each pane, so an old answer cannot finish a
+    /// replacement check occupying the same card.
+    console_checks: HashMap<CardId, Target>,
     /// Transient user intent, never an execution proof. Automatic restoration
     /// cannot acquire this permission; an exact failed History start can retry.
     explicit_starts: HashMap<CardId, chat::Session>,
@@ -635,7 +636,7 @@ impl Default for State {
             receiver,
             generation: 0,
             phases: HashMap::new(),
-            console_checks: HashSet::new(),
+            console_checks: HashMap::new(),
             explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
@@ -6794,6 +6795,7 @@ impl Cagents {
     }
 
     pub(super) fn chat_forget(&mut self, card: CardId) {
+        self.chat_ui.console_checks.remove(&card);
         self.chat_ui.explicit_starts.remove(&card);
         self.chat_ui.capacity_offers.remove(&card);
         // The runtime is about to be dropped, so its unsent text is captured
@@ -6828,6 +6830,7 @@ impl Cagents {
     /// stashing its unsent text would pin the string for the lifetime of the
     /// process with nothing able to read it back.
     pub(super) fn chat_discard(&mut self, card: CardId) {
+        self.chat_ui.console_checks.remove(&card);
         self.chat_ui.default_chats.remove(&card);
         // A start still in flight is not dropped with the card: whatever it
         // leaves in the daemon is given up when it answers, as for a close.
@@ -7463,17 +7466,23 @@ impl Cagents {
                 self.open_chat(card, session, chat::Intent::Restore)
             }
             Surface::Chat => {
-                if !self.chat_ui.console_checks.insert(card) {
+                if self.chat_ui.console_checks.contains_key(&card) {
                     return Task::none();
                 }
-                let console = presentation.console;
+                let target = self.chat_ui.next_target(card);
+                self.chat_ui.console_checks.insert(card, target);
+                let console = presentation.console.clone();
                 cosmic::task::future(async move {
                     let hosted =
                         tokio::task::spawn_blocking(move || console_still_hosted(&console))
                             .await
                             .map_err(|error| format!("console check join failed: {error}"))
                             .and_then(|result| result);
-                    Message::AgentConsoleChecked { card, hosted }
+                    Message::AgentConsoleChecked {
+                        target,
+                        presentation,
+                        hosted,
+                    }
                 })
             }
         }
@@ -7485,15 +7494,23 @@ impl Cagents {
     /// keeps the chat rather than trading it for a dead terminal.
     pub(super) fn agent_console_checked(
         &mut self,
-        card: CardId,
+        target: Target,
+        presentation: crate::workspace_model::views::AgentPresentation,
         hosted: Result<bool, String>,
     ) -> Task<Message> {
         use crate::agent_execution::Surface;
+        let card = target.card;
+        if self.chat_ui.console_checks.get(&card) != Some(&target) {
+            return Task::none();
+        }
         self.chat_ui.console_checks.remove(&card);
         // The person may have moved on while the daemon answered.
-        let Some((presentation, Surface::Chat)) = self.agent_presentation(card) else {
+        let Some((current, Surface::Chat)) = self.agent_presentation(card) else {
             return Task::none();
         };
+        if current != presentation {
+            return Task::none();
+        }
         if let Some(reason) = self.chat_switch_blocker(card) {
             self.status = Some(TransientNotice::error(reason.into_owned()));
             return Task::none();
@@ -28682,6 +28699,14 @@ mod agent_presentation_tests {
         (app, card, agent, directory)
     }
 
+    fn console_check_result(app: &Cagents, card: CardId, hosted: Result<bool, String>) -> Message {
+        Message::AgentConsoleChecked {
+            target: *app.chat_ui.console_checks.get(&card).expect("issued check"),
+            presentation: app.agent_presentation(card).expect("same agent").0,
+            hosted,
+        }
+    }
+
     /// Showing a console agent as its chat attaches the chat to the running
     /// provider in place and leaves the console running; showing the console
     /// again puts the same console back. Neither direction hands the
@@ -28730,10 +28755,8 @@ mod agent_presentation_tests {
             matches!(app.card_state(card).unwrap().kind, CardKind::Chat(_)),
             "the pane waits for the daemon's answer"
         );
-        drop(app.update(Message::AgentConsoleChecked {
-            card,
-            hosted: Ok(true),
-        }));
+        let checked = console_check_result(&app, card, Ok(true));
+        drop(app.update(checked));
         assert_eq!(
             app.card_state(card).unwrap().kind,
             CardKind::Terminal(presentation.console.clone())
@@ -28765,8 +28788,9 @@ mod agent_presentation_tests {
                 crate::workspace_model::views::AgentPresentation::of(&agent).unwrap();
             shown_as_chat(&mut app, card);
             drop(app.update(Message::ChatUi(Action::Switch(card))));
-            assert!(app.chat_ui.console_checks.contains(&card));
-            drop(app.update(Message::AgentConsoleChecked { card, hosted }));
+            assert!(app.chat_ui.console_checks.contains_key(&card));
+            let checked = console_check_result(&app, card, hosted);
+            drop(app.update(checked));
             assert!(app.chat_ui.console_checks.is_empty());
             assert_eq!(
                 app.card_state(card).unwrap().kind,
@@ -28783,7 +28807,11 @@ mod agent_presentation_tests {
         let (mut app, card, agent, _directory) = console_agent_app();
         let presentation = crate::workspace_model::views::AgentPresentation::of(&agent).unwrap();
         drop(app.update(Message::AgentConsoleChecked {
-            card,
+            target: super::Target {
+                card,
+                generation: 0,
+            },
+            presentation: presentation.clone(),
             hosted: Ok(false),
         }));
         assert_eq!(
@@ -28795,6 +28823,208 @@ mod agent_presentation_tests {
                 .recent()
                 .any(|logged| logged.notice.message == AGENT_CONSOLE_ENDED),
             "the pane already shows the console"
+        );
+    }
+
+    /// A liveness answer for the previous conversation/account/process is
+    /// not evidence that the current console runs, even on the same card.
+    #[test]
+    fn an_old_console_check_cannot_switch_a_replaced_conversation() {
+        for changed in ["conversation", "account", "proof", "console"] {
+            let (mut app, card, mut agent, _directory) = console_agent_app();
+            shown_as_chat(&mut app, card);
+            drop(app.update(Message::ChatUi(Action::Switch(card))));
+            let old_answer = console_check_result(&app, card, Ok(true));
+            let Some(HostedSession::Chat(native)) = &mut agent.session else {
+                unreachable!();
+            };
+            match changed {
+                "conversation" => native.launch.session_id = Some("replacement".into()),
+                "account" => {
+                    native.launch.recipe.environment.insert(
+                        "CLAUDE_CONFIG_DIR".into(),
+                        "/synthetic/replacement-account".into(),
+                    );
+                    agent.spec.account = Some(AccountId::new());
+                }
+                "proof" => {
+                    native.proof.as_mut().unwrap().host_incarnation =
+                        crate::model::HostIncarnation::new("replacement");
+                }
+                "console" => {
+                    agent.console.as_mut().unwrap().launch.working_directory =
+                        "/synthetic/replacement-console".into();
+                }
+                _ => unreachable!(),
+            }
+            let replacement = crate::workspace_model::views::AgentPresentation::of(&agent).unwrap();
+            app.workspace_model.agents = vec![agent];
+            app.card_state_mut(card).unwrap().kind = replacement.kind(Surface::Chat);
+            assert!(app.agent_presentation(card).is_some(), "{changed}");
+
+            drop(app.update(old_answer));
+
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                replacement.kind(Surface::Chat),
+                "{changed}"
+            );
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))));
+            assert!(app.chat_ui.console_checks.is_empty());
+        }
+    }
+
+    /// A complete accepted model read can replace the saved descriptor while
+    /// the old check is in flight. Its result must not change the projected
+    /// pane or whichever runtime the ordinary reconciliation retained.
+    #[test]
+    fn a_console_check_cannot_switch_the_conversation_from_a_new_model_read() {
+        use crate::workspace_model::views::{Pane, Scope, View};
+        use crate::workspace_model::{ModelChannel, ModelProject, WorkspaceModel};
+
+        let (mut app, card, mut agent, _directory) = console_agent_app();
+        shown_as_chat(&mut app, card);
+        let Scope::Channel(channel) = agent.placement.clone() else {
+            unreachable!();
+        };
+        let project = ProjectId::new();
+        let repository = agent.spec.target.repository.clone();
+        let identity = uuid::Uuid::new_v4();
+        app.sidebar_model.projects.push(
+            crate::sidebar::SidebarProject::new(
+                project,
+                crate::repository::RepositoryId::new(),
+                "Console fixture".into(),
+                repository.clone(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+        );
+        {
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.workspace_model_identity = Some(identity);
+            durable.active_channel = Some(channel);
+            durable.channels.push(ProjectChannel {
+                id: channel,
+                project_id: project,
+                title: "Console fixture".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+                shared: true,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        }
+        app.shared_views = super::super::shared_views::State::for_workspace(&app.durable);
+        let scope = Scope::Channel(channel);
+        app.acknowledge_view_edit(scope.clone(), None);
+        let mut view = View::empty(scope);
+        view.panes.push(
+            Pane::from_card(app.card_state(card).unwrap(), Some(repository.clone())).unwrap(),
+        );
+        let mut model = WorkspaceModel {
+            identity,
+            sequence: 1,
+            projects: vec![ModelProject {
+                repository: repository.clone(),
+                name: "Console fixture".into(),
+                kind: ProjectKind::Folder,
+                ordinal: 1,
+            }],
+            channels: vec![ModelChannel {
+                id: channel,
+                repository,
+                title: "Console fixture".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            }],
+            views: vec![view],
+            agents: vec![agent.clone()],
+            ..WorkspaceModel::default()
+        };
+        drop(app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::Read(model.clone()),
+        )));
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let old_answer = console_check_result(&app, card, Ok(true));
+        let Some(HostedSession::Chat(native)) = &mut agent.session else {
+            unreachable!();
+        };
+        native.launch.session_id = Some("replacement-from-model".into());
+        let replacement = crate::workspace_model::views::AgentPresentation::of(&agent).unwrap();
+        model.sequence += 1;
+        model.agents = vec![agent];
+        model.views[0].revision += 1;
+        model.views[0].panes[0].kind = replacement.kind(Surface::Chat);
+        drop(app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::Read(model),
+        )));
+        assert_eq!(app.agent_presentation(card).unwrap().0, replacement);
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            replacement.kind(Surface::Chat)
+        );
+        let runtime = match app.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => (
+                runtime.target,
+                runtime.session.clone(),
+                runtime.unsent_text().to_owned(),
+            ),
+            _ => panic!("the replacement keeps a chat runtime"),
+        };
+
+        drop(app.update(old_answer));
+
+        assert_eq!(app.agent_presentation(card).unwrap().0, replacement);
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            replacement.kind(Surface::Chat)
+        );
+        let Some(CardRuntime::Chat(current)) = app.cards.get(&card) else {
+            panic!("the late answer replaced the chat runtime");
+        };
+        assert_eq!(
+            (
+                current.target,
+                current.session.clone(),
+                current.unsent_text().to_owned()
+            ),
+            runtime
+        );
+    }
+
+    /// Leaving a chat invalidates its check. Its late result must not take
+    /// the slot, status or result of a new check for that same presentation.
+    #[test]
+    fn an_old_console_answer_cannot_finish_a_new_check() {
+        let (mut app, card, agent, _directory) = console_agent_app();
+        shown_as_chat(&mut app, card);
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let old_answer = console_check_result(&app, card, Ok(true));
+        let old_target = *app.chat_ui.console_checks.get(&card).unwrap();
+        app.chat_forget(card);
+        assert!(app.chat_ui.console_checks.is_empty());
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let new_target = *app.chat_ui.console_checks.get(&card).unwrap();
+        assert_ne!(old_target, new_target);
+        let new_answer = console_check_result(&app, card, Ok(false));
+
+        drop(app.update(old_answer));
+
+        assert_eq!(app.chat_ui.console_checks.get(&card), Some(&new_target));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            crate::workspace_model::views::AgentPresentation::of(&agent)
+                .unwrap()
+                .kind(Surface::Chat)
+        );
+        drop(app.update(new_answer));
+        assert!(app.chat_ui.console_checks.is_empty());
+        assert!(
+            app.notices
+                .recent()
+                .any(|logged| logged.notice.message == AGENT_CONSOLE_ENDED)
         );
     }
 
