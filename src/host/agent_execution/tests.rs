@@ -4638,7 +4638,10 @@ fn console_tail_exact_fit_without_older_printable_entries_is_complete() {
         vec![visible.clone()],
         vec![exact_fit_console_item(true), visible.clone()],
     ] {
-        let (text, truncated) = console_text(&items);
+        let (text, truncated) = console_text(&chat::Snapshot {
+            items,
+            ..Default::default()
+        });
         assert_eq!(text, expected);
         assert!(!truncated, "no printable entry was omitted");
     }
@@ -4660,8 +4663,59 @@ fn console_tail_exact_fit_marks_an_older_printable_entry_as_truncated() {
         },
         at: None,
     });
-    let (text, truncated) = console_text(&[older, exact_fit_console_item(true), visible]);
+    let (text, truncated) = console_text(&chat::Snapshot {
+        items: vec![older, exact_fit_console_item(true), visible],
+        ..Default::default()
+    });
     assert_eq!(text.len(), crate::agent_execution::MAX_RESULT_BYTES);
     assert_eq!(text, expected);
     assert!(truncated, "the earlier settled step fell outside the tail");
+}
+
+#[test]
+fn console_short_resident_windows_report_missing_context_in_either_direction() {
+    let step = |id: &str| {
+        Arc::new(chat::Item {
+            started_at: None,
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: chat::ItemContent::Tool {
+                name: "Agent".into(),
+                input: String::new(),
+                output: String::new(),
+                status: chat::ToolStatus::Succeeded,
+            },
+            at: None,
+        })
+    };
+    let ready = Arc::new(chat::Item {
+        started_at: None,
+        id: "ready".into(),
+        role: chat::Role::Assistant,
+        content: chat::ItemContent::Text {
+            text: "Ready".into(),
+            thinking: false,
+            phase: Default::default(),
+        },
+        at: None,
+    });
+    for (has_earlier, has_later, expected_truncated) in [
+        (false, false, false),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        let snapshot = chat::Snapshot {
+            generation: 2,
+            items: vec![step("first-call"), ready.clone(), step("second-call")],
+            has_earlier,
+            has_later,
+            ..Default::default()
+        };
+        let (text, truncated) = console_text(&snapshot);
+        assert_eq!(text, "Called Agent\nAssistant: Ready\nCalled Agent\n");
+        assert_eq!(text.matches("Called Agent\n").count(), 2);
+        assert!(text.len() < crate::agent_execution::MAX_RESULT_BYTES);
+        assert_eq!(truncated, expected_truncated);
+    }
 }

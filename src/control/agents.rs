@@ -2227,13 +2227,13 @@ mod tests {
         let output = console_delta(previous, recent, true);
         assert_eq!(
             output,
-            "\n[Console resynchronized: recent output follows. Repeated lines may already have been shown; earlier output may be missing.]\nAssistant: Ready\nCalled Agent\n[End of recent console view]\n"
+            "\n[Console resynchronized: partial transcript follows. Lines may repeat and some output may be missing.]\nAssistant: Ready\nCalled Agent\n[End of partial console view]\n"
         );
 
         // Distinct occurrences with identical wording remain in the snapshot.
         let repeated = console_delta(recent, "Called Agent\nCalled Agent\n", true);
         assert_eq!(repeated.matches("Called Agent\n").count(), 2);
-        assert!(repeated.contains("recent output follows"));
+        assert!(repeated.contains("partial transcript follows"));
     }
 
     #[test]
@@ -2245,8 +2245,8 @@ mod tests {
         let next = console_delta(recent, recent, true);
         assert_eq!(first, next);
         assert!(next.starts_with("\n[Console resynchronized:"));
-        assert!(next.contains("earlier output may be missing"));
-        assert!(next.ends_with("Assistant: Ready\n[End of recent console view]\n"));
+        assert!(next.contains("some output may be missing"));
+        assert!(next.ends_with("Assistant: Ready\n[End of partial console view]\n"));
 
         // Untruncated equality still has the ordinary quiet streaming behavior.
         assert_eq!(console_delta(recent, recent, false), "");
@@ -2256,8 +2256,8 @@ mod tests {
     fn console_resynchronization_bounds_large_views_without_splitting_utf8() {
         let text = format!("{}\nCalled Agent\n", "€".repeat(CONSOLE_RESYNC_BYTES));
         let output = console_delta(&text, &text, true);
-        assert!(output.contains("Showing only the end of this recent view."));
-        assert!(output.ends_with("Called Agent\n[End of recent console view]\n"));
+        assert!(output.contains("Showing only the end of this view."));
+        assert!(output.ends_with("Called Agent\n[End of partial console view]\n"));
         assert!(output.len() < CONSOLE_RESYNC_BYTES + 512);
         assert!(!output.contains('\u{fffd}'));
     }
@@ -3005,31 +3005,31 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
     })
 }
 
-// A resynchronization is a preview, not another dump of the full daemon tail.
+// A resynchronization is a preview, not another dump of the full daemon view.
 const CONSOLE_RESYNC_BYTES: usize = 16 * 1024;
 
 /// Untruncated growth streams as a suffix. Late settled lines are printed once
 /// per occurrence without replaying unchanged lines. If either adjacent view
 /// was truncated, line contents cannot identify occurrences across the moving
-/// tail, even when both strings are equal. Show the daemon's bounded recent
+/// window, even when both strings are equal. Show the daemon's partial
 /// view with an explicit resynchronization notice instead of guessing a delta.
 fn console_delta(previous: &str, text: &str, bounded: bool) -> String {
     if bounded {
         let mut output = String::from(
-            "\n[Console resynchronized: recent output follows. Repeated lines may already have been shown; earlier output may be missing.]\n",
+            "\n[Console resynchronized: partial transcript follows. Lines may repeat and some output may be missing.]\n",
         );
         let mut start = text.len().saturating_sub(CONSOLE_RESYNC_BYTES);
         while !text.is_char_boundary(start) {
             start += 1;
         }
         if start != 0 {
-            output.push_str("[Showing only the end of this recent view.]\n");
+            output.push_str("[Showing only the end of this view.]\n");
         }
         output.push_str(&text[start..]);
         if !output.ends_with('\n') {
             output.push('\n');
         }
-        output.push_str("[End of recent console view]\n");
+        output.push_str("[End of partial console view]\n");
         return output;
     }
     if let Some(delta) = text.strip_prefix(previous) {

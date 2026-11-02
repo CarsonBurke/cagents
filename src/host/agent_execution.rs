@@ -1435,7 +1435,7 @@ fn console(
             let Some(snapshot) = handle.snapshot(cursor) else {
                 return Ok(Reply::Console(None));
             };
-            let (text, truncated) = console_text(&snapshot.items);
+            let (text, truncated) = console_text(&snapshot);
             let mut requests = snapshot.requests;
             hide_secrets(&mut requests);
             Ok(Reply::Console(Some(ConsoleView {
@@ -1450,14 +1450,18 @@ fn console(
     }
 }
 
-/// The recent printable console view, including whether earlier output was
-/// omitted. Exact exhaustion alone is not truncation: one older printable
-/// entry distinguishes a bounded tail from a complete view that exactly fits.
-fn console_text(items: &[Arc<chat::Item>]) -> (String, bool) {
+/// The printable console view, including any missing resident-window context.
+/// Exact byte exhaustion alone is not truncation: one older printable entry
+/// distinguishes a bounded tail from a complete view that exactly fits.
+fn console_text(snapshot: &chat::Snapshot) -> (String, bool) {
     let mut chunks = Vec::new();
     let mut remaining = crate::agent_execution::MAX_RESULT_BYTES;
-    let mut truncated = false;
-    let mut lines = items.iter().rev().filter_map(|item| console_line(item));
+    let mut truncated = snapshot.has_earlier || snapshot.has_later;
+    let mut lines = snapshot
+        .items
+        .iter()
+        .rev()
+        .filter_map(|item| console_line(item));
     for mut text in lines.by_ref() {
         if text.len() > remaining {
             crate::agent_execution::truncate(&mut text, remaining);
