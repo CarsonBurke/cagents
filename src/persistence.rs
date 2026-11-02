@@ -4393,12 +4393,18 @@ fn validate_card_conversion(
                 [card.id.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
+            // An agent's console runs the cagents CLI over the native session
+            // that shares its identity, so showing that session is the same
+            // conversation even though the console names no provider.
+            let agent_console = crate::agent_execution::console_agent(&source.launch).is_some();
             if source.id != session.id
                 || id != source.id.to_string()
                 || from_json::<crate::model::LaunchRecipe>("terminal recipe", &recipe)?
                     != source.launch
-                || !(source_chat_launch_matches(source, session) || codex_cli_view(session, source))
-                || exact_chat_resume(session).is_none()
+                || !(agent_console
+                    || ((source_chat_launch_matches(source, session)
+                        || codex_cli_view(session, source))
+                        && exact_chat_resume(session).is_some()))
             {
                 return Err(invalid());
             }
@@ -4410,6 +4416,17 @@ fn validate_card_conversion(
                 |row| row.get(0),
             )?;
             let session: crate::chat::Session = from_json("chat card", &content)?;
+            // Back to the agent console the chat was paired with, exactly.
+            if crate::agent_execution::console_agent(&terminal.launch).is_some()
+                && terminal.id == session.id
+                && session.terminal.as_ref().is_some_and(|console| {
+                    console.id == terminal.id
+                        && console.launch == terminal.launch
+                        && console.transcript_path == terminal.transcript_path
+                })
+            {
+                return Ok(());
+            }
             let proof = terminal.continuity.live_proof();
             let reattach = session.launch.provider == crate::agent::Provider::Codex
                 && proof.is_some()
@@ -10078,6 +10095,75 @@ mod tests {
                 .unwrap()
                 .kind,
             CardKind::Terminal(terminal)
+        );
+    }
+
+    /// An agent's pane switches between its console and its native chat in
+    /// either direction, and only to the chat of that console's own session.
+    #[test]
+    fn an_agent_console_switches_to_its_own_chat_and_back() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        let mut workspace = workspace_with_terminal(&boot("chat-boot"));
+        let agent = crate::model::AgentId::new();
+        let CardKind::Terminal(console) = &mut workspace.cards[0].kind else {
+            unreachable!()
+        };
+        console.launch.program = "cagents".into();
+        console.launch.arguments = vec!["agent".into(), "console".into(), agent.to_string()];
+        console.resume_hint = None;
+        let console = console.clone();
+        let proof = console.continuity.live_proof().unwrap();
+        let chat = crate::chat::Session {
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            id: console.id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: recipe(),
+                session_id: None,
+            },
+            proof: Some(proof.clone()),
+            terminal: Some(console.clone()),
+        };
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+
+        let mut other = chat.clone();
+        other.id = TerminalId::new();
+        workspace.cards[0].kind = CardKind::Chat(other);
+        assert!(matches!(
+            card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+            StoreError::InvalidState(_)
+        ));
+        let mut unpaired = chat.clone();
+        unpaired.terminal = None;
+        workspace.cards[0].kind = CardKind::Chat(unpaired);
+        assert!(matches!(
+            card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+            StoreError::InvalidState(_)
+        ));
+
+        workspace.cards[0].kind = CardKind::Chat(chat.clone());
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            store
+                .load_card(workspace.cards[0].id, Some(&proof))
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Chat(chat)
+        );
+        workspace.cards[0].kind = CardKind::Terminal(console.clone());
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            store
+                .load_card(workspace.cards[0].id, Some(&proof))
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Terminal(console)
         );
     }
 

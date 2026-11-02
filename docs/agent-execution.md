@@ -178,6 +178,8 @@ A message body is at most 64 KiB, and a lineage holds at most 64 undelivered mes
 - `/quit` detaches the console; the provider remains hosted.
 - Closing the terminal card follows normal active-work confirmation and retires the exact paired actor.
 
+The console and the native chat are two views of the same running agent, so its pane can show either. **Show as chat** in the pane's menu or header attaches the chat to the running provider in place, and **Show as console** puts the console back. Switching starts no provider, replays no prompt, closes neither the actor nor the console, does not take the agent over, and leaves its history and its spawn surface unchanged; presenting the surface already shown changes nothing.
+
 ## Delegation and bundled skill
 
 Fresh hosted sessions receive a daemon-issued, session-bound capability in `CAGENTS_AGENT_AUTHORITY`. It is transient process context, omitted from public recipes and redacted in diagnostics. Agents use the same CLI commands as people, but can only inspect/control children created under their live, proved session. A plain human CLI invocation without that variable owns a separate root scope. Passing a parent ID never grants authority. Do not copy, print, unset, or fabricate capabilities to bypass that scope.
