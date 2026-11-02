@@ -1072,20 +1072,18 @@ class Lifecycle(SandboxCase):
         broker.RELAY = original + "\nimport time\ntime.sleep(300)\n"
         self.addCleanup(setattr, broker, "RELAY", original)
 
-    def end_after_test(self, pid):
-        def end():
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-        self.addCleanup(end)
+    def end_after_test(self, process):
+        # Retain the original wait owner, never a PID that may be reused after
+        # stop reaps it. Separate callbacks still wait if kill itself fails.
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
 
     def test_stop_ends_a_sandbox_that_ignores_its_channel_and_rewrote_its_files(self):
         self.relay_ignoring_end_of_channel()
         owner = self.start()["owner"]
         fixture = self.fixtures.live["demo"]
         holder = fixture.holder_pid
-        self.end_after_test(holder)
+        self.end_after_test(fixture.process)
         shutil.rmtree(fixture.layout.sandbox / "project")
         self.call("stop", fixture="demo", owner=owner)
         self.assertTrue(self.await_gone(holder), "stop must end the sandbox")
@@ -1095,11 +1093,9 @@ class Lifecycle(SandboxCase):
         self.start()
         fixture = self.fixtures.live["demo"]
         holder = fixture.holder_pid
-        self.end_after_test(holder)
+        self.end_after_test(fixture.process)
         shutil.rmtree(fixture.layout.sandbox / "project")
         process, fixture.process = fixture.process, None
-        self.addCleanup(process.wait)
-        self.addCleanup(process.kill)
         self.fixtures._kill_holder(fixture)
         self.assertTrue(self.await_gone(holder), "the pidfd kill must not depend on sandbox files")
 
@@ -3036,6 +3032,20 @@ class Protocol(TemporaryRepository):
         for forbidden in ("subprocess", "os.exec", "os.system", "os.spawn", "os.fork",
                           "os.environ.copy", "dict(os.environ)", AUTHORITY):
             self.assertNotIn(forbidden, source)
+
+
+class CleanupCustody(unittest.TestCase):
+    def test_cleanup_of_a_settled_original_child_never_signals_its_old_pid(self):
+        process = subprocess.Popen(["/usr/bin/true"])
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        self.assertEqual(process.wait(timeout=30), 0)
+        cleanups = unittest.TestCase()
+        Lifecycle.end_after_test(cleanups, process)
+        with mock.patch.object(os, "kill", side_effect=AssertionError("stale PID signal")) as kill:
+            self.assertTrue(cleanups.doCleanups())
+        kill.assert_not_called()
+        self.assertEqual(process.returncode, 0)
 
 
 if __name__ == "__main__":
