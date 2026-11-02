@@ -1035,6 +1035,44 @@ impl Cagents {
 }
 
 /// Prefer concrete activity from the newest assistant item when available.
+/// A read-only pane cannot take a message, so its empty transcript must not
+/// invite one, and must not read as loss while its history is still on the way.
+fn empty_transcript_text(saved_history: bool, loading: bool) -> &'static str {
+    match (saved_history, loading) {
+        (false, _) => "Your conversation appears here. Send a message to begin.",
+        (true, true) => "Loading the saved conversation.",
+        (true, false) => "This conversation has no saved messages to show.",
+    }
+}
+
+/// What a saved transcript's reader is told beside its Resume action. The
+/// uncertainty is only claimed from the newest page of the transcript.
+fn saved_history_caption(snapshot: &chat::Snapshot) -> std::borrow::Cow<'_, str> {
+    let uncertain = !snapshot.history_loading
+        && !snapshot.has_later
+        && chat::last_turn_uncertain(&snapshot.items);
+    if let Some(reason) = snapshot
+        .read_only_reason
+        .as_deref()
+        .filter(|reason| reason.starts_with(chat::LOST_PROVIDER_REASON))
+    {
+        return if uncertain {
+            format!("{reason} The last turn may not have finished: no final reply was saved, so read it before resuming.").into()
+        } else {
+            reason.into()
+        };
+    }
+    if uncertain {
+        "The last turn may not have finished: no final reply was saved. Resuming reopens this conversation without resending anything, though messages waiting from other agents are delivered once it is running, so read it first and decide what to ask next. Your draft is retained.".into()
+    } else {
+        snapshot
+            .read_only_reason
+            .as_deref()
+            .unwrap_or("Saved conversation history is read-only; no provider was started.")
+            .into()
+    }
+}
+
 fn activity_label(snapshot: &chat::Snapshot) -> &'static str {
     if snapshot.has_later {
         return "Working";
@@ -1885,8 +1923,11 @@ impl Runtime {
                 // of an invitation; the status line is where a state belongs.
                 transcript.push(
                     widget::container(
-                        design::body("Your conversation appears here. Send a message to begin.")
-                            .class(cosmic::theme::Text::Custom(design::muted_text)),
+                        design::body(empty_transcript_text(
+                            self.has_connected_saved_history(snapshot),
+                            snapshot.history_loading,
+                        ))
+                        .class(cosmic::theme::Text::Custom(design::muted_text)),
                     )
                     .center_x(Length::Fill)
                     .padding(space::XXL)
@@ -2258,22 +2299,25 @@ impl Runtime {
                 && self.pastes_pending == 0
                 && (!saved_history || !snapshot.history_loading);
             let mut controls = vec![
-                crate::design::caption(if unresumable {
+                crate::design::caption({ let text: std::borrow::Cow<'_, str> = if unresumable {
                     // The provider's own sentence is already above this line,
                     // so this says what it means for the card, and what the
                     // second control does and does not do: the old
                     // conversation is left alone, but this card stops being
                     // the way back to it.
-                    "The saved conversation did not load. Retry resumes it, or start a new one beside it - the old conversation stays on disk, but this card stops pointing at it."
+                    "The saved conversation did not load. Retry resumes it, or start a new one beside it - the old conversation stays on disk, but this card stops pointing at it.".into()
                 } else if snapshot.exited && self.session.owns_codex_listener() {
-                    "Chat attachment ended. The retained provider may still be running; your draft is retained."
+                    "Chat attachment ended. The retained provider may still be running; your draft is retained.".into()
+                } else if saved_history {
+                    saved_history_caption(snapshot)
                 } else if snapshot.exited {
                     snapshot.read_only_reason.as_deref().unwrap_or(
                         "Agent process exited. The transcript and draft are retained.",
-                    )
+                    ).into()
                 } else {
-                    "Disconnected. The daemon may still be working; your draft is retained."
-                })
+                    "Disconnected. The daemon may still be working; your draft is retained.".into()
+                };
+ text })
                 .width(Length::Fill)
                 .into(),
                 if saved_history {
@@ -5948,6 +5992,201 @@ mod tests {
         assert_eq!(
             recorded_message_stamp(at, None),
             Some((at, full.clone(), full))
+        );
+    }
+
+    /// What a saved-history pane actually draws, and the Resume press it offers.
+    fn saved_history_pane(
+        items: Vec<Arc<chat::Item>>,
+        loading: bool,
+    ) -> (Vec<String>, Vec<Message>) {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout, mouse,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Texts(Vec<(String, iced::Rectangle)>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                self.0.push((text.to_owned(), bounds));
+            }
+        }
+        let plain = items
+            .iter()
+            .map(|item| (**item).clone())
+            .collect::<Vec<_>>();
+        let (mut runtime, _) = frame_cost::live_runtime(&plain);
+        runtime.session.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
+        runtime.session.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        runtime.session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "fixture-host".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "fixture-incarnation".into(),
+        });
+        let snapshot = Snapshot {
+            session_id: runtime.session.launch.session_id.clone(),
+            exited: true,
+            read_only_reason: Some("READ_ONLY_REASON".into()),
+            history_loading: loading,
+            items,
+            ..Default::default()
+        };
+        runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+            runtime.session.clone(),
+            snapshot.clone(),
+        )));
+        runtime.snapshot = Arc::new(snapshot);
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let mut element = runtime.view(
+            None,
+            false,
+            true,
+            &shortcuts,
+            900.0,
+            Place {
+                name: "Fixture".into(),
+                channel: None,
+                branch: None,
+            },
+            true,
+            None,
+            vec![],
+        );
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = iced::Rectangle::with_size(iced::Size::new(900.0, 1000.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        let mut texts = Texts::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+        let mut messages = vec![];
+        if let Some((_, bounds)) = texts
+            .0
+            .iter()
+            .find(|(text, _)| text == "Resume conversation")
+        {
+            let cursor =
+                mouse::Cursor::Available(iced::Point::new(bounds.center_x(), bounds.center_y()));
+            for event in [
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ] {
+                let mut shell = Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Mouse(event),
+                    Layout::new(&node),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &viewport,
+                );
+            }
+        }
+        (
+            texts.0.into_iter().map(|(text, _)| text).collect(),
+            messages,
+        )
+    }
+
+    #[test]
+    fn a_lost_providers_caption_keeps_its_reason_and_the_uncertain_turn() {
+        let question = Arc::new(chat::Item {
+            id: "question".into(),
+            role: chat::Role::User,
+            at: None,
+            started_at: None,
+            content: ItemContent::Text {
+                text: "Saved question".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        });
+        let reason = format!("{} Fixture detail.", chat::LOST_PROVIDER_REASON);
+        let snapshot = Snapshot {
+            read_only_reason: Some(reason.clone()),
+            items: vec![question],
+            ..Default::default()
+        };
+        let caption = saved_history_caption(&snapshot);
+        assert!(caption.contains("Fixture detail"), "{caption}");
+        assert!(caption.contains("may not have finished"), "{caption}");
+        let plain = Snapshot {
+            read_only_reason: Some("Other".into()),
+            ..snapshot.clone()
+        };
+        let caption = saved_history_caption(&plain);
+        assert!(
+            caption.contains("messages waiting from other agents"),
+            "{caption}"
+        );
+        assert!(!caption.contains("sends nothing"), "{caption}");
+    }
+
+    #[test]
+    fn saved_history_pane_draws_its_state_and_offers_one_resume() {
+        let item = |id: &str, role, body: &str| {
+            Arc::new(chat::Item {
+                id: id.into(),
+                role,
+                at: None,
+                started_at: None,
+                content: ItemContent::Text {
+                    text: body.into(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+            })
+        };
+        let warned = |texts: &[String]| {
+            texts
+                .iter()
+                .any(|text| text.contains("may not have finished"))
+        };
+        let invites = |texts: &[String]| texts.iter().any(|text| text.contains("Send a message"));
+        let resumes = |messages: &[Message]| {
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::ChatUi(Action::ResumeSaved(_))))
+                .count()
+        };
+        let question = item("question", chat::Role::User, "Saved question");
+        let answer = item("answer", chat::Role::Assistant, "Saved answer");
+
+        let (closed, presses) = saved_history_pane(vec![question.clone(), answer], false);
+        assert!(!warned(&closed), "{closed:?}");
+        assert!(closed.iter().any(|text| text == "READ_ONLY_REASON"));
+        assert!(!invites(&closed));
+        assert_eq!(resumes(&presses), 1, "{} messages", presses.len());
+
+        for items in [vec![question], vec![]] {
+            let empty = items.is_empty();
+            let (open, presses) = saved_history_pane(items, false);
+            assert!(warned(&open), "{open:?}");
+            assert!(!invites(&open));
+            assert_eq!(resumes(&presses), 1, "the choice stays with the reader");
+            assert_eq!(
+                open.iter().any(|text| text.contains("no saved messages")),
+                empty
+            );
+        }
+
+        // Nothing is claimed about a transcript still on its way.
+        let (loading, _) = saved_history_pane(vec![], true);
+        assert!(!warned(&loading) && !invites(&loading), "{loading:?}");
+        assert!(
+            loading
+                .iter()
+                .any(|text| text.contains("Loading the saved"))
         );
     }
 

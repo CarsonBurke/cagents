@@ -1420,7 +1420,9 @@ fn cleanup_retirement(
         }
         for owner in page {
             after = Some(owner.actor());
+            // Another boot's owner has no readable receipt and nothing to close.
             if owner.source().id != requested.id
+                || owner.owner().boot != proof.boot_id
                 || discovered.is_some_and(|record| record != owner.owner())
             {
                 continue;

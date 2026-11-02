@@ -633,6 +633,575 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
     assert!(host.lock().unwrap().chats.is_empty());
 }
 
+/// The whole reboot route through the real helper, host and client. The kill
+/// and removed discovery stand in for the reboot; the saved proof carries the
+/// changed boot because one kernel cannot host both sides of it. The fixture
+/// provider aborts on any second prompt.
+#[test]
+fn named_claude_resume_after_lost_holder_sends_nothing() {
+    lost_holder_case(
+        "named_claude_resume_after_lost_holder_sends_nothing",
+        false,
+        false,
+    );
+}
+
+#[test]
+fn named_claude_resume_of_lost_agent_rebinds_and_sends_nothing() {
+    lost_holder_case(
+        "named_claude_resume_of_lost_agent_rebinds_and_sends_nothing",
+        true,
+        false,
+    );
+}
+
+#[test]
+fn named_claude_resume_of_lost_agent_delivers_waiting_mail_once() {
+    lost_holder_case(
+        "named_claude_resume_of_lost_agent_delivers_waiting_mail_once",
+        true,
+        true,
+    );
+}
+
+fn lost_holder_case(name: &str, managed: bool, mail: bool) {
+    let Some(root) = isolated(name) else { return };
+    let provider = root.join("bin/claude");
+    fs::write(
+        &provider,
+        include_str!("../../../tests/fixtures/claude-upgrade-continuity.py"),
+    )
+    .unwrap();
+    fs::set_permissions(provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let project = root.join("fixture-inputs/workload/project");
+    let wait = |stage: &str, condition: &mut dyn FnMut() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !condition() {
+            assert!(Instant::now() < deadline, "did not settle at {stage}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let serve = |host: &SharedHost, id: ClientId, source: Session| {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let served = host.clone();
+        let worker = thread::spawn(move || super::super::client::serve(server, id, served));
+        (
+            chat::client::ClientHandle::fixture_restore(client, source),
+            worker,
+        )
+    };
+    let users = |items: &[Arc<chat::Item>]| {
+        items
+            .iter()
+            .filter(|item| item.role == chat::Role::User)
+            .count()
+    };
+    let initial = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        project.clone(),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let initial_id = initial.id;
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let original = {
+        let (host, proof) = setup(&root, "before-reboot");
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let notifications = super::super::notifications::Broker::start(
+            &host,
+            crate::notifications::Application::Cagents,
+        )
+        .unwrap();
+        host.lock().unwrap().notifications = Some(notifications.handle());
+        let _wire = HostClientWire::start(&host, &proof);
+        start(&host, initial).unwrap();
+        let handle = host.lock().unwrap().chats[&initial_id].handle.clone();
+        wait("initial SDK", &mut || handle.attachment_snapshot().ready);
+        handle
+            .command(chat::Command::Prompt {
+                text: "LIVE_WORK_1513".into(),
+                attachments: vec![],
+                mode: chat::PromptMode::Send,
+            })
+            .unwrap();
+        wait("initial prompt", &mut || {
+            root.join("provider-done").exists() && handle.is_idle()
+        });
+        let ServerResponse::ChatListed { sessions } =
+            process(&host, 0, ClientRequest::ChatList).unwrap()
+        else {
+            panic!("expected the hosted conversation");
+        };
+        let original = sessions
+            .into_iter()
+            .find(|session| session.id == initial_id)
+            .unwrap();
+        assert!(original.native_continuity.retains_provider());
+        if managed {
+            let registry = super::super::agent_execution::registry(&host).unwrap();
+            let mut registry = registry.lock().unwrap();
+            registry
+                .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                    repository: project.clone(),
+                    name: "Fixture".into(),
+                    kind: crate::model::ProjectKind::Folder,
+                })
+                .unwrap();
+            let accepted = registry
+                .submit_agent(
+                    &crate::agent_execution::Origin::User,
+                    &crate::agent_execution::Submit {
+                        name: None,
+                        destination: crate::agent_execution::Destination::New(
+                            crate::agent_execution::Spec {
+                                provider: Provider::Claude,
+                                account: None,
+                                target: crate::agent_execution::Target {
+                                    repository: project.clone(),
+                                    directory: project.clone(),
+                                    placement: None,
+                                },
+                                surface: crate::agent_execution::Surface::Chat,
+                                model: None,
+                                permission_mode: None,
+                                reasoning_effort: None,
+                            },
+                        ),
+                        prompt: "LIVE_WORK_1513".into(),
+                        idempotency_key: "lost-holder-agent".into(),
+                    },
+                    1,
+                )
+                .unwrap();
+            registry
+                .bind_agent(
+                    accepted.agent.id,
+                    None,
+                    crate::agent_execution::HostedSession::Chat(original.clone()),
+                )
+                .unwrap();
+        }
+
+        // A live holder still attaches as itself.
+        let (attached, worker) = serve(&host, 80, original.clone());
+        let attached = attached.unwrap();
+        assert_eq!(attached.session(), original);
+        assert!(attached.snapshot().read_only_reason.is_none());
+        drop(attached);
+        worker.join().unwrap();
+        // And a live owner is not displaced by a descriptor claiming a changed
+        // boot: the reader needs that allocation to be empty.
+        let mut claimed = original.clone();
+        claimed.proof.as_mut().unwrap().boot_id = "earlier-boot".into();
+        let (refused, worker) = serve(&host, 81, claimed);
+        assert!(refused.is_err());
+        worker.join().unwrap();
+        assert!(host.lock().unwrap().chats[&initial_id].handle.owns_work());
+
+        let owner = handle.actor_identity().unwrap().record;
+        cleanup_owner(&owner);
+        wait("holder exit", &mut || {
+            !owner.holder.is_current()
+                && (owner.root.pid == std::process::id() as i32 || !owner.root.is_current())
+        });
+        original
+    };
+    fs::remove_dir_all(holders::directory(Kind::Native).unwrap()).unwrap();
+    let _ = fs::remove_file(crate::terminal::ipc::daemon_socket_path().unwrap());
+
+    let thread = original.launch.session_id.clone().unwrap();
+    let project_key = project
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    let account = root.join("fixture-inputs/workload/account-alpha");
+    let history = account
+        .join("projects")
+        .join(project_key)
+        .join(format!("{thread}.jsonl"));
+    let history_before = fs::read(&history).unwrap();
+    let prompts_before = fs::read_to_string(root.join("prompts")).unwrap();
+    assert_eq!(prompts_before, "prompt\n");
+    let provider_runs = || {
+        fs::read_to_string(root.join("provider-trace.jsonl"))
+            .unwrap()
+            .matches("\"bootstrap\"")
+            .count()
+    };
+    let runs_before = provider_runs();
+    // The fixture otherwise fails its first resume on purpose.
+    let refused_once = root.join("history-retry-start-failed-once.json");
+    fs::write(
+        &refused_once,
+        serde_json::to_string(&serde_json::json!({
+            "account": account.canonicalize().unwrap(),
+            "thread": thread,
+        }))
+        .unwrap()
+        .replace("\":\"", "\": \"")
+        .replace("\",\"", "\", \""),
+    )
+    .unwrap();
+    fs::set_permissions(&refused_once, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let (host, proof) = setup(&root, "after-reboot");
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let notifications = super::super::notifications::Broker::start(
+        &host,
+        crate::notifications::Application::Cagents,
+    )
+    .unwrap();
+    host.lock().unwrap().notifications = Some(notifications.handle());
+    let _wire = HostClientWire::start(&host, &proof);
+    let mut saved = original.clone();
+    saved.proof.as_mut().unwrap().boot_id = "earlier-boot".into();
+    let reader = saved.lost_holder_history(&proof).unwrap();
+    // What a real reboot leaves: every durable row still names the old boot,
+    // including the ownership row's owner.
+    let fixture = rusqlite::Connection::open(root.join("registry.sqlite3")).unwrap();
+    let live_boot = proof.boot_id.to_string();
+    let tables: &[(&str, &str)] = if managed {
+        &[
+            ("agent_authorities", "source"),
+            ("native_actor_ownerships", "ownership"),
+            ("agents", "record"),
+        ]
+    } else {
+        &[
+            ("agent_authorities", "source"),
+            ("native_actor_ownerships", "ownership"),
+        ]
+    };
+    for (table, column) in tables {
+        let changed = fixture
+            .execute(
+                &format!(
+                    "UPDATE {table} SET {column}=replace({column},?1,'earlier-boot') WHERE instr({column},?1)>0"
+                ),
+                [&live_boot],
+            )
+            .unwrap();
+        assert!(changed >= 1, "{table} carried no boot to rewrite");
+    }
+    {
+        let registry = super::super::agent_execution::registry(&host).unwrap();
+        let owners = registry
+            .lock()
+            .unwrap()
+            .native_actor_ownerships(None, 128)
+            .unwrap();
+        assert!(owners.iter().any(|owner| owner.source().id == saved.id
+            && owner.owner().boot.to_string() == "earlier-boot"));
+    }
+    let authority_row = || -> (String, String) {
+        fixture
+            .query_row(
+                "SELECT token,source FROM agent_authorities WHERE session_id=?1",
+                [saved.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    let authority_before = authority_row();
+    let agent_state = || {
+        let registry = super::super::agent_execution::registry(&host).unwrap();
+        let registry = registry.lock().unwrap();
+        registry.agent_for_session(saved.id).unwrap().map(|agent| {
+            let run = registry.latest_agent_run(agent.id).unwrap();
+            (agent, run)
+        })
+    };
+    if managed {
+        // What daemon startup does to a run it cannot prove finished.
+        super::super::agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .interrupt_unproven_agent_runs(2)
+            .unwrap();
+    }
+    let lost_agent = agent_state();
+
+    // A home remapped under the recorded launch is another account.
+    let account_moved = root.join("fixture-inputs/workload/account-moved");
+    let remap = || {
+        fs::rename(&account, &account_moved).unwrap();
+        fs::create_dir(&account).unwrap();
+        fs::set_permissions(&account, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let unmap = || {
+        fs::remove_dir_all(&account).unwrap();
+        fs::rename(&account_moved, &account).unwrap();
+    };
+    remap();
+    let (remapped, worker) = serve(&host, 83, saved.clone());
+    let failure = remapped.err().expect("a remapped home opened a reader");
+    assert!(
+        failure.message.contains("different physical account home"),
+        "{}",
+        failure.message
+    );
+    worker.join().unwrap();
+    unmap();
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert_eq!(authority_row(), authority_before);
+
+    let (restored, worker) = serve(&host, 82, saved.clone());
+    let restored = restored.unwrap();
+    assert_eq!(restored.session(), reader);
+    restored.set_visible(true).unwrap();
+    wait("saved transcript", &mut || {
+        let snapshot = restored.snapshot();
+        !snapshot.history_loading && users(&snapshot.items) == 1
+    });
+    let snapshot = restored.snapshot();
+    assert!(snapshot.read_only_reason.is_some() && snapshot.exited);
+    assert!(snapshot.items.iter().any(
+        |item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == "FRAME_000|")
+    ));
+    assert_eq!(
+        provider_runs(),
+        runs_before,
+        "opening history ran no provider"
+    );
+    assert_eq!(fs::read(&history).unwrap(), history_before);
+
+    assert_eq!(authority_row(), authority_before, "reading revokes nothing");
+    assert_eq!(agent_state(), lost_agent, "reading changes no agent record");
+    if let Some((agent, run)) = &lost_agent {
+        assert_eq!(run.state, crate::agent_execution::State::Interrupted);
+        assert!(
+            snapshot
+                .read_only_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no confirmed outcome")),
+            "{:?}",
+            snapshot.read_only_reason
+        );
+        // A reader is not this agent's provider to address.
+        let refused = super::super::agent_execution::process(
+            &host,
+            Default::default(),
+            crate::agent_execution::Operation::Requests(agent.id),
+        )
+        .unwrap_err();
+        assert!(refused.contains("no longer live"), "{refused}");
+    }
+    assert!(
+        !super::super::agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .retained_agent_sources(saved.id)
+            .unwrap()
+            .is_empty()
+    );
+
+    // The same remap between reading and resuming still refuses.
+    remap();
+    let refused = crate::chat::client::ClientHandle::connect(
+        reader.clone(),
+        chat::Intent::Start,
+        None,
+        false,
+        None,
+        |_| {},
+    )
+    .err()
+    .expect("a remapped home resumed");
+    assert!(
+        refused.message.contains("different physical account home"),
+        "{}",
+        refused.message
+    );
+    unmap();
+    assert_eq!(provider_runs(), runs_before);
+
+    // Mail waiting for this lineage does not reach a reader, and the courier
+    // is what delivers it, not Resume.
+    let courier = mail.then(|| {
+        let courier = super::super::agent_execution::mailbox::Courier::start(&host).unwrap();
+        let message = crate::agent_execution::mailbox::Message {
+            id: crate::model::MessageId::new(),
+            from: crate::agent_execution::mailbox::Party {
+                lineage: None,
+                session: None,
+                title: None,
+            },
+            to: crate::agent_execution::mailbox::Party {
+                lineage: Some(crate::agent_execution::Lineage(saved.id)),
+                session: None,
+                title: None,
+            },
+            reply_to: None,
+            body: "LIVE_WORK_1513 WAITING_MAIL".into(),
+            wait_until_ms: None,
+            state: crate::agent_execution::mailbox::State::Pending,
+            created_ms: chat::now_ms().unwrap_or(1),
+        };
+        super::super::agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .post_message(&message)
+            .unwrap();
+        courier.wake_and_wait_for_scan();
+        let stored = super::super::agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .message(message.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.state,
+            crate::agent_execution::mailbox::State::Pending,
+            "a reader takes no mail"
+        );
+        // The fixture takes one prompt per run; the earlier one is on record.
+        fs::remove_file(root.join("prompts")).unwrap();
+        fs::remove_file(root.join("prompt-bodies")).unwrap();
+        (courier, message.id)
+    });
+
+    // The one explicit action: normal Start on the exact reader descriptor.
+    let resumed = crate::chat::client::ClientHandle::connect(
+        reader.clone(),
+        chat::Intent::Start,
+        None,
+        false,
+        None,
+        |_| {},
+    )
+    .unwrap();
+    assert!(
+        provider_runs() > runs_before,
+        "the action resumed a provider"
+    );
+    let session = resumed.session();
+    assert_eq!(session.id, original.id);
+    assert_eq!(session.launch, original.launch);
+    assert!(session.native_continuity.retains_provider());
+    if let Some((courier, message)) = courier {
+        let delivered = || {
+            super::super::agent_execution::registry(&host)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .message(message)
+                .unwrap()
+                .unwrap()
+                .state
+        };
+        wait("waiting mail", &mut || {
+            courier.wake_and_wait_for_scan();
+            delivered() != crate::agent_execution::mailbox::State::Pending
+                && root.join("prompts").exists()
+        });
+        courier.wake_and_wait_for_scan();
+        courier.wake_and_wait_for_scan();
+        assert_eq!(
+            fs::read_to_string(root.join("prompts")).unwrap(),
+            "prompt\n",
+            "mail arrives at most once"
+        );
+        let bodies = fs::read_to_string(root.join("prompt-bodies")).unwrap();
+        assert_eq!(bodies.lines().count(), 1, "the old prompt is not replayed");
+        assert!(bodies.contains("WAITING_MAIL"), "{bodies}");
+        drop(courier);
+        drop(resumed);
+        drop(restored);
+        drop(worker);
+        return;
+    }
+    resumed.set_visible(true).unwrap();
+    wait("resumed transcript", &mut || {
+        let snapshot = resumed.snapshot();
+        snapshot.ready && !snapshot.history_loading && users(&snapshot.items) == 1
+    });
+    assert_eq!(
+        fs::read_to_string(root.join("prompts")).unwrap(),
+        prompts_before,
+        "no prompt reached the provider"
+    );
+    assert_eq!(
+        fs::read(&history).unwrap(),
+        history_before,
+        "the provider's user records are unchanged"
+    );
+    // Start's own fresh capability replaced the dead row.
+    assert_ne!(authority_row().0, authority_before.0);
+    if let Some((before, run)) = &lost_agent {
+        let (agent, after) = agent_state().unwrap();
+        assert_eq!(
+            agent.session,
+            Some(crate::agent_execution::HostedSession::Chat(session.clone())),
+            "later prompts reach the provider now running"
+        );
+        assert_eq!(&after, run, "the interrupted run stays interrupted");
+        assert_eq!(agent.id, before.id);
+        // The provider is the agent's, and closes as the agent.
+        super::super::agent_execution::process(
+            &host,
+            Default::default(),
+            crate::agent_execution::Operation::Requests(agent.id),
+        )
+        .unwrap();
+        let reply = super::super::agent_execution::process(
+            &host,
+            Default::default(),
+            crate::agent_execution::Operation::Close(agent.id),
+        )
+        .unwrap();
+        assert!(
+            matches!(reply, crate::agent_execution::Reply::Closed(agent) if agent.closed),
+            "the agent closes"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("prompts")).unwrap(),
+            prompts_before
+        );
+        drop(resumed);
+        drop(restored);
+        drop(worker);
+        return;
+    }
+
+    // The kept allocation is not poisoned by the older owner's unreadable row.
+    let closing = resumed.session();
+    resumed.close().unwrap();
+    drop(resumed);
+    wait("resumed close", &mut || {
+        !host.lock().unwrap().chats.contains_key(&closing.id)
+    });
+    let ServerResponse::ChatResumePrepared { session: next } = process(
+        &host,
+        0,
+        ClientRequest::ChatPrepareResume {
+            source: closing.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected exact resume preparation");
+    };
+    assert_ne!(next.id, closing.id);
+    assert_eq!(next.launch, closing.launch);
+    super::retained_actor::close_unattached(&host, &closing, None).unwrap();
+    assert_eq!(
+        fs::read(&history).unwrap(),
+        history_before,
+        "the provider's user records are still unchanged"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("prompts")).unwrap(),
+        prompts_before
+    );
+    drop(restored);
+    drop(worker);
+}
+
 /// Framed native Client calls use the actual HOST handlers, lease and private
 /// execed helper. This test adapter supplies only the Connect envelope; it does
 /// not fabricate start/attach, provider exit, semantic ACK or retirement data.
