@@ -1453,11 +1453,11 @@ fn console(
 /// The recent printable console view, including whether earlier output was
 /// omitted. Exact exhaustion alone is not truncation: one older printable
 /// entry distinguishes a bounded tail from a complete view that exactly fits.
-fn console_text(items: &[chat::Item]) -> (String, bool) {
+fn console_text(items: &[Arc<chat::Item>]) -> (String, bool) {
     let mut chunks = Vec::new();
     let mut remaining = crate::agent_execution::MAX_RESULT_BYTES;
     let mut truncated = false;
-    let mut lines = items.iter().rev().filter_map(console_line);
+    let mut lines = items.iter().rev().filter_map(|item| console_line(item));
     for mut text in lines.by_ref() {
         if text.len() > remaining {
             crate::agent_execution::truncate(&mut text, remaining);

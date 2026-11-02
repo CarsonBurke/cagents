@@ -4615,8 +4615,8 @@ fn console_lines_summarize_steps_without_their_payloads() {
     assert!(after.starts_with(&before) && after.len() > before.len());
 }
 
-fn exact_fit_console_item(thinking: bool) -> chat::Item {
-    chat::Item {
+fn exact_fit_console_item(thinking: bool) -> Arc<chat::Item> {
+    Arc::new(chat::Item {
         started_at: None,
         id: if thinking { "hidden" } else { "exact-fit" }.into(),
         role: chat::Role::Assistant,
@@ -4626,7 +4626,7 @@ fn exact_fit_console_item(thinking: bool) -> chat::Item {
             phase: Default::default(),
         },
         at: None,
-    }
+    })
 }
 
 #[test]
@@ -4648,7 +4648,7 @@ fn console_tail_exact_fit_without_older_printable_entries_is_complete() {
 fn console_tail_exact_fit_marks_an_older_printable_entry_as_truncated() {
     let visible = exact_fit_console_item(false);
     let expected = console_line(&visible).unwrap();
-    let older = chat::Item {
+    let older = Arc::new(chat::Item {
         started_at: None,
         id: "older-step".into(),
         role: chat::Role::Assistant,
@@ -4659,7 +4659,7 @@ fn console_tail_exact_fit_marks_an_older_printable_entry_as_truncated() {
             status: chat::ToolStatus::Succeeded,
         },
         at: None,
-    };
+    });
     let (text, truncated) = console_text(&[older, exact_fit_console_item(true), visible]);
     assert_eq!(text.len(), crate::agent_execution::MAX_RESULT_BYTES);
     assert_eq!(text, expected);
