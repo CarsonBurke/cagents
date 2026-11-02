@@ -1435,29 +1435,12 @@ fn console(
             let Some(snapshot) = handle.snapshot(cursor) else {
                 return Ok(Reply::Console(None));
             };
-            let mut chunks = Vec::new();
-            let mut remaining = crate::agent_execution::MAX_RESULT_BYTES;
-            let mut truncated = false;
-            for item in snapshot.items.iter().rev() {
-                let Some(mut text) = console_line(item) else {
-                    continue;
-                };
-                if text.len() > remaining {
-                    crate::agent_execution::truncate(&mut text, remaining);
-                    truncated = true;
-                }
-                remaining -= text.len();
-                chunks.push(text);
-                if remaining == 0 {
-                    break;
-                }
-            }
-            chunks.reverse();
+            let (text, truncated) = console_text(&snapshot.items);
             let mut requests = snapshot.requests;
             hide_secrets(&mut requests);
             Ok(Reply::Console(Some(ConsoleView {
                 generation: snapshot.generation,
-                text: chunks.concat(),
+                text,
                 truncated,
                 requests,
                 ready: snapshot.ready,
@@ -1465,6 +1448,32 @@ fn console(
             })))
         }
     }
+}
+
+/// The recent printable console view, including whether earlier output was
+/// omitted. Exact exhaustion alone is not truncation: one older printable
+/// entry distinguishes a bounded tail from a complete view that exactly fits.
+fn console_text(items: &[Arc<chat::Item>]) -> (String, bool) {
+    let mut chunks = Vec::new();
+    let mut remaining = crate::agent_execution::MAX_RESULT_BYTES;
+    let mut truncated = false;
+    let mut lines = items.iter().rev().filter_map(|item| console_line(item));
+    for mut text in lines.by_ref() {
+        if text.len() > remaining {
+            crate::agent_execution::truncate(&mut text, remaining);
+            truncated = true;
+        }
+        remaining -= text.len();
+        chunks.push(text);
+        if remaining == 0 {
+            break;
+        }
+    }
+    if !truncated && remaining == 0 {
+        truncated = lines.next().is_some();
+    }
+    chunks.reverse();
+    (chunks.concat(), truncated)
 }
 
 /// One console line per transcript item. The console is a plain-text view a
@@ -1475,8 +1484,8 @@ fn console(
 ///
 /// A step appears once it settles, so finishing it adds a line instead of
 /// rewriting one the client already printed. A step that settles after later
-/// text still lands before that text; the client then prints only the lines
-/// it has not shown (`console_delta` in the CLI).
+/// text still lands before that text; for an untruncated view the client then
+/// prints only the lines it has not shown (`console_delta` in the CLI).
 fn console_line(item: &chat::Item) -> Option<String> {
     use chat::{ChangeKind, CommandAction, DeliveryKind, ItemContent, ToolStatus};
     if item.content.status() == Some(ToolStatus::Running) {
