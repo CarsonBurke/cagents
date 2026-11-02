@@ -110,6 +110,12 @@ jobs:
                   raise SystemExit(result.returncode)
           PY
 
+      - name: Check fixed prebuilt carrier contracts
+        run: |
+          sha256sum scripts/native-fixture scripts/native-fixture-broker \
+            scripts/native_fixture_prebuilt.py tests/native_fixture_prebuilt.py
+          python3 -I -B tests/native_fixture_prebuilt.py -v
+
       - name: Allow the native fixture sandbox
         run: |
           sudo apt-get update
