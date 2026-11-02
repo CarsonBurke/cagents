@@ -2253,6 +2253,16 @@ mod tests {
     }
 
     #[test]
+    fn console_resynchronization_bounds_large_views_without_splitting_utf8() {
+        let text = format!("{}\nCalled Agent\n", "€".repeat(CONSOLE_RESYNC_BYTES));
+        let output = console_delta(&text, &text, true);
+        assert!(output.contains("Showing only the end of this recent view."));
+        assert!(output.ends_with("Called Agent\n[End of recent console view]\n"));
+        assert!(output.len() < CONSOLE_RESYNC_BYTES + 512);
+        assert!(!output.contains('\u{fffd}'));
+    }
+
+    #[test]
     fn console_answers_require_explicit_request_action_and_structured_fields() {
         use crate::agent_execution::ConsoleCommand;
         let ConsoleCommand::Control(crate::chat::Command::Answer {
@@ -2995,6 +3005,9 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
     })
 }
 
+// A resynchronization is a preview, not another dump of the full daemon tail.
+const CONSOLE_RESYNC_BYTES: usize = 16 * 1024;
+
 /// Untruncated growth streams as a suffix. Late settled lines are printed once
 /// per occurrence without replaying unchanged lines. If either adjacent view
 /// was truncated, line contents cannot identify occurrences across the moving
@@ -3005,7 +3018,14 @@ fn console_delta(previous: &str, text: &str, bounded: bool) -> String {
         let mut output = String::from(
             "\n[Console resynchronized: recent output follows. Repeated lines may already have been shown; earlier output may be missing.]\n",
         );
-        output.push_str(text);
+        let mut start = text.len().saturating_sub(CONSOLE_RESYNC_BYTES);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        if start != 0 {
+            output.push_str("[Showing only the end of this recent view.]\n");
+        }
+        output.push_str(&text[start..]);
         if !output.ends_with('\n') {
             output.push('\n');
         }
