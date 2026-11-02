@@ -41,9 +41,13 @@ NIRI_CONFIG = 'input { keyboard { xkb { layout "us"; }; }; }\nprefer-no-csd\n'
 HANDSHAKE = r'''
 import json, os, pathlib
 p = pathlib.Path(__import__('sys').argv[1])
-f = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+pending = p.with_name('handshake.pending')
+f = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(f, 'w') as out:
     json.dump({'display': os.environ['WAYLAND_DISPLAY'], 'socket': os.environ['NIRI_SOCKET']}, out)
+# Publish only a complete closed record, atomically and without overwriting.
+os.link(pending, p)
+os.unlink(pending)
 '''
 
 
@@ -577,6 +581,9 @@ def install(base):
             super().__init__(host, {})
             self.package = package
             self.start_lock = base.threading.Lock()
+            # Inherited early stop/shutdown may arrive outside fixture.lock.
+            # All shared-channel calls AND shutdown receipt state use one lock.
+            self.channel_lock = base.threading.RLock()
 
         def handle(self, request):
             if request["op"] == "start-prebuilt":
@@ -667,6 +674,10 @@ def install(base):
                     *args, "--", "/usr/bin/python3", "-I", "-c", RELAY, str(relay)]
 
         def prebuilt_step(self, fixture, request):
+            with self.channel_lock:
+                return self._prebuilt_step(fixture, request)
+
+        def _prebuilt_step(self, fixture, request):
             self.package.verify()
             reply = fixture.channel.call({"action": request["step"]}, 40)
             self.package.verify()
@@ -677,6 +688,10 @@ def install(base):
             return {key: value for key, value in reply.items() if key != "id"}
 
         def status(self, fixture, _request):
+            with self.channel_lock:
+                return self._prebuilt_status(fixture)
+
+        def _prebuilt_status(self, fixture):
             return {"fixture": fixture.layout.name, "source": SOURCE, "building": False,
                     "private": True, "runtime": str(fixture.layout.runtime),
                     "children": fixture.channel.call({"action": "status"}, 10).get("children"),
@@ -709,6 +724,10 @@ def install(base):
             return {"exit_code": result.returncode, "stdout": base.bounded(result.stdout), "stderr": base.bounded(result.stderr)}
 
         def _kill_holder(self, fixture):
+            with self.channel_lock:
+                return self._settle_prebuilt_holder(fixture)
+
+        def _settle_prebuilt_holder(self, fixture):
             # Override ALL inherited stop/shutdown call sites: never kill this
             # namespace or an unproven retained provider to make cleanup pass.
             errors = []

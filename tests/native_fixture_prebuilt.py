@@ -3,16 +3,18 @@
 
 No entry point or authority guard is invoked. No real package, broker, native
 display, subprocess, socket, lifecycle, tool discovery or inherited environment
-is used. Relay declarations are split from its channel/EOF loops with AST;
-only those declarations run, with inert OS/path/subprocess objects.
+is used. Relay declarations are split from its channel/EOF loops with AST.
+The explicit channel-tail regression runs that tail with inert stream, OS,
+clock and subprocess objects; the other relay tests run declarations only.
 """
 
 import ast
-from contextlib import ExitStack, redirect_stderr
+from contextlib import ExitStack, nullcontext, redirect_stderr
 import hashlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import signal
@@ -21,6 +23,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -578,7 +581,9 @@ class NamedLifecycle(MockOnly):
 class PrivateBoundaryAndCleanup(MockOnly):
     def fixtures(self):
         kind = prebuilt.install(broker)
-        return object.__new__(kind)  # No Fixtures constructor, thread or spawner.
+        fixtures = object.__new__(kind)  # No Fixtures constructor, thread or spawner.
+        fixtures.channel_lock = threading.RLock()
+        return fixtures
 
     def test_environment_and_mounts_do_not_forward_host_home_build_desktop_or_tokens(self):
         expected = {"HOME": "/fixture/home", "USER": "fixture", "LOGNAME": "fixture",
@@ -736,6 +741,295 @@ class PrivateBoundaryAndCleanup(MockOnly):
                 desktop.spawn("bus", ["/synthetic/never-executed"])
             close.assert_called_once_with(2000)
         subprocess.Popen.assert_not_called()
+
+
+class QuitAndChannel(MockOnly):
+    def desktop(self):
+        desktop = prebuilt.Desktop(broker, SimpleNamespace(private=Path("/synthetic/private"),
+                                                         niri_root=Path("/synthetic/niri")))
+        desktop.ipc_fd = 37  # Synthetic number, never passed to the real OS.
+        desktop.ipc = "/synthetic/held-original-niri-socket"
+        for role in ("niri", "kwin", "bus"):
+            record = {"role": role, "child": FakeChild(), "streams": [], "waited": False,
+                      "close_unknown": False, "closed_streams": set(), "raw_fds": [],
+                      "spawn_unknown": False}
+            desktop.records.append(record)
+            desktop.children[role] = record
+        return desktop
+
+    def connection(self, *, pid=1001, uid=1000, replies=()):
+        connection = mock.MagicMock(name="synthetic original niri stream")
+        connection.__enter__.return_value = connection
+        connection.__exit__.return_value = False
+        connection.getsockopt.return_value = struct.pack("3i", pid, uid, 1000)
+        connection.recv.side_effect = list(replies)
+        return connection
+
+    def test_quit_uses_same_verified_original_peer_stream_and_ack_is_not_child_wait(self):
+        for pid, uid in ((1002, 1000), (1001, 1002)):
+            with self.subTest(pid=pid, uid=uid):
+                desktop = self.desktop()
+                connection = self.connection(pid=pid, uid=uid)
+                with mock.patch.object(prebuilt.os, "geteuid", return_value=1000), \
+                        mock.patch.object(prebuilt.socket, "socket", return_value=connection) as factory:
+                    with self.assertRaisesRegex(broker.Refusal, "not the original Child"):
+                        desktop.owned_connection()
+                    factory.assert_called_once_with(prebuilt.socket.AF_UNIX)
+                    connection.close.assert_called_once_with()
+                    connection.sendall.assert_not_called()
+        desktop = self.desktop()
+        connection = self.connection(replies=(b'{"Ok":', b'"Handled"}\n'))
+        with mock.patch.object(prebuilt.os, "geteuid", return_value=1000), \
+                mock.patch.object(prebuilt.time, "monotonic", return_value=0), \
+                mock.patch.object(prebuilt.socket, "socket", return_value=connection) as factory:
+            desktop.quit_original()
+            self.assertTrue(desktop.quit_ack)
+            self.assertTrue(desktop.quit_attempted)
+            factory.assert_called_once_with(prebuilt.socket.AF_UNIX)
+            connection.connect.assert_called_once_with(desktop.ipc)
+            connection.getsockopt.assert_called_once_with(prebuilt.socket.SOL_SOCKET, prebuilt.socket.SO_PEERCRED, 12)
+            connection.sendall.assert_called_once_with(b'{"Action":{"Quit":{"skip_confirmation":true}}}\n')
+            call_names = [call[0] for call in connection.mock_calls]
+            self.assertLess(call_names.index("getsockopt"), call_names.index("sendall"))
+            self.assertEqual(connection.recv.call_count, 2)
+            desktop.quit_original()
+            factory.assert_called_once_with(prebuilt.socket.AF_UNIX)
+            connection.sendall.assert_called_once()
+        for record in desktop.records:
+            self.assertEqual(record["child"].waits, [])
+            self.assertFalse(record["waited"])
+            record["child"].kill.assert_not_called()
+            record["child"].terminate.assert_not_called()
+
+    def test_incomplete_oversize_malformed_or_err_quit_never_resends_or_signals_siblings(self):
+        responses = {"EOF": [b""], "partial": [b'{"Ok":"Handled"}', b""],
+                     "oversize": [b"x" * 1024] * 4 + [b"x"],
+                     "malformed": [b"{broken}\n"], "Err": [b'{"Err":"refused"}\n']}
+        for label, replies in responses.items():
+            with self.subTest(reply=label):
+                desktop = self.desktop()
+                connection = self.connection(replies=replies)
+                with mock.patch.object(prebuilt.os, "geteuid", return_value=1000), \
+                        mock.patch.object(prebuilt.time, "monotonic", return_value=0), \
+                        mock.patch.object(prebuilt.socket, "socket", return_value=connection) as factory:
+                    with self.assertRaises(broker.Refusal):
+                        desktop.quit_original()
+                    self.assertTrue(desktop.quit_attempted)
+                    self.assertFalse(desktop.quit_ack)
+                    desktop.children["niri"]["child"].code = 0  # Later fake natural exit cannot repair unknown ACK.
+                    with self.assertRaisesRegex(broker.Refusal, "acknowledgement unknown"):
+                        desktop.quit_original()
+                    with self.assertRaisesRegex(broker.Refusal, "acknowledgement unknown"):
+                        desktop.stop()
+                    factory.assert_called_once_with(prebuilt.socket.AF_UNIX)
+                    connection.sendall.assert_called_once()
+                    if label == "oversize":
+                        connection.recv.assert_called_with(1)
+                self.assertFalse(desktop.ipc_close_unknown)
+                self.assertEqual(desktop.ipc_fd, 37)
+                for record in desktop.records:
+                    self.assertEqual(record["child"].waits, [])
+                    self.assertFalse(record["waited"])
+                    record["child"].kill.assert_not_called()
+                    record["child"].terminate.assert_not_called()
+                    record["child"].send_signal.assert_not_called()
+
+    def test_relay_eof_or_broken_channel_retains_live_original_until_natural_wait(self):
+        tree = ast.parse(prebuilt.RELAY)
+        boundary = next(i for i, node in enumerate(tree.body) if isinstance(node, ast.Assign)
+                        and any(isinstance(t, ast.Name) and t.id == "channel" for t in node.targets))
+        tail = compile(ast.Module(body=tree.body[boundary:], type_ignores=[]), "<inert prebuilt RELAY tail>", "exec")
+        for label, error in (("EOF", None), ("broken-greeting", BrokenPipeError), ("malformed-request", ValueError)):
+            with self.subTest(channel=label):
+                relay = RelayHarness()
+                original = relay.namespace["spawn"]("daemon", ["/synthetic/never-executed"])
+                child = original["child"]
+                channel, stream = mock.MagicMock(), mock.MagicMock()
+                stream.__enter__.return_value = stream
+                stream.__exit__.return_value = False
+                stream.__iter__.return_value = iter([b"{broken}\n"] if label == "malformed-request" else [])
+                if label == "broken-greeting":
+                    stream.write.side_effect = BrokenPipeError("synthetic greeting failure")
+                channel.makefile.return_value = stream
+                relay.socket.socket.side_effect = None
+                relay.socket.socket.return_value = channel
+                before_exit = []
+                def observed_sleep(delay):
+                    before_exit.append({"delay": delay, "retained": relay.namespace["children"].get("daemon") is original,
+                                        "settled": original["settled"], "waits": list(child.waits),
+                                        "capture_closes": [capture.close.call_count for capture in original["streams"]],
+                                        "signals": child.kill.call_count + child.terminate.call_count + child.send_signal.call_count})
+                    child.code = 0  # Only fake natural exit, after observing retained live custody.
+                    if len(before_exit) > 1:
+                        # Stop a regressed mocked loop finitely; the assertions
+                        # below fail if this test-only abort was needed.
+                        relay.namespace["closing"] = True
+                relay.namespace["time"].sleep.side_effect = observed_sleep
+                expectation = self.assertRaises(error) if error is not None else nullcontext()
+                with expectation:
+                    exec(tail, relay.namespace)
+                self.assertEqual(before_exit, [{"delay": .1, "retained": True, "settled": False,
+                                                "waits": [], "capture_closes": [0, 0], "signals": 0}])
+                self.assertFalse(relay.namespace["closing"])
+                self.assertIs(relay.namespace["history"][0], original)
+                self.assertTrue(original["settled"])
+                self.assertEqual(child.waits, [None])
+                for capture in original["streams"]:
+                    capture.close.assert_called_once_with()
+                relay.socket.socket.assert_called_once_with(fileno=3)
+                channel.makefile.assert_called_once_with("rwb")
+                relay.os.waitid.assert_called_with(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                relay.os.waitpid.assert_not_called()
+                relay.no_signals()
+
+
+class PublicationAndChannel(MockOnly):
+    def test_handshake_publishes_only_closed_complete_record_without_overwrite(self):
+        pending = Path("/synthetic/handshake.pending")
+        final = Path("/synthetic/handshake.json")
+        expected = {"display": "wayland-synthetic", "socket": "/synthetic/niri.sock"}
+        for fault in (None, "write", "close", "existing-final"):
+            with self.subTest(fault=fault):
+                files = {final: "original final"} if fault == "existing-final" else {}
+                events = []
+                retained = {}
+
+                class Capture(io.StringIO):
+                    def write(self, text):
+                        if fault != "existing-final":
+                            self_test.assertNotIn(final, files)
+                        if fault == "write":
+                            raise OSError("synthetic pending write")
+                        return super().write(text)
+
+                    def close(self):
+                        if not self.closed:
+                            retained["text"] = self.getvalue()
+                            events.append("closed-pending")
+                            super().close()
+                            if fault == "close":
+                                raise OSError("synthetic pending close")
+
+                self_test = self
+                capture = Capture()
+                def opened(path, flags, mode):
+                    self.assertEqual((path, flags, mode), (pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+                    self.assertNotIn(pending, files)
+                    files[pending] = capture
+                    events.append("opened-pending")
+                    return 2000
+                def fdopen(fd, mode):
+                    self.assertEqual((fd, mode), (2000, "w"))
+                    return capture
+                def link(source, destination):
+                    self.assertEqual((source, destination), (pending, final))
+                    self.assertTrue(capture.closed)
+                    self.assertEqual(json.loads(retained["text"]), expected)
+                    if destination in files:
+                        raise FileExistsError("synthetic existing final")
+                    files[destination] = retained["text"]
+                    events.append("published-complete")
+                def unlink(path):
+                    self.assertEqual(path, pending)
+                    self.assertEqual(json.loads(files[final]), expected)
+                    del files[path]
+                    events.append("removed-pending")
+                fake_os = SimpleNamespace(open=mock.Mock(side_effect=opened), fdopen=mock.Mock(side_effect=fdopen),
+                                          link=mock.Mock(side_effect=link), unlink=mock.Mock(side_effect=unlink),
+                                          O_WRONLY=os.O_WRONLY, O_CREAT=os.O_CREAT, O_EXCL=os.O_EXCL,
+                                          environ={"WAYLAND_DISPLAY": expected["display"], "NIRI_SOCKET": expected["socket"]})
+                imports = {"json": json, "os": fake_os, "pathlib": SimpleNamespace(Path=Path),
+                           "sys": SimpleNamespace(argv=["handshake", str(final)])}
+                imported = []
+                def synthetic_import(name, *_args, **_kwargs):
+                    imported.append(name)
+                    return imports[name]  # No fallback to real os/environment.
+                namespace = {"__builtins__": {"__import__": synthetic_import}}
+                expectation = nullcontext() if fault is None else self.assertRaises(OSError)
+                with expectation:
+                    exec(compile(prebuilt.HANDSHAKE, "<inert prebuilt handshake>", "exec"), namespace)
+                self.assertEqual(set(imported), {"json", "os", "pathlib", "sys"})
+                if fault is None:
+                    self.assertEqual(events, ["opened-pending", "closed-pending", "published-complete", "removed-pending"])
+                    self.assertNotIn(pending, files)
+                    self.assertEqual(json.loads(files[final]), expected)
+                else:
+                    fake_os.unlink.assert_not_called()
+                    self.assertIn(pending, files)
+                    self.assertEqual(files.get(final), "original final" if fault == "existing-final" else None)
+                    if fault in ("write", "close"):
+                        fake_os.link.assert_not_called()
+
+    def test_status_and_step_serialize_with_early_cleanup_on_original_channel(self):
+        for operation in ("status", "prebuilt-step"):
+            with self.subTest(operation=operation):
+                fixtures = object.__new__(prebuilt.install(broker))
+                fixtures.channel_lock = threading.RLock()
+                fixtures.package = SimpleNamespace(verify=mock.Mock())
+                first_entered, release_first, overlap = threading.Event(), threading.Event(), threading.Event()
+                start_cleanup = threading.Barrier(2)
+                stats_lock = threading.Lock()
+                active = 0
+                maximum = 0
+                actions, errors, results = [], [], {}
+                def call(request, _timeout):
+                    nonlocal active, maximum
+                    action = request["action"]
+                    with stats_lock:
+                        active += 1
+                        maximum = max(maximum, active)
+                        actions.append(action)
+                        if active > 1:
+                            overlap.set()
+                    try:
+                        if action != "shutdown":
+                            first_entered.set()
+                            if not release_first.wait(timeout=2):
+                                raise AssertionError("test did not release original mocked request")
+                            return {"children": {}}
+                        return {"settled": False, "refused": "synthetic original still live"}
+                    finally:
+                        with stats_lock:
+                            active -= 1
+                child = FakeChild()
+                fixture = SimpleNamespace(layout=SimpleNamespace(name="case-a", runtime=Path("/synthetic/runtime")),
+                                          channel=SimpleNamespace(call=call), process=child, pidfd=37)
+                def first_worker():
+                    try:
+                        results["request"] = (fixtures.status(fixture, {}) if operation == "status" else
+                                              fixtures.prebuilt_step(fixture, {"step": "daemon-status"}))
+                    except BaseException as error:
+                        errors.append(error)
+                def cleanup_worker():
+                    try:
+                        start_cleanup.wait(timeout=2)
+                        results["cleanup"] = fixtures._kill_holder(fixture)
+                    except BaseException as error:
+                        errors.append(error)
+                workers = [threading.Thread(target=first_worker), threading.Thread(target=cleanup_worker)]
+                started = []
+                try:
+                    workers[0].start()
+                    started.append(workers[0])
+                    self.assertTrue(first_entered.wait(timeout=2))
+                    workers[1].start()
+                    started.append(workers[1])
+                    start_cleanup.wait(timeout=2)
+                    self.assertFalse(overlap.wait(timeout=.1))
+                finally:
+                    release_first.set()
+                    start_cleanup.abort()
+                    for worker in started:
+                        worker.join(timeout=3)
+                    self.assertFalse(any(worker.is_alive() for worker in started), "owned test workers must join")
+                self.assertEqual(errors, [])
+                self.assertEqual(maximum, 1)
+                self.assertEqual(active, 0)
+                self.assertEqual(actions, ["status" if operation == "status" else "daemon-status", "shutdown"])
+                self.assertFalse(results["cleanup"]["settled"])
+                self.assertEqual(child.waits, [])
+                child.kill.assert_not_called()
+                child.terminate.assert_not_called()
 
 
 if __name__ == "__main__":
