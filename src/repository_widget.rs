@@ -2189,6 +2189,7 @@ pub(crate) struct NativeSaveIdentity {
 #[cfg(all(feature = "development", target_os = "linux"))]
 pub(crate) struct NativeHeldSave {
     pub original: NativeSaveIdentity,
+    fault: Option<crate::editor::retained_save::NativeSaveFaultPlan>,
     task: Task<RepositoryAction>,
 }
 
@@ -2203,6 +2204,9 @@ impl std::fmt::Debug for NativeHeldSave {
 
 #[cfg(all(feature = "development", target_os = "linux"))]
 impl NativeHeldSave {
+    pub(crate) fn fault(&self) -> Option<&crate::editor::retained_save::NativeSaveFaultPlan> {
+        self.fault.as_ref()
+    }
     pub(crate) fn into_task(self) -> Task<RepositoryAction> {
         self.task
     }
@@ -2213,6 +2217,8 @@ pub struct RepositoryRuntime {
     native_save_arm: Option<CardId>,
     #[cfg(all(feature = "development", target_os = "linux"))]
     native_held_save: Option<NativeHeldSave>,
+    #[cfg(all(feature = "development", target_os = "linux"))]
+    native_save_fault: Option<crate::editor::retained_save::NativeSaveFaultPlan>,
     pub descriptor: RepositoryView,
     original_editor_root: Option<Arc<crate::fs_safety::Root>>,
     original_read_attested: bool,
@@ -2460,6 +2466,8 @@ impl RepositoryRuntime {
             native_save_arm: None,
             #[cfg(all(feature = "development", target_os = "linux"))]
             native_held_save: None,
+            #[cfg(all(feature = "development", target_os = "linux"))]
+            native_save_fault: None,
             directory_only: descriptor.selected_file.is_some(),
             descriptor,
             original_editor_root: None,
@@ -5726,8 +5734,22 @@ impl RepositoryRuntime {
     }
 
     #[cfg(all(feature = "development", target_os = "linux"))]
+    pub(crate) fn native_fixture_arm_fault_save(
+        &mut self,
+        card: CardId,
+        mode: crate::editor::retained_save::NativeSaveFault,
+    ) -> bool {
+        if !self.native_fixture_arm_save(card) {
+            return false;
+        }
+        self.native_save_fault = Some(crate::editor::retained_save::NativeSaveFaultPlan::new(mode));
+        true
+    }
+
+    #[cfg(all(feature = "development", target_os = "linux"))]
     pub(crate) fn native_fixture_take_save(&mut self) -> Option<NativeHeldSave> {
         self.native_save_arm = None;
+        self.native_save_fault = None;
         self.native_held_save.take()
     }
 
@@ -5746,6 +5768,24 @@ impl RepositoryRuntime {
         overwrite: bool,
         trigger: SaveTrigger,
     ) -> Task<RepositoryAction> {
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        if let Some(plan) = self
+            .native_save_fault
+            .as_ref()
+            .filter(|_| self.native_save_arm == Some(card))
+            .cloned()
+        {
+            return self.request_save_with_writer(
+                card,
+                overwrite,
+                trigger == SaveTrigger::Explicit,
+                move |root, path, text, hash, overwrite, context| {
+                    crate::editor::retained_save::save_file_with_native_fault_at(
+                        root, path, text, hash, overwrite, context, plan,
+                    )
+                },
+            );
+        }
         self.request_save_with_writer(
             card,
             overwrite,
@@ -5968,6 +6008,7 @@ impl RepositoryRuntime {
             self.native_save_arm = None;
             self.native_held_save = Some(NativeHeldSave {
                 original: native_original,
+                fault: self.native_save_fault.take(),
                 task,
             });
             return Task::none();
