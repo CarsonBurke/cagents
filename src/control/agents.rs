@@ -2203,18 +2203,53 @@ mod tests {
     fn console_prints_late_settled_steps_without_replaying_the_transcript() {
         // A background tool still running is not shown; later text is.
         let t1 = "User: Build it\nAssistant: Started the build.\n";
-        assert_eq!(console_delta("", t1), t1);
+        assert_eq!(console_delta("", t1, false), t1);
         // The tool settles before that text in transcript order.
         let t2 = "User: Build it\nCalled Agent\nAssistant: Started the build.\n";
-        assert_eq!(console_delta(t1, t2), "Called Agent\n");
+        assert_eq!(console_delta(t1, t2, false), "Called Agent\n");
         // Growth at the end still streams as a plain suffix.
         let t3 = format!("{t2}Assistant: Done");
-        assert_eq!(console_delta(t2, &t3), "Assistant: Done");
+        assert_eq!(console_delta(t2, &t3, false), "Assistant: Done");
         // A repeated line counts once per occurrence.
         let t4 = "User: Build it\nCalled Agent\nCalled Agent\nAssistant: Started the build.\nAssistant: Done";
-        assert_eq!(console_delta(&t3, t4), "\nCalled Agent\n");
-        // Text dropped from the front of a bounded transcript prints nothing.
-        assert_eq!(console_delta(t4, "Called Agent\nAssistant: Done"), "");
+        assert_eq!(console_delta(&t3, t4, false), "\nCalled Agent\n");
+        // An untruncated view that shrinks without new lines prints nothing.
+        assert_eq!(
+            console_delta(t4, "Called Agent\nAssistant: Done", false),
+            ""
+        );
+    }
+
+    #[test]
+    fn console_tail_rollover_resynchronizes_instead_of_losing_repeated_steps() {
+        let previous = "Called Agent\nAssistant: Ready\n";
+        let recent = "Assistant: Ready\nCalled Agent\n";
+        let output = console_delta(previous, recent, true);
+        assert_eq!(
+            output,
+            "\n[Console resynchronized: recent output follows. Repeated lines may already have been shown; earlier output may be missing.]\nAssistant: Ready\nCalled Agent\n[End of recent console view]\n"
+        );
+
+        // Distinct occurrences with identical wording remain in the snapshot.
+        let repeated = console_delta(recent, "Called Agent\nCalled Agent\n", true);
+        assert_eq!(repeated.matches("Called Agent\n").count(), 2);
+        assert!(repeated.contains("recent output follows"));
+    }
+
+    #[test]
+    fn console_identical_bounded_views_do_not_claim_no_new_occurrences() {
+        // A newer generation can have the same bounded tail after old entries
+        // roll out. Equal text cannot establish whether new steps occurred.
+        let recent = "Called Agent\nAssistant: Ready";
+        let first = console_delta("", recent, true);
+        let next = console_delta(recent, recent, true);
+        assert_eq!(first, next);
+        assert!(next.starts_with("\n[Console resynchronized:"));
+        assert!(next.contains("earlier output may be missing"));
+        assert!(next.ends_with("Assistant: Ready\n[End of recent console view]\n"));
+
+        // Untruncated equality still has the ordinary quiet streaming behavior.
+        assert_eq!(console_delta(recent, recent, false), "");
     }
 
     #[test]
@@ -2807,6 +2842,7 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
     let mut reconnecting: Option<Instant> = None;
     let mut generation = None;
     let mut previous = String::new();
+    let mut previous_truncated = false;
     let mut last_run = None;
     let mut last_requests = Vec::new();
     loop {
@@ -2839,8 +2875,12 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                     .chars()
                     .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
                     .collect();
-                print!("{}", console_delta(&previous, &text));
+                print!(
+                    "{}",
+                    console_delta(&previous, &text, previous_truncated || view.truncated)
+                );
                 previous = text;
+                previous_truncated = view.truncated;
                 if last_run != Some((view.run.id, view.run.revision)) {
                     let usage = &view.run.result.usage;
                     let tokens = if usage.input_tokens + usage.output_tokens == 0 {
@@ -2955,13 +2995,23 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
     })
 }
 
-/// What to print so the terminal shows `text` after it already showed
-/// `previous`. Usually the transcript only grew at its end. When an earlier
-/// line changed instead, such as a step that settled after later text was
-/// printed or text dropped from the front of a bounded transcript, a terminal
-/// cannot take back what it printed, so only the lines it has not shown yet
-/// are printed, in order, rather than the whole transcript again.
-fn console_delta(previous: &str, text: &str) -> String {
+/// Untruncated growth streams as a suffix. Late settled lines are printed once
+/// per occurrence without replaying unchanged lines. If either adjacent view
+/// was truncated, line contents cannot identify occurrences across the moving
+/// tail, even when both strings are equal. Show the daemon's bounded recent
+/// view with an explicit resynchronization notice instead of guessing a delta.
+fn console_delta(previous: &str, text: &str, bounded: bool) -> String {
+    if bounded {
+        let mut output = String::from(
+            "\n[Console resynchronized: recent output follows. Repeated lines may already have been shown; earlier output may be missing.]\n",
+        );
+        output.push_str(text);
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str("[End of recent console view]\n");
+        return output;
+    }
     if let Some(delta) = text.strip_prefix(previous) {
         return delta.to_owned();
     }
