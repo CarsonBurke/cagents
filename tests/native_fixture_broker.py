@@ -1464,7 +1464,7 @@ class Lifecycle(SandboxCase):
         def refuse_after_noting(channel, timeout):
             fixture = self.fixtures.live["demo"]
             seen["holder"] = fixture.holder_pid
-            self.end_after_test(seen["holder"])
+            self.end_after_test(fixture.process)
             # Past bwrap's setup, which removing the fixture's directories could also end.
             marker = fixture.layout.sandbox / "project/.running"
             deadline = time.monotonic() + 15
