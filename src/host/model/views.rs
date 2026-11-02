@@ -279,6 +279,12 @@ fn current_agent_process(
     if !source.has_complete_proof() {
         return false;
     }
+    if let (HostedSession::Chat(reader), Some(HostedSession::Chat(session))) =
+        (&source, &agent.session)
+        && crate::workspace_model::views::lost_holder_reader_matches(session, reader)
+    {
+        return true;
+    }
     agent
         .session
         .as_ref()
@@ -768,9 +774,15 @@ pub(super) fn adopt_authenticated_agent_pane(
     let pane = view.panes.iter_mut().find(|pane| pane.id == id).unwrap();
     let replacement = match (&pane.kind, successor) {
         (CardKind::Chat(current), HostedSession::Chat(next))
-            if retained.contains(&HostedSession::Chat(current.clone()))
+            if (retained.contains(&HostedSession::Chat(current.clone()))
                 && (crate::chat::is_upgrade_recovery(current, next)
-                    || crate::chat::is_upgrade_identity_learning(current, next)) =>
+                    || crate::chat::is_upgrade_identity_learning(current, next)))
+                // What a person resumed: its reader, or the descriptor it replaced.
+                || (current.is_saved_claude_history() && next.launch == current.launch)
+                || super::earlier_boot_self_authority(
+                    &HostedSession::Chat(current.clone()),
+                    successor,
+                ) =>
         {
             CardKind::Chat(next.clone())
         }

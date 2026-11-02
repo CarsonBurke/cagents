@@ -865,6 +865,643 @@ mod tests {
         }
     }
 
+    /// The real client handshake over the real host, for a retained pane whose
+    /// helper died with `saved_boot`.
+    fn lost_holder_source(
+        host: &SharedHost,
+        transcript: &[serde_json::Value],
+        saved_boot: &str,
+    ) -> (tempfile::TempDir, Session, std::path::PathBuf) {
+        let (directory, mut source, handle) = closed_history(host);
+        {
+            let mut state = host.lock().unwrap();
+            state.chats.remove(&source.id);
+        }
+        drop(handle);
+        let path = provider_history_path(&source);
+        let body = transcript
+            .iter()
+            .map(|row| {
+                let mut row = row.clone();
+                row["sessionId"] = source.launch.session_id.clone().into();
+                row.to_string() + "\n"
+            })
+            .collect::<String>();
+        std::fs::write(&path, body).unwrap();
+        // The directory exists again, as an ordinary project does after reboot.
+        std::fs::create_dir_all(&source.launch.recipe.working_directory).unwrap();
+        let marker = directory.path().join("provider-started");
+        let program = directory.path().join("provider");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf started > '{}'\nexit 91\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        source.launch.recipe.program = program.to_string_lossy().into_owned();
+        source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        source.proof.as_mut().unwrap().boot_id = BootId::new(saved_boot);
+        assert!(source.has_valid_native_continuity());
+        (directory, source, marker)
+    }
+
+    fn user_row(id: &str, text: &str, parent: Option<&str>) -> serde_json::Value {
+        serde_json::json!({"type":"user","uuid":id,"parentUuid":parent,"message":{"role":"user","content":text}})
+    }
+
+    fn reply_row(id: &str, text: &str, parent: &str) -> serde_json::Value {
+        serde_json::json!({"type":"assistant","uuid":id,"parentUuid":parent,"message":{"id":id,"role":"assistant","content":[{"type":"text","text":text}]}})
+    }
+
+    #[test]
+    fn lost_holder_opens_exact_saved_transcript_without_starting_a_provider() {
+        for (uncertain, rows) in [
+            (
+                false,
+                vec![
+                    user_row("u1", "lost holder question", None),
+                    reply_row("a1", "lost holder answer", "u1"),
+                ],
+            ),
+            (true, vec![user_row("u1", "lost holder question", None)]),
+        ] {
+            let host = host();
+            let (_directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+            let live = host.lock().unwrap().proof().clone();
+            let expected = source.lost_holder_history(&live).unwrap();
+            let (restored, server) = restore_client(&host, source.clone(), 71);
+            let restored = restored.unwrap();
+            restored.set_visible(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while restored.snapshot().history_loading || restored.snapshot().items.is_empty() {
+                assert!(Instant::now() < deadline, "saved history did not arrive");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(restored.session(), expected);
+            assert_eq!(expected.id, source.id);
+            assert_eq!(expected.launch, source.launch);
+            assert!(expected.is_saved_claude_history());
+            let witness = restored.authenticated_upgrade_recovery().unwrap();
+            assert!(witness.validate());
+            assert_eq!(witness.source(), &source);
+            assert_eq!(witness.replacement(), &expected);
+            let snapshot = restored.snapshot();
+            assert!(snapshot.read_only_reason.is_some());
+            assert!(snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("lost holder question"))));
+            assert_eq!(chat::last_turn_uncertain(&snapshot.items), uncertain);
+            assert!(!marker.exists(), "opening history started no provider");
+            drop(restored);
+            server.join().unwrap();
+
+            // A second window, or a lost commit, finds that same reader.
+            let (again, server) = restore_client(&host, source.clone(), 72);
+            let again = again.unwrap();
+            assert_eq!(again.session(), expected);
+            drop(again);
+            server.join().unwrap();
+            assert!(!marker.exists());
+        }
+    }
+
+    /// The authority and launch rows exactly as the registry stored them.
+    fn authority_rows(directory: &std::path::Path, id: TerminalId) -> Vec<(String, String)> {
+        let db = rusqlite::Connection::open(directory.join("capacity-model.sqlite")).unwrap();
+        let mut rows = db
+            .prepare("SELECT token,source FROM agent_authorities WHERE session_id=?1")
+            .unwrap();
+        rows.query_map([id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn register_authority(host: &SharedHost, source: &Session) {
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        registry
+            .lock()
+            .unwrap()
+            .register_agent_authority(&crate::agent_execution::HostedSession::Chat(source.clone()))
+            .unwrap();
+    }
+
+    fn add_launch_record(directory: &std::path::Path, source: &Session) {
+        let db = rusqlite::Connection::open(directory.join("capacity-model.sqlite")).unwrap();
+        db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        db.execute(
+            "INSERT INTO agent_launches(agent,session_id,source) VALUES (?1,?2,?3)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                source.id.to_string(),
+                serde_json::to_string(&crate::agent_execution::HostedSession::Chat(source.clone()))
+                    .unwrap()
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_dead_capability_stays_recorded_and_opens_the_reader() {
+        let host = host();
+        let rows = [user_row("u1", "lost holder question", None)];
+        let (directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+        register_authority(&host, &source);
+        let before = authority_rows(directory.path(), source.id);
+        assert_eq!(before.len(), 1);
+
+        // A reader that then fails leaves it too.
+        let history = provider_history_path(&source);
+        let saved = std::fs::read(&history).unwrap();
+        std::fs::remove_file(&history).unwrap();
+        let (failed, server) = restore_client(&host, source.clone(), 74);
+        let failure = match failed {
+            Err(failure) => failure,
+            Ok(_) => panic!("a missing transcript opened a reader"),
+        };
+        assert!(failure.message.contains("could not be reattached"));
+        server.join().unwrap();
+        assert_eq!(authority_rows(directory.path(), source.id), before);
+
+        std::fs::write(&history, saved).unwrap();
+        let live = host.lock().unwrap().proof().clone();
+        let reader = source.lost_holder_history(&live).unwrap();
+        let (restored, server) = restore_client(&host, source.clone(), 75);
+        let restored = restored.unwrap();
+        assert_eq!(restored.session(), reader);
+        assert_eq!(authority_rows(directory.path(), source.id), before);
+        assert!(!marker.exists());
+
+        // Releasing that reader neither refuses nor revokes.
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        let hosted = crate::agent_execution::HostedSession::Chat(reader.clone());
+        registry
+            .lock()
+            .unwrap()
+            .inspect_resident_release(
+                &hosted,
+                crate::host::model::ResidentRelease::ReadOnlyHistory,
+            )
+            .unwrap();
+        registry
+            .lock()
+            .unwrap()
+            .retire_resident_release(
+                &hosted,
+                crate::host::model::ResidentRelease::ReadOnlyHistory,
+            )
+            .unwrap();
+        assert_eq!(authority_rows(directory.path(), source.id), before);
+        drop(restored);
+        server.join().unwrap();
+    }
+
+    fn lost_submit(directory: &std::path::Path, key: &str) -> crate::agent_execution::Submit {
+        use crate::agent_execution::*;
+        Submit {
+            name: None,
+            destination: Destination::New(Spec {
+                provider: Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: directory.to_owned(),
+                    directory: directory.to_owned(),
+                    placement: None,
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            }),
+            prompt: "ORIGINAL_PROMPT".into(),
+            idempotency_key: key.into(),
+        }
+    }
+
+    /// An open agent bound to `source`, with the run a restart left unproved.
+    fn lost_agent(
+        host: &SharedHost,
+        directory: &std::path::Path,
+        source: &Session,
+    ) -> crate::agent_execution::Accepted {
+        use crate::agent_execution::*;
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        let mut registry = registry.lock().unwrap();
+        registry
+            .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                repository: directory.to_owned(),
+                name: "Fixture".into(),
+                kind: crate::model::ProjectKind::Folder,
+            })
+            .unwrap();
+        let accepted = registry
+            .submit_agent(&Origin::User, &lost_submit(directory, "lost-agent"), 1)
+            .unwrap();
+        registry
+            .bind_agent(accepted.agent.id, None, HostedSession::Chat(source.clone()))
+            .unwrap();
+        registry.interrupt_unproven_agent_runs(2).unwrap();
+        accepted
+    }
+
+    #[test]
+    fn a_lost_agent_is_readable_unchanged_and_closes_without_starting_anything() {
+        use crate::agent_execution::{Operation, Reply, State};
+        for with_reader in [true, false] {
+            let host = host();
+            let rows = [user_row("u1", "lost agent question", None)];
+            let (directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+            let accepted = lost_agent(&host, directory.path(), &source);
+            let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+            let mut server = None;
+            if with_reader {
+                let (restored, worker) = restore_client(&host, source.clone(), 77);
+                let restored = restored.unwrap();
+                assert!(restored.session().is_saved_claude_history());
+                let reason = restored.snapshot().read_only_reason.clone().unwrap();
+                assert!(reason.contains("no confirmed outcome"), "{reason}");
+                assert!(reason.contains("without resending"), "{reason}");
+                server = Some((restored, worker));
+            }
+            let (agent, run) = {
+                let registry = registry.lock().unwrap();
+                (
+                    registry.agent(accepted.agent.id).unwrap(),
+                    registry.latest_agent_run(accepted.agent.id).unwrap(),
+                )
+            };
+            assert_eq!(
+                agent.session,
+                Some(crate::agent_execution::HostedSession::Chat(source.clone()))
+            );
+            assert_eq!(run.state, State::Interrupted);
+
+            let reply = super::super::super::agent_execution::process(
+                &host,
+                Default::default(),
+                Operation::Close(accepted.agent.id),
+            )
+            .unwrap();
+            assert!(matches!(reply, Reply::Closed(agent) if agent.closed));
+            assert!(!marker.exists(), "closing started no provider");
+            assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+            let run = registry.lock().unwrap().agent_run(run.id).unwrap();
+            assert_eq!(run.state, State::Interrupted, "its outcome stays unknown");
+            if let Some((restored, worker)) = server {
+                drop(restored);
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    fn agent_open(host: &SharedHost, id: crate::model::AgentId) -> bool {
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        let open = !registry.lock().unwrap().agent(id).unwrap().closed;
+        open
+    }
+
+    fn close_agent_operation(host: &SharedHost, id: crate::model::AgentId) -> Result<(), String> {
+        super::super::super::agent_execution::process(
+            host,
+            Default::default(),
+            crate::agent_execution::Operation::Close(id),
+        )
+        .map(|_| ())
+    }
+
+    #[test]
+    fn closing_a_lost_agents_pane_ends_the_agent() {
+        // Through the reader a window holds.
+        let host = host();
+        let rows = [user_row("u1", "lost agent question", None)];
+        let (directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+        register_authority(&host, &source);
+        let accepted = lost_agent(&host, directory.path(), &source);
+        let (restored, server) = restore_client(&host, source.clone(), 79);
+        let restored = restored.unwrap();
+        restored.close().unwrap();
+        drop(restored);
+        server.join().unwrap();
+        assert!(!agent_open(&host, accepted.agent.id), "the agent closed");
+        assert!(authority_rows(directory.path(), source.id).is_empty());
+        assert!(!marker.exists());
+
+        // With no reader, named and unnamed: the daemon request a pane sends.
+        for named in [true, false] {
+            let host = super::tests::host();
+            let (directory, mut source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+            if !named {
+                source.launch.session_id = None;
+            }
+            let accepted = lost_agent(&host, directory.path(), &source);
+            super::super::close_retained_from_pane(&host, &source).unwrap();
+            assert!(!agent_open(&host, accepted.agent.id), "named: {named}");
+            assert!(!marker.exists());
+        }
+
+        // A plain conversation with nothing left to close stays a no-op.
+        let host = super::tests::host();
+        let (_directory, source, _) = lost_holder_source(&host, &rows, "earlier-boot");
+        super::super::close_retained_from_pane(&host, &source).unwrap();
+    }
+
+    #[test]
+    fn a_lost_agent_with_a_start_under_way_does_not_close() {
+        for case in ["fresh-capability", "starting"] {
+            let host = host();
+            let rows = [user_row("u1", "lost agent question", None)];
+            let (directory, source, _) = lost_holder_source(&host, &rows, "earlier-boot");
+            let accepted = lost_agent(&host, directory.path(), &source);
+            let mut guard = None;
+            let live = source
+                .lost_holder_history(&host.lock().unwrap().proof().clone())
+                .unwrap();
+            match case {
+                "fresh-capability" => {
+                    let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+                    registry
+                        .lock()
+                        .unwrap()
+                        .fresh_agent_authority(&crate::agent_execution::HostedSession::Chat(
+                            live.clone(),
+                        ))
+                        .unwrap();
+                }
+                _ => guard = Reservation::new(&host, &live).unwrap(),
+            }
+            let before = authority_rows(directory.path(), source.id);
+            let refused = close_agent_operation(&host, accepted.agent.id).unwrap_err();
+            assert!(refused.contains("may be running"), "{case}: {refused}");
+            let refused = super::super::close_retained_from_pane(&host, &source).unwrap_err();
+            assert!(refused.contains("may be running"), "{case}: {refused}");
+            assert!(agent_open(&host, accepted.agent.id), "{case}");
+            assert_eq!(authority_rows(directory.path(), source.id), before);
+            drop(guard);
+        }
+    }
+
+    #[test]
+    fn a_lost_agent_only_reads_and_resumes_its_own_conversation() {
+        let host = host();
+        let rows = [user_row("u1", "lost agent question", None)];
+        let (directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+        let accepted = lost_agent(&host, directory.path(), &source);
+        let mut stale = source.clone();
+        stale.launch.session_id = Some("22345678-1234-4234-8234-123456789abc".into());
+        let stale_history = provider_history_path(&stale);
+        std::fs::copy(provider_history_path(&source), stale_history).unwrap();
+        let (refused, server) = restore_client(&host, stale.clone(), 80);
+        assert!(refused.is_err(), "another conversation opened a reader");
+        server.join().unwrap();
+        let live = host.lock().unwrap().proof().clone();
+        let mut start = stale.lost_holder_history(&live).unwrap();
+        start.proof = Some(live);
+        let refused = process_inner(
+            &host,
+            0,
+            ClientRequest::ChatStart {
+                session: start,
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
+        )
+        .err()
+        .expect("another conversation started under the agent");
+        assert!(
+            refused.message.contains("no longer matches"),
+            "{}",
+            refused.message
+        );
+        assert!(!marker.exists());
+        assert!(agent_open(&host, accepted.agent.id));
+    }
+
+    #[test]
+    fn an_unconfirmed_earlier_boot_launch_refuses_close_before_changing_anything() {
+        use crate::agent_execution::*;
+        let host = host();
+        let rows = [user_row("u1", "launch question", None)];
+        let (directory, source, _) = lost_holder_source(&host, &rows, "earlier-boot");
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        let accepted = {
+            let mut registry = registry.lock().unwrap();
+            registry
+                .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                    repository: directory.path().to_owned(),
+                    name: "Fixture".into(),
+                    kind: crate::model::ProjectKind::Folder,
+                })
+                .unwrap();
+            registry
+                .submit_agent(&Origin::User, &lost_submit(directory.path(), "pending"), 1)
+                .unwrap()
+        };
+        registry
+            .lock()
+            .unwrap()
+            .reserve_agent_launch(accepted.agent.id, &HostedSession::Chat(source.clone()))
+            .unwrap();
+        register_authority(&host, &source);
+        let before = authority_rows(directory.path(), source.id);
+        assert_eq!(before.len(), 1);
+        for _ in 0..2 {
+            let failure = close_agent_operation(&host, accepted.agent.id).unwrap_err();
+            assert!(failure.contains("Cannot confirm teardown"), "{failure}");
+            assert_eq!(authority_rows(directory.path(), source.id), before);
+        }
+    }
+
+    #[test]
+    fn a_lost_parents_caption_says_its_children_stay_open_and_closing_leaves_them() {
+        use crate::agent_execution::*;
+        let host = host();
+        let rows = [user_row("u1", "parent question", None)];
+        let (directory, source, _) = lost_holder_source(&host, &rows, "earlier-boot");
+        let accepted = lost_agent(&host, directory.path(), &source);
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        let child = registry
+            .lock()
+            .unwrap()
+            .submit_agent(
+                &Origin::Child {
+                    parent: Lineage(source.id),
+                },
+                &lost_submit(directory.path(), "child"),
+                3,
+            )
+            .unwrap();
+        let (restored, server) = restore_client(&host, source.clone(), 81);
+        let restored = restored.unwrap();
+        let reason = restored.snapshot().read_only_reason.clone().unwrap();
+        assert!(reason.contains("1 agent that is still open"), "{reason}");
+        assert!(reason.contains("stays open whether"), "{reason}");
+        assert!(reason.contains("messages waiting"), "{reason}");
+        assert!(
+            reason.contains("Closing this pane ends the agent"),
+            "{reason}"
+        );
+        assert!(!reason.contains("sends nothing"), "{reason}");
+        close_agent_operation(&host, accepted.agent.id).unwrap();
+        assert!(
+            agent_open(&host, child.agent.id),
+            "a parent's close leaves its child"
+        );
+        drop(restored);
+        server.join().unwrap();
+
+        // A plain chat that started agents says so, and offers no agent close.
+        let host = super::tests::host();
+        let (directory, source, _) = lost_holder_source(&host, &rows, "earlier-boot");
+        register_authority(&host, &source);
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        {
+            let mut registry = registry.lock().unwrap();
+            registry
+                .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                    repository: directory.path().to_owned(),
+                    name: "Fixture".into(),
+                    kind: crate::model::ProjectKind::Folder,
+                })
+                .unwrap();
+            registry
+                .submit_agent(
+                    &Origin::Child {
+                        parent: Lineage(source.id),
+                    },
+                    &lost_submit(directory.path(), "plain-child"),
+                    3,
+                )
+                .unwrap();
+        }
+        let (restored, server) = restore_client(&host, source, 82);
+        let restored = restored.unwrap();
+        let reason = restored.snapshot().read_only_reason.clone().unwrap();
+        assert!(reason.contains("1 agent that is still open"), "{reason}");
+        assert!(!reason.contains("ends the agent"), "{reason}");
+        drop(restored);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_missing_agent_provider_in_this_boot_stays_unconfirmed() {
+        let host = host();
+        let rows = [user_row("u1", "same boot question", None)];
+        let (directory, source, marker) = lost_holder_source(&host, &rows, "boot");
+        let accepted = lost_agent(&host, directory.path(), &source);
+        let (refused, server) = restore_client(&host, source.clone(), 78);
+        assert!(refused.is_err(), "a same-boot agent opened a reader");
+        server.join().unwrap();
+        let failure = super::super::super::agent_execution::process(
+            &host,
+            Default::default(),
+            crate::agent_execution::Operation::Close(accepted.agent.id),
+        )
+        .unwrap_err();
+        assert!(failure.contains("Cannot confirm teardown"), "{failure}");
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_capability_that_may_still_mean_something_refuses_the_reader() {
+        const MANAGED: &str = "The actor belongs to a managed agent";
+        const UNCONFIRMED: &str = "has no confirmed end";
+        for case in ["current-boot", "multiple", "managed", "undecodable"] {
+            let host = host();
+            let rows = [user_row("u1", "lost holder question", None)];
+            let (directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+            let mut current = source.clone();
+            current.proof = Some(host.lock().unwrap().proof().clone());
+            match case {
+                "current-boot" => register_authority(&host, &current),
+                "multiple" => {
+                    register_authority(&host, &source);
+                    add_launch_record(directory.path(), &source);
+                }
+                "managed" => add_launch_record(directory.path(), &source),
+                _ => {
+                    register_authority(&host, &source);
+                    rusqlite::Connection::open(directory.path().join("capacity-model.sqlite"))
+                        .unwrap()
+                        .execute("UPDATE agent_authorities SET source='not json'", [])
+                        .unwrap();
+                }
+            }
+            let before = authority_rows(directory.path(), source.id);
+            let (refused, server) = restore_client(&host, source.clone(), 76);
+            let failure = match refused {
+                Err(failure) => failure,
+                Ok(_) => panic!("{case}: opened a reader"),
+            };
+            assert!(
+                failure.message.contains("could not be reattached"),
+                "{case}: {}",
+                failure.message
+            );
+            if case == "current-boot" {
+                assert!(failure.message.contains(UNCONFIRMED), "{}", failure.message);
+                assert!(!failure.message.contains(MANAGED), "{}", failure.message);
+            } else if case != "undecodable" {
+                assert!(
+                    failure.message.contains(MANAGED),
+                    "{case}: {}",
+                    failure.message
+                );
+            } else {
+                assert!(!failure.message.contains(MANAGED), "{}", failure.message);
+            }
+            server.join().unwrap();
+            assert!(
+                !host.lock().unwrap().chats.contains_key(&source.id),
+                "{case}"
+            );
+            assert_eq!(
+                authority_rows(directory.path(), source.id),
+                before,
+                "{case}"
+            );
+            assert!(!marker.exists(), "{case}");
+        }
+    }
+
+    #[test]
+    fn missing_holder_without_a_changed_boot_keeps_the_refusal() {
+        let host = host();
+        let rows = [user_row("u1", "same boot question", None)];
+        let (_directory, source, marker) = lost_holder_source(&host, &rows, "boot");
+        // The same kernel boot: another incarnation of the daemon, not proof
+        // that the helper is gone.
+        let mut source = source;
+        source.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("earlier");
+        let (restored, server) = restore_client(&host, source.clone(), 73);
+        let failure = match restored {
+            Err(failure) => failure,
+            Ok(_) => panic!("a same-boot missing holder opened a reader"),
+        };
+        assert!(failure.message.contains("could not be reattached"));
+        server.join().unwrap();
+        assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+        assert!(!marker.exists());
+
+        // Nor does a retained pane the provider never named, or a descriptor
+        // already owned by something other than its reader.
+        let live = host.lock().unwrap().proof().clone();
+        let mut earlier = source.clone();
+        earlier.proof.as_mut().unwrap().boot_id = BootId::new("earlier-boot");
+        let mut unnamed = earlier.clone();
+        unnamed.launch.session_id = None;
+        assert!(unnamed.lost_holder_history(&live).is_none());
+        let mut plain = earlier.clone();
+        plain.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        assert!(plain.lost_holder_history(&live).is_none());
+        let mut changed = earlier.lost_holder_history(&live).unwrap();
+        assert!(chat::is_lost_holder_history(&earlier, &changed));
+        changed.launch.recipe.program = "/other-provider".into();
+        assert!(!chat::is_lost_holder_history(&earlier, &changed));
+    }
+
     fn provider_history_path(source: &Session) -> std::path::PathBuf {
         let project: String = source
             .launch
@@ -1822,15 +2459,31 @@ fn load_history(session: &Session) -> Result<LoadedHistory, String> {
     Ok((spec, adapter, initial))
 }
 
-fn require_unmanaged(host: &SharedHost, id: TerminalId) -> Result<(), String> {
+fn require_unmanaged(host: &SharedHost, session: &Session) -> Result<(), String> {
     let registry = super::super::agent_execution::registry(host)?;
-    if registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retained_agent_sources(id)?
-        .is_empty()
-    {
+    let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    // Every retained chat holds a capability for its own provider, and an open
+    // agent names that provider too. Left by an earlier boot they have no living
+    // holder, and stay in place until an explicit Start or Close settles them.
+    let reader = crate::agent_execution::HostedSession::Chat(session.clone());
+    if registry.lost_holder_reader_admitted(&reader)? {
         Ok(())
+    } else if registry
+        .retained_agent_authority_source(session.id)?
+        .is_some_and(|stored| match (&stored, &reader) {
+            (
+                crate::agent_execution::HostedSession::Chat(stored),
+                crate::agent_execution::HostedSession::Chat(reader),
+            ) => stored.proof.as_ref().is_some_and(|stored| {
+                reader
+                    .proof
+                    .as_ref()
+                    .is_some_and(|reader| stored.boot_id == reader.boot_id)
+            }),
+            _ => false,
+        })
+    {
+        Err("A provider started for this conversation since the computer last restarted has no confirmed end, so its saved history was not opened".into())
     } else {
         Err(
             "The actor belongs to a managed agent; use its supported owned-agent close operation"
@@ -1873,8 +2526,23 @@ pub(super) fn restore_saved_history(
         }
     }
     super::super::account_lifecycle::ensure_idle(host)?;
-    require_unmanaged(host, session.id).map_err(unavailable)?;
+    require_unmanaged(host, &session).map_err(unavailable)?;
     let (mut spec, adapter, mut initial) = load_history(&session).map_err(unavailable)?;
+    if let Some(summary) = super::super::agent_execution::registry(host)
+        .map_err(unavailable)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .lost_holder_summary(&crate::agent_execution::HostedSession::Chat(
+            session.clone(),
+        ))
+        .map_err(unavailable)?
+    {
+        for event in &mut initial.events {
+            if let chat::Event::ReadOnlyHistory { reason } = event {
+                *reason = summary.clone();
+            }
+        }
+    }
     spec.messages = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1969,6 +2637,41 @@ pub(super) fn recover_saved_history(
     );
     restore_saved_history(host, 0, session.clone())?;
     register_saved_history_alias(host, source)
+}
+
+/// Open or find the saved reader of a retained conversation whose holder died
+/// with an earlier kernel boot. `None` leaves every other descriptor, including
+/// a same-boot missing holder, to the existing refusal.
+pub(super) fn lost_holder_history(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<Session>, ProtocolError> {
+    let (proof, resident) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            state.proof().clone(),
+            state.chats.get(&source.id).map(|record| {
+                (
+                    record.session.clone(),
+                    record.handle.is_read_only_history() && !record.handle.owns_work(),
+                )
+            }),
+        )
+    };
+    let Some(reader) = source.lost_holder_history(&proof) else {
+        return Ok(None);
+    };
+    match resident {
+        // A second window, or a commit lost to a closing UI, finds the same one.
+        Some((session, true)) if session == reader => Ok(Some(reader)),
+        Some(_) => Ok(None),
+        None => {
+            super::retained_resume::ensure_prior_boot_account(host, &reader)
+                .map_err(unavailable)?;
+            restore_saved_history(host, 0, reader.clone())?;
+            Ok(Some(reader))
+        }
+    }
 }
 
 /// Classify an already authenticated paging reader for an explicit Retry.

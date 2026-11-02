@@ -603,6 +603,42 @@ impl NativeContinuity {
     }
 }
 
+/// How a reader of a lost provider opens its read-only reason, when that reason
+/// also says what is known about the work around it.
+pub(crate) const LOST_PROVIDER_REASON: &str =
+    "This conversation's provider stopped when the computer restarted.";
+
+/// Whether `replacement` is exactly the reader of `source`'s lost holder.
+pub(crate) fn is_lost_holder_history(source: &Session, replacement: &Session) -> bool {
+    replacement
+        .proof
+        .as_ref()
+        .and_then(|live| source.lost_holder_history(live))
+        .as_ref()
+        == Some(replacement)
+}
+
+/// Whether a saved transcript gives no sign its last turn closed. A transcript
+/// records no end-of-turn mark, so this only asks the reader to check: it cannot
+/// see text saved just before a tool call that never ran, or a background job
+/// a finished-looking turn had started. An empty transcript shows nothing either.
+pub(crate) fn last_turn_uncertain(items: &[std::sync::Arc<Item>]) -> bool {
+    items
+        .iter()
+        .rev()
+        .find(|item| item.role != Role::System)
+        .is_none_or(|item| {
+            !(item.role == Role::Assistant
+                && matches!(
+                    &item.content,
+                    ItemContent::Text {
+                        thinking: false,
+                        ..
+                    }
+                ))
+        })
+}
+
 /// Account recovery changes only account selection. It never changes the
 /// provider, conversation, executable, working directory, or launch options.
 /// Runtime identities and daemon-allocated listener paths may be refreshed.
@@ -870,6 +906,63 @@ impl Session {
                 .session_id
                 .as_ref()
                 .is_some_and(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+    }
+
+    /// The saved reader for a retained Claude conversation whose helper belonged
+    /// to an earlier kernel boot, when `live` is the daemon that would serve it.
+    /// A changed boot proves every old process is gone; a missing holder within
+    /// the same boot proves nothing and yields no reader. Everything except the
+    /// dead owner's proof, pair and continuity stays exact, and the result is
+    /// only a page reader: starting a provider remains a separate explicit act.
+    pub(crate) fn lost_holder_history(
+        &self,
+        live: &crate::model::HostSessionProof,
+    ) -> Option<Self> {
+        if !matches!(
+            self.native_continuity,
+            NativeContinuity::RetainedClaudeActor { protocol: 2 }
+        ) || !self.has_valid_native_continuity()
+            || !live.is_complete()
+            || self
+                .proof
+                .as_ref()
+                .is_none_or(|saved| !saved.is_complete() || saved.boot_id == live.boot_id)
+        {
+            return None;
+        }
+        let mut reader = self.clone();
+        reader.proof = Some(live.clone());
+        reader.terminal = None;
+        reader.native_continuity = NativeContinuity::ReconnectOnly;
+        reader.is_saved_claude_history().then_some(reader)
+    }
+
+    /// Why a provider that held this conversation cannot come back, when it was
+    /// lost with an earlier kernel boot and no exact way back exists: Codex has
+    /// no local reader for its thread here, and an unnamed Claude conversation
+    /// has no identity to read. `None` leaves every other refusal to its caller.
+    pub(crate) fn lost_holder_explanation(
+        &self,
+        live: &crate::model::HostSessionProof,
+    ) -> Option<&'static str> {
+        let earlier = self
+            .proof
+            .as_ref()
+            .is_some_and(|saved| saved.is_complete() && saved.boot_id != live.boot_id);
+        if !earlier || !self.native_continuity.retains_provider() {
+            return None;
+        }
+        if self.launch.provider == Provider::Codex {
+            Some(
+                "This Codex conversation's server stopped when the computer restarted. cagents cannot show its saved transcript here. Nothing was restarted or resent, and the conversation stays on disk.",
+            )
+        } else if self.launch.session_id.is_none() {
+            Some(
+                "This conversation's provider stopped when the computer restarted, before Claude reported a conversation ID, so cagents cannot tell which saved transcript is this one. Nothing was restarted or resent.",
+            )
+        } else {
+            None
+        }
     }
 
     /// Import an installed capability observed on this exact authenticated

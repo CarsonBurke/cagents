@@ -151,10 +151,17 @@ pub(in crate::host) fn resolve(
             // The separate history constructor can only page saved data and
             // repeats owner/managed-work fences under its admission guard.
             if !source.is_saved_claude_history() {
-                return Err(unavailable(native_error));
+                let Some(reader) = super::capacity::lost_holder_history(host, source)? else {
+                    return Err(unavailable(native_error));
+                };
+                return Ok(ordinary_attachment(host, client, reader));
             }
             super::capacity::recover_saved_history(host, source)?;
         }
+    } else if !source.is_saved_claude_history()
+        && let Some(reader) = super::capacity::lost_holder_history(host, source)?
+    {
+        return Ok(ordinary_attachment(host, client, reader));
     }
     if source.is_saved_claude_history() {
         super::capacity::register_saved_history_alias(host, source)?;
@@ -199,6 +206,15 @@ pub(in crate::host) fn resolve(
     let resolved = grant.resolved.clone();
     state.chat_resolutions.insert(client, Attempt::Ready(grant));
     Ok(resolved)
+}
+
+/// A reader has no actor attachment for a grant to pin.
+fn ordinary_attachment(host: &SharedHost, client: ClientId, reader: Session) -> Session {
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chat_resolutions
+        .remove(&client);
+    reader
 }
 
 /// Ordinary fresh/History attachments have no attempt and keep their existing
