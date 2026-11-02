@@ -1254,6 +1254,75 @@ exit 0
     }
 
     #[test]
+    fn a_plain_lost_conversation_refuses_close_while_its_start_is_reserved() {
+        let host = host();
+        let rows = [user_row("u1", "plain conversation question", None)];
+        let (directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+        register_authority(&host, &source);
+        let authority = authority_rows(directory.path(), source.id);
+        assert_eq!(authority.len(), 1);
+        let history_path = provider_history_path(&source);
+        let history = std::fs::read(&history_path).unwrap();
+        let reader = source
+            .lost_holder_history(&host.lock().unwrap().proof().clone())
+            .unwrap();
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .agent_for_session(source.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !registry
+                .lock()
+                .unwrap()
+                .has_agent_launch_for_session(source.id)
+                .unwrap()
+        );
+
+        // This is the actual token Start holds before publishing a provider,
+        // without a managed agent whose separate close fence could hide this.
+        let reservation = Reservation::new(&host, &reader).unwrap().unwrap();
+        let (spawning, inventory_generation) = {
+            let state = host.lock().unwrap();
+            assert_eq!(state.chat_spawning.get(&source.id), Some(&reader));
+            assert_eq!(state.chat_spawning.len(), 1);
+            assert!(state.chats.is_empty());
+            assert!(state.native_actor_startups.is_empty());
+            (state.chat_spawning.clone(), state.inventory_generation)
+        };
+        for closing in [&source, &reader] {
+            super::super::close_retained_from_pane(&host, closing)
+                .expect_err("Close must refuse while the original start owns its reservation");
+            {
+                let state = host.lock().unwrap();
+                assert_eq!(state.chat_spawning, spawning);
+                assert_eq!(state.inventory_generation, inventory_generation);
+                assert!(state.chats.is_empty());
+                assert!(state.native_actor_startups.is_empty());
+            }
+            assert_eq!(authority_rows(directory.path(), source.id), authority);
+            assert_eq!(std::fs::read(&history_path).unwrap(), history);
+            assert!(!marker.exists(), "Close must not start a provider");
+        }
+
+        drop(reservation);
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+        super::super::close_retained_from_pane(&host, &source).unwrap();
+        let state = host.lock().unwrap();
+        assert!(state.chat_spawning.is_empty(), "Close leaked a reservation");
+        assert!(state.chats.is_empty());
+        assert!(state.native_actor_startups.is_empty());
+        drop(state);
+        assert_eq!(authority_rows(directory.path(), source.id), authority);
+        assert_eq!(std::fs::read(history_path).unwrap(), history);
+        assert!(!marker.exists());
+    }
+
+    #[test]
     fn a_lost_agent_only_reads_and_resumes_its_own_conversation() {
         let host = host();
         let rows = [user_row("u1", "lost agent question", None)];
