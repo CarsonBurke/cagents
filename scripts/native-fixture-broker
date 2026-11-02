@@ -85,7 +85,7 @@ ACCOUNTS_XDG = (
     ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state"),
     ("XDG_RUNTIME_DIR", "runtime"),
 )
-PROJECT_CLOSE_SCENES = ("edit", "unchanged", "reopen", "saving")
+PROJECT_CLOSE_SCENES = ("edit", "unchanged", "reopen", "saving", "fault", "warning", "recovery")
 PROJECT_CLOSE_WIDTHS = {"wide": 1600, "narrow": 900}
 PROJECT_CLOSE_DIRECTORIES = ("home", "data", "config", "cache", "state", "runtime")
 SYSTEM_PATH = "/usr/bin:/usr/sbin"

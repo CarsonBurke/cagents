@@ -106,8 +106,10 @@ can write from your own shell. Also `move`, `key`, `scroll` and `observe`; see
 ### Fixed project-close scenes
 
 The optional `project-close` recipe supplies only the PR1937 `edit`,
-`unchanged`, `reopen`, and `saving` scenes. Choose the scene, layout and source-side label
-at `start`, with all four recipe fields and an explicit width. Wide requires
+`unchanged`, `reopen`, `saving`, `fault`, `warning`, and `recovery` scenes.
+The fixed syntax is `--recipe project-close --scene <scene> --layout
+<wide|narrow> --side <before|after> --width <1600|900>`. Supply all four
+recipe fields and the corresponding explicit width at `start`. Wide requires
 1600 and narrow requires 900; incompatible widths refuse before dispatch.
 The scene needs an actual native viewport of at least 900x600. A label or a
 requested width does not establish the reached viewport, height, scale or pixels;
@@ -121,7 +123,7 @@ scripts/native-fixture run-ui --owner "$owner" close-before
 
 Use the owner returned by this start. The same original held private runtime
 bind is mounted at the literal
-`/tmp/cagents-1937-native-<edit|unchanged|reopen|saving>-<wide|narrow>-<before|after>`.
+`/tmp/cagents-1937-native-<edit|unchanged|reopen|saving|fault|warning|recovery>-<wide|narrow>-<before|after>`.
 It has exactly six original mode0700 children: `home`, `data`, `config`,
 `cache`, `state`, and `runtime`. HOME and all five XDG variables point to those
 children; the only scene selector is
@@ -144,16 +146,17 @@ width. The existing original wait/host-stop/close uncertainty still retains
 ownership and can keep shutdown incomplete. These creation records do not
 prove ownership against arbitrary same-user changes.
 
-The source consumer seeds a private editor file at `<literal-root>/project/notes.txt`.
-After actual `PR1937_NATIVE` scene readiness, use the fixture's ordinary matched
-CLI to close that literal project. The fixture holds the original successful
-completion **after** its real cleanup/IPC work has finished. For `edit`, click
-the actual editor and type synthetic text only after the original callback is
-held; for `unchanged`, keep it clean; for `reopen`, use ordinary CLI project open
-for the same literal path and wait for the actual peer-reopen observation.
-Release that original callback only through the existing native `key ... F9`
-input with no modifiers; keep the editor focused for the edit comparison.
-There is no callback/release RPC or manufactured reducer message.
+The separately bound source consumer seeds a private editor file at
+`<literal-root>/project/notes.txt`. After actual `PR1937_NATIVE` scene readiness,
+use the fixture's ordinary matched CLI to close that literal project. The
+fixture must hold the original successful completion **after** its real
+cleanup/IPC work has finished. For `edit`, click the actual editor and type
+synthetic text only after the original callback is held; for `unchanged`, keep
+it clean; for `reopen`, use ordinary CLI project open for the same literal path
+and wait for the actual peer-reopen observation. Release that original callback
+only through the existing native `key ... F9` input with no modifiers; keep the
+editor focused for the edit comparison. There is no callback/release RPC or
+manufactured reducer message.
 
 For `saving`, first close the **clean** project and wait until that original
 successful callback is held after actual cleanup/IPC. Then use the mounted
@@ -161,35 +164,86 @@ native editor to edit, perform ordinary Save, and use ordinary Undo to restore
 the baseline while the original save owner remains pending. This fixed source
 consumer has auto-save off. It retains only the original unpolled filesystem
 save Task, never the full App/runtime batch. Starting Save before the clean
-close admission exercises a refusal, not this delayed-callback scene.
+close admission exercises a refusal, not this delayed-callback scene. Deliver
+the original close callback with bare F9 first; only after it is consumed may
+bare F10 release the **same** original save Task once. The intervening Undo can
+leave the current buffer dirty after that original Save completes. Use a later
+ordinary Save of the current retained baseline, observe its real result, and
+then allow fresh close cleanup/retirement. Completion of the held Save alone
+does not qualify that terminal flow.
 
-Use bare native F9 to deliver the original close callback once. Only after that
-callback has been consumed, use the existing `key ... F10` with no modifiers to
-release the **same** original save Task once. Neither key overrides captured
-events or establishes widget focus; verify actual native input and frames.
-The original result must pass the ordinary local Repository retention/guards
-and per-card branch (including the missing-card branch), with a matching
-same-dispatch acknowledgement before the shared postlude records observation.
-A raw result or later unrelated frame cannot provide that acknowledgement.
-Held, released-but-unobserved or refused/unknown work keeps the window-close
-fence. Errors remain errors; do not replay a callback or force cleanup. This
-carrier adds no writer fault, warning or recovery producer.
+The three new selectors `fault`, `warning`, and `recovery` require a separately
+frozen and independently reviewed consumer. Their order differs from `saving`:
+while the original successful close callback remains held, make an actual native
+edit and use ordinary Save; use bare F10 **before F9** to release that original
+Save Task once. Require the intended real I/O stage, original typed result and
+matching normal same-dispatch acknowledgement before F9 may deliver the
+original close callback. A generic error, raw result, log line or later frame
+cannot satisfy these prerequisites. Neither key overrides captured events or
+establishes widget focus; verify actual native input and frames.
+
+The required fault source is fixed descriptor I/O within that original Save
+Task: attempt `sync_all` on its retained original `O_PATH` directory descriptor
+at the reviewed stage, and preserve the actual error through the unchanged
+writer/result path. The expected refusal is a source inference until executed;
+unexpected success or an earlier unrelated error does not qualify it. Do not
+fabricate an `io::Error`, typed completion, recovery authority or reducer
+message, or alter paths, permissions or unrelated files to force the outcome.
+The separately reviewed consumer must distinguish these three cases:
+
+- `fault`: the real pre-publication error preserves the original destination
+  and failed dirty snapshot; ordinary authenticated cleanup succeeds. After the
+  original result and acknowledgement, use F9. The retained After editor must
+  expose the real Save-failed explanation and permit ordinary uninjected Save.
+  Undo or discarding the failed snapshot does not qualify that retry flow.
+- `warning`: the real post-publication parent-sync error yields the original
+  `Saved(Unconfirmed)` result, actual replacement bytes, a clean buffer and a
+  visible durability warning. Use F9 only after the result and acknowledgement.
+  Ordinary Retry save or Reload file from disk must clear the warning through
+  its normal path before a fresh close can retire the editor. A clean buffer
+  alone does not resolve durability uncertainty.
+- `recovery`: a real pre-publication error is followed by one consumed
+  descriptor-I/O cleanup refusal **after** authenticated temporary unlink and
+  **before** removing the original empty Holding. The unchanged producer must
+  return the genuine `Err(Recovery)` and retain its original authority. After
+  the result and acknowledgement, use ordinary Undo to make the buffer clean
+  while that authority remains unresolved, then F9. Ordinary Retry file
+  recovery must settle that same original empty Holding through its actual
+  Retry/Finished path; consuming the injected control alone is not settlement.
+  This is cleanup ownership, not a retained unsaved-payload claim.
+
+For every save scene, the original result must pass the ordinary local
+Repository retention/guards and per-card branch (including the missing-card
+branch), with a matching same-dispatch acknowledgement before the shared
+postlude records observation. Held, released-but-unobserved or refused/unknown
+work keeps the window-close fence. Expected writer errors remain errors and
+are distinct from structural fixture refusal. Do not replay a callback or force
+cleanup. Actual successful ordinary recovery and a fresh close census decide
+retirement; Before local row/card retirement does not establish loss of
+window-owned recovery custody.
+
+These names add only fixed selectors to the broker, not a writer, fault,
+callback, retry or cleanup RPC. The six private directories, Wayland bind,
+original width and single-use custody remain unchanged. Exact new paired
+consumer heads, trees, source pins and their current independent reviews are
+**pending**; no new-scene producer is qualified by this carrier. Bind those
+artifacts before any attempted native use. Forwarding a selector to an older
+checkout or getting an ordinary UI is missing scene readiness, never success.
+
+Use separately bound reviewed Before and After sources, fresh roots, matched
+executables and actual native captures for each scene; side labels do not check
+Git or ELF identity. The first three scenes retain the late-edit, clean-close
+and peer-reopen comparison. `saving` retains its original unpolled-save
+comparison; the new three require the additional producer contract above.
 Maintained runner stdout and stderr go to the original `ui.log`, not runner
-stdout. A receipt alone is not native input, rendered pixels, retirement or
-process-settlement evidence.
-
-Use separately bound reviewed Before and After fixture sources, fresh roots,
-matched executables and actual native captures; side labels do not check Git or
-ELF identity. An older checkout may ignore an unknown selector, so require the
-actual scene readiness receipt and independently bound consumer source instead
-of accepting an ordinary UI as the fixture. The intended comparison is late
-edit retention versus the old completed-callback retirement, with clean
-retirement and peer reopen as controls. The fourth scene carries the bounded
-original-unpolled-save consumer only; use separately bound reviewed G3 Before
-and After sources. It does not supply a writer fault, durability-warning or
-complete recovery flow, active-census hold, provider jobs or complete PR1937
-acceptance. Private editor data also does not establish runtime/protection-lock
-support or ordinary caller readiness for Save; those remain actual prerequisites.
+stdout. A receipt is not native input, rendered pixels, retirement or process
+settlement. Private editor data also does not establish runtime/protection-lock
+support or ordinary caller readiness for Save. Active-census holds, provider
+jobs and complete PR1937 acceptance remain outside this carrier. The maintained
+screenshot interface produces PNG: retain the raw capture and source/viewport
+binding, then convert the same pixels to WebP for the separate PR screenshot
+branch. Renaming the extension or redrawing the image is not conversion; no
+new broker screenshot operation is supplied here.
 
 This is source preparation, not native or build admission. A genuine User must
 start a separately reviewed broker after stable resource/build admission. No
