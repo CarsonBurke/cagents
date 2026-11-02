@@ -13,6 +13,27 @@ enum Scene {
     Unchanged,
     Reopen,
     Saving,
+    Fault,
+    Warning,
+    Recovery,
+}
+
+impl Scene {
+    fn holds_save(self) -> bool {
+        matches!(
+            self,
+            Self::Saving | Self::Fault | Self::Warning | Self::Recovery
+        )
+    }
+    fn fault(self) -> Option<crate::editor::retained_save::NativeSaveFault> {
+        use crate::editor::retained_save::NativeSaveFault;
+        match self {
+            Self::Fault => Some(NativeSaveFault::BeforePublish),
+            Self::Warning => Some(NativeSaveFault::DirectoryDurability),
+            Self::Recovery => Some(NativeSaveFault::RetainedCleanup),
+            _ => None,
+        }
+    }
 }
 
 fn scene(value: &str) -> Result<Scene, String> {
@@ -21,6 +42,9 @@ fn scene(value: &str) -> Result<Scene, String> {
         "unchanged" => Ok(Scene::Unchanged),
         "reopen" => Ok(Scene::Reopen),
         "saving" => Ok(Scene::Saving),
+        "fault" => Ok(Scene::Fault),
+        "warning" => Ok(Scene::Warning),
+        "recovery" => Ok(Scene::Recovery),
         _ => Err("unknown fixed project-close fixture scene".into()),
     }
 }
@@ -81,7 +105,7 @@ pub(in crate::app) fn context() -> Result<Option<Context>, String> {
             })
         })
     {
-        return Err("fixture requires its fixed /tmp/cagents-1937-native-<edit|unchanged|reopen|saving>-<wide|narrow>-<before|after>/home".into());
+        return Err("fixture requires its fixed /tmp/cagents-1937-native-<edit|unchanged|reopen|saving|fault|warning|recovery>-<wide|narrow>-<before|after>/home".into());
     }
     private_directory(&root)?;
     for (name, leaf) in [
@@ -199,6 +223,9 @@ enum Phase {
 pub(in crate::app) struct Fixture {
     dispatch: Arc<()>,
     save: Option<SaveCustody>,
+    fault_probe: Option<crate::editor::retained_save::NativeSaveFaultPlan>,
+    writer_outcome: Option<WriterObservation>,
+    recovery_event: bool,
     context: Context,
     phase: Phase,
     project: Option<ProjectId>,
@@ -212,6 +239,102 @@ pub(in crate::app) struct Fixture {
     files_loaded: bool,
     reopened: bool,
     delivering: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterResultKind {
+    IoError,
+    RecoveryError,
+    Unconfirmed,
+    Other,
+}
+
+#[derive(Debug)]
+struct WriterObservation {
+    kind: WriterResultKind,
+    planned_stages_observed: bool,
+    expected: bool,
+    detail: Option<String>,
+}
+
+fn writer_observation(
+    selected: Scene,
+    plan: Option<&crate::editor::retained_save::NativeSaveFaultPlan>,
+    result: &Result<
+        crate::editor::retained_save::RetainedSaveOutcome,
+        crate::editor::retained_save::RetainedSaveError,
+    >,
+) -> WriterObservation {
+    use crate::editor::retained_save::{NativeSaveFaultStage as Stage, RetainedSaveError};
+    let kind = match result {
+        Err(RetainedSaveError::Io(_)) => WriterResultKind::IoError,
+        Err(RetainedSaveError::Recovery { .. }) => WriterResultKind::RecoveryError,
+        Ok(outcome) => match outcome.outcome() {
+            crate::editor::SaveOutcome::Saved {
+                durability: crate::editor::SaveDurability::Unconfirmed { .. },
+                ..
+            } => WriterResultKind::Unconfirmed,
+            _ => WriterResultKind::Other,
+        },
+    };
+    let stages: &[Stage] = match selected {
+        Scene::Fault => &[Stage::BeforePublish],
+        Scene::Warning => &[Stage::DirectoryDurability],
+        Scene::Recovery => &[Stage::BeforePublish, Stage::EmptyHoldingCleanup],
+        _ => &[],
+    };
+    let planned_stages_observed = plan.is_some_and(|plan| {
+        let actual = plan.observations();
+        Some(plan.mode()) == selected.fault()
+            && actual.len() == stages.len()
+            && actual.iter().zip(stages).all(|(got, expected)| {
+                got.stage == *expected
+                    && got.failed
+                    && got.raw_errno == Some(libc::EBADF)
+                    && got.error_kind.is_some()
+            })
+    });
+    let actual_authority = match result {
+        Ok(outcome) => outcome.recovery_authority(),
+        Err(error) => error.recovery_authority(),
+    };
+    let expected = planned_stages_observed
+        && match selected {
+            Scene::Fault => kind == WriterResultKind::IoError && actual_authority.is_none(),
+            Scene::Warning => kind == WriterResultKind::Unconfirmed && actual_authority.is_none(),
+            Scene::Recovery => {
+                kind == WriterResultKind::RecoveryError
+                    && actual_authority.is_some_and(|authority| !authority.is_resolved())
+            }
+            _ => false,
+        };
+    let detail = match result {
+        Err(error) => Some(error.to_string()),
+        Ok(outcome) => match outcome.outcome() {
+            crate::editor::SaveOutcome::Saved {
+                durability: crate::editor::SaveDurability::Unconfirmed { error },
+                ..
+            } => Some(error.clone()),
+            _ => None,
+        },
+    };
+    WriterObservation {
+        kind,
+        planned_stages_observed,
+        expected,
+        detail,
+    }
+}
+
+fn fault_stages(
+    plan: Option<&crate::editor::retained_save::NativeSaveFaultPlan>,
+) -> serde_json::Value {
+    let values: Vec<_> = plan.into_iter().flat_map(|plan| plan.observations()).map(|stage| {
+        serde_json::json!({"stage":format!("{:?}",stage.stage),"actual_directory_device":stage.directory_device,
+            "actual_directory_inode":stage.directory_inode,"actual_io_failed":stage.failed,
+            "actual_error_kind":stage.error_kind,"actual_errno":stage.raw_errno})
+    }).collect();
+    serde_json::json!(values)
 }
 
 #[derive(Debug)]
@@ -272,10 +395,27 @@ pub(in crate::app) fn acknowledge_save_dispatch(app: &mut Cagents, token: Arc<()
 
 pub(in crate::app) fn wants_save_hold(app: &Cagents, action: &RepositoryAction) -> bool {
     app.project_ui.native_fixture.as_ref().is_some_and(|f| {
-        f.context.scene == Scene::Saving && f.phase == Phase::Held && f.held.is_some()
+        f.context.scene.holds_save() && f.phase == Phase::Held && f.held.is_some()
             && f.save.is_none() && f.error.is_none()
             && matches!(action, RepositoryAction::Save { card, overwrite: false } if f.card == Some(*card))
     })
+}
+
+pub(in crate::app) fn save_fault(
+    app: &Cagents,
+    action: &RepositoryAction,
+) -> Option<crate::editor::retained_save::NativeSaveFault> {
+    wants_save_hold(app, action)
+        .then(|| {
+            app.project_ui
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .context
+                .scene
+                .fault()
+        })
+        .flatten()
 }
 
 pub(in crate::app) fn accept_save(
@@ -290,7 +430,8 @@ pub(in crate::app) fn accept_save(
         return Task::none();
     };
     let accepted = app.project_ui.native_fixture.as_ref().is_some_and(|f| {
-        f.context.scene == Scene::Saving
+        f.context.scene.holds_save()
+            && held.fault().map(|plan| plan.mode()) == f.context.scene.fault()
             && f.phase == Phase::Held
             && f.held.is_some()
             && f.save.is_none()
@@ -311,6 +452,7 @@ pub(in crate::app) fn accept_save(
         "revision":held.original.revision,"worker_polled":false,"native_input_proven":false}),
     );
     let original = held.original.clone();
+    app.project_ui.native_fixture.as_mut().unwrap().fault_probe = held.fault().cloned();
     app.project_ui.native_fixture.as_mut().unwrap().save = Some(SaveCustody {
         original,
         held: Some(held),
@@ -324,7 +466,12 @@ pub(in crate::app) fn accept_save(
 
 fn release_save(app: &mut Cagents) -> Task<Message> {
     let f = app.project_ui.native_fixture.as_mut().unwrap();
-    if f.context.scene != Scene::Saving || f.phase != Phase::Finished {
+    let phase_allowed = if f.context.scene == Scene::Saving {
+        f.phase == Phase::Finished
+    } else {
+        f.context.scene.fault().is_some() && f.phase == Phase::Held && f.held.is_some()
+    };
+    if !phase_allowed {
         return Task::none();
     }
     let Some(save) = f.save.as_mut() else {
@@ -369,6 +516,13 @@ fn observe_save_result(app: &mut Cagents, message: &Message) {
     {
         return;
     }
+    if f.context.scene.fault().is_some() {
+        f.writer_outcome = Some(writer_observation(
+            f.context.scene,
+            f.fault_probe.as_ref(),
+            result,
+        ));
+    }
     save.recovery = match result {
         Ok(outcome) => outcome.recovery_authority(),
         Err(error) => error.recovery_authority(),
@@ -395,6 +549,31 @@ fn finish_save_observation(app: &mut Cagents) {
     {
         // Raw delivery or a later unrelated frame is not normal processing.
         // Keep the window-owned released/unknown fence; never replay a result.
+        return;
+    }
+    if f.context.scene.fault().is_some() {
+        let result = save.pending.take().unwrap().result;
+        save.observed = true;
+        let expected = f
+            .writer_outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.expected);
+        receipt(
+            serde_json::json!({"event":"controlled_writer_result_observed",
+            "same_dispatch_normal_ack":true,"ticket":save.original.ticket,"revision":save.original.revision,
+            "actual_writer_result_ok":result.is_ok(),"actual_writer_error":result.as_ref().err(),
+            "result_kind":f.writer_outcome.as_ref().map(|outcome|format!("{:?}",outcome.kind)),
+            "actual_writer_detail":f.writer_outcome.as_ref().and_then(|outcome|outcome.detail.as_deref()),
+            "planned_stages_observed":f.writer_outcome.as_ref().is_some_and(|outcome|outcome.planned_stages_observed),
+            "fixed_scene_outcome_observed":expected,"recovery_retained":save.recovery.is_some(),
+            "stages":fault_stages(f.fault_probe.as_ref()),"native_input_or_ux_qualified":false}),
+        );
+        if !expected {
+            fail(
+                app,
+                "original writer did not reach the exact planned IO stages and typed outcome",
+            );
+        }
         return;
     }
     let result = save.pending.take().unwrap().result;
@@ -432,6 +611,9 @@ pub(in crate::app) fn install(app: &mut Cagents, context: Context) -> Task<Messa
     app.project_ui.native_fixture = Some(Fixture {
         dispatch: Arc::new(()),
         save: None,
+        fault_probe: None,
+        writer_outcome: None,
+        recovery_event: false,
         context,
         phase: Phase::Project,
         project: None,
@@ -473,6 +655,18 @@ pub(in crate::app) fn install(app: &mut Cagents, context: Context) -> Task<Messa
         == Scene::Saving
     {
         app.notices.record(TransientNotice::warning("INERT saving scene · first hold the clean peer-close callback, then edit, Save and Undo · F9 delivers that callback; F10 releases the same unpolled Save task"));
+    }
+    if let Some(mode) = app
+        .project_ui
+        .native_fixture
+        .as_ref()
+        .unwrap()
+        .context
+        .scene
+        .fault()
+    {
+        app.notices.record(TransientNotice::warning(format!(
+            "INERT {mode:?} scene · hold the clean peer-close callback, edit and Save, then F10 runs the original writer before F9 · deliberate fixture IO only")));
     }
     receipt(serde_json::json!({"event":"installed","project":project,
         "mode":"ORIGINAL_COMPLETION_DELAY","provider_started":false,"native_input_proven":false}));
@@ -634,6 +828,33 @@ fn release(app: &mut Cagents) -> Task<Message> {
                     !e.blocks_navigation() && e.editor_text().as_deref() == Some(BASELINE)
                 })
         }
+        Scene::Fault | Scene::Warning | Scene::Recovery => {
+            let observed = f
+                .save
+                .as_ref()
+                .is_some_and(|save| save.released && save.observed)
+                && f.writer_outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.expected)
+                && f.error.is_none();
+            observed
+                && current.is_some_and(|e| match f.context.scene {
+                    Scene::Fault => e.is_dirty() && !e.is_saving(),
+                    Scene::Warning => !e.is_dirty() && !e.is_saving() && e.has_durability_warning(),
+                    Scene::Recovery => {
+                        !e.is_dirty()
+                            && !e.is_saving()
+                            && !e.has_durability_warning()
+                            && e.editor_text().as_deref() == Some(BASELINE)
+                            && f.save
+                                .as_ref()
+                                .and_then(|save| save.recovery.as_ref())
+                                .is_some_and(|authority| !authority.is_resolved())
+                            && app.operation_recovery_pending()
+                    }
+                    _ => false,
+                })
+        }
         Scene::Saving => {
             f.save
                 .as_ref()
@@ -643,7 +864,7 @@ fn release(app: &mut Cagents) -> Task<Message> {
                 })
         }
     };
-    if f.context.scene == Scene::Saving && !acceptable {
+    if f.context.scene.holds_save() && !acceptable {
         return Task::none();
     }
     if !acceptable && f.error.is_none() {
@@ -705,7 +926,9 @@ fn completed(app: &mut Cagents) {
     let card_present = app.cards.contains_key(&card);
     let row_present = app.sidebar_model.project(project).is_some();
     let retained = match f.context.scene {
-        Scene::Edit | Scene::Saving => EXPECTS_EDIT_RETAINED,
+        Scene::Edit | Scene::Saving | Scene::Fault | Scene::Warning | Scene::Recovery => {
+            EXPECTS_EDIT_RETAINED
+        }
         Scene::Unchanged => false,
         Scene::Reopen => true,
     };
@@ -737,7 +960,7 @@ fn completed(app: &mut Cagents) {
 
 fn allowed(app: &Cagents, message: &Message) -> bool {
     let f = app.project_ui.native_fixture.as_ref().unwrap();
-    if f.context.scene == Scene::Saving
+    if f.context.scene.holds_save()
         && matches!(
             message,
             Message::Repository(RepositoryAction::RetainedSaveFinished { .. })
@@ -747,7 +970,7 @@ fn allowed(app: &Cagents, message: &Message) -> bool {
         // normal per-card fences; only the bound tuple earns fixture credit.
         return true;
     }
-    if f.context.scene == Scene::Saving
+    if f.context.scene.holds_save()
         && let Some(save) = &f.save
         && let Some(original) = &save.recovery
     {
@@ -849,6 +1072,10 @@ pub(in crate::app) fn before_update(
     f.files_loaded = false;
     f.reopened = false;
     f.delivering = false;
+    f.recovery_event = matches!(
+        &message,
+        Message::OperationRecovery(crate::operation_recovery::Action::Finished { .. })
+    );
     if matches!(&message, Message::KeyEvent { captured: false, event: keyboard::Event::KeyPressed {
         key: keyboard::Key::Named(keyboard::key::Named::F10), modifiers, ..
     }} if modifiers.is_empty())
@@ -870,6 +1097,8 @@ pub(in crate::app) fn before_update(
         let message = if let Some(save) = f.save.as_ref().filter(|save| !save.observed) {
             if save.released {
                 "Wait for the original Save result before closing this private window."
+            } else if f.context.scene.fault().is_some() {
+                "Release the original Save with F10, observe its result, then finish the original close callback with F9 before closing this private window."
             } else {
                 "Finish the original close callback with F9, then release its Save with F10 before closing this private window."
             }
@@ -920,6 +1149,15 @@ pub(in crate::app) fn after_update(app: &mut Cagents) -> Task<Message> {
         completed(app);
     }
     finish_save_observation(app);
+    let f = app.project_ui.native_fixture.as_ref().unwrap();
+    if f.recovery_event && f.context.scene == Scene::Recovery {
+        receipt(
+            serde_json::json!({"event":"original_recovery_callback_observed",
+            "original_authority_resolved":f.save.as_ref().and_then(|save|save.recovery.as_ref()).is_some_and(|authority|authority.is_resolved()),
+            "window_operations_pending":app.operation_recovery_pending(),
+            "normal_retry_receipt_guard_unchanged":true,"native_input_or_ux_qualified":false}),
+        );
+    }
     observe(app, project_loaded, files_loaded, reopened)
 }
 
@@ -975,6 +1213,9 @@ mod tests {
         app.project_ui.native_fixture = Some(Fixture {
             dispatch: Arc::new(()),
             save: None,
+            fault_probe: None,
+            writer_outcome: None,
+            recovery_event: false,
             context: Context {
                 root: PathBuf::from("/unused-gate-unit-data"),
                 scene: Scene::Edit,
@@ -1000,14 +1241,11 @@ mod tests {
         assert_eq!(scene("edit").unwrap(), Scene::Edit);
         assert_eq!(scene("unchanged").unwrap(), Scene::Unchanged);
         assert_eq!(scene("reopen").unwrap(), Scene::Reopen);
-        for invalid in [
-            "",
-            "save",
-            "recovery",
-            "edit/../reopen",
-            "/tmp/edit",
-            "Edit",
-        ] {
+        assert_eq!(scene("saving").unwrap(), Scene::Saving);
+        assert_eq!(scene("fault").unwrap(), Scene::Fault);
+        assert_eq!(scene("warning").unwrap(), Scene::Warning);
+        assert_eq!(scene("recovery").unwrap(), Scene::Recovery);
+        for invalid in ["", "save", "recover", "edit/../reopen", "/tmp/edit", "Edit"] {
             assert!(scene(invalid).is_err());
         }
     }
@@ -1966,5 +2204,234 @@ mod tests {
             BASELINE
         );
         assert!(!app.operation_recovery_pending());
+    }
+    #[test]
+    fn unrelated_io_without_the_planned_stage_never_earns_scene_credit() {
+        use crate::editor::retained_save::{
+            NativeSaveFault, NativeSaveFaultPlan, RetainedSaveError,
+        };
+        let result = Err(RetainedSaveError::Io("unrelated context refusal".into()));
+        for (scene, mode) in [
+            (Scene::Fault, NativeSaveFault::BeforePublish),
+            (Scene::Warning, NativeSaveFault::DirectoryDurability),
+            (Scene::Recovery, NativeSaveFault::RetainedCleanup),
+        ] {
+            let plan = NativeSaveFaultPlan::new(mode);
+            let observed = writer_observation(scene, Some(&plan), &result);
+            assert!(!observed.planned_stages_observed && !observed.expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn fault_scene_moves_one_original_writer_and_requires_its_normal_ack() {
+        let (directory, mut app, card) = save_app().await;
+        app.project_ui
+            .native_fixture
+            .as_mut()
+            .unwrap()
+            .context
+            .scene = Scene::Fault;
+        let (_, early) = before_update(
+            &mut app,
+            save_key(
+                keyboard::key::Named::F10,
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        assert!(iced::runtime::task::into_stream(early).is_none());
+        admit_save(&mut app, card);
+        let pointer = app
+            .project_ui
+            .native_fixture
+            .as_ref()
+            .unwrap()
+            .save
+            .as_ref()
+            .unwrap()
+            .held
+            .as_ref()
+            .unwrap() as *const repository_widget::NativeHeldSave;
+        for (captured, modifiers) in [
+            (true, keyboard::Modifiers::empty()),
+            (false, keyboard::Modifiers::SHIFT),
+        ] {
+            let (_, task) = before_update(
+                &mut app,
+                save_key(keyboard::key::Named::F10, captured, modifiers),
+            );
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            let save = app
+                .project_ui
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .save
+                .as_ref()
+                .unwrap();
+            assert!(!save.released && !save.observed);
+            assert!(std::ptr::eq(save.held.as_ref().unwrap(), pointer));
+        }
+        let (_, task) = before_update(
+            &mut app,
+            save_key(
+                keyboard::key::Named::F10,
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        let (_, duplicate) = before_update(
+            &mut app,
+            save_key(
+                keyboard::key::Named::F10,
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        assert!(iced::runtime::task::into_stream(duplicate).is_none());
+        let original = save_message(task).await;
+        assert!(matches!(
+            &original,
+            Message::Repository(RepositoryAction::RetainedSaveFinished {
+                result: Err(crate::editor::retained_save::RetainedSaveError::Io(_)),
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("project/notes.txt")).unwrap(),
+            BASELINE
+        );
+        drop(app.update(original));
+        let f = app.project_ui.native_fixture.as_ref().unwrap();
+        assert!(f.save.as_ref().unwrap().observed && f.writer_outcome.as_ref().unwrap().expected);
+        assert!(f.error.is_none() && f.phase == Phase::Held && f.held.is_some());
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.is_dirty() && !runtime.is_saving())
+        );
+    }
+
+    #[tokio::test]
+    async fn warning_scene_observes_the_real_clean_unconfirmed_save_before_close() {
+        let (directory, mut app, card) = save_app().await;
+        app.project_ui
+            .native_fixture
+            .as_mut()
+            .unwrap()
+            .context
+            .scene = Scene::Warning;
+        admit_save(&mut app, card);
+        let snapshot = app
+            .project_ui
+            .native_fixture
+            .as_ref()
+            .unwrap()
+            .save
+            .as_ref()
+            .unwrap()
+            .original
+            .snapshot
+            .clone();
+        let (_, task) = before_update(
+            &mut app,
+            save_key(
+                keyboard::key::Named::F10,
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        let original = save_message(task).await;
+        assert!(
+            matches!(&original, Message::Repository(RepositoryAction::RetainedSaveFinished {
+            result: Ok(outcome), .. }) if matches!(outcome.outcome(), crate::editor::SaveOutcome::Saved {
+                durability: crate::editor::SaveDurability::Unconfirmed { .. }, .. }))
+        );
+        drop(app.update(original));
+        let f = app.project_ui.native_fixture.as_ref().unwrap();
+        assert!(f.save.as_ref().unwrap().observed && f.writer_outcome.as_ref().unwrap().expected);
+        assert!(f.error.is_none() && f.phase == Phase::Held && f.held.is_some());
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if !runtime.is_dirty() && !runtime.is_saving() && runtime.has_durability_warning()
+                && runtime.blocks_navigation())
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("project/notes.txt")).unwrap(),
+            snapshot
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_scene_undo_keeps_the_original_owner_for_normal_retry() {
+        let (directory, mut app, card) = save_app().await;
+        app.project_ui
+            .native_fixture
+            .as_mut()
+            .unwrap()
+            .context
+            .scene = Scene::Recovery;
+        admit_save(&mut app, card);
+        let (_, task) = before_update(
+            &mut app,
+            save_key(
+                keyboard::key::Named::F10,
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        let original = save_message(task).await;
+        assert!(matches!(
+            &original,
+            Message::Repository(RepositoryAction::RetainedSaveFinished {
+                result: Err(crate::editor::retained_save::RetainedSaveError::Recovery { .. }),
+                ..
+            })
+        ));
+        drop(app.update(original));
+        drop(app.update(Message::Repository(RepositoryAction::Undo { card })));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if !runtime.is_dirty() && !runtime.is_saving() && !runtime.has_durability_warning()
+                && runtime.editor_text().as_deref() == Some(BASELINE))
+        );
+        assert!(app.operation_recovery_pending());
+        let f = app.project_ui.native_fixture.as_ref().unwrap();
+        assert!(f.writer_outcome.as_ref().unwrap().expected && f.error.is_none());
+        let authority = f.save.as_ref().unwrap().recovery.as_ref().unwrap().clone();
+        assert!(!authority.is_resolved());
+        let retry = app.update(Message::OperationRecovery(
+            crate::operation_recovery::Action::Retry(authority.clone()),
+        ));
+        let mut outputs =
+            iced::runtime::task::into_stream(retry).expect("original ordinary Retry task");
+        let mut completed = false;
+        while let Some(output) = outputs.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(message)) = output {
+                assert!(matches!(
+                    &message,
+                    Message::OperationRecovery(crate::operation_recovery::Action::Finished { .. })
+                ));
+                assert!(!completed);
+                completed = true;
+                drop(app.update(message));
+            }
+        }
+        assert!(completed && authority.is_resolved() && !app.operation_recovery_pending());
+        assert_eq!(
+            app.project_ui
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .fault_probe
+                .as_ref()
+                .unwrap()
+                .observations()
+                .len(),
+            2
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("project/notes.txt")).unwrap(),
+            BASELINE
+        );
     }
 }

@@ -130,6 +130,131 @@ fn resolve_error(error: ResolveError) -> FileIoError {
     io_error(error)
 }
 
+#[cfg(all(feature = "development", target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeSaveFault {
+    BeforePublish,
+    DirectoryDurability,
+    RetainedCleanup,
+}
+
+#[cfg(all(feature = "development", target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeSaveFaultStage {
+    BeforePublish,
+    DirectoryDurability,
+    EmptyHoldingCleanup,
+}
+
+#[cfg(all(feature = "development", target_os = "linux"))]
+#[derive(Debug, Clone)]
+pub(crate) struct NativeSaveFaultObservation {
+    pub stage: NativeSaveFaultStage,
+    pub directory_device: u64,
+    pub directory_inode: u64,
+    pub failed: bool,
+    pub error_kind: Option<String>,
+    pub raw_errno: Option<i32>,
+}
+
+/// Observation only, carried by ONE original Save alongside its existing tuple.
+/// It contains no descriptors, authority, result, caller or global fault state.
+#[cfg(all(feature = "development", target_os = "linux"))]
+#[derive(Debug, Clone)]
+pub(crate) struct NativeSaveFaultPlan {
+    mode: NativeSaveFault,
+    stages: std::sync::Arc<std::sync::Mutex<Vec<NativeSaveFaultObservation>>>,
+}
+
+#[cfg(all(feature = "development", target_os = "linux"))]
+impl NativeSaveFaultPlan {
+    pub(crate) fn new(mode: NativeSaveFault) -> Self {
+        Self {
+            mode,
+            stages: Default::default(),
+        }
+    }
+    pub(crate) fn mode(&self) -> NativeSaveFault {
+        self.mode
+    }
+    pub(crate) fn observations(&self) -> Vec<NativeSaveFaultObservation> {
+        self.stages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Deliberate fixture IO on a duplicate of this SAME original O_PATH directory.
+/// Return the actual sync_all result unchanged: unexpected success is not an
+/// injected error. The observing scene must refuse a missing/incorrect stage.
+#[cfg(all(feature = "development", target_os = "linux"))]
+fn native_directory_fault(
+    directory: &Root,
+    plan: &NativeSaveFaultPlan,
+    stage: NativeSaveFaultStage,
+) -> io::Result<()> {
+    let original = directory.retained_directory()?;
+    let metadata = original.metadata()?;
+    let result = original.sync_all();
+    plan.stages
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(NativeSaveFaultObservation {
+            stage,
+            directory_device: metadata.dev(),
+            directory_inode: metadata.ino(),
+            failed: result.is_err(),
+            error_kind: result
+                .as_ref()
+                .err()
+                .map(|error| format!("{:?}", error.kind())),
+            raw_errno: result.as_ref().err().and_then(io::Error::raw_os_error),
+        });
+    result
+}
+
+/// Fixed development scene producer; ordinary save_file_at remains unchanged.
+#[cfg(all(feature = "development", target_os = "linux"))]
+pub(crate) fn save_file_with_native_fault_at(
+    root: &Root,
+    relative_path: &Path,
+    text: &str,
+    expected_disk_hash: blake3::Hash,
+    overwrite: bool,
+    context: &FilesystemRecoveryContext,
+    plan: NativeSaveFaultPlan,
+) -> Result<RetainedSaveOutcome, RetainedSaveError> {
+    if relative_path != Path::new("notes.txt") {
+        return Err(io_error("fixed native writer requires notes.txt"));
+    }
+    let cleanup = (plan.mode() == NativeSaveFault::RetainedCleanup).then(|| plan.clone());
+    save_file_with_pipeline_hooks(
+        root,
+        relative_path,
+        text,
+        expected_disk_hash,
+        overwrite,
+        context,
+        || Ok(()),
+        || match plan.mode() {
+            NativeSaveFault::BeforePublish | NativeSaveFault::RetainedCleanup => {
+                native_directory_fault(root, &plan, NativeSaveFaultStage::BeforePublish)
+            }
+            NativeSaveFault::DirectoryDurability => Ok(()),
+        },
+        |_, _| Ok(()),
+        |parent| {
+            if plan.mode() == NativeSaveFault::DirectoryDurability {
+                native_directory_fault(parent, &plan, NativeSaveFaultStage::DirectoryDurability)
+            } else {
+                fs_safety::sync_directory(parent)
+            }
+        },
+        cleanup,
+    )
+}
+
 /// The blocking worker supplies the ORIGINAL read root and a real local
 /// qualified context: outside placement or Save-only actual-parent
 /// custody. No path recapture or unprotected fallback exists.
@@ -196,6 +321,8 @@ fn save_file_with_read_hook(
         before_publish,
         |_, _| Ok(()),
         sync_parent,
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        None,
     )
 }
 
@@ -224,6 +351,8 @@ pub(crate) fn save_file_with_cleanup_warning_at(
                 "injected source-parent directory sync failure",
             ))
         },
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        None,
     )
 }
 
@@ -238,6 +367,9 @@ fn save_file_with_pipeline_hooks(
     before_publish: impl FnOnce() -> io::Result<()>,
     after_publish: impl FnOnce(&Root, &Root) -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
+    #[cfg(all(feature = "development", target_os = "linux"))] native_cleanup_fault: Option<
+        NativeSaveFaultPlan,
+    >,
 ) -> Result<RetainedSaveOutcome, RetainedSaveError> {
     validate_repo_path(relative_path).map_err(io_error)?;
     context.validate_for_source(root).map_err(io_error)?;
@@ -296,6 +428,8 @@ fn save_file_with_pipeline_hooks(
         |parent, _| validate_target_parent(root, relative_path, parent),
         after_publish,
         sync_parent,
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        native_cleanup_fault,
     )?;
     let (durability, recovery) = match durability {
         SaveDurability::Durable => (super::SaveDurability::Durable, None),
@@ -466,6 +600,8 @@ struct Holding {
     // Directory durability is an observation, separate from live namespace
     // and content custody. Only unresolved artifacts retain authority.
     directory_warnings: Vec<String>,
+    #[cfg(all(feature = "development", target_os = "linux"))]
+    native_cleanup_fault: Option<NativeSaveFaultPlan>,
 }
 impl Holding {
     fn create(
@@ -508,6 +644,8 @@ impl Holding {
             slot: Some(slot),
             files: vec![source],
             directory_warnings,
+            #[cfg(all(feature = "development", target_os = "linux"))]
+            native_cleanup_fault: None,
         })
     }
     fn root(&self) -> &Root {
@@ -576,6 +714,18 @@ impl Holding {
     fn remove_empty(&mut self, _parent: &Root) -> Result<(), FileIoError> {
         if !self.publication.is_removed() {
             self.validate_payload().map_err(io_error)?;
+            #[cfg(all(feature = "development", target_os = "linux"))]
+            if let Some(plan) = self.native_cleanup_fault.take() {
+                // clean_before_acquire has already authenticated/unlinked the
+                // temporary. Keep the REAL empty Holding on an actual IO error;
+                // unchanged retry_cleanup never consults this consumed plan.
+                native_directory_fault(
+                    self.root(),
+                    &plan,
+                    NativeSaveFaultStage::EmptyHoldingCleanup,
+                )
+                .map_err(io_error)?;
+            }
             self.publication.cleanup_empty().map_err(resolve_error)?;
         } else {
             self.context.placement().validate().map_err(io_error)?;
@@ -684,6 +834,8 @@ fn publish_replacement(
         |_, _| Ok(()),
         |_, _| Ok(()),
         sync_parent,
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        None,
     )
 }
 
@@ -699,8 +851,15 @@ fn publish_with_hooks(
     after_acquire: impl FnOnce(&Root, &Root) -> io::Result<()>,
     after_publish: impl FnOnce(&Root, &Root) -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
+    #[cfg(all(feature = "development", target_os = "linux"))] native_cleanup_fault: Option<
+        NativeSaveFaultPlan,
+    >,
 ) -> Result<SaveDurability, FileIoError> {
     let mut holding = Holding::create(parent, destination, context)?;
+    #[cfg(all(feature = "development", target_os = "linux"))]
+    {
+        holding.native_cleanup_fault = native_cleanup_fault;
+    }
     let result = publish_in_holding(
         &mut holding,
         parent,
@@ -1515,6 +1674,8 @@ mod tests {
                 Ok(())
             },
             fs_safety::sync_directory,
+            #[cfg(all(feature = "development", target_os = "linux"))]
+            None,
         )
         .unwrap();
         let authority = match result {
@@ -1541,5 +1702,137 @@ mod tests {
         fs_safety::unlink_within(&holding, &name).unwrap();
         authority.retry().unwrap();
         assert!(authority.is_resolved());
+    }
+    #[cfg(feature = "development")]
+    fn native_writer_fixture() -> (tempfile::TempDir, Root) {
+        let (directory, root) = fixture();
+        fs::rename(
+            directory.path().join("file"),
+            directory.path().join("notes.txt"),
+        )
+        .unwrap();
+        (directory, root)
+    }
+
+    #[cfg(feature = "development")]
+    #[test]
+    fn native_before_publish_fault_preserves_original_bytes_without_recovery() {
+        let (directory, root) = native_writer_fixture();
+        let context = fixture_context(&root).unwrap();
+        let plan = NativeSaveFaultPlan::new(NativeSaveFault::BeforePublish);
+        let result = finish_context(
+            &context,
+            save_file_with_native_fault_at(
+                &root,
+                Path::new("notes.txt"),
+                "changed",
+                blake3::hash(b"base"),
+                false,
+                &context,
+                plan.clone(),
+            ),
+        );
+        assert!(matches!(&result, Err(RetainedSaveError::Io(_))));
+        assert!(result.as_ref().unwrap_err().recovery_authority().is_none());
+        assert_eq!(
+            fs::read(directory.path().join("notes.txt")).unwrap(),
+            b"base"
+        );
+        let stages = plan.observations();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].stage, NativeSaveFaultStage::BeforePublish);
+        assert!(stages[0].failed);
+        assert_eq!(stages[0].raw_errno, Some(libc::EBADF));
+    }
+
+    #[cfg(feature = "development")]
+    #[test]
+    fn native_post_publish_io_warning_has_a_real_saved_baseline() {
+        let (directory, root) = native_writer_fixture();
+        let context = fixture_context(&root).unwrap();
+        let plan = NativeSaveFaultPlan::new(NativeSaveFault::DirectoryDurability);
+        let result = finish_context(
+            &context,
+            save_file_with_native_fault_at(
+                &root,
+                Path::new("notes.txt"),
+                "changed",
+                blake3::hash(b"base"),
+                false,
+                &context,
+                plan.clone(),
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            result.outcome(),
+            super::super::SaveOutcome::Saved {
+                durability: super::super::SaveDurability::Unconfirmed { .. },
+                ..
+            }
+        ));
+        assert!(result.recovery_authority().is_none());
+        assert_eq!(
+            fs::read(directory.path().join("notes.txt")).unwrap(),
+            b"changed"
+        );
+        let stages = plan.observations();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].stage, NativeSaveFaultStage::DirectoryDurability);
+        assert!(stages[0].failed);
+        assert_eq!(stages[0].raw_errno, Some(libc::EBADF));
+    }
+
+    #[cfg(feature = "development")]
+    #[test]
+    fn native_cleanup_fault_retains_the_real_empty_holding_and_retries_once() {
+        let (directory, root) = native_writer_fixture();
+        let context = fixture_context(&root).unwrap();
+        let plan = NativeSaveFaultPlan::new(NativeSaveFault::RetainedCleanup);
+        let result = finish_context(
+            &context,
+            save_file_with_native_fault_at(
+                &root,
+                Path::new("notes.txt"),
+                "changed",
+                blake3::hash(b"base"),
+                false,
+                &context,
+                plan.clone(),
+            ),
+        );
+        let authority = match result {
+            Err(RetainedSaveError::Recovery { authority, .. }) => authority,
+            other => panic!("real unresolved holding required: {other:?}"),
+        };
+        assert!(!authority.is_resolved());
+        assert_eq!(
+            fs::read(directory.path().join("notes.txt")).unwrap(),
+            b"base"
+        );
+        let stages = plan.observations();
+        assert_eq!(
+            stages.iter().map(|stage| stage.stage).collect::<Vec<_>>(),
+            vec![
+                NativeSaveFaultStage::BeforePublish,
+                NativeSaveFaultStage::EmptyHoldingCleanup
+            ]
+        );
+        assert!(
+            stages
+                .iter()
+                .all(|stage| stage.failed && stage.raw_errno == Some(libc::EBADF))
+        );
+        authority.retry().unwrap();
+        assert!(authority.is_resolved());
+        assert_eq!(
+            plan.observations().len(),
+            2,
+            "ordinary retry must not reapply the one-shot fault"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("notes.txt")).unwrap(),
+            b"base"
+        );
     }
 }

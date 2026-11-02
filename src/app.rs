@@ -15407,11 +15407,16 @@ impl Application for Cagents {
                 #[cfg(all(feature = "development", target_os = "linux"))]
                 let native_save_arm = project_ui::native_close_fixture::wants_save_hold(self, &action);
                 #[cfg(all(feature = "development", target_os = "linux"))]
+                let native_save_fault = project_ui::native_close_fixture::save_fault(self, &action);
+                #[cfg(all(feature = "development", target_os = "linux"))]
                 let mut native_save = None;
                 let task = match self.cards.get_mut(&card) {
                     Some(CardRuntime::Repository(runtime)) => {
                         #[cfg(all(feature = "development", target_os = "linux"))]
-                        let native_armed = native_save_arm && runtime.native_fixture_arm_save(card);
+                        let native_armed = native_save_arm && match native_save_fault {
+                            Some(mode) => runtime.native_fixture_arm_fault_save(card, mode),
+                            None => runtime.native_fixture_arm_save(card),
+                        };
                         let task = runtime.update(action);
                         #[cfg(all(feature = "development", target_os = "linux"))]
                         if native_armed {
