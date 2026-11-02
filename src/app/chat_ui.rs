@@ -28965,6 +28965,10 @@ mod agent_presentation_tests {
             app.card_state(card).unwrap().kind,
             replacement.kind(Surface::Chat)
         );
+        let Some(CardRuntime::Chat(current)) = app.cards.get_mut(&card) else {
+            panic!("the replacement keeps a chat runtime");
+        };
+        current.replace_draft(text_editor::Content::with_text("unsent replacement draft"));
         let runtime = match app.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => (
                 runtime.target,
