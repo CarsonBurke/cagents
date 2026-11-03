@@ -114,6 +114,23 @@ fn reported(app: &Cagents) -> Option<&str> {
         .then(|| app.status.as_ref().unwrap().message.as_str())
 }
 
+fn reported_details(app: &Cagents) -> Option<&str> {
+    app.startup_gate
+        .reported
+        .then(|| app.status.as_ref().unwrap().details.as_deref())
+        .flatten()
+}
+
+/// The notice is read by a person; only the launcher answer carries the
+/// handshake's machine prefix.
+fn assert_readable(notice: &str) {
+    assert!(
+        !notice.contains(instance::UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX.trim_end()),
+        "{notice}"
+    );
+    assert!(!notice.contains("recovery controls"), "{notice}");
+}
+
 #[test]
 fn retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes() {
     let (mut app, cards) = waiting(3);
@@ -135,13 +152,17 @@ fn retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes() {
         }),
     ));
     let reason = reported(&app).expect("retained recovery must answer the launcher");
+    assert_readable(reason);
+    assert!(!reason.contains(DETAIL), "{reason}");
+    assert_eq!(reported_details(&app), Some(DETAIL));
     // Launchers keep the window open only for this error form.
+    let answer = retained_reason(DETAIL);
     assert!(
-        reason.starts_with(instance::UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX),
-        "{reason}"
+        answer.starts_with(instance::UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX),
+        "{answer}"
     );
-    assert!(reason.contains(DETAIL), "{reason}");
-    assert!(reason.contains("this window remains available"), "{reason}");
+    assert!(answer.contains(DETAIL), "{answer}");
+    assert!(answer.contains("this window remains available"), "{answer}");
     for card in cards {
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
     }
@@ -179,11 +200,17 @@ fn panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_re
     elapse(&mut app, Duration::from_secs(2));
     drop(app.verify_startup_gate());
     let reason = reported(&app).expect("a stalled gate must answer the launcher");
-    assert!(
-        reason.starts_with(instance::UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX),
-        "{reason}"
-    );
+    assert_readable(reason);
+    assert!(reason.starts_with("3 saved panes"), "{reason}");
     assert!(reason.contains("made no progress"), "{reason}");
+    let answer = stalled_reason(&Pending {
+        admission: false,
+        panes: cards.clone(),
+    });
+    assert!(
+        answer.starts_with(instance::UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX),
+        "{answer}"
+    );
     assert!(reason.contains(&cards[0].to_string()), "{reason}");
 }
 
@@ -247,6 +274,7 @@ fn the_inventory_budget_still_caps_a_daemon_that_keeps_restoring() {
     ));
     drop(app.verify_startup_gate());
     let reason = reported(&app).expect("the absolute cap still applies");
+    assert!(reason.starts_with("Saved conversations"), "{reason}");
     assert!(reason.contains("still reconnecting"), "{reason}");
 }
 
@@ -395,8 +423,9 @@ fn current_connected_owner_refuses_old_or_incomplete_inspection_proofs() {
             detail: DETAIL.into(),
         }),
     ));
-    assert!(
-        reported(&app).unwrap().contains(DETAIL),
+    assert_eq!(
+        reported_details(&app),
+        Some(DETAIL),
         "a current matching failure must remain visible"
     );
 }
@@ -551,11 +580,9 @@ fn delayed_retained_cannot_override_current_readiness_or_save_completion() {
         assert!(app.startup_gate.reported && !app.startup_gate.saving);
         assert_eq!(app.settings_ack_generation, generation);
         assert_eq!(app.settings_path, Some(path));
-        assert!(
-            app.status
-                .as_ref()
-                .is_none_or(|status| !status.message.contains(DETAIL))
-        );
+        assert!(app.status.as_ref().is_none_or(|status| {
+            !status.message.contains(DETAIL) && status.details.as_deref() != Some(DETAIL)
+        }));
         drop(app.startup_state_inspected(duplicate));
         assert!(app.startup_gate.daemon.is_none());
         assert_eq!(app.settings_ack_generation, generation);
@@ -768,6 +795,29 @@ fn a_stale_inspection_does_not_hide_a_real_save_error() {
     );
     drop(app.startup_panes_saved(settings, workspace));
     let reason = reported(&app).unwrap();
+    assert_readable(reason);
+    assert!(reason.starts_with("Conversations reconnected"), "{reason}");
     assert!(reason.contains("workspace storage unavailable"));
     assert!(!reason.contains(DETAIL));
+}
+
+#[test]
+fn an_inspection_that_sees_panes_move_leaves_polling_to_the_running_check() {
+    let (mut app, cards) = waiting(3);
+    let stale = inspection(&mut app, Ok(StartupState::Ready));
+    app.cards.insert(
+        cards[0],
+        CardRuntime::Failed("Fixture attach failed".into()),
+    );
+    // The gate's own check is already scheduled. Each inspection that saw a
+    // pane settle must not start another 200 ms poll on the UI thread.
+    assert_eq!(app.startup_state_inspected(stale).units(), 0);
+    assert_eq!(reported(&app), None);
+    assert!(app.startup_gate.outstanding.is_none());
+    // The running check still records that move as progress.
+    elapse(&mut app, Duration::from_secs(1));
+    let progressed = app.startup_gate.progressed;
+    app.startup_gate.inspected = Some(Instant::now());
+    drop(app.verify_startup_gate());
+    assert_ne!(app.startup_gate.progressed, progressed);
 }
