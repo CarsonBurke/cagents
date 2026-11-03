@@ -362,7 +362,11 @@ impl Cagents {
         match self.startup_pending() {
             Err(reason) => return self.fail_startup_gate(reason),
             Ok(Some(pending)) if pending == inspection.context.pending => {}
-            Ok(_) => return self.verify_startup_gate(),
+            // The gate's own check is already rescheduled and records this
+            // progress; starting another here would add a poll loop for every
+            // inspection that saw the panes move.
+            Ok(Some(_)) => return Task::none(),
+            Ok(None) => return self.verify_startup_gate(),
         }
         let now = Instant::now();
         self.startup_gate.inspected = Some(now);
@@ -407,7 +411,8 @@ impl Cagents {
             return Task::none();
         };
         let reason = retained_reason(detail);
-        self.fail_startup_gate(reason)
+        let notice = TransientNotice::warning(RETAINED_NOTICE).with_details(bounded_detail(detail));
+        self.report_startup_failure(reason, notice)
     }
 
     fn startup_observation_current(&self, observed: &Observed, pending: &Pending) -> bool {
@@ -463,9 +468,15 @@ impl Cagents {
     }
 
     fn fail_startup_gate(&mut self, reason: String) -> Task<Message> {
+        let notice = TransientNotice::warning(notice_text(&reason));
+        self.report_startup_failure(reason, notice)
+    }
+
+    /// `reason` answers the launcher; `notice` is what this window shows.
+    fn report_startup_failure(&mut self, reason: String, notice: TransientNotice) -> Task<Message> {
         self.startup_gate.retire_inspections();
         self.startup_gate.reported = true;
-        self.status = Some(TransientNotice::warning(reason.clone()));
+        self.status = Some(notice);
         report(Err(reason))
     }
 
@@ -486,7 +497,7 @@ impl Cagents {
         }
         self.startup_gate.reported = true;
         if let Err(reason) = &result {
-            self.status = Some(TransientNotice::warning(reason.clone()));
+            self.status = Some(TransientNotice::warning(notice_text(reason)));
         }
         report(result)
     }
@@ -520,9 +531,25 @@ fn inspect_existing_daemon(
     inspect()
 }
 
-/// The daemon kept its original owners after a failed restore. That does not
-/// resolve by waiting, so the window says so at once and stays available.
-fn retained_reason(detail: &str) -> String {
+/// What the window says when the daemon kept its original owners after a
+/// failed restore; the daemon's own reason goes beneath it as details.
+const RETAINED_NOTICE: &str = "Saved sessions could not be reconnected after the update. Their original processes were kept and nothing was closed or deleted, but this window cannot reach them. The update has not been verified.";
+
+/// The handshake's prefix tells the launcher to keep the window open; the
+/// person reading the notice needs only the sentence after it.
+fn notice_text(reason: &str) -> String {
+    let text = reason
+        .strip_prefix(instance::UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX)
+        .unwrap_or(reason);
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+/// The daemon's reason on one line, bounded to fit the launcher's handshake.
+fn bounded_detail(detail: &str) -> String {
     let mut detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
     if detail.len() > MAX_DAEMON_DETAIL_BYTES {
         let end = (0..=MAX_DAEMON_DETAIL_BYTES)
@@ -532,9 +559,17 @@ fn retained_reason(detail: &str) -> String {
         detail.truncate(end);
         detail.push('…');
     }
+    detail
+}
+
+/// The daemon kept its original owners after a failed restore. That does not
+/// resolve by waiting, so the launcher learns at once, with the daemon's
+/// reason, and the window stays available.
+fn retained_reason(detail: &str) -> String {
+    let detail = bounded_detail(detail);
     let detail = detail.trim_end_matches('.');
     format!(
-        "recovery-incomplete: the terminal service could not finish restoring saved sessions and kept their original processes: {detail}. Saved conversations cannot reconnect while it does; open the affected panes to use their recovery controls. Their drafts and recovery evidence are retained; this window remains available. The update has not been verified."
+        "recovery-incomplete: the terminal service could not reconnect saved sessions after the update: {detail}. Their original processes were kept and nothing was closed or deleted; this window remains available. The update has not been verified."
     )
 }
 
@@ -546,7 +581,7 @@ fn stalled_reason(pending: &Pending) -> String {
         );
     }
     format!(
-        "recovery-incomplete: {} saved panes made no progress reconnecting for {} seconds (panes {}). The window remains available; open the affected panes to inspect their recovery controls. The update has not been verified.",
+        "recovery-incomplete: {} saved panes made no progress reconnecting for {} seconds (panes {}). The window remains available with its saved panes. The update has not been verified.",
         pending.panes.len(),
         NO_PROGRESS.as_secs(),
         pending
