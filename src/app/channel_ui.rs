@@ -1681,6 +1681,21 @@ mod tests {
             let (mut app, target, selected, _) = channel_with_a_conversation();
             app.context_inspector_open = false;
             drop(app.select_channel(selected));
+            // The private selection helper changes scope without refreshing
+            // the cached sidebar rows used by compact drawing and focus.
+            app.refresh_sidebar_channels();
+            if unavailable == "compact" {
+                let row = app.sidebar_model.projects[0]
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == target)
+                    .unwrap();
+                assert!(!row.selected);
+                assert!(!row.unread);
+                assert!(row.activity.is_none());
+                assert!(row.deletion.is_none());
+                assert_eq!(row.attention, sidebar::AttentionSummary::default());
+            }
             assert!(app.workspace.focused().is_none());
             if unavailable != "no dialog" {
                 drop(app.handle_channel_ui(Action::Delete(target)));
