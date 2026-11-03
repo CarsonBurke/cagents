@@ -504,17 +504,37 @@ impl Cagents {
             Action::Dismiss => {
                 // Declining to delete a channel whose deletion failed is the
                 // answer to that failure, so its row stops asking.
-                if let Some(dismissed) = self.channel_ui.dialog.take()
+                let dismissed = self.channel_ui.dialog.take();
+                if let Some(dismissed) = &dismissed
                     && self.channel_ui.failed.remove(&dismissed.channel).is_some()
                 {
                     self.refresh_sidebar_channels();
                 }
-                let focus = self.nested_modal_focus_target().unwrap_or_else(|| {
-                    self.workspace
-                        .focused()
-                        .map(|card| self.card_keyboard_focus(card))
-                        .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
-                });
+                if let Some(focus) = self.nested_modal_focus_target() {
+                    return iced::widget::operation::focus(focus).map(cosmic::Action::App);
+                }
+                // Return to the row that asked, without opening its channel
+                // or expanding navigation the user has since hidden.
+                if let Some(dismissed) = dismissed
+                    && self
+                        .durable
+                        .channels
+                        .iter()
+                        .any(|channel| channel.id == dismissed.channel)
+                    && self
+                        .visible_sidebar_rows()
+                        .contains(&sidebar::SelectionRow::Channel(dismissed.channel))
+                {
+                    return sidebar::focus_and_reveal(sidebar::selection_row_focus_id(
+                        sidebar::SelectionRow::Channel(dismissed.channel),
+                    ))
+                    .map(cosmic::Action::App);
+                }
+                let focus = self
+                    .workspace
+                    .focused()
+                    .map(|card| self.card_keyboard_focus(card))
+                    .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
                 iced::widget::operation::focus(focus).map(cosmic::Action::App)
             }
         }
@@ -1312,6 +1332,301 @@ mod tests {
             assert_eq!(app.card_state(card), Some(&original));
             assert!(!app.channel_ui.deletion_running());
         }
+    }
+
+    /// Apply the reducer's actual widget operations to the mounted sidebar,
+    /// then optionally send a key to the focus those operations established.
+    fn sidebar_after_task(
+        app: &Cagents,
+        task: Task<Message>,
+        key: Option<keyboard::key::Named>,
+    ) -> (Option<widget::Id>, Vec<Message>) {
+        use iced::advanced::{
+            clipboard,
+            widget::{Operation, operation},
+        };
+        use iced::futures::StreamExt;
+        use iced::runtime::{Action as Effect, UserInterface, task, user_interface::Cache};
+
+        let mut renderer = super::super::tests::headless_renderer();
+        let mut frame = UserInterface::build(
+            sidebar::view_cached(
+                &app.sidebar_model,
+                &app.sidebar_state,
+                app.projects_sidebar_mode(),
+                app.settings.sidebar_width,
+                app.modal_is_open(),
+                &app.navigation_cache,
+                &app.settings.keyboard_shortcuts,
+            )
+            .map(Message::Sidebar),
+            iced::Size::new(800.0, 900.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        if let Some(mut effects) = task::into_stream(task) {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            while let Some(effect) = executor.block_on(effects.next()) {
+                let Effect::Widget(mut operation) = effect else {
+                    continue;
+                };
+                loop {
+                    frame.operate(&renderer, operation.as_mut());
+                    match operation.finish() {
+                        operation::Outcome::Chain(next) => operation = next,
+                        _ => break,
+                    }
+                }
+            }
+        }
+        let focused: Arc<std::sync::Mutex<Option<widget::Id>>> = Default::default();
+        let sink = Arc::clone(&focused);
+        let mut probe = operation::map(operation::focusable::find_focused(), move |id| {
+            *sink.lock().unwrap() = Some(id);
+        });
+        frame.operate(&renderer, &mut probe);
+        let _ = probe.finish();
+        let focused = focused.lock().unwrap().clone();
+        let mut messages = Vec::new();
+        if let Some(key) = key {
+            frame.update(
+                &[iced::Event::Keyboard(
+                    super::super::dialog_ui::tests::key_press(key),
+                )],
+                iced::mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+        }
+        (focused, messages)
+    }
+
+    #[test]
+    fn channel_delete_cancel_returns_to_the_nonselected_row_and_keyboard_navigation() {
+        use keyboard::key::Named;
+        use sidebar::SelectionRow;
+
+        for answer in 0..3 {
+            let (mut app, target, selected, _) = channel_with_a_conversation();
+            app.context_inspector_open = false;
+            drop(app.select_channel(selected));
+            let durable = Arc::clone(&app.durable);
+            let focused_card = app.workspace.focused();
+            let directory = app.active_workspace.clone();
+            let selection = serde_json::to_value(app.sidebar_state.saved_view()).unwrap();
+            let selected_rows = app.sidebar_state.selected_rows(&app.visible_sidebar_rows());
+            let opening = app.update(Message::Sidebar(SidebarAction::DeleteChannel {
+                channel_id: target,
+            }));
+            assert_eq!(
+                super::super::tests::focused_element(app.channel_dialog_view().unwrap(), opening),
+                Some(State::focus_target())
+            );
+            let answer = match answer {
+                0 => Message::ChannelUi(Action::Dismiss),
+                1 => super::super::dialog_ui::tests::enter_control(
+                    app.channel_dialog_view().unwrap(),
+                    State::focus_target(),
+                ),
+                _ => Message::KeyEvent {
+                    event: super::super::dialog_ui::tests::key_press(Named::Escape),
+                    captured: false,
+                },
+            };
+            let task = app.update(answer);
+            assert!(!app.channel_ui.modal_open());
+            let row = SelectionRow::Channel(target);
+            let (focused, mut messages) = sidebar_after_task(&app, task, Some(Named::ArrowDown));
+            assert_eq!(focused, Some(sidebar::selection_row_focus_id(row)));
+            assert_eq!(messages.len(), 1, "the returned row answers the next key");
+            let message = messages.pop().unwrap();
+            assert!(matches!(
+                &message,
+                Message::Sidebar(SidebarAction::NavigateRow {
+                    row: current,
+                    key: Named::ArrowDown,
+                }) if *current == row
+            ));
+            let next = app
+                .sidebar_keyboard_neighbor(row, Named::ArrowDown)
+                .unwrap();
+            assert_ne!(next, row, "the fixture has a following visible row");
+            let task = app.update(message);
+            assert_eq!(
+                sidebar_after_task(&app, task, None).0,
+                Some(sidebar::selection_row_focus_id(next))
+            );
+            assert_eq!(app.durable.as_ref(), durable.as_ref());
+            assert_eq!(app.durable.active_channel, Some(selected));
+            assert_eq!(app.workspace.focused(), focused_card);
+            assert_eq!(app.active_workspace, directory);
+            assert_eq!(
+                serde_json::to_value(app.sidebar_state.saved_view()).unwrap(),
+                selection
+            );
+            assert_eq!(
+                app.sidebar_state.selected_rows(&app.visible_sidebar_rows()),
+                selected_rows
+            );
+            assert!(!app.channel_ui.deletion_running());
+        }
+    }
+
+    #[test]
+    fn declining_a_failed_channel_deletion_clears_its_badge_and_refocuses_its_row() {
+        let (mut app, target, _, _) = channel_with_a_conversation();
+        app.context_inspector_open = false;
+        drop(app.handle_channel_ui(Action::Delete(target)));
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        let operation = app.channel_ui.close_operation(target);
+        drop(app.handle_channel_ui(Action::SessionsClosed(
+            target,
+            operation,
+            Err("fixture: close refused".into()),
+        )));
+        assert_eq!(
+            app.channel_ui.row_deletion(target),
+            Some(RowDeletion::Failed("fixture: close refused".into()))
+        );
+        drop(app.handle_channel_ui(Action::Delete(target)));
+        assert!(app.channel_ui.dialog.as_ref().unwrap().failure.is_some());
+        let durable = Arc::clone(&app.durable);
+        let task = app.handle_channel_ui(Action::Dismiss);
+        assert_eq!(
+            sidebar_after_task(&app, task, None).0,
+            Some(sidebar::selection_row_focus_id(
+                sidebar::SelectionRow::Channel(target)
+            ))
+        );
+        assert_eq!(app.channel_ui.row_deletion(target), None);
+        assert_eq!(
+            app.sidebar_model.projects[0]
+                .channels
+                .iter()
+                .find(|channel| channel.id == target)
+                .unwrap()
+                .deletion,
+            None
+        );
+        assert_eq!(app.durable.as_ref(), durable.as_ref());
+        assert!(!app.channel_ui.deletion_running());
+    }
+
+    #[test]
+    fn channel_cancel_does_not_focus_a_missing_or_hidden_row_or_invent_a_dialog_target() {
+        for unavailable in [
+            "no dialog",
+            "removed",
+            "stale row",
+            "collapsed",
+            "search",
+            "compact",
+            "deleting",
+        ] {
+            let (mut app, target, selected, _) = channel_with_a_conversation();
+            app.context_inspector_open = false;
+            drop(app.select_channel(selected));
+            assert!(app.workspace.focused().is_none());
+            if unavailable != "no dialog" {
+                drop(app.handle_channel_ui(Action::Delete(target)));
+                assert!(app.channel_ui.modal_open());
+            }
+            match unavailable {
+                "removed" | "stale row" => {
+                    Arc::make_mut(&mut app.durable)
+                        .channels
+                        .retain(|channel| channel.id != target);
+                    if unavailable == "removed" {
+                        app.refresh_sidebar_channels();
+                    }
+                }
+                "collapsed" => app.sidebar_state.apply(&SidebarAction::ToggleProject(
+                    app.sidebar_model.projects[0].id,
+                )),
+                "search" => app
+                    .sidebar_state
+                    .apply(&SidebarAction::SearchChanged("Migration".into())),
+                "compact" => app.chrome_ui.projects_collapsed = true,
+                "deleting" => {
+                    app.channel_ui.deleting.insert(target);
+                    app.refresh_sidebar_channels();
+                }
+                _ => {}
+            }
+            if matches!(unavailable, "no dialog" | "stale row") {
+                assert!(
+                    app.visible_sidebar_rows()
+                        .contains(&sidebar::SelectionRow::Channel(target)),
+                    "the visible row alone must not invent a current dialog owner: {unavailable}"
+                );
+            } else {
+                assert!(
+                    !app.visible_sidebar_rows()
+                        .contains(&sidebar::SelectionRow::Channel(target)),
+                    "the fixture really withholds the row: {unavailable}"
+                );
+            }
+            let durable = Arc::clone(&app.durable);
+            let sidebar = app.sidebar_state.clone();
+            let deleting = app.channel_ui.deleting.clone();
+            let task = app.handle_channel_ui(Action::Dismiss);
+            assert_eq!(
+                super::super::tests::focused(&app, task),
+                Some(widget::Id::new(TOOLBAR_FOCUS_ID)),
+                "an unavailable opener retains the existing toolbar fallback: {unavailable}"
+            );
+            assert_eq!(app.sidebar_state, sidebar);
+            assert_eq!(app.durable.as_ref(), durable.as_ref());
+            assert_eq!(app.channel_ui.deleting, deleting);
+            assert!(!app.channel_ui.modal_open());
+        }
+    }
+
+    #[test]
+    fn channel_cancel_preserves_an_exposed_nested_modal_focus_owner() {
+        let (mut app, target, _, _) = channel_with_a_conversation();
+        drop(app.handle_channel_ui(Action::Delete(target)));
+        let project = app.sidebar_model.projects[0].id;
+        app.worktree_dialog = Some(WorktreeDialog::new(
+            project,
+            PathBuf::from("/repo"),
+            WorktreeDraft {
+                base: "main".into(),
+                destination: "/worktrees".into(),
+                ..WorktreeDraft::default()
+            },
+        ));
+        let durable = Arc::clone(&app.durable);
+        let task = app.handle_channel_ui(Action::Dismiss);
+        assert!(!app.channel_ui.modal_open());
+        assert!(app.worktree_dialog.is_some());
+        assert_eq!(
+            super::super::tests::focused_element(app.dialog().unwrap(), task),
+            Some(worktree_dialog_focus_id())
+        );
+        assert_eq!(app.durable.as_ref(), durable.as_ref());
+    }
+
+    #[test]
+    fn channel_dismiss_without_a_dialog_retains_the_focused_card_fallback() {
+        let (mut app, _, _, _) = channel_with_a_conversation();
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        app.cards.insert(card, CardRuntime::Settings);
+        app.card_state_mut(card).unwrap().kind = CardKind::Settings;
+        app.workspace.resize_viewport(1200.0);
+        let durable = Arc::clone(&app.durable);
+        let task = app.handle_channel_ui(Action::Dismiss);
+        assert_eq!(
+            super::super::tests::focused(&app, task),
+            Some(crate::settings_widgets::search_id())
+        );
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert_eq!(app.durable.as_ref(), durable.as_ref());
     }
 
     #[test]
