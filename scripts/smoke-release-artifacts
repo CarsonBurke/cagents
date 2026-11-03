@@ -47,12 +47,17 @@ artifacts=(
     "cagents-browserless_${VERSION}_amd64.deb"
     "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
     "cagents-browserless-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-    "ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+    "ceditor-${VERSION%%+*}-x86_64-unknown-linux-gnu.tar.gz"
 )
 for artifact in "${artifacts[@]}"; do
     [[ -f $DIST_DIR/$artifact && ! -L $DIST_DIR/$artifact ]] || fail "missing regular artifact: $artifact"
 done
 for artifact in "${artifacts[@]}"; do
+    # The editor bundle carries its manifest version without local build metadata.
+    case $artifact in
+        ceditor-*) artifact_version=${VERSION%%+*} ;;
+        *) artifact_version=$VERSION ;;
+    esac
     mkdir "$WORK/rootfs" "$WORK/scratch"
     cp -a --reflink=auto -- "$BASE_ROOT/." "$WORK/rootfs/"
     # Even an interrupted developer build must not provide persisted user data
@@ -66,7 +71,7 @@ for artifact in "${artifacts[@]}"; do
         --setenv XDG_CONFIG_HOME /root/config --setenv XDG_DATA_HOME /root/data \
         --setenv XDG_CACHE_HOME /root/cache --setenv XDG_STATE_HOME /root/state \
         --setenv XDG_RUNTIME_DIR /run/fixture --chdir / \
-        -- /bin/bash /smoke "$artifact" "$VERSION"
+        -- /bin/bash /smoke "$artifact" "$artifact_version"
     rm -rf -- "$WORK/rootfs" "$WORK/scratch"
     printf 'Artifact smoke passed: %s\n' "$artifact"
 done

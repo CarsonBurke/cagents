@@ -123,8 +123,15 @@ editor_version=$(jq -er '.packages[] | select(.name == "ceditor") | .version' <<
 case $SOURCE_REF in
     v[0-9]*|refs/tags/v[0-9]*)
         [[ ${SOURCE_REF#refs/tags/} == "v$VERSION" ]] || fail 'tag and manifest versions do not match'
+        [[ -z $RELEASE_BUILD_METADATA ]] || fail 'a version tag cannot carry build metadata'
         ;;
 esac
+# A local candidate's build metadata lets it install beside earlier builds of
+# the same version. The editor bundle keeps its manifest version.
+if [[ -n $RELEASE_BUILD_METADATA ]]; then
+    [[ $RELEASE_BUILD_METADATA =~ ^[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*$ ]] || fail 'invalid build metadata'
+    VERSION+="+$RELEASE_BUILD_METADATA"
+fi
 export VERSION
 DEB_ARCH=amd64
 # Use conventional build permissions; the host wrapper's cache remains private.
@@ -146,7 +153,7 @@ cargo test --locked --release --package ceditor --all-targets
 cargo test --locked --release --features integrated-browser --all-targets
 ./scripts/package-linux.sh --variant full
 ./scripts/package-linux.sh --variant browserless
-./scripts/package-ceditor-linux.sh
+VERSION=$editor_version ./scripts/package-ceditor-linux.sh
 
 metric() {
     local value
@@ -173,7 +180,8 @@ for measurement in resolved_package_ids build_seconds installed_binary_bytes por
 done
 
 jq -n --arg version "$VERSION" --arg target "$CAGENTS_RELEASE_TARGET" \
-    --arg deb_arch "$DEB_ARCH" --arg source_commit "$SOURCE_COMMIT" '{
+    --arg deb_arch "$DEB_ARCH" --arg source_commit "$SOURCE_COMMIT" \
+    --arg editor_version "$editor_version" '{
     schema_version: 1,
     repository: "CarsonBurke/cagents",
     version: $version,
@@ -192,7 +200,7 @@ jq -n --arg version "$VERSION" --arg target "$CAGENTS_RELEASE_TARGET" \
                 checksums: "SHA256SUMS-browserless"
             },
             ceditor: {
-                archive: ("ceditor-" + $version + "-" + $target + ".tar.gz"),
+                archive: ("ceditor-" + $editor_version + "-" + $target + ".tar.gz"),
                 checksums: "SHA256SUMS-ceditor"
             }
         }
@@ -244,8 +252,8 @@ for product in cagents cagents-browserless; do
     [[ $("$debian_root/usr/bin/$product" --version) == "cagents $VERSION" ]]
 done
 
-tar -xzf "/dist/ceditor-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" -C "$staging"
-editor_root="$staging/ceditor-$VERSION"
+tar -xzf "/dist/ceditor-$editor_version-$CAGENTS_RELEASE_TARGET.tar.gz" -C "$staging"
+editor_root="$staging/ceditor-$editor_version"
 desktop=io.github.cagents.ceditor
 desktop-file-validate "$editor_root/share/applications/$desktop.desktop"
 grep -Fqx 'Exec=ceditor %F' "$editor_root/share/applications/$desktop.desktop"
@@ -253,10 +261,10 @@ grep -Fqx "Icon=$desktop" "$editor_root/share/applications/$desktop.desktop"
 grep -Fqx "StartupWMClass=$desktop" "$editor_root/share/applications/$desktop.desktop"
 [[ -x $editor_root/bin/ceditor && -s $editor_root/share/icons/hicolor/scalable/apps/$desktop.svg ]]
 for binary in ceditor cagents cagentsd; do
-    check_glibc "$editor_root/lib/ceditor/releases/$VERSION/bin/$binary"
-    [[ $("$editor_root/lib/ceditor/releases/$VERSION/bin/$binary" --version) == "$binary $VERSION" ]]
+    check_glibc "$editor_root/lib/ceditor/releases/$editor_version/bin/$binary"
+    [[ $("$editor_root/lib/ceditor/releases/$editor_version/bin/$binary" --version) == "$binary $editor_version" ]]
 done
-[[ $("$editor_root/bin/ceditor" --version) == "ceditor $VERSION" ]]
+[[ $("$editor_root/bin/ceditor" --version) == "ceditor $editor_version" ]]
 editor_config="$staging/editor-config"
 settings_path=$(XDG_CONFIG_HOME="$editor_config" "$editor_root/bin/ceditor" --settings-path)
 [[ $settings_path == "$editor_config/ceditor/settings.toml" && ! -e $editor_config ]]
@@ -269,7 +277,7 @@ settings_path=$(XDG_CONFIG_HOME="$editor_config" "$editor_root/bin/ceditor" --se
         "cagents-$VERSION-artifact-comparison.txt" \
         "cagents-browserless-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" \
         "cagents-browserless_${VERSION}_${DEB_ARCH}.deb" "cagents-browserless-$VERSION-sizes.txt" \
-        "ceditor-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" \
+        "ceditor-$editor_version-$CAGENTS_RELEASE_TARGET.tar.gz" \
         SHA256SUMS-browserless SHA256SUMS-ceditor release-metadata.json install.sh > SHA256SUMS
     sha256sum --check --strict SHA256SUMS
     sha256sum --check --strict SHA256SUMS-browserless

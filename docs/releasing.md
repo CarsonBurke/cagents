@@ -37,6 +37,12 @@ then build:
 ./scripts/build-release-linux --ref v0.1.2 --output /var/tmp/cagents-v0.1.2
 ```
 
+To qualify a local candidate from a commit or branch, add
+`--build-metadata local.<short sha>`. The `cagents` artifacts are then versioned
+`<version>+local.<short sha>`, so `install.sh` can stage them beside earlier
+builds of the same version; the editor bundle keeps its manifest version. A
+version tag refuses build metadata.
+
 Run `./scripts/build-release-linux --help` for the cache location and other
 details. `CARGO_BUILD_JOBS` defaults to 2 inside the builder. Download and build
 temporary files stay in its private disk cache rather than a RAM-backed `/tmp`.

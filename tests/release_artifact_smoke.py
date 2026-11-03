@@ -133,6 +133,25 @@ class SmokeBoundary(unittest.TestCase):
             self.assertEqual(arguments[-4:], ["/bin/bash", "/smoke", artifact, VERSION])
         self.assert_clean()
 
+    def test_local_build_metadata_versions_every_artifact_except_the_editor(self):
+        local = f"{VERSION}+local.0123abcd"
+        for artifact in ARTIFACTS:
+            (self.dist / artifact).unlink()
+        expected = [
+            (artifact.replace(VERSION, local), local) if not artifact.startswith("ceditor-")
+            else (artifact, VERSION)
+            for artifact in ARTIFACTS
+        ]
+        for artifact, _ in expected:
+            (self.dist / artifact).write_text("boundary fixture only\n")
+        result = self.invoke(arguments=["--dist", str(self.dist), "--version", local, "--rootfs", str(self.base)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [tuple(arguments[-2:]) for arguments in self.recorded()],
+            expected,
+        )
+        self.assert_clean()
+
     def test_failed_artifact_stops_the_sequence_and_cleans_only_disposable_state(self):
         result = self.invoke(SMOKE_CONTRACT_FAIL_AT="2")
         self.assertNotEqual(result.returncode, 0)

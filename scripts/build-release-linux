@@ -6,6 +6,7 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CACHE=${CAGENTS_RELEASE_CACHE:-"$HOME/.cache/cagents-release/ubuntu-22.04-amd64"}
 OUTPUT=${CAGENTS_DIST_DIR:-"$ROOT_DIR/dist"}
 REF=
+BUILD_METADATA=
 BASE_URL=https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-amd64.tar.gz
 BASE_SHA256=242cd8898b33ea806ef5f13b1076ed7c76f9f989d18384452f7166692438ff1a
 CACHE_ID="cagents-local-release-v1 ubuntu-22.04.5 amd64 rust-1.93.0 zig-0.15.2 $BASE_SHA256"
@@ -17,17 +18,23 @@ fail() {
 
 while (($#)); do
     case $1 in
-        --ref|--output)
+        --ref|--output|--build-metadata)
             (($# >= 2)) && [[ -n $2 ]] || fail "$1 requires a value"
-            case $1 in --ref) REF=$2 ;; --output) OUTPUT=$2 ;; esac
+            case $1 in
+                --ref) REF=$2 ;;
+                --output) OUTPUT=$2 ;;
+                --build-metadata) BUILD_METADATA=$2 ;;
+            esac
             shift 2
             ;;
         --help)
             printf '%s\n' \
-                'Usage: scripts/build-release-linux [--ref REF] [--output DIR]' \
+                'Usage: scripts/build-release-linux [--ref REF] [--output DIR] [--build-metadata META]' \
                 'Build and verify Linux releases locally in rootless Ubuntu 22.04.' \
                 'REF defaults to v<Cargo.toml version>; only committed source is exported.' \
                 'DIR defaults to CAGENTS_DIST_DIR or dist and must be empty.' \
+                'META versions a local candidate as <version>+META (for example local.<short sha>)' \
+                'so it installs beside earlier builds; it is refused for a version tag.' \
                 'Requires Linux x86_64, unprivileged user namespaces, bubblewrap, Bash,' \
                 'Git, curl, GNU tar/coreutils, flock, network access, and ample disk space.' \
                 'CAGENTS_RELEASE_CACHE selects a private, marked cache (default:' \
@@ -71,8 +78,12 @@ done
 case $REF in
     v[0-9]*|refs/tags/v[0-9]*)
         [[ ${REF#refs/tags/} == "v$version" ]] || fail 'source tag and manifest versions do not match'
+        [[ -z $BUILD_METADATA ]] || fail 'a version tag builds the release itself; omit --build-metadata'
         ;;
 esac
+# SemVer build metadata: dot-separated, nonempty ASCII alphanumeric or hyphen identifiers.
+[[ -z $BUILD_METADATA || $BUILD_METADATA =~ ^[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*$ ]] \
+    || fail "invalid build metadata: $BUILD_METADATA"
 for file in scripts/package-linux.sh scripts/package-ceditor-linux.sh install.sh; do
     git -C "$ROOT_DIR" cat-file -e "$SOURCE_COMMIT:$file" || fail "missing source file: $file"
 done
@@ -185,13 +196,14 @@ bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
     --setenv CARGO_BUILD_JOBS "$JOBS" --setenv CAGENTS_DIST_DIR /dist \
     --setenv CAGENTS_RELEASE_TARGET x86_64-unknown-linux-gnu \
     --setenv SOURCE_COMMIT "$SOURCE_COMMIT" --setenv SOURCE_REF "$REF" \
+    --setenv RELEASE_BUILD_METADATA "$BUILD_METADATA" \
     --setenv SOURCE_DATE_EPOCH "$SOURCE_DATE_EPOCH" \
     --setenv CC /usr/bin/clang --setenv CXX /usr/bin/clang++ --setenv LIBCLANG_PATH /usr/lib/llvm-14/lib \
     --chdir /source -- /bin/bash /release-build
 # Runtime image preparation can use the network; artifact execution below has
 # separate networkless namespaces and never mounts the host's home or credentials.
 SMOKE_ROOTFS=$("$ROOT_DIR/scripts/prepare-release-smoke-rootfs")
-VERSION=$(git -C "$ROOT_DIR" show "$SOURCE_COMMIT:Cargo.toml" | sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}')
+VERSION=$version${BUILD_METADATA:+"+$BUILD_METADATA"}
 "$ROOT_DIR/scripts/smoke-release-artifacts" --dist "$WORK/dist" --version "$VERSION" --rootfs "$SMOKE_ROOTFS"
 # Build or smoke failures leave public output empty. Only verified assets cross out.
 cp -- "$WORK/dist/"* "$OUTPUT/"
