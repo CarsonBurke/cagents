@@ -632,7 +632,8 @@ def install(base):
                 held.append(os.dup(self.package.fd))
                 # Fixed existing offline provider, never a host account/provider.
                 provider = self.host.repo / "tests/fixtures/chat-composer-claude.sh"
-                held.append(os.open(provider, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC))
+                # Check special-file metadata without waiting for a FIFO writer.
+                held.append(os.open(provider, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC))
                 before = os.fstat(held[-1])
                 if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
                         or stat.S_IMODE(before.st_mode) != 0o755 or before.st_size != 12225):

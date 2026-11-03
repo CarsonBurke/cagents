@@ -209,6 +209,96 @@ class TinyPackage(MockOnly):
             self.assertEqual(target_calls, [mock.call(target)])
 
 
+class PrivateProviderInput(MockOnly):
+    def provider_fixture(self, root):
+        fixtures = object.__new__(prebuilt.install(broker))
+        package_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        self.addCleanup(os.close, package_fd)
+        fixtures.package = SimpleNamespace(fd=package_fd, verify=mock.Mock())
+        fixtures.host = SimpleNamespace(repo=root, runtime_dir=root)
+        fixture = SimpleNamespace(layout=SimpleNamespace(root_parts=("private",), runtime_name="runtime"))
+        return fixtures, fixture
+
+    def test_fifo_provider_refuses_before_blocking_and_closes_partial_binds(self):
+        with tempfile.TemporaryDirectory(prefix="prebuilt-provider-fifo-", dir="/tmp") as temporary:
+            root = Path(temporary)
+            provider = root / "tests/fixtures/chat-composer-claude.sh"
+            provider.parent.mkdir(parents=True)
+            os.mkfifo(provider, 0o600)
+            fixtures, fixture = self.provider_fixture(root)
+            original_open, original_dup = os.open, os.dup
+            acquired = []
+
+            def duplicate(fd):
+                result = original_dup(fd)
+                acquired.append(result)
+                return result
+
+            def opened(path, flags, **kwargs):
+                self.assertEqual(path, provider)
+                # Fail before a blocking syscall on a regressed implementation;
+                # the passing path really opens the private FIFO without a writer.
+                self.assertTrue(flags & os.O_NONBLOCK, "special input must be opened nonblocking before metadata")
+                result = original_open(path, flags, **kwargs)
+                acquired.append(result)
+                return result
+
+            with mock.patch.object(prebuilt.os, "dup", side_effect=duplicate), \
+                    mock.patch.object(prebuilt.os, "open", side_effect=opened), \
+                    mock.patch.object(broker, "hold_directory") as directory, \
+                    mock.patch.object(broker, "hold_socket") as endpoint:
+                with self.assertRaisesRegex(broker.Refusal, "fixed offline provider input refused"):
+                    fixtures.hold_fixture_binds(fixture, "unused")
+                directory.assert_not_called()
+                endpoint.assert_not_called()
+            self.assertEqual(len(acquired), 2)
+            for fd in acquired:
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+            os.fstat(fixtures.package.fd)  # Original package owner remains open.
+            fixtures.package.verify.assert_called_once_with()
+
+    def test_regular_provider_digest_and_partial_bind_custody_are_preserved(self):
+        content = (REPOSITORY / "tests/fixtures/chat-composer-claude.sh").read_bytes()
+        self.assertEqual(len(content), 12225)
+        self.assertEqual(hashlib.sha256(content).hexdigest(), prebuilt.PROVIDER_SHA256)
+        for valid in (False, True):
+            with self.subTest(valid=valid), tempfile.TemporaryDirectory(prefix="prebuilt-provider-file-", dir="/tmp") as temporary:
+                root = Path(temporary)
+                provider = root / "tests/fixtures/chat-composer-claude.sh"
+                provider.parent.mkdir(parents=True)
+                provider.write_bytes(content if valid else b"X" * len(content))
+                provider.chmod(0o755)
+                fixtures, fixture = self.provider_fixture(root)
+                original_open, original_dup = os.open, os.dup
+                acquired = []
+
+                def duplicate(fd):
+                    result = original_dup(fd)
+                    acquired.append(result)
+                    return result
+
+                def opened(path, flags, **kwargs):
+                    result = original_open(path, flags, **kwargs)
+                    acquired.append(result)
+                    return result
+
+                with mock.patch.object(prebuilt.os, "dup", side_effect=duplicate), \
+                        mock.patch.object(prebuilt.os, "open", side_effect=opened), \
+                        mock.patch.object(broker, "hold_directory", side_effect=OSError("next bind boundary")) as directory, \
+                        mock.patch.object(broker, "hold_socket") as endpoint:
+                    error, message = (OSError, "next bind boundary") if valid else (broker.Refusal, "digest or identity changed")
+                    with self.assertRaisesRegex(error, message):
+                        fixtures.hold_fixture_binds(fixture, "unused")
+                    self.assertEqual(directory.call_count, int(valid))
+                    endpoint.assert_not_called()
+                self.assertEqual(len(acquired), 2)
+                for fd in acquired:
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
+                os.fstat(fixtures.package.fd)
+
+
 class FakePath:
     def __init__(self, value, metadata=None):
         self.value = str(value)
