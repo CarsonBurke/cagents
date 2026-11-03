@@ -3323,4 +3323,259 @@ mod renderer_startup_protocol_tests {
         assert_eq!(cause.kind(), io::ErrorKind::TimedOut);
         assert_eq!(cause.to_string(), "fixture original recovery failure");
     }
+
+    const REPORT_CHILD: &str = "CAGENTS_TEST_RENDERER_REPORT_CHILD";
+    const REPORT_CASE: &str = "CAGENTS_TEST_RENDERER_REPORT_CASE";
+    const REPORT_DIRECTORY: &str = "CAGENTS_TEST_RENDERER_REPORT_DIRECTORY";
+
+    // A fresh exact-test process owns the real production latch. Redirect
+    // after libtest's opening banner and exit before its closing footer, so
+    // every captured byte belongs to the reporting functions, without filters.
+    fn report_child_if_selected(test: &str) {
+        let Some(selected) = env::var_os(REPORT_CHILD) else {
+            return;
+        };
+        assert_eq!(selected, test);
+        let directory = PathBuf::from(env::var_os(REPORT_DIRECTORY).unwrap());
+        let output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("protocol"))
+            .unwrap();
+        io::stdout().flush().unwrap();
+        // SAFETY: this fresh child owns the file and its stdout descriptor.
+        assert_ne!(
+            unsafe { libc::dup2(output.as_raw_fd(), libc::STDOUT_FILENO) },
+            -1
+        );
+        let failed: Result<(), String> = Err("fixture startup failed\nsecond line".into());
+        match env::var(REPORT_CASE).unwrap().as_str() {
+            "renderer-first" => {
+                report_ui_renderer_before_state("fixture renderer failed").unwrap();
+                report_ui_startup(&Ok(())).unwrap();
+                report_ui_startup(&failed).unwrap();
+                report_ui_renderer_before_state("a second renderer failure").unwrap();
+            }
+            "ready-first" => {
+                report_ui_startup(&Ok(())).unwrap();
+                report_ui_renderer_before_state("fixture renderer failed").unwrap();
+                report_ui_startup(&failed).unwrap();
+            }
+            "error-first" => {
+                report_ui_startup(&failed).unwrap();
+                report_ui_renderer_before_state("fixture renderer failed").unwrap();
+                report_ui_startup(&Ok(())).unwrap();
+            }
+            "renderer-error" => {
+                report_ui_renderer_before_state("fixture renderer failed").unwrap();
+                report_ui_startup(&failed).unwrap();
+                report_ui_startup(&Ok(())).unwrap();
+            }
+            other => panic!("unknown reporting fixture case: {other}"),
+        }
+        // Do not flush stdout here: the parent must observe the production
+        // writes while this original child still awaits its explicit release.
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("reported"))
+            .unwrap()
+            .write_all(b"reported")
+            .unwrap();
+        let mut release = [0];
+        io::stdin().read_exact(&mut release).unwrap();
+        assert_eq!(release, [1]);
+        process::exit(0);
+    }
+
+    struct OriginalReportChild {
+        child: process::Child,
+        release: Option<process::ChildStdin>,
+        deadline: std::time::Instant,
+    }
+
+    impl OriginalReportChild {
+        fn wait(&mut self) -> process::ExitStatus {
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    return status;
+                }
+                assert!(
+                    std::time::Instant::now() < self.deadline,
+                    "original reporting child exceeded its deadline"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl Drop for OriginalReportChild {
+        fn drop(&mut self) {
+            // Closing owned stdin releases a child even when an oracle panics.
+            self.release.take();
+            self.child.stdin.take();
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => return,
+                    Ok(None) => {}
+                }
+                if std::time::Instant::now() >= self.deadline {
+                    // Only this unreaped original child can be signalled.
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReportMode {
+        Update,
+        LegacyUpdate,
+        Ordinary,
+        NoHandshake,
+        ModeOnly,
+    }
+
+    fn bounded_report_file(path: &Path) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        File::open(path)
+            .unwrap()
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert!(
+            bytes.len() <= 4096,
+            "report fixture output exceeded its bound"
+        );
+        bytes
+    }
+
+    fn assert_report_while_original_child_is_held(
+        test: &str,
+        case: &str,
+        mode: ReportMode,
+        expected: &[u8],
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let stderr = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.path().join("stderr"))
+            .unwrap();
+        let mut command = process::Command::new(env::current_exe().unwrap());
+        command
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(REPORT_CHILD, test)
+            .env(REPORT_CASE, case)
+            .env(REPORT_DIRECTORY, directory.path())
+            .stdin(process::Stdio::piped())
+            .stdout(process::Stdio::null())
+            .stderr(stderr);
+        // No caller, authority, HOME or other inherited context is changed.
+        match mode {
+            ReportMode::Update => configure_ui_launch_handshake(&mut command, true),
+            ReportMode::Ordinary => configure_ui_launch_handshake(&mut command, false),
+            ReportMode::LegacyUpdate => {
+                command
+                    .env(UI_LAUNCH_HANDSHAKE_ENV, "update-retry-v1")
+                    .env_remove(UI_LAUNCH_UPDATE_MODE_ENV);
+            }
+            ReportMode::NoHandshake | ReportMode::ModeOnly => {
+                command.env_remove(UI_LAUNCH_HANDSHAKE_ENV);
+                if matches!(mode, ReportMode::ModeOnly) {
+                    command.env(UI_LAUNCH_UPDATE_MODE_ENV, "update-retry-v1");
+                } else {
+                    command.env_remove(UI_LAUNCH_UPDATE_MODE_ENV);
+                }
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut original = OriginalReportChild {
+            child: command.spawn().unwrap(),
+            release: None,
+            deadline,
+        };
+        original.release = Some(original.child.stdin.take().unwrap());
+        while !directory.path().join("reported").try_exists().unwrap() {
+            assert!(
+                original.child.try_wait().unwrap().is_none(),
+                "reporting child exited before its hold: {}",
+                String::from_utf8_lossy(&bounded_report_file(&directory.path().join("stderr")))
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reporting child did not reach its hold"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let protocol = directory.path().join("protocol");
+        let reported = bounded_report_file(&protocol);
+        assert!(original.child.try_wait().unwrap().is_none());
+        assert_eq!(
+            reported, expected,
+            "all producer calls completed before release"
+        );
+        original.release.take().unwrap().write_all(&[1]).unwrap();
+        let status = original.wait();
+        assert!(
+            status.success(),
+            "reporting child failed: {status}: {}",
+            String::from_utf8_lossy(&bounded_report_file(&directory.path().join("stderr")))
+        );
+        assert!(bounded_report_file(&directory.path().join("stderr")).is_empty());
+        assert_eq!(bounded_report_file(&protocol), reported);
+    }
+
+    #[test]
+    fn renderer_before_state_claims_the_shared_terminal_report_once_and_flushes() {
+        const TEST: &str = "instance::renderer_startup_protocol_tests::renderer_before_state_claims_the_shared_terminal_report_once_and_flushes";
+        report_child_if_selected(TEST);
+        let expected = b"renderer-before-state-v1: {\"version\":1,\"kind\":\"graphics_initialization\",\"detail\":\"fixture renderer failed\"}\n";
+        for mode in [ReportMode::Update, ReportMode::LegacyUpdate] {
+            assert_report_while_original_child_is_held(TEST, "renderer-first", mode, expected);
+        }
+    }
+
+    #[test]
+    fn ready_or_error_claims_the_report_before_a_later_renderer_failure() {
+        const TEST: &str = "instance::renderer_startup_protocol_tests::ready_or_error_claims_the_report_before_a_later_renderer_failure";
+        report_child_if_selected(TEST);
+        for (case, expected) in [
+            ("ready-first", b"ready\n".as_slice()),
+            (
+                "error-first",
+                b"error: fixture startup failed second line\n".as_slice(),
+            ),
+        ] {
+            assert_report_while_original_child_is_held(TEST, case, ReportMode::Update, expected);
+        }
+    }
+
+    #[test]
+    fn ordinary_and_absent_handshakes_cannot_publish_renderer_retry_records() {
+        const TEST: &str = "instance::renderer_startup_protocol_tests::ordinary_and_absent_handshakes_cannot_publish_renderer_retry_records";
+        report_child_if_selected(TEST);
+        for (case, mode, expected) in [
+            (
+                "renderer-first",
+                ReportMode::Ordinary,
+                b"ready\n".as_slice(),
+            ),
+            (
+                "renderer-error",
+                ReportMode::Ordinary,
+                b"error: fixture startup failed second line\n".as_slice(),
+            ),
+            ("renderer-first", ReportMode::NoHandshake, b"".as_slice()),
+            ("renderer-error", ReportMode::ModeOnly, b"".as_slice()),
+        ] {
+            assert_report_while_original_child_is_held(TEST, case, mode, expected);
+        }
+    }
 }
