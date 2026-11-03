@@ -28904,7 +28904,11 @@ mod agent_presentation_tests {
                         "CLAUDE_CONFIG_DIR".into(),
                         "/synthetic/replacement-account".into(),
                     );
-                    agent.spec.account = Some(AccountId::new());
+                    agent.spec.account = Some(
+                        "claude/00000000-0000-4000-8000-000000000001"
+                            .parse::<AccountId>()
+                            .unwrap(),
+                    );
                 }
                 "proof" => {
                     native.proof.as_mut().unwrap().host_incarnation =
@@ -28964,7 +28968,7 @@ mod agent_presentation_tests {
             let durable = Arc::make_mut(&mut app.durable);
             durable.workspace_model_identity = Some(identity);
             durable.active_channel = Some(channel);
-            durable.channels.push(ProjectChannel {
+            durable.channels.push(crate::model::ProjectChannel {
                 id: channel,
                 project_id: project,
                 title: "Console fixture".into(),
