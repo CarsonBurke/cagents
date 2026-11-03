@@ -24,10 +24,14 @@ use std::{
 };
 
 mod daemon_admission;
+mod ui_launch_handshake;
 pub(crate) use daemon_admission::{
     DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, has_inherited_daemon_fence,
     inherit_daemon_fence,
 };
+pub(crate) use ui_launch_handshake::configure_ui_launch_handshake;
+use ui_launch_handshake::current_ui_launch_handshake_mode;
+pub use ui_launch_handshake::{UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_UPDATE_MODE_ENV};
 
 use directories::ProjectDirs;
 use thiserror::Error;
@@ -62,9 +66,6 @@ compile_error!(
 const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents-browserless";
 #[cfg(not(feature = "full"))]
 const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents";
-pub const UI_LAUNCH_HANDSHAKE_ENV: &str = "CAGENTS_UI_LAUNCH_HANDSHAKE";
-/// Private matched CLI/UI startup ABI; ordinary launches keep value "1".
-pub(crate) const UI_LAUNCH_UPDATE_HANDSHAKE: &str = "update-retry-v1";
 pub(crate) const UI_PRESTATE_RENDERER_PREFIX: &str = "renderer-before-state-v1: ";
 static UI_STARTUP_REPORTED: AtomicBool = AtomicBool::new(false);
 
@@ -365,20 +366,12 @@ impl WindowLease {
     }
 }
 
-fn ui_launch_handshake_mode(value: Option<&std::ffi::OsStr>) -> Option<bool> {
-    match value {
-        Some(value) if value == "1" => Some(false),
-        Some(value) if value == UI_LAUNCH_UPDATE_HANDSHAKE => Some(true),
-        _ => None,
-    }
-}
-
 pub fn ui_launch_handshake_requested() -> bool {
-    ui_launch_handshake_mode(env::var_os(UI_LAUNCH_HANDSHAKE_ENV).as_deref()).is_some()
+    current_ui_launch_handshake_mode().is_some()
 }
 
 pub fn ui_launch_update_handshake_requested() -> bool {
-    ui_launch_handshake_mode(env::var_os(UI_LAUNCH_HANDSHAKE_ENV).as_deref()) == Some(true)
+    current_ui_launch_handshake_mode() == Some(true)
 }
 
 /// Only the guarded deferred window's actual before-state graphics failure
@@ -3280,9 +3273,13 @@ mod renderer_startup_protocol_tests {
 
     #[test]
     fn updater_mode_is_fixed_and_ordinary_mode_remains_distinct() {
-        assert_eq!(ui_launch_handshake_mode(Some("1".as_ref())), Some(false));
+        use ui_launch_handshake::ui_launch_handshake_mode;
         assert_eq!(
-            ui_launch_handshake_mode(Some(UI_LAUNCH_UPDATE_HANDSHAKE.as_ref())),
+            ui_launch_handshake_mode(Some("1".as_ref()), None),
+            Some(false)
+        );
+        assert_eq!(
+            ui_launch_handshake_mode(Some("update-retry-v1".as_ref()), None),
             Some(true)
         );
         for value in [
@@ -3291,7 +3288,7 @@ mod renderer_startup_protocol_tests {
             Some("update".as_ref()),
             Some("2".as_ref()),
         ] {
-            assert_eq!(ui_launch_handshake_mode(value), None);
+            assert_eq!(ui_launch_handshake_mode(value, None), None);
         }
     }
 

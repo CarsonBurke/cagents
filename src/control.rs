@@ -53,8 +53,8 @@ pub(crate) mod invocation;
 use crate::{
     agent_execution::Authority,
     instance::{
-        self, UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_READY,
-        UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX, UI_LAUNCH_RECOVERY_PROGRESS_PREFIX,
+        self, UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_READY, UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX,
+        UI_LAUNCH_RECOVERY_PROGRESS_PREFIX,
     },
     model::{
         ChannelId, HostSessionProof, LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession,
@@ -2854,8 +2854,8 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
         crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?
             + UI_LAUNCH_HANDSHAKE_TIMEOUT
     };
+    instance::configure_ui_launch_handshake(command, false);
     command
-        .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
         .env(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2874,8 +2874,8 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
     finish_ui_launch(child, result, stdout)
 }
 
-/// Update-only launch. The matched UI recognizes this fixed private ABI; an
-/// ordinary launch still uses spawn_ui_process and handshake value "1".
+/// Update-only launch. Older UIs retain their final ready/error handshake;
+/// newer UIs also recognize the separate fixed renderer-retry capability.
 pub(crate) fn spawn_updated_ui_process(command: &mut Command) -> io::Result<()> {
     let timeout = if crate::device::is_remote() {
         UI_LAUNCH_HANDSHAKE_TIMEOUT
@@ -2898,11 +2898,8 @@ fn spawn_updated_ui_with_timeout(
     mut observe: impl FnMut(UpdateLaunchEvent),
 ) -> io::Result<()> {
     crate::install_guard::sanitize_child_environment(command);
+    instance::configure_ui_launch_handshake(command, true);
     command
-        .env(
-            UI_LAUNCH_HANDSHAKE_ENV,
-            instance::UI_LAUNCH_UPDATE_HANDSHAKE,
-        )
         .env(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -7930,6 +7927,41 @@ mod ui_renderer_retry_tests {
     }
 
     #[test]
+    fn an_update_can_reopen_a_ui_that_accepts_only_the_legacy_handshake() {
+        let root = tempfile::tempdir().unwrap();
+        let body = r#"
+            test "$CAGENTS_UI_LAUNCH_HANDSHAKE" = 1 || exit 97
+            printf 'ready\n'
+        "#;
+        let mut command = fixture_command(root.path(), body);
+        let mut events = Vec::new();
+        spawn_updated_ui_with_timeout(&mut command, Duration::from_secs(5), |event| {
+            events.push(event)
+        })
+        .unwrap();
+        assert_eq!(events, [UpdateLaunchEvent::Spawned(0)]);
+    }
+
+    #[test]
+    fn a_legacy_ui_error_or_missing_ack_never_earns_an_update_retry() {
+        for body in [
+            "test \"$CAGENTS_UI_LAUNCH_HANDSHAKE\" = 1 || exit 97; printf 'error: fixture older UI failure\\n'; exit 1",
+            "test \"$CAGENTS_UI_LAUNCH_HANDSHAKE\" = 1 || exit 97; exit 1",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = fixture_command(root.path(), body);
+            let mut events = Vec::new();
+            assert!(
+                spawn_updated_ui_with_timeout(&mut command, Duration::from_secs(5), |event| {
+                    events.push(event)
+                })
+                .is_err()
+            );
+            assert_eq!(events, [UpdateLaunchEvent::Spawned(0)]);
+        }
+    }
+
+    #[test]
     fn typed_renderer_failure_waits_for_original_exit_before_second_spawn() {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -7943,7 +7975,8 @@ mod ui_renderer_retry_tests {
             .open(&fifo)
             .unwrap();
         let body = r#"
-            test "$CAGENTS_UI_LAUNCH_HANDSHAKE" = update-retry-v1 || exit 97
+            test "$CAGENTS_UI_LAUNCH_HANDSHAKE" = 1 || exit 97
+            test "$CAGENTS_UI_LAUNCH_UPDATE_MODE" = update-retry-v1 || exit 97
             if test ! -f "$1/count"; then
                 printf 1 > "$1/count"
                 printf '%s\n' "$2"

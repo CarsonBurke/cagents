@@ -221,6 +221,7 @@ fn render_with_helper(
         // handshake set. Inheriting it would let the helper put a readiness
         // line on the stdout the frame is read from.
         .env_remove(crate::instance::UI_LAUNCH_HANDSHAKE_ENV)
+        .env_remove(crate::instance::UI_LAUNCH_UPDATE_MODE_ENV)
         .env_remove(crate::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV);
     // SAFETY: the hook performs only the close_range syscall before exec.
     unsafe {

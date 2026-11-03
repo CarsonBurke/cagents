@@ -359,6 +359,7 @@ fn reopen_command(executable: &std::path::Path, request: &Request) -> Command {
     command
         .args(request.arguments())
         .env_remove(instance::UI_LAUNCH_HANDSHAKE_ENV)
+        .env_remove(instance::UI_LAUNCH_UPDATE_MODE_ENV)
         .env_remove(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
