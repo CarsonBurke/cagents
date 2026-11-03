@@ -16438,13 +16438,39 @@ pub(crate) mod tests {
                 .expect("the compact row's menu paints at its anchor");
             let selected = (*top..=*bottom).step_by(4).find_map(|y| {
                 let mut candidate = Sidebar::compact_row(channel, merged_worktree);
-                candidate.click(mouse::Button::Right, row);
-                candidate.feed(
-                    &[Event::Window(cosmic::iced::window::Event::RedrawRequested(
-                        std::time::Instant::now(),
-                    ))],
-                    row,
+                assert!(candidate.click(mouse::Button::Right, row).is_empty());
+                let redraw = Event::Window(cosmic::iced::window::Event::RedrawRequested(
+                    std::time::Instant::now(),
+                ));
+                assert!(
+                    candidate
+                        .feed(std::slice::from_ref(&redraw), row)
+                        .is_empty()
                 );
+                if merged_worktree {
+                    // Six editor commands put Delete below this window's
+                    // initial menu slice. Scroll the real overlay to its end.
+                    let inside = Point::new(row.x + 30.0, (*top + *bottom) as f32 / 2.0);
+                    let amount = -candidate.bounds.height;
+                    assert!(
+                        candidate
+                            .feed(
+                                &[
+                                    Event::Mouse(mouse::Event::CursorMoved { position: inside }),
+                                    Event::Mouse(mouse::Event::WheelScrolled {
+                                        delta: mouse::ScrollDelta::Pixels { x: 0.0, y: amount },
+                                    }),
+                                ],
+                                inside,
+                            )
+                            .is_empty()
+                    );
+                    assert!(
+                        candidate
+                            .feed(std::slice::from_ref(&redraw), inside)
+                            .is_empty()
+                    );
+                }
                 let at = Point::new(row.x + 30.0, y as f32);
                 candidate.move_to(at);
                 let actions = candidate.click(mouse::Button::Left, at);
