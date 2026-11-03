@@ -1953,6 +1953,194 @@ mod tests {
     }
 
     #[test]
+    fn six_optional_image_mentions_preserve_array_history_and_reencoding() {
+        crate::chat::attachment_assets::with_test_image(|first| {
+            let mut images = vec![first];
+            images.extend(
+                (2..=6).map(|i| {
+                    crate::chat::attachment_assets::test_image(&format!("optional-{i}.png"))
+                }),
+            );
+            let references = images
+                .iter()
+                .map(|image| image.reference.clone().unwrap())
+                .collect::<Vec<_>>();
+            let bytes = images
+                .iter()
+                .map(|image| std::fs::read(&image.path).unwrap())
+                .collect::<Vec<_>>();
+            let pixels = bytes
+                .iter()
+                .map(|bytes| image::load_from_memory(bytes).unwrap().to_rgba8())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                references.iter().map(|r| r.number).collect::<Vec<_>>(),
+                [1, 2, 3, 4, 5, 6]
+            );
+            for i in 0..6 {
+                for j in i + 1..6 {
+                    assert_ne!(pixels[i], pixels[j], "fixtures must have distinct pixels");
+                }
+            }
+            let cases = [
+                (
+                    format!(
+                        "Compare {} {} {} {} {}; keep the other image too.",
+                        references[0].token(),
+                        references[2].token(),
+                        references[3].token(),
+                        references[4].token(),
+                        references[5].token()
+                    ),
+                    vec![0, 2, 3, 4, 5, 1],
+                ),
+                (
+                    "Compare all six attached images. Earlier [Image 77777] is ordinary prose."
+                        .into(),
+                    vec![0, 1, 2, 3, 4, 5],
+                ),
+                (
+                    format!(
+                        "Compare {} then {}, again {}, then {}.",
+                        references[5].token(),
+                        references[2].token(),
+                        references[5].token(),
+                        references[0].token()
+                    ),
+                    vec![5, 2, 0, 1, 3, 4],
+                ),
+            ];
+            for (text, order) in cases {
+                let mut sender = Omp {
+                    ready: true,
+                    ..Default::default()
+                };
+                let submitted = sender
+                    .command(Command::Prompt {
+                        text: text.clone(),
+                        attachments: images.clone(),
+                        mode: PromptMode::Queue,
+                    })
+                    .unwrap();
+                assert_eq!(submitted.writes.len(), 1);
+                let request = &submitted.writes[0];
+                assert_eq!(request["type"], "follow_up");
+                let mapping = order
+                    .iter()
+                    .map(|&index| Some(references[index].clone()))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    request["message"],
+                    format!(
+                        "{text}{}",
+                        super::super::image_references::image_list(&mapping).unwrap()
+                    )
+                );
+                let payloads = request["images"].as_array().unwrap();
+                assert_eq!(payloads.len(), 6);
+                for (position, &index) in order.iter().enumerate() {
+                    assert_eq!(payloads[position]["type"], "image");
+                    assert_eq!(payloads[position]["mimeType"], "image/png");
+                    assert_eq!(
+                        STANDARD
+                            .decode(payloads[position]["data"].as_str().unwrap())
+                            .unwrap(),
+                        bytes[index]
+                    );
+                }
+
+                let mut content = vec![json!({"type":"text", "text":request["message"]})];
+                content.extend(payloads.iter().cloned());
+                let mut reader = Omp::default();
+                let items = reader
+                    .message_items(&json!({"role":"user", "id":"six-images", "content":content}));
+                assert_eq!(items.len(), 7);
+                assert!(
+                    matches!(&items[0].content, ItemContent::Text { text: body, .. } if body == &text)
+                );
+                let mut restored = Vec::new();
+                for (position, &index) in order.iter().enumerate() {
+                    let ItemContent::Image {
+                        reference: Some(reference),
+                        path,
+                        description,
+                    } = &items[position + 1].content
+                    else {
+                        panic!("verified image history must retain its UUID");
+                    };
+                    assert_eq!(reference, &references[index]);
+                    assert_eq!(description, &references[index].label());
+                    assert!(path.starts_with("data:image/png;base64,"));
+                    assert!(
+                        items[position + 1]
+                            .id
+                            .ends_with(&format!(":{}", position + 1))
+                    );
+                    restored.push(chat::Attachment {
+                        path: path.as_str().into(),
+                        reference: Some(reference.clone()),
+                    });
+                }
+                let mut retry = Omp {
+                    ready: true,
+                    ..Default::default()
+                };
+                let resent = retry
+                    .command(Command::Prompt {
+                        text: text.clone(),
+                        attachments: restored,
+                        mode: PromptMode::Queue,
+                    })
+                    .unwrap();
+                assert_eq!(resent.writes[0]["type"], "follow_up");
+                assert_eq!(resent.writes[0]["message"], request["message"]);
+                assert_eq!(resent.writes[0]["images"], request["images"]);
+            }
+        });
+    }
+
+    #[test]
+    fn unavailable_image_uuid_with_an_existing_path_refuses_without_a_prompt_write() {
+        crate::chat::attachment_assets::with_test_image(|mut image| {
+            let mut adapter = Omp {
+                ready: true,
+                ..Default::default()
+            };
+            let existing = adapter
+                .command(Command::Prompt {
+                    text: "Already queued".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Queue,
+                })
+                .unwrap();
+            assert_eq!(existing.writes.len(), 1);
+            assert_eq!(existing.writes[0]["type"], "follow_up");
+            let requests = adapter.requests.clone();
+            assert!(image.path.is_file());
+            let missing_id = uuid::Uuid::new_v4();
+            assert!(
+                crate::chat::attachment_assets::list()
+                    .unwrap()
+                    .images
+                    .iter()
+                    .all(|stored| stored.id != missing_id)
+            );
+            image.reference.as_mut().unwrap().id = missing_id;
+            let error = adapter
+                .command(Command::Prompt {
+                    text: "Compare the attached image without an inline label.".into(),
+                    attachments: vec![image],
+                    mode: PromptMode::Queue,
+                })
+                .unwrap_err();
+            assert!(error.contains("is unavailable"), "{error}");
+            assert_eq!(adapter.requests, requests);
+            assert!(adapter.execution.is_none());
+            assert!(!adapter.busy);
+        });
+    }
+
+    #[test]
     fn referenced_image_array_mapping_restores_only_verified_retained_history() {
         crate::chat::attachment_assets::with_test_image(|first| {
             let second = crate::chat::attachment_assets::test_image("second.png");

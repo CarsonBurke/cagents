@@ -18082,6 +18082,65 @@ mod tests {
     }
 
     #[test]
+    fn reopened_composer_keeps_unmentioned_images_in_every_prompt_mode() {
+        chat::attachment_assets::with_test_image(|first| {
+            let mut attachments = vec![first];
+            attachments.extend((1..6).map(|index| {
+                chat::attachment_assets::test_image(&format!("composer-{index}.png"))
+            }));
+            let tokens = attachments
+                .iter()
+                .map(|attachment| attachment.reference.as_ref().unwrap().token())
+                .collect::<Vec<_>>();
+            let text = format!(
+                "Compare {} {} {} {} {}",
+                tokens[0], tokens[1], tokens[2], tokens[4], tokens[5]
+            );
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            let session = {
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.replace_draft(text_editor::Content::with_text(&text));
+                runtime.replace_attachments(attachments.clone());
+                runtime.session.clone()
+            };
+            let saved = app.persistent_workspace();
+            app.chat_forget(card);
+            app.chat_ui = State::with_draft_attachments(
+                saved.chat_drafts.clone(),
+                saved.chat_draft_attachments.clone(),
+            );
+            drop(app.open_chat_draft(card, session));
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert_eq!(runtime.composer.text(), text);
+            assert_eq!(runtime.attachments, attachments);
+            for mode in [PromptMode::Send, PromptMode::Queue, PromptMode::Steer] {
+                for text in [text.as_str(), "Describe the attachments", ""] {
+                    let command =
+                        submission(text, &runtime.snapshot, &runtime.attachments, mode).unwrap();
+                    assert_eq!(
+                        command,
+                        Command::Prompt {
+                            text: text.into(),
+                            attachments: attachments.clone(),
+                            mode,
+                        }
+                    );
+                }
+            }
+            assert_eq!(
+                runtime.composer.text(),
+                text,
+                "preflight does not rewrite prose"
+            );
+            assert_eq!(runtime.attachments, attachments);
+            assert!(!text.contains(&tokens[3]));
+        });
+    }
+
+    #[test]
     fn image_history_recall_takeback_and_retry_preserve_full_receipts_and_unsent_stash() {
         chat::attachment_assets::with_test_image(|sent| {
             let draft = chat::attachment_assets::test_image("draft.png");

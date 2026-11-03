@@ -4452,6 +4452,200 @@ mod tests {
     }
 
     #[test]
+    fn six_optional_image_mentions_preserve_native_input_history_and_queue() {
+        crate::chat::attachment_assets::with_test_image(|first| {
+            let mut images = vec![first];
+            images.extend(
+                (2..=6).map(|i| {
+                    crate::chat::attachment_assets::test_image(&format!("optional-{i}.png"))
+                }),
+            );
+            let references = images
+                .iter()
+                .map(|image| image.reference.clone().unwrap())
+                .collect::<Vec<_>>();
+            let bytes = images
+                .iter()
+                .map(|image| std::fs::read(&image.path).unwrap())
+                .collect::<Vec<_>>();
+            let pixels = bytes
+                .iter()
+                .map(|bytes| image::load_from_memory(bytes).unwrap().to_rgba8())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                references.iter().map(|r| r.number).collect::<Vec<_>>(),
+                [1, 2, 3, 4, 5, 6]
+            );
+            for i in 0..6 {
+                for j in i + 1..6 {
+                    assert_ne!(pixels[i], pixels[j], "fixtures must have distinct pixels");
+                }
+            }
+            let cases = [
+                (
+                    format!(
+                        "Compare {} {} {} {} {}; keep the other image too.",
+                        references[0].token(),
+                        references[2].token(),
+                        references[3].token(),
+                        references[4].token(),
+                        references[5].token()
+                    ),
+                    vec![0, 2, 3, 4, 5, 1],
+                ),
+                (
+                    "Compare all six attached images. Earlier [Image 77777] is ordinary prose."
+                        .into(),
+                    vec![0, 1, 2, 3, 4, 5],
+                ),
+                (
+                    format!(
+                        "Compare {} then {}, again {}, then {}.",
+                        references[5].token(),
+                        references[2].token(),
+                        references[5].token(),
+                        references[0].token()
+                    ),
+                    vec![5, 2, 0, 1, 3, 4],
+                ),
+            ];
+            for (text, order) in cases {
+                let mut sender = adapter();
+                sender
+                    .modalities
+                    .insert("model".into(), vec!["image".into()]);
+                let submitted = sender
+                    .command(Command::Prompt {
+                        text: text.clone(),
+                        attachments: images.clone(),
+                        mode: PromptMode::Queue,
+                    })
+                    .unwrap();
+                assert_eq!(submitted.writes.len(), 1);
+                assert_eq!(submitted.writes[0]["method"], "thread/queue/add");
+                let input = &submitted.writes[0]["params"]["input"];
+                assert_eq!(input.as_array().unwrap().len(), 13);
+                assert_eq!(input[0], json!({"type":"text", "text":text}));
+                for (position, &index) in order.iter().enumerate() {
+                    assert_eq!(
+                        input[1 + position * 2]["text"],
+                        super::super::image_references::marker(&references[index]).unwrap()
+                    );
+                    assert_eq!(
+                        input[2 + position * 2],
+                        json!({"type":"localImage", "path":images[index].path.to_str().unwrap()})
+                    );
+                    assert_eq!(
+                        std::fs::read(input[2 + position * 2]["path"].as_str().unwrap()).unwrap(),
+                        bytes[index]
+                    );
+                }
+
+                let mut restored = adapter();
+                restored
+                    .modalities
+                    .insert("model".into(), vec!["image".into()]);
+                let mut history_request = Step::default();
+                restored.history(&mut history_request, None).unwrap();
+                let history = restored.receive(json!({"id":history_request.writes[0]["id"], "result":{"data":[{"id":"six-images-turn", "status":"completed", "items":[{"id":"six-images", "type":"userMessage", "content":input}]}], "nextCursor":null}})).unwrap();
+                let items = history
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::LatestHistory { items, .. } => Some(items),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(items.len(), 7);
+                assert!(
+                    matches!(&items[0].content, ItemContent::Text { text: body, .. } if body == &text)
+                );
+                for (position, &index) in order.iter().enumerate() {
+                    assert!(
+                        matches!(&items[position + 1].content, ItemContent::Image { reference: Some(reference), path, description } if reference == &references[index] && path == images[index].path.to_str().unwrap() && description == &references[index].label())
+                    );
+                    assert!(
+                        items[position + 1]
+                            .id
+                            .ends_with(&format!("/input/{}", 2 + position * 2)),
+                        "provider block indices must not be renumbered"
+                    );
+                }
+                let mut queue = Step::default();
+                restored.queue_page(&json!({"data":[{"id":"six-images-queued", "input":input}], "nextCursor":null}), &mut queue).unwrap();
+                let queued = queue
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::QueueChanged(messages) => messages.first(),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(queued.editable);
+                assert_eq!(queued.text, text);
+                assert_eq!(
+                    queued.attachments,
+                    order
+                        .iter()
+                        .map(|&index| images[index].clone())
+                        .collect::<Vec<_>>()
+                );
+                let resent = restored
+                    .command(Command::Prompt {
+                        text: queued.text.clone(),
+                        attachments: queued.attachments.clone(),
+                        mode: PromptMode::Queue,
+                    })
+                    .unwrap();
+                assert_eq!(resent.writes[0]["method"], "thread/queue/add");
+                assert_eq!(&resent.writes[0]["params"]["input"], input);
+            }
+        });
+    }
+
+    #[test]
+    fn unavailable_image_uuid_with_an_existing_path_refuses_before_a_new_rpc() {
+        crate::chat::attachment_assets::with_test_image(|mut image| {
+            let mut adapter = adapter();
+            adapter
+                .modalities
+                .insert("model".into(), vec!["image".into()]);
+            adapter
+                .command(Command::Prompt {
+                    text: "Already queued".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Queue,
+                })
+                .unwrap();
+            let pending = adapter.pending.keys().cloned().collect::<Vec<_>>();
+            let queue = adapter.queue_listing.clone();
+            let next_id = adapter.next_id;
+            assert!(image.path.is_file());
+            let missing_id = uuid::Uuid::new_v4();
+            assert!(
+                crate::chat::attachment_assets::list()
+                    .unwrap()
+                    .images
+                    .iter()
+                    .all(|stored| stored.id != missing_id)
+            );
+            image.reference.as_mut().unwrap().id = missing_id;
+            let error = adapter
+                .command(Command::Prompt {
+                    text: "Compare the attached image without an inline label.".into(),
+                    attachments: vec![image],
+                    mode: PromptMode::Queue,
+                })
+                .unwrap_err();
+            assert!(error.contains("is unavailable"), "{error}");
+            assert_eq!(adapter.pending.keys().cloned().collect::<Vec<_>>(), pending);
+            assert_eq!(adapter.queue_listing, queue);
+            assert_eq!(adapter.next_id, next_id);
+            assert!(!adapter.busy);
+        });
+    }
+
+    #[test]
     fn multiple_image_inputs_follow_caret_order_without_renumbering() {
         crate::chat::attachment_assets::with_test_image(|first| {
             let second = crate::chat::attachment_assets::test_image("second.png");

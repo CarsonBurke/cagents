@@ -53,9 +53,10 @@ pub(super) fn restore(text: &str, source: &str) -> Option<ImageReference> {
     crate::chat::attachment_assets::restore_reference(&reference, source)
 }
 
-/// Provider image order follows the first inline mention. Legacy attachments
-/// without references retain their relative order at the end. Never reassign
-/// a display number or manufacture an identity while sorting.
+/// Provider image order follows the first inline mention. Every unmentioned
+/// attachment, managed or legacy, retains its relative order at the end.
+/// Inline mentions are optional; never drop an attachment, reassign a display
+/// number or manufacture an identity while sorting.
 pub(super) fn ordered<'a>(
     text: &str,
     attachments: &'a [Attachment],
@@ -72,24 +73,9 @@ pub(super) fn ordered<'a>(
             }
         }
     }
-    let managed = attachments
-        .iter()
-        .filter_map(|attachment| attachment.reference.as_ref())
-        .collect::<Vec<_>>();
-    if !managed.is_empty() && !text.trim().is_empty() {
-        for reference in &managed {
-            if !text.contains(&reference.token()) {
-                return Err(format!(
-                    "{} is attached but its inline reference is missing. Insert {} or remove the attachment.",
-                    reference.label(),
-                    reference.token()
-                ));
-            }
-        }
-        // Other labels may refer to earlier conversation images or quoted
-        // prose. Text alone neither selects an image nor grants authority to
-        // resolve one; only the current attachment metadata is validated.
-    }
+    // Labels may refer to earlier conversation images or quoted prose. Text
+    // alone never grants authority to resolve an image; each real attachment
+    // still carries its own verified mapping through the provider encoder.
     let mut ordered = attachments.iter().enumerate().collect::<Vec<_>>();
     ordered.sort_by_key(|(index, attachment)| {
         (
@@ -224,10 +210,9 @@ mod tests {
         assert_eq!(order, [&second, &first, &attachments[1]]);
         assert_eq!(attachments[0].reference.as_ref().unwrap().number, 13);
         assert!(ordered("[Image 13]", &[first.clone(), first.clone()]).is_err());
-        assert!(
-            ordered("missing reference", &[first.clone()])
-                .unwrap_err()
-                .contains("inline reference is missing")
+        assert_eq!(
+            ordered("Describe the attachment", &[first.clone()]).unwrap(),
+            [&first]
         );
         let current = [second.clone()];
         let mixed = ordered(
@@ -243,5 +228,103 @@ mod tests {
         assert!(ordered("[Image 13] then literal [Image 999]", &[first.clone()]).is_ok());
         assert!(ordered("", &[first]).is_ok());
         assert!(ordered("literal [Image 999]", &[Attachment::file("/legacy.png")]).is_ok());
+    }
+
+    fn numbered_attachments() -> Vec<Attachment> {
+        (16..=21)
+            .map(|number| Attachment {
+                path: format!("/image-{number}.png").into(),
+                reference: Some(reference(number)),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_missing_middle_mention_keeps_all_six_exact_attachments() {
+        let attachments = numbered_attachments();
+        let before = attachments.clone();
+        let ordered = ordered(
+            "Compare [Image 16] [Image 17] [Image 18] [Image 20] [Image 21]",
+            &attachments,
+        )
+        .unwrap();
+        assert_eq!(
+            ordered,
+            [
+                &attachments[0],
+                &attachments[1],
+                &attachments[2],
+                &attachments[4],
+                &attachments[5],
+                &attachments[3],
+            ]
+        );
+        assert_eq!(attachments, before, "sorting never mutates any binding");
+        assert_eq!(ordered[5].reference.as_ref().unwrap().number, 19);
+        assert_eq!(
+            super::ordered("Describe [Image 19]", &attachments).unwrap(),
+            [
+                &attachments[3],
+                &attachments[0],
+                &attachments[1],
+                &attachments[2],
+                &attachments[4],
+                &attachments[5],
+            ]
+        );
+    }
+
+    #[test]
+    fn unmentioned_images_and_legacy_files_keep_their_attachment_order() {
+        let mut attachments = numbered_attachments();
+        attachments.insert(2, Attachment::file("/notes.txt"));
+        let expected = attachments.iter().collect::<Vec<_>>();
+        for text in [
+            "Describe these attachments",
+            "",
+            "Earlier [Image 3] was dark",
+        ] {
+            assert_eq!(ordered(text, &attachments).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn repeated_and_reordered_mentions_never_duplicate_or_relabel_an_image() {
+        let attachments = numbered_attachments();
+        assert_eq!(
+            ordered(
+                "[Image 21] then [Image 17], and [Image 21] again",
+                &attachments,
+            )
+            .unwrap(),
+            [
+                &attachments[5],
+                &attachments[1],
+                &attachments[0],
+                &attachments[2],
+                &attachments[3],
+                &attachments[4],
+            ]
+        );
+        assert_eq!(
+            attachments
+                .iter()
+                .map(|image| image.reference.as_ref().unwrap().number)
+                .collect::<Vec<_>>(),
+            [16, 17, 18, 19, 20, 21]
+        );
+    }
+
+    #[test]
+    fn optional_mentions_do_not_relax_typed_identity_validation() {
+        let attachments = numbered_attachments();
+        let first = attachments[0].clone();
+        assert!(ordered("Describe the images", &[first.clone(), first.clone()]).is_err());
+        let mut duplicate_label = attachments[1].clone();
+        duplicate_label.reference.as_mut().unwrap().number = 16;
+        assert!(ordered("", &[first.clone(), duplicate_label]).is_err());
+        let mut invalid = first;
+        invalid.reference.as_mut().unwrap().number = 0;
+        assert!(ordered("Describe the image", &[invalid]).is_err());
     }
 }
