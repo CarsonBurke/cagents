@@ -5,8 +5,11 @@ Only the copied Python fixture is executed, with finite synthetic stdin and EOF.
 No cagents/helper/provider binary, network, or authority is supplied by this test.
 The ordinary env exec overlays only owned fake HOME/account inputs; inherited
 authority is neither read, copied, cleared, nor replaced.
+The five-second subprocess.run timeout can kill and wait only for its exact
+owned env-exec/Python child on failure; it performs no native or other PID action.
 """
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -198,6 +201,14 @@ class ResumeAnswerFixtureContracts(unittest.TestCase):
         self.assertIn("unexpected second prompt or replacement provider", result.stderr)
         self.assert_no_prompt_or_history_change(result)
         self.assert_one_denial()
+
+    def test_fifo_mode_is_refused_without_waiting_for_a_writer(self):
+        os.mkfifo(self.root / "resume-answer-mode", 0o600)
+        result = self.run_fixture([initialize()], opt_in=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("resume Answer mode must be an owned regular file", result.stderr)
+        self.assert_no_prompt_or_history_change(result)
+        self.assertFalse(self.receipt.exists())
 
 
 if __name__ == "__main__":

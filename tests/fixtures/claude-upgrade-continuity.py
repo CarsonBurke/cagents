@@ -69,14 +69,14 @@ permission_mode = False
 if resume:
     # A fixed, private test opt-in; never an execution capability or HOST row.
     try:
-        fd = os.open(root/'resume-answer-mode', os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(root/'resume-answer-mode', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         pass
     else:
         try:
             row = os.fstat(fd)
             expected = b'deny-only-v1\n'
-            assert stat.S_ISREG(row.st_mode) and row.st_uid == os.getuid() and row.st_nlink == 1
+            assert stat.S_ISREG(row.st_mode) and row.st_uid == os.getuid() and row.st_nlink == 1, 'resume Answer mode must be an owned regular file'
             assert stat.S_IMODE(row.st_mode) == 0o600 and row.st_size == len(expected)
             assert os.read(fd, len(expected)+1) == expected, 'invalid resume Answer fixture mode'
             permission_mode = True
