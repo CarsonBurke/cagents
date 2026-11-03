@@ -73,6 +73,9 @@ jobs:
       - name: Check offline Claude resume-answer fixture contracts
         run: python3 -I -B tests/fixtures/test_claude_upgrade_resume_answer.py -v
 
+      - name: Check release builder caller refusal contracts
+        run: python3 -I -B tests/release_builder_caller.py -v
+
       - name: Check validation checkout and process custody contracts
         run: |
           python3 -I -B - <<'PY'

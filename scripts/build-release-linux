@@ -39,6 +39,14 @@ while (($#)); do
     esac
 done
 
+# Full release validation includes installation and daemon lifecycle checks.
+# Refuse before a namespace can clear the inherited caller classification.
+if [[ ${CAGENTS_AGENT_AUTHORITY+x} == x \
+    || ${CAGENTS_AGENT_TOKEN+x} == x \
+    || ${CAGENTS_SESSION_TOKEN+x} == x ]]; then
+    fail 'full release builds require your own terminal; hosted sessions cannot run installation or daemon lifecycle checks'
+fi
+
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'Linux x86_64 is required'
 CALLER_UID=$(id -u)
 CALLER_GID=$(id -g)
