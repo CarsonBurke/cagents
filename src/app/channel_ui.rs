@@ -415,8 +415,10 @@ impl Cagents {
                 }
             };
         }
+        // An earlier autosave may start behind this dialog. Dismissing it is
+        // safe while that write remains owned; deletion and navigation wait.
         if self.update_prepared
-            || self.focused_repository_is_saving()
+            || (self.focused_repository_is_saving() && !matches!(&action, Action::Dismiss))
             || (self.modal_is_open() && !action.answers_own_dialog())
         {
             return Task::none();
@@ -1473,6 +1475,155 @@ mod tests {
                 selected_rows
             );
             assert!(!app.channel_ui.deletion_running());
+        }
+    }
+
+    #[test]
+    fn channel_cancel_remains_answerable_when_a_pending_autosave_starts_behind_it() {
+        use iced::futures::StreamExt;
+        use keyboard::key::Named;
+        use std::fs;
+
+        for answer in 0..3 {
+            // Own the original read root until after the App and its unpolled
+            // save task are dropped. No save completion is invented or driven.
+            let directory = tempfile::tempdir().unwrap();
+            let checkout = directory.path().join("checkout");
+            fs::create_dir(&checkout).unwrap();
+            let path = checkout.join("notes.txt");
+            fs::write(&path, "before\n").unwrap();
+            let (mut app, target, selected, _) = channel_with_a_conversation();
+            app.context_inspector_open = false;
+            app.settings.editor_auto_save = true;
+            let card = app.workspace.focused().unwrap();
+            let descriptor = RepositoryView {
+                project: app.sidebar_model.projects[0].id,
+                repository: checkout.clone(),
+                worktree: checkout,
+                selected_file: None,
+            };
+            let mut runtime = RepositoryRuntime::new_directory(descriptor.clone());
+            let read = super::super::tests::task_app_message(repository_task(runtime.update(
+                RepositoryAction::OpenFile {
+                    card,
+                    path: "notes.txt".into(),
+                },
+            )));
+            let Message::Repository(read) = read else {
+                panic!("the original file read returns its actual callback");
+            };
+            assert!(matches!(&read, RepositoryAction::FileLoadedAt { .. }));
+            drop(runtime.update(read));
+            assert_eq!(runtime.editor_text().as_deref(), Some("before\n"));
+            runtime.set_auto_save(true);
+            for action in [
+                repository_widget::EditorAction::SelectAll,
+                repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Paste(
+                    Arc::new("pending edit\n".into()),
+                )),
+            ] {
+                drop(runtime.update(RepositoryAction::EditorAction { card, action }));
+            }
+            let pending_autosave = repository_task(runtime.auto_save_task(card));
+            {
+                let durable = Arc::make_mut(&mut app.durable);
+                durable
+                    .cards
+                    .iter_mut()
+                    .find(|entry| entry.id == card)
+                    .unwrap()
+                    .kind = CardKind::Repository(descriptor);
+                let channel = durable
+                    .channels
+                    .iter_mut()
+                    .find(|channel| channel.id == selected)
+                    .unwrap();
+                channel.cards = vec![card];
+                channel.focused = Some(card);
+                durable.active_channel = Some(selected);
+            }
+            app.cards
+                .insert(card, CardRuntime::Repository(Box::new(runtime)));
+            app.refresh_sidebar_channels();
+            assert!(!app.focused_repository_is_saving());
+            let opening = app.update(Message::Sidebar(SidebarAction::DeleteChannel {
+                channel_id: target,
+            }));
+            assert_eq!(
+                super::super::tests::focused_element(app.channel_dialog_view().unwrap(), opening),
+                Some(State::focus_target())
+            );
+
+            // Deliver the real debounce output after the dialog opened. This
+            // background action is intentionally admitted behind a modal.
+            let mut pending = iced::runtime::task::into_stream(pending_autosave).unwrap();
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let effect = executor.block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), pending.next())
+                    .await
+                    .expect("the original autosave debounce completes")
+                    .expect("the original autosave produces an action")
+            });
+            let iced::runtime::Action::Output(cosmic::Action::App(due)) = effect else {
+                panic!("the autosave task returns an application action");
+            };
+            assert!(
+                matches!(&due, Message::Repository(RepositoryAction::AutoSaveDue { identity, .. }) if identity.card == card)
+            );
+            let save = app.update(due);
+            assert!(app.focused_repository_is_saving());
+            assert!(app.operation_recovery_pending());
+            assert!(app.channel_ui.modal_open());
+            let durable = Arc::clone(&app.durable);
+            let selection = app.sidebar_state.clone();
+            let recovery = app.operation_recovery.clone();
+
+            // Dismiss is the sole exception: neither confirmation nor ordinary
+            // channel navigation may discard the still-saving editor.
+            drop(app.update(Message::ChannelUi(Action::ConfirmDelete)));
+            assert_eq!(app.channel_ui.dialog.as_ref().unwrap().channel, target);
+            assert!(!app.channel_ui.deletion_running());
+            let answer = match answer {
+                0 => Message::ChannelUi(Action::Dismiss),
+                1 => super::super::dialog_ui::tests::enter_control(
+                    app.channel_dialog_view().unwrap(),
+                    State::focus_target(),
+                ),
+                _ => Message::KeyEvent {
+                    event: super::super::dialog_ui::tests::key_press(Named::Escape),
+                    captured: false,
+                },
+            };
+            let focus = app.update(answer);
+            assert!(!app.channel_ui.modal_open());
+            assert_eq!(
+                sidebar_after_task(&app, focus, None).0,
+                Some(sidebar::selection_row_focus_id(
+                    sidebar::SelectionRow::Channel(target)
+                ))
+            );
+            drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+                channel_id: target,
+            })));
+            drop(app.update(Message::ChannelUi(Action::Open(target))));
+            assert_eq!(app.durable.as_ref(), durable.as_ref());
+            assert_eq!(app.sidebar_state, selection);
+            assert_eq!(app.workspace.focused(), Some(card));
+            assert_eq!(app.durable.active_channel, Some(selected));
+            assert!(Arc::ptr_eq(&app.operation_recovery, &recovery));
+            assert!(app.focused_repository_is_saving());
+            assert!(app.operation_recovery_pending());
+            assert!(
+                matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+                if runtime.is_dirty() && runtime.editor_text().as_deref() == Some("pending edit\n"))
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
+            // Keep the original save and its operation owner through every
+            // assertion; teardown drops it without polling a writer/callback.
+            drop(save);
         }
     }
 
