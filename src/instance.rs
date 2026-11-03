@@ -3413,20 +3413,39 @@ mod renderer_startup_protocol_tests {
 
     impl Drop for OriginalReportChild {
         fn drop(&mut self) {
-            // Closing owned stdin releases a child even when an oracle panics.
+            // Request release through owned stdin, including on oracle panic.
             self.release.take();
             self.child.stdin.take();
+            let mut kill_attempted = false;
+            let mut wait_error_reported = false;
             loop {
                 match self.child.try_wait() {
-                    Ok(Some(_)) | Err(_) => return,
-                    Ok(None) => {}
+                    Ok(Some(_)) => return,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= self.deadline && !kill_attempted {
+                            // A positive running observation permits only one
+                            // kill attempt against this original unreaped child.
+                            kill_attempted = true;
+                            if let Err(error) = self.child.kill() {
+                                let _ = writeln!(
+                                    io::stderr().lock(),
+                                    "reporting child kill failed; retaining original owner: {error}"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if !wait_error_reported {
+                            wait_error_reported = true;
+                            let _ = writeln!(
+                                io::stderr().lock(),
+                                "reporting child wait is unknown; retaining original owner: {error}"
+                            );
+                        }
+                    }
                 }
-                if std::time::Instant::now() >= self.deadline {
-                    // Only this unreaped original child can be signalled.
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    return;
-                }
+                // The budget never renews. Cleanup uncertainty retains this
+                // exact Child until its original wait confirms settlement.
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
