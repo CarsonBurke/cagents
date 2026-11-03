@@ -1871,7 +1871,10 @@ impl Claude {
             if task.is_empty() {
                 continue;
             }
-            let Ok(owner) = self.task_agent(
+            // Only an Agent's notice settles its task. Other tasks, such as a
+            // Monitor, notify while they still run, and an unmatched advisory
+            // remains a Delivery rather than an invented task.
+            let Ok(Some(owner)) = self.task_agent(
                 &task,
                 (!reported.is_empty()).then_some(reported.as_str()),
                 false,
@@ -1880,14 +1883,10 @@ impl Claude {
             };
             let id = format!("claude-task:{task}");
             let key = ScopedId::new(None, &id);
-            // An unmatched advisory remains a Delivery, not an invented task.
-            if owner.is_none() && !self.tools.contains_key(&key) {
-                continue;
-            }
             let status =
-                self.update_task_agent(&task, owner.as_deref(), false, Some(status), status, step);
+                self.update_task_agent(&task, Some(&owner), false, Some(status), status, step);
             self.tasks.retain(|running| running != &task);
-            let represented = owner.as_deref().is_some_and(|tool| self.agent_tool(tool));
+            let represented = self.agent_tool(&owner);
             if let Some(item) = self.tools.get_mut(&key)
                 && let ItemContent::Tool {
                     status: current, ..
@@ -10534,6 +10533,24 @@ mod tests {
         assert!(notification_agent_statuses(&repeated, "tool-one").is_empty());
         assert!(adapter.background_agents.contains("tool-one"));
         assert!(adapter.ended_agents.is_empty());
+    }
+
+    #[test]
+    fn live_monitor_events_leave_their_running_task_row_running() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"monitor-call","task_type":"local_bash"})).unwrap();
+        let event = adapter
+            .receive(json!({
+                "type": "user",
+                "uuid": "event",
+                "message": {"role": "user", "content": "<task-notification>\n<task-id>b1</task-id>\n<summary>Monitor event: \"queue\"</summary>\n<event>6329:queued</event>\n</task-notification>"}
+            }))
+            .unwrap();
+        assert!(!event.events.iter().any(
+            |event| matches!(event, Event::Item(item) if item.id == "claude-task:b1")
+        ));
+        let row = &adapter.tools[&ScopedId::new(None, "claude-task:b1")];
+        assert_eq!(row.content.status(), Some(ToolStatus::Running));
     }
 
     #[test]
