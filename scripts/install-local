@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Build the committed HEAD as a matched production set and stage it into this
+# user's installation, then finish through the reviewed `daemon upgrade` flow.
+set -euo pipefail
+
+PROGRAM=install-local
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+BUILD_HOST=
+STAGE_ONLY=0
+UPGRADE_ARGS=()
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/install-local [--build-host HOST] [--stage-only] [--yes] [--interrupt]
+
+Builds HEAD with the `local` Cargo profile as version <version>+local.<sha>,
+stages it with install.sh --stage-only, and runs `cagents daemon upgrade`.
+
+  --build-host HOST  Build on HOST over ssh, then install here. HEAD is pushed
+                     to HOST's checkout at the same path relative to $HOME and
+                     built in its .worktrees/install-local with a warm target.
+  --stage-only       Stop after staging; finish from the application's notice.
+  --yes, --interrupt Passed to `cagents daemon upgrade`.
+
+Only committed source is built. CARGO_BUILD_JOBS defaults to every CPU.
+EOF
+}
+
+while (($#)); do
+    case $1 in
+        --build-host)
+            (($# >= 2)) && [[ -n $2 ]] || fail '--build-host requires a host'
+            BUILD_HOST=$2
+            shift 2
+            ;;
+        --stage-only) STAGE_ONLY=1; shift ;;
+        --yes|--interrupt) UPGRADE_ARGS+=("$1"); shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) fail "unknown argument: $1 (see --help)" ;;
+    esac
+done
+((STAGE_ONLY == 0 || ${#UPGRADE_ARGS[@]} == 0)) || fail '--yes and --interrupt apply to the upgrade, not --stage-only'
+
+cd "$ROOT_DIR"
+# A version names exactly one source; uncommitted edits would make it lie.
+[[ -z $(git status --porcelain --untracked-files=no) ]] || fail 'commit or discard tracked changes first'
+COMMIT=$(git rev-parse --verify HEAD)
+SHORT=$(git rev-parse --short=9 HEAD)
+MANIFEST_VERSION=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}' Cargo.toml)
+VERSION=$MANIFEST_VERSION+local.$SHORT
+PREFIX=${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install
+ARCHIVE=cagents-$VERSION-x86_64-unknown-linux-gnu.tar.gz
+OUTPUT=${TMPDIR:-/var/tmp}/cagents-install-local/$VERSION
+
+# Runs on the build host from a checkout of COMMIT. Each Cargo invocation is
+# incremental in the checkout's own target directory.
+build() {
+    local checkout=$1 output=$2
+    rm -rf -- "$output"
+    mkdir -p -- "$output"
+    (
+        cd "$checkout"
+        export PATH=$HOME/.cargo/bin:$PATH
+        export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-$(nproc)}
+        VERSION=$VERSION CAGENTS_CARGO_PROFILE=local CAGENTS_DIST_DIR=$output \
+            scripts/package-linux.sh --variant full --archive-only
+    )
+}
+
+if [[ -e $PREFIX/versions/$VERSION ]]; then
+    printf '%s is already installed; skipping the build.\n' "$VERSION"
+elif [[ -z $BUILD_HOST ]]; then
+    build "$ROOT_DIR" "$OUTPUT"
+else
+    REMOTE_REPOSITORY=${ROOT_DIR#"$HOME"/}
+    [[ $REMOTE_REPOSITORY != "$ROOT_DIR" ]] || fail 'the checkout must be under $HOME to locate it on the build host'
+    REMOTE_OUTPUT=/var/tmp/cagents-install-local/$VERSION
+    git push --quiet --force "ssh://$BUILD_HOST/~/$REMOTE_REPOSITORY" "$COMMIT:refs/heads/install-local"
+    # The host's login shell may not be POSIX; run the build under bash.
+    # shellcheck disable=SC2029
+    ssh "$BUILD_HOST" bash -s -- "$REMOTE_REPOSITORY" "$COMMIT" "$VERSION" "$REMOTE_OUTPUT" <<EOF
+set -euo pipefail
+$(declare -f build)
+repository=\$HOME/\$1 commit=\$2 VERSION=\$3 output=\$4
+checkout=\$repository/.worktrees/install-local
+if [[ ! -d \$checkout ]]; then
+    git -C "\$repository" worktree add --detach "\$checkout" "\$commit"
+fi
+git -C "\$checkout" checkout --quiet --force --detach "\$commit"
+build "\$checkout" "\$output"
+EOF
+    rm -rf -- "$OUTPUT"
+    mkdir -p -- "$OUTPUT"
+    scp -q "$BUILD_HOST:$REMOTE_OUTPUT/$ARCHIVE" "$BUILD_HOST:$REMOTE_OUTPUT/SHA256SUMS" "$OUTPUT/"
+    # shellcheck disable=SC2029
+    ssh "$BUILD_HOST" rm -rf -- "$REMOTE_OUTPUT"
+fi
+
+if [[ ! -e $PREFIX/versions/$VERSION ]]; then
+    # A remote build may link against a newer glibc than this host provides.
+    have=$(getconf GNU_LIBC_VERSION | awk '{ print $2 }')
+    tar -xzf "$OUTPUT/$ARCHIVE" -C "$OUTPUT" "cagents-$VERSION/bin"
+    need=$(for binary in "$OUTPUT/cagents-$VERSION"/bin/cagents*; do
+        [[ -L $binary ]] || readelf --version-info "$binary"
+    done | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/GLIBC_//' | sort -Vu | tail -n1)
+    [[ $(printf '%s\n%s\n' "$need" "$have" | sort -V | tail -n1) == "$have" ]] \
+        || fail "the build requires glibc $need; this host has $have"
+    CAGENTS_ARCHIVE=$OUTPUT/$ARCHIVE CAGENTS_CHECKSUMS=$OUTPUT/SHA256SUMS \
+        sh "$ROOT_DIR/install.sh" --version "$VERSION" --stage-only
+    rm -rf -- "$OUTPUT"
+fi
+
+if ((STAGE_ONLY)); then
+    printf 'Staged %s. Finish the update from the application, or run: cagents daemon upgrade\n' "$VERSION"
+    exit 0
+fi
+exec "$PREFIX/current/bin/cagents" daemon upgrade "${UPGRADE_ARGS[@]}"

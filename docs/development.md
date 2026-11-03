@@ -484,6 +484,33 @@ packages using the generated maintainer-script contract, checks
 mixed-generation interruption, and preserves unrelated files and fixture user
 data. It does not signal the host daemon or install anything on the host.
 
+## Installing your checkout
+
+`scripts/install-local` replaces your installed cagents with the committed
+`HEAD`:
+
+```sh
+scripts/install-local --build-host fw16
+```
+
+It builds the three matched executables with the `local` Cargo profile,
+versioned `<version>+local.<short sha>`. That profile keeps release identity
+and optimization but skips link-time optimization and single-unit code
+generation. Each build is incremental, so after the first one only changed
+code is recompiled. The script stages the archive with
+`install.sh --stage-only` and runs `cagents daemon upgrade`, which shows each
+affected session and asks before replacing anything. `--stage-only` stops
+after staging so you can finish from the application's update notice instead.
+
+With `--build-host`, `HEAD` is pushed to the same repository path on that host
+and built in its `.worktrees/install-local`. The archive is copied back, and
+the script refuses it if it needs a newer glibc than this machine has.
+Uncommitted changes are refused so that the version names its exact source.
+Rebuilding an installed version is skipped.
+
+Published releases still come from `scripts/build-release-linux`; see
+[Releasing](releasing.md).
+
 ## Troubleshooting
 
 | Symptom | What to do |

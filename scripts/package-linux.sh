@@ -7,19 +7,33 @@ ROOT_DIR=$(dirname -- "$SCRIPT_DIR")
 DIST_DIR=${CAGENTS_DIST_DIR:-"$ROOT_DIR/dist"}
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}
 VARIANT=full
+# Cargo profile for the packaged executables; `local` keeps release identity.
+PROFILE=${CAGENTS_CARGO_PROFILE:-release}
+ARCHIVE_ONLY=0
 
 fail() {
     printf '%s: %s\n' "$PROGRAM" "$*" >&2
     exit 1
 }
 
-case $# in
-    0) ;;
-    2)
-        [ "$1" = --variant ] || fail 'usage: package-linux.sh [--variant full|browserless]'
-        VARIANT=$2
-        ;;
-    *) fail 'usage: package-linux.sh [--variant full|browserless]' ;;
+USAGE='usage: package-linux.sh [--variant full|browserless] [--archive-only]'
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --variant)
+            [ "$#" -ge 2 ] || fail "$USAGE"
+            VARIANT=$2
+            shift 2
+            ;;
+        # The portable archive and its checksums are all install.sh needs.
+        --archive-only)
+            ARCHIVE_ONLY=1
+            shift
+            ;;
+        *) fail "$USAGE" ;;
+    esac
+done
+case $PROFILE in
+    ''|*[!0-9A-Za-z_-]*) fail "unsafe Cargo profile: $PROFILE" ;;
 esac
 [ "$(uname -s)" = Linux ] || fail 'packaging is supported only on Linux'
 [ "$(uname -m)" = x86_64 ] || fail 'packaging is supported only on x86_64'
@@ -83,9 +97,15 @@ case $VARIANT in
     *) fail "unknown package variant: $VARIANT" ;;
 esac
 
-for command in awk cargo date dpkg-deb gzip install mktemp readelf sed sha256sum sort strip tar touch wc; do
+for command in awk cargo date gzip install mktemp readelf sed sha256sum sort strip tar touch wc; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
+[ "$ARCHIVE_ONLY" = 1 ] || command -v dpkg-deb >/dev/null 2>&1 || fail 'required command not found: dpkg-deb'
+if [ "$ARCHIVE_ONLY" = 1 ]; then
+    GZIP_LEVEL=-1
+else
+    GZIP_LEVEL=-9
+fi
 
 BUILD_SECONDS=skipped
 if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
@@ -120,7 +140,7 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
         python3 "$SCRIPT_DIR/build-ceditor-product" "$product" \
             --manifest-path "$ROOT_DIR/Cargo.toml" \
             --locked \
-            --release \
+            --profile "$PROFILE" \
             --target-dir "$TARGET_DIR" \
             --target "$RELEASE_TARGET" \
             "$@"
@@ -143,33 +163,36 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     BUILD_SECONDS=$((BUILD_FINISHED - BUILD_STARTED))
 else
     # Explicit prebuilt mode retains its native release layout.
-    CLI_BINARY=$TARGET_DIR/release/cagents
-    HOST_BINARY=$TARGET_DIR/release/cagentsd
-    UI_BINARY=$TARGET_DIR/release/cagents-ui
+    CLI_BINARY=$TARGET_DIR/$PROFILE/cagents
+    HOST_BINARY=$TARGET_DIR/$PROFILE/cagentsd
+    UI_BINARY=$TARGET_DIR/$PROFILE/cagents-ui
 fi
 
-# Report the package's whole resolved graph: the union of the lanes built above.
-# `cargo tree` only reads Cargo.lock, so unifying the features here resolves
-# nothing that a build would compile. Never copy these feature sets into a
-# build command.
-if [ "$VARIANT" = browserless ]; then
-    RESOLVED_PACKAGE_IDS=$(
-        cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
-            --no-default-features --features ui,host --edges normal --prefix none |
-            sed 's/ (\*)$//' |
-            LC_ALL=C sort -u |
-            wc -l
-    )
-else
-    RESOLVED_PACKAGE_IDS=$(
-        cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
-            --features host,integrated-browser --edges normal --prefix none |
-            sed 's/ (\*)$//' |
-            LC_ALL=C sort -u |
-            wc -l
-    )
+# Only the release size report reads this.
+if [ "$ARCHIVE_ONLY" = 0 ]; then
+    # Report the package's whole resolved graph: the union of the lanes built above.
+    # `cargo tree` only reads Cargo.lock, so unifying the features here resolves
+    # nothing that a build would compile. Never copy these feature sets into a
+    # build command.
+    if [ "$VARIANT" = browserless ]; then
+        RESOLVED_PACKAGE_IDS=$(
+            cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
+                --no-default-features --features ui,host --edges normal --prefix none |
+                sed 's/ (\*)$//' |
+                LC_ALL=C sort -u |
+                wc -l
+        )
+    else
+        RESOLVED_PACKAGE_IDS=$(
+            cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
+                --features host,integrated-browser --edges normal --prefix none |
+                sed 's/ (\*)$//' |
+                LC_ALL=C sort -u |
+                wc -l
+        )
+    fi
+    RESOLVED_PACKAGE_IDS=$((RESOLVED_PACKAGE_IDS))
 fi
-RESOLVED_PACKAGE_IDS=$((RESOLVED_PACKAGE_IDS))
 
 for binary in "$CLI_BINARY" "$UI_BINARY" "$HOST_BINARY"; do
     [ -x "$binary" ] || fail "missing release binary: $binary"
@@ -293,7 +316,17 @@ PORTABLE_TAR=$WORK_DIR/portable.tar
         -cf "$PORTABLE_TAR" \
         "$TOP_LEVEL"
 )
-gzip -n -9 -c "$PORTABLE_TAR" > "$DIST_DIR/$ARCHIVE_NAME"
+gzip -n "$GZIP_LEVEL" -c "$PORTABLE_TAR" > "$DIST_DIR/$ARCHIVE_NAME"
+
+if [ "$ARCHIVE_ONLY" = 1 ]; then
+    (
+        cd "$DIST_DIR"
+        sha256sum "$ARCHIVE_NAME" > "$CHECKSUM_NAME"
+    )
+    printf 'Created %s archive:\n  %s\n  %s\n' \
+        "$VARIANT" "$DIST_DIR/$ARCHIVE_NAME" "$DIST_DIR/$CHECKSUM_NAME"
+    exit 0
+fi
 
 DEB_ROOT=$WORK_DIR/deb
 install -d -m 0755 \
