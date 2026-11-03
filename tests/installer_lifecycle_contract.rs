@@ -200,6 +200,148 @@ print(json.dumps({'Ok':None}))
     );
 }
 
+// Use the actual CLI bytes in the archive: forwarding coordinate-install to
+// another executable would accidentally borrow that executable's companions.
+// The explicit host fixture qualifies the inherited fence and request only;
+// it never starts a daemon or reads SQLite/provider state.
+#[test]
+fn verified_archive_bootstraps_the_real_coordinator_and_its_inspector() {
+    for legacy in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join("data");
+        let prefix = data.join("cagents-install");
+        let runtime = home.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let saved = data
+            .join(cagents::instance::STORAGE_NAME)
+            .join("sessions.sqlite3");
+        if legacy {
+            let old = prefix.join("versions/old/bin");
+            fs::create_dir_all(&old).unwrap();
+            fs::write(
+                prefix.join(".cagents-install-root"),
+                "cagents install root\n",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink("versions/old", prefix.join("current")).unwrap();
+            // This predates the guard and cannot supply a source inspector.
+            executable(&old.join("cagents"), "#!/bin/sh\nexit 64\n");
+            fs::create_dir_all(saved.parent().unwrap()).unwrap();
+            fs::write(&saved, b"saved panes require the archived inspector").unwrap();
+        }
+        let archive_root = home.path().join("archive");
+        let candidate = archive_root.join("cagents-9.9.9");
+        let bin = candidate.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::copy(env!("CARGO_BIN_EXE_cagents"), bin.join("cagents")).unwrap();
+        executable(&bin.join("cagents-ui"), "#!/bin/sh\nexit 99\n");
+        executable(&bin.join("cagents-uninstall"), "#!/bin/sh\nexit 99\n");
+        install_source_inspector_fixture(&bin.join("cagentsd"));
+        // A first install attempts login-daemon startup. Refuse that in the
+        // fixture instead of hosting a service; the install must still finish.
+        let inspector = fs::read_to_string(bin.join("cagentsd")).unwrap().replace(
+            "assert len(sys.argv) == 3",
+            "if len(sys.argv) != 3 or sys.argv[1] != '--inspect-upgrade-source':\n    (pathlib.Path(os.environ['HOME'])/'startup-refused').touch()\n    sys.exit(1)\nassert len(sys.argv) == 3",
+        );
+        executable(&bin.join("cagentsd"), &inspector);
+        fs::write(bin.join(".cagents-ui-lease-v1"), b"").unwrap();
+        for relative in [
+            "share/applications/dev.cagents.Cagents.desktop",
+            "share/autostart/dev.cagents.Cagents.Daemon.desktop",
+            "share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg",
+            "share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png",
+            "share/metainfo/dev.cagents.Cagents.metainfo.xml",
+            "share/doc/cagents/LICENSE",
+        ] {
+            let path = candidate.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "[Desktop Entry]\nExec=cagents ui\nIcon=cagents\n").unwrap();
+        }
+        let archive = home
+            .path()
+            .join("cagents-9.9.9-x86_64-unknown-linux-gnu.tar.gz");
+        assert!(
+            Command::new("tar")
+                .arg("-czf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&archive_root)
+                .arg("cagents-9.9.9")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let hash = Command::new("sha256sum").arg(&archive).output().unwrap();
+        assert!(hash.status.success());
+        let checksums = home.path().join("SHA256SUMS");
+        let hash = String::from_utf8(hash.stdout).unwrap();
+        fs::write(
+            &checksums,
+            format!(
+                "{}  {}\n",
+                hash.split_whitespace().next().unwrap(),
+                archive.file_name().unwrap().to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let tools = home.path().join("tools");
+        fs::create_dir(&tools).unwrap();
+        for tool in ["gtk-update-icon-cache", "update-desktop-database"] {
+            executable(&tools.join(tool), "#!/bin/sh\nexit 0\n");
+        }
+        let output = Command::new("sh")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
+            .args(["--version", "9.9.9", "--prefix"])
+            .arg(&prefix)
+            .env("HOME", home.path())
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("CAGENTS_ARCHIVE", &archive)
+            .env("CAGENTS_CHECKSUMS", &checksums)
+            .env("FIXTURE_REAL_CLI", env!("CARGO_BIN_EXE_cagents"))
+            .env(
+                "FIXTURE_SOURCE_PROTOCOL",
+                cagents::terminal_ipc::PROTOCOL_VERSION.to_string(),
+            )
+            .env("FIXTURE_REQUIRE_RESUMABLE", "false")
+            .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "legacy={legacy}: {output:?}");
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/9.9.9")
+        );
+        assert_eq!(
+            fs::read(prefix.join("current/bin/cagents")).unwrap(),
+            fs::read(env!("CARGO_BIN_EXE_cagents")).unwrap()
+        );
+        assert_eq!(
+            home.path().join("source-inspected").exists(),
+            legacy,
+            "legacy={legacy}: {output:?}"
+        );
+        assert!(
+            home.path().join("startup-refused").exists(),
+            "the fixture must refuse actual daemon startup"
+        );
+        if legacy {
+            assert_eq!(
+                fs::read(&saved).unwrap(),
+                b"saved panes require the archived inspector"
+            );
+        } else {
+            assert!(
+                !saved.exists(),
+                "a fresh install must not create a pane database"
+            );
+        }
+    }
+}
+
 // The fixture CLI records every destructive request, not merely its final
 // status: a stop/start pair would otherwise look like preserved sessions.
 fn upgrade_fixture(
@@ -263,6 +405,17 @@ fn coordinated_release_mode(
     fs::copy(env!("CARGO_BIN_EXE_cagents"), &real_cli).unwrap();
     install_source_inspector_fixture(&coordinator_bin.join("cagentsd"));
     let data = home.path().join("data with spaces");
+    // Exercise inspection even without a live daemon. An empty namespace may
+    // legitimately skip it; these upgrade-policy fixtures model saved panes.
+    let saved = data
+        .join(cagents::instance::STORAGE_NAME)
+        .join("sessions.sqlite3");
+    fs::create_dir_all(saved.parent().unwrap()).unwrap();
+    fs::write(
+        &saved,
+        b"fixture saved panes inspected by the explicit helper",
+    )
+    .unwrap();
     let prefix = data.join("cagents-install");
     let old_bin = prefix.join("versions/old/bin");
     fs::create_dir_all(&old_bin).unwrap();

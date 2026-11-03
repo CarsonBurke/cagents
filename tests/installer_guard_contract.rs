@@ -738,6 +738,119 @@ fn verify_mode(runtime: &Path, lease: Option<&File>, stage_only: bool) -> Output
     command.output().unwrap()
 }
 
+// Copy the real coordinator away from Cargo's output directory: a host build
+// in another feature lane must not silently supply this missing companion.
+// These fixtures preserve the caller's authority and exercise no real daemon.
+fn coordinator_without_source_inspector(saved_store: Option<&str>) {
+    let root = coordinator_fixture::Root::new(tempfile::tempdir().unwrap());
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let cli = bin.join("cagents");
+    fs::copy(env!("CARGO_BIN_EXE_cagents"), &cli).unwrap();
+    assert!(!bin.join("cagentsd").exists());
+    let runtime = root.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let prefix = root.path().join("installation");
+    fs::create_dir(&prefix).unwrap();
+    let data = root.path().join("data");
+    let saved_store = saved_store.map(|relative| {
+        let path = data.join(cagents::instance::STORAGE_NAME).join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Even an empty store requires its qualified reader. No file length
+        // or SQLite parse shortcut can establish that saved state is absent.
+        fs::write(&path, []).unwrap();
+        path
+    });
+    let installer = root.path().join("installer.sh");
+    fs::write(
+        &installer,
+        "#!/bin/sh\n\"$FIXTURE_REAL_CLI\" verify-install-guard >/dev/null || exit 91\nprintf 'installed\\n' > \"$FIXTURE_INSTALLED\"\n",
+    )
+    .unwrap();
+    let installed = root.path().join("installed");
+    let mut command = Command::new(&cli);
+    command
+        .arg("coordinate-install")
+        .arg("--prefix")
+        .arg(&prefix)
+        .arg("--installer")
+        .arg(&installer)
+        .env("HOME", root.path())
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
+        .env("FIXTURE_REAL_CLI", &cli)
+        .env("FIXTURE_INSTALLED", &installed)
+        .current_dir(root.path());
+    let mut child = coordinator_fixture::Coordinator::start(command, &root, false);
+    let output = child
+        .wait_until(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    if let Some(path) = saved_store {
+        assert!(!output.status.success(), "{output:?}");
+        assert_missing_source_inspector(&output);
+        assert!(
+            !installed.exists(),
+            "source refusal must precede installation"
+        );
+        assert!(fs::read(path).unwrap().is_empty());
+    } else {
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read_to_string(installed).unwrap(), "installed\n");
+    }
+    assert!(!bin.join("cagentsd").exists());
+    assert!(!prefix.join("current").exists());
+    assert!(fs::read_dir(&prefix).unwrap().next().is_none());
+    assert!(
+        !runtime
+            .join(cagents::instance::RUNTIME_SUBDIRECTORY)
+            .join("cagentsd.sock")
+            .exists(),
+        "source preflight must not start a daemon"
+    );
+    let fence = File::open(runtime.join(format!(
+        "{}-ui.lock.update",
+        cagents::instance::STORAGE_NAME
+    )))
+    .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(fence.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "coordinator must release its launch fence"
+    );
+    drop(fence);
+    root.close();
+}
+
+fn assert_missing_source_inspector(output: &Output) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for message in [
+        "matched source inspector is unavailable",
+        "reinstall the matching cagents and cagentsd",
+        "before retrying",
+        "source windows remain usable",
+    ] {
+        assert!(stderr.contains(message), "missing {message:?}: {output:?}");
+    }
+}
+
+#[test]
+fn fresh_profile_coordinator_runs_without_a_host_companion() {
+    let _fixture = OS_FIXTURE.lock().unwrap();
+    coordinator_without_source_inspector(None);
+}
+
+#[test]
+fn saved_primary_and_secondary_stores_require_the_matched_source_inspector() {
+    let _fixture = OS_FIXTURE.lock().unwrap();
+    for store in ["sessions.sqlite3", "windows/inactive-copy/sessions.sqlite3"] {
+        coordinator_without_source_inspector(Some(store));
+    }
+}
+
 #[test]
 fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
     let _fixture = OS_FIXTURE.lock().unwrap();
@@ -916,10 +1029,7 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
                     "{output:?}"
                 );
             } else {
-                assert!(
-                    String::from_utf8_lossy(&output.stderr).contains("(os error 2)"),
-                    "missing matched inspector must expose the actual not-found failure: {output:?}"
-                );
+                assert_missing_source_inspector(&output);
             }
             println!(
                 "source inspection {status}: {}",

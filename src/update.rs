@@ -4,6 +4,8 @@ mod candidate;
 mod confirmation;
 mod installed;
 mod source;
+#[cfg(test)]
+mod source_inspection_tests;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
 pub mod impact;
 #[cfg(feature = "ui")]
@@ -1177,15 +1179,42 @@ fn inspect_source_panes_mode(
     reconcile_retained: bool,
 ) -> Result<(), UpdateError> {
     let (protocol, proof) = source::inspect_identity(proof.as_ref())?;
+    // Only an entirely new source namespace has nothing for the host to
+    // inspect. An absent daemon alone says nothing about saved panes, and a
+    // live window must flush and qualify even if its database is not on disk.
+    if proof.is_none() && !guard.has_running_windows()? {
+        let mut empty = true;
+        for path in crate::instance::window_database_paths()? {
+            match fs::symlink_metadata(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => {
+                    empty = false;
+                    break;
+                }
+            }
+        }
+        if empty {
+            let (current_protocol, current_proof) = source::inspect_identity(None)?;
+            if current_protocol != protocol || current_proof != proof {
+                return Err(invalid(
+                    "Source ownership changed during pane inspection; source windows remain usable",
+                ));
+            }
+            return Ok(());
+        }
+    }
     let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
-    let before = fs::symlink_metadata(&helper)?;
+    let unavailable = || {
+        invalid(
+            "The matched source inspector is unavailable; reinstall the matching cagents and cagentsd before retrying; source windows remain usable",
+        )
+    };
+    let before = fs::symlink_metadata(&helper).map_err(|_| unavailable())?;
     if !before.is_file()
         || !crate::install_guard::trusted_executable_owner(before.uid())
         || before.mode() & 0o022 != 0
     {
-        return Err(invalid(
-            "The matched source inspector is unavailable; source windows remain usable",
-        ));
+        return Err(unavailable());
     }
     let request = crate::install_guard::SourceInspectionRequest {
         protocol,
