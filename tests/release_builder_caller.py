@@ -83,7 +83,8 @@ class ReleaseBuilderCaller(unittest.TestCase):
                               capture_output=True, text=True, timeout=10)
 
     def test_naturally_hosted_caller_refuses_before_platform_or_cache_commands(self):
-        if not any(name in os.environ for name in MARKERS):
+        present_names = set(os.environ)
+        if not any(name in present_names for name in MARKERS):
             self.skipTest("no naturally inherited hosted marker; no User-context full release invocation")
         result = self.run_full("--ref", "synthetic-ref", "--output", str(self.fixture / "assets"))
         self.assertEqual(result.returncode, 1, result.stderr)
