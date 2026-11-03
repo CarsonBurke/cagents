@@ -56,7 +56,6 @@ fn isolated(name: &str) -> Option<PathBuf> {
             &format!("host::chat::retained_admission_tests::{name}"),
             "--nocapture",
         ])
-        .env_clear()
         .env(MODE, name)
         .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
         .env("CAGENTS_HOLDER_ROOT", root)
@@ -664,8 +663,18 @@ fn named_claude_resume_of_lost_agent_delivers_waiting_mail_once() {
     );
 }
 
+#[test]
+fn named_claude_resume_of_lost_agent_answers_waiting_permission_once() {
+    lost_holder_case(
+        "named_claude_resume_of_lost_agent_answers_waiting_permission_once",
+        true,
+        false,
+    );
+}
+
 fn lost_holder_case(name: &str, managed: bool, mail: bool) {
     let Some(root) = isolated(name) else { return };
+    let answer = name == "named_claude_resume_of_lost_agent_answers_waiting_permission_once";
     let provider = root.join("bin/claude");
     fs::write(
         &provider,
@@ -831,6 +840,16 @@ fn lost_holder_case(name: &str, managed: bool, mail: bool) {
             .count()
     };
     let runs_before = provider_runs();
+    let sdk_answers = || {
+        fs::read_to_string(root.join("provider-trace.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .is_ok_and(|value| value["event"] == "resume-answer-input")
+            })
+            .count()
+    };
     // The fixture otherwise fails its first resume on purpose.
     let refused_once = root.join("history-retry-start-failed-once.json");
     fs::write(
@@ -1066,6 +1085,14 @@ fn lost_holder_case(name: &str, managed: bool, mail: bool) {
         (courier, message.id)
     });
 
+    if answer {
+        // Only the replacement SDK emits this request, from its real initialize
+        // exchange. The private marker grants no HOST/request/actor authority.
+        let mode = root.join("resume-answer-mode");
+        fs::write(&mode, b"deny-only-v1\n").unwrap();
+        fs::set_permissions(&mode, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     // The one explicit action: normal Start on the exact reader descriptor.
     let resumed = crate::chat::client::ClientHandle::connect(
         reader.clone(),
@@ -1142,6 +1169,112 @@ fn lost_holder_case(name: &str, managed: bool, mail: bool) {
         );
         assert_eq!(&after, run, "the interrupted run stays interrupted");
         assert_eq!(agent.id, before.id);
+        if answer {
+            use crate::agent_execution::{Control, Operation, Reply};
+
+            let requests = || {
+                let reply = super::super::agent_execution::process(
+                    &host,
+                    Default::default(),
+                    Operation::Requests(agent.id),
+                )
+                .unwrap();
+                let Reply::Requests(requests) = reply else {
+                    panic!("expected the resumed provider's requests: {reply:?}")
+                };
+                requests
+            };
+            wait("resumed SDK permission", &mut || {
+                requests()
+                    .iter()
+                    .any(|request| request.id == "post-resume-permission")
+            });
+            let pending = requests();
+            let [request] = pending.as_slice() else {
+                panic!("expected exactly the SDK permission: {pending:?}")
+            };
+            assert_eq!(request.id, "post-resume-permission");
+            assert_eq!(request.kind, chat::RequestKind::Approval);
+            assert!(request.fields.is_empty());
+            assert!(request.actions.iter().any(|action| action.id == "deny"));
+            let control = |action: &str| {
+                super::super::agent_execution::process(
+                    &host,
+                    Default::default(),
+                    Operation::Control {
+                        agent: agent.id,
+                        command: Control::Answer {
+                            request_id: request.id.clone(),
+                            action: action.into(),
+                            answers: Vec::new(),
+                        },
+                    },
+                )
+            };
+            let receipt = root.join("resume-answer-receipts.jsonl");
+            let refusal = control("allow").unwrap_err();
+            assert!(refusal.contains("only decline"), "{refusal}");
+            assert!(!receipt.exists(), "a terminal run authorized provider work");
+            assert_eq!(sdk_answers(), 0, "approval reached the SDK");
+            assert_eq!(requests(), pending);
+            assert_eq!(&agent_state().unwrap().1, run);
+
+            let handle = host.lock().unwrap().chats[&session.id].handle.clone();
+            let identity = handle.actor_identity().unwrap();
+            let (_, before_answer) = handle
+                .retained_outcome_clock_until(Instant::now() + Duration::from_secs(10))
+                .unwrap();
+            assert!(
+                before_answer > 0,
+                "the real waiting event needs a watermark"
+            );
+            let reply = control("deny").unwrap();
+            assert!(matches!(reply, Reply::Requests(requests) if requests.is_empty()));
+            let expected_receipt = serde_json::json!({
+                "request_id": request.id,
+                "behavior": "deny",
+                "session_id": thread,
+            });
+            wait("SDK received the denial", &mut || {
+                fs::read_to_string(&receipt).is_ok_and(|lines| {
+                    lines.lines().count() == 1
+                        && serde_json::from_str::<serde_json::Value>(lines.trim())
+                            .is_ok_and(|value| value == expected_receipt)
+                })
+            });
+            assert_eq!(sdk_answers(), 1, "the denial reached the SDK exactly once");
+            assert!(requests().is_empty());
+            let (acknowledged, through) = handle
+                .retained_outcome_clock_until(Instant::now() + Duration::from_secs(10))
+                .unwrap();
+            assert!(through >= before_answer);
+            assert_eq!(acknowledged, through, "the helper watermark was not ACKed");
+            let registry = super::super::agent_execution::registry(&host).unwrap();
+            let durable = registry
+                .lock()
+                .unwrap()
+                .native_actor_committed_through(identity.instance, &identity.record)
+                .unwrap();
+            assert!(
+                durable >= through,
+                "helper ACK exceeded the exact HOST cursor"
+            );
+            assert_eq!(&agent_state().unwrap().1, run);
+            assert_eq!(run.state, crate::agent_execution::State::Interrupted);
+
+            // A repeat is refused before another provider input, not replayed.
+            let once = fs::read(&receipt).unwrap();
+            let refusal = control("deny").unwrap_err();
+            assert!(refusal.contains("No pending request"), "{refusal}");
+            assert_eq!(fs::read(&receipt).unwrap(), once);
+            assert_eq!(sdk_answers(), 1, "the repeated denial reached the SDK");
+            assert_eq!(fs::read(&history).unwrap(), history_before);
+            assert_eq!(
+                fs::read_to_string(root.join("prompts")).unwrap(),
+                prompts_before
+            );
+            assert_eq!(users(&resumed.snapshot().items), 1);
+        }
         // The provider is the agent's, and closes as the agent.
         super::super::agent_execution::process(
             &host,
@@ -1163,9 +1296,27 @@ fn lost_holder_case(name: &str, managed: bool, mail: bool) {
             fs::read_to_string(root.join("prompts")).unwrap(),
             prompts_before
         );
+        if answer {
+            assert_eq!(
+                &super::super::agent_execution::registry(&host)
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .agent_run(run.id)
+                    .unwrap(),
+                run,
+                "denial and normal Close preserve the terminal Interrupted run"
+            );
+            assert_eq!(fs::read(&history).unwrap(), history_before);
+            assert_eq!(sdk_answers(), 1, "normal Close replayed the denial");
+        }
         drop(resumed);
         drop(restored);
-        drop(worker);
+        if answer {
+            worker.join().unwrap();
+        } else {
+            drop(worker);
+        }
         return;
     }
 

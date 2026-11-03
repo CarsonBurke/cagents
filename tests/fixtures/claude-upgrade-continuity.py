@@ -65,6 +65,26 @@ def send(value):
         with history.open('a') as log: log.write(raw)
         parent=value.get('uuid',parent)
     print(json.dumps(value),flush=True)
+permission_mode = False
+if resume:
+    # A fixed, private test opt-in; never an execution capability or HOST row.
+    try:
+        fd = os.open(root/'resume-answer-mode', os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        pass
+    else:
+        try:
+            row = os.fstat(fd)
+            expected = b'deny-only-v1\n'
+            assert stat.S_ISREG(row.st_mode) and row.st_uid == os.getuid() and row.st_nlink == 1
+            assert stat.S_IMODE(row.st_mode) == 0o600 and row.st_size == len(expected)
+            assert os.read(fd, len(expected)+1) == expected, 'invalid resume Answer fixture mode'
+            permission_mode = True
+        finally:
+            os.close(fd)
+permission_sent = False
+permission_answered = False
+permission_id = 'post-resume-permission'
 if resume:
     # The normal initial UI prompt created this history and settled result.
     # No model rows, accounts, history bytes, authority or receipts are seeded.
@@ -104,6 +124,22 @@ for line in sys.stdin:
     trace({'event':'input','type':str(frame.get('type'))[:96],'uuid':str(frame.get('uuid'))[:96]})
     if frame.get('type')=='control_request':
         send({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':{}}})
+        if permission_mode and not permission_sent and frame.get('request',{}).get('subtype')=='initialize':
+            send({'type':'control_request','request_id':permission_id,'request':{'subtype':'can_use_tool','tool_name':'Read','tool_use_id':'post-resume-read','input':{'file_path':'/fixture/deny-only'}}})
+            permission_sent = True
+    elif frame.get('type')=='control_response' and permission_mode:
+        response = frame.get('response', {})
+        trace({'event':'resume-answer-input'})
+        assert permission_sent and not permission_answered, 'unexpected or duplicate resume Answer'
+        assert response.get('subtype') == 'success' and response.get('request_id') == permission_id, 'wrong resume Answer request'
+        assert response.get('response') == {'behavior':'deny', 'message':'The user denied this request'}, 'only the exact denial is supported'
+        receipt = json.dumps({'request_id':permission_id,'behavior':'deny','session_id':session},sort_keys=True,separators=(',',':')).encode()+b'\n'
+        fd = os.open(root/'resume-answer-receipts.jsonl', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            assert os.write(fd, receipt) == len(receipt)
+        finally:
+            os.close(fd)
+        permission_answered = True
     elif frame.get('type')=='user':
         assert not (root/'prompts').exists(), 'unexpected second prompt or replacement provider'
         assert 'LIVE_WORK_1513' in json.dumps(frame.get('message',{})), 'unexpected fixture prompt'
