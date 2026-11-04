@@ -1,9 +1,12 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
+mod adapter_items;
+mod child_tools;
 mod file_changes;
 mod text_copy;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
+pub(super) use adapter_items::reader as adapter_item_reader;
 use base64::Engine as _;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -46,6 +49,10 @@ pub(super) struct Window {
 }
 pub(crate) struct Store {
     db: Connection,
+    canonical_generation: uuid::Uuid,
+    pending_child_tool: Option<child_tools::Pending>,
+    child_tools_unavailable: Option<&'static str>,
+    child_tools_have_revocations: bool,
     copy_cache: uuid::Uuid,
     copy_revision: u64,
     copy_projection: Vec<Option<crate::chat::TextCopySource>>,
@@ -134,28 +141,32 @@ impl Store {
         if self.child_files_seen
             || self.file_index_incomplete
             || !self.presented_children.is_empty()
+            || self.pending_child_tool.is_some()
+            || self.child_tools_unavailable.is_some()
+            || self.db.query_row("SELECT EXISTS(SELECT 1 FROM child_tools) OR EXISTS(SELECT 1 FROM child_tool_revoked) OR EXISTS(SELECT 1 FROM adapter_task_items)",[],|row|row.get::<_,bool>(0)).map_err(|e|e.to_string())?
         {
             return Ok(false);
         }
         let mut items = self
             .db
-            .prepare("SELECT id,metadata,len0,len1,len2,spans FROM items ORDER BY ordinal")
+            .prepare("SELECT id,metadata,len0,len1,len2,spans,source_shortened FROM items ORDER BY ordinal")
             .map_err(|error| error.to_string())?;
         let mut rows = items.query([]).map_err(|error| error.to_string())?;
         let mut last_ordinal = None;
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
             let id: String = row.get(0).map_err(|error| error.to_string())?;
-            let resident: (Vec<u8>, i64, i64, i64, Vec<u8>) = (
+            let resident: (Vec<u8>, i64, i64, i64, Vec<u8>, bool) = (
                 row.get(1).map_err(|error| error.to_string())?,
                 row.get(2).map_err(|error| error.to_string())?,
                 row.get(3).map_err(|error| error.to_string())?,
                 row.get(4).map_err(|error| error.to_string())?,
                 row.get(5).map_err(|error| error.to_string())?,
+                row.get(6).map_err(|error| error.to_string())?,
             );
-            let loaded: Option<(i64, (Vec<u8>, i64, i64, i64, Vec<u8>))> = reloaded
+            let loaded: Option<(i64, (Vec<u8>, i64, i64, i64, Vec<u8>, bool))> = reloaded
                 .db
                 .query_row(
-                    "SELECT ordinal,metadata,len0,len1,len2,spans FROM items WHERE id=?1",
+                    "SELECT ordinal,metadata,len0,len1,len2,spans,source_shortened FROM items WHERE id=?1",
                     [&id],
                     |row| {
                         Ok((
@@ -166,6 +177,7 @@ impl Store {
                                 row.get(3)?,
                                 row.get(4)?,
                                 row.get(5)?,
+                                row.get(6)?,
                             ),
                         ))
                     },
@@ -228,13 +240,21 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             let db = Connection::open(&path).map_err(|e| e.to_string())?;
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
-                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
+                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL, source_shortened INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
+                .map_err(|e| e.to_string())?;
+            db.execute_batch(adapter_items::SCHEMA)
+                .map_err(|e| e.to_string())?;
+            db.execute_batch(child_tools::SCHEMA)
                 .map_err(|e| e.to_string())?;
             db.execute_batch(text_copy::SCHEMA)
                 .map_err(|e| e.to_string())?;
             Ok(Self {
+                canonical_generation: uuid::Uuid::new_v4(),
+                pending_child_tool: None,
+                child_tools_unavailable: None,
+                child_tools_have_revocations: false,
                 copy_cache: uuid::Uuid::new_v4(),
                 copy_revision: 0,
                 copy_projection: Default::default(),
@@ -338,6 +358,7 @@ impl Store {
             item.started_at = item.at;
         }
         let mut preserve_input = false;
+        let mut inherited_identity = false;
         if let Some((_, metadata, _)) = &previous {
             let old: Item = postcard::from_bytes(metadata).map_err(|e| e.to_string())?;
             item.started_at = old.started_at.or(old.at).or(item.started_at);
@@ -350,6 +371,7 @@ impl Store {
             ) = (&mut item.content, old.content)
             {
                 if name.is_empty() {
+                    inherited_identity = true;
                     *name = old_name;
                 }
                 preserve_input = input.is_empty();
@@ -456,10 +478,22 @@ impl Store {
         } else {
             false
         };
+        let source_shortened = shortened
+            || ((preserve_input || inherited_identity)
+                && self
+                    .db
+                    .query_row(
+                        "SELECT source_shortened FROM items WHERE id=?1",
+                        [&item.id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false));
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
-        transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans]).map_err(|e| e.to_string())?;
+        transaction.execute("INSERT INTO items(id,ordinal,metadata,len0,len1,len2,spans,source_shortened) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans,source_shortened=excluded.source_shortened", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans,source_shortened]).map_err(|e| e.to_string())?;
         if preserve_input {
             transaction
                 .execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])
@@ -751,7 +785,16 @@ impl Store {
     }
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
+    #[cfg(test)]
+    pub(crate) fn adapter_reader_for_test(
+        store: &std::sync::Arc<std::sync::Mutex<Self>>,
+    ) -> std::sync::Arc<dyn crate::chat::protocol::CanonicalItemReader> {
+        adapter_items::reader(store)
+    }
     pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
+        if matches!(&event, Event::Reset { .. }) {
+            self.canonical_generation = uuid::Uuid::new_v4();
+        }
         if let Some(seal) = &self.messages {
             match &mut event {
                 Event::Item(item) => seal.recognize(item),
@@ -761,8 +804,21 @@ impl Store {
                 _ => {}
             }
         }
+        if self.revoked_child_tool_event(&event)? {
+            return Ok(vec![nonfatal(
+                "Delegated tool source was removed or changed kind; its late update was discarded"
+                    .into(),
+            )]);
+        }
+        let mut out = if matches!(&event, Event::Reset { .. }) {
+            Vec::new()
+        } else {
+            self.cache_child_tool(&event)?
+                .into_iter()
+                .map(nonfatal)
+                .collect::<Vec<_>>()
+        };
         self.index_child_event(&event)?;
-        let mut out = Vec::new();
         let earlier = matches!(&event, Event::History { .. });
         if !matches!(&event, Event::TextDelta { .. })
             && let Some(warning) = self.flush_text()?
@@ -907,16 +963,10 @@ impl Store {
                 self.dirty = true;
             }
             Event::Reset { reason } => {
-                self.files_reset()?;
-                self.db
-                    .execute("DELETE FROM copy_sources", [])
-                    .map_err(|e| e.to_string())?;
+                self.reset_adapter_sources()?;
                 self.copy_cache = uuid::Uuid::new_v4();
                 self.copy_revision = self.copy_revision.wrapping_add(1);
                 self.copy_projection.clear();
-                self.db
-                    .execute("DELETE FROM items", [])
-                    .map_err(|e| e.to_string())?;
                 self.end = None;
                 self.first = None;
                 self.newest = None;
@@ -961,6 +1011,46 @@ impl Store {
             }
         }
         Ok(out)
+    }
+    fn reset_adapter_sources(&mut self) -> Result<(), String> {
+        let previous = (
+            self.file_revision,
+            self.child_files_seen,
+            self.file_index_incomplete,
+            self.file_keys,
+            self.applied_files,
+        );
+        self.db
+            .execute_batch("SAVEPOINT reset_adapter_sources")
+            .map_err(|e| e.to_string())?;
+        let result = (|| {
+            self.files_reset()?;
+            self.db.execute_batch("DELETE FROM copy_sources; DELETE FROM items; DELETE FROM adapter_task_items; DELETE FROM child_tools; DELETE FROM child_tool_revoked; UPDATE child_tool_budget SET bytes=0,items=0,chunks=0 WHERE singleton=1;").map_err(|e|e.to_string())?;
+            self.db
+                .execute_batch("RELEASE reset_adapter_sources")
+                .map_err(|e| e.to_string())
+        })();
+        if let Err(error) = result {
+            let rollback = self
+                .db
+                .execute_batch("ROLLBACK TO reset_adapter_sources; RELEASE reset_adapter_sources");
+            (
+                self.file_revision,
+                self.child_files_seen,
+                self.file_index_incomplete,
+                self.file_keys,
+                self.applied_files,
+            ) = previous;
+            if let Err(rollback) = rollback {
+                self.child_tools_unavailable = Some("Canonical source reset rollback failed");
+                return Err(format!("{error}; reset rollback failed: {rollback}"));
+            }
+            return Err(error);
+        }
+        self.pending_child_tool = None;
+        self.child_tools_unavailable = None;
+        self.child_tools_have_revocations = false;
+        Ok(())
     }
     fn flush_text(&mut self) -> Result<Option<String>, String> {
         match self.pending_text.take() {
