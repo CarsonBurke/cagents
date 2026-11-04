@@ -154,6 +154,15 @@ pub fn open(
     open_with_receipt(&root()?, terminal, metadata)
 }
 
+/// A terminal's earlier output after its daemon is gone, so no host can issue a
+/// receipt. The path comes from the identity and never from saved state, and
+/// `open_in` applies the same ownership and mode checks.
+pub fn open_without_host(terminal: TerminalId) -> Result<ValidatedTranscript, Unavailable> {
+    let root = root()?;
+    let path = root.join(format!("{terminal}.log"));
+    open_in(&root, terminal, &path)
+}
+
 fn open_with_receipt(
     root: &Path,
     terminal: TerminalId,
