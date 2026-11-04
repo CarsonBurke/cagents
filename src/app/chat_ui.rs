@@ -10084,11 +10084,9 @@ impl Cagents {
                             if account_source.is_some()
                                 || source != &attempt.session
                                 || !chat::is_retained_resume_commit(source, &replacement)
-                                || handle
-                                    .snapshot()
-                                    .session_id
-                                    .as_ref()
-                                    .is_some_and(|id| Some(id) != source.launch.session_id.as_ref())
+                                // The successor is started on the source's
+                                // conversation, so its first snapshot names it.
+                                || handle.snapshot().session_id != source.launch.session_id
                             {
                                 self.status = Some(TransientNotice::error(
                                     "The reopened conversation did not match the saved one. Its saved identity is retained.",

@@ -1331,8 +1331,8 @@ fn restore(
 /// group), and allocates it under a new identity so the old allocation's
 /// census is never reused. Nothing the old actor held is resubmitted: the
 /// successor starts the provider on the saved conversation with no input.
-/// A card that never learned its conversation has nothing to resume and opens
-/// as a draft instead.
+/// A card that never learned its conversation ID cannot name what to resume,
+/// so it keeps its card and offers Retry; it never becomes a draft.
 fn resume_retained_claude(
     stream: &mut UnixStream,
     codec: &mut FrameCodec,
@@ -1343,8 +1343,11 @@ fn resume_retained_claude(
     refusal: Option<String>,
 ) -> Result<ClientRequest, StartFailure> {
     if session.launch.session_id.is_none() {
-        return Err(StartFailure::fresh(format!(
-            "The helper that was hosting this conversation is no longer running, and it never recorded a conversation to resume. {}",
+        // Claude can write a transcript before it reports the conversation
+        // ID, so a missing ID proves nothing about what is on disk. The card
+        // keeps its conversation and offers Retry rather than a draft.
+        return Err(StartFailure::retry(format!(
+            "The saved native conversation could not be reattached. Its uncertain work was not restarted or resubmitted. {}",
             refusal.unwrap_or_else(|| "No authenticated native holder was available.".to_owned())
         )));
     }
@@ -3956,11 +3959,11 @@ mod tests {
     }
 
     #[test]
-    fn stranded_retained_claude_card_without_a_conversation_opens_as_a_draft() {
+    fn stranded_retained_claude_card_without_a_conversation_id_keeps_its_card() {
         let (result, resumed, asked) =
             resume_stranded(stranded_claude(None), |_| panic!("nothing to resume"));
         let failure = result.unwrap_err();
-        assert_eq!(failure.recovery, crate::chat::Recovery::Fresh);
+        assert_eq!(failure.recovery, crate::chat::Recovery::Retry);
         assert!(resumed.is_none());
         assert_eq!(asked, 1, "only the upgrade lineage is asked");
     }
