@@ -312,8 +312,12 @@ fn transfer_agent(
             return Ok(());
         }
         agent.placement = destination.clone();
+        // Keep a daemon stop's `process_end` marker, which lives only in the
+        // stored record: moving a stopped card must not make it unclosable.
         db.execute(
-            "UPDATE agents SET record=?2 WHERE id=?1",
+            "UPDATE agents SET record=CASE WHEN json_extract(record,'$.process_end') IS NULL THEN ?2
+                 ELSE json_set(?2,'$.process_end',json_extract(record,'$.process_end')) END
+             WHERE id=?1",
             params![
                 agent.id.to_string(),
                 serde_json::to_string(&agent).map_err(|error| error.to_string())?
