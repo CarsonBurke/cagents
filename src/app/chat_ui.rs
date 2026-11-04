@@ -37,6 +37,7 @@ mod literal_content;
 mod markdown;
 mod markdown_source;
 mod monospace;
+mod observed_notices;
 mod pending_admission;
 mod permissions;
 mod preparation;
@@ -188,6 +189,17 @@ pub enum Action {
     CancelQueued(Target),
     Switch(CardId),
     Ready(Target, Ready),
+    ObservedNoticesReady(
+        observed_notices::Ticket,
+        Ready,
+        Arc<observed_notices::Loaded>,
+    ),
+    ObservedNoticesBound(observed_notices::Ticket, Arc<observed_notices::Loaded>),
+    ObservedNoticesSaved(
+        observed_notices::Ticket,
+        Arc<observed_notices::Loaded>,
+        Result<(), crate::session::ObservedNoticeSaveFailure>,
+    ),
     AccountCommitted(Target, Ready, Result<(), String>),
     UpgradeCommitted(Target, Ready, Result<(), String>),
     RetainedCopyCommitted(CardId, Result<(), String>),
@@ -414,6 +426,9 @@ impl Action {
         matches!(
             self,
             Self::Ready(..)
+                | Self::ObservedNoticesReady(..)
+                | Self::ObservedNoticesBound(..)
+                | Self::ObservedNoticesSaved(..)
                 | Self::FindAvailable
                 | Self::FindGroups(..)
                 | Self::FindHighlight(..)
@@ -541,6 +556,7 @@ struct Attempt {
     upgrade_committed: bool,
     /// Exact authoritative target; only authenticated upgrade resolution may bind its draft.
     upgrade_admission: Option<chat::Session>,
+    observed_notices: Option<observed_notices::ReadyState>,
 }
 
 struct LocalReturn {
@@ -587,6 +603,8 @@ pub(super) struct State {
     receiver: async_channel::Receiver<(Target, Wake)>,
     generation: u64,
     phases: HashMap<CardId, Phase>,
+    closing_notices: Vec<observed_notices::Capture>,
+    notice_ready_cleanup: Vec<(Target, Ready)>,
     /// Transient user intent, never an execution proof. Automatic restoration
     /// cannot acquire this permission; an exact failed History start can retry.
     explicit_starts: HashMap<CardId, chat::Session>,
@@ -635,6 +653,8 @@ impl Default for State {
             receiver,
             generation: 0,
             phases: HashMap::new(),
+            closing_notices: Vec::new(),
+            notice_ready_cleanup: Vec::new(),
             explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
@@ -2140,6 +2160,7 @@ pub(super) struct Runtime {
     capacity_refused: bool,
     /// Local send errors anchored to the exchange that produced them.
     failures: Vec<failure::Note>,
+    observed_notices: observed_notices::RuntimeState,
     /// Notices raised while an earlier page is shown. That page holds
     /// neither the latest prompt nor the latest work, so they are recorded
     /// when the latest page next arrives.
@@ -2957,6 +2978,17 @@ impl Runtime {
         visible: bool,
         syntax_theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
+        Self::new_with_observed_notices(target, session, connection, visible, syntax_theme, None)
+    }
+
+    fn new_with_observed_notices(
+        target: Target,
+        session: chat::Session,
+        connection: Connection,
+        visible: bool,
+        syntax_theme: crate::settings::EditorSyntaxTheme,
+        observed: Option<Arc<observed_notices::Loaded>>,
+    ) -> Self {
         let permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
         let mut runtime = Self {
@@ -3035,6 +3067,7 @@ impl Runtime {
             error: None,
             capacity_refused: false,
             failures: Vec::new(),
+            observed_notices: observed_notices::RuntimeState::default(),
             unplaced_failures: Vec::new(),
             failure_ui: failure::State::default(),
             reasoning_picker: false,
@@ -3062,6 +3095,9 @@ impl Runtime {
             completion: completion::State::default(),
             suggestion_dismissed: None,
         };
+        if let Some(observed) = observed {
+            runtime.restore_observed_notices(observed);
+        }
         runtime.refresh();
         runtime
     }
@@ -3095,6 +3131,7 @@ impl Runtime {
         self.child_unfolded.clear();
         self.answers.clear();
         self.failures.clear();
+        self.retire_observed_notices(None);
         self.unplaced_failures.clear();
         self.failure_ui = failure::State::default();
         self.child_picker = None;
@@ -3191,6 +3228,9 @@ impl Runtime {
                 self.failures.push(note);
                 changed = true;
             }
+            if changed {
+                self.observe_capacity_notice(self.failures.len() - 1);
+            }
             return changed;
         }
         if self.failures.len() == 32 {
@@ -3201,6 +3241,7 @@ impl Runtime {
             after,
             text: notice,
         });
+        self.observe_capacity_notice(self.failures.len() - 1);
         true
     }
     /// Puts a first message that was never sent back in the composer, ahead
@@ -4304,8 +4345,14 @@ impl Runtime {
         {
             self.replace_draft(text_editor::Content::with_text(text));
         }
-        if snapshot.session_id.is_some() || self.snapshot.session_id.is_some() {
-            self.session.launch.session_id = snapshot.session_id.clone();
+        if (snapshot.session_id.is_some() || self.snapshot.session_id.is_some())
+            && self.session.launch.session_id != snapshot.session_id
+        {
+            let mut launch = self.session.launch.clone();
+            launch.session_id = snapshot.session_id.clone();
+            self.promote_observed_notices(&launch);
+            self.retire_observed_notices(Some(&launch));
+            self.session.launch = launch;
         }
         // Each question's boundary is recorded once, against whatever item was
         // newest when it arrived, so it lands where the reader was actually
@@ -4651,8 +4698,14 @@ impl Runtime {
     fn refresh_session(&mut self) {
         let Some(handle) = self.handle() else { return };
         let observed = handle.session();
-        if let Some(id) = &observed.launch.session_id {
-            self.session.launch.session_id = Some(id.clone());
+        if let Some(id) = &observed.launch.session_id
+            && self.session.launch.session_id.as_ref() != Some(id)
+        {
+            let mut launch = self.session.launch.clone();
+            launch.session_id = Some(id.clone());
+            self.promote_observed_notices(&launch);
+            self.retire_observed_notices(Some(&launch));
+            self.session.launch = launch;
         }
         self.session.learn_native_continuity_from(&observed);
     }
@@ -5577,6 +5630,7 @@ impl Cagents {
         runtime.snapshot = Arc::new(snapshot);
         runtime.completion.restart(true);
         if let Some(session) = &moved {
+            runtime.prepare_observed_session(&session);
             runtime.session = session.clone();
             runtime.error = None;
         }
@@ -5679,6 +5733,7 @@ impl Cagents {
         if session == runtime.session {
             return Task::none();
         }
+        runtime.prepare_observed_session(&session);
         runtime.session = session.clone();
         Arc::make_mut(&mut runtime.snapshot).skills.clear();
         Arc::make_mut(&mut runtime.snapshot).permission_mode =
@@ -5813,6 +5868,7 @@ impl Cagents {
                 intent: chat::Intent::Restore,
                 session: replacement.clone(),
                 upgrade_committed: false,
+                observed_notices: None,
                 upgrade_admission: None,
                 recovery: Some(AccountRecovery {
                     source: source.clone(),
@@ -6769,6 +6825,7 @@ impl Cagents {
     }
 
     pub(super) fn chat_forget(&mut self, card: CardId) {
+        self.capture_closing_observed_notices(card);
         self.chat_ui.explicit_starts.remove(&card);
         self.chat_ui.capacity_offers.remove(&card);
         // The runtime is about to be dropped, so its unsent text is captured
@@ -6808,6 +6865,13 @@ impl Cagents {
         // leaves in the daemon is given up when it answers, as for a close.
         match self.chat_ui.phases.remove(&card) {
             Some(Phase::Starting(attempt)) => {
+                if let Some(observed_notices::ReadyState::Loading { ready, .. }) =
+                    attempt.observed_notices
+                {
+                    self.chat_ui
+                        .notice_ready_cleanup
+                        .push((attempt.target, ready));
+                }
                 self.chat_ui
                     .abandoned
                     .insert(attempt.target, attempt.session);
@@ -7416,6 +7480,7 @@ impl Cagents {
                 session: session.clone(),
                 recovery: None,
                 upgrade_committed: false,
+                observed_notices: None,
                 upgrade_admission: upgrade_admission.clone(),
             }),
         );
@@ -7750,6 +7815,7 @@ impl Cagents {
         runtime.model_picker = None;
         runtime.account_picker = false;
         runtime.reasoning_picker = false;
+        runtime.prepare_observed_session(&session);
         runtime.session = session.clone();
         self.replace_chat_conversation(target.card, session.clone());
         self.start_chat(target.card, session, chat::Intent::Start, None, false)
@@ -7972,6 +8038,7 @@ impl Cagents {
             Connection::Live(handle) => Some(handle),
             Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
         };
+        runtime.prepare_observed_session(&draft);
         runtime.session = draft.clone();
         runtime.snapshot = Arc::new(snapshot);
         runtime.forget_transcript();
@@ -8340,6 +8407,20 @@ impl Cagents {
     }
 
     fn handle_chat_ui_inner(&mut self, action: Action) -> Task<Message> {
+        let action = match action {
+            Action::ObservedNoticesReady(target, ready, loaded) => {
+                return self.finish_ready_observed_notices(target, ready, loaded);
+            }
+            Action::ObservedNoticesBound(target, loaded) => {
+                self.finish_bound_observed_notices(target, loaded);
+                return Task::none();
+            }
+            Action::ObservedNoticesSaved(ticket, loaded, result) => {
+                self.finish_saved_observed_notices(ticket, loaded, result);
+                return Task::none();
+            }
+            action => action,
+        };
         if crate::device::is_remote()
             && let Action::PastedImage(target, id, Some(_)) = &action
         {
@@ -8383,6 +8464,9 @@ impl Cagents {
             return Task::none();
         }
         match action {
+            Action::ObservedNoticesReady(..)
+            | Action::ObservedNoticesBound(..)
+            | Action::ObservedNoticesSaved(..) => unreachable!("notice callbacks handled above"),
             Action::CopyClosedDraft(target, revision) => {
                 return self.copy_closed_chat_draft(target, revision);
             }
@@ -8747,6 +8831,12 @@ impl Cagents {
                 return self.update(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::Ready(target, ready) => {
+                if self.chat_ui.attempt(target.card).is_some_and(|attempt| {
+                    attempt.target == target
+                        && matches!(&attempt.observed_notices, Some(observed_notices::ReadyState::Loading { ready: pending, .. }) if Arc::ptr_eq(&pending.0, &ready.0))
+                }) {
+                    return Task::none();
+                }
                 let result = ready.0.lock().ok().and_then(|mut ready| ready.take());
                 let Some(result) = result else {
                     return Task::none();
@@ -8764,11 +8854,11 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
-                let recovery = attempt.recovery.take();
+                let recovery = attempt.recovery.as_ref();
                 let automatic_submit = recovery.as_ref().and_then(|recovery| recovery.submit);
                 let account_committed =
                     recovery.as_ref().is_some_and(|recovery| recovery.committed);
-                let account_source = recovery.map(|recovery| recovery.source);
+                let account_source = recovery.map(|recovery| recovery.source.clone());
                 let upgrade_source = result
                     .as_ref()
                     .ok()
@@ -8959,6 +9049,20 @@ impl Cagents {
                                 });
                             }
                         }
+                        // Optional local history cannot delay account/upgrade
+                        // admission. A reconstructed named transcript loads its
+                        // retained notices before the first grouping; an existing
+                        // same-owner runtime already retains its notes.
+                        if let Some(task) = self.load_ready_observed_notices(&mut attempt, &handle)
+                        {
+                            self.chat_ui
+                                .phases
+                                .insert(target.card, Phase::Starting(attempt));
+                            return task;
+                        }
+                        let hydrate_live_history = attempt.session.launch.session_id.is_some()
+                            || account_source.is_some()
+                            || attempt.upgrade_admission.is_some();
                         if attempt.upgrade_admission.is_some() {
                             Arc::make_mut(&mut self.durable)
                                 .pending_chat_admissions
@@ -8979,6 +9083,10 @@ impl Cagents {
                         let visible = self.workspace.visibility(target.card)
                             == Some(VisibilityClass::Visible)
                             && self.workspace_surfaces_visible();
+                        let observed = attempt
+                            .observed_notices
+                            .take()
+                            .and_then(|state| state.loaded());
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.preparation.clear();
                             if let Some(queued) = &mut runtime.queued {
@@ -8989,6 +9097,7 @@ impl Cagents {
                             runtime.model_picker = None;
                             runtime.account_picker = false;
                             runtime.reasoning_picker = false;
+                            runtime.prepare_observed_session(&session);
                             runtime.session = session.clone();
                             runtime.disconnected = false;
                             runtime.pending = None;
@@ -9000,15 +9109,24 @@ impl Cagents {
                             runtime.later_asked = None;
                             runtime.error = None;
                             runtime.capacity_refused = false;
+                            if let Some(observed) = observed {
+                                runtime.restore_observed_notices(observed);
+                            } else if hydrate_live_history {
+                                runtime.prepare_observed_history();
+                            }
                             runtime.show(visible);
                         } else {
-                            let mut runtime = Runtime::new(
+                            let mut runtime = Runtime::new_with_observed_notices(
                                 target,
                                 session.clone(),
                                 Connection::Live(handle),
                                 visible,
                                 self.settings.editor_syntax_theme,
+                                observed,
                             );
+                            if hydrate_live_history {
+                                runtime.prepare_observed_history();
+                            }
                             // Whatever was typed before this card last left the
                             // chat surface comes back with it.
                             if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
@@ -19014,10 +19132,33 @@ mod tests {
         target: Target,
         result: Result<Arc<ClientHandle>, chat::StartFailure>,
     ) {
+        if let Ok(handle) = &result {
+            prepare_observed_fixture(app, target, handle);
+        }
         let _ = app.update(Message::ChatUi(Action::Ready(
             target,
             Ready(Arc::new(Mutex::new(Some(result)))),
         )));
+    }
+
+    fn prepare_observed_fixture(app: &mut Cagents, target: Target, handle: &Arc<ClientHandle>) {
+        // Lifecycle fixtures prepare the journal explicitly, as rendering
+        // fixtures prepare markdown. Focused journal tests drive the real task.
+        if let Some(writer) = app.session.as_ref()
+            && handle.session().launch.session_id.is_some()
+        {
+            let store = writer.operation_store();
+            let launch = handle.session().launch;
+            let loaded = std::thread::spawn(move || observed_notices::load(&store, launch, true))
+                .join()
+                .unwrap();
+            if let Some(Phase::Starting(attempt)) = app.chat_ui.phases.get_mut(&target.card)
+                && attempt.target == target
+            {
+                attempt.observed_notices =
+                    Some(observed_notices::ReadyState::Complete(Arc::new(loaded)));
+            }
+        }
     }
 
     /// Whether `task` asks for the keyboard to go to `control`.
@@ -19124,23 +19265,50 @@ mod tests {
         );
     }
 
-    fn account_commit_reply(task: Task<Message>) -> Message {
-        use cosmic::iced::futures::StreamExt;
+    fn account_commit_reply(app: &mut Cagents, task: Task<Message>) -> Message {
+        use cosmic::iced::futures::{StreamExt, stream::SelectAll};
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async {
                 tokio::time::timeout(Duration::from_secs(10), async {
-                    let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
-                    while let Some(action) = stream.next().await {
-                        if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
-                            message @ Message::ChatUi(
-                                Action::AccountCommitted(..) | Action::UpgradeCommitted(..),
-                            ),
-                        )) = action
+                    let mut streams = SelectAll::new();
+                    if let Some(stream) = cosmic::iced::runtime::task::into_stream(task) {
+                        streams.push(stream.boxed_local());
+                    }
+                    while let Some(action) = streams.next().await {
+                        if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) =
+                            action
                         {
-                            return message;
+                            match message {
+                                message @ Message::ChatUi(
+                                    Action::AccountCommitted(..) | Action::UpgradeCommitted(..),
+                                ) => {
+                                    if let Message::ChatUi(
+                                        Action::AccountCommitted(target, ready, Ok(()))
+                                        | Action::UpgradeCommitted(target, ready, Ok(())),
+                                    ) = &message
+                                        && let Some(Ok(handle)) =
+                                            ready.0.lock().ok().and_then(|reply| reply.clone())
+                                    {
+                                        prepare_observed_fixture(app, *target, &handle);
+                                    }
+                                    return message;
+                                }
+                                message @ Message::ChatUi(
+                                    Action::ObservedNoticesReady(..)
+                                    | Action::ObservedNoticesBound(..)
+                                    | Action::ObservedNoticesSaved(..),
+                                ) => {
+                                    if let Some(stream) = cosmic::iced::runtime::task::into_stream(
+                                        app.update(message),
+                                    ) {
+                                        streams.push(stream.boxed_local());
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     panic!("account commit produced no acknowledgment");
@@ -23189,6 +23357,7 @@ mod tests {
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
+                    observed_notices: None,
                     upgrade_admission: None,
                 }),
             );
@@ -23198,12 +23367,20 @@ mod tests {
                 Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
             )));
             assert!(app.chat_start_pending(card));
+            assert!(
+                app.chat_ui
+                    .attempt(card)
+                    .unwrap()
+                    .observed_notices
+                    .is_none(),
+                "upgrade admission must precede optional capacity-history IO"
+            );
             assert_eq!(
                 app.card_state(card).unwrap().kind,
                 CardKind::Chat(source.clone())
             );
             assert!(!app.cards.contains_key(&card));
-            let receipt = account_commit_reply(task);
+            let receipt = account_commit_reply(&mut app, task);
             if writer_refused {
                 assert!(matches!(&receipt,
                     Message::ChatUi(Action::UpgradeCommitted(_, _, Err(reason)))
@@ -23247,6 +23424,7 @@ mod tests {
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
+                        observed_notices: None,
                         upgrade_admission: None,
                     }),
                 );
@@ -23401,7 +23579,7 @@ mod tests {
                 app.card_state(card).unwrap().kind,
                 CardKind::Chat(source.clone())
             );
-            let reply = account_commit_reply(task);
+            let reply = account_commit_reply(&mut app, task);
             assert!(matches!(
                 &reply,
                 Message::ChatUi(Action::AccountCommitted(_, _, Err(_)))
@@ -23441,7 +23619,7 @@ mod tests {
             if close_before_ack {
                 app.notices.entries.clear();
                 close_chat(&mut app, card);
-                let reply = account_commit_reply(task);
+                let reply = account_commit_reply(&mut app, task);
                 let _ = app.update(reply);
                 app.session
                     .as_ref()
@@ -23457,7 +23635,7 @@ mod tests {
                 retired(&mut app, card);
                 continue;
             }
-            let reply = account_commit_reply(task);
+            let reply = account_commit_reply(&mut app, task);
             let _ = app.update(reply);
             let CardKind::Chat(recovered) = &app.card_state(card).unwrap().kind else {
                 panic!("chat retained");
@@ -23620,7 +23798,7 @@ mod tests {
         );
         assert_eq!(app.sidebar_state.card_activity(card), activity_before);
         assert!(app.sidebar_state.has_card_update(card));
-        let reply = account_commit_reply(task);
+        let reply = account_commit_reply(&mut app, task);
         assert!(matches!(
             &reply,
             Message::ChatUi(Action::AccountCommitted(_, _, Ok(())))
@@ -26789,7 +26967,7 @@ mod tests {
             f.source,
             "a connected handle is not the durable writer ACK"
         );
-        let receipt = account_commit_reply(checkpoint);
+        let receipt = account_commit_reply(&mut f.app, checkpoint);
         assert!(matches!(
             &receipt,
             Message::ChatUi(Action::UpgradeCommitted(_, _, Ok(())))
@@ -26834,14 +27012,19 @@ mod tests {
         exercise_live_shared_recovery(true);
     }
 
-    fn assert_no_live_upgrade_checkpoint(task: Task<Message>) {
-        use cosmic::iced::futures::StreamExt;
+    fn assert_no_live_upgrade_checkpoint(app: &mut Cagents, task: Task<Message>) {
+        use cosmic::iced::futures::{StreamExt, stream::SelectAll};
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) else { return };
+            let mut streams = SelectAll::new();
+            if let Some(stream) = cosmic::iced::runtime::task::into_stream(task) { streams.push(stream.boxed_local()); }
             tokio::time::timeout(Duration::from_secs(5), async {
-                while let Some(action) = stream.next().await {
+                while let Some(action) = streams.next().await {
                     if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
-                        assert!(!matches!(message, Message::ChatUi(Action::UpgradeCommitted(..) | Action::AccountCommitted(..) | Action::Ready(..) | Action::Retired(..))), "refused or stale Ready cannot checkpoint, activate or retire an actor");
+                        if matches!(&message, Message::ChatUi(Action::ObservedNoticesReady(..) | Action::ObservedNoticesBound(..) | Action::ObservedNoticesSaved(..))) {
+                            if let Some(stream) = cosmic::iced::runtime::task::into_stream(app.update(message)) { streams.push(stream.boxed_local()); }
+                        } else {
+                            assert!(!matches!(message, Message::ChatUi(Action::UpgradeCommitted(..) | Action::AccountCommitted(..) | Action::Ready(..) | Action::Retired(..))), "refused or stale Ready cannot checkpoint, activate or retire an actor");
+                        }
                     }
                 }
             }).await.expect("ancillary UI tasks must settle without an upgrade checkpoint");
@@ -26979,15 +27162,15 @@ mod tests {
                 Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
             )));
             if case == "unproved" {
-                assert_no_live_upgrade_checkpoint(checkpoint);
+                assert_no_live_upgrade_checkpoint(&mut f.app, checkpoint);
                 assert_live_recovery_content(&f);
                 assert_eq!(chat_runtime(&f.app, f.card).session, f.source);
                 assert!(!chat_runtime(&f.app, f.card).connected());
             } else if case == "newer canonical before Ready" {
-                assert_no_live_upgrade_checkpoint(checkpoint);
+                assert_no_live_upgrade_checkpoint(&mut f.app, checkpoint);
                 assert_inert_live_recovery_copy(&f);
             } else {
-                let receipt = account_commit_reply(checkpoint);
+                let receipt = account_commit_reply(&mut f.app, checkpoint);
                 if case == "writer refusal" {
                     assert!(
                         matches!(&receipt, Message::ChatUi(Action::UpgradeCommitted(_, _, Err(error))) if error.contains("fixture refused recovery"))
@@ -27031,6 +27214,7 @@ mod tests {
                         submit: None,
                     }),
                     upgrade_committed: false,
+                    observed_notices: None,
                     upgrade_admission: None,
                 }),
                 "return" => Phase::Returning {
@@ -27048,6 +27232,7 @@ mod tests {
                         session: other,
                         recovery: None,
                         upgrade_committed: false,
+                        observed_notices: None,
                         upgrade_admission: None,
                     })
                 }
@@ -27181,7 +27366,7 @@ mod tests {
             target,
             Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
         )));
-        let receipt = account_commit_reply(task);
+        let receipt = account_commit_reply(&mut f.app, task);
         assert!(
             matches!(&receipt, Message::ChatUi(Action::UpgradeCommitted(_, _, Err(error))) if error.contains("saved conversation changed"))
         );
@@ -27332,6 +27517,7 @@ mod tests {
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
+                    observed_notices: None,
                     upgrade_admission: None,
                 }),
             );
@@ -27350,7 +27536,7 @@ mod tests {
             // This changed old-source autosave must translate only after the ordered CAS succeeds.
             app.card_state_mut(card).unwrap().title = "Edited while recovery waits".into();
             app.persist();
-            let receipt = account_commit_reply(task);
+            let receipt = account_commit_reply(&mut app, task);
             if refused {
                 assert!(matches!(
                     &receipt,
@@ -27410,6 +27596,7 @@ mod tests {
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
+                        observed_notices: None,
                         upgrade_admission: None,
                     }),
                 );

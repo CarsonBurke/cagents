@@ -860,6 +860,12 @@ fn quarantined_write_line<'a>(
                 format!("Latest changes to pane “{title}” (storage keeps its last saved state)")
             },
         ),
+        WriteSubject::ObservedNotices { card } => card_title(*card).map_or_else(
+            || "Earlier capacity-error details (still pending after closing)".to_owned(),
+            |title| {
+                format!("Earlier capacity-error details in “{title}” (still pending after closing)")
+            },
+        ),
         WriteSubject::CardIdentity {
             card,
             kind: ReplacedIdentity::Terminal,
@@ -929,7 +935,15 @@ fn save_quarantine_view<'a>(
         ("Retry requested; waiting for the session writer.", None)
     } else {
         (
-            QUARANTINE_GUIDANCE,
+            if health
+                .quarantined
+                .iter()
+                .any(|write| matches!(write.subject, WriteSubject::ObservedNotices { .. }))
+            {
+                "Retry saving the pending changes. Earlier capacity-error details remain pending after the conversation closes; changing or closing a pane does not clear them."
+            } else {
+                QUARANTINE_GUIDANCE
+            },
             (health.offers_retry() && !lane_offers_retry).then(|| {
                 notice_surface_action(
                     NoticeSeverity::Error,
@@ -17777,6 +17791,7 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::RetrySessionSave => {
+                self.retry_observed_chat_notices();
                 if let (Some(session), Some(health)) = (&self.session, &mut self.save_health) {
                     health.request_retry(session);
                 }
@@ -18104,13 +18119,14 @@ impl Application for Cagents {
         ])
             })();
         self.reconcile_chat_failure_presentations();
+        let observed_notices = self.persist_observed_chat_notices();
         if attention_scope_changed {
             self.notification_ui.scope_changed();
         }
         let activation = self.retry_notification_activation();
         let visibility = self.sync_visible_attention();
         self.sync_notification_presence();
-        Task::batch([task, activation, visibility])
+        Task::batch([task, activation, visibility, observed_notices])
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -20238,6 +20254,15 @@ mod tests {
         let line = quarantined_write_line(&write(WriteSubject::Workspace { card: None }), &titled);
         assert!(line.starts_with("Window layout and panes —"), "{line}");
         assert!(!line.contains("closing the pane"), "{line}");
+
+        let capacity = write(WriteSubject::ObservedNotices { card });
+        let line = quarantined_write_line(&capacity, &titled);
+        assert!(
+            line.contains("Earlier capacity-error details in “build”"),
+            "{line}"
+        );
+        assert!(line.contains("still pending after closing"), "{line}");
+        assert!(!line.contains("closing the pane clears it"), "{line}");
     }
 
     fn launch_recipe(working_directory: impl Into<PathBuf>) -> LaunchRecipe {

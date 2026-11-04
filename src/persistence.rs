@@ -29,6 +29,7 @@ use crate::{
     },
 };
 
+pub(crate) mod observed_notices;
 #[cfg(feature = "ui")]
 mod review_cache;
 
