@@ -142,8 +142,9 @@ umask 022
 # Parallel fixtures hold many sockets and pipes; the inherited soft limit
 # (often 1024) is not a release property, so use the whole hard limit.
 ulimit -n "$(ulimit -Hn)"
-# Test threads follow the job count chosen for this host's memory.
-export RUST_TEST_THREADS=${CARGO_BUILD_JOBS:-2}
+# Compilation uses every job; tests keep their qualified concurrency. Several
+# UI fixtures still interfere at higher parallelism (#2058).
+export RUST_TEST_THREADS=2
 # Tests keep release semantics (optimized, production identity, no debug
 # assertions) without the LTO and single codegen unit of shipped binaries.
 # The lane defines this profile, so refs that predate it build the same way.
