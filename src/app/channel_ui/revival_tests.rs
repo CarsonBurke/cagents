@@ -616,8 +616,8 @@ fn a_channel_deleted_elsewhere_is_not_revived() {
     assert_eq!(fixture.resumed().title, TITLE);
 }
 
-/// Reopening reaches back only within the project on screen: a channel that
-/// retired in another project is not revived from here.
+/// Reopening revives a retired channel only from its own project's
+/// worktrees: not from another project, nor from another channel.
 #[test]
 fn reopening_in_another_project_leaves_a_retired_channel_alone() {
     let mut fixture = fixture();
@@ -630,6 +630,21 @@ fn reopening_in_another_project_leaves_a_retired_channel_alone() {
 
     assert!(fixture.app.durable.channels.is_empty());
     assert_eq!(fixture.app.durable.cards.len(), cards);
+    assert_eq!(fixture.app.recently_closed.len(), 1);
+
+    // Nor from another channel, even in its own project: that channel
+    // reopens its own panes.
+    let path = fixture.directory.path().to_path_buf();
+    drop(fixture.app.select_worktree(path, false));
+    let other = fixture
+        .app
+        .create_channel(fixture.project, "Other".into(), Default::default())
+        .unwrap();
+    drop(fixture.app.select_channel(other));
+    assert_eq!(fixture.app.durable.active_channel, Some(other));
+    fixture.reopen_pane();
+    assert_eq!(fixture.app.durable.active_channel, Some(other));
+    assert_eq!(fixture.app.durable.channels.len(), 1);
     assert_eq!(fixture.app.recently_closed.len(), 1);
 
     // Back in its own project, it still reopens into its channel.

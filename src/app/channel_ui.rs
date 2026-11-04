@@ -631,8 +631,9 @@ impl Cagents {
     }
 
     /// Whether a card closed in channel `id` reopens from `scope`: from the
-    /// channel it now resolves to, or, once that channel retired, from
-    /// anywhere in its project, since it is no longer anywhere to reopen from.
+    /// channel it now resolves to, or, once that channel retired, from the
+    /// project's worktrees, where the window fell back to when it retired.
+    /// Another channel keeps reopening its own panes.
     pub(super) fn closed_channel_reopens_from(
         &self,
         id: ChannelId,
@@ -649,7 +650,9 @@ impl Cagents {
                     .iter()
                     .find(|emptied| emptied.id == retired)
                     .map(|emptied| emptied.project_id);
-                project.is_some() && project == self.destination_project(scope)
+                !matches!(scope, Some(WorkspaceDestination::Channel(_)))
+                    && project.is_some()
+                    && project == self.destination_project(scope)
             }
             Some(ClosedCardHome::Strip) | None => false,
         }
