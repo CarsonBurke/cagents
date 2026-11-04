@@ -2231,7 +2231,7 @@ impl Actor {
             {
                 return Err(with_ignored_output(
                     if self.first_frame {
-                        "Provider initialization timed out before handshake completion"
+                        "Provider initialization timed out before the provider reported it was ready"
                     } else {
                         "Provider initialization timed out without a JSON protocol frame"
                     },
@@ -7339,9 +7339,8 @@ mod tests {
         let snapshot = finish_initialization_pipe(&handle, IO_TIMEOUT + Duration::from_secs(5));
         assert!(!snapshot.ready);
         assert!(
-            snapshot.error.as_deref().is_some_and(
-                |error| error.contains("initialization timed out before handshake completion")
-            ),
+            snapshot.error.as_deref().is_some_and(|error| error
+                .contains("initialization timed out before the provider reported it was ready")),
             "{snapshot:?}"
         );
         assert!(handle.failure().is_some());
