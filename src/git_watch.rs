@@ -1883,13 +1883,13 @@ mod tests {
             }
         })
         .unwrap();
-        let await_edit = |phase: &str| {
+        let await_edit = |path: &Path, phase: &str| {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let event = receiver
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     .unwrap_or_else(|error| panic!("{phase}: no native file edit: {error}"));
-                if event.paths.contains(&file)
+                if event.paths.iter().any(|event_path| event_path == path)
                     && matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))
                 {
                     break;
@@ -1908,7 +1908,7 @@ mod tests {
             BTreeSet::from([first, second])
         );
         std::fs::write(&file, "positive control").unwrap();
-        await_edit("initial live watch");
+        await_edit(&file, "initial live watch");
         watcher.unwatch(&source).unwrap();
         // Explicit native watch loss models DELETE/MOVED_FROM retirement.
         // Keeping this directory in place supplies identical cached metadata
@@ -1938,8 +1938,9 @@ mod tests {
             BTreeSet::from([first, second])
         );
         while receiver.try_recv().is_ok() {}
-        std::fs::write(&file, "edit after native rearm").unwrap();
-        await_edit("same-identity rearmed watch");
+        let recovered_file = source.join("after-rearm.rs");
+        std::fs::write(&recovered_file, "edit after native rearm").unwrap();
+        await_edit(&recovered_file, "same-identity rearmed watch");
         assert!(failures.is_empty());
     }
 
