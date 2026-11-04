@@ -27,9 +27,6 @@ const COMPACT_HEADER_WIDTH: f32 = 440.0;
 /// From this width the automation list sits beside the selection.
 const SIDE_BY_SIDE_WIDTH: f32 = 700.0;
 const LIST_WIDTH: f32 = 240.0;
-/// The most of a narrow pane's height the stacked list takes from the
-/// selection below it, including short split panes.
-const STACKED_LIST_SHARE: f32 = 0.4;
 const PROVIDERS: [&str; 3] = ["Claude", "Codex", "Omp"];
 const SCHEDULES: [&str; 5] = ["Hourly", "Daily", "Weekdays", "Weekly", "Cron"];
 const WEEKDAYS: [&str; 7] = [
@@ -80,9 +77,38 @@ pub enum Field {
     Timeout,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum DetailSection {
+    Instructions,
+    Settings,
+    Precheck,
+    Changes,
+}
+
+#[derive(Default)]
+struct DetailSections {
+    instructions: bool,
+    settings: bool,
+    precheck: bool,
+    changes: bool,
+}
+
+impl DetailSections {
+    fn toggle(&mut self, section: DetailSection) {
+        let expanded = match section {
+            DetailSection::Instructions => &mut self.instructions,
+            DetailSection::Settings => &mut self.settings,
+            DetailSection::Precheck => &mut self.precheck,
+            DetailSection::Changes => &mut self.changes,
+        };
+        *expanded = !*expanded;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Browse,
+    ReturnToList,
     /// Leaves the open run for the automation or history it was opened from.
     CloseRun,
     Tick,
@@ -107,6 +133,7 @@ pub enum Action {
     Reuse(bool),
     Precheck(bool),
     ToggleAdvanced,
+    ToggleDetail(DetailSection),
     Prompt(text_editor::Action),
     PromptCursor(text_editor::Cursor),
     Shell(text_editor::Action),
@@ -245,6 +272,7 @@ struct Confirmation {
     automation: Automation,
     request: Request,
     title: &'static str,
+    details: DetailSections,
 }
 
 #[derive(PartialEq, Eq)]
@@ -726,6 +754,7 @@ pub struct State {
     list_changed: bool,
     search: String,
     selected: Option<Automation>,
+    details: DetailSections,
     draft: Option<Draft>,
     discard_draft: Option<(u64, Action)>,
     discard_generation: u64,
@@ -747,6 +776,20 @@ pub struct State {
 }
 
 impl State {
+    fn latest_firing(&self, automation: Uuid) -> Option<HistoryKey> {
+        if let Some(latest) = self.last_firings.get(&automation) {
+            return Some(*latest);
+        }
+        if self.history_newer {
+            return None;
+        }
+        self.history
+            .iter()
+            .filter(|firing| firing.automation == automation)
+            .map(history_key)
+            .max()
+    }
+
     pub fn has_draft(&self) -> bool {
         self.draft.is_some()
     }
@@ -1534,9 +1577,21 @@ impl State {
             }
             return self.request(Pending::Mutate, confirmation.request);
         }
+        if let Action::ToggleDetail(section) = action {
+            if let Some(confirmation) = &mut self.confirmation {
+                confirmation.details.toggle(section);
+            } else {
+                self.details.toggle(section);
+            }
+            return None;
+        }
         if matches!(
             action,
-            Action::New | Action::Select(_) | Action::Edit | Action::CancelEdit
+            Action::New
+                | Action::Select(_)
+                | Action::Edit
+                | Action::CancelEdit
+                | Action::ReturnToList
         ) && self.draft_dirty()
         {
             self.discard_generation = self.discard_generation.wrapping_add(1);
@@ -1545,6 +1600,17 @@ impl State {
         }
         self.confirmation = None;
         match action {
+            Action::ReturnToList => {
+                self.selected = None;
+                self.run = None;
+                self.lifecycle = None;
+                self.all_history = false;
+                self.error = None;
+                self.notice = None;
+                if self.list_status == ListStatus::Unread && self.rows.is_empty() {
+                    return self.update(Action::Browse);
+                }
+            }
             Action::Browse => {
                 if self.selected.is_some() || self.run.is_some() || self.all_history {
                     self.notice = None;
@@ -1599,6 +1665,7 @@ impl State {
                 self.run = None;
             }
             Action::Select(id) => {
+                self.details = DetailSections::default();
                 if self.selected.as_ref().map(|automation| automation.id) != Some(id)
                     || self.run.is_some()
                     || self.all_history
@@ -1798,6 +1865,12 @@ impl State {
                         automation: automation.clone(),
                         request,
                         title,
+                        details: DetailSections {
+                            instructions: false,
+                            settings: true,
+                            precheck: true,
+                            ..Default::default()
+                        },
                     });
                 }
             }
@@ -1920,8 +1993,16 @@ impl State {
         match self.section() {
             Section::RunHistory => self.run.is_some().then_some(Action::CloseRun),
             Section::Automations => {
-                (self.run.is_some() || self.selected.is_some()).then_some(Action::Browse)
+                (self.run.is_some() || self.selected.is_some()).then_some(self.list_return())
             }
+        }
+    }
+
+    fn list_return(&self) -> Action {
+        if !self.rows.is_empty() || self.list_status == ListStatus::Loaded {
+            Action::ReturnToList
+        } else {
+            Action::Browse
         }
     }
 
@@ -1990,7 +2071,7 @@ impl State {
                 section.label(),
                 Some(match section {
                     Section::RunHistory => Action::CloseRun,
-                    Section::Automations => Action::Browse,
+                    Section::Automations => self.list_return(),
                 }),
             ),
             (run.definition.name.as_str(), name),
@@ -2234,34 +2315,79 @@ impl State {
             content = content.push(crate::design::body(notice));
         }
         if let Some(confirmation) = &self.confirmation {
-            content =
-                content
-                    .push(crate::design::title(confirmation.title))
-                    .push(launch_description(
-                        &confirmation.automation,
-                        self.accounts.iter().chain(&self.archived_accounts),
-                    ));
-            content = content.push(crate::design::body(if matches!(confirmation.request, Request::Remove { .. }) {
-                "Past runs remain in history. Active or uncertain work must be closed before removal."
-            } else {
-                "The agent may change files and use tools allowed by these permissions. Confirm only this displayed launch configuration."
-            }));
+            let removing = matches!(confirmation.request, Request::Remove { .. });
+            content = content
+                .push(crate::design::title(confirmation.title))
+                .push(crate::design::heading(&confirmation.automation.definition.name))
+                .push(crate::design::body(
+                    confirmation.automation.definition.agent.target.directory.display().to_string(),
+                ))
+                .push(crate::design::body(if removing {
+                    "This stops future scheduled runs and closes the automation's idle agent. Past runs remain in Run history. Active or uncertain work must be resolved first."
+                } else if matches!(confirmation.request, Request::RunNow { .. }) {
+                    if confirmation.automation.enabled {
+                        "Start one run now. The schedule stays enabled. The agent may change files and use tools allowed by the settings below."
+                    } else {
+                        "Start one run now. The schedule stays paused. The agent may change files and use tools allowed by the settings below."
+                    }
+                } else {
+                    "Allow this schedule to run while the window is closed. The agent may change files and use tools allowed by the settings below."
+                }));
+            if !removing {
+                let definition = &confirmation.automation.definition;
+                let account = self
+                    .accounts
+                    .iter()
+                    .chain(&self.archived_accounts)
+                    .find(|account| Some(&account.id) == definition.agent.account.as_ref())
+                    .map(|account| account.label.as_str())
+                    .unwrap_or("Saved account is unavailable");
+                content = content
+                    .push(crate::design::body(schedule_description(&definition.schedule)))
+                    .push(crate::design::body(format!(
+                        "{} · {}\nAccount: {account}\nPermissions: {} · {}",
+                        PROVIDERS[provider_index(definition.agent.provider)],
+                        definition.agent.model.as_deref().unwrap_or("Provider default model"),
+                        definition.agent.permission_mode.as_deref().unwrap_or("Provider default"),
+                        if definition.session_mode == SessionMode::Fresh { "New agent each run" } else { "Reuse this agent" },
+                    )))
+                    .push(crate::design::caption(match &definition.precheck {
+                        Some(check) => format!("Shell precheck runs first · {}-second timeout · Nonzero exit skips the run", check.timeout_seconds),
+                        None => "No shell precheck".into(),
+                    }));
+            }
             content = content.push(
                 widget::row::with_children(vec![
                     button("Cancel", Action::CancelConfirmation, !busy),
-                    if matches!(confirmation.request, Request::Remove { .. }) {
+                    if removing {
                         crate::ui_controls::button::destructive("Remove automation")
                             .on_press_maybe(
                                 (!busy).then_some(Action::Confirm(confirmation.generation)),
                             )
                             .into()
                     } else {
-                        button("Confirm", Action::Confirm(confirmation.generation), !busy)
+                        crate::ui_controls::button::primary(
+                            if matches!(confirmation.request, Request::RunNow { .. }) {
+                                "Run now"
+                            } else {
+                                "Enable schedule"
+                            },
+                        )
+                        .on_press_maybe((!busy).then_some(Action::Confirm(confirmation.generation)))
+                        .into()
                     },
                 ])
                 .spacing(space::S)
                 .wrap(),
             );
+            if !removing {
+                content = content.push(launch_description(
+                    &confirmation.automation,
+                    self.accounts.iter().chain(&self.archived_accounts),
+                    &confirmation.details,
+                    busy,
+                ));
+            }
         } else if let Some(draft) = &self.draft {
             content = content.push(draft.view(busy, &self.models, self.error.as_deref(), width));
         } else {
@@ -2386,29 +2512,63 @@ impl State {
                     if let Some(selected) = &self.selected {
                         content = content
                             .push(crate::design::title(selected.definition.name.as_str()))
-                            .push(launch_description(
-                                selected,
-                                self.accounts.iter().chain(&self.archived_accounts),
-                            ))
                             .push(crate::design::body(format!(
-                                "{} · Next: {} ({})",
+                                "{} · {}",
                                 if selected.enabled {
                                     "Enabled"
                                 } else {
                                     "Paused"
                                 },
+                                schedule_description(&selected.definition.schedule),
+                            )))
+                            .push(crate::design::caption(match &selected.next {
+                                Some(next) => format!("Next run: {}", next.local),
+                                None => "No upcoming scheduled run".into(),
+                            }))
+                            .push(crate::design::caption(
                                 selected
-                                    .next
-                                    .as_ref()
-                                    .map(|next| next.local.as_str())
-                                    .unwrap_or("—"),
-                                selected.definition.schedule.timezone
+                                    .definition
+                                    .agent
+                                    .target
+                                    .directory
+                                    .display()
+                                    .to_string(),
+                            ));
+                        let latest = self.latest_firing(selected.id);
+                        if let Some((created_ms, id)) = latest
+                            && let Some(last) = self.history.iter().find(|firing| firing.id == id)
+                        {
+                            content = content.push(crate::design::caption(format!(
+                                "Last run: {} · {}",
+                                state_label(last.state),
+                                timestamp(created_ms),
                             )));
+                        }
                         if let Some(blocked) = &selected.blocked {
-                            content = content.push(crate::design::body(blocked));
+                            content = content
+                                .push(crate::design::body(blocked))
+                                .push(crate::design::caption("Open the run to resolve its agent before starting more work or removing this automation."));
+                        } else if selected.active_firing.is_some() {
+                            content = content.push(crate::design::caption("A run is in progress. New runs and removal are available after it finishes and releases its agent."));
                         }
                         content = content.push(
                             widget::row::with_children(vec![
+                                crate::ui_controls::button::primary(
+                                    if self.manual_requests.get(&selected.id).is_some_and(
+                                        |(revision, _)| *revision == selected.execution_revision,
+                                    ) {
+                                        "Retry run…"
+                                    } else {
+                                        "Run now…"
+                                    },
+                                )
+                                .on_press_maybe(
+                                    (!busy
+                                        && selected.active_firing.is_none()
+                                        && selected.blocked.is_none())
+                                    .then_some(Action::RunNow),
+                                )
+                                .into(),
                                 button("Edit", Action::Edit, !busy),
                                 if selected.enabled {
                                     button("Pause", Action::Pause, !busy)
@@ -2420,19 +2580,6 @@ impl State {
                                     )
                                 },
                                 button(
-                                    if self.manual_requests.get(&selected.id).is_some_and(
-                                        |(revision, _)| *revision == selected.execution_revision,
-                                    ) {
-                                        "Retry run…"
-                                    } else {
-                                        "Run now…"
-                                    },
-                                    Action::RunNow,
-                                    !busy
-                                        && selected.active_firing.is_none()
-                                        && selected.blocked.is_none(),
-                                ),
-                                button(
                                     "Remove…",
                                     Action::Remove,
                                     !busy
@@ -2443,54 +2590,27 @@ impl State {
                             .spacing(space::S)
                             .wrap(),
                         );
-                    }
-                }
-                if self.selected.is_some() {
-                    content = content.push(crate::design::title("Lifecycle")).push(button(
-                        "Refresh lifecycle",
-                        Action::Lifecycle,
-                        !busy,
-                    ));
-                    if let Some(page) = &self.lifecycle {
-                        if page.events.is_empty() {
-                            content =
-                                content.push(crate::design::body("No recorded lifecycle events."));
-                        }
-                        for event in &page.events {
-                            let actor = event.actor.label();
-                            content = content.push(crate::design::body(format!(
-                                "{} · {} · {} · Revision {}",
-                                timestamp(event.occurred_ms),
-                                event.cause.label(),
-                                actor,
-                                event.revision,
-                            )));
-                            if let Some(firing) = event.firing {
-                                content = content.push(button_owned(
-                                    format!("Inspect run {firing}"),
-                                    Action::Run(firing),
-                                    !busy,
-                                ));
-                            }
-                        }
-                        if page.earlier_events_unavailable {
-                            content = content.push(crate::design::body(
-                                "Earlier lifecycle events are unavailable. Their actor and cause are unknown.",
-                            ));
-                        }
-                        if page.next.is_some()
-                            && page.events.len() < crate::automations::MAX_LIFECYCLE_EVENTS
+                        if let Some(firing) =
+                            selected.active_firing.or_else(|| latest.map(|(_, id)| id))
                         {
                             content = content.push(button(
-                                "Older lifecycle events",
-                                Action::MoreLifecycle,
+                                if selected.active_firing.is_some() {
+                                    "View active run"
+                                } else {
+                                    "View latest run"
+                                },
+                                Action::Run(firing),
                                 !busy,
                             ));
                         }
-                    } else {
-                        content = content.push(crate::design::body(
-                            "Load lifecycle receipts to inspect changes to this automation.",
-                        ));
+                        content = content.push(crate::design::horizontal_rule()).push(
+                            launch_description(
+                                selected,
+                                self.accounts.iter().chain(&self.archived_accounts),
+                                &self.details,
+                                busy,
+                            ),
+                        );
                     }
                 }
                 if self.selected.is_some() || self.all_history {
@@ -2551,25 +2671,84 @@ impl State {
                                 format!("Scheduled {}", occurrence.local)
                             }
                         };
-                        content = content.push(button_owned(
-                            format!(
-                                "{} · {} · {} · {}{}",
-                                firing.name,
-                                timestamp(firing.created_ms),
-                                origin,
-                                state_label(firing.state),
-                                if firing.release_pending {
-                                    " · Session release pending"
-                                } else {
-                                    ""
-                                }
-                            ),
-                            Action::Run(firing.id),
-                            !busy,
-                        ));
+                        let label = format!(
+                            "{} · {} · {}{}",
+                            timestamp(firing.created_ms),
+                            origin,
+                            state_label(firing.state),
+                            if firing.release_pending {
+                                " · Session release pending"
+                            } else {
+                                ""
+                            }
+                        );
+                        let label = if self.all_history {
+                            format!("{} · {label}", firing.name)
+                        } else {
+                            label
+                        };
+                        content = content.push(button_owned(label, Action::Run(firing.id), !busy));
                     }
                     if self.history_next.is_some() {
                         content = content.push(button("Older runs", Action::MoreHistory, !busy));
+                    }
+                }
+                if self.selected.is_some() {
+                    content = content
+                        .push(crate::design::horizontal_rule())
+                        .push(disclosure(
+                            "Changes",
+                            DetailSection::Changes,
+                            self.details.changes,
+                            busy,
+                        ));
+                }
+                if self.selected.is_some() && self.details.changes {
+                    content = content.push(crate::design::title("Changes")).push(button(
+                        "Refresh lifecycle",
+                        Action::Lifecycle,
+                        !busy,
+                    ));
+                    if let Some(page) = &self.lifecycle {
+                        if page.events.is_empty() {
+                            content =
+                                content.push(crate::design::body("No recorded lifecycle events."));
+                        }
+                        for event in &page.events {
+                            let actor = event.actor.label();
+                            content = content.push(crate::design::body(format!(
+                                "{} · {} · {} · Revision {}",
+                                timestamp(event.occurred_ms),
+                                event.cause.label(),
+                                actor,
+                                event.revision,
+                            )));
+                            if let Some(firing) = event.firing {
+                                content = content.push(button_owned(
+                                    format!("Inspect run {firing}"),
+                                    Action::Run(firing),
+                                    !busy,
+                                ));
+                            }
+                        }
+                        if page.earlier_events_unavailable {
+                            content = content.push(crate::design::body(
+                                "Earlier lifecycle events are unavailable. Their actor and cause are unknown.",
+                            ));
+                        }
+                        if page.next.is_some()
+                            && page.events.len() < crate::automations::MAX_LIFECYCLE_EVENTS
+                        {
+                            content = content.push(button(
+                                "Older lifecycle events",
+                                Action::MoreLifecycle,
+                                !busy,
+                            ));
+                        }
+                    } else {
+                        content = content.push(crate::design::body(
+                            "Load lifecycle receipts to inspect changes to this automation.",
+                        ));
                     }
                 }
             }
@@ -2646,7 +2825,24 @@ impl State {
         } else {
             content.padding(space::L).height(Length::Fill).into()
         };
-        let body = if listing.is_empty() {
+        let narrow_selection = width < SIDE_BY_SIDE_WIDTH && self.selected.is_some();
+        let content = if narrow_selection
+            && self.run.is_none()
+            && self.draft.is_none()
+            && self.confirmation.is_none()
+        {
+            widget::column::with_children(vec![
+                widget::container(button("Back to automations", self.list_return(), !busy))
+                    .padding([space::S, space::L])
+                    .into(),
+                content,
+            ])
+            .height(Length::Fill)
+            .into()
+        } else {
+            content
+        };
+        let body = if listing.is_empty() || narrow_selection {
             content
         } else {
             let mut search = crate::ui_controls::field::search("Filter automations", &self.search)
@@ -2691,16 +2887,32 @@ impl State {
                 .height(Length::Fill)
                 .into()
             } else {
-                // Stacked, the list takes the height of its rows up to a
-                // share of the pane, leaving the rest to the selection.
-                widget::column::with_children(vec![
+                // With no selection, the list uses the available narrow pane.
+                let mut body = widget::column::with_capacity(3).spacing(space::S);
+                if let Some(error) = &self.error {
+                    body = body.push(
+                        widget::container(crate::design::body(error).class(
+                            cosmic::theme::Text::Custom(|theme| {
+                                cosmic::iced::widget::text::Style {
+                                    color: Some(crate::design::destructive_color(theme)),
+                                    ..Default::default()
+                                }
+                            }),
+                        ))
+                        .padding([space::S, space::L]),
+                    );
+                }
+                if let Some(notice) = &self.notice {
+                    body = body.push(
+                        widget::container(crate::design::body(notice))
+                            .padding([space::S, space::L]),
+                    );
+                }
+                body.push(
                     widget::container(list)
                         .width(Length::Fill)
-                        .max_height(size.height * STACKED_LIST_SHARE)
-                        .into(),
-                    crate::design::horizontal_rule(),
-                    content,
-                ])
+                        .height(Length::Fill),
+                )
                 .height(Length::Fill)
                 .into()
             }
@@ -3078,13 +3290,56 @@ impl Draft {
 fn launch_description<'a>(
     automation: &'a Automation,
     mut accounts: impl Iterator<Item = &'a AccountChoice>,
+    details: &DetailSections,
+    busy: bool,
 ) -> Element<'a, Action> {
     let definition = &automation.definition;
     let account = accounts
         .find(|account| Some(&account.id) == definition.agent.account.as_ref())
         .map(|account| account.label.as_str())
         .unwrap_or("Saved account is unavailable");
-    let description = format!(
+    let mut column = widget::column::with_capacity(8)
+        .spacing(space::S)
+        .width(Length::Fill);
+    column = column.push(disclosure(
+        "Instructions",
+        DetailSection::Instructions,
+        details.instructions,
+        busy,
+    ));
+    if details.instructions {
+        column = column.push(crate::design::body(definition.prompt.as_str()));
+    } else {
+        let mut preview: String = definition.prompt.chars().take(180).collect();
+        if definition.prompt.chars().nth(180).is_some() {
+            preview.push('…');
+        }
+        column = column.push(crate::design::body(preview));
+    }
+    column = column
+        .push(disclosure(
+            "Execution settings",
+            DetailSection::Settings,
+            details.settings,
+            busy,
+        ))
+        .push(crate::design::caption(format!(
+            "{} · {} · {}",
+            PROVIDERS[provider_index(definition.agent.provider)],
+            definition
+                .agent
+                .model
+                .as_deref()
+                .unwrap_or("Provider default model"),
+            if definition.session_mode == SessionMode::Fresh {
+                "New agent each run"
+            } else {
+                "Reuse this agent"
+            },
+        )))
+        .push(crate::design::caption(format!("Account: {account}")));
+    if details.settings {
+        column = column.push(crate::design::body(format!(
         "Provider: {}\nAccount: {}\nProject: {}\nDirectory: {}\nModel: {}\nReasoning effort: {}\nPermissions: {}\nSession: {}\nSchedule: {} ({})\nRevision: {}",
         PROVIDERS[provider_index(definition.agent.provider)],
         account,
@@ -3117,19 +3372,69 @@ fn launch_description<'a>(
             .unwrap_or_else(|_| "Invalid schedule".into()),
         definition.schedule.timezone,
         automation.revision
-    );
-    let mut column = widget::column::with_children(vec![
-        crate::design::body(description).into(),
-        crate::design::body(definition.prompt.as_str()).into(),
-    ])
-    .spacing(space::S);
-    if let Some(precheck) = &definition.precheck {
-        column = column.push(crate::design::body(format!(
-            "Shell precheck ({} seconds):\n{}",
-            precheck.timeout_seconds, precheck.command
         )));
     }
+    if let Some(precheck) = &definition.precheck {
+        column = column
+            .push(disclosure(
+                "Shell precheck",
+                DetailSection::Precheck,
+                details.precheck,
+                busy,
+            ))
+            .push(crate::design::caption(format!(
+                "{}-second timeout · A nonzero exit skips the run",
+                precheck.timeout_seconds,
+            )));
+        if details.precheck {
+            column = column.push(crate::design::body(precheck.command.as_str()));
+        }
+    }
     column.into()
+}
+
+fn disclosure(
+    label: &'static str,
+    section: DetailSection,
+    expanded: bool,
+    busy: bool,
+) -> Element<'static, Action> {
+    crate::ui_controls::button::quiet(label)
+        .name(format!(
+            "{} {label}",
+            if expanded { "Hide" } else { "Show" }
+        ))
+        .icon(
+            if expanded {
+                crate::ui_controls::Icon::ChevronDown
+            } else {
+                crate::ui_controls::Icon::ChevronRight
+            }
+            .handle(),
+        )
+        .on_press_maybe((!busy).then_some(Action::ToggleDetail(section)))
+        .into()
+}
+
+fn schedule_description(schedule: &Schedule) -> String {
+    let pattern = match &schedule.pattern {
+        SchedulePattern::Hourly { minute } => format!("Every hour at :{minute:02}"),
+        SchedulePattern::Daily { hour, minute } => format!("Daily at {hour:02}:{minute:02}"),
+        SchedulePattern::Weekdays { hour, minute } => format!("Weekdays at {hour:02}:{minute:02}"),
+        SchedulePattern::Weekly {
+            weekday,
+            hour,
+            minute,
+        } => format!(
+            "{} at {hour:02}:{minute:02}",
+            WEEKDAYS
+                .get(weekday.saturating_sub(1) as usize)
+                .copied()
+                .unwrap_or("Invalid weekday")
+        ),
+        SchedulePattern::Cron { expression } => format!("Cron: {expression}"),
+    };
+    format!("{pattern} ({})", schedule.timezone)
 }
 /// What the header's progress says a command in flight is doing.
 fn progress_label(pending: Pending) -> &'static str {
@@ -4087,7 +4392,7 @@ mod tests {
     }
 
     #[test]
-    fn a_short_stacked_pane_keeps_the_selected_automation_scrollable() {
+    fn a_short_narrow_pane_prioritizes_the_selection_and_keeps_a_way_back() {
         let owner = automation();
         let mut rows = vec![owner.summary(None)];
         for index in 0..4 {
@@ -4107,14 +4412,14 @@ mod tests {
                 let outline = Outline::of(&state, width, height);
                 assert_eq!(
                     outline.scrollables.len(),
-                    2,
-                    "list and selection scroll independently"
+                    1,
+                    "the selected automation uses the narrow viewport"
                 );
-                let list = outline.scrollables[0].0;
-                let details = outline.scrollables[1].0;
+                let details = outline.scrollables[0].0;
+                outline.text("Back to automations");
                 assert!(
-                    list.height <= height * STACKED_LIST_SHARE + 0.5,
-                    "at {width}x{height} the list must leave room below its header: {list:?}"
+                    outline.field.is_none(),
+                    "the list search returns with the list"
                 );
                 assert!(
                     details.height > 0.0,
@@ -4126,6 +4431,146 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn long_instructions_do_not_hide_management_or_run_history() {
+        let mut owner = automation();
+        owner.definition.prompt =
+            "Review the recent changes and summarize the result. ".repeat(150);
+        let state = State {
+            rows: vec![owner.summary(None)],
+            selected: Some(owner),
+            list_status: ListStatus::Loaded,
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        for width in [300.0, 480.0, 900.0] {
+            let outline = Outline::of(&state, width, 800.0);
+            let remove = outline.text("Remove…");
+            let instructions = outline.text("Instructions");
+            assert!(
+                remove.y < instructions.y,
+                "management comes before long content at {width}"
+            );
+            assert!(
+                outline.last("Run history").y < 800.0,
+                "collapsed details leave room for results at {width}"
+            );
+            assert!(
+                !outline
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text == &state.selected.as_ref().unwrap().definition.prompt)
+            );
+        }
+    }
+
+    #[test]
+    fn removal_reviews_the_target_and_consequences_without_repeating_the_prompt() {
+        let owner = automation();
+        let prompt = owner.definition.prompt.clone();
+        let mut state = State {
+            selected: Some(owner),
+            ..Default::default()
+        };
+        state.update(Action::Remove);
+        let outline = Outline::of(&state, 480.0, 700.0);
+        outline.text("Daily review");
+        outline.text("/fixture");
+        outline.text("Remove automation");
+        assert!(!outline.texts.iter().any(|(text, _)| text == &prompt));
+        assert!(
+            !buttons(&state, 480.0)
+                .iter()
+                .any(|(name, _)| name.contains("Instructions"))
+        );
+        let confirmation = state.confirmation.as_ref().unwrap();
+        assert!(
+            matches!(confirmation.request, Request::Remove { id, revision } if id == confirmation.automation.id && revision == confirmation.automation.revision)
+        );
+    }
+
+    #[test]
+    fn launch_disclosures_preserve_the_frozen_confirmation_and_selected_context() {
+        let owner = automation();
+        let mut state = State {
+            selected: Some(owner.clone()),
+            ..Default::default()
+        };
+        state.update(Action::ToggleDetail(DetailSection::Settings));
+        assert!(state.details.settings);
+        state.update(Action::RunNow);
+        let generation = state.confirmation.as_ref().unwrap().generation;
+        assert!(!state.confirmation.as_ref().unwrap().details.instructions);
+        state.selected.as_mut().unwrap().definition.prompt = "A later definition".into();
+        state.update(Action::ToggleDetail(DetailSection::Instructions));
+        let outline = Outline::of(&state, 900.0, 700.0);
+        outline.text(&owner.definition.prompt);
+        assert!(
+            !outline
+                .texts
+                .iter()
+                .any(|(text, _)| text == "A later definition")
+        );
+        assert_eq!(state.confirmation.as_ref().unwrap().generation, generation);
+        assert!(
+            state.details.settings,
+            "confirmation disclosure does not change the detail view"
+        );
+        state.update(Action::CancelConfirmation);
+        assert!(state.confirmation.is_none());
+        assert!(state.details.settings);
+    }
+
+    #[test]
+    fn narrow_list_keeps_operation_feedback_and_return_preserves_loaded_pages() {
+        let owner = automation();
+        let mut state = State {
+            rows: list_refresh_rows(PAGE * 2),
+            list_status: ListStatus::Loaded,
+            selected: Some(owner),
+            search: "retained query".into(),
+            more: true,
+            ..Default::default()
+        };
+        let rows = state.rows.clone();
+        let after = state.after;
+        assert!(matches!(state.list_return(), Action::ReturnToList));
+        assert!(state.update(Action::ReturnToList).is_none());
+        assert_eq!(state.rows, rows);
+        assert_eq!(state.after, after);
+        assert!(state.more);
+        assert_eq!(state.search, "retained query");
+        state.search.clear();
+        state.error = Some("Couldn't open this automation. Try again.".into());
+        state.notice = Some("Automation removed. Past runs remain in history.".into());
+        let outline = Outline::of(&state, 480.0, 700.0);
+        outline.text(state.error.as_ref().unwrap());
+        outline.text(state.notice.as_ref().unwrap());
+    }
+
+    #[test]
+    fn latest_run_recovery_uses_the_known_newest_identity_outside_the_loaded_page() {
+        let owner = automation();
+        let mut older = history_firing(100, crate::automations::FiringState::Succeeded);
+        older.automation = owner.id;
+        let newer = (200, Uuid::new_v4());
+        let mut state = State {
+            history: vec![older.clone()],
+            history_newer: true,
+            ..Default::default()
+        };
+        assert!(
+            state.latest_firing(owner.id).is_none(),
+            "an older snapshot does not claim to be latest"
+        );
+        state.last_firings.insert(owner.id, newer);
+        assert_eq!(state.latest_firing(owner.id), Some(newer));
+        assert_eq!(
+            state.history[0].id, older.id,
+            "the paged snapshot stays stable"
+        );
     }
 
     #[test]
