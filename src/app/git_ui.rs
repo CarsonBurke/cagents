@@ -1477,7 +1477,7 @@ mod tests {
             )
             .unwrap()
         };
-        let (_, other_plan) = plan(other, first);
+        let (other_snapshot, other_plan) = plan(other, first);
         let (snapshot, project_plan) = plan(project, second);
         let project_plan = Arc::new(project_plan.unwrap());
         let worktree = snapshot.worktrees[0].0.id;
@@ -1492,29 +1492,53 @@ mod tests {
             Vec::new(),
         ));
         app.repository_generations.insert(project, 1);
-        app.refresh_ui.git.entries.insert(
-            project,
-            Entry {
-                snapshot: snapshot.clone(),
-                generation: 1,
-                plan: Some(project_plan.clone()),
-                archived: Vec::new(),
-                remote_started: false,
-                cancellation: None,
-                read_failure: None,
-                read_full_scan: false,
-                pending: Default::default(),
-                fallback: None,
-                last_full_scan: Instant::now(),
-            },
-        );
+        let entry = |snapshot, plan| Entry {
+            snapshot,
+            generation: 1,
+            plan: Some(plan),
+            archived: Vec::new(),
+            remote_started: false,
+            cancellation: None,
+            read_failure: None,
+            read_full_scan: false,
+            pending: Default::default(),
+            fallback: None,
+            last_full_scan: Instant::now(),
+        };
+        app.refresh_ui
+            .git
+            .entries
+            .insert(project, entry(snapshot.clone(), project_plan.clone()));
+        app.sidebar_model.projects.push(SidebarProject::new(
+            other,
+            other_snapshot.repository.id,
+            "Competing repository".into(),
+            other_snapshot.repository.common_dir.clone(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.refresh_ui
+            .git
+            .entries
+            .insert(other, entry(other_snapshot, Arc::new(other_plan.unwrap())));
         // One real repository fits; a second competes for the same bounded
         // coordinator budget. No global kernel-watch exhaustion is required.
-        let monitor = git_watch::Monitor::start_with_limit(|| {}, 6).unwrap();
-        monitor.configure(vec![Arc::new(other_plan.unwrap()), project_plan.clone()]);
-        let failure = wait_for(&monitor, project, "native quota failure", |change| {
-            change.coverage == Some(false) && change.error.is_some()
-        });
+        let (wake, receiver) = async_channel::bounded(1);
+        let monitor = git_watch::Monitor::start_with_limit(
+            move || {
+                let _ = wake.try_send(());
+            },
+            6,
+        )
+        .unwrap();
+        app.refresh_ui.git.watch = Some(Watch { monitor, receiver });
+        app.refresh_ui.git.configure();
+        let failure = wait_for(
+            &app.refresh_ui.git.watch.as_ref().unwrap().monitor,
+            project,
+            "native quota failure",
+            |change| change.coverage == Some(false) && change.error.is_some(),
+        );
         assert_eq!(
             failure.error.as_deref(),
             Some("directory watch limit reached")
@@ -1558,12 +1582,14 @@ mod tests {
         }));
         // Closing the competing project frees the budget. Use the real
         // consumer's recovered inventory and real coordinator acknowledgement.
-        monitor.configure(vec![
-            app.refresh_ui.git.entries[&project].plan.clone().unwrap(),
-        ]);
-        let recovered = wait_for(&monitor, project, "native quota recovery", |change| {
-            change.coverage == Some(true) && change.error.is_none()
-        });
+        app.sidebar_model.projects.retain(|row| row.id != other);
+        app.refresh_ui.git.forget(other);
+        let recovered = wait_for(
+            &app.refresh_ui.git.watch.as_ref().unwrap().monitor,
+            project,
+            "native quota recovery",
+            |change| change.coverage == Some(true) && change.error.is_none(),
+        );
         app.refresh_ui.git.changed(project, recovered);
         assert!(app.refresh_ui.git.entries[&project].fallback.is_none());
         // Settle the recovery read before the next edit, as the application
@@ -1585,7 +1611,7 @@ mod tests {
         }));
         fs::write(&later_file, "edit after quota recovery\n").unwrap();
         let changed = wait_for(
-            &monitor,
+            &app.refresh_ui.git.watch.as_ref().unwrap().monitor,
             project,
             "ordinary edit after quota recovery",
             |change| {
@@ -1600,7 +1626,7 @@ mod tests {
         app.refresh_ui.git.changed(project, changed.clone());
         assert!(app.refresh_ui.git.queue.contains(&project));
         let entry = &app.refresh_ui.git.entries[&project];
-        let (fresh, _) = read_local_with_plan(
+        let (fresh, plan) = read_local_with_plan(
             project,
             entry.snapshot.clone(),
             changed,
@@ -1609,6 +1635,20 @@ mod tests {
         )
         .unwrap();
         assert!(fresh.worktrees[0].1.as_ref().unwrap().dirty.is_dirty());
+        drop(app.start_git_reads());
+        drop(app.update_git(Action::Read {
+            project,
+            generation: 1,
+            result: Ok((fresh, plan)),
+        }));
+        assert!(
+            app.refresh_ui.git.entries[&project].snapshot.worktrees[0]
+                .1
+                .as_ref()
+                .unwrap()
+                .dirty
+                .is_dirty()
+        );
     }
 
     #[test]
