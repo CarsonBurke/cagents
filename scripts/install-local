@@ -82,8 +82,10 @@ if [[ -e $PREFIX/versions/$VERSION ]]; then
 elif [[ -z $BUILD_HOST ]]; then
     build "$ROOT_DIR" "$OUTPUT"
 else
-    REMOTE_REPOSITORY=${ROOT_DIR#"$HOME"/}
-    [[ $REMOTE_REPOSITORY != "$ROOT_DIR" ]] || fail 'the checkout must be under $HOME to locate it on the build host'
+    # Worktrees share their repository's objects; address the main checkout.
+    REPOSITORY=$(dirname -- "$(git rev-parse --path-format=absolute --git-common-dir)")
+    REMOTE_REPOSITORY=${REPOSITORY#"$HOME"/}
+    [[ $REMOTE_REPOSITORY != "$REPOSITORY" ]] || fail 'the repository must be under $HOME to locate it on the build host'
     REMOTE_OUTPUT=/var/tmp/cagents-install-local/$VERSION
     git push --quiet --force "ssh://$BUILD_HOST/~/$REMOTE_REPOSITORY" "$COMMIT:refs/heads/install-local"
     # The host's login shell may not be POSIX; run the build under bash.
