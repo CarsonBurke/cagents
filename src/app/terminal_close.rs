@@ -7,6 +7,12 @@ pub(super) struct CloseIntent {
     pub terminal: TerminalId,
     pub proof: HostSessionProof,
     completed_source: Option<TerminalSession>,
+    /// The pane as Close found it. Only this exact state may be retired on a
+    /// proof that its terminal is gone.
+    saved_source: Option<TerminalSession>,
+    /// The connection to this terminal was lost, so no close may be sent to
+    /// it: Close may only ask whether the terminal is proven gone.
+    probe_only: bool,
     pub generation: u64,
     pub restore_card: Option<CardId>,
     pub pending: bool,
@@ -22,6 +28,11 @@ pub enum CloseOutcome {
     Closed,
     Active,
     Stale,
+    /// The owning daemon answered and the terminal is proven gone. Nothing was
+    /// stopped: there is nothing left to stop.
+    NotHosted,
+    /// Not proven gone, for the reason given. Nothing was sent to the terminal.
+    Kept(String),
     Unreachable(String),
 }
 
@@ -37,10 +48,27 @@ pub(super) struct QueuedCardClose {
     unasked: bool,
 }
 
+#[cfg(test)]
+impl CloseIntent {
+    pub(super) fn is_probe_only(&self) -> bool {
+        self.probe_only
+    }
+}
+
 fn target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
     intent.completed_source.is_none()
         && matches!(state, Some(CardState { kind: CardKind::Terminal(session), .. })
         if session.id == intent.terminal && session.continuity.live_proof().as_ref() == Some(&intent.proof))
+}
+
+fn terminal_session(state: Option<&CardState>) -> Option<&TerminalSession> {
+    match state {
+        Some(CardState {
+            kind: CardKind::Terminal(session),
+            ..
+        }) => Some(session),
+        _ => None,
+    }
 }
 
 fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
@@ -240,17 +268,21 @@ impl Cagents {
                 .live_proof()
                 .or_else(|| self.uncertain_terminal_proofs.get(&card).cloned())
         {
+            let uncertain = self.uncertain_terminal_proofs.contains_key(&card);
+            let probe_only = uncertain && session.continuity.live_proof().is_some();
             self.terminal_close = Some(CloseIntent {
                 card,
                 terminal: session.id,
                 proof,
                 completed_source: None,
+                saved_source: Some(session.clone()),
+                probe_only,
                 generation: 0,
                 restore_card: self.workspace.focused(),
                 pending: false,
                 active: false,
                 dont_ask_again: false,
-                detail: self.uncertain_terminal_proofs.contains_key(&card).then(|| {
+                detail: (uncertain && !probe_only).then(|| {
                     "Daemon unreachable; the card is retained. Reconnect before closing.".into()
                 }),
                 focus: 0,
@@ -296,6 +328,8 @@ impl Cagents {
                     terminal: session.id,
                     proof,
                     completed_source: Some(session),
+                    saved_source: None,
+                    probe_only: false,
                     generation: 0,
                     restore_card: self.workspace.focused(),
                     restore_keyboard_nav: self.core.keyboard_nav(),
@@ -557,7 +591,7 @@ impl Cagents {
             && !exited_target_matches(intent, self.card_state(intent.card))
         {
             self.terminal_close.as_mut().unwrap().detail =
-                Some("Terminal identity or daemon proof changed. Nothing was closed.".into());
+                Some("This terminal changed before it could close, so nothing was closed. Try closing the pane again.".into());
             self.core.set_keyboard_nav(false);
             return close_focus(0);
         }
@@ -619,7 +653,22 @@ impl Cagents {
         }
         let identity_matches = target_matches(intent, self.card_state(card))
             || exited_target_matches(intent, self.card_state(card));
+        let still_saved = intent
+            .saved_source
+            .as_ref()
+            .is_some_and(|saved| terminal_session(self.card_state(card)) == Some(saved));
+        let starting = self.terminal_start_in_flight(card);
         match outcome {
+            CloseOutcome::NotHosted if identity_matches && still_saved && !starting => {
+                if intent.active || intent.detail.is_some() {
+                    self.core.set_keyboard_nav(intent.restore_keyboard_nav);
+                }
+                self.terminal_close = None;
+                // No request was sent, so nothing is outstanding for the fence.
+                self.terminal_close_attempts.remove(&terminal);
+                self.closed_terminal_cards.insert(card);
+                self.request_card_removal(card)
+            }
             CloseOutcome::Closed if identity_matches => {
                 if intent.active || intent.detail.is_some() {
                     self.core.set_keyboard_nav(intent.restore_keyboard_nav);
@@ -654,12 +703,20 @@ impl Cagents {
                 intent.pending = false;
                 intent.focus = 0;
                 intent.detail = Some(match outcome {
-                    CloseOutcome::Closed | CloseOutcome::Active | CloseOutcome::Stale => {
-                        "Terminal identity or daemon proof changed. The card was kept.".into()
+                    CloseOutcome::NotHosted if starting => {
+                        "This terminal is starting, so the pane was kept. Close it again when it finishes.".into()
                     }
-                    CloseOutcome::Unreachable(error) => format!(
-                        "Close unconfirmed: {error}. The card was kept; no automatic retry will be sent."
-                    ),
+                    CloseOutcome::Closed
+                    | CloseOutcome::Active
+                    | CloseOutcome::Stale
+                    | CloseOutcome::NotHosted => {
+                        "This terminal changed before it could close, so the pane was kept. Try closing it again.".into()
+                    }
+                    CloseOutcome::Kept(reason) => reason,
+                    CloseOutcome::Unreachable(error) => {
+                        tracing::warn!(%error, "terminal close was not confirmed");
+                        "Cagents couldn't confirm this terminal closed, so it may still be running. The pane was kept and Cagents won't retry on its own. Try Close again in a moment. If this keeps happening, leave the pane in place.".into()
+                    }
                 });
                 self.core.set_keyboard_nav(false);
                 close_focus(0)
@@ -764,6 +821,85 @@ fn close_focus(index: usize) -> Task<Message> {
 mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+    fn routing_intent(probe_only: bool, saved: Option<TerminalSession>) -> CloseIntent {
+        CloseIntent {
+            card: CardId::new(),
+            terminal: TerminalId::new(),
+            proof: HostSessionProof {
+                host_session_id: HostSessionId::new("host"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            },
+            completed_source: None,
+            saved_source: saved,
+            probe_only,
+            generation: 0,
+            restore_card: None,
+            pending: true,
+            active: false,
+            dont_ask_again: false,
+            detail: None,
+            focus: 0,
+            restore_keyboard_nav: false,
+        }
+    }
+
+    #[test]
+    fn close_asks_for_proof_only_after_the_daemon_declines_the_saved_identity() {
+        let app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let session = terminal_source(&app, card);
+        let saved = routing_intent(false, Some(session.clone()));
+        let no_proof = |_: &TerminalSession| -> Result<(), String> {
+            panic!("the daemon answered, so no proof is needed")
+        };
+        assert!(matches!(
+            close_or_prove_gone(&saved, || CloseOutcome::Closed, no_proof),
+            CloseOutcome::Closed
+        ));
+        assert!(matches!(
+            close_or_prove_gone(&saved, || CloseOutcome::Active, no_proof),
+            CloseOutcome::Active
+        ));
+        assert!(matches!(
+            close_or_prove_gone(&saved, || CloseOutcome::Unreachable("x".into()), no_proof),
+            CloseOutcome::Unreachable(_)
+        ));
+        assert!(matches!(
+            close_or_prove_gone(&saved, || CloseOutcome::Stale, |_| Ok(())),
+            CloseOutcome::NotHosted
+        ));
+        assert!(matches!(
+            close_or_prove_gone(&saved, || CloseOutcome::Stale, |_| Err("why".into())),
+            CloseOutcome::Kept(reason) if reason == "why"
+        ));
+        assert!(matches!(
+            close_or_prove_gone(
+                &routing_intent(false, None),
+                || CloseOutcome::Stale,
+                no_proof
+            ),
+            CloseOutcome::Stale
+        ));
+    }
+
+    #[test]
+    fn a_card_with_a_lost_connection_never_reaches_the_close_request() {
+        let app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let session = terminal_source(&app, card);
+        let probe = routing_intent(true, Some(session));
+        let never = || -> CloseOutcome { panic!("a probe must not send a close") };
+        assert!(matches!(
+            close_or_prove_gone(&probe, never, |_| Ok(())),
+            CloseOutcome::NotHosted
+        ));
+        assert!(matches!(
+            close_or_prove_gone(&probe, never, |_| Err("still there".into())),
+            CloseOutcome::Kept(_)
+        ));
+    }
 
     fn channel_close_fixture() -> (Cagents, CardId, crate::channel_work::Home) {
         use crate::workspace_model::{
@@ -1375,7 +1511,35 @@ fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcom
         };
         return run().unwrap_or_else(CloseOutcome::Unreachable);
     }
-    close_hosted_terminal(intent.terminal, &intent.proof, allow_active)
+    close_or_prove_gone(
+        intent,
+        || close_hosted_terminal(intent.terminal, &intent.proof, allow_active),
+        super::daemon_recovery::prove_not_hosted,
+    )
+}
+
+/// `close` is the only route that can stop anything, so a card whose connection
+/// was lost never reaches it. Its `Stale` means the daemon doesn't host the saved
+/// identity. That is what a dead terminal looks like, and also what an unknown
+/// one looks like, so only a positive proof may retire the pane.
+fn close_or_prove_gone(
+    intent: &CloseIntent,
+    close: impl FnOnce() -> CloseOutcome,
+    prove: impl FnOnce(&TerminalSession) -> Result<(), String>,
+) -> CloseOutcome {
+    if !intent.probe_only {
+        match close() {
+            CloseOutcome::Stale => {}
+            outcome => return outcome,
+        }
+    }
+    let Some(saved) = &intent.saved_source else {
+        return CloseOutcome::Stale;
+    };
+    match prove(saved) {
+        Ok(()) => CloseOutcome::NotHosted,
+        Err(reason) => CloseOutcome::Kept(reason),
+    }
 }
 
 /// Asks the daemon to close `terminal`, provided the daemon is still the one

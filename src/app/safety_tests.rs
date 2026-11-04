@@ -894,6 +894,103 @@ fn report_close(app: &mut Cagents, outcome: terminal_close::CloseOutcome) {
     });
 }
 
+#[test]
+fn a_terminal_proven_gone_leaves_through_ordinary_removal() {
+    let (mut app, card, terminal, _) = live_app();
+    app.card_state_mut(card).unwrap().residency = Residency::Hot;
+    let _ = app.update(Message::CloseCard(card));
+    assert!(app.card_state(card).unwrap().existence.is_open());
+    assert!(app.terminal_close.as_ref().unwrap().pending);
+    report_close(&mut app, terminal_close::CloseOutcome::NotHosted);
+    assert!(app.terminal_close.is_none());
+    assert!(!app.terminal_close_attempts.contains(&terminal));
+    let _ = app.update(Message::CommitClose(card));
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+}
+
+#[test]
+fn a_proof_of_absence_cannot_retire_a_pane_that_changed_or_is_starting() {
+    let (mut app, card, _, _) = live_app();
+    let _ = app.update(Message::CloseCard(card));
+    // Any change, even one keeping the identity and proof, means the proof was
+    // about a pane that no longer exists.
+    let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+        unreachable!()
+    };
+    session.resume_hint = Some("changed while closing".into());
+    report_close(&mut app, terminal_close::CloseOutcome::NotHosted);
+    assert!(app.terminal_close.as_ref().unwrap().detail.is_some());
+    assert!(app.card_state(card).unwrap().existence.is_open());
+    assert!(app.workspace.pending_close().is_none());
+
+    let (mut app, card, _, _) = live_app();
+    let _ = app.update(Message::CloseCard(card));
+    app.begin_terminal_start(card);
+    report_close(&mut app, terminal_close::CloseOutcome::NotHosted);
+    assert!(
+        app.terminal_close
+            .as_ref()
+            .unwrap()
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("starting")
+    );
+    assert!(app.workspace.pending_close().is_none());
+}
+
+#[test]
+fn a_kept_terminal_says_why_and_allows_a_fresh_explicit_close() {
+    let (mut app, card, terminal, _) = live_app();
+    let _ = app.update(Message::CloseCard(card));
+    report_close(
+        &mut app,
+        terminal_close::CloseOutcome::Kept("the reason to keep it".into()),
+    );
+    let intent = app.terminal_close.as_ref().unwrap();
+    assert_eq!(intent.detail.as_deref(), Some("the reason to keep it"));
+    assert!(!intent.pending);
+    assert!(app.card_state(card).unwrap().existence.is_open());
+    assert!(!app.terminal_close_attempts.contains(&terminal));
+    let _ = app.update(Message::CancelTerminalClose);
+    let _ = app.update(Message::CloseCard(card));
+    assert!(app.terminal_close.as_ref().unwrap().pending);
+}
+
+/// A lost connection used to stop Close before it asked anything, so a pane
+/// whose daemon came back without its terminal could never be removed.
+#[test]
+fn a_lost_connection_only_asks_whether_the_terminal_is_gone() {
+    let (mut app, card, _, proof) = live_app();
+    app.uncertain_terminal_proofs.insert(card, proof);
+    let _ = app.update(Message::CloseCard(card));
+    let intent = app.terminal_close.as_ref().unwrap();
+    assert!(intent.pending);
+    assert!(intent.is_probe_only());
+    assert!(intent.detail.is_none());
+    report_close(&mut app, terminal_close::CloseOutcome::NotHosted);
+    let _ = app.update(Message::CommitClose(card));
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+
+    // Without a saved identity there is nothing to ask about.
+    let (mut app, card, _, proof) = live_app();
+    app.uncertain_terminal_proofs.insert(card, proof);
+    let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+        unreachable!()
+    };
+    session.continuity = TerminalContinuity::Failed {
+        typed_error: crate::model::RuntimeError {
+            code: "runtime_failed".into(),
+            message: "failed".into(),
+        },
+        retryable: true,
+    };
+    let _ = app.update(Message::CloseCard(card));
+    let intent = app.terminal_close.as_ref().unwrap();
+    assert!(!intent.pending);
+    assert!(intent.detail.as_deref().unwrap().contains("Reconnect"));
+}
+
 fn request_active_close(app: &mut Cagents, card: CardId) {
     let _ = app.update(Message::CloseCard(card));
     report_close(app, terminal_close::CloseOutcome::Active);

@@ -603,6 +603,15 @@ impl NativeContinuity {
     }
 }
 
+impl Session {
+    /// A holder or listener outside the daemon's actors can answer a close of
+    /// this session. Anything else has only a lost actor, which proves nothing.
+    pub fn closes_without_hosted_actor(&self) -> bool {
+        self.owned_codex_listener.is_some()
+            || matches!(self.native_continuity, NativeContinuity::Durable { .. })
+    }
+}
+
 /// Account recovery changes only account selection. It never changes the
 /// provider, conversation, executable, working directory, or launch options.
 /// Runtime identities and daemon-allocated listener paths may be refreshed.

@@ -506,6 +506,37 @@ pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
     Ok(records)
 }
 
+/// Whether a running holder registered this terminal on this boot, for a caller
+/// that holds no authority over the registry. Unlike discovery this creates and
+/// removes nothing. A record that can't be read is an error, not an absence.
+#[cfg(feature = "ui")]
+pub(crate) fn holds_terminal(terminal: TerminalId, boot: &BootId, kind: Kind) -> io::Result<bool> {
+    let directory = directory(kind).map_err(io::Error::other)?;
+    crate::secure_file::reject_symlink_components(&directory)?;
+    holds_terminal_in(&directory, terminal, boot, kind)
+}
+
+#[cfg(feature = "ui")]
+fn holds_terminal_in(
+    directory: &Path,
+    terminal: TerminalId,
+    boot: &BootId,
+    kind: Kind,
+) -> io::Result<bool> {
+    let path = socket(directory, terminal).with_extension("json");
+    let record = match read(&path) {
+        Ok(record) => record,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(record.kind == kind
+        && record.supported_version()
+        && record.application == crate::instance::APPLICATION_ID
+        && record.path(directory) == path
+        && &record.boot == boot
+        && record.holder.is_current())
+}
+
 pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
     discover_inner(directory, boot, kind, false)
 }
@@ -791,6 +822,43 @@ mod tests {
             holder: process.clone(),
             root: process,
         }
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn checking_for_a_holder_changes_nothing_in_the_registry() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("holders");
+        let boot = crate::daemon::read_boot_id().unwrap();
+        let unknown = TerminalId::new();
+        assert!(!holds_terminal_in(&directory, unknown, &boot, Kind::Terminal).unwrap());
+        assert!(!directory.exists(), "a read must not create the registry");
+
+        crate::secure_file::prepare_private_directory(&directory).unwrap();
+        let live = record();
+        live.create(&directory).unwrap();
+        assert!(holds_terminal_in(&directory, live.terminal, &boot, Kind::Terminal).unwrap());
+        assert!(!holds_terminal_in(&directory, unknown, &boot, Kind::Terminal).unwrap());
+        assert!(!holds_terminal_in(&directory, live.terminal, &boot, Kind::Native).unwrap());
+        let other_boot = BootId::new("another-boot");
+        assert!(
+            !holds_terminal_in(&directory, live.terminal, &other_boot, Kind::Terminal).unwrap()
+        );
+
+        // Discovery prunes a dead holder's record. This caller has no such authority.
+        let mut dead = record();
+        dead.holder.start += 1;
+        dead.create(&directory).unwrap();
+        assert!(!holds_terminal_in(&directory, dead.terminal, &boot, Kind::Terminal).unwrap());
+        assert!(dead.path(&directory).exists());
+
+        let unreadable = TerminalId::new();
+        std::fs::write(
+            socket(&directory, unreadable).with_extension("json"),
+            "not a record",
+        )
+        .unwrap();
+        assert!(holds_terminal_in(&directory, unreadable, &boot, Kind::Terminal).is_err());
     }
 
     fn endpoint_with_byte_length(root: &Path, length: usize) -> PathBuf {
