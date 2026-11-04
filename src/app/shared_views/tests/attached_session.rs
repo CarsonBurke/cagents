@@ -131,6 +131,8 @@ fn local_only_chat() -> (Cagents, View, Pane, tempfile::TempDir) {
     };
     chat.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
     let kind = app.card_state(card).unwrap().kind.clone();
+    // Its own publication is over: the daemon never took it, so it stays local.
+    app.shared_views.pending.clear();
     app.retain_local_pane(card);
     app.persist();
     let destination = ChannelId::new();

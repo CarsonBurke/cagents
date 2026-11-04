@@ -567,6 +567,43 @@ fn every_scoped_legacy_mutation_authenticates_captured_authority_before_reads_an
     }
 }
 
+/// The command `cagents sessions` suggests is refused inside every hosted
+/// session, so the refusal has to say what does work from there.
+#[test]
+fn a_hosted_session_attaching_a_session_is_refused_and_told_what_works() {
+    let fixture = Fixture::new();
+    let model = fixture.model.clone();
+    let authority = Authority::session("fixture-hosted-shell-scope".into());
+    let expected = authority.clone();
+    let peer = Peer::new(connected(), move |peer| {
+        auth(peer, &expected, true);
+        read_model(peer, &model);
+        let request = next(peer);
+        reply(peer, &request, denied());
+    });
+    let context = ProjectChannelContext {
+        authority: authority.clone(),
+        remote: false,
+        no_start: false,
+    };
+    let argv = [
+        "channel".to_owned(),
+        "move".to_owned(),
+        TerminalId::new().to_string(),
+        "--to".to_owned(),
+        fixture.destination.to_string(),
+    ];
+    let error = dispatch(parse(&argv), |mutation| {
+        selected(&context, mutation, &peer.socket)
+    })
+    .err()
+    .expect("the hosted session is refused");
+    assert!(error.message.contains("a terminal outside cagents"));
+    assert!(!error.message.contains("CAGENTS_AGENT_AUTHORITY"));
+    assert_refused(error, &authority);
+    peer.finished();
+}
+
 #[test]
 fn invalid_and_empty_inherited_tokens_cannot_read_or_edit_after_authentication_refusal() {
     for authority in [
