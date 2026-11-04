@@ -5401,6 +5401,28 @@ fn retire_conversation(
     handle: Option<Arc<ClientHandle>>,
     session: Option<chat::Session>,
 ) -> Result<(), String> {
+    end_conversation(handle, session, super::channel_ui::close_sessions)
+}
+
+/// Closes a conversation the reader closed, like [`retire_conversation`],
+/// and also retires the agent still bound to it after a daemon stop. Giving
+/// up a failed start must not do that, so only an explicit Close comes here.
+fn close_conversation(
+    handle: Option<Arc<ClientHandle>>,
+    session: Option<chat::Session>,
+) -> Result<(), String> {
+    end_conversation(
+        handle,
+        session,
+        super::channel_ui::close_sessions_retiring_agents,
+    )
+}
+
+fn end_conversation(
+    handle: Option<Arc<ClientHandle>>,
+    session: Option<chat::Session>,
+    close: fn(Vec<CardKind>) -> Result<(), String>,
+) -> Result<(), String> {
     let refused = match handle.map(|handle| handle.close()) {
         Some(Ok(())) => return Ok(()),
         Some(Err(error)) => Some(error),
@@ -5409,12 +5431,10 @@ fn retire_conversation(
     let Some(session) = session else {
         return refused.map_or(Ok(()), Err);
     };
-    super::channel_ui::close_sessions(vec![CardKind::Chat(session)]).map_err(
-        |error| match refused {
-            Some(refused) => format!("{refused}; {error}"),
-            None => error,
-        },
-    )
+    close(vec![CardKind::Chat(session)]).map_err(|error| match refused {
+        Some(refused) => format!("{refused}; {error}"),
+        None => error,
+    })
 }
 
 /// The CLI the daemon still runs for a Codex thread, if any.
@@ -8027,7 +8047,7 @@ impl Cagents {
             return cosmic::task::future(async move {
                 let saved = session.clone();
                 let result =
-                    tokio::task::spawn_blocking(move || retire_conversation(handle, Some(saved)))
+                    tokio::task::spawn_blocking(move || close_conversation(handle, Some(saved)))
                         .await
                         .map_err(|error| error.to_string())
                         .and_then(|result| result);
@@ -8040,7 +8060,7 @@ impl Cagents {
         let retire = if pending {
             Task::none()
         } else {
-            self.retire_chat(card, handle, Some(session))
+            self.end_chat(card, handle, Some(session), close_conversation)
         };
         Task::batch([retire, remove])
     }
@@ -8052,10 +8072,20 @@ impl Cagents {
         handle: Option<Arc<ClientHandle>>,
         session: Option<chat::Session>,
     ) -> Task<Message> {
+        self.end_chat(card, handle, session, retire_conversation)
+    }
+
+    fn end_chat(
+        &mut self,
+        card: CardId,
+        handle: Option<Arc<ClientHandle>>,
+        session: Option<chat::Session>,
+        end: fn(Option<Arc<ClientHandle>>, Option<chat::Session>) -> Result<(), String>,
+    ) -> Task<Message> {
         let target = self.chat_ui.next_target(card);
         self.chat_ui.retiring.insert(target);
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || retire_conversation(handle, session))
+            let result = tokio::task::spawn_blocking(move || end(handle, session))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
