@@ -363,7 +363,8 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         for prebuilt in (False, True):
             for name, binding in (("hb_new_future_api", "GLOBAL"),
                                   ("FT_New_Face", "GLOBAL"),
-                                  ("hb_blob_destroy@@HB_1.0", "WEAK")):
+                                  ("hb_blob_destroy@@HB_1.0", "WEAK"),
+                                  ("hb_unique_object", "<OS specific>: 10")):
                 with self.subTest(prebuilt=prebuilt, name=name):
                     self.reset_outputs()
                     overrides = {"MOCK_UI_DYNSYM": self.dynamic_symbols(name, binding)}
@@ -407,6 +408,13 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
     def test_font_imports_remain_valid_and_browserless_does_not_gain_full_link_policy(self):
         self.reset_outputs()
         result = self.package("full", MOCK_UI_DYNSYM=self.dynamic_symbols("hb_system_import", index="UND"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_packages("full")
+        # C++ GNU_UNIQUE objects are legitimate exports; readelf prints their
+        # binding as a reserved value rather than a single word.
+        self.reset_outputs()
+        result = self.package("full", MOCK_UI_DYNSYM=self.dynamic_symbols(
+            "_ZN2sh9BuiltInId17gl_MaxDrawBuffersE", binding="<OS specific>: 10"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_packages("full")
         self.reset_outputs()

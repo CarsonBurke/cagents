@@ -285,6 +285,9 @@ if [ "$VARIANT" = full ]; then
             next
         }
         /^[[:space:]]*[0-9]+:/ {
+            # readelf names reserved type/binding values, such as C++
+            # GNU_UNIQUE objects, as "<OS specific>: 10". Keep them one field.
+            gsub(/<(OS|processor) specific>: [0-9]+/, "RESERVED")
             if (tables != 1 || headings != 1 || NF < 7 || NF > 9 ||
                 $1 != rows ":" || $2 !~ /^[0-9a-fA-F]+$/ ||
                 $3 !~ /^(0x[0-9a-fA-F]+|[0-9]+)$/ ||
