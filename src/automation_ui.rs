@@ -3313,8 +3313,13 @@ fn launch_description<'a>(
     if details.instructions {
         column = column.push(crate::design::body(definition.prompt.as_str()));
     } else {
-        let mut preview: String = definition.prompt.chars().take(180).collect();
-        if definition.prompt.chars().nth(180).is_some() {
+        let mut normalized = definition
+            .prompt
+            .split_whitespace()
+            .enumerate()
+            .flat_map(|(index, word)| (index > 0).then_some(' ').into_iter().chain(word.chars()));
+        let mut preview: String = normalized.by_ref().take(180).collect();
+        if normalized.next().is_some() {
             preview.push('…');
         }
         column = column.push(crate::design::body(preview));
@@ -4438,34 +4443,49 @@ mod tests {
 
     #[test]
     fn long_instructions_do_not_hide_management_or_run_history() {
-        let mut owner = automation();
-        owner.definition.prompt =
-            "Review the recent changes and summarize the result. ".repeat(150);
-        let state = State {
-            rows: vec![owner.summary(None)],
-            selected: Some(owner),
-            list_status: ListStatus::Loaded,
-            history_status: HistoryStatus::Loaded,
-            ..Default::default()
-        };
-        for width in [300.0, 480.0, 900.0] {
-            let outline = Outline::of(&state, width, 800.0);
-            let remove = outline.text("Remove…");
-            let instructions = outline.text("Instructions");
-            assert!(
-                remove.y < instructions.y,
-                "management comes before long content at {width}"
-            );
-            assert!(
-                outline.last("Run history").y < 800.0,
-                "collapsed details leave room for results at {width}"
-            );
-            assert!(
-                !outline
+        for prompt in [
+            "Review the recent changes and summarize the result. ".repeat(150),
+            "\n\nReview\n\n\nrecent\tchanges.\n\nSummarize\nresults.\n\n".repeat(150),
+        ] {
+            let mut owner = automation();
+            owner.definition.prompt = prompt.clone();
+            let mut state = State {
+                rows: vec![owner.summary(None)],
+                selected: Some(owner),
+                list_status: ListStatus::Loaded,
+                history_status: HistoryStatus::Loaded,
+                ..Default::default()
+            };
+            for width in [300.0, 480.0, 900.0] {
+                let outline = Outline::of(&state, width, 800.0);
+                let remove = outline.text("Remove…");
+                let instructions = outline.text("Instructions");
+                assert!(
+                    remove.y < instructions.y,
+                    "management comes before long content at {width}"
+                );
+                assert!(
+                    outline.last("Run history").y < 800.0,
+                    "collapsed details leave room for results at {width}"
+                );
+                assert!(!outline.texts.iter().any(|(text, _)| text == &prompt));
+                let preview = &outline
                     .texts
                     .iter()
-                    .any(|(text, _)| text == &state.selected.as_ref().unwrap().definition.prompt)
-            );
+                    .find(|(text, _)| text.starts_with("Review"))
+                    .expect("collapsed instructions retain a readable preview")
+                    .0;
+                assert!(preview.chars().count() <= 181 && preview.ends_with('…'));
+                assert!(
+                    !preview
+                        .chars()
+                        .any(|character| character.is_whitespace() && character != ' ')
+                        && !preview.contains("  "),
+                    "blank lines and indentation cannot expand the collapsed preview"
+                );
+            }
+            state.details.instructions = true;
+            Outline::of(&state, 900.0, 800.0).text(&prompt);
         }
     }
 
