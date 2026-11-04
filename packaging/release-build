@@ -139,7 +139,15 @@ export VERSION
 DEB_ARCH=amd64
 # Use conventional build permissions; the host wrapper's cache remains private.
 umask 022
+# Test threads follow the job count chosen for this host's memory.
 export RUST_TEST_THREADS=${CARGO_BUILD_JOBS:-2}
+# Tests keep release semantics (optimized, production identity, no debug
+# assertions) without the LTO and single codegen unit of shipped binaries.
+# The lane defines this profile, so refs that predate it build the same way.
+export CARGO_PROFILE_RELEASE_TEST_INHERITS=release \
+    CARGO_PROFILE_RELEASE_TEST_LTO=false \
+    CARGO_PROFILE_RELEASE_TEST_CODEGEN_UNITS=256 \
+    CARGO_PROFILE_RELEASE_TEST_INCREMENTAL=true
 
 # Each command resolves its own feature graph; never use --workspace or combine
 # these features. All native artifacts are produced inside this Ubuntu rootfs.

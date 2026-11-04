@@ -31,7 +31,7 @@ while (($#)); do
                 'Requires Linux x86_64, unprivileged user namespaces, bubblewrap, Bash,' \
                 'Git, curl, GNU tar/coreutils, flock, network access, and ample disk space.' \
                 'CAGENTS_RELEASE_CACHE selects a private, marked cache (default:' \
-                '~/.cache/cagents-release/ubuntu-22.04-amd64). CARGO_BUILD_JOBS defaults to every CPU.' \
+                '~/.cache/cagents-release/ubuntu-22.04-amd64). CARGO_BUILD_JOBS defaults to one per CPU and 2 GiB available memory.' \
                 'No root, Docker, host toolchain, credentials, or publication is used.'
             exit 0
             ;;
@@ -46,7 +46,14 @@ CALLER_GID=$(id -g)
 for command in bwrap git curl tar sha256sum flock realpath stat mktemp install; do
     command -v "$command" >/dev/null || fail "required command not found: $command"
 done
-JOBS=${CARGO_BUILD_JOBS:-$(nproc)}
+if [[ -z ${CARGO_BUILD_JOBS:-} ]]; then
+    # Servo, SpiderMonkey and the final links each need gigabytes; leave every
+    # job about 2 GiB of what is available now.
+    available_gib=$(awk '/^MemAvailable:/ { print int($2 / 1048576) }' /proc/meminfo)
+    CARGO_BUILD_JOBS=$(( available_gib / 2 < $(nproc) ? available_gib / 2 : $(nproc) ))
+    ((CARGO_BUILD_JOBS > 0)) || CARGO_BUILD_JOBS=1
+fi
+JOBS=$CARGO_BUILD_JOBS
 [[ $JOBS =~ ^[1-9][0-9]*$ ]] || fail 'CARGO_BUILD_JOBS must be a positive integer'
 if [[ -z $REF ]]; then
     version=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' "$ROOT_DIR/Cargo.toml")
@@ -165,11 +172,15 @@ mkdir "$WORK/dist"
 # Unchanged path crates stay fresh. The repository stays outside the tree, so
 # /source has no .git, just as an archive export had none.
 source_git() {
-    git -c core.hooksPath=/dev/null -c core.autocrlf=false \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        git -c core.hooksPath=/dev/null -c core.autocrlf=false -c gc.autoDetach=false \
         --git-dir="$CACHE/source.git" --work-tree="$CACHE/source" "$@"
 }
 [[ -f $CACHE/source.git/HEAD ]] || git init -q --bare "$CACHE/source.git"
-source_git fetch -q --no-tags --depth=1 "$ROOT_DIR" "$SOURCE_COMMIT"
+# The cache lock is held, so any Git lock left here is from a killed build.
+find "$CACHE/source.git" -name '*.lock' -type f -delete
+# A full fetch from the local repository is incremental after the first.
+source_git fetch -q --no-tags "$ROOT_DIR" "$SOURCE_COMMIT"
 source_git checkout -q -f --detach "$SOURCE_COMMIT"
 source_git clean -q -ffdx
 # User lookup must work without importing the host's account database.

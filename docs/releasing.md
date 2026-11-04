@@ -41,8 +41,8 @@ then build:
 ```
 
 Run `./scripts/build-release-linux --help` for the cache location and other
-details. `CARGO_BUILD_JOBS` defaults to every CPU inside the builder; lower it on a
-shared or memory-constrained host. Download and build temporary files stay in
+details. `CARGO_BUILD_JOBS` defaults to one job per CPU, limited to one per 2 GiB of
+available memory, and test threads follow it; set it lower on a shared host. Download and build temporary files stay in
 its private disk cache rather than a RAM-backed `/tmp`. The cache also keeps
 one checkout of the source, and each build rewrites only the files that changed,
 so Cargo recompiles only the crates they belong to.
