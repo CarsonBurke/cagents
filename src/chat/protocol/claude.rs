@@ -454,6 +454,9 @@ struct Claude {
     /// so the notification that follows it does not show it again.
     handed_back: VecDeque<String>,
     background_agents: HashSet<String>,
+    /// Agents whose settled run `SendMessage` started again: their tool row
+    /// still shows the earlier outcome, which the next receipt must replace.
+    restarted_agents: HashSet<String>,
     /// The agent ID Claude Code gave each agent it runs in the background,
     /// with the Agent tool call that started it, oldest first. A task's frames
     /// name the agent by this ID, and after `SendMessage` resumes it, by no
@@ -1820,6 +1823,14 @@ impl Claude {
                 .any(|(agent, known)| agent == task && known == tool);
         let status = if started {
             self.ended_agents.retain(|(known, _)| known != tool);
+            if self
+                .tools
+                .get(&ScopedId::new(None, tool))
+                .and_then(|item| item.content.status())
+                .is_some_and(|status| status != ToolStatus::Running)
+            {
+                self.restarted_agents.insert(tool.into());
+            }
             ToolStatus::Running
         } else if ended.is_some() && self.ended_agent(tool) == Some(ToolStatus::Stopped) {
             ToolStatus::Stopped
@@ -1841,6 +1852,7 @@ impl Claude {
         let settled = !started
             && ended.is_some()
             && !self.background_agents.contains(tool)
+            && !self.restarted_agents.contains(tool)
             && self
                 .tools
                 .get(&ScopedId::new(None, tool))
@@ -1864,6 +1876,7 @@ impl Claude {
                 self.background_agents.insert(tool.into());
             } else if status != ToolStatus::Running {
                 self.background_agents.remove(tool);
+                self.restarted_agents.remove(tool);
             }
         }
         status
@@ -6329,6 +6342,35 @@ mod tests {
             matches!(parent.events.as_slice(), [Event::Error { .. }]),
             "ordinary parent API errors keep their existing event representation"
         );
+    }
+
+    #[test]
+    fn a_foreground_agent_restarted_by_send_message_settles_from_its_next_receipt() {
+        let frames = vec![
+            json!({"type":"stream_event","uuid":"restart-parent-start","event":{"type":"message_start","message":{"id":"restart-parent"}}}),
+            scoped_call(None, "launch-restart", "restart-child", "Agent", json!({})),
+            json!({"type":"system","subtype":"task_started","task_id":"restart-task","tool_use_id":"restart-child","task_type":"local_agent"}),
+            json!({"type":"user","uuid":"restart-first-result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"restart-child","content":"First report.","is_error":false}]}}),
+            // SendMessage resumes the same agent after its row settled.
+            json!({"type":"system","subtype":"task_started","task_id":"restart-task","task_type":"local_agent"}),
+            json!({"type":"system","subtype":"task_notification","uuid":"restart-notification","task_id":"restart-task","status":"completed","summary":"Second report"}),
+            json!({"type":"result","uuid":"restart-parent-result","subtype":"success","is_error":false}),
+        ];
+        let (_, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(Claude {
+                busy: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "restart-child")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Succeeded);
+        assert!(!state.is_working());
     }
 
     #[test]
