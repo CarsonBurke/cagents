@@ -129,14 +129,18 @@ class PackageDependencies(unittest.TestCase):
         self.binaries = self.work / "target/release"
         self.tools.mkdir()
         self.binaries.mkdir(parents=True)
-        # These are deliberately shell fixtures, never application ELFs. Only
-        # the fake CLI protocol query executes; UI/daemon execution fails.
+        # Shell fixtures, never application ELFs. Only version queries and the
+        # fake CLI protocol query execute; UI/daemon startup still fails.
         fixtures = {
             self.tools / "cargo": '#!/bin/sh\n[ "$1" = tree ] || exit 91\nprintf "fixture v1\\n"\n',
             self.tools / "strip": "#!/bin/sh\nexit 0\n",
-            self.binaries / "cagents": '#!/bin/sh\n[ "$*" = "daemon protocol-version" ] || exit 92\nprintf "1\\n"\n',
-            self.binaries / "cagents-ui": "#!/bin/sh\nexit 93\n",
-            self.binaries / "cagentsd": "#!/bin/sh\nexit 94\n",
+            self.binaries / "cagents": '#!/bin/sh\ncase "$*" in\n'
+            f'--version) printf "cagents {VERSION}\\n" ;;\n'
+            "'daemon protocol-version') printf '1\\n' ;;\n*) exit 92 ;;\nesac\n",
+            self.binaries / "cagents-ui": '#!/bin/sh\n[ "$*" = --version ] || exit 93\n'
+            f'printf "cagents-ui {VERSION}\\n"\n',
+            self.binaries / "cagentsd": '#!/bin/sh\n[ "$*" = --version ] || exit 94\n'
+            f'printf "cagentsd {VERSION}\\n"\n',
         }
         for path, contents in fixtures.items():
             path.write_text(contents)

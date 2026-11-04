@@ -780,6 +780,12 @@ impl Cagents {
             if !view.panes.is_empty() {
                 continue;
             }
+            // An empty view can precede a live pane's first publication. Closing
+            // that pane later captures the channel again.
+            if self.channel_holds_unpublished_work(channel) {
+                self.channel_work.retire_candidates.remove(&captured);
+                continue;
+            }
             let edit = crate::workspace_model::ModelEdit::RetireEmptyChannel {
                 home: captured,
                 expected_view_revision: view.revision,
