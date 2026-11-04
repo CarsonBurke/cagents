@@ -1689,13 +1689,20 @@ mod tests {
         }
     }
 
-    fn settle_watch_events(scanner: &mut Scanner, handle: &Handle, repository: &Path) {
+    fn settle_watch_events(
+        scanner: &mut Scanner,
+        handle: &Handle,
+        repository: &Path,
+        covered: bool,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut quiet_since = Instant::now();
         loop {
             scanner.drain(handle);
             let mut shared = handle.shared();
             let tracked = shared.projects.get_mut(repository).unwrap();
+            assert_eq!(tracked.covered, covered);
+            assert!(tracked.scan_error.is_none());
             if tracked.pending.take().is_some() {
                 quiet_since = Instant::now();
             } else if quiet_since.elapsed() >= Duration::from_millis(100) {
@@ -2041,7 +2048,7 @@ mod tests {
         }
 
         // Let the removal/index traffic settle before testing an ordinary edit.
-        settle_watch_events(&mut scanner, &handle, &repository);
+        settle_watch_events(&mut scanner, &handle, &repository, true);
         std::fs::write(&file, "ordinary tracked edit after native recovery\n").unwrap();
         wait_for_watch(
             &mut scanner,
@@ -2158,7 +2165,7 @@ mod tests {
             .last_scan = Some(Instant::now() - SCAN_SPACING);
         scanner.dispatch(&handle);
         handle.scan_job(take_scan_job(&handle), scan::scan);
-        settle_watch_events(&mut scanner, &handle, &repository);
+        settle_watch_events(&mut scanner, &handle, &repository, false);
         let full_scan = handle.shared().projects[&repository].last_full_scan;
         assert!(full_scan.is_some());
         // The primary's deep census consumes the budget before the linked
@@ -2244,7 +2251,7 @@ mod tests {
             assert!(!Arc::ptr_eq(local.plan.as_ref().unwrap(), &old_plan));
         }
         scanner.configure(&handle);
-        settle_watch_events(&mut scanner, &handle, &repository);
+        settle_watch_events(&mut scanner, &handle, &repository, false);
         assert!(!handle.shared().projects[&repository].covered);
 
         // The full deadline must also retry native registration after space
@@ -2287,7 +2294,7 @@ mod tests {
         }
         // Healthy projects retain their slower status poll, which also owns
         // an independent deadline even though it needs no inventory rebuild.
-        settle_watch_events(&mut scanner, &handle, &repository);
+        settle_watch_events(&mut scanner, &handle, &repository, true);
         {
             let mut shared = handle.shared();
             let tracked = shared.projects.get_mut(&repository).unwrap();
