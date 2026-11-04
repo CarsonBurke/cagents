@@ -6,6 +6,10 @@ use crate::{
     model::WorktreeId,
 };
 
+/// Longer than the registry takes to answer a retirement, after which a
+/// channel still present was kept.
+pub(super) const RETIREMENT_ANSWERED: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Surface {
     Conversations,
@@ -23,6 +27,11 @@ pub(super) struct Navigation {
 pub(super) struct State {
     pub(super) view: ui::State,
     pub(super) retire_candidates: HashSet<Home>,
+    /// Retirements sent to the registry, with the view revision each expects
+    /// and when it was sent. The registry applies edits in order, so a pane
+    /// published into one of these channels before the answer arrives would
+    /// land after it retired.
+    pub(super) retiring: HashMap<crate::model::ChannelId, (u64, std::time::Instant)>,
     routes: HashMap<Home, Route>,
     main: bool,
     title: String,
@@ -37,6 +46,7 @@ impl Default for State {
         Self {
             view: ui::State::default(),
             retire_candidates: HashSet::new(),
+            retiring: HashMap::new(),
             routes: HashMap::new(),
             main: false,
             title: String::new(),
@@ -752,6 +762,9 @@ impl Cagents {
     /// View publication supplies the settled revision. The daemon checks that
     /// exact revision and durable work/history together before retiring a home.
     pub(super) fn retire_settled_empty_channels(&mut self) {
+        self.channel_work
+            .retiring
+            .retain(|_, (_, sent)| sent.elapsed() < RETIREMENT_ANSWERED);
         let candidates = self
             .channel_work
             .retire_candidates
@@ -786,6 +799,9 @@ impl Cagents {
             };
             if self.workspace_model_tx.try_send(edit).is_ok() {
                 self.channel_work.retire_candidates.remove(&captured);
+                self.channel_work
+                    .retiring
+                    .insert(channel, (view.revision, std::time::Instant::now()));
             }
         }
     }

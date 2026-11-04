@@ -1002,11 +1002,13 @@ impl Cagents {
             }
             Command::ReopenPane => {
                 let scope = self.active_workspace_destination();
-                let Some(index) = self
-                    .recently_closed
-                    .iter()
-                    .rposition(|(_, saved_scope)| *saved_scope == scope)
-                else {
+                // The latest pane closed here, or in a channel that retired
+                // when it closed, which reopening brings back.
+                let Some(index) = self.recently_closed.iter().rposition(|(_, saved_scope)| {
+                    *saved_scope == scope
+                        || matches!(saved_scope, Some(WorkspaceDestination::Channel(id))
+                            if self.closed_channel_reopens_from(*id, scope))
+                }) else {
                     return Task::none();
                 };
                 let (card, saved_scope) = self.recently_closed[index].clone();
@@ -1023,21 +1025,42 @@ impl Cagents {
                         });
                     return task;
                 }
-                self.recently_closed.remove(index);
                 if card.kind.is_utility() {
-                    self.open_utility_card(card.kind)
-                } else {
-                    // Close retires the old card's filing. The matching saved
-                    // destination identifies the workspace being reopened in;
-                    // channel membership is restored separately on insertion.
-                    let owner = match saved_scope {
-                        Some(
-                            WorkspaceDestination::Worktree(_) | WorkspaceDestination::Folder(_),
-                        ) => self.active_workspace.clone(),
-                        Some(WorkspaceDestination::Channel(_)) | None => None,
-                    };
-                    self.duplicate_pane_in_scope(card, owner)
+                    self.recently_closed.remove(index);
+                    return self.open_utility_card(card.kind);
                 }
+                // Close retires the old card's filing. The matching saved
+                // destination identifies the workspace being reopened in;
+                // channel membership is restored separately on insertion, into
+                // the channel entered here.
+                let (owner, scope, revived) = match saved_scope {
+                    Some(WorkspaceDestination::Worktree(_) | WorkspaceDestination::Folder(_)) => {
+                        (self.active_workspace.clone(), Task::none(), None)
+                    }
+                    Some(WorkspaceDestination::Channel(id)) => {
+                        let home = self.closed_channel_home(id);
+                        let revived = match home {
+                            Some(channel_ui::ClosedCardHome::Retired(retired)) => Some(retired),
+                            _ => None,
+                        };
+                        match home.and_then(|home| self.enter_closed_card_home(home)) {
+                            Some(entered) => (None, entered, revived),
+                            // Closed in the strip on screen, which takes it back.
+                            None if saved_scope == scope => (None, Task::none(), None),
+                            // Its channel could not be brought back, and the
+                            // pane belongs nowhere else.
+                            None => return Task::none(),
+                        }
+                    }
+                    None => (None, Task::none(), None),
+                };
+                self.recently_closed.remove(index);
+                let reopened = self.duplicate_pane_in_scope(card, owner);
+                // A pane that cannot be cloned, or that opens outside the
+                // window, leaves a revived channel with nothing in it.
+                let abandoned =
+                    revived.map_or_else(Task::none, |retired| self.abandon_empty_revival(retired));
+                Task::batch([scope, reopened, abandoned])
             }
             Command::FocusPane1
             | Command::FocusPane2

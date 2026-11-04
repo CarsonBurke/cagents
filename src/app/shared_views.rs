@@ -90,6 +90,22 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Treats `scope` as already seeded with `panes`, as an acknowledged seed
+    /// leaves it.
+    #[cfg(test)]
+    pub(super) fn initialize(&mut self, scope: Scope, panes: Vec<Pane>) {
+        self.baseline.insert(scope.clone(), panes);
+        self.initialized.insert(scope);
+    }
+
+    /// View edits published and not yet acknowledged, oldest first.
+    #[cfg(test)]
+    pub(super) fn pending_changes(&self) -> impl DoubleEndedIterator<Item = (&Scope, &Change)> {
+        self.pending
+            .iter()
+            .map(|(_, scope, change)| (scope, change))
+    }
+
     pub(super) fn requested_transfer_card(&self, operation: uuid::Uuid) -> Option<CardId> {
         self.requested_transfers.get(&operation).copied()
     }

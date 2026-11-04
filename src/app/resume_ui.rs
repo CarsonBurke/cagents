@@ -821,20 +821,54 @@ impl Cagents {
         }
         let replace = self.resume_ui.replace;
         self.close_resume();
+        // Read before forgetting the closed card, which records where it was.
+        let home = self.closed_card_home(entry.card);
         self.recently_closed
             .retain(|(card, _)| card.id != entry.card);
-        let scope = self.select_worktree(session.launch.recipe.working_directory.clone(), false);
+        let scope = self.enter_resumed_conversation_home(home, &session);
         // The draft `/resume` was asked from gives its place to the
         // conversation, where both belong to the same strip.
         let replace = replace.filter(|card| {
             self.chat_is_unused(*card) && self.workspace.order().any(|id| id == *card)
         });
         let insert = self.insert_chat_card(session, replace, None);
-        if let Some(card) = self.workspace.focused() {
-            self.apply_reported_title(card, entry.title);
+        // The new card is published under its provider's generic name, and
+        // the shared view would name it that again unless its own name is
+        // published too.
+        if let Some(card) = self.durable.focused
+            && self.apply_reported_title(card, entry.title)
+        {
+            self.persist();
         }
         let discard = replace.map_or_else(Task::none, |card| self.close_card_unasked(card));
         Task::batch([scope, insert, discard])
+    }
+
+    /// Enters the place a resumed conversation belongs: the channel it was
+    /// closed in, brought back if it retired with its last card; else the
+    /// channel `/resume` was asked from, when the conversation runs in that
+    /// channel's directory; else the conversation's own worktree.
+    fn enter_resumed_conversation_home(
+        &mut self,
+        home: Option<channel_ui::ClosedCardHome>,
+        session: &chat::Session,
+    ) -> Task<Message> {
+        let directory = &session.launch.recipe.working_directory;
+        if let Some(home) = home
+            && let Some(scope) = self.enter_closed_card_home(home)
+        {
+            return scope;
+        }
+        if home.is_none()
+            && let Some(channel) = self.durable.active_channel
+            && !self.channel_ui.is_deleting(channel)
+            && self.channel_directory(channel).as_ref() == Some(directory)
+        {
+            return self
+                .enter_closed_card_home(channel_ui::ClosedCardHome::Channel(channel))
+                .unwrap_or_else(Task::none);
+        }
+        self.select_worktree(directory.clone(), false)
     }
 
     /// Closes the picker and stops indexing. Focus is left to whatever the

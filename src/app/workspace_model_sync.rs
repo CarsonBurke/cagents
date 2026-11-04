@@ -56,6 +56,13 @@ pub enum ModelUpdate {
         model: WorkspaceModel,
     },
     NavigationFailed(String),
+    /// The registry's answer to this window's request to retire an emptied
+    /// channel: the model after it decided, either way. A channel still in it
+    /// was kept.
+    RetirementAnswered {
+        channel: ChannelId,
+        model: WorkspaceModel,
+    },
     /// Optional naming yielded after temporary admission pressure. The next
     /// real wake may retry this exact current candidate; this is not a timer.
     TitleDeferred(ModelEdit),
@@ -373,12 +380,12 @@ fn send(
             model: model.clone(),
         });
     }
-    if reordered
-        || matches!(
-            &request,
-            ModelEdit::SuggestConversationTitle { .. } | ModelEdit::RetireEmptyChannel { .. }
-        )
-    {
+    if let ModelEdit::RetireEmptyChannel { home, .. } = &request {
+        let _ = updates.send_blocking(ModelUpdate::RetirementAnswered {
+            channel: home.channel,
+            model: model.clone(),
+        });
+    } else if reordered || matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
         let _ = updates.send_blocking(ModelUpdate::Read(model.clone()));
     }
     if let Some(repository) = reopened {
@@ -532,6 +539,14 @@ impl Cagents {
         &mut self,
         update: ModelUpdate,
     ) -> (Task<Message>, bool) {
+        if let ModelUpdate::RetirementAnswered { channel, model } = update {
+            // Applied as the snapshot it carries, which retires the channel if
+            // the registry did, while the retirement still reads as this
+            // window's own.
+            let effect = self.apply_workspace_model_update_effect(ModelUpdate::Read(model));
+            self.channel_work.retiring.remove(&channel);
+            return effect;
+        }
         if let ModelUpdate::Read(model) = &update
             && model.identity == self.workspace_model.identity
             && model.sequence < self.shared_views.snapshot_sequence
@@ -608,6 +623,9 @@ impl Cagents {
                 self.install_workspace_model_snapshot(model);
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
+            }
+            ModelUpdate::RetirementAnswered { model, .. } => {
+                self.apply_workspace_model_update_inner(ModelUpdate::Read(model))
             }
             ModelUpdate::Read(model) => {
                 if !self.install_workspace_model_snapshot(model) {
@@ -1547,11 +1565,19 @@ impl Cagents {
             repository: repository.clone(),
             name,
         });
+        // A new channel's title is empty; a revived one keeps the name it had.
+        let (title, title_source) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .map(|channel| (channel.title.clone(), channel.title_source))
+            .unwrap_or_default();
         self.publish_model_edit(ModelEdit::CreateChannel {
             id,
             repository,
-            title: String::new(),
-            title_source: Default::default(),
+            title,
+            title_source,
         });
     }
 

@@ -220,6 +220,39 @@ pub struct State {
     /// channel straight back. An identity is never reused, so remembering it
     /// for the life of the window is exact.
     deleted: HashSet<ChannelId>,
+    /// Channels this window closed the last card of, as they were then, so a
+    /// card reopened from one can bring it back after it retires. Explicit
+    /// deletion forgets the channel; only automatic retirement is undone.
+    emptied: Vec<EmptiedChannel>,
+    /// The channel each retired one was revived as. A retired identity is
+    /// never reused, so a revival is a new channel, and every other card
+    /// closed in the old one follows it there.
+    revived: HashMap<ChannelId, ChannelId>,
+}
+
+/// What a channel was when its last card closed: enough to recreate it as the
+/// user knew it, under its own name and in its own project.
+#[derive(Debug, Clone)]
+struct EmptiedChannel {
+    id: ChannelId,
+    project_id: ProjectId,
+    title: String,
+    title_source: crate::model::ChannelTitleSource,
+}
+
+/// As many emptied channels as there are recently closed cards to reopen.
+const EMPTIED_CHANNELS: usize = 32;
+
+/// Where a closed card was when it closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClosedCardHome {
+    /// A channel that still exists and can take the card back.
+    Channel(ChannelId),
+    /// A channel that retired when its last card closed, which reopening the
+    /// card recreates.
+    Retired(ChannelId),
+    /// A worktree or folder strip, or a channel that is gone for good.
+    Strip,
 }
 
 #[derive(Debug)]
@@ -421,55 +454,10 @@ impl Cagents {
                 self.delete_channel(id)
             }
             Action::Create(project_id) => {
-                let Some(project) = self
-                    .sidebar_model
-                    .projects
-                    .iter()
-                    .find(|project| project.id == project_id)
+                let Some(id) = self.create_channel(project_id, String::new(), Default::default())
                 else {
                     return Task::none();
                 };
-                if self.project_ui.removing.contains_key(&project.repository)
-                    || self.project_ui.closed.contains(&project.repository)
-                {
-                    self.status = Some(TransientNotice::warning("That project is being removed."));
-                    return Task::none();
-                }
-                let Some(directory) = self.project_primary_worktree(project_id) else {
-                    return Task::none();
-                };
-                if let Err(error) = self.worktree_protections.protect_next(&directory) {
-                    self.status = Some(TransientNotice::warning(format!(
-                        "Cannot open this worktree yet: {error}"
-                    )));
-                    return Task::none();
-                }
-                let id = ChannelId::new();
-                // The registry assigns the real rank and this window learns it
-                // from the answer to the publish below. Until then it takes one
-                // more than the highest rank it knows, which is what the
-                // registry would assign and what keeps two channels created
-                // before any answer arrives in the order they were made.
-                let ordinal = self.next_provisional_ordinal();
-                Arc::make_mut(&mut self.durable)
-                    .channels
-                    .push(ProjectChannel {
-                        title_source: Default::default(),
-                        id,
-                        project_id,
-                        // Empty means awaiting the channel's first accepted prompt.
-                        // Nonempty names, including user edits, are never replaced here.
-                        title: String::new(),
-                        ordinal,
-                        // Not shared until the registry answers the publish
-                        // below. Claiming it early would let a registry that
-                        // never received the create retire it on a reconnect.
-                        shared: false,
-                        cards: Vec::new(),
-                        focused: None,
-                    });
-                self.publish_channel_creation(id, project_id);
-                self.sidebar_state.reveal_project(project_id);
                 let scope = self.open_channel_with_default(id);
                 self.persist();
                 Task::batch([
@@ -511,10 +499,293 @@ impl Cagents {
         }
     }
 
+    /// Adds a channel to `project_id` and publishes it, without entering it.
+    ///
+    /// An empty `title` means the channel awaits its first accepted prompt; a
+    /// nonempty one, including a user's, is never replaced by that prompt.
+    fn create_channel(
+        &mut self,
+        project_id: ProjectId,
+        title: String,
+        title_source: crate::model::ChannelTitleSource,
+    ) -> Option<ChannelId> {
+        let project = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)?;
+        if self.project_ui.removing.contains_key(&project.repository)
+            || self.project_ui.closed.contains(&project.repository)
+        {
+            self.status = Some(TransientNotice::warning("That project is being removed."));
+            return None;
+        }
+        let directory = self.project_primary_worktree(project_id)?;
+        if let Err(error) = self.worktree_protections.protect_next(&directory) {
+            self.status = Some(TransientNotice::warning(format!(
+                "Cannot open this worktree yet: {error}"
+            )));
+            return None;
+        }
+        let id = ChannelId::new();
+        // The registry assigns the real rank and this window learns it from
+        // the answer to the publish below. Until then it takes one more than
+        // the highest rank it knows, which is what the registry would assign
+        // and what keeps two channels created before any answer arrives in the
+        // order they were made.
+        let ordinal = self.next_provisional_ordinal();
+        Arc::make_mut(&mut self.durable)
+            .channels
+            .push(ProjectChannel {
+                title_source,
+                id,
+                project_id,
+                title,
+                ordinal,
+                // Not shared until the registry answers the publish below.
+                // Claiming it early would let a registry that never received
+                // the create retire it on a reconnect.
+                shared: false,
+                cards: Vec::new(),
+                focused: None,
+            });
+        self.publish_channel_creation(id, project_id);
+        self.sidebar_state.reveal_project(project_id);
+        Some(id)
+    }
+
+    /// Where `card` was when it closed, when this window can tell: the scope
+    /// it was closed from, or else the one shared view that records removing
+    /// it. A pane moved between views is retired from each view it left, so
+    /// more than one such view is no answer.
+    pub(super) fn closed_card_home(&self, card: CardId) -> Option<ClosedCardHome> {
+        let closed_from = self
+            .recently_closed
+            .iter()
+            .rev()
+            .find(|(state, _)| state.id == card)
+            .and_then(|(_, destination)| destination.as_ref());
+        let channel = match closed_from {
+            Some(WorkspaceDestination::Channel(id)) => *id,
+            Some(WorkspaceDestination::Worktree(_) | WorkspaceDestination::Folder(_)) => {
+                return Some(ClosedCardHome::Strip);
+            }
+            None => {
+                let mut views = self
+                    .workspace_model
+                    .views
+                    .iter()
+                    .filter(|view| view.retired.contains(&card));
+                let view = views.next()?;
+                if views.next().is_some() {
+                    return None;
+                }
+                match view.scope {
+                    crate::workspace_model::views::Scope::Channel(id) => id,
+                    crate::workspace_model::views::Scope::Worktree { .. } => {
+                        return Some(ClosedCardHome::Strip);
+                    }
+                }
+            }
+        };
+        self.closed_channel_home(channel)
+    }
+
+    /// The channel a card closed in `id` returns to: `id` itself, or the
+    /// channel that revived it, while it is still there to enter, or else a
+    /// retired one this window can recreate.
+    pub(super) fn closed_channel_home(&self, mut id: ChannelId) -> Option<ClosedCardHome> {
+        // Each revival maps a retired identity to a newer one, so the chain
+        // is acyclic and no longer than the map.
+        for _ in 0..self.channel_ui.revived.len() {
+            match self.channel_ui.revived.get(&id) {
+                Some(&next) => id = next,
+                None => break,
+            }
+        }
+        let present = self.durable.channels.iter().any(|channel| channel.id == id)
+            && !self.channel_ui.is_deleting(id);
+        if present && !self.channel_retiring(id) {
+            return Some(ClosedCardHome::Channel(id));
+        }
+        // A channel gone any other way, deleted by the user in any window,
+        // is gone for good, and its cards reopen in their worktree.
+        Some(
+            if self
+                .channel_ui
+                .emptied
+                .iter()
+                .any(|emptied| emptied.id == id)
+            {
+                ClosedCardHome::Retired(id)
+            } else {
+                ClosedCardHome::Strip
+            },
+        )
+    }
+
+    /// Whether a card closed in channel `id` reopens from `scope`: from the
+    /// channel it now resolves to, or, once that channel retired, from
+    /// anywhere in its project, since it is no longer anywhere to reopen from.
+    pub(super) fn closed_channel_reopens_from(
+        &self,
+        id: ChannelId,
+        scope: Option<WorkspaceDestination>,
+    ) -> bool {
+        match self.closed_channel_home(id) {
+            Some(ClosedCardHome::Channel(home)) => {
+                scope == Some(WorkspaceDestination::Channel(home))
+            }
+            Some(ClosedCardHome::Retired(retired)) => {
+                let project = self
+                    .channel_ui
+                    .emptied
+                    .iter()
+                    .find(|emptied| emptied.id == retired)
+                    .map(|emptied| emptied.project_id);
+                project.is_some() && project == self.destination_project(scope)
+            }
+            Some(ClosedCardHome::Strip) | None => false,
+        }
+    }
+
+    /// Whether a retirement this window sent for `id` may still be applied:
+    /// the registry has not answered, and nothing proves it refused. It
+    /// refuses one whose view has moved on, so a newer revision or a pane is
+    /// that proof. An answer lost with its connection is presumed refused
+    /// once overdue.
+    fn channel_retiring(&self, id: ChannelId) -> bool {
+        let Some(&(expected, sent)) = self.channel_work.retiring.get(&id) else {
+            return false;
+        };
+        sent.elapsed() < super::channel_work::RETIREMENT_ANSWERED
+            && self
+                .workspace_model
+                .views
+                .iter()
+                .find(|view| view.scope == crate::workspace_model::views::Scope::Channel(id))
+                .is_none_or(|view| view.revision == expected && view.panes.is_empty())
+    }
+
+    /// Enters the channel a closed card returns to, recreating it if it
+    /// retired, and keeps it from retiring under the card about to arrive.
+    /// `None` when the card belongs to no channel this window can enter.
+    pub(super) fn enter_closed_card_home(&mut self, home: ClosedCardHome) -> Option<Task<Message>> {
+        let (id, reveal) = match home {
+            ClosedCardHome::Channel(id) => {
+                self.channel_work
+                    .retire_candidates
+                    .retain(|candidate| candidate.channel != id);
+                // No longer empty, so no longer a channel to revive.
+                self.channel_ui.emptied.retain(|emptied| emptied.id != id);
+                (id, Task::none())
+            }
+            ClosedCardHome::Retired(id) => {
+                let id = self.revive_channel(id)?;
+                (
+                    id,
+                    sidebar::reveal(sidebar::selection_row_focus_id(
+                        sidebar::SelectionRow::Channel(id),
+                    ))
+                    .map(cosmic::Action::App),
+                )
+            }
+            ClosedCardHome::Strip => return None,
+        };
+        let scope = self.select_channel(id);
+        (self.durable.active_channel == Some(id)).then(|| Task::batch([scope, reveal]))
+    }
+
+    /// The project `scope` belongs to.
+    fn destination_project(&self, scope: Option<WorkspaceDestination>) -> Option<ProjectId> {
+        match scope? {
+            WorkspaceDestination::Channel(id) => self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == id)
+                .map(|channel| channel.project_id),
+            WorkspaceDestination::Folder(project) => Some(project),
+            WorkspaceDestination::Worktree(worktree) => self
+                .sidebar_model
+                .projects
+                .iter()
+                .find(|project| project.worktrees.iter().any(|row| row.id == worktree))
+                .map(|project| project.id),
+        }
+    }
+
+    /// Takes back a revival that received no card, so the channel is not left
+    /// empty where nothing would retire it, and stays revivable.
+    pub(super) fn abandon_empty_revival(&mut self, retired: ChannelId) -> Task<Message> {
+        let Some(&revived) = self.channel_ui.revived.get(&retired) else {
+            return Task::none();
+        };
+        if self.channel_has_open_card(revived) {
+            return Task::none();
+        }
+        let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == revived)
+        else {
+            return Task::none();
+        };
+        let snapshot = EmptiedChannel {
+            id: retired,
+            project_id: channel.project_id,
+            title: channel.title.clone(),
+            title_source: channel.title_source,
+        };
+        self.channel_ui.revived.remove(&retired);
+        self.channel_ui.emptied.push(snapshot);
+        self.retire_channel(revived, false)
+    }
+
+    /// Recreates a channel that retired when its last card closed, under its
+    /// name and in its project. The old identity is gone for good, so the
+    /// channel returns as a new one that the old identity now resolves to.
+    fn revive_channel(&mut self, id: ChannelId) -> Option<ChannelId> {
+        let index = self
+            .channel_ui
+            .emptied
+            .iter()
+            .position(|emptied| emptied.id == id)?;
+        let emptied = self.channel_ui.emptied[index].clone();
+        let revived =
+            self.create_channel(emptied.project_id, emptied.title, emptied.title_source)?;
+        self.channel_ui.emptied.remove(index);
+        self.channel_ui.revived.insert(id, revived);
+        Some(revived)
+    }
+
     /// Defer automatic retirement until the canonical view publication settles.
     /// A work-bearing channel survives its final conversation, across windows.
     pub(super) fn close_emptied_channels(&mut self, retired: &[CardId]) -> Task<Message> {
         let emptied = self.channels_emptied_by(retired);
+        for &id in &emptied {
+            let Some(channel) = self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == id)
+            else {
+                continue;
+            };
+            let snapshot = EmptiedChannel {
+                id,
+                project_id: channel.project_id,
+                title: channel.title.clone(),
+                title_source: channel.title_source,
+            };
+            let state = &mut self.channel_ui;
+            state.emptied.retain(|emptied| emptied.id != id);
+            state.emptied.push(snapshot);
+            if state.emptied.len() > EMPTIED_CHANNELS {
+                state.emptied.remove(0);
+            }
+        }
         let captured = emptied.into_iter().filter_map(|id| {
             let channel = self.workspace_model.channel(id)?;
             let home = crate::channel_work::Home {
@@ -656,6 +927,9 @@ impl Cagents {
         if !self.channel_ui.deleting.insert(id) {
             return Task::none();
         }
+        // A channel the user deleted stays deleted; reopening one of its
+        // cards does not bring it back.
+        self.channel_ui.emptied.retain(|emptied| emptied.id != id);
         self.channel_ui.failed.remove(&id);
         self.refresh_sidebar_channels();
         // Settling spawns and closing sessions take a round trip each, and the
@@ -828,6 +1102,11 @@ impl Cagents {
         // identically whoever asked.
         self.publish_model_edit(ModelEdit::DeleteChannel { id });
         self.channel_ui.deleted.insert(id);
+        // Only this window's own retirement of an emptied channel is undone by
+        // reopening one of its cards; a deletion anywhere is final.
+        if self.channel_work.retiring.remove(&id).is_none() {
+            self.channel_ui.emptied.retain(|emptied| emptied.id != id);
+        }
         let mut freed_utility = false;
         for card in channel.cards {
             // A utility pane outlives the channel it was visiting: it leaves
@@ -2146,3 +2425,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod revival_tests;
