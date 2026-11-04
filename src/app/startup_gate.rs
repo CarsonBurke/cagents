@@ -1,10 +1,27 @@
 //! A launched window is ready only after its saved conversations and workspace
 //! have actually recovered. Opening a native surface alone cannot finish an update.
 use super::*;
+use crate::terminal::ipc::StartupState;
 
 mod retries;
 
 const LAUNCHER_MARGIN: Duration = Duration::from_secs(5);
+/// Every saved pane's own attach is bounded: a native chat's attach gives up
+/// on a reply after 70 s (two 30 s holder startup exchanges plus slack), and a
+/// terminal's control requests far sooner. While the daemon reports nothing
+/// left to restore, no pane settling for longer means nothing is still working.
+const NO_PROGRESS: Duration = Duration::from_secs(90);
+/// How often the gate asks the daemon about its startup recovery.
+const INSPECT_EVERY: Duration = Duration::from_secs(1);
+/// How long a window whose panes have all settled waits for the daemon's first
+/// answer before reporting without it.
+const FIRST_ANSWER_GRACE: Duration = Duration::from_secs(5);
+/// The launcher reads one handshake line of at most 4 KiB; the daemon's reason
+/// must leave room for the rest of the sentence.
+const MAX_DAEMON_DETAIL_BYTES: usize = 1024;
+/// What the window says when the daemon kept its original owners after a
+/// failed restore; the daemon's own reason goes beneath it as details.
+const RETAINED_NOTICE: &str = "Saved sessions could not be reconnected after the update. Their original processes were kept and nothing was closed or deleted, but this window cannot reach them. The update has not been verified.";
 
 #[derive(Default)]
 pub(super) struct State {
@@ -15,9 +32,27 @@ pub(super) struct State {
     pub(super) retries: retries::Retries,
     /// Since when a view this window shows has not been admitted.
     views_unready: Option<Instant>,
+    /// The daemon's latest answer about its startup recovery, if it gave one.
+    daemon: Option<StartupState>,
+    /// The latest attempt to ask the daemon failed.
+    daemon_unavailable: bool,
+    inspecting: bool,
+    inspected: Option<Instant>,
+    /// The panes the gate last waited on, and when that last changed.
+    waiting_on: Vec<CardId>,
+    progressed: Option<Instant>,
 }
 
 impl State {
+    /// Whether the daemon has answered, cannot, or has had long enough to.
+    fn daemon_heard(&self) -> bool {
+        self.daemon.is_some()
+            || self.daemon_unavailable
+            || self
+                .opened
+                .is_some_and(|opened| opened.elapsed() >= FIRST_ANSWER_GRACE)
+    }
+
     pub(super) fn window_opened(&self) -> bool {
         self.opened.is_some()
     }
@@ -34,6 +69,7 @@ impl State {
     pub(super) fn fixture_opened() -> Self {
         Self {
             opened: Some(Instant::now()),
+            daemon: Some(StartupState::Ready),
             ..Self::default()
         }
     }
@@ -243,12 +279,26 @@ impl Cagents {
     /// What the gate reports once its budget runs out: each pane it was
     /// still waiting on, named as its tab is, with the first reason known.
     pub(super) fn startup_timeout_report(&self) -> String {
-        let mut waiting = Vec::new();
-        let mut reasons = Vec::new();
         let views_hold = self
             .shared_views_startup_hold()
             .filter(|_| !self.shared_views.registry_unavailable);
-        reasons.extend(views_hold.map(str::to_owned));
+        let (waiting, reasons) = self.startup_waiting();
+        let reasons = views_hold
+            .map(str::to_owned)
+            .into_iter()
+            .chain(reasons)
+            .collect::<Vec<_>>();
+        match (waiting.is_empty(), views_hold) {
+            (false, _) => self.startup_incomplete(&waiting, reasons.first()),
+            (true, Some(hold)) => views_incomplete(hold),
+            (true, None) => "recovery-incomplete: saved conversations are still reconnecting. The window remains available; open the affected chats to inspect their recovery controls. The update has not been verified.".to_owned(),
+        }
+    }
+
+    /// Each saved pane the gate is still waiting on, and why.
+    fn startup_waiting(&self) -> (Vec<CardId>, Vec<String>) {
+        let mut waiting = Vec::new();
+        let mut reasons = Vec::new();
         for card in self
             .durable
             .cards
@@ -300,11 +350,7 @@ impl Cagents {
             waiting.push(card.id);
             reasons.push(reason);
         }
-        match (waiting.is_empty(), views_hold) {
-            (false, _) => self.startup_incomplete(&waiting, reasons.first()),
-            (true, Some(hold)) => views_incomplete(hold),
-            (true, None) => "recovery-incomplete: saved conversations are still reconnecting. The window remains available; open the affected chats to inspect their recovery controls. The update has not been verified.".to_owned(),
-        }
+        (waiting, reasons)
     }
 
     /// Records why each saved terminal the gate is waiting on, with nothing
@@ -434,6 +480,7 @@ impl Cagents {
         self.startup_gate.opened = Some(Instant::now());
         let count = self.startup_conversation_count();
         let attach = self.qualify_startup_terminals();
+        let inspect = self.inspect_daemon_startup();
         let progress = cosmic::task::future(async move {
             match tokio::task::spawn_blocking(move || instance::report_ui_recovery_progress(count))
                 .await
@@ -443,7 +490,7 @@ impl Cagents {
                 Err(error) => Message::StartupReported(Err(error.to_string())),
             }
         });
-        Task::batch([progress, attach])
+        Task::batch([progress, attach, inspect])
     }
 
     pub(super) fn verify_startup_gate(&mut self) -> Task<Message> {
@@ -467,7 +514,8 @@ impl Cagents {
                 // timeout does not replace the report naming what is stuck.
                 let timeout =
                     Duration::from_secs(30 + 30 * count as u64).saturating_sub(LAUNCHER_MARGIN);
-                if self.startup_gate.opened.unwrap().elapsed() >= timeout {
+                let stalled = self.startup_stalled();
+                if stalled || self.startup_gate.opened.unwrap().elapsed() >= timeout {
                     self.startup_gate.reported = true;
                     let reason = self.startup_timeout_report();
                     self.status = Some(incomplete_notice(&reason));
@@ -478,7 +526,16 @@ impl Cagents {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     Message::VerifyStartupPanes
                 });
-                Task::batch([attach, next])
+                Task::batch([attach, next, self.inspect_daemon_startup()])
+            }
+            // Every pane can settle on a daemon that kept its original owners
+            // when none of them was among those it retained.
+            Ok(true) if !self.startup_gate.daemon_heard() => {
+                let next = cosmic::task::future(async {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Message::VerifyStartupPanes
+                });
+                Task::batch([next, self.inspect_daemon_startup()])
             }
             Ok(true) => {
                 self.startup_gate.saving = true;
@@ -490,6 +547,86 @@ impl Cagents {
                 })
             }
         }
+    }
+
+    /// Whether the panes the gate waits on have stopped changing for
+    /// [`NO_PROGRESS`], while the daemon reports nothing left to restore.
+    fn startup_stalled(&mut self) -> bool {
+        let (waiting, _) = self.startup_waiting();
+        let now = Instant::now();
+        let gate = &mut self.startup_gate;
+        if gate.waiting_on != waiting {
+            gate.waiting_on = waiting;
+            gate.progressed = Some(now);
+        }
+        gate.daemon == Some(StartupState::Ready)
+            && gate
+                .progressed
+                .is_some_and(|progressed| now.duration_since(progressed) >= NO_PROGRESS)
+    }
+
+    /// Asks the daemon off the UI thread, one request at a time. A refused
+    /// pane looks the same whether its daemon is still restoring or has already
+    /// given up; only the daemon can tell them apart.
+    fn inspect_daemon_startup(&mut self) -> Task<Message> {
+        let gate = &mut self.startup_gate;
+        if gate.inspecting
+            || gate
+                .inspected
+                .is_some_and(|inspected| inspected.elapsed() < INSPECT_EVERY)
+        {
+            return Task::none();
+        }
+        gate.inspecting = true;
+        gate.inspected = Some(Instant::now());
+        cosmic::task::future(async move {
+            let state = tokio::task::spawn_blocking(inspect_daemon)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|state| state);
+            Message::StartupStateInspected(state)
+        })
+    }
+
+    pub(super) fn startup_state_inspected(
+        &mut self,
+        state: Result<StartupState, String>,
+    ) -> Task<Message> {
+        let gate = &mut self.startup_gate;
+        gate.inspecting = false;
+        if gate.reported || gate.saving {
+            return Task::none();
+        }
+        match state {
+            Ok(StartupState::Retained { detail }) => {
+                gate.reported = true;
+                self.status = Some(
+                    TransientNotice::warning(RETAINED_NOTICE).with_details(bounded_detail(&detail)),
+                );
+                return report(Err(retained_reason(&detail)));
+            }
+            // Only time the daemon reports as ready counts against the panes:
+            // while it restores they are not expected to move, and its
+            // finishing is progress in its own right.
+            Ok(state) => {
+                if state != StartupState::Ready {
+                    gate.retries.restart_windows();
+                }
+                if state != StartupState::Ready || gate.daemon != Some(StartupState::Ready) {
+                    gate.progressed = Some(Instant::now());
+                }
+                gate.daemon = Some(state);
+                gate.daemon_unavailable = false;
+            }
+            Err(error) => {
+                if !gate.daemon_unavailable {
+                    tracing::warn!(%error, "daemon startup state is unavailable");
+                }
+                gate.daemon = None;
+                gate.daemon_unavailable = true;
+            }
+        }
+        Task::none()
     }
 
     pub(super) fn startup_panes_saved(
@@ -594,6 +731,41 @@ fn startup_detail(detail: &str) -> String {
     text
 }
 
+/// Never starts a daemon merely to ask it; the panes' own attaches decide
+/// whether this window needs one. An ordinary remote bridge may start its
+/// selected daemon on connection, so a remote window goes without an answer.
+fn inspect_daemon() -> Result<StartupState, String> {
+    if crate::device::is_remote() {
+        return Err("startup inspection is unavailable for this remote connection".into());
+    }
+    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+    crate::control::ControlClient::connect(&socket)
+        .map_err(|error| error.to_string())?
+        .startup_state()
+        .map_err(|error| error.to_string())
+}
+
+/// The daemon's reason on one line, bounded to fit the launcher's handshake.
+fn bounded_detail(detail: &str) -> String {
+    let mut detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    if detail.len() > MAX_DAEMON_DETAIL_BYTES {
+        detail.truncate(detail.floor_char_boundary(MAX_DAEMON_DETAIL_BYTES));
+        detail.push('\u{2026}');
+    }
+    detail
+}
+
+/// The daemon kept its original owners after a failed restore. That does not
+/// resolve by waiting, so the launcher learns at once, with the daemon's
+/// reason, and the window stays available.
+fn retained_reason(detail: &str) -> String {
+    let detail = bounded_detail(detail);
+    let detail = detail.trim_end_matches('.');
+    format!(
+        "recovery-incomplete: the terminal service could not reconnect saved sessions after the update: {detail}. Their original processes were kept and nothing was closed or deleted; this window remains available. The update has not been verified."
+    )
+}
+
 /// What this window shows for `reason`. The handshake prefix tells the
 /// launcher how to treat the report; it means nothing to the person reading.
 fn incomplete_notice(reason: &str) -> TransientNotice {
@@ -621,3 +793,5 @@ fn report(result: Result<(), String>) -> Task<Message> {
 
 #[cfg(test)]
 mod attachment_tests;
+#[cfg(test)]
+mod daemon_tests;
