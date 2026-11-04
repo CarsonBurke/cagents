@@ -2140,7 +2140,27 @@ pub struct Item {
     pub at: Option<u64>,
 }
 
+/// A paged command's label or tool's name as the provider gave it.
+pub(crate) fn without_page_mark(label: &str) -> &str {
+    label
+        .rsplit_once(" (part ")
+        .filter(|(_, mark)| {
+            mark.strip_suffix(')')
+                .and_then(|mark| mark.split_once('/'))
+                .is_some_and(|(part, parts)| {
+                    part.parse::<usize>().is_ok() && parts.parse::<usize>().is_ok()
+                })
+        })
+        .map_or(label, |(label, _)| label)
+}
+
 impl Item {
+    /// Whether this is a later part of an item too long for one, which is still
+    /// a single thing the provider did or said.
+    pub(crate) fn continues_paged_item(&self) -> bool {
+        TranscriptPart::parse(&self.id).is_some()
+    }
+
     /// Bodies whose complete canonical bytes can be copied through the owned
     /// transcript source. Provider context uses the same field as ordinary
     /// prose; other deliveries retain their existing presentation copy rules.

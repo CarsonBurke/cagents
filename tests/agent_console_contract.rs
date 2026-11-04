@@ -387,10 +387,8 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     let waiting = fixture.wait(&["agent", "wait", first_run, "--timeout", "10"], 5);
     assert_eq!(waiting["run"]["state"], "Waiting", "{waiting}");
     let terminal = waiting["agent"]["console"]["id"].as_str().unwrap();
-    // Wait for the actionable line that ends the console's request block. The
-    // pretty request nearly fills the 24-row screen, so a run status line
-    // printed after it can scroll the block's heading off. Assert the action
-    // IDs the instruction refers to, which stay on screen beside it.
+    // Wait for the actionable line that ends the console's request block, then
+    // assert the choices it refers to.
     let displayed = fixture.cli(&[
         "terminal",
         "wait",
@@ -401,9 +399,10 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
         "10",
     ]);
     let screen = displayed["snapshot"]["text"].as_str().unwrap();
-    for action in ["\"id\": \"allow\"", "\"id\": \"deny\""] {
-        assert!(screen.contains(action), "{action} in {displayed}");
-    }
+    assert!(
+        screen.contains("Actions: allow (Allow once); deny (Deny)"),
+        "actions in {displayed}"
+    );
     fixture.cli(&[
         "terminal",
         "write",
@@ -415,7 +414,7 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
         "wait",
         terminal,
         "--text",
-        "Succeeded",
+        "Finished (7 input, 3 output tokens)",
         "--timeout",
         "10",
     ]);
@@ -465,6 +464,67 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     );
     let closed = fixture.cli(&["agent", "close", agent]);
     assert_eq!(closed["agent"]["closed"], true);
+}
+
+/// The shipped daemon and console over a provider that streams its answer and
+/// runs tools with large outputs: the pane shows what the agent said and one
+/// line per step, each once, and none of what those steps carried.
+#[test]
+fn terminal_console_prints_each_line_once_without_tool_payloads() {
+    let fixture = Fixture::with_provider(include_str!("fixtures/console-transcript-claude.sh"));
+    let project = fixture.root.path().join("project");
+    let project = project.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let accepted = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "claude",
+        "--repository",
+        project,
+        "--directory",
+        project,
+        "--surface",
+        "terminal",
+        "--prompt",
+        "first",
+        "--idempotency-key",
+        "console-transcript",
+    ]);
+    let agent = accepted["agent"]["id"].as_str().unwrap();
+    let run = accepted["run"]["id"].as_str().unwrap();
+    let finished = fixture.wait(&["agent", "wait", run, "--timeout", "30"], 0);
+    assert_eq!(finished["run"]["state"], "Succeeded", "{finished}");
+    let terminal = finished["agent"]["console"]["id"].as_str().unwrap();
+    let displayed = fixture.cli(&[
+        "terminal",
+        "wait",
+        terminal,
+        "--text",
+        "Finished",
+        "--timeout",
+        "10",
+    ]);
+    let text = displayed["snapshot"]["text"].as_str().unwrap();
+    for once in [
+        "Assistant: Looking at the failing test.",
+        "Ran cargo test --locked (failed)",
+        "Called Agent",
+        "Assistant: The second paragraph follows.",
+    ] {
+        assert_eq!(text.matches(once).count(), 1, "{once}: {text}");
+    }
+    for hidden in [
+        "PAYLOAD_OUTPUT",
+        "PAYLOAD_INPUT",
+        "Current transcript",
+        "\"input_tokens\"",
+        run,
+        agent,
+    ] {
+        assert!(!text.contains(hidden), "{hidden}: {text}");
+    }
+    fixture.cli(&["agent", "close", agent]);
 }
 
 #[test]

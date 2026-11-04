@@ -4766,3 +4766,434 @@ fn execution_gates_keep_existing_callers_after_successful_close() {
     );
     assert!(Arc::ptr_eq(&pending, &agent_gate(&host, accepted.agent.id)));
 }
+
+#[test]
+fn console_lines_summarize_steps_without_their_payloads() {
+    use chat::{
+        ChangeKind, CommandAction, DeliveryKind, FileChange, Item, ItemContent, Role, ToolStatus,
+    };
+    let item = |role, content| Item {
+        started_at: None,
+        id: "item".into(),
+        role,
+        content,
+        at: None,
+    };
+    let command = |action, label: &str, status, exit_code| {
+        item(
+            Role::Assistant,
+            ItemContent::Command {
+                label: label.into(),
+                command: "cargo test --locked\nexit 0".into(),
+                working_directory: "/repo".into(),
+                action,
+                status,
+                exit_code,
+                duration_ms: None,
+                output: "SECRET_OUTPUT".into(),
+            },
+        )
+    };
+    let tool = |status| {
+        item(
+            Role::Assistant,
+            ItemContent::Tool {
+                name: "Agent".into(),
+                input: "{\"prompt\":\"internal instructions\"}".into(),
+                output: "agentId: internal metadata".into(),
+                status,
+            },
+        )
+    };
+    let change = |path: &str, kind| FileChange {
+        path: path.into(),
+        kind,
+        diff: "+SECRET_DIFF".into(),
+    };
+    let changes = |changes| {
+        item(
+            Role::Assistant,
+            ItemContent::Changes {
+                changes,
+                status: ToolStatus::Succeeded,
+            },
+        )
+    };
+    let delivery = |kind, body: &str| {
+        item(
+            Role::User,
+            ItemContent::Delivery {
+                kind,
+                from: "Explore".into(),
+                sender: "task".into(),
+                summary: "Mapped the console".into(),
+                body: body.into(),
+            },
+        )
+    };
+    let items = [
+        item(
+            Role::Assistant,
+            ItemContent::Text {
+                text: "Done.".into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+        ),
+        item(
+            Role::Assistant,
+            ItemContent::Text {
+                text: "private reasoning".into(),
+                thinking: true,
+                phase: Default::default(),
+            },
+        ),
+        command(CommandAction::Run, " \n", ToolStatus::Succeeded, Some(0)),
+        command(
+            CommandAction::Run,
+            "Run the tests",
+            ToolStatus::Failed,
+            Some(101),
+        ),
+        command(
+            CommandAction::Run,
+            "Run the tests",
+            ToolStatus::Running,
+            None,
+        ),
+        command(
+            CommandAction::Read,
+            "Read src/app.rs",
+            ToolStatus::Succeeded,
+            None,
+        ),
+        tool(ToolStatus::Succeeded),
+        tool(ToolStatus::Denied),
+        tool(ToolStatus::Running),
+        changes(vec![]),
+        changes(vec![change("src/new.rs", ChangeKind::Added)]),
+        changes(vec![
+            change("a.rs", ChangeKind::Updated),
+            change("b.rs", ChangeKind::Deleted),
+        ]),
+        delivery(DeliveryKind::Report, "FULL_REPORT_BODY"),
+        delivery(DeliveryKind::Message, "Please rerun the build.\n"),
+    ];
+    let lines = items
+        .iter()
+        .filter_map(|item| console_line(item, 0))
+        .collect::<String>();
+    let report = chat::delivery_heading(
+        DeliveryKind::Report,
+        "Explore",
+        "task",
+        "Mapped the console",
+    );
+    let message = chat::delivery_heading(
+        DeliveryKind::Message,
+        "Explore",
+        "task",
+        "Mapped the console",
+    );
+    assert_eq!(
+        lines,
+        format!(
+            "Assistant: Done.\n\
+             Ran cargo test --locked\n\
+             Ran Run the tests (failed, exit 101)\n\
+             Read src/app.rs\n\
+             Called Agent\n\
+             Called Agent (denied)\n\
+             Added src/new.rs\n\
+             Edited 2 files\n\
+             {report}\n\
+             {message}:\nPlease rerun the build.\n"
+        )
+    );
+    for hidden in [
+        "private reasoning",
+        "SECRET",
+        "exit 0",
+        "internal",
+        "FULL_REPORT_BODY",
+    ] {
+        assert!(!lines.contains(hidden), "{hidden} leaked into {lines:?}");
+    }
+    // Settling the running steps in sequence only appends to what the client
+    // already printed, so it never reprints the transcript.
+    let mut settled = items.to_vec();
+    for item in &mut settled {
+        if let ItemContent::Command { status, .. } | ItemContent::Tool { status, .. } =
+            &mut item.content
+            && *status == ToolStatus::Running
+        {
+            *status = ToolStatus::Succeeded;
+        }
+    }
+    let before = items[..5]
+        .iter()
+        .filter_map(|item| console_line(item, 0))
+        .collect::<String>();
+    let after = settled[..5]
+        .iter()
+        .filter_map(|item| console_line(item, 0))
+        .collect::<String>();
+    assert!(after.starts_with(&before) && after.len() > before.len());
+}
+
+fn console_snapshot(texts: &[&str], busy: bool) -> chat::Snapshot {
+    chat::Snapshot {
+        busy,
+        items: texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                std::sync::Arc::new(chat::Item {
+                    started_at: None,
+                    id: index.to_string(),
+                    role: chat::Role::Assistant,
+                    content: chat::ItemContent::Text {
+                        text: (*text).into(),
+                        thinking: false,
+                        phase: Default::default(),
+                    },
+                    at: None,
+                })
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// The client prints only complete lines, so the daemon leaves the line a
+/// provider is still writing unterminated, and only that one.
+#[test]
+fn console_text_leaves_only_a_line_still_being_written_open() {
+    let (text, _) = console_text(&console_snapshot(&["One.", "Two"], true), 0);
+    assert_eq!(text, "Assistant: One.\nAssistant: Two");
+    let (text, _) = console_text(&console_snapshot(&["One.", "Two"], false), 0);
+    assert_eq!(text, "Assistant: One.\nAssistant: Two\n");
+    // Text followed by a step in progress is finished: it is not held back
+    // for as long as that step runs.
+    let mut running = console_snapshot(&["About to run the tests."], true);
+    running.items.push(std::sync::Arc::new(chat::Item {
+        started_at: None,
+        id: "tool".into(),
+        role: chat::Role::Assistant,
+        content: chat::ItemContent::Tool {
+            name: "Bash".into(),
+            input: String::new(),
+            output: String::new(),
+            status: chat::ToolStatus::Running,
+        },
+        at: None,
+    }));
+    let (text, _) = console_text(&running, 0);
+    assert_eq!(text, "Assistant: About to run the tests.\n");
+}
+
+/// A line the client printed never comes back shorter, which would make it
+/// look new when the front of a long transcript is dropped.
+#[test]
+fn console_text_drops_whole_items_from_the_front_of_a_long_transcript() {
+    let limit = crate::agent_execution::MAX_RESULT_BYTES;
+    let old = "o".repeat(limit / 2);
+    let new = "n".repeat(limit / 2 + 64);
+    let (text, truncated) = console_text(&console_snapshot(&[&old, &new, "Last."], false), 0);
+    assert!(truncated);
+    assert_eq!(text, format!("Assistant: {new}\nAssistant: Last.\n"));
+
+    // An item too long to fit at all is still a complete line.
+    let huge = "h".repeat(limit + 1);
+    let (text, truncated) = console_text(&console_snapshot(&[&huge], false), 0);
+    assert!(truncated);
+    assert!(text.len() <= limit && text.ends_with('\n'));
+
+    let mut paged = console_snapshot(&["Recent."], false);
+    paged.has_earlier = true;
+    assert_eq!(
+        console_text(&paged, 0),
+        ("Assistant: Recent.\n".to_owned(), true)
+    );
+}
+
+#[test]
+fn console_says_a_step_is_running_only_once_it_has_taken_a_while() {
+    let started = 1_000_000;
+    let command = chat::Item {
+        started_at: Some(started),
+        id: "command".into(),
+        role: chat::Role::Assistant,
+        content: chat::ItemContent::Command {
+            label: String::new(),
+            command: "cargo test".into(),
+            working_directory: String::new(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Running,
+            exit_code: None,
+            duration_ms: None,
+            output: "PAYLOAD".into(),
+        },
+        at: None,
+    };
+    assert_eq!(console_line(&command, started + 4_999), None);
+    assert_eq!(
+        console_line(&command, started + 5_000).as_deref(),
+        Some("Running cargo test\n")
+    );
+    // A replayed step has no known start, so its age is unknown too.
+    let replayed = chat::Item {
+        started_at: None,
+        ..command
+    };
+    assert_eq!(console_line(&replayed, started + 60_000), None);
+}
+
+#[test]
+fn console_holds_no_line_back_for_a_text_block_that_is_still_empty() {
+    let (text, _) = console_text(&console_snapshot(&["One.", ""], true), 0);
+    assert_eq!(text, "Assistant: One.\n");
+}
+
+#[test]
+fn console_prints_a_paged_item_as_one_step() {
+    let part = |id: &str, content| chat::Item {
+        started_at: None,
+        id: id.into(),
+        role: chat::Role::Assistant,
+        content,
+        at: None,
+    };
+    let tool = |name: &str| chat::ItemContent::Tool {
+        name: name.into(),
+        input: "PAYLOAD".into(),
+        output: "PAYLOAD".into(),
+        status: chat::ToolStatus::Succeeded,
+    };
+    let later = "tool:native-part:1:tool:0-0:0-0";
+    assert_eq!(
+        console_line(&part("tool", tool("Agent (part 1/3)")), 0).as_deref(),
+        Some("Called Agent\n")
+    );
+    assert_eq!(
+        console_line(&part(later, tool("Agent (part 2/3)")), 0),
+        None
+    );
+    // A provider's own ID can contain the store's marker without being a part.
+    assert_eq!(
+        console_line(&part("provider:native-part:tool", tool("Agent")), 0).as_deref(),
+        Some("Called Agent\n")
+    );
+    let text = chat::ItemContent::Text {
+        text: "and the rest.".into(),
+        thinking: false,
+        phase: Default::default(),
+    };
+    assert_eq!(
+        console_line(&part("answer:native-part:1:text:0-0:0-0", text), 0).as_deref(),
+        Some("and the rest.\n")
+    );
+    assert_eq!(chat::without_page_mark("Fix (part one)"), "Fix (part one)");
+}
+
+#[test]
+fn console_prints_a_provider_notice_as_one_unlabelled_line() {
+    let notice = |id: &str, text: &str| chat::Item {
+        id: id.into(),
+        role: chat::Role::System,
+        content: chat::ItemContent::Text {
+            text: text.into(),
+            thinking: false,
+            phase: Default::default(),
+        },
+        started_at: None,
+        at: None,
+    };
+    let line = |id: &str, text: &str| console_line(&notice(id, text), 0);
+    assert_eq!(
+        line("summary", "Searched the retry path").as_deref(),
+        Some("Searched the retry path\n")
+    );
+    assert_eq!(
+        line("output", "Current model: example\nsecond\nthird").as_deref(),
+        Some("Current model: example\n"),
+        "command output filed as a notice stays one line"
+    );
+    let long = line("long", &"x".repeat(5_000)).unwrap();
+    assert!(long.len() <= CONSOLE_NOTICE_BYTES + 1, "{}", long.len());
+    assert_eq!(
+        line(
+            "frame",
+            r#"{"type":"model_refusal_fallback","retracted":[]}"#
+        ),
+        None,
+        "a protocol frame is not a message"
+    );
+    assert_eq!(line("fragments", r#"[{"text":"internal"}]"#), None);
+    assert_eq!(
+        line(
+            "output:native-part:1:text:0-0:0-0",
+            "the rest of the output"
+        ),
+        None,
+        "a later part of a notice adds no line"
+    );
+}
+
+#[test]
+fn console_counts_the_files_a_paged_edit_adds_in_each_part() {
+    let change = |path: &str| chat::FileChange {
+        path: path.into(),
+        kind: chat::ChangeKind::Updated,
+        diff: String::new(),
+    };
+    let part = |id: &str, paths: &[&str]| {
+        std::sync::Arc::new(chat::Item {
+            started_at: None,
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: chat::ItemContent::Changes {
+                changes: paths.iter().map(|path| change(path)).collect(),
+                status: chat::ToolStatus::Succeeded,
+            },
+            at: None,
+        })
+    };
+    let snapshot = chat::Snapshot {
+        items: vec![
+            part("edit", &["a.rs"]),
+            part("edit:native-part:1:changes:0-0:0-0", &["a.rs"]),
+            part(
+                "edit:native-part:2:changes:0-0:0-0",
+                &["a.rs", "b.rs", "c.rs"],
+            ),
+        ],
+        ..Default::default()
+    };
+    let (text, _) = console_text(&snapshot, 0);
+    assert_eq!(text, "Edited a.rs\nEdited 2 more files\n");
+}
+
+#[test]
+fn console_names_a_paged_command_once() {
+    let command = chat::Item {
+        started_at: None,
+        id: "command".into(),
+        role: chat::Role::Assistant,
+        content: chat::ItemContent::Command {
+            label: "cargo test (part 1/8)".into(),
+            command: "cargo test".into(),
+            working_directory: String::new(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            exit_code: None,
+            duration_ms: None,
+            output: "PAYLOAD".into(),
+        },
+        at: None,
+    };
+    assert_eq!(
+        console_line(&command, 0).as_deref(),
+        Some("Ran cargo test\n")
+    );
+}
