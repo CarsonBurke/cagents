@@ -25,6 +25,18 @@ pub(crate) struct SourceProof {
     pub(crate) placement_epoch: u64,
 }
 
+/// One released registry snapshot, not a cache capability or a promise that
+/// these placements remain current. The host must authenticate live sources and
+/// compare a fresh context again before admitting a peer response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PeerReadContext {
+    pub(crate) home: Home,
+    pub(crate) caller_card: CardId,
+    pub(crate) target_card: CardId,
+    pub(crate) caller_placement_epoch: u64,
+    pub(crate) target_placement_epoch: u64,
+}
+
 pub(crate) struct TrustedResolvedOrigin {
     pub(crate) origin: Origin,
     pub(crate) proof: Option<SourceProof>,
@@ -44,6 +56,8 @@ pub(crate) enum ApplyError {
     CommitUncertain,
 }
 
+#[cfg(test)]
+mod peer_read_tests;
 #[cfg(test)]
 mod tests;
 
@@ -575,6 +589,159 @@ fn resolve_in(
     })
 }
 
+/// Resolve both ends using the caller-owned read transaction. In particular,
+/// do not adopt a source or call a resolver that journals an issued capability.
+fn peer_chat_read_context_in(
+    db: &Connection,
+    authority: &Authority,
+    caller_source: &HostedSession,
+    target_source: &crate::chat::Session,
+) -> Result<PeerReadContext, String> {
+    let caller = resolve_in(db, authority, caller_source)?;
+    let Origin::Actor { home, .. } = caller.origin else {
+        return Err("Peer reads require an authenticated actor".into());
+    };
+    let proof = caller.proof.ok_or("The caller source is unavailable")?;
+    let target = HostedSession::Chat(target_source.clone());
+    if !target.has_complete_proof() {
+        return Err("The peer source has no complete process proof".into());
+    }
+    let issued: Option<String> = db
+        .query_row(
+            "SELECT source FROM agent_authorities WHERE session_id=?1",
+            [target.id().to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let issued: HostedSession = decode(&issued.ok_or("The peer source was not issued")?)?;
+    if !issued.has_complete_proof() || !issued.same_process(&target) {
+        return Err("The issued peer source changed".into());
+    }
+
+    let all_views = views::all(db)?;
+    let mut caller_pane = None;
+    let mut target_pane = None;
+    for view in &all_views {
+        for pane in &view.panes {
+            let source = match &pane.kind {
+                CardKind::Chat(session) => HostedSession::Chat(session.clone()),
+                CardKind::Terminal(session) => HostedSession::Terminal(session.clone()),
+                _ => {
+                    if pane.id == proof.card {
+                        return Err("The caller pane changed kind".into());
+                    }
+                    continue;
+                }
+            };
+            if pane.id == proof.card {
+                if caller_pane.is_some()
+                    || view.scope != crate::workspace_model::views::Scope::Channel(home.channel)
+                    || view.retired.contains(&pane.id)
+                    || pane.pending_terminal_start
+                    || !source.has_complete_proof()
+                {
+                    return Err("The caller pane is not uniquely active".into());
+                }
+                caller_pane = Some(source);
+            }
+            // Count ID matches before checking kind/proof: a terminal alias or
+            // a malformed duplicate cannot provide a second peer presentation.
+            if source.id() == target.id() {
+                if target_pane.is_some()
+                    || view.scope != crate::workspace_model::views::Scope::Channel(home.channel)
+                    || view.retired.contains(&pane.id)
+                    || pane.pending_terminal_start
+                    || !matches!(pane.kind, CardKind::Chat(_))
+                    || !source.has_complete_proof()
+                    || !source.same_process(&target)
+                {
+                    return Err("The peer has no unique active chat in the caller channel".into());
+                }
+                target_pane = Some(pane.id);
+            }
+        }
+    }
+    let caller_pane = caller_pane.ok_or("The caller pane disappeared")?;
+    let target_card = target_pane.ok_or("The peer chat is not in the caller channel")?;
+    // Card identities, as well as native IDs, must have exactly one owner.
+    if all_views
+        .iter()
+        .flat_map(|view| &view.panes)
+        .filter(|pane| pane.id == target_card)
+        .count()
+        != 1
+    {
+        return Err("The peer card has ambiguous ownership".into());
+    }
+    require_peer_managed_binding(db, &home, proof.card, caller_source, &caller_pane)?;
+    require_peer_managed_binding(db, &home, target_card, &target, &target)?;
+    Ok(PeerReadContext {
+        home,
+        caller_card: proof.card,
+        target_card,
+        caller_placement_epoch: proof.placement_epoch,
+        target_placement_epoch: placement::token(db, target_card)?,
+    })
+}
+
+/// Probe canonical identity and issued-session indexes, including pending and
+/// closed records. Ownership/origin is intentionally not a peer-read filter.
+/// Managed callers and targets must use their canonical agent card; a separate
+/// console-only display does not qualify, even if Work can resolve that source.
+fn require_peer_managed_binding(
+    db: &Connection,
+    home: &Home,
+    card: CardId,
+    issued: &HostedSession,
+    displayed: &HostedSession,
+) -> Result<(), String> {
+    let mut statement = db
+        .prepare(
+            "SELECT id,record,closed FROM agents WHERE id=?1 OR session_id=?2
+             OR id IN (SELECT agent FROM agent_launches WHERE session_id=?2)",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![card.to_string(), issued.id().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    if rows.len() > 1 {
+        return Err("The managed peer binding is ambiguous".into());
+    }
+    if let Some((id, record, closed)) = rows.first() {
+        let agent: crate::agent_execution::Agent = decode(record)?;
+        let matches_source =
+            |source: &HostedSession| {
+                agent.session.as_ref().is_some_and(|session| {
+                    session.has_complete_proof() && session.same_process(source)
+                }) || agent.console.as_ref().is_some_and(|console| {
+                    let console = HostedSession::Terminal(console.clone());
+                    console.has_complete_proof() && console.same_process(source)
+                })
+            };
+        if *closed
+            || agent.closed
+            || *id != agent.id.to_string()
+            || CardId::from_uuid(agent.id.as_uuid()) != card
+            || agent.channel() != Some(home.channel)
+            || !matches_source(issued)
+            || !matches_source(displayed)
+        {
+            return Err("The managed peer binding changed".into());
+        }
+        super::execution::require_placement(db, &agent.placement, &agent.spec.target.repository)?;
+    }
+    Ok(())
+}
+
 fn require_origin(
     db: &Connection,
     resolved: &TrustedResolvedOrigin,
@@ -790,6 +957,30 @@ fn operation_in(
 }
 
 impl Registry {
+    /// Observe canonical caller/peer placement without changing any registry,
+    /// authority, view or placement clock. No context escapes an owned SQLite
+    /// transaction until explicit release succeeds on both acceptance/refusal.
+    pub(crate) fn peer_chat_read_context(
+        &self,
+        authority: &Authority,
+        caller_source: &HostedSession,
+        target_source: &crate::chat::Session,
+    ) -> Result<PeerReadContext, String> {
+        if !self.db.is_autocommit() {
+            return Err("Peer reads require an independent registry snapshot".into());
+        }
+        let tx = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let result = peer_chat_read_context_in(&tx, authority, caller_source, target_source);
+        let released = tx.rollback();
+        if released.is_err() || !self.db.is_autocommit() {
+            return Err("The peer registry snapshot could not be released".into());
+        }
+        result
+    }
+
     /// Root must first perform strict live/adopted host authentication. This
     /// method never falls back from an unknown actor token to User authority.
     pub(crate) fn resolve_channel_work_source(

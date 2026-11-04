@@ -35,6 +35,9 @@ mod retained_actor;
 mod store;
 mod websocket;
 pub(crate) use store::Store;
+pub(crate) use store::peer_query::{
+    Cursor as PeerCursor, Kind as PeerKind, Page as PeerPage, Reader as PeerReader,
+};
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
@@ -963,6 +966,19 @@ impl LocalHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .file_query(command)
+    }
+    /// Cache-only value read. Store::peer_page explicitly checks read release
+    /// before returning; no Store/SQLite guard crosses this runtime boundary.
+    pub(crate) fn peer_page(
+        &self,
+        reader: &mut PeerReader,
+        after: Option<PeerCursor>,
+    ) -> Result<PeerPage, String> {
+        self.0
+            .store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .peer_page(reader, after)
     }
     pub(crate) fn text_copy(
         &self,

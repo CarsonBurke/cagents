@@ -137,7 +137,7 @@ pub enum TopCommand {
     /// List live agent sessions in this project, whoever started them.
     #[command(visible_alias = "ls")]
     Sessions(SessionsArgs),
-    /// Inspect native resident capacity and explicitly release completed handles.
+    /// Read cached peer conversations, inspect capacity, or explicitly release completed handles.
     Chat {
         #[command(subcommand)]
         command: ChatCommand,

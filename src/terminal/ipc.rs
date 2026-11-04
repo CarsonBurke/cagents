@@ -2366,6 +2366,74 @@ mod tests {
     }
 
     #[test]
+    fn peer_inspection_round_trips_framed_requests_and_bounded_pages() {
+        use crate::agent_execution::{Authority, Operation, Reply, inspection};
+
+        let session = TerminalId::new();
+        let host_proof = proof(
+            "peer-read-session",
+            "peer-read-boot",
+            "peer-read-incarnation",
+        );
+        // User here exercises serialization only; the host's scoped read
+        // admission separately refuses absent issuing-agent authority.
+        let request = ClientEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: 83,
+            proof: Some(host_proof.clone()),
+            request: ClientRequest::Agent {
+                authority: Authority::default(),
+                operation: Operation::InspectChat {
+                    session,
+                    cursor: Some(inspection::Cursor::parse("v1.checkpoint").unwrap()),
+                },
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let decoded: ClientEnvelope = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, request);
+
+        let mut page = inspection::Page::new(session, inspection::Coverage::Cached);
+        for index in 0..inspection::MAX_PARTS {
+            if !page
+                .try_push(inspection::Part {
+                    item_id: format!("opaque-{index}"),
+                    kind: inspection::Kind::UserText,
+                    offset: 0,
+                    text: "\0".repeat(8192),
+                    complete: true,
+                    started_at: None,
+                    at: None,
+                })
+                .unwrap()
+            {
+                break;
+            }
+        }
+        assert!(!page.parts.is_empty());
+        assert!(page.parts.len() < inspection::MAX_PARTS);
+        page.at_end = true;
+        page.validate_for(session).unwrap();
+        let response = ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: Some(83),
+            proof: host_proof,
+            message: ServerMessage::Response {
+                response: ServerResponse::Agent(Reply::ChatPage(page)),
+            },
+        };
+        // Exercise the actual enclosing proof, response tags and correlation
+        // fields, beyond the page-only sizing contract, for both encodings.
+        assert!(serde_json::to_vec(&response).unwrap().len() <= inspection::MAX_PAGE_BYTES);
+        assert!(postcard::to_stdvec(&response).unwrap().len() <= inspection::MAX_PAGE_BYTES);
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        let decoded: ServerEnvelope = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
     fn terminal_recovery_origin_round_trips_in_framed_inventory() {
         for origin in [None, Some(TerminalId::new())] {
             let mut terminal = TerminalDescriptor::relaunchable(
