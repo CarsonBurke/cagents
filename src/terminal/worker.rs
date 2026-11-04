@@ -459,6 +459,9 @@ struct PublishedState {
     /// and parked reader remain on the original worker until explicit Close.
     startup_unresolved: AtomicBool,
     startup_diagnostic: Mutex<Option<String>>,
+    // Live capability retains the actual receipt-created directory and caller;
+    // CodeOwner metadata alone is never installed here.
+    bound_start: OnceLock<Arc<crate::host::fresh_code::SpawnAdmission>>,
     #[cfg(test)]
     test_fail_startup_commit: AtomicBool,
     #[cfg(test)]
@@ -555,6 +558,7 @@ impl PublishedState {
             completed: AtomicBool::new(false),
             startup_unresolved: AtomicBool::new(false),
             startup_diagnostic: Mutex::new(None),
+            bound_start: OnceLock::new(),
             #[cfg(test)]
             test_fail_startup_commit: AtomicBool::new(false),
             #[cfg(test)]
@@ -1102,6 +1106,7 @@ impl TerminalHandle {
             published.clone(),
             joins::reserve().map_err(TerminalStartError::Worker)?,
         );
+        let thread_start = join_owner.thread_start();
         let worker_owner = join_owner.clone();
         let worker_published = Arc::clone(&published);
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
@@ -1117,14 +1122,19 @@ impl TerminalHandle {
                 worker: join_owner.clone(),
             }),
         };
-        if let Err(error) = install(&handle) {
+        let installed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| install(&handle)))
+            .unwrap_or_else(
+                |_| Err("Terminal installation panicked before thread creation".into()),
+            );
+        if let Err(error) = installed {
             published.startup_unresolved.store(false, Ordering::Release);
+            thread_start.refuse();
             return Err(TerminalStartError::Worker(error));
         }
 
-        let worker = thread::Builder::new()
-            .name(format!("terminal-{:?}", session.id))
-            .spawn(move || {
+        thread_start.spawn(
+            thread::Builder::new().name(format!("terminal-{:?}", session.id)),
+            move || {
                 let _body = joins::BodyCompletion(worker_owner);
                 let completion = Arc::clone(&worker_published);
                 if admitted.recv().is_err() {
@@ -1192,7 +1202,6 @@ impl TerminalHandle {
                 published.startup_unresolved.store(false, Ordering::Release);
                 TerminalStartError::Worker(error.to_string())
             })?;
-        join_owner.install(worker);
         let _ = begin.send(());
 
         match startup_rx.recv() {
@@ -2665,6 +2674,214 @@ impl Reader {
     }
 }
 
+/// Kept outside the protected preparation step for an opted-in bound start.
+/// In particular, a Reader's original queue and Held must not unwind merely
+/// because a later local allocation or callback failed.
+#[derive(Default)]
+struct PreparedParts {
+    // Match ordinary local teardown: ancillary writers/readers before Holder.
+    transcript: Option<TranscriptWriter>,
+    reader: Option<Reader>,
+    writer: Option<File>,
+    held: Option<holder::Held>,
+}
+
+/// An internal no-thread enrollment, not a public spawn adapter. The only
+/// capability that could permit helper entry is deliberately uninhabited.
+/// Dropping this value positively settles an unused OS-thread reservation.
+pub(crate) struct BoundStartStaged {
+    handle: TerminalHandle,
+    thread_start: Option<joins::ThreadStart>,
+    construction: BoundConstruction,
+}
+
+impl BoundStartStaged {
+    pub(crate) fn handle(&self) -> &TerminalHandle {
+        &self.handle
+    }
+
+    /// No legacy-helper fallback exists. This becomes implementable only with
+    /// the original-owner authenticated opt-in helper and retained Close loop.
+    fn start(
+        self,
+        capability: holder::BoundHelperCapability,
+    ) -> Result<TerminalHandle, TerminalStartError> {
+        match capability {}
+    }
+}
+
+impl Drop for BoundStartStaged {
+    fn drop(&mut self) {
+        if let Some(start) = self.thread_start.take() {
+            start.refuse();
+            self.handle
+                .inner
+                .published
+                .startup_unresolved
+                .store(false, Ordering::Release);
+        }
+    }
+}
+
+/// The original worker must own this OUTSIDE every preparation/commit catch.
+/// The admission Arc retains the real filesystem root/parent and original
+/// caller. A process-root descriptor is populated only by the future helper;
+/// it cannot be recovered by reopening a CodeOwner PID or home pathname.
+struct BoundConstruction {
+    admission: Arc<crate::host::fresh_code::SpawnAdmission>,
+    session: TerminalSession,
+    config: TerminalConfig,
+    commands: Receiver<Command>,
+    events: Sender<TerminalEvent>,
+    published: Arc<PublishedState>,
+    holder: holder::StagedStart,
+    prepared: PreparedParts,
+    worker: Option<Worker>,
+    // ONE final lifecycle lease belongs to this owner through ambiguous entry.
+    // Nothing in the initial, no-helper slice acquires or fabricates it.
+    account_lease: Option<crate::account::registry::LaunchAccountLease>,
+}
+
+impl BoundConstruction {
+    fn catch_step<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(self)))
+            .unwrap_or_else(|_| {
+                Err("Original bound construction panicked; custody retained".into())
+            });
+        if let Err(message) = &result {
+            *self
+                .published
+                .startup_diagnostic
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(message.clone());
+        }
+        result
+    }
+}
+
+impl TerminalHandle {
+    /// Stage the actual live admission before the install callback and before
+    /// any OS worker exists. This performs no holder/provider entry, and is not
+    /// called by any public operation while the bound helper gate is held.
+    pub(crate) fn stage_bound_start(
+        session: TerminalSession,
+        config: TerminalConfig,
+        admission: Arc<crate::host::fresh_code::SpawnAdmission>,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+        install: impl FnOnce(&TerminalHandle) -> Result<(), String>,
+    ) -> Result<BoundStartStaged, TerminalStartError> {
+        let owner = admission.owner();
+        owner
+            .validate()
+            .map_err(|error| TerminalStartError::Worker(error.to_string()))?;
+        if config.adoption.is_some()
+            || config.execution_environment.is_some()
+            || session.id != owner.attempt.terminal_id
+            || &session.launch != admission.recipe()
+            || session.continuity.live_proof().as_ref() != Some(&owner.host)
+            || config.holder_recovery.as_ref().is_none_or(|recovery| {
+                recovery.source != session
+                    || recovery.execution_recipe.is_some()
+                    || recovery.execution_environment.is_some()
+            })
+        {
+            return Err(TerminalStartError::Worker(
+                "The original bound constructor context changed".into(),
+            ));
+        }
+        config
+            .holder_recovery
+            .as_ref()
+            .unwrap()
+            .validate(&owner.host.boot_id, session.id)
+            .map_err(TerminalStartError::Worker)?;
+        event_notifier().map_err(TerminalStartError::Worker)?;
+        super::reactor::runtime().map_err(TerminalStartError::Worker)?;
+        let (commands, command_rx) = command_channel(config.command_capacity);
+        let (event_tx, events) = crossbeam_channel::unbounded();
+        let published = Arc::new(PublishedState::new(
+            config.initially_visible,
+            Arc::new(wake),
+        ));
+        let _ = published.bound_start.set(admission.clone());
+        published.startup_unresolved.store(true, Ordering::Release);
+        let worker = joins::JoinOwner::new(
+            published.clone(),
+            joins::reserve().map_err(TerminalStartError::Worker)?,
+        );
+        let thread_start = worker.thread_start();
+        let handle = Self {
+            inner: Arc::new(HandleInner {
+                commands,
+                events,
+                published: published.clone(),
+                worker,
+            }),
+        };
+        let staged = BoundStartStaged {
+            handle,
+            thread_start: Some(thread_start),
+            construction: BoundConstruction {
+                admission,
+                session,
+                config,
+                commands: command_rx,
+                events: event_tx,
+                published,
+                holder: holder::StagedStart::default(),
+                prepared: PreparedParts::default(),
+                worker: None,
+                account_lease: None,
+            },
+        };
+        // Keep all ownership outside the callback's unwind boundary as well.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| install(staged.handle())))
+            .unwrap_or_else(|_| {
+                Err("Bound startup installation panicked before thread creation".into())
+            })
+            .map_err(TerminalStartError::Worker)?;
+        Ok(staged)
+    }
+
+    pub(crate) fn bound_start_matches(
+        &self,
+        owner: &crate::account::fresh_code::CodeOwner,
+    ) -> bool {
+        self.inner
+            .published
+            .bound_start
+            .get()
+            .is_some_and(|admission| {
+                let original = admission.owner();
+                original.binding == owner.binding
+                    && original.attempt == owner.attempt
+                    && original.host == owner.host
+            })
+    }
+
+    pub(crate) fn bound_start_uses(
+        &self,
+        admission: &Arc<crate::host::fresh_code::SpawnAdmission>,
+    ) -> bool {
+        self.inner
+            .published
+            .bound_start
+            .get()
+            .is_some_and(|original| Arc::ptr_eq(original, admission))
+    }
+
+    pub(crate) fn bound_start_no_thread(&self) -> bool {
+        self.inner.published.bound_start.get().is_some() && self.inner.worker.no_thread()
+    }
+
+    pub(crate) fn bound_start_cleanup_settled(&self) -> bool {
+        self.inner.published.bound_start.get().is_some() && self.inner.worker.cleanup_settled()
+    }
+}
+
 impl Worker {
     fn prepare(
         session: TerminalSession,
@@ -2674,6 +2891,36 @@ impl Worker {
         events: Sender<TerminalEvent>,
         published: Arc<PublishedState>,
     ) -> Result<Self, String> {
+        // Ordinary starts retain their existing error/drop policy. A bound
+        // constructor owns this slot outside catch_unwind instead.
+        let mut parts = PreparedParts::default();
+        Self::prepare_in(
+            &mut parts,
+            session,
+            config,
+            execution_recipe,
+            commands,
+            events,
+            published,
+        )
+    }
+
+    fn prepare_in(
+        parts: &mut PreparedParts,
+        session: TerminalSession,
+        config: TerminalConfig,
+        execution_recipe: Option<LaunchRecipe>,
+        commands: Receiver<Command>,
+        events: Sender<TerminalEvent>,
+        published: Arc<PublishedState>,
+    ) -> Result<Self, String> {
+        if parts.held.is_some()
+            || parts.writer.is_some()
+            || parts.reader.is_some()
+            || parts.transcript.is_some()
+        {
+            return Err("The original preparation slot already owns resources; reconcile it without restarting".into());
+        }
         if config
             .holder_recovery
             .as_ref()
@@ -2777,7 +3024,7 @@ impl Worker {
             .then(|| RootIdentity::launch_executable(&command))
             .flatten();
         let (child_exit_tx, child_exit_rx) = crossbeam_channel::bounded(1);
-        let (mut held, output) = match &config.adoption {
+        let (held, output) = match &config.adoption {
             Some(socket) => {
                 let adopted = holder::adopt_recoverable(
                     socket,
@@ -2835,6 +3082,9 @@ impl Worker {
                 )
             }
         };
+        // Install the original owner before every fallible local preparation.
+        parts.held = Some(held);
+        let held = parts.held.as_mut().expect("staged original Held");
         // The holder reaps the root, so its pid identifies it only while the
         // pidfd still reaches an unreaped process: checked after the capture,
         // that proves the capture read the root and not a reused pid.
@@ -2859,7 +3109,8 @@ impl Worker {
                 }
             }
         }
-        let writer = File::from(duplicate("writing")?);
+        parts.writer = Some(File::from(duplicate("writing")?));
+        let writer = parts.writer.as_ref().expect("staged original PTY writer");
         // Duplicated master descriptors share status flags. Existing reader
         // and detached-holder paths already rearm on WouldBlock.
         let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
@@ -2874,9 +3125,14 @@ impl Worker {
         }
         // Output an adopted terminal produced between daemons comes first, as
         // any other output would.
-        let mut reader = Reader::prepare(session.id, &held.master, config.pty_capacity, output)?;
+        parts.reader = Some(Reader::prepare(
+            session.id,
+            &held.master,
+            config.pty_capacity,
+            output,
+        )?);
 
-        let mut transcript = session
+        parts.transcript = session
             .transcript_path
             .map(|path| {
                 TranscriptWriter::start(
@@ -2887,7 +3143,8 @@ impl Worker {
                 )
             })
             .transpose()?;
-        if let Some(location) = transcript
+        if let Some(location) = parts
+            .transcript
             .as_mut()
             .and_then(|writer| writer.location.take())
         {
@@ -2934,6 +3191,12 @@ impl Worker {
         let events = Arc::new(events);
         let _ = published.semantic_events.set(Arc::downgrade(&events));
 
+        // All fallible preparation is complete before moving the original
+        // resources out of the caller-owned slot into the complete Worker.
+        let held = parts.held.take().expect("prepared original Held");
+        let writer = parts.writer.take().expect("prepared original PTY writer");
+        let mut reader = parts.reader.take().expect("prepared original reader");
+        let transcript = parts.transcript.take();
         let worker = Self {
             terminal_id: session.id,
             resume_hint: crate::model::agent_recovery::observed_hint_from_launch(&execution),
@@ -6615,6 +6878,68 @@ mod tests {
                 last_exit: None,
             },
         }
+    }
+
+    #[test]
+    fn refused_or_panicked_install_proves_no_thread_without_provider_entry() {
+        for panic_install in [false, true] {
+            let directory = tempdir().unwrap();
+            let marker = directory.path().join("must-not-enter");
+            let session = shell_session(&format!("touch '{}'", marker.display()));
+            let mut original = None;
+            let result = TerminalHandle::spawn_with_execution_installed(
+                session,
+                TerminalConfig::default(),
+                None,
+                |_| {},
+                |handle| {
+                    original = Some(handle.clone());
+                    assert!(!handle.inner.worker.no_thread());
+                    assert!(!handle.inner.worker.cleanup_settled());
+                    if panic_install {
+                        panic!("injected installation panic before OS thread");
+                    }
+                    Err("injected installation refusal before OS thread".into())
+                },
+            );
+            assert!(matches!(result, Err(TerminalStartError::Worker(_))));
+            let original = original.unwrap();
+            assert!(original.inner.worker.no_thread());
+            assert!(original.inner.worker.cleanup_settled());
+            assert!(!original.inner.worker.joined());
+            assert!(!original.is_completed());
+            assert!(original.holder_identity().is_none());
+            assert!(!marker.exists());
+        }
+    }
+
+    #[test]
+    fn retained_preparation_slot_refuses_a_second_constructor_before_effects() {
+        let directory = tempdir().unwrap();
+        let marker = directory.path().join("must-not-enter");
+        let session = shell_session(&format!("touch '{}'", marker.display()));
+        // This is an ordinary owned file, never a fake root pidfd or entry fact.
+        let writer = File::create(directory.path().join("retained-writer")).unwrap();
+        let descriptor = writer.as_raw_fd();
+        let mut parts = PreparedParts {
+            writer: Some(writer),
+            ..PreparedParts::default()
+        };
+        let (_, commands) = command_channel(1);
+        let (events, _) = crossbeam_channel::unbounded();
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let result = Worker::prepare_in(
+            &mut parts,
+            session,
+            TerminalConfig::default(),
+            None,
+            commands,
+            events,
+            published,
+        );
+        assert!(matches!(result, Err(message) if message.contains("already owns resources")));
+        assert_eq!(parts.writer.as_ref().unwrap().as_raw_fd(), descriptor);
+        assert!(!marker.exists());
     }
 
     /// The handle's screen as text, once it shows `needle`.

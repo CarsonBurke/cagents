@@ -195,7 +195,21 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 143 preserves this branch's version-127 contracts and appends typed
+/// AccountPreparation device request/reply variants. Its owning host requires
+/// explicit User connection scope and metadata/physical admission. Matched executables
+/// are required; this does not adopt unrelated private protocol experiments.
+/// The metadata facade refuses Create without physical authority; owning HOST
+/// admission can create its exact planned home. Installation-less existing-pending
+/// intents remain refused. Transport alone does not complete the account setup flow.
+/// Version 144 preserves version 143 and appends a correlated, read-only
+/// installation observation under explicit User connection scope. It reports
+/// only the current optional installation identity; it does not reaffirm an
+/// installation-less intent or authorize setup continuation. Preparation DTOs
+/// and prior device-operation request/reply tags remain unchanged.
+// 145 appends identity-only initialization to the 144 preparation lineage.
+// Older uncomposed CodingConfigCreate/Import tag-20/17 layouts are not adopted.
+pub const PROTOCOL_VERSION: u16 = 145;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -2090,6 +2104,407 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn account_preparation_appends_wire_tags_and_round_trips_complete_framed_intents() {
+        use crate::account::preparation::{
+            AccountPreparationOutcome as Outcome, AccountPreparationRecord as Record,
+            AccountPreparationReply, AccountPreparationRequest as Request, ExistingPendingBinding,
+            ExistingPendingRecord, ExistingPendingRequest, ExistingPendingState,
+            ExistingPendingTarget, Preparation, PreparationBinding, PreparationPayload,
+            PreparationRequest, PreparationState,
+        };
+        use crate::{
+            agent::Provider,
+            device_service::{Operation, Reply},
+        };
+        use uuid::Uuid;
+        let binding = PreparationBinding {
+            request_id: Uuid::from_u128(1),
+            installation_id: Uuid::from_u128(2),
+            key: Uuid::from_u128(3),
+            payload: PreparationPayload {
+                provider: Provider::Codex,
+                copy_codex_config: true,
+            },
+        };
+        let pending = ExistingPendingBinding {
+            installation_id: Uuid::from_u128(2),
+            provider: Provider::Claude,
+            key: Uuid::from_u128(4),
+            started_at: 1234,
+            generation_id: Uuid::from_u128(5),
+        };
+        let mut requests = vec![
+            Request::Preparation(PreparationRequest::Plan {
+                request_id: binding.request_id,
+                payload: binding.payload.clone(),
+            }),
+            Request::Preparation(PreparationRequest::Create {
+                binding: binding.clone(),
+            }),
+            Request::Preparation(PreparationRequest::CancelRetained {
+                binding: binding.clone(),
+            }),
+            Request::Preparation(PreparationRequest::Reconcile {
+                binding: binding.clone(),
+            }),
+        ];
+        let targets = [
+            ExistingPendingTarget::Observed {
+                provider: pending.provider,
+                key: pending.key,
+                started_at: pending.started_at,
+                expected_installation: None,
+            },
+            ExistingPendingTarget::Observed {
+                provider: pending.provider,
+                key: pending.key,
+                started_at: pending.started_at,
+                expected_installation: Some(pending.installation_id),
+            },
+            ExistingPendingTarget::Bound {
+                binding: pending.clone(),
+            },
+        ];
+        for (index, target) in targets.into_iter().enumerate() {
+            requests.push(Request::ExistingPending(ExistingPendingRequest::Resume {
+                target: target.clone(),
+            }));
+            requests.push(Request::ExistingPending(ExistingPendingRequest::Cancel {
+                operation_id: Uuid::from_u128(6 + index as u128),
+                target,
+            }));
+        }
+        let mut outcomes = vec![
+            Outcome::NotAttempted {
+                message: "Refused before storage".into(),
+            },
+            Outcome::ReconcileRequired {
+                message: "Storage result unknown".into(),
+                observed: None,
+            },
+        ];
+        for record in [
+            Record::Preparation(Preparation {
+                binding,
+                state: PreparationState::CancelledRetained,
+            }),
+            Record::ExistingPending(ExistingPendingRecord {
+                binding: pending,
+                state: ExistingPendingState::Registered,
+            }),
+        ] {
+            outcomes.push(Outcome::Confirmed {
+                record: record.clone(),
+            });
+            outcomes.push(Outcome::ReconcileRequired {
+                message: "Visible metadata is not a completed durability barrier".into(),
+                observed: Some(record),
+            });
+        }
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("preparation-codec-host"),
+            boot_id: BootId::new("preparation-codec-boot"),
+            host_incarnation: HostIncarnation::new("preparation-codec-incarnation"),
+        };
+        let mut request_codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
+        let mut response_codec = FrameCodec::new(MAX_FRAME_BYTES);
+        assert_eq!(
+            postcard::to_allocvec(&Operation::AccountsRead).unwrap()[0],
+            3
+        );
+        assert_eq!(
+            postcard::to_allocvec(&Operation::ReadImage {
+                root: "/device".into(),
+                path: "image.png".into(),
+            })
+            .unwrap()[0],
+            16
+        );
+        assert_eq!(postcard::to_allocvec(&Reply::Image(vec![])).unwrap()[0], 14);
+        let mut count = 0;
+        for (index, request) in requests.into_iter().enumerate() {
+            let operation = Operation::AccountPreparation {
+                request: request.clone(),
+            };
+            assert_eq!(postcard::to_allocvec(&operation).unwrap()[0], 18);
+            let mut original_payload = vec![18];
+            original_payload.extend(postcard::to_allocvec(&request).unwrap());
+            assert_eq!(postcard::to_allocvec(&operation).unwrap(), original_payload);
+            let envelope = ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: 100 + index as u64,
+                proof: Some(proof.clone()),
+                request: ClientRequest::DeviceOperation { operation },
+            };
+            let mut bytes = Vec::new();
+            request_codec.write(&mut bytes, &envelope).unwrap();
+            let mut cursor = Cursor::new(bytes);
+            assert_eq!(
+                request_codec.read::<ClientEnvelope>(&mut cursor).unwrap(),
+                Some(envelope)
+            );
+            assert!(
+                request_codec
+                    .read::<ClientEnvelope>(&mut cursor)
+                    .unwrap()
+                    .is_none()
+            );
+            for outcome in &outcomes {
+                let reply = Reply::AccountPreparation(AccountPreparationReply {
+                    request: request.clone(),
+                    outcome: outcome.clone(),
+                });
+                assert_eq!(postcard::to_allocvec(&reply).unwrap()[0], 15);
+                let mut original_payload = vec![15];
+                original_payload.extend(
+                    postcard::to_allocvec(&AccountPreparationReply {
+                        request: request.clone(),
+                        outcome: outcome.clone(),
+                    })
+                    .unwrap(),
+                );
+                assert_eq!(postcard::to_allocvec(&reply).unwrap(), original_payload);
+                let envelope = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(100 + index as u64),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::DeviceOperation { reply },
+                    },
+                };
+                let mut bytes = Vec::new();
+                response_codec.write(&mut bytes, &envelope).unwrap();
+                let mut cursor = Cursor::new(bytes);
+                assert_eq!(
+                    response_codec.read::<ServerEnvelope>(&mut cursor).unwrap(),
+                    Some(envelope)
+                );
+                assert!(
+                    response_codec
+                        .read::<ServerEnvelope>(&mut cursor)
+                        .unwrap()
+                        .is_none()
+                );
+                count += 1;
+            }
+        }
+        assert_eq!(
+            count, 60,
+            "all ten request/target forms and six outcome forms must run"
+        );
+    }
+
+    #[test]
+    fn account_installation_observation_appends_wire_tags_and_preserves_framed_correlation() {
+        use crate::{
+            account::preparation::{
+                AccountPreparationOutcome, AccountPreparationReply, AccountPreparationRequest,
+                PreparationPayload, PreparationRequest,
+            },
+            agent::Provider,
+            device_service::{Operation, Reply},
+        };
+        use uuid::Uuid;
+
+        let preparation = AccountPreparationRequest::Preparation(PreparationRequest::Plan {
+            request_id: Uuid::from_u128(10),
+            payload: PreparationPayload {
+                provider: Provider::Codex,
+                copy_codex_config: true,
+            },
+        });
+        assert_eq!(
+            postcard::to_allocvec(&Operation::AccountPreparation {
+                request: preparation.clone(),
+            })
+            .unwrap()[0],
+            18,
+            "installation reads must not move the existing preparation request tag"
+        );
+        assert_eq!(
+            postcard::to_allocvec(&Reply::AccountPreparation(AccountPreparationReply {
+                request: preparation,
+                outcome: AccountPreparationOutcome::NotAttempted {
+                    message: "Installation observation grants no setup authority".into(),
+                },
+            }))
+            .unwrap()[0],
+            15,
+            "installation observations must not move the existing preparation reply tag"
+        );
+
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("installation-observation-codec-host"),
+            boot_id: BootId::new("installation-observation-codec-boot"),
+            host_incarnation: HostIncarnation::new("installation-observation-codec-incarnation"),
+        };
+        let mut request_codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
+        let mut response_codec = FrameCodec::new(MAX_FRAME_BYTES);
+        for (index, installation_id) in [None, Some(Uuid::from_u128(20))].into_iter().enumerate() {
+            let request_id = Uuid::from_u128(30 + index as u128);
+            let wire_request_id = 200 + index as u64;
+            let operation = Operation::AccountInstallationRead { request_id };
+            assert_eq!(postcard::to_allocvec(&operation).unwrap()[0], 19);
+            let request = ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: wire_request_id,
+                proof: Some(proof.clone()),
+                request: ClientRequest::DeviceOperation { operation },
+            };
+            let mut bytes = Vec::new();
+            request_codec.write(&mut bytes, &request).unwrap();
+            let mut cursor = Cursor::new(bytes);
+            let decoded = request_codec
+                .read::<ClientEnvelope>(&mut cursor)
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded, request);
+            validate_proof(decoded.proof.as_ref(), &proof).unwrap();
+            assert!(
+                request_codec
+                    .read::<ClientEnvelope>(&mut cursor)
+                    .unwrap()
+                    .is_none()
+            );
+
+            let reply = Reply::AccountInstallationObservation {
+                request_id,
+                installation_id,
+            };
+            assert_eq!(postcard::to_allocvec(&reply).unwrap()[0], 16);
+            let response = ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(wire_request_id),
+                proof: proof.clone(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::DeviceOperation { reply },
+                },
+            };
+            let mut bytes = Vec::new();
+            response_codec.write(&mut bytes, &response).unwrap();
+            let mut cursor = Cursor::new(bytes);
+            let decoded = response_codec
+                .read::<ServerEnvelope>(&mut cursor)
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded, response);
+            assert_eq!(decoded.request_id, Some(wire_request_id));
+            assert_eq!(decoded.proof, proof);
+            assert!(matches!(
+                decoded.message,
+                ServerMessage::Response {
+                    response: ServerResponse::DeviceOperation {
+                        reply: Reply::AccountInstallationObservation {
+                            request_id: echoed,
+                            installation_id: observed,
+                        },
+                    },
+                } if echoed == request_id && observed == installation_id
+            ));
+            assert!(
+                response_codec
+                    .read::<ServerEnvelope>(&mut cursor)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn account_installation_initialization_appends_only_its_own_framed_payload() {
+        use crate::{
+            account::installation::{
+                InitializationOutcome, InitializationRefusal, InitializationReply,
+                InitializationRequest,
+            },
+            device_service::{Operation, Reply},
+        };
+        use uuid::Uuid;
+        let request = InitializationRequest {
+            request_id: Uuid::from_u128(401),
+        };
+        let operation = Operation::AccountInstallationInitialize { request };
+        let mut expected = vec![20];
+        expected.extend(postcard::to_allocvec(&request).unwrap());
+        assert_eq!(postcard::to_allocvec(&operation).unwrap(), expected);
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("initializer"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let envelope = ClientEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: 901,
+            proof: Some(proof.clone()),
+            request: ClientRequest::DeviceOperation { operation },
+        };
+        let mut codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
+        let mut bytes = Vec::new();
+        codec.write(&mut bytes, &envelope).unwrap();
+        assert_eq!(
+            codec
+                .read::<ClientEnvelope>(&mut Cursor::new(bytes))
+                .unwrap(),
+            Some(envelope)
+        );
+        for outcome in [
+            InitializationOutcome::Confirmed {
+                installation_id: Uuid::from_u128(402),
+            },
+            InitializationOutcome::Unknown,
+            InitializationOutcome::NotAttempted {
+                reason: InitializationRefusal::InvalidRequestId,
+            },
+            InitializationOutcome::NotAttempted {
+                reason: InitializationRefusal::StoreUnavailable,
+            },
+        ] {
+            let payload = InitializationReply {
+                request_id: request.request_id,
+                outcome,
+            };
+            let reply = Reply::AccountInstallationInitialized(payload);
+            let mut expected = vec![17];
+            expected.extend(postcard::to_allocvec(&payload).unwrap());
+            assert_eq!(postcard::to_allocvec(&reply).unwrap(), expected);
+            let envelope = ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(901),
+                proof: proof.clone(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::DeviceOperation { reply },
+                },
+            };
+            let mut bytes = Vec::new();
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            codec.write(&mut bytes, &envelope).unwrap();
+            assert_eq!(
+                codec
+                    .read::<ServerEnvelope>(&mut Cursor::new(bytes))
+                    .unwrap(),
+                Some(envelope)
+            );
+        }
+        assert_eq!(
+            postcard::to_allocvec(&Operation::AccountInstallationRead {
+                request_id: request.request_id
+            })
+            .unwrap()[0],
+            19
+        );
+        for installation_id in [None, Some(Uuid::from_u128(403))] {
+            assert_eq!(
+                postcard::to_allocvec(&Reply::AccountInstallationObservation {
+                    request_id: request.request_id,
+                    installation_id
+                })
+                .unwrap()[0],
+                16
+            );
+        }
+    }
 
     #[test]
     fn scrollback_options_keep_legacy_json_and_positional_wire_bytes() {

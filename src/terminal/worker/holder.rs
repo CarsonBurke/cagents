@@ -278,6 +278,97 @@ pub(super) fn spawn_recoverable(
     spawn_reserved(command, size, exits, recovery, reservation)
 }
 
+/// Required lower-holder semantics have no constructor yet. In particular,
+/// neither legacy Spawn nor a nonce echo can manufacture this capability.
+/// A later opt-in helper must authenticate the original child-owned socket and
+/// preserve its actual root before this type gains an inhabited constructor.
+pub(super) enum BoundHelperCapability {}
+
+/// Mutable ownership lives in the caller, outside its unwind closure. Failed
+/// ACK/evidence/watch steps leave the original Child and all received pins in
+/// this same slot. The ordinary caller still applies its existing Drop policy;
+/// an entered bound caller must retain the slot until exact reconciliation.
+#[derive(Default)]
+pub(super) struct StagedStart {
+    report: Option<Report>,
+    descriptors: Vec<OwnedFd>,
+    master: Option<PtyMaster>,
+    child: Option<HeldChild>,
+    directory: Option<Arc<File>>,
+    launch_directory: Option<LaunchDirectoryPin>,
+    request_may_have_entered: bool,
+    // The ordinary failure path drops received resources before its existing
+    // Holder release policy, just as the original stack locals did.
+    holder: Option<Holder>,
+}
+
+impl StagedStart {
+    pub(super) fn request_may_have_entered(&self) -> bool {
+        self.request_may_have_entered
+    }
+
+    fn install_watch(
+        &mut self,
+        pid: libc::pid_t,
+        exited: Option<libc::c_int>,
+        exits: Sender<ChildExit>,
+        identity: Option<crate::agent_execution::DirectoryIdentity>,
+    ) -> Result<(), String> {
+        let holder = self.holder.as_mut().expect("original holder staged");
+        if holder.protocol != PROTOCOL || self.descriptors.len() != 3 {
+            return Err("terminal holder sent the wrong launch-directory descriptors".into());
+        }
+        // No fallible operation separates consuming SCM_RIGHTS from staging
+        // every original descriptor. Validation may then fail conservatively.
+        let directory = self.descriptors.pop().unwrap();
+        let root = self.descriptors.pop().unwrap();
+        let master = self.descriptors.pop().unwrap();
+        self.directory = Some(Arc::new(File::from(directory)));
+        self.child = Some(HeldChild {
+            pid,
+            pidfd: File::from(root),
+        });
+        self.master = Some(PtyMaster(master));
+        let identity = identity.ok_or("terminal holder did not attest its launch directory")?;
+        self.launch_directory = Some(checked_launch_directory(
+            identity,
+            self.directory.as_ref().unwrap().clone(),
+        )?);
+        let root = &self.child.as_ref().unwrap().pidfd;
+        let (acknowledge, acknowledged) = crossbeam_channel::bounded(1);
+        holder.acknowledged = Some(acknowledged);
+        let reader = holder
+            .control
+            .try_clone()
+            .map_err(|error| format!("watch terminal holder: {error}"))?;
+        let watched_root = root
+            .try_clone()
+            .map_err(|error| format!("watch terminal root: {error}"))?;
+        let (released, release) =
+            std::io::pipe().map_err(|error| format!("watch terminal release: {error}"))?;
+        let watch = Watch::start(
+            reader,
+            watched_root,
+            released,
+            exits,
+            acknowledge,
+            exited.is_some(),
+        )?;
+        holder.release = Some(release);
+        holder.watch = Some(watch);
+        Ok(())
+    }
+
+    fn take_held(&mut self) -> Held {
+        Held {
+            master: self.master.take().expect("prepared original PTY"),
+            child: self.child.take().expect("prepared original root"),
+            holder: self.holder.take().expect("prepared original holder"),
+            launch_directory: self.launch_directory.take(),
+        }
+    }
+}
+
 fn spawn_reserved(
     command: CommandBuilder,
     size: PtySize,
@@ -285,6 +376,24 @@ fn spawn_reserved(
     recovery: Option<Recovery>,
     reservation: crate::daemon::child_reaper::Reservation,
 ) -> Result<Held, String> {
+    let mut staged = StagedStart::default();
+    spawn_ordinary_in(&mut staged, command, size, exits, recovery, reservation)?;
+    Ok(staged.take_held())
+}
+
+// This function deliberately accepts no bound capability. It preserves legacy
+// helper semantics and is never an implementation of fresh bound entry.
+fn spawn_ordinary_in(
+    staged: &mut StagedStart,
+    command: CommandBuilder,
+    size: PtySize,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+    reservation: crate::daemon::child_reaper::Reservation,
+) -> Result<(), String> {
+    if staged.holder.is_some() || staged.request_may_have_entered {
+        return Err("The original holder start is already owned; it cannot be retried".into());
+    }
     // Every image that can start a holder has to be able to serve as one.
     // Referencing the entry here keeps the linker from discarding it.
     std::hint::black_box(&SERVE);
@@ -322,7 +431,8 @@ fn spawn_reserved(
     drop(remote);
     // The holder is this daemon's unreaped child until `Holder` reaps it.
     let pidfd = open_pidfd(process.child.id() as libc::pid_t);
-    let mut holder = Holder::new(control, Some(process));
+    staged.holder = Some(Holder::new(control, Some(process)));
+    let holder = staged.holder.as_mut().expect("original holder staged");
     // Preserve the captured descriptor in the cleanup owner before any other
     // fallible setup step can return through Holder::drop.
     holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
@@ -335,6 +445,8 @@ fn spawn_reserved(
         .map(|command| STANDARD.encode(command))
         .map_err(|error| format!("encode terminal command: {error}"))?;
     let deadline = Instant::now() + START_TIMEOUT;
+    // Mark ambiguity BEFORE the first byte may authorize root construction.
+    staged.request_may_have_entered = true;
     let started = crate::descriptor_frame::send_json_with_fds_until(
         &holder.control,
         &Request::Spawn {
@@ -359,18 +471,21 @@ fn spawn_reserved(
     })
     .map_err(|error| format!("start terminal holder: {error}"))?;
     let (report, descriptors) = started;
-    let (pid, launch_directory) = match report {
+    // Preserve every issued descriptor before validation/evidence/watch work.
+    staged.descriptors = descriptors;
+    staged.report = Some(report);
+    let (pid, launch_directory) = match staged.report.as_ref().unwrap() {
         Report::Started {
             protocol,
             pid,
             launch_directory,
-        } if protocol == PROTOCOL => (pid, launch_directory),
+        } if *protocol == PROTOCOL => (*pid, *launch_directory),
         Report::Started { protocol, .. } => {
             return Err(format!(
                 "terminal holder speaks protocol {protocol}, expected {PROTOCOL}"
             ));
         }
-        Report::Failed(message) => return Err(message),
+        Report::Failed(message) => return Err(message.clone()),
         _ => return Err("terminal holder answered out of turn".into()),
     };
     crate::daemon::process_scope::warn_if_shared(owner.pid as u32, pid as u32);
@@ -383,7 +498,8 @@ fn spawn_reserved(
         }
         holder.record = Some(record);
     }
-    watched(holder, pid, descriptors, None, exits, launch_directory)
+    staged.install_watch(pid, None, exits, launch_directory)?;
+    Ok(())
 }
 
 /// A terminal taken over from a detached holder.

@@ -79,6 +79,21 @@ pub enum Operation {
     ReadImageAsset {
         reference: crate::chat::ImageReference,
     },
+    /// Retained setup on the selected daemon. Create additionally requires its
+    /// exact physical reservation; replies grant no login/registration authority.
+    AccountPreparation {
+        request: crate::account::preparation::AccountPreparationRequest,
+    },
+    /// Observe an existing installation identity on this already selected
+    /// connection. This never creates identity or authorizes a retained intent.
+    AccountInstallationRead {
+        request_id: uuid::Uuid,
+    },
+    /// Explicit identity-only initialization on this original connection.
+    /// Appended only to the protocol-144 preparation lineage.
+    AccountInstallationInitialize {
+        request: crate::account::installation::InitializationRequest,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -132,6 +147,14 @@ pub enum Reply {
         error: String,
     },
     Image(Vec<u8>),
+    /// Echoes the complete submitted intent with its metadata-only outcome.
+    AccountPreparation(crate::account::preparation::AccountPreparationReply),
+    /// A read-only observation, not a preparation durability acknowledgement.
+    AccountInstallationObservation {
+        request_id: uuid::Uuid,
+        installation_id: Option<uuid::Uuid>,
+    },
+    AccountInstallationInitialized(crate::account::installation::InitializationReply),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -191,6 +214,15 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     match operation {
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
+        }
+        Operation::AccountPreparation { .. } => {
+            Err("Account preparation requires explicit user and daemon admission".into())
+        }
+        Operation::AccountInstallationRead { .. } => {
+            Err("Installation observation requires explicit user and daemon admission".into())
+        }
+        Operation::AccountInstallationInitialize { .. } => {
+            Err("Installation initialization requires explicit user and daemon admission".into())
         }
         Operation::ProjectNavigation { repository, kind } => {
             navigation(repository, kind).map(Reply::ProjectNavigation)
@@ -1658,6 +1690,11 @@ fn request_as(
     selected_socket: impl FnOnce() -> Result<PathBuf, String>,
     ready_socket: impl FnOnce() -> Result<PathBuf, String>,
 ) -> Result<Reply, String> {
+    if matches!(&operation, Operation::AccountInstallationInitialize { .. }) {
+        return Err(
+            "Installation initialization requires the original captured control connection".into(),
+        );
+    }
     // Resolving a remote socket can launch its SSH bridge before authentication.
     // Device operations are reserved for User, so refuse scoped remote callers
     // before either resolver can create transport or start a remote daemon.
@@ -1919,6 +1956,35 @@ mod wire_tests {
         account::{Account, AccountHome},
         agent::Provider,
     };
+
+    #[test]
+    fn initialization_refuses_generic_route_resolution_before_connect_or_start() {
+        for remote in [false, true] {
+            for no_start in [false, true] {
+                for authority in [
+                    crate::agent_execution::Authority::default(),
+                    crate::agent_execution::Authority::session("invalid-private-fixture".into()),
+                ] {
+                    let result = request_as(
+                        Operation::AccountInstallationInitialize {
+                            request: crate::account::installation::InitializationRequest {
+                                request_id: uuid::Uuid::from_u128(601),
+                            },
+                        },
+                        authority,
+                        no_start,
+                        remote,
+                        || panic!("initializer resolved a fresh selected socket"),
+                        || panic!("initializer started or reconnected a daemon"),
+                    );
+                    assert_eq!(
+                        result.unwrap_err(),
+                        "Installation initialization requires the original captured control connection"
+                    );
+                }
+            }
+        }
+    }
 
     fn roundtrip<T>(value: &T)
     where
