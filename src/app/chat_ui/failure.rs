@@ -947,8 +947,11 @@ impl Runtime {
                     .iter()
                     .find(|agent| &agent.id == child)
                     .and_then(|agent| agent.items.iter().find(|item| &item.id == id));
+                // A short failure is resident in full; only a preview
+                // depends on its retained original.
                 if item.is_some_and(|item| {
-                    chat::failure::provider_error_text(Provider::Codex, item).is_some()
+                    chat::failure::provider_error_text(Provider::Codex, item)
+                        .is_some_and(chat::failure::is_preview)
                 }) {
                     retained = true;
                     complete &= child_copy_source(&self.snapshot, child, id).is_some();
@@ -997,12 +1000,18 @@ impl Runtime {
                         .find(|agent| &agent.id == child)
                         .and_then(|agent| agent.items.iter().find(|item| &item.id == id))
                         .ok_or("Original diagnostic item is unavailable")?;
-                    if chat::failure::provider_error_text(Provider::Codex, item).is_some() {
-                        Some(child_copy_source(&self.snapshot, child, id).ok_or(
-                            "Original diagnostic unavailable: it was refused, changed or evicted",
-                        )?)
-                    } else {
-                        None
+                    match chat::failure::provider_error_text(Provider::Codex, item) {
+                        Some(text) => match child_copy_source(&self.snapshot, child, id) {
+                            Some(source) => Some(source),
+                            // The resident text is the whole original.
+                            None if !chat::failure::is_preview(text) => None,
+                            None => {
+                                return Err("Original diagnostic unavailable: it was \
+                                    refused, changed or evicted"
+                                    .into());
+                            }
+                        },
+                        None => None,
                     }
                 }
                 Source::ChildDetail(_) => None,

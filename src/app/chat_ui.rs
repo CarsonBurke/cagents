@@ -25928,7 +25928,14 @@ mod tests {
             "You've hit your session limit · resets 3:40pm (America/Vancouver)\n{}\nTAIL original λ",
             "猫 exact diagnostics\n".repeat(20_000)
         );
-        let mut preview = (*presentation_text("child-failure", "You've hit your session limit · resets 3:40pm (America/Vancouver)\nDiagnostic preview only")).clone();
+        let mut preview = (*presentation_text(
+            "child-failure",
+            &format!(
+                "You've hit your session limit · resets 3:40pm (America/Vancouver){}",
+                chat::failure::PREVIEW_OMITTED
+            ),
+        ))
+        .clone();
         assert!(chat::failure::mark_provider_error(
             Provider::Codex,
             &mut preview

@@ -472,6 +472,7 @@ fn create_inner(
             children: BTreeMap::new(),
             branch_points: Vec::new(),
             is_child: false,
+            child_failure: None,
             child_buffer: BTreeMap::new(),
         }),
     ))
@@ -629,6 +630,9 @@ struct Codex {
     children: BTreeMap<String, Box<Codex>>,
     branch_points: Vec<chat::BranchPoint>,
     is_child: bool,
+    /// The turn and message of the last final error a child reported, which
+    /// Codex repeats in that turn's failed completion: one failure, one item.
+    child_failure: Option<(String, String)>,
     child_buffer: BTreeMap<String, Vec<Value>>,
 }
 
@@ -2948,14 +2952,20 @@ impl Adapter for Codex {
                         .as_str()
                         .map(str::to_owned)
                         .unwrap_or_else(|| turn["error"].to_string());
-                    step.events.push(if self.is_child {
-                        provider_error_notice(message)
-                    } else {
-                        Event::Error {
+                    // Codex repeats a child's final error notification in the
+                    // turn's failed completion; one failure keeps one item.
+                    let reported = self
+                        .child_failure
+                        .as_ref()
+                        .is_some_and(|(turn, text)| turn == turn_id && *text == message);
+                    if self.is_child && !reported {
+                        step.events.push(provider_error_notice(message));
+                    } else if !self.is_child {
+                        step.events.push(Event::Error {
                             message,
                             fatal: false,
-                        }
-                    });
+                        });
+                    }
                 }
                 if method == "turn/completed" {
                     self.finish_execution(turn, &mut step, false)?;
@@ -3186,6 +3196,12 @@ impl Adapter for Codex {
                 // Child diagnostics must likewise stay in their own timeline
                 // before generic child routing discards parent error state.
                 if params["willRetry"] == true || self.is_child {
+                    if self.is_child
+                        && params["willRetry"] != true
+                        && let Some(turn) = params["turnId"].as_str()
+                    {
+                        self.child_failure = Some((turn.to_owned(), message.clone()));
+                    }
                     step.events.push(provider_error_notice(message));
                 } else {
                     step.events.push(Event::Error {
@@ -5890,6 +5906,7 @@ mod tests {
             children: BTreeMap::new(),
             branch_points: Vec::new(),
             is_child: false,
+            child_failure: None,
             child_buffer: BTreeMap::new(),
         }
     }
@@ -5995,6 +6012,39 @@ mod tests {
             Some("Reconnecting... 1/2")
         );
         assert!(chat::failure::provider_error_text(Provider::Claude, item).is_none());
+    }
+
+    #[test]
+    fn a_child_failed_turn_restating_its_final_error_adds_no_second_notice() {
+        let mut parent = adapter();
+        let mut child = adapter();
+        child.thread = Some("child-thread".into());
+        child.is_child = true;
+        parent
+            .children
+            .insert("child-thread".into(), Box::new(child));
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-turn","items":[]}}})).unwrap();
+        let notices = |step: Step| {
+            step.events
+                .iter()
+                .filter(|event| {
+                    matches!(event, Event::SubagentItem { item, .. }
+                    if chat::failure::provider_error_text(Provider::Codex, item).is_some())
+                })
+                .count()
+        };
+        let error = parent.receive(json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","willRetry":false,"error":{"message":"Usage limit · resets 3:40pm"}}})).unwrap();
+        assert_eq!(notices(error), 1);
+        let failed = |turn: &str, message: &str| json!({"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":turn,"status":"failed","error":{"message":message},"items":[]}}});
+        let restated = parent
+            .receive(failed("child-turn", "Usage limit · resets 3:40pm"))
+            .unwrap();
+        assert_eq!(notices(restated), 0, "the same failure is already shown");
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"next-turn","items":[]}}})).unwrap();
+        let different = parent
+            .receive(failed("next-turn", "Usage limit · resets 3:40pm"))
+            .unwrap();
+        assert_eq!(notices(different), 1, "another turn's failure is its own");
     }
 
     #[test]
@@ -6424,7 +6474,9 @@ mod tests {
                 <= 64 * 1024
         );
         let originals = originals.unwrap();
-        assert_eq!(originals, vec![raw.clone(), raw.clone(), raw]);
+        // The failed completion and its stale repeat restate the error
+        // notification, so the child shows the one failure once.
+        assert_eq!(originals, vec![raw]);
     }
 
     #[test]

@@ -11,7 +11,7 @@ const ORIGINAL_BYTES: usize = 1024 * 1024;
 const TOTAL_BYTES: usize = 8 * ORIGINAL_BYTES;
 const METADATA_BYTES: usize = 1024 * 1024;
 const RECORDS: usize = 32 * 64;
-const OMITTED: &str = "\n[Diagnostic preview; the original requires its retained copy source.]";
+use crate::chat::failure::PREVIEW_OMITTED as OMITTED;
 // Match Failure::parse's complete classification prefix even for four-byte
 // Unicode scalars, while staying below the child resident item budget.
 const PREVIEW_CHARS: usize = 8192;

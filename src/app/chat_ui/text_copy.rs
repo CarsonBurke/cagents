@@ -260,7 +260,12 @@ impl Cagents {
                         .plan
                         .is_current_or_withdrawn(&request.handle.snapshot())
                 {
-                    runtime.error = Some(format!("Original diagnostic unavailable: {error}"));
+                    const PREFIX: &str = "Original diagnostic unavailable: ";
+                    runtime.error = Some(if error.starts_with(PREFIX) {
+                        error
+                    } else {
+                        format!("{PREFIX}{error}")
+                    });
                 }
                 Task::none()
             }

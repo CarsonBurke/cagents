@@ -33,6 +33,16 @@ pub fn mark_provider_error(provider: Provider, item: &mut super::Item) -> bool {
     true
 }
 
+/// Ends a child provider failure whose resident body is a bounded preview;
+/// only its retained copy source holds the complete original.
+pub const PREVIEW_OMITTED: &str =
+    "\n[Diagnostic preview; the original requires its retained copy source.]";
+
+/// Whether a provider failure's resident text is only a preview of it.
+pub fn is_preview(text: &str) -> bool {
+    text.ends_with(PREVIEW_OMITTED)
+}
+
 /// Require the full tuple and paired provider. Existing task/peer deliveries
 /// can carry arbitrary names, so a matching `from` field alone is insufficient.
 pub fn provider_error_text(provider: Provider, item: &super::Item) -> Option<&str> {
