@@ -135,19 +135,6 @@ pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
 
 /// Legacy records omit the name, so SQLite's NULL uniqueness semantics allow
 /// them all. The index also fences writes outside the acceptance helper.
-/// An open agent whose recorded process a daemon stop proved ended. The row
-/// names that exact session, so a successor binding a new session (or a
-/// closed agent) no longer matches it.
-pub(super) fn migrate_process_ends(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
-    tx.execute_batch(
-        "CREATE TABLE agent_process_ends (
-             agent TEXT PRIMARY KEY REFERENCES agents(id),
-             session_id TEXT NOT NULL
-         ) STRICT;",
-    )
-    .map_err(|error| error.to_string())
-}
-
 pub(super) fn migrate_names(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS agents_by_name
@@ -198,8 +185,7 @@ impl Registry {
             "SELECT NOT EXISTS(SELECT 1 FROM agent_launches)
                 AND NOT EXISTS(SELECT 1 FROM agent_runs WHERE state IN ('accepted', 'running', 'waiting'))
                 AND NOT EXISTS(SELECT 1 FROM agents a WHERE closed = 0 AND session_id IS NOT NULL
-                    AND NOT EXISTS(SELECT 1 FROM agent_process_ends e
-                        WHERE e.agent = a.id AND e.session_id = a.session_id))",
+                    AND json_extract(a.record, '$.process_end') IS NOT a.session_id)",
             [], |row| row.get(0),
         ).map_err(|error| error.to_string())
     }
@@ -1538,11 +1524,6 @@ impl Registry {
                         [agent.id.to_string()],
                     )
                     .map_err(|e| e.to_string())?;
-                    tx.execute(
-                        "DELETE FROM agent_process_ends WHERE agent = ?1",
-                        [agent.id.to_string()],
-                    )
-                    .map_err(|e| e.to_string())?;
                     // ChatClose retires through this path before the execution
                     // service can reach close_agent. Commit the pane tombstone
                     // here too, so a crash cannot publish a closed agent while
@@ -1562,9 +1543,8 @@ impl Registry {
                     // resumed successor.
                     changed |= tx
                         .execute(
-                            "INSERT INTO agent_process_ends(agent, session_id) VALUES (?1, ?2)
-                             ON CONFLICT(agent) DO UPDATE SET session_id = excluded.session_id
-                             WHERE session_id != excluded.session_id",
+                            "UPDATE agents SET record = json_set(record, '$.process_end', ?2)
+                             WHERE id = ?1 AND json_extract(record, '$.process_end') IS NOT ?2",
                             params![agent.id.to_string(), source.id().to_string()],
                         )
                         .map_err(|e| e.to_string())?
@@ -1651,16 +1631,11 @@ impl Registry {
         if !stopped && !earlier_boot {
             return Err("The predecessor may still be running; stop it first".into());
         }
-        // Any authority left from an earlier boot is stale, and the stop
-        // record described the predecessor, not the successor.
+        // Any authority left from an earlier boot is stale. Rewriting the
+        // record below also drops the predecessor's stop marker.
         tx.execute(
             "DELETE FROM agent_authorities WHERE session_id = ?1",
             [predecessor.id.to_string()],
-        )
-        .map_err(|error| error.to_string())?;
-        tx.execute(
-            "DELETE FROM agent_process_ends WHERE agent = ?1",
-            [agent.id.to_string()],
         )
         .map_err(|error| error.to_string())?;
         let unsettled: bool = tx
@@ -1742,11 +1717,6 @@ impl Registry {
         tx.execute(
             "UPDATE agents SET closed = 1, record = ?2 WHERE id = ?1",
             params![id.to_string(), encode(&agent)?],
-        )
-        .map_err(|error| error.to_string())?;
-        tx.execute(
-            "DELETE FROM agent_process_ends WHERE agent = ?1",
-            [id.to_string()],
         )
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -1991,11 +1961,16 @@ fn process_agent(tx: &Transaction<'_>, source: &HostedSession) -> Result<Option<
 }
 
 /// Whether a daemon stop recorded that this open agent's bound process ended.
+///
+/// The stop stores the ended session ID as `process_end` in the agent's JSON
+/// record, outside the `Agent` type, which also crosses IPC. It counts only
+/// while it names the agent's current session, so binding a successor or
+/// closing the agent ends it. Older builds ignore the key, and a record they
+/// rewrite drops it, which only restores the older stop behavior.
 fn process_ended(tx: &Connection, agent: AgentId) -> Result<bool, String> {
     tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agents a JOIN agent_process_ends e
-             ON e.agent = a.id AND e.session_id = a.session_id
-         WHERE a.id = ?1 AND a.closed = 0)",
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1 AND closed = 0
+             AND json_extract(record, '$.process_end') = session_id)",
         [agent.to_string()],
         |row| row.get(0),
     )
@@ -2884,6 +2859,32 @@ mod tests {
                 "its directory stays protected for the resume"
             );
             assert!(registry.cleanup_execution_is_quiescent().unwrap());
+            // Moving the stopped card keeps the stop record.
+            let moved = Scope::Worktree {
+                repository: directory.path().into(),
+                path: directory.path().into(),
+            };
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    scope: scope.clone(),
+                    expected_revision: registry.view_revision(&scope).unwrap(),
+                    operation: uuid::Uuid::new_v4(),
+                    change: crate::workspace_model::views::Change::Transfer {
+                        id: pane.id,
+                        destination: moved.clone(),
+                        before: None,
+                    },
+                })
+                .unwrap();
+            assert_eq!(
+                registry.agent(accepted.agent.id).unwrap().placement,
+                Placement::Worktree {
+                    repository: directory.path().into(),
+                    path: directory.path().into(),
+                }
+            );
+            assert!(registry.agent_process_ended(accepted.agent.id).unwrap());
+            let scope = moved;
 
             // The resumed conversation's process takes over the same agent
             // and pane, now that the stop proved its predecessor ended.
@@ -2970,6 +2971,33 @@ mod tests {
         assert!(registry.retire_agent_process(&source, 4).unwrap());
         assert!(registry.agent(accepted.agent.id).unwrap().closed);
         assert!(!registry.agent_process_ended(accepted.agent.id).unwrap());
+    }
+
+    /// The stop marker lives only in the stored JSON. A build without it, and
+    /// the IPC `Agent`, must read such a record unchanged.
+    #[test]
+    fn a_stop_marker_is_invisible_to_the_agent_shape_older_builds_decode() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let stopped = source();
+        registry
+            .bind_agent(accepted.agent.id, None, stopped.clone())
+            .unwrap();
+        registry.stop_agent_process(&stopped, 2).unwrap();
+        let record: String = registry
+            .db
+            .query_row(
+                "SELECT record FROM agents WHERE id = ?1",
+                [accepted.agent.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(raw["process_end"], stopped.id().to_string());
+        // `Agent` is the shape every older build decodes; it gains no field.
+        let decoded: Agent = decode(&record).unwrap();
+        assert_eq!(decoded, registry.agent(accepted.agent.id).unwrap());
+        assert!(!encode(&decoded).unwrap().contains("process_end"));
     }
 
     #[test]
@@ -3115,8 +3143,7 @@ mod tests {
                 registry
                     .db
                     .execute_batch(
-                        "DROP TABLE agent_process_ends;
- DROP TABLE automation_notifications;
+                        "DROP TABLE automation_notifications;
                          DROP TABLE channel_work_placement_epochs;
                          DROP TABLE channel_work_placement_clock;
                          DROP TABLE channel_work_operations;
@@ -4088,8 +4115,7 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE agent_process_ends;
- DROP TABLE automation_notifications;
+                "DROP TABLE automation_notifications;
                  DROP TABLE channel_work_placement_epochs;
                  DROP TABLE channel_work_placement_clock;
                  DROP TABLE channel_work_operations;

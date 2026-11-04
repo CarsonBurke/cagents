@@ -2069,7 +2069,7 @@ fn failed_shutdown_stop_keeps_process_authority_until_the_stop_can_be_saved() {
     let accepted = submit(&host, &Authority::default(), request).unwrap();
     assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
     let fault = rusqlite::Connection::open(path).unwrap();
-    fault.execute_batch("CREATE TRIGGER refuse_shutdown_retirement BEFORE INSERT ON agent_process_ends BEGIN SELECT RAISE(FAIL, 'fixture retirement unavailable'); END;").unwrap();
+    fault.execute_batch("CREATE TRIGGER refuse_shutdown_retirement BEFORE UPDATE OF record ON agents BEGIN SELECT RAISE(FAIL, 'fixture retirement unavailable'); END;").unwrap();
     assert!(
         super::super::finish_chat_shutdown(&host)
             .unwrap_err()

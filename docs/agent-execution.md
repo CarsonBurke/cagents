@@ -60,8 +60,7 @@ channel, where its saved conversation can be resumed. A turn the stop cut short
 ends with a note that it may be incomplete and is never resent, so inspect the
 conversation before sending more work. Until the conversation is resumed, a new
 prompt to the agent fails without being sent. `agent close` still retires a
-stopped agent. The daemon registry records stopped agents from schema version
-20; an older cagents refuses to open it.
+stopped agent.
 
 Every command takes an agent by its exact name, or an agent or run by its whole ID or any unique prefix of one, matched against the caller's open agents and their latest runs; an ambiguous prefix fails and names the candidates. An agent handle stands for its latest run, and a run handle for its agent. A whole ID outside that list is passed on as an agent, or to `wait` as an older run. Names resolve without case sensitivity and take precedence over ID prefixes. People read eight-character IDs; JSON always carries whole ones.
 
