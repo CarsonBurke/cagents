@@ -4351,7 +4351,7 @@ impl Runtime {
             let mut launch = self.session.launch.clone();
             launch.session_id = snapshot.session_id.clone();
             self.promote_observed_notices(&launch);
-            self.retire_observed_notices(Some(&launch));
+            self.retire_observed_notices(Some((&launch, self.session.id)));
             self.session.launch = launch;
         }
         // Each question's boundary is recorded once, against whatever item was
@@ -4704,7 +4704,7 @@ impl Runtime {
             let mut launch = self.session.launch.clone();
             launch.session_id = Some(id.clone());
             self.promote_observed_notices(&launch);
-            self.retire_observed_notices(Some(&launch));
+            self.retire_observed_notices(Some((&launch, self.session.id)));
             self.session.launch = launch;
         }
         self.session.learn_native_continuity_from(&observed);
@@ -19148,10 +19148,12 @@ mod tests {
             && handle.session().launch.session_id.is_some()
         {
             let store = writer.operation_store();
-            let launch = handle.session().launch;
-            let loaded = std::thread::spawn(move || observed_notices::load(&store, launch, true))
-                .join()
-                .unwrap();
+            let session = handle.session();
+            let loaded = std::thread::spawn(move || {
+                observed_notices::load(&store, session.launch, session.id, true)
+            })
+            .join()
+            .unwrap();
             if let Some(Phase::Starting(attempt)) = app.chat_ui.phases.get_mut(&target.card)
                 && attempt.target == target
             {

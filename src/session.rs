@@ -3100,7 +3100,7 @@ fn persistence_loop(
             merge_identity_replacement(&mut writes.identity_replacements, replacement);
         }
         let retry_requested = std::mem::take(&mut state.retry_requested);
-        let retry_answered_after = retry_requested.then_some(health.revision);
+        let mut retry_answered_after = retry_requested.then_some(health.revision);
         if retry_requested && !(writes.is_settled() && writes.quarantine.is_empty()) {
             // An explicit retry is also the one way a refused write is offered
             // to storage again: the reader may have fixed what storage refused.
@@ -3175,6 +3175,12 @@ fn persistence_loop(
             // Publish ordinary recovery/refusal before journal I/O can hold
             // the shared connection and delay an existing custody guard.
             health.quarantine(writes.quarantined());
+            // An unchanged refusal still answers an explicit retry. Publish
+            // that acknowledgement before its ordinary barrier can release
+            // the reader, independently of any following journal I/O.
+            if let Some(revision) = retry_answered_after.take() {
+                health.answer_retry(revision);
+            }
             for checkpoint in checkpoints {
                 let result = if !writes.ordinary_writes_settled() {
                     Err(save_refusal(ordinary_failure))
@@ -6021,6 +6027,75 @@ mod tests {
             .unwrap();
         lock.lock().unwrap().shutdown = true;
         changed.notify_one();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn observed_notices_blocked_io_cannot_delay_an_explicit_retry_acknowledgement() {
+        let directory = tempdir().unwrap();
+        let (notice, receipt) = observed_notice_checkpoint(
+            CardId::new(),
+            observed_notice_scope(directory.path()),
+            vec![observed_notice(0)],
+        );
+        let (barrier_reply, barrier) = std::sync::mpsc::sync_channel(1);
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                conversions: VecDeque::from([notice]),
+                retry_requested: true,
+                checkpoints: vec![barrier_reply],
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release) = std::sync::mpsc::sync_channel(1);
+        let release = Mutex::new(release);
+        let mut store = FakeStore::new([]);
+        store.after_notice = Some(Box::new(move |_| {
+            entered_tx.send(()).unwrap();
+            release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }));
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let publisher = HealthPublisher::new(health_tx);
+        let before = latest_health(&health_rx);
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || {
+            run_persistence_worker(
+                store,
+                empty_writes(),
+                worker_queue,
+                Arc::new(Mutex::new(None)),
+                publisher,
+                fast_persistence_config(3),
+            )
+        });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        barrier
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        // Journal I/O remains blocked, so an acknowledgement left after it
+        // could not have arrived. The ordinary barrier must already fence it.
+        let answered = latest_health(&health_rx);
+        assert!(answered.revision > before.revision);
+        assert_eq!(answered.health, SessionSaveHealth::Healthy);
+        assert!(answered.quarantined.is_empty());
+        assert_eq!(
+            receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        release_tx.send(()).unwrap();
+        receipt
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        queue.0.lock().unwrap().shutdown = true;
+        queue.1.notify_one();
         worker.join().unwrap();
     }
 

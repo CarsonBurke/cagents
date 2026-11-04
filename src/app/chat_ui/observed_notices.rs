@@ -28,6 +28,7 @@ pub(super) enum ReadyState {
     Loading {
         ticket: Ticket,
         launch: chat::Launch,
+        actor: TerminalId,
         ready: Ready,
     },
     Complete(Arc<Loaded>),
@@ -56,6 +57,7 @@ struct Pending {
 struct Batch {
     local: bool,
     launch: chat::Launch,
+    actor: TerminalId,
     binding: Option<Result<Scope, String>>,
     pending: Option<Pending>,
     records: Vec<Notice>,
@@ -73,10 +75,11 @@ pub(super) struct Capture {
 }
 
 impl Batch {
-    fn new(launch: chat::Launch) -> Self {
+    fn new(launch: chat::Launch, actor: TerminalId) -> Self {
         Self {
             local: !crate::device::is_remote(),
             launch,
+            actor,
             binding: None,
             pending: None,
             records: Vec::new(),
@@ -89,6 +92,7 @@ impl Batch {
 
     fn owns(&self, ticket: Ticket, loaded: &Loaded) -> bool {
         self.launch == loaded.launch
+            && self.actor == loaded.actor
             && self
                 .pending
                 .as_ref()
@@ -200,33 +204,99 @@ fn retained_capture_bytes(capture: &Capture) -> usize {
     bytes
 }
 
-/// Compare captured selectors without filesystem work or mutable environment
-/// fallback. Scope::resolve_local independently attests the physical home.
-fn same_account(left: &chat::Launch, right: &chat::Launch) -> bool {
+/// Compare captured observation owners without filesystem or inherited
+/// environment fallback. An unavailable selector permits only this exact
+/// actor/process context to retain its own local notes, never durable account
+/// authority. Argument-only model/permission metadata changes do not change an
+/// already-running actor's account; changing its captured environment does.
+/// Scope::resolve_local still independently refuses an unattested account.
+fn same_account(
+    left: &chat::Launch,
+    left_actor: TerminalId,
+    right: &chat::Launch,
+    right_actor: TerminalId,
+) -> bool {
     if left.provider != right.provider {
         return false;
     }
-    let Some(variable) = crate::account::home_variable(left.provider) else {
-        return false;
-    };
     let home = |launch: &chat::Launch| {
+        let variable = crate::account::home_variable(launch.provider)?;
         if launch.recipe.unset_environment.contains(variable) {
             return None;
         }
-        launch.recipe.environment.get(variable).map(|home| {
-            let path = PathBuf::from(home);
-            if path.is_absolute() {
-                path
-            } else {
-                launch.recipe.working_directory.join(path)
-            }
-        })
+        launch
+            .recipe
+            .environment
+            .get(variable)
+            .filter(|home| !home.is_empty())
+            .map(|home| {
+                let path = PathBuf::from(home);
+                if path.is_absolute() {
+                    path
+                } else {
+                    launch.recipe.working_directory.join(path)
+                }
+            })
     };
-    home(left) == home(right)
+    match (home(left), home(right)) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => {
+            left_actor == right_actor
+                && left.recipe.program == right.recipe.program
+                && left.recipe.environment == right.recipe.environment
+                && left.recipe.unset_environment == right.recipe.unset_environment
+                && left.recipe.working_directory == right.recipe.working_directory
+                && observation_identity_arguments(&left.recipe.arguments)
+                    .eq(observation_identity_arguments(&right.recipe.arguments))
+        }
+        _ => false,
+    }
 }
 
-fn same_owner(left: &chat::Launch, right: &chat::Launch) -> bool {
-    left.session_id == right.session_id && same_account(left, right)
+/// Only these known presentation options may change within one actual actor.
+/// Preserve every other argument, including profile/config/session selectors;
+/// malformed value options cannot swallow a following ownership selector.
+fn observation_identity_arguments(arguments: &[String]) -> impl Iterator<Item = &str> {
+    let mut arguments = arguments.iter().map(String::as_str).peekable();
+    let mut positional = false;
+    std::iter::from_fn(move || {
+        loop {
+            let argument = arguments.next()?;
+            if positional {
+                return Some(argument);
+            }
+            if argument == "--" {
+                positional = true;
+                return Some(argument);
+            }
+            let metadata =
+                |flag| matches!(flag, "--model" | "--permission-mode" | "--approval-mode");
+            if metadata(argument)
+                && arguments
+                    .peek()
+                    .is_some_and(|value| !value.starts_with('-'))
+            {
+                arguments.next();
+                continue;
+            }
+            if argument
+                .split_once('=')
+                .is_some_and(|(flag, value)| metadata(flag) && !value.is_empty())
+            {
+                continue;
+            }
+            return Some(argument);
+        }
+    })
+}
+
+fn same_owner(
+    left: &chat::Launch,
+    left_actor: TerminalId,
+    right: &chat::Launch,
+    right_actor: TerminalId,
+) -> bool {
+    left.session_id == right.session_id && same_account(left, left_actor, right, right_actor)
 }
 
 fn capacity(provider: Provider, text: &str) -> bool {
@@ -237,6 +307,7 @@ fn capacity(provider: Provider, text: &str) -> bool {
 /// only this shared, single-use payload, including across recovery checkpoints.
 pub struct Loaded {
     launch: chat::Launch,
+    actor: TerminalId,
     scope: Result<Scope, String>,
     records: Arc<[Notice]>,
     notes: Mutex<Option<Vec<failure::Note>>>,
@@ -252,6 +323,7 @@ impl std::fmt::Debug for Loaded {
 impl Loaded {
     fn from_records(
         launch: chat::Launch,
+        actor: TerminalId,
         scope: Result<Scope, String>,
         records: Vec<Notice>,
     ) -> Self {
@@ -269,6 +341,7 @@ impl Loaded {
             .collect();
         Self {
             launch,
+            actor,
             scope,
             records: records.into(),
             notes: Mutex::new(Some(notes)),
@@ -276,12 +349,12 @@ impl Loaded {
         }
     }
 
-    fn failed(launch: chat::Launch, error: String) -> Self {
-        Self::from_records(launch, Err(error), Vec::new())
+    fn failed(launch: chat::Launch, actor: TerminalId, error: String) -> Self {
+        Self::from_records(launch, actor, Err(error), Vec::new())
     }
 
-    fn unsupported(launch: chat::Launch, error: String) -> Self {
-        let mut loaded = Self::failed(launch, error);
+    fn unsupported(launch: chat::Launch, actor: TerminalId, error: String) -> Self {
+        let mut loaded = Self::failed(launch, actor, error);
         loaded.retryable = false;
         loaded
     }
@@ -290,11 +363,13 @@ impl Loaded {
 pub(super) fn load(
     store: &crate::persistence::StateStore,
     launch: chat::Launch,
+    actor: TerminalId,
     local: bool,
 ) -> Loaded {
     if !local {
         return Loaded::unsupported(
             launch,
+            actor,
             "Remote capacity history needs an attested remote account home".into(),
         );
     }
@@ -309,20 +384,20 @@ pub(super) fn load(
     })();
     let owner = match owner {
         Ok(owner) => owner,
-        Err(error) => return Loaded::unsupported(launch, error),
+        Err(error) => return Loaded::unsupported(launch, actor, error),
     };
     let scope = match Scope::resolve_local(&launch, owner) {
         Ok(scope) => scope,
         Err(error) => {
             let retryable = !error.refuses_content();
-            let mut loaded = Loaded::failed(launch, error.to_string());
+            let mut loaded = Loaded::failed(launch, actor, error.to_string());
             loaded.retryable = retryable;
             return loaded;
         }
     };
     match store.load_observed_notices(&scope) {
-        Ok(records) => Loaded::from_records(launch, Ok(scope), records),
-        Err(error) => Loaded::failed(launch, error.to_string()),
+        Ok(records) => Loaded::from_records(launch, actor, Ok(scope), records),
+        Err(error) => Loaded::failed(launch, actor, error.to_string()),
     }
 }
 
@@ -331,7 +406,7 @@ impl Runtime {
         if self.session.launch.session_id.is_some() {
             self.observed_notices
                 .batch
-                .get_or_insert_with(|| Batch::new(self.session.launch.clone()));
+                .get_or_insert_with(|| Batch::new(self.session.launch.clone(), self.session.id));
         }
     }
     /// Called only after an actual note change. Share its body once, then use
@@ -346,8 +421,13 @@ impl Runtime {
         let batch = self
             .observed_notices
             .batch
-            .get_or_insert_with(|| Batch::new(self.session.launch.clone()));
-        debug_assert!(same_owner(&batch.launch, &self.session.launch));
+            .get_or_insert_with(|| Batch::new(self.session.launch.clone(), self.session.id));
+        debug_assert!(same_owner(
+            &batch.launch,
+            batch.actor,
+            &self.session.launch,
+            self.session.id
+        ));
         if let Some(record) = batch.records.iter_mut().find(|record| {
             failure::same_prompt(
                 self.session.launch.provider,
@@ -377,7 +457,7 @@ impl Runtime {
         } else if self.session.launch.session_id.is_none() {
             self.retire_observed_notices(None);
         }
-        self.retire_observed_notices(Some(&next.launch));
+        self.retire_observed_notices(Some((&next.launch, next.id)));
     }
 
     /// Only callers observing the same exact actor may promote pre-ID notes.
@@ -387,7 +467,7 @@ impl Runtime {
         };
         if batch.launch.session_id.is_none()
             && launch.session_id.is_some()
-            && same_account(&batch.launch, launch)
+            && same_account(&batch.launch, batch.actor, launch, self.session.id)
             && batch.pending.is_none()
         {
             batch.launch.session_id.clone_from(&launch.session_id);
@@ -400,13 +480,12 @@ impl Runtime {
     /// Retire the old captured owner before a reset/rebind can reuse item IDs.
     /// Outstanding jobs and exact bytes move with it, rather than binding to
     /// the new account/conversation through this still-existing UI runtime.
-    pub(super) fn retire_observed_notices(&mut self, launch: Option<&chat::Launch>) {
-        if self
-            .observed_notices
-            .batch
-            .as_ref()
-            .is_none_or(|batch| launch.is_some_and(|launch| same_owner(&batch.launch, launch)))
-        {
+    pub(super) fn retire_observed_notices(&mut self, launch: Option<(&chat::Launch, TerminalId)>) {
+        if self.observed_notices.batch.as_ref().is_none_or(|batch| {
+            launch.is_some_and(|(launch, actor)| {
+                same_owner(&batch.launch, batch.actor, launch, actor)
+            })
+        }) {
             return;
         }
         let batch = self.observed_notices.batch.take().unwrap();
@@ -437,14 +516,19 @@ impl Runtime {
     }
 
     pub(super) fn restore_observed_notices(&mut self, loaded: Arc<Loaded>) {
-        if !same_owner(&self.session.launch, &loaded.launch) {
+        if !same_owner(
+            &self.session.launch,
+            self.session.id,
+            &loaded.launch,
+            loaded.actor,
+        ) {
             return;
         }
-        self.retire_observed_notices(Some(&loaded.launch));
+        self.retire_observed_notices(Some((&loaded.launch, loaded.actor)));
         let batch = self
             .observed_notices
             .batch
-            .get_or_insert_with(|| Batch::new(loaded.launch.clone()));
+            .get_or_insert_with(|| Batch::new(loaded.launch.clone(), loaded.actor));
         batch.binding = Some(loaded.scope.clone());
         batch.reported = false;
         batch.retryable = loaded.retryable;
@@ -511,6 +595,7 @@ fn start_batch(
     }
     let store = writer.operation_store();
     let launch = batch.launch.clone();
+    let actor = batch.actor;
     let local = batch.local;
     let ticket = Ticket::new(capture.target);
     if batch.binding.is_none() {
@@ -527,11 +612,16 @@ fn start_batch(
         });
         return Ok(Some(cosmic::task::future(async move {
             let worker_launch = launch.clone();
-            let loaded = tokio::task::spawn_blocking(move || load(&store, worker_launch, local))
-                .await
-                .unwrap_or_else(|error| {
-                    Loaded::failed(launch, format!("Capacity history loader stopped: {error}"))
-                });
+            let loaded =
+                tokio::task::spawn_blocking(move || load(&store, worker_launch, actor, local))
+                    .await
+                    .unwrap_or_else(|error| {
+                        Loaded::failed(
+                            launch,
+                            actor,
+                            format!("Capacity history loader stopped: {error}"),
+                        )
+                    });
             Message::ChatUi(Action::ObservedNoticesBound(ticket, Arc::new(loaded)))
         })));
     }
@@ -563,12 +653,16 @@ fn start_batch(
                     retryable: true,
                 })
                 .and_then(|result| result);
-            (load(&store, worker_launch, local), result)
+            (load(&store, worker_launch, actor, local), result)
         })
         .await;
         let (loaded, saved) = result.unwrap_or_else(|error| {
             (
-                Loaded::failed(launch, format!("Capacity history writer stopped: {error}")),
+                Loaded::failed(
+                    launch,
+                    actor,
+                    format!("Capacity history writer stopped: {error}"),
+                ),
                 Err(SaveFailure {
                     message: error.to_string(),
                     retryable: true,
@@ -587,14 +681,15 @@ fn ready_load_task(
     ticket: Ticket,
     ready: Ready,
     launch: chat::Launch,
+    actor: TerminalId,
     deadline: Duration,
     loader: impl FnOnce() -> Loaded + Send + 'static,
 ) -> Task<Message> {
     cosmic::task::future(async move {
         let loaded = match tokio::time::timeout(deadline, tokio::task::spawn_blocking(loader)).await {
             Ok(Ok(loaded)) => loaded,
-            Ok(Err(error)) => Loaded::failed(launch, format!("Capacity history loader stopped: {error}")),
-            Err(_) => Loaded::failed(launch,
+            Ok(Err(error)) => Loaded::failed(launch, actor, format!("Capacity history loader stopped: {error}")),
+            Err(_) => Loaded::failed(launch, actor,
                 "Earlier capacity history did not finish loading; the transcript may be incomplete. Open Notices to retry saving.".into()),
         };
         // A timed-out blocking read may finish later. Its detached result has
@@ -616,7 +711,9 @@ impl Cagents {
         attempt: &mut Attempt,
         handle: &Arc<ClientHandle>,
     ) -> Option<Task<Message>> {
-        let launch = handle.session().launch;
+        let session = handle.session();
+        let launch = session.launch;
+        let actor = session.id;
         launch.session_id.as_ref()?;
         let fresh = attempt.intent == chat::Intent::Start
             && attempt.session.launch.session_id.is_none()
@@ -625,15 +722,19 @@ impl Cagents {
             && !attempt.upgrade_committed
             && attempt.upgrade_admission.is_none();
         let retained = matches!(self.cards.get(&attempt.target.card), Some(CardRuntime::Chat(runtime))
-            if matches!(runtime.connection, Connection::Live(_)) && same_owner(&runtime.session.launch, &launch));
+            if matches!(runtime.connection, Connection::Live(_)) && same_owner(&runtime.session.launch, runtime.session.id, &launch, actor));
         if fresh || retained {
             return None;
         }
         match &attempt.observed_notices {
             Some(ReadyState::Loading {
-                launch: pending, ..
-            }) if same_owner(pending, &launch) => return Some(Task::none()),
-            Some(ReadyState::Complete(loaded)) if same_owner(&loaded.launch, &launch) => {
+                launch: pending,
+                actor: pending_actor,
+                ..
+            }) if same_owner(pending, *pending_actor, &launch, actor) => return Some(Task::none()),
+            Some(ReadyState::Complete(loaded))
+                if same_owner(&loaded.launch, loaded.actor, &launch, actor) =>
+            {
                 return None;
             }
             _ => {}
@@ -646,6 +747,7 @@ impl Cagents {
         attempt.observed_notices = Some(ReadyState::Loading {
             ticket,
             launch: launch.clone(),
+            actor,
             ready: ready.clone(),
         });
         let worker_launch = launch.clone();
@@ -653,8 +755,9 @@ impl Cagents {
             ticket,
             ready,
             launch,
+            actor,
             READY_LOAD_DEADLINE,
-            move || load(&store, worker_launch, local),
+            move || load(&store, worker_launch, actor, local),
         ))
     }
 
@@ -668,7 +771,7 @@ impl Cagents {
         if let Some(Phase::Starting(attempt)) = self.chat_ui.phases.get_mut(&target.card)
             && attempt.target == target
         {
-            if !matches!(&attempt.observed_notices, Some(ReadyState::Loading { ticket: pending, launch, .. }) if *pending == ticket && same_owner(launch, &loaded.launch))
+            if !matches!(&attempt.observed_notices, Some(ReadyState::Loading { ticket: pending, launch, actor, .. }) if *pending == ticket && *actor == loaded.actor && *launch == loaded.launch)
             {
                 return Task::none();
             }
@@ -715,7 +818,12 @@ impl Cagents {
                 .is_some_and(|batch| batch.owns(ticket, &loaded))
             {
                 runtime.observed_notices.batch.as_mut().unwrap().pending = None;
-                if same_owner(&runtime.session.launch, &loaded.launch) {
+                if same_owner(
+                    &runtime.session.launch,
+                    runtime.session.id,
+                    &loaded.launch,
+                    loaded.actor,
+                ) {
                     runtime.restore_observed_notices(loaded);
                 }
                 return;
@@ -1030,28 +1138,39 @@ mod tests {
     }
 
     fn fixture() -> (Runtime, Arc<ClientHandle>, tempfile::TempDir) {
+        fixture_for(Provider::Codex)
+    }
+
+    fn fixture_for(provider: Provider) -> (Runtime, Arc<ClientHandle>, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
         let mut session = fresh_chat_session(
-            Provider::Codex,
+            provider,
             TerminalId::new(),
             directory.path().into(),
-            &Account::system(Provider::Codex),
+            &Account::system(provider),
             false,
         )
         .unwrap();
         session.launch.session_id = Some(FIRST.into());
-        session.launch.recipe.environment.insert(
-            "CODEX_HOME".into(),
-            directory.path().to_string_lossy().into_owned(),
-        );
+        if let Some(variable) = crate::account::home_variable(provider) {
+            session.launch.recipe.environment.insert(
+                variable.into(),
+                directory.path().to_string_lossy().into_owned(),
+            );
+        }
+        let (first, next) = if provider == Provider::Codex {
+            ("first/input/0".into(), "next/input/0".into())
+        } else {
+            (format!("{FIRST}:0"), format!("{SECOND}:0"))
+        };
         let handle = Arc::new(ClientHandle::fixture(
             session.clone(),
             Snapshot {
                 ready: true,
                 session_id: Some(FIRST.into()),
                 items: vec![
-                    text("first/input/0", chat::Role::User, "Investigate"),
-                    text("next/input/0", chat::Role::User, "."),
+                    text(&first, chat::Role::User, "Investigate"),
+                    text(&next, chat::Role::User, "."),
                 ],
                 ..Snapshot::default()
             },
@@ -1085,6 +1204,7 @@ mod tests {
     fn loaded(runtime: &Runtime, records: Vec<Notice>) -> Arc<Loaded> {
         Arc::new(Loaded::from_records(
             runtime.session.launch.clone(),
+            runtime.session.id,
             Ok(scope(&runtime.session.launch)),
             records,
         ))
@@ -1239,7 +1359,7 @@ mod tests {
             } else {
                 next.session_id = Some(SECOND.into());
             }
-            runtime.retire_observed_notices(Some(&next));
+            runtime.retire_observed_notices(Some((&next, runtime.session.id)));
             runtime.session.launch = next;
             runtime.restore_observed_notices(loaded(&runtime, Vec::new()));
             assert!(
@@ -1315,7 +1435,7 @@ mod tests {
         let answer = loaded(&runtime, Vec::new());
         let mut next = runtime.session.launch.clone();
         next.session_id = Some(SECOND.into());
-        runtime.retire_observed_notices(Some(&next));
+        runtime.retire_observed_notices(Some((&next, runtime.session.id)));
         runtime.session.launch = next;
         runtime.note_at(
             Some("first/input/0".into()),
@@ -1393,6 +1513,7 @@ mod tests {
         let (mut runtime, _, directory) = fixture();
         runtime.restore_observed_notices(Arc::new(Loaded::failed(
             runtime.session.launch.clone(),
+            runtime.session.id,
             "fixture read refusal".into(),
         )));
         let (writer, _) = crate::session::SessionRuntime::open(
@@ -1450,6 +1571,22 @@ mod tests {
                 .await
                 .expect("bounded journal task completion")
             })
+    }
+
+    fn assert_no_task_actions(task: Task<Message>) {
+        use cosmic::iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
+                    let action = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                        .await
+                        .expect("ignored action must finish promptly");
+                    assert!(action.is_none(), "ignored action must not emit work");
+                }
+            });
     }
 
     #[test]
@@ -1614,7 +1751,7 @@ mod tests {
             _ => unreachable!(),
         };
         let duplicate = app.handle_chat_ui(Action::Ready(target, pending.clone()));
-        assert!(cosmic::iced::runtime::task::into_stream(duplicate).is_none());
+        assert_no_task_actions(duplicate);
         assert!(
             pending.0.lock().unwrap().is_some(),
             "duplicate cannot bypass hydration"
@@ -1708,6 +1845,7 @@ mod tests {
         });
         let answer = Arc::new(Loaded::failed(
             runtime.session.launch.clone(),
+            runtime.session.id,
             "fixture unavailable".into(),
         ));
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -1768,7 +1906,12 @@ mod tests {
         )
         .unwrap();
         let store = writer.operation_store();
-        let initial = Arc::new(load(&store, runtime.session.launch.clone(), true));
+        let initial = Arc::new(load(
+            &store,
+            runtime.session.launch.clone(),
+            runtime.session.id,
+            true,
+        ));
         let scope = initial.scope.clone().unwrap();
         runtime.restore_observed_notices(initial);
         runtime.note_at(
@@ -1899,7 +2042,12 @@ mod tests {
         )
         .unwrap();
         let store = writer.operation_store();
-        let empty = load(&store, runtime.session.launch.clone(), true);
+        let empty = load(
+            &store,
+            runtime.session.launch.clone(),
+            runtime.session.id,
+            true,
+        );
         let scope = empty.scope.unwrap();
         let newer = note("newer-work", 0);
         store.preserve_observed_notices(&scope, &[newer]).unwrap();
@@ -1911,6 +2059,7 @@ mod tests {
         runtime.restore_observed_notices(Arc::new(load(
             &store,
             runtime.session.launch.clone(),
+            runtime.session.id,
             true,
         )));
         assert_eq!(
@@ -1944,8 +2093,11 @@ mod tests {
     fn unsupported_discovery_is_quiet_but_retained_details_and_missing_storage_are_explicit() {
         let (mut runtime, _, _directory) = fixture();
         let launch = runtime.session.launch.clone();
-        runtime
-            .restore_observed_notices(Arc::new(Loaded::unsupported(launch, "unattested".into())));
+        runtime.restore_observed_notices(Arc::new(Loaded::unsupported(
+            launch,
+            runtime.session.id,
+            "unattested".into(),
+        )));
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let target = put(&mut app, runtime);
         assert!(app.observed_capacity_notice_problem().is_none());
@@ -2040,6 +2192,7 @@ mod tests {
             .unwrap();
             app.session = Some(writer);
             let launch = runtime.session.launch.clone();
+            let actor = runtime.session.id;
             drop(app.insert_chat_card(runtime.session.clone(), None, None));
             let card = app.workspace.focused().unwrap();
             let target = app.chat_ui.attempt(card).unwrap().target;
@@ -2051,6 +2204,7 @@ mod tests {
             attempt.observed_notices = Some(ReadyState::Loading {
                 ticket,
                 launch: launch.clone(),
+                actor,
                 ready: ready.clone(),
             });
             let (release, blocked) = std::sync::mpsc::sync_channel(1);
@@ -2061,11 +2215,13 @@ mod tests {
                 ticket,
                 ready.clone(),
                 launch,
+                actor,
                 Duration::from_millis(5),
                 move || {
                     blocked.recv().unwrap();
                     let loaded = Loaded::from_records(
                         worker_launch,
+                        actor,
                         Ok(late_scope),
                         vec![note("first/input/0", 1)],
                     );
@@ -2169,7 +2325,7 @@ mod tests {
             );
             let mut next = runtime.session.launch.clone();
             next.session_id = Some(SECOND.into());
-            runtime.retire_observed_notices(Some(&next));
+            runtime.retire_observed_notices(Some((&next, runtime.session.id)));
             runtime.session.launch = next;
             let old_records = runtime.observed_notices.retired[0].batch.records.clone();
             let old_launch = runtime.observed_notices.retired[0].batch.launch.clone();
@@ -2178,7 +2334,7 @@ mod tests {
             for index in 0..139 {
                 let mut launch = old_launch.clone();
                 launch.session_id = Some(format!("77777777-7777-4777-8777-{index:012x}"));
-                let mut batch = Batch::new(launch);
+                let mut batch = Batch::new(launch, runtime.session.id);
                 batch.records = old_records.clone();
                 batch.dirty = true;
                 runtime.observed_notices.retired.push(Capture {
@@ -2230,6 +2386,265 @@ mod tests {
                 app.status
                     .as_ref()
                     .is_some_and(|notice| notice.message.contains("could not all be retained"))
+            );
+        }
+    }
+
+    #[test]
+    fn unattested_omp_notes_stay_with_the_same_actor_options_but_not_new_process_contexts() {
+        for change in [
+            "clone",
+            "options",
+            "environment",
+            "directory",
+            "program",
+            "actor",
+            "profile",
+            "profile-equals",
+            "session-dir",
+            "session-dir-equals",
+            "config",
+            "config-equals",
+            "missing-model-value",
+        ] {
+            let (mut runtime, _, directory) = fixture_for(Provider::Omp);
+            let anchor = format!("{FIRST}:0");
+            runtime.note_at(Some(anchor.clone()), Some(anchor.clone()), CAPACITY.into());
+            let original = runtime.session.clone();
+            let body = runtime.observed_notices.batch.as_ref().unwrap().records[0]
+                .text
+                .clone();
+            let ticket = Ticket::new(runtime.target);
+            runtime.observed_notices.batch.as_mut().unwrap().pending = Some(Pending {
+                ticket,
+                offered: None,
+            });
+            let mut next = original.clone();
+            match change {
+                "options" => next.launch.recipe.arguments.extend([
+                    "--model".into(),
+                    "another-model".into(),
+                    "--permission-mode=default".into(),
+                ]),
+                "environment" => {
+                    next.launch
+                        .recipe
+                        .environment
+                        .insert("OMP_PROFILE".into(), "other-account".into());
+                }
+                "directory" => {
+                    next.launch.recipe.working_directory = directory.path().join("other-directory")
+                }
+                "program" => next.launch.recipe.program = "another-omp".into(),
+                "actor" => next.id = TerminalId::new(),
+                "profile" => next
+                    .launch
+                    .recipe
+                    .arguments
+                    .extend(["--profile".into(), "another-profile".into()]),
+                "profile-equals" => next
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--profile=another-profile".into()),
+                "session-dir" => next
+                    .launch
+                    .recipe
+                    .arguments
+                    .extend(["--session-dir".into(), "/other-sessions".into()]),
+                "session-dir-equals" => next
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--session-dir=/other-sessions".into()),
+                "config" => next
+                    .launch
+                    .recipe
+                    .arguments
+                    .extend(["--config".into(), "/other-config".into()]),
+                "config-equals" => next
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--config=/other-config".into()),
+                "missing-model-value" => next.launch.recipe.arguments.extend([
+                    "--model".into(),
+                    "--profile".into(),
+                    "another-profile".into(),
+                ]),
+                _ => {}
+            }
+            runtime.prepare_observed_session(&next);
+            runtime.session = next;
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("omp-owner.sqlite3"),
+                crate::model::BootId::new(change),
+            )
+            .unwrap();
+            let answer = Arc::new(load(
+                &writer.operation_store(),
+                original.launch.clone(),
+                original.id,
+                true,
+            ));
+            assert!(answer.scope.is_err());
+            assert!(
+                !answer.retryable,
+                "actor continuity cannot grant an attested account home"
+            );
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.session = Some(writer);
+            let target = put(&mut app, runtime);
+            drop(app.persist_observed_chat_notices());
+            let wrong_actor = Arc::new(Loaded::unsupported(
+                original.launch.clone(),
+                TerminalId::new(),
+                "unattested actor".into(),
+            ));
+            app.finish_bound_observed_notices(ticket, wrong_actor);
+            let same_actor = change == "clone" || change == "options";
+            if same_actor {
+                assert!(
+                    app.chat_runtime_mut(target)
+                        .unwrap()
+                        .observed_notices
+                        .batch
+                        .as_ref()
+                        .unwrap()
+                        .pending
+                        .is_some()
+                );
+            } else {
+                assert!(app.chat_ui.closing_notices[0].batch.pending.is_some());
+            }
+            app.finish_bound_observed_notices(ticket, answer);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            if same_actor {
+                let batch = runtime.observed_notices.batch.as_ref().unwrap();
+                assert_eq!(
+                    batch.launch, original.launch,
+                    "pending work retains its exact captured recipe"
+                );
+                assert_eq!(batch.actor, original.id);
+                assert!(batch.pending.is_none());
+                assert!(Arc::ptr_eq(&body, &batch.records[0].text));
+                assert!(runtime.failures.iter().any(|note| note.text == CAPACITY));
+                runtime.note_at(Some(anchor), Some("later-work".into()), CAPACITY.into());
+            } else {
+                assert!(runtime.observed_notices.batch.is_none());
+                assert!(
+                    runtime.failures.is_empty(),
+                    "an old unattested owner cannot bind to a replacement context"
+                );
+                let retired = &app.chat_ui.closing_notices[0].batch;
+                assert_eq!(retired.launch, original.launch);
+                assert_eq!(retired.actor, original.id);
+                assert!(Arc::ptr_eq(&body, &retired.records[0].text));
+                assert!(retired.pending.is_none());
+            }
+            drop(app.persist_observed_chat_notices());
+            assert!(
+                app.observed_capacity_notice_problem()
+                    .is_some_and(|(_, retry)| !retry)
+            );
+        }
+    }
+
+    #[test]
+    fn named_omp_ready_finishes_unsupported_or_timed_out_hydration_for_only_its_actual_actor() {
+        for timeout in [false, true] {
+            let (runtime, handle, directory) = fixture_for(Provider::Omp);
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.error = Some(CAPACITY.into());
+            handle.publish_snapshot_for_test(snapshot);
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("omp-ready.sqlite3"),
+                crate::model::BootId::new("omp-ready"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            drop(app.insert_chat_card(runtime.session.clone(), None, None));
+            let card = app.workspace.focused().unwrap();
+            let target = app.chat_ui.attempt(card).unwrap().target;
+            let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle.clone())))));
+            let initial = app.handle_chat_ui(Action::Ready(target, ready));
+            let (ticket, launch, actor, pending) =
+                match &app.chat_ui.attempt(card).unwrap().observed_notices {
+                    Some(ReadyState::Loading {
+                        ticket,
+                        launch,
+                        actor,
+                        ready,
+                    }) => (*ticket, launch.clone(), *actor, ready.clone()),
+                    _ => panic!("named Omp must start exactly one hydration"),
+                };
+            let wrong = Arc::new(Loaded::unsupported(
+                launch.clone(),
+                TerminalId::new(),
+                "unattested actor".into(),
+            ));
+            assert_no_task_actions(app.finish_ready_observed_notices(
+                ticket,
+                pending.clone(),
+                wrong,
+            ));
+            assert!(
+                matches!(app.chat_ui.attempt(card).unwrap().observed_notices, Some(ReadyState::Loading { ticket: current, .. }) if current == ticket)
+            );
+            assert!(pending.0.lock().unwrap().is_some());
+            let task = if timeout {
+                drop(initial);
+                let late_launch = launch.clone();
+                ready_load_task(
+                    ticket,
+                    pending,
+                    launch,
+                    actor,
+                    Duration::from_millis(1),
+                    move || {
+                        std::thread::sleep(Duration::from_millis(25));
+                        Loaded::unsupported(
+                            late_launch,
+                            actor,
+                            "provider has no account-home selector".into(),
+                        )
+                    },
+                )
+            } else {
+                initial
+            };
+            let Message::ChatUi(Action::ObservedNoticesReady(ticket, ready, loaded)) =
+                first_output(task)
+            else {
+                panic!("Omp hydration completion")
+            };
+            assert_eq!(loaded.actor, handle.session().id);
+            assert!(loaded.scope.is_err());
+            assert_eq!(loaded.retryable, timeout);
+            drop(app.finish_ready_observed_notices(ticket, ready, loaded));
+            assert!(
+                app.chat_ui.attempt(card).is_none(),
+                "unattested account must not strand named Omp in Starting"
+            );
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+            assert!(runtime.failures.iter().any(|note| note.text == CAPACITY));
+            assert!(
+                runtime
+                    .observed_notices
+                    .batch
+                    .as_ref()
+                    .unwrap()
+                    .binding
+                    .as_ref()
+                    .unwrap()
+                    .is_err()
+            );
+            drop(app.persist_observed_chat_notices());
+            assert!(
+                app.observed_capacity_notice_problem()
+                    .is_some_and(|(_, retry)| retry == timeout)
             );
         }
     }
