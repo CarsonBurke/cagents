@@ -370,11 +370,11 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                     overrides = {"MOCK_UI_DYNSYM": self.dynamic_symbols(name, binding)}
                     if prebuilt:
                         # The original layout contains intentionally failing
-                        # stale binaries. Supply a valid protocol fixture so
-                        # this negative actually reaches the export guard.
+                        # stale binaries. Supply products that report the
+                        # requested version so this negative reaches the
+                        # export guard.
                         for product in PRODUCTS:
-                            body = ('printf "127\n"\n' if product == "cagents" else "exit 93\n")
-                            self.executable(self.target / "release" / product, "#!/bin/sh\n" + body)
+                            self.prebuilt_product(product)
                         overrides.update(CAGENTS_SKIP_BUILD="1", CAGENTS_SKIP_STRIP="1")
                     result = self.package("full", **overrides)
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
