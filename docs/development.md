@@ -198,6 +198,12 @@ leaves that daemon running without a socket. An instance's storage remains
 for its next launch; delete `~/.local/share/cagents-development-NAME` and its
 config and state siblings to discard it.
 
+An idle instance takes about 0.4 GiB: the UI, its daemon, a headless niri
+compositor and the session's portals. Memory rarely limits how many run at
+once; building them does. Each checkout compiles its own matched set, so start
+instances from checkouts that are already built, and let `scripts/cargo-gate`
+admit the builds.
+
 The browserless UI keeps saved browser descriptors and opens their URLs through
 the system browser instead of compiling Servo.
 
