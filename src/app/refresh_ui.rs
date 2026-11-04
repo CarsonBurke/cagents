@@ -199,6 +199,7 @@ impl Cagents {
             self.cancel_workspace_preview();
         }
         self.refresh_ui.focused = focused;
+        crate::ui_controls::animate_activity(focused);
         if !regained {
             return self.accounts_focus_changed(focused, false);
         }
@@ -406,6 +407,27 @@ mod tests {
 
     fn active<const N: usize>(projects: [ProjectId; N]) -> [(ProjectId, Duration); N] {
         projects.map(|project| (project, ACTIVE_PROJECT_INTERVAL))
+    }
+
+    /// Spinners take their cadence from the main window's focus and nothing
+    /// else: another window's focus changes must neither slow nor restore it.
+    #[test]
+    fn activity_spinners_run_at_full_cadence_only_while_the_main_window_is_focused() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let main = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(main));
+        let other = window::Id::unique();
+        assert!(!crate::ui_controls::activity_animates());
+
+        drop(app.update(Message::RefreshUi(Action::Focused(main, true))));
+        assert!(crate::ui_controls::activity_animates());
+        drop(app.update(Message::RefreshUi(Action::Focused(other, false))));
+        assert!(crate::ui_controls::activity_animates());
+
+        drop(app.update(Message::RefreshUi(Action::Focused(main, false))));
+        assert!(!crate::ui_controls::activity_animates());
+        drop(app.update(Message::RefreshUi(Action::Focused(other, true))));
+        assert!(!crate::ui_controls::activity_animates());
     }
 
     #[test]

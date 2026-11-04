@@ -3216,6 +3216,7 @@ impl Application for Editor {
                     if self.core.main_window_id() == Some(window) {
                         let regained = focused && !self.window_focused;
                         self.window_focused = focused;
+                        cagents::ui_controls::animate_activity(focused);
                         if !focused {
                             self.tab_history.finish(self.active);
                         }
