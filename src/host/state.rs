@@ -48,7 +48,7 @@ pub(super) const RETAINED_CHILD_CLEANUP_MESSAGE: &str = "Original helper cleanup
 fn missing_registry() -> ProtocolError {
     ProtocolError::new(
         ProtocolErrorCode::Internal,
-        "the shared workspace model store is unavailable",
+        crate::workspace_model::REGISTRY_UNAVAILABLE,
         false,
     )
 }

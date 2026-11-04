@@ -5847,7 +5847,7 @@ impl Cagents {
         if self.shared_views.defaults.contains_key(&card)
             || self.durable.pending_terminal_creations.contains(&card)
             || (self.shared_views.attached.contains(&card)
-                && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+                && self.shared_registry_connecting()
                 && !explicit_retry)
         {
             return Task::none();
@@ -5864,7 +5864,7 @@ impl Cagents {
         let config = self.terminal_config(visible);
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
-        let shared = self.shared_views.attached.contains(&card);
+        let shared = self.attaches_as_shared(card);
         let reserved = self
             .workspace_model
             .views
@@ -5895,11 +5895,8 @@ impl Cagents {
                             }
                         }
                     }
-                    let hosted=hosted.ok_or("This shared terminal is disconnected; another client must restore its hosted session")?;
-                    let proof = client.proof().clone();
-                    (daemon_recovery::RecoveredTerminal { session: hosted.session,
-                        expected_host: Some(proof.clone()), attach_completed: false, recovery_lease: None },
-                        TerminalStartMode::Attach(proof))
+                    let hosted=hosted.ok_or(SHARED_TERMINAL_DISCONNECTED)?;
+                    shared_terminal_attachment(hosted.session, client.proof().clone())
                 } else { recover_terminal(session, explicit_retry)? };
                 tracing::debug!(target: "cagents::pane_open", stage = "recovered", ?card, shared);
                 let started = open_terminal(card, recovered, mode, config, sender, created);
@@ -5921,17 +5918,28 @@ impl Cagents {
     /// reports what the agent is doing before anyone opens the card. Only a
     /// terminal the daemon still hosts is attached: launching one again is the
     /// user's decision, made by opening the card.
+    ///
+    /// A shared pane's hosted session is restored by the registry's clients,
+    /// so it is attached exactly as opening the card attaches it: by its exact
+    /// ID under the daemon's current proof, never through this window's own
+    /// recovery of a cached descriptor.
     fn attach_restored_agent(&self, card: CardId, session: TerminalSession) -> Task<Message> {
         self.begin_terminal_start(card);
         let config = self.terminal_config(false);
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
+        let shared = self.attaches_as_shared(card);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let (recovered, mode) = recover_terminal(session, false)?;
-                if matches!(mode, TerminalStartMode::Spawn(_)) {
+                let connect = || {
+                    let socket = crate::terminal::ensure_daemon_ready()
+                        .map_err(|error| error.to_string())?;
+                    crate::control::ControlClient::connect(&socket)
+                        .map_err(|error| error.to_string())
+                };
+                let Some((recovered, mode)) = restored_attachment(shared, session, connect)? else {
                     return Ok(None);
-                }
+                };
                 open_terminal(card, recovered, mode, config, sender, false).map(Some)
             })
             .await
@@ -5945,6 +5953,35 @@ impl Cagents {
         })
     }
 
+    /// Whether a queued restored row attaches from a cold residency, or why
+    /// its card is not attached from the queue at all.
+    fn restored_attach_residency(&self, card: CardId) -> Result<bool, &'static str> {
+        match self.lifecycle.state(card) {
+            Some((_, Residency::Hibernated)) => Ok(false),
+            Some((Exposure::Offscreen, Residency::Cold)) => Ok(true),
+            Some(_) => Err("it is waiting for its own pane to start it"),
+            None => Err("this window has not registered its pane"),
+        }
+    }
+
+    /// Why the attach queue would hold `card`'s restored `session` back.
+    pub(super) fn restored_attach_hold(
+        &self,
+        card: CardId,
+        session: &TerminalSession,
+    ) -> Option<&'static str> {
+        if let Err(hold) = self.restored_attach_residency(card) {
+            return Some(hold);
+        }
+        if self
+            .card_state(card)
+            .is_some_and(|state| self.project_ui.deleting_card(state))
+        {
+            return Some("its worktree is being deleted");
+        }
+        self.shared_terminal_attach_hold(card, session)
+    }
+
     /// Starts the next queued restored agent attach that still applies, once
     /// no other terminal start is outstanding. Each attach holds the daemon's
     /// recovery lease, so they run one at a time and never ahead of a card
@@ -5955,28 +5992,51 @@ impl Cagents {
         }
         // A worktree being deleted is about to close its cards, so theirs
         // wait: a deletion that fails leaves them to be attached after all.
-        let mut deleting = Vec::new();
+        // A shared pane waits for the registry to confirm its descriptor, as
+        // opening it would. A daemon without one leaves its descriptor the
+        // only record, which is attached the way it was before sharing.
+        let mut held = Vec::new();
         let mut task = Task::none();
         while let Some(card) = self.restored_agent_attaches.pop_front() {
-            if !matches!(self.lifecycle.state(card), Some((_, Residency::Hibernated))) {
+            // A card being opened has a start of its own. One that is cold
+            // has none coming while it is off screen, which is how a shared
+            // view projects a pane it has not shown yet.
+            let Ok(cold) = self.restored_attach_residency(card) else {
                 continue;
-            }
+            };
             if self
                 .card_state(card)
                 .is_some_and(|state| self.project_ui.deleting_card(state))
             {
-                deleting.push(card);
+                held.push(card);
                 continue;
             }
             if let Some(session) = deferred_terminal_session(
                 self.card_state(card),
                 matches!(self.cards.get(&card), Some(CardRuntime::Loading)),
             ) {
+                if !self.shared_terminal_ready_for_restored_attach(card, &session) {
+                    held.push(card);
+                    continue;
+                }
+                // Attached for its row or for startup qualification only, so
+                // its rendering surface stays asleep until the card is opened.
+                if cold {
+                    self.lifecycle.register(
+                        card,
+                        Exposure::Offscreen,
+                        Residency::Hibernated,
+                        Instant::now(),
+                    );
+                    if let Some(state) = self.card_state_mut(card) {
+                        state.residency = Residency::Hibernated;
+                    }
+                }
                 task = self.attach_restored_agent(card, session);
                 break;
             }
         }
-        for card in deleting.into_iter().rev() {
+        for card in held.into_iter().rev() {
             self.restored_agent_attaches.push_front(card);
         }
         task
@@ -14658,12 +14718,15 @@ impl Application for Cagents {
             } => {
                 match result {
                     Ok(Some(started)) => self.terminal_started(card, terminal, Ok(started)),
-                    Ok(None) => self.finish_terminal_start(card),
                     // Nobody is looking at this card, so its failure is not
-                    // reported here. Opening it starts the terminal again and
-                    // reports whatever still stands in the way.
-                    Err(error) => {
-                        tracing::debug!(?card, %error, "restored agent terminal stays detached");
+                    // shown here. Opening it starts the terminal again and
+                    // reports whatever still stands in the way; a startup gate
+                    // reports it rather than waiting for that.
+                    result => {
+                        let reason = result.err().unwrap_or_else(|| {
+                            "the terminal service no longer hosts it; open it to relaunch".into()
+                        });
+                        self.startup_attach_failed(card, terminal, reason);
                         self.finish_terminal_start(card)
                     }
                 }
@@ -19321,6 +19384,58 @@ fn load_repository_github(
         })
     })()
     .unwrap_or_else(|unavailable| unavailable)
+}
+
+const SHARED_TERMINAL_DISCONNECTED: &str =
+    "This shared terminal is disconnected; another client must restore its hosted session";
+
+/// Another client may own a shared terminal's recovery, so a shared pane only
+/// attaches the exact session its daemon hosts, under that daemon's proof.
+fn shared_terminal_attachment(
+    hosted: TerminalSession,
+    proof: HostSessionProof,
+) -> (daemon_recovery::RecoveredTerminal, TerminalStartMode) {
+    (
+        daemon_recovery::RecoveredTerminal {
+            session: hosted,
+            expected_host: Some(proof.clone()),
+            attach_completed: false,
+            recovery_lease: None,
+        },
+        TerminalStartMode::Attach(proof),
+    )
+}
+
+/// What a restored agent row attaches, or `None` when only a launch could
+/// bring it back. `connect` reaches the daemon a shared pane is hosted by.
+fn restored_attachment(
+    shared: bool,
+    session: TerminalSession,
+    connect: impl FnOnce() -> Result<crate::control::ControlClient, String>,
+) -> Result<Option<(daemon_recovery::RecoveredTerminal, TerminalStartMode)>, String> {
+    let (recovered, mode) = if shared {
+        hosted_shared_terminal(&mut connect()?, session.id)?
+    } else {
+        recover_terminal(session, false)?
+    };
+    Ok(matches!(mode, TerminalStartMode::Attach(_)).then_some((recovered, mode)))
+}
+
+/// The exact shared terminal `client`'s daemon hosts, ready to attach.
+fn hosted_shared_terminal(
+    client: &mut crate::control::ControlClient,
+    terminal: TerminalId,
+) -> Result<(daemon_recovery::RecoveredTerminal, TerminalStartMode), String> {
+    let hosted = client
+        .list()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|hosted| hosted.session.id == terminal)
+        .ok_or(SHARED_TERMINAL_DISCONNECTED)?;
+    Ok(shared_terminal_attachment(
+        hosted.session,
+        client.proof().clone(),
+    ))
 }
 
 /// Finds the terminal a start should attach to, or the launch it should make.

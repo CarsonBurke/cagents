@@ -76,6 +76,16 @@ impl TerminalSurface {
         self.handle.proof()
     }
 
+    /// See [`HostedTerminalHandle::current_attachment`].
+    pub fn current_attachment(&self) -> Result<Option<HostSessionProof>, String> {
+        self.handle.current_attachment()
+    }
+
+    /// See [`HostedTerminalHandle::attachment_failure`].
+    pub fn attachment_failure(&self) -> Option<String> {
+        self.handle.attachment_failure()
+    }
+
     pub fn acknowledge_redraw(&self, observed_generation: u64) {
         self.handle.acknowledge_redraw(observed_generation);
     }
