@@ -367,7 +367,7 @@ fn attach_session(
                     title => title,
                 };
                 let human = format!(
-                    "Attached session {id} to channel \"{title}\" in {}. Open that channel to see it.",
+                    "Attached session {id} to channel \"{title}\" in {}. Open that channel to see it. A window holding unsent text in this conversation keeps it until that text is sent or cleared.",
                     entry.project_name.as_deref().unwrap_or("its project"),
                 );
                 placed_output(&result, placed, to, true, human)
@@ -1133,7 +1133,7 @@ mod tests {
         assert_eq!(
             output.human,
             format!(
-                "Attached session {} to channel \"channel\" in repo. Open that channel to see it.",
+                "Attached session {} to channel \"channel\" in repo. Open that channel to see it. A window holding unsent text in this conversation keeps it until that text is sent or cleared.",
                 match &expected.kind {
                     CardKind::Chat(session) => session.id,
                     _ => unreachable!(),

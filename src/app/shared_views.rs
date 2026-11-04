@@ -1516,9 +1516,11 @@ impl Cagents {
                         }
                         self.status = Some(if local_work {
                             self.shared_views.blocked_aliases.insert(alias);
+                            let title = self
+                                .card_state(alias)
+                                .map_or(shared.title.as_str(), |card| card.title.as_str());
                             TransientNotice::warning(format!(
-                                "\u{201c}{}\u{201d} was also placed in a shared channel. It moves there once you send or clear what you've written here.",
-                                shared.title
+                                "\u{201c}{title}\u{201d} was also placed in a shared channel. It moves there once you send or clear what you've written here."
                             ))
                         } else {
                             TransientNotice::warning(
