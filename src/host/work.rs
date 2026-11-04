@@ -1494,6 +1494,11 @@ impl Scanner {
                     .get_or_insert_with(Default::default)
                     .merge(git_watch::Change {
                         worktrees,
+                        // Native registration can fail without a membership
+                        // event. Rebuild its plan on the fallback deadline so
+                        // configure retries even when the inventory is unchanged.
+                        topology: !tracked.covered,
+                        membership: !tracked.covered,
                         ..git_watch::Change::default()
                     });
             }
@@ -1587,6 +1592,90 @@ impl Scanner {
 mod tests {
     use super::*;
 
+    fn test_git(root: &Path, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(arguments)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {arguments:?}: {output:?}");
+    }
+
+    fn test_scanner(repository: &Path, monitor: git_watch::Monitor) -> (Handle, Scanner) {
+        let handle = Handle(Arc::new(Inner {
+            host: Weak::new(),
+            shared: Mutex::new(Shared {
+                projects: BTreeMap::from([(repository.to_path_buf(), Tracked::new("repo".into()))]),
+                pins: BTreeMap::new(),
+                session_activity: HashMap::new(),
+                tickets: BTreeMap::new(),
+                linear_unavailable: None,
+                stale_after_days: 7,
+                read_at: None,
+                restored: BTreeMap::new(),
+            }),
+            updated: Condvar::new(),
+            scanner: Signal::default(),
+            forge: Signal::default(),
+            publisher: Signal::default(),
+            publication: Mutex::new(Publication::default()),
+            jobs: Jobs::default(),
+            store: Mutex::new(None),
+            cancellation: CancellationToken::new(),
+        }));
+        let scanner = Scanner {
+            monitor: Some(monitor),
+            configured: BTreeMap::new(),
+            stamped: HashMap::new(),
+            sampled: Some(Instant::now()),
+            refreshed: Some(Instant::now()),
+        };
+        (handle, scanner)
+    }
+
+    fn take_scan_job(handle: &Handle) -> Job {
+        handle
+            .0
+            .jobs
+            .state
+            .lock()
+            .unwrap()
+            .queue
+            .pop_front()
+            .expect("the real dispatcher queued a scan")
+    }
+
+    fn wait_for_watch(
+        scanner: &mut Scanner,
+        handle: &Handle,
+        repository: &Path,
+        phase: &str,
+        predicate: &dyn Fn(&Tracked) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            scanner.drain(handle);
+            if predicate(&handle.shared().projects[repository]) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{phase}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn a_failed_watch_inventory_retries_on_the_worker_deadline_then_rearms() {
         let directory = tempfile::tempdir().unwrap();
@@ -1597,27 +1686,7 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         let file = source.join("main.rs");
         std::fs::write(&file, "initial\n").unwrap();
-        let git = |arguments: &[&str]| {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
-                .args([
-                    "-c",
-                    "commit.gpgsign=false",
-                    "-c",
-                    "init.defaultBranch=main",
-                ])
-                .args(arguments)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {arguments:?}: {output:?}");
-        };
+        let git = |arguments: &[&str]| test_git(&root, arguments);
         git(&["init", "-q"]);
         git(&["add", "."]);
         git(&["commit", "-qm", "initial"]);
@@ -1636,56 +1705,12 @@ mod tests {
             linked.to_str().unwrap(),
         ]);
         let repository = root.join(".git").canonicalize().unwrap();
-        let handle = Handle(Arc::new(Inner {
-            host: Weak::new(),
-            shared: Mutex::new(Shared {
-                projects: BTreeMap::from([(repository.clone(), Tracked::new("repo".into()))]),
-                pins: BTreeMap::new(),
-                session_activity: HashMap::new(),
-                tickets: BTreeMap::new(),
-                linear_unavailable: None,
-                stale_after_days: 7,
-                read_at: None,
-                restored: BTreeMap::new(),
-            }),
-            updated: Condvar::new(),
-            scanner: Signal::default(),
-            forge: Signal::default(),
-            publisher: Signal::default(),
-            publication: Mutex::new(Publication::default()),
-            jobs: Jobs::default(),
-            store: Mutex::new(None),
-            cancellation: CancellationToken::new(),
-        }));
-        let mut scanner = Scanner {
-            monitor: Some(git_watch::Monitor::start(|| {}).unwrap()),
-            configured: BTreeMap::new(),
-            stamped: HashMap::new(),
-            sampled: Some(Instant::now()),
-            refreshed: Some(Instant::now()),
-        };
-        let take_job = || {
-            handle
-                .0
-                .jobs
-                .state
-                .lock()
-                .unwrap()
-                .queue
-                .pop_front()
-                .expect("the real dispatcher queued a scan")
-        };
+        let (handle, mut scanner) =
+            test_scanner(&repository, git_watch::Monitor::start(|| {}).unwrap());
+        let take_job = || take_scan_job(&handle);
         let wait_for =
             |scanner: &mut Scanner, phase: &str, predicate: &dyn Fn(&Tracked) -> bool| {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    scanner.drain(&handle);
-                    if predicate(&handle.shared().projects[&repository]) {
-                        break;
-                    }
-                    assert!(Instant::now() < deadline, "{phase}");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
+                wait_for_watch(scanner, &handle, &repository, phase, predicate);
             };
         scanner.dispatch(&handle);
         handle.scan_job(take_job(), scan::scan);
@@ -1854,6 +1879,188 @@ mod tests {
                     .as_ref()
                     .is_some_and(|change| change.worktrees.contains(&primary) && !change.topology)
         });
+    }
+
+    #[test]
+    fn native_watch_quota_failure_retries_on_the_fallback_poll_then_rearms() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("repo");
+        let source = root.join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        let file = source.join("main.rs");
+        std::fs::write(&file, "initial\n").unwrap();
+        // A small real tracked census exceeds the bounded native quota.
+        // src sorts first and keeps its watch throughout the fallback.
+        let mut excess = root.join("zz-excess");
+        for _ in 0..20 {
+            excess = excess.join("nested");
+        }
+        std::fs::create_dir_all(&excess).unwrap();
+        std::fs::write(excess.join("tracked.rs"), "excess\n").unwrap();
+        let git = |arguments: &[&str]| test_git(&root, arguments);
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "initial"]);
+        let repository = root.join(".git").canonicalize().unwrap();
+        let (handle, mut scanner) = test_scanner(
+            &repository,
+            git_watch::Monitor::start_with_limit(|| {}, 16).unwrap(),
+        );
+        scanner.dispatch(&handle);
+        handle.scan_job(take_scan_job(&handle), scan::scan);
+        let (id, primary, old_plan) = {
+            let shared = handle.shared();
+            let tracked = &shared.projects[&repository];
+            let local = tracked.local.as_ref().unwrap();
+            assert!(tracked.pending.is_none());
+            assert!(tracked.scan_error.is_none() && local.plan_error.is_none());
+            (
+                tracked.id,
+                local.worktrees[0].id,
+                local.plan.clone().unwrap(),
+            )
+        };
+        scanner.configure(&handle);
+        wait_for_watch(
+            &mut scanner,
+            &handle,
+            &repository,
+            "native quota failure ACK",
+            &|tracked| {
+                tracked
+                    .pending
+                    .as_ref()
+                    .is_some_and(|change| change.worktrees.contains(&primary))
+            },
+        );
+        {
+            let mut shared = handle.shared();
+            let tracked = shared.projects.get_mut(&repository).unwrap();
+            assert!(!tracked.covered);
+            assert!(tracked.scan_error.is_none());
+            let change = tracked.pending.as_ref().unwrap();
+            assert!(!change.topology && !change.membership && !change.references);
+            tracked.last_scan = Some(Instant::now() - SCAN_SPACING);
+        }
+        // Consume the initial ACK's status refresh normally. A pure native
+        // failure leaves no inventory retry and retains the configured Arc.
+        scanner.dispatch(&handle);
+        handle.scan_job(take_scan_job(&handle), scan::scan);
+        scanner.configure(&handle);
+        {
+            let shared = handle.shared();
+            let tracked = &shared.projects[&repository];
+            assert!(tracked.pending.is_none() && tracked.scan_error.is_none());
+            let local = tracked.local.as_ref().unwrap();
+            assert!(local.plan_error.is_none());
+            assert!(Arc::ptr_eq(local.plan.as_ref().unwrap(), &old_plan));
+            assert!(Arc::ptr_eq(&scanner.configured[&id], &old_plan));
+            assert_eq!(shared.poll_interval(tracked), IDLE_POLL);
+        }
+
+        // Shrink the real index to restore the same native quota. Do not drain
+        // these filesystem events: only the fallback deadline may ask for the
+        // retry, even when no topology or membership delta reaches HOST.
+        git(&["rm", "-qr", "zz-excess"]);
+        git(&["commit", "-qm", "release native watch budget"]);
+        scanner.dispatch(&handle);
+        assert!(handle.0.jobs.state.lock().unwrap().queue.is_empty());
+        {
+            let mut shared = handle.shared();
+            let interval = shared.poll_interval(&shared.projects[&repository]);
+            let tracked = shared.projects.get_mut(&repository).unwrap();
+            assert!(tracked.pending.is_none());
+            assert!(!tracked.covered && tracked.scan_error.is_none());
+            assert!(tracked.local.as_ref().unwrap().plan_error.is_none());
+            tracked.last_scan = Some(Instant::now() - interval - Duration::from_millis(1));
+        }
+        scanner.dispatch(&handle);
+        let job = take_scan_job(&handle);
+        assert!(job.change.topology && job.change.membership);
+        assert_eq!(job.change.worktrees, BTreeSet::from([primary]));
+        handle.scan_job(job, scan::scan);
+        {
+            let shared = handle.shared();
+            let tracked = &shared.projects[&repository];
+            let local = tracked.local.as_ref().unwrap();
+            assert!(tracked.scan_error.is_none() && local.plan_error.is_none());
+            assert!(!Arc::ptr_eq(local.plan.as_ref().unwrap(), &old_plan));
+            assert!(Arc::ptr_eq(&scanner.configured[&id], &old_plan));
+            assert!(!tracked.covered, "replanning still needs a native ACK");
+            assert_eq!(local.worktrees[0].dirty.as_ref().unwrap().paths, 0);
+        }
+        scanner.configure(&handle);
+        wait_for_watch(
+            &mut scanner,
+            &handle,
+            &repository,
+            "native coverage after fallback retry",
+            &|tracked| tracked.covered,
+        );
+        {
+            let shared = handle.shared();
+            let tracked = &shared.projects[&repository];
+            assert_eq!(shared.poll_interval(tracked), WATCHED_POLL);
+            assert!(Arc::ptr_eq(
+                &scanner.configured[&id],
+                tracked.local.as_ref().unwrap().plan.as_ref().unwrap()
+            ));
+        }
+
+        // Let the removal/index traffic settle before testing an ordinary edit.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut quiet_since = Instant::now();
+        loop {
+            scanner.drain(&handle);
+            let mut shared = handle.shared();
+            let tracked = shared.projects.get_mut(&repository).unwrap();
+            assert!(tracked.covered && tracked.scan_error.is_none());
+            if tracked.pending.take().is_some() {
+                quiet_since = Instant::now();
+            } else if quiet_since.elapsed() >= Duration::from_millis(100) {
+                break;
+            }
+            drop(shared);
+            assert!(Instant::now() < deadline, "native traffic did not settle");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::write(&file, "ordinary tracked edit after native recovery\n").unwrap();
+        wait_for_watch(
+            &mut scanner,
+            &handle,
+            &repository,
+            "ordinary native edit after quota recovery",
+            &|tracked| {
+                tracked.covered
+                    && tracked.pending.as_ref().is_some_and(|change| {
+                        change.worktrees == BTreeSet::from([primary])
+                            && !change.topology
+                            && !change.membership
+                            && !change.references
+                            && change.coverage.is_none()
+                            && change.error.is_none()
+                    })
+            },
+        );
+        handle
+            .shared()
+            .projects
+            .get_mut(&repository)
+            .unwrap()
+            .last_scan = Some(Instant::now() - SCAN_SPACING);
+        scanner.dispatch(&handle);
+        handle.scan_job(take_scan_job(&handle), scan::scan);
+        let shared = handle.shared();
+        let tracked = &shared.projects[&repository];
+        assert!(tracked.covered && tracked.scan_error.is_none());
+        assert_eq!(
+            tracked.local.as_ref().unwrap().worktrees[0]
+                .dirty
+                .as_ref()
+                .unwrap()
+                .paths,
+            1
+        );
     }
 
     #[test]
