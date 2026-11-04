@@ -90,6 +90,10 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn has_observed_chat(&self, card: CardId) -> bool {
+        self.observed_chats.contains_key(&card)
+    }
+
     pub(super) fn requested_transfer_card(&self, operation: uuid::Uuid) -> Option<CardId> {
         self.requested_transfers.get(&operation).copied()
     }
@@ -1094,6 +1098,16 @@ impl Cagents {
                 .map(|view| view.revision)
                 .unwrap_or(0);
             for change in views::changes(&previous, &panes) {
+                // A Remove is every window's instruction to close the pane. A
+                // pane still open here has only lost its local placement.
+                if let Change::Remove { id } = &change
+                    && self
+                        .card_state(*id)
+                        .is_some_and(|card| card.existence.is_open())
+                {
+                    tracing::warn!(card = %id, ?scope, "not retiring a shared pane that is still open");
+                    continue;
+                }
                 if let Change::Insert { pane, .. } = &change
                     && matches!(pane.kind, CardKind::Chat(_))
                 {
@@ -1648,11 +1662,7 @@ impl Cagents {
                 && self
                     .card_state(id)
                     .is_some_and(|card| matches!(&card.kind, CardKind::Chat(_)))
-                && !self
-                    .workspace_model
-                    .views
-                    .iter()
-                    .any(|view| view.retired.contains(&id))
+                && !self.pane_retired(id, view)
             {
                 continue;
             }
@@ -1688,7 +1698,20 @@ impl Cagents {
                 }
                 continue;
             }
-            self.detach_shared_pane(id);
+            if self.absence_closes_pane(id, view) {
+                self.detach_shared_pane(id);
+                continue;
+            }
+            // Nobody closed this pane: a snapshot only says what the registry
+            // holds, and whole-model updates re-project every view whatever
+            // changed. Anything still running here stays where it is.
+            if !self.shared_views.retained.contains(&id) {
+                tracing::warn!(card = %id, scope = ?view.scope, "keeping a pane the shared view has neither listed nor retired");
+                self.status = Some(TransientNotice::warning(
+                    "A pane is not in the shared workspace, so it is kept only in this window.",
+                ));
+            }
+            self.retain_local_pane(id);
         }
         current.extend(retained_upgrades);
         for shared in &view.panes {
@@ -1982,6 +2005,29 @@ impl Cagents {
             card.residency = Residency::Hot;
         }
         task
+    }
+
+    /// `view` carries this window's pending edits over the canonical one, so a
+    /// local close counts here as well as a peer's.
+    fn pane_retired(&self, id: CardId, view: &View) -> bool {
+        view.retired.contains(&id)
+            || self
+                .workspace_model
+                .views
+                .iter()
+                .any(|view| view.retired.contains(&id))
+    }
+
+    /// Whether a pane missing from its shared view should close here. Only a
+    /// recorded removal says someone closed it. The automatic panes below have
+    /// no actor and no work; a view that gained content simply replaces them.
+    fn absence_closes_pane(&self, id: CardId, view: &View) -> bool {
+        self.pane_retired(id, view)
+            || self.chat_is_unused_default(id)
+            || self.shared_views.defaults.contains_key(&id)
+            || !self
+                .card_state(id)
+                .is_some_and(|card| card.existence.is_open())
     }
 
     /// Passive removal detaches surfaces; it never calls a host close request.
@@ -4296,7 +4342,9 @@ mod tests {
             assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
         }
         for app in [&mut first, &mut second] {
-            app.workspace_model.views[0].panes.clear();
+            app.workspace_model.views[0]
+                .apply(&Change::Remove { id: pane.id })
+                .unwrap();
             drop(app.reconcile_shared_views());
             assert!(!app.card_state(pane.id).unwrap().existence.is_open());
         }
@@ -4326,7 +4374,7 @@ mod tests {
         assert_eq!(app.durable.focused, Some(second.id));
         crate::persistence::validate_workspace(&app.persistent_workspace()).unwrap();
 
-        view.panes = vec![first.clone()];
+        view.apply(&Change::Remove { id: second.id }).unwrap();
         app.workspace_model.views = vec![view];
         drop(app.reconcile_shared_views());
         assert!(!app.card_state(second.id).unwrap().existence.is_open());
@@ -4415,6 +4463,34 @@ mod tests {
     }
 
     #[test]
+    fn an_open_pane_losing_its_local_placement_does_not_publish_a_removal() {
+        let (mut app, a, _, pane) = fixture();
+        app.workspace_model.views = vec![View {
+            panes: vec![pane.clone()],
+            revision: 1,
+            ..View::empty(a)
+        }];
+        drop(app.reconcile_shared_views());
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        let (sender, published) = async_channel::unbounded();
+        app.workspace_model_tx = sender;
+        for channel in &mut Arc::make_mut(&mut app.durable).channels {
+            channel.cards.retain(|id| *id != pane.id);
+        }
+        app.publish_view_changes();
+        assert!(
+            !std::iter::from_fn(|| published.try_recv().ok()).any(|edit| matches!(
+                edit,
+                ModelEdit::ChangeView {
+                    change: Change::Remove { .. },
+                    ..
+                }
+            )),
+            "only a close may tell every window to close the pane"
+        );
+    }
+
+    #[test]
     fn empty_shared_views_keep_unused_defaults_local_until_used() {
         let (mut app, a, _, _) = fixture();
         app.active_workspace = Some(PathBuf::from("/repo"));
@@ -4483,7 +4559,11 @@ mod tests {
             app.card_worktree(app.card_state(first.id).unwrap()),
             Some(path.as_path())
         );
-        app.workspace_model.views[0].panes.clear();
+        for id in [first.id, second.id] {
+            app.workspace_model.views[0]
+                .apply(&Change::Remove { id })
+                .unwrap();
+        }
         drop(app.reconcile_shared_views());
         assert!(!app.card_state(first.id).unwrap().existence.is_open());
     }
@@ -4674,6 +4754,7 @@ mod tests {
         app.shared_views.pending.clear();
         let mut view = View::empty(channel);
         view.panes.push(retained);
+        view.retired.push(closed);
         app.workspace_model.views = vec![view];
         drop(app.reconcile_shared_views());
         assert!(!app.card_state(closed).unwrap().existence.is_open());
@@ -4718,7 +4799,9 @@ mod tests {
         assert!(app.sidebar_state.has_card_update(card));
         assert!(!app.notification_ui.acknowledged_for_test(id));
         app.shared_views.pending.clear();
-        app.workspace_model.views = vec![View::empty(channel)];
+        let mut view = View::empty(channel);
+        view.retired.push(card);
+        app.workspace_model.views = vec![view];
         drop(app.reconcile_shared_views());
         assert!(!app.card_state(card).unwrap().existence.is_open());
         assert!(!app.sidebar_state.has_card_update(card));

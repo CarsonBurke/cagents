@@ -6837,6 +6837,19 @@ impl Cagents {
                 .is_some_and(|images| !images.is_empty())
     }
 
+    /// A live or starting conversation no authoritative view has ever listed.
+    pub(super) fn chat_runs_unobserved_by_peers(&self, card: CardId) -> bool {
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
+        };
+        !self.shared_views.has_observed_chat(card)
+            && (self.chat_start_pending(card)
+                || runtime.is_some_and(|runtime| {
+                    runtime.handle().is_some() && !runtime.disconnected && !runtime.snapshot.exited
+                }))
+    }
+
     pub(super) fn can_rekey_shared_terminal_draft(&self, alias: CardId, canonical: CardId) -> bool {
         !self.chat_ui.phases.contains_key(&alias)
             && !self.chat_ui.parked.contains_key(&alias)
@@ -28551,3 +28564,7 @@ mod tests {
 #[cfg(test)]
 #[path = "chat_ui/first_start_checkpoint_tests.rs"]
 mod first_start_checkpoint_tests;
+
+#[cfg(test)]
+#[path = "chat_ui/absence_tests.rs"]
+mod absence_tests;

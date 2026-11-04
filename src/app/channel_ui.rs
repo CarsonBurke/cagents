@@ -562,6 +562,25 @@ impl Cagents {
             .collect()
     }
 
+    /// An automatic composer nobody used does not keep a channel alive; any
+    /// other open content does, whether or not the registry has heard of it.
+    pub(super) fn channel_holds_unpublished_work(&self, id: ChannelId) -> bool {
+        self.durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .is_some_and(|channel| {
+                channel.cards.iter().any(|&card| {
+                    self.is_channel_content(card)
+                        && !self.chat_is_unused_default(card)
+                        && !self.shared_views.defaults.contains_key(&card)
+                        && self
+                            .card_state(card)
+                            .is_some_and(|state| state.existence.is_open())
+                })
+            })
+    }
+
     pub(super) fn channel_has_open_card(&self, id: ChannelId) -> bool {
         self.durable
             .channels
@@ -837,8 +856,11 @@ impl Cagents {
                 freed_utility = true;
                 continue;
             }
+            // Whoever deleted the channel could not have meant a conversation
+            // that never reached its shared view.
             if passive
                 && (self.shared_chat_has_local_work(card)
+                    || self.chat_runs_unobserved_by_peers(card)
                     || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving()))
             {
                 self.retain_local_pane(card);
