@@ -1033,11 +1033,13 @@ impl Cagents {
                 // destination identifies the workspace being reopened in;
                 // channel membership is restored separately on insertion, into
                 // the channel entered here.
+                let mut previous = (None, None);
                 let (owner, scope, revived) = match saved_scope {
                     Some(WorkspaceDestination::Worktree(_) | WorkspaceDestination::Folder(_)) => {
                         (self.active_workspace.clone(), Task::none(), None)
                     }
                     Some(WorkspaceDestination::Channel(id)) => {
+                        previous = (self.durable.active_channel, self.active_workspace.clone());
                         let home = self.closed_channel_home(id);
                         let revived = match home {
                             Some(channel_ui::ClosedCardHome::Retired(retired)) => Some(retired),
@@ -1058,8 +1060,9 @@ impl Cagents {
                 let reopened = self.duplicate_pane_in_scope(card, owner);
                 // A pane that cannot be cloned, or that opens outside the
                 // window, leaves a revived channel with nothing in it.
-                let abandoned =
-                    revived.map_or_else(Task::none, |retired| self.abandon_empty_revival(retired));
+                let abandoned = revived.map_or_else(Task::none, |retired| {
+                    self.abandon_empty_revival(retired, previous)
+                });
                 Task::batch([scope, reopened, abandoned])
             }
             Command::FocusPane1

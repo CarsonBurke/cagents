@@ -131,6 +131,16 @@ impl Fixture {
     /// The registry answers this window's request with the model after it
     /// decided: without the channel if it retired it, unchanged if it kept it.
     fn answer_retirement(&mut self, retired: bool) {
+        let sequence = self
+            .app
+            .workspace_model
+            .sequence
+            .max(self.app.shared_views.snapshot_sequence)
+            + 1;
+        self.answer_retirement_at(retired, sequence);
+    }
+
+    fn answer_retirement_at(&mut self, retired: bool, sequence: u64) {
         let channel = self.channel;
         let mut model = self.app.workspace_model.clone();
         if retired {
@@ -139,7 +149,7 @@ impl Fixture {
                 .views
                 .retain(|view| view.scope != Scope::Channel(channel));
         }
-        model.sequence = model.sequence.max(self.app.shared_views.snapshot_sequence) + 1;
+        model.sequence = sequence;
         drop(self.app.apply_workspace_model_update(
             super::super::workspace_model_sync::ModelUpdate::RetirementAnswered { channel, model },
         ));
@@ -656,9 +666,14 @@ fn a_pane_reopened_outside_the_window_does_not_leave_an_empty_channel() {
         Some(WorkspaceDestination::Channel(fixture.channel)),
     ));
 
+    let path = fixture.directory.path().to_path_buf();
     fixture.reopen_pane();
 
     assert_eq!(fixture.app.recently_closed.len(), 1);
+    assert_eq!(
+        fixture.app.active_workspace.as_deref(),
+        Some(path.as_path())
+    );
     assert!(
         fixture
             .app
@@ -674,4 +689,38 @@ fn a_pane_reopened_outside_the_window_does_not_leave_an_empty_channel() {
     drop(fixture.app.resume_saved_conversation(saved));
     assert_eq!(fixture.active_channel().title, "Investigation");
     assert_eq!(fixture.active_channel().cards, vec![fixture.resumed().id]);
+}
+
+/// Another window's edit can reach this one before the registry's answer,
+/// so the answer's model is older than the channels the window folded since.
+/// The answer still settles the retirement, and the card reopens into a
+/// revival rather than into the channel the registry already deleted.
+#[test]
+fn a_retirement_answered_behind_newer_metadata_still_retires_the_channel() {
+    let mut fixture = fixture();
+    fixture.close_card();
+    let _published = fixture.send_retirement();
+    let answered = fixture
+        .app
+        .workspace_model
+        .sequence
+        .max(fixture.app.shared_views.snapshot_sequence)
+        + 1;
+    fixture.app.workspace_model.sequence = answered + 1;
+
+    fixture.answer_retirement_at(true, answered);
+
+    assert!(fixture.app.durable.channels.is_empty());
+    assert!(
+        fixture
+            .app
+            .workspace_model
+            .channel(fixture.channel)
+            .is_none()
+    );
+    fixture.reopen_pane();
+    let revived = fixture.active_channel().clone();
+    assert_ne!(revived.id, fixture.channel);
+    assert_eq!(revived.title, "Investigation");
+    assert_eq!(revived.cards, vec![fixture.resumed().id]);
 }

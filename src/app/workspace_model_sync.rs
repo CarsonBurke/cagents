@@ -540,12 +540,23 @@ impl Cagents {
         update: ModelUpdate,
     ) -> (Task<Message>, bool) {
         if let ModelUpdate::RetirementAnswered { channel, model } = update {
-            // Applied as the snapshot it carries, which retires the channel if
-            // the registry did, while the retirement still reads as this
-            // window's own.
-            let effect = self.apply_workspace_model_update_effect(ModelUpdate::Read(model));
+            // The registry never echoes this window's own retirement, so the
+            // answer's model is the evidence of it: a channel absent there
+            // retired, even when metadata folded since keeps an older channel
+            // list. It retires here while the retirement still reads as this
+            // window's own, which keeps its cards reopenable.
+            let retired =
+                model.channel(channel).is_none() && model.identity == self.workspace_model.identity;
+            let (mut task, applied) =
+                self.apply_workspace_model_update_effect(ModelUpdate::Read(model));
+            if retired {
+                self.workspace_model
+                    .channels
+                    .retain(|shared| shared.id != channel);
+                task = Task::batch([task, self.retire_peer_channel(channel)]);
+            }
             self.channel_work.retiring.remove(&channel);
-            return effect;
+            return (task, applied || retired);
         }
         if let ModelUpdate::Read(model) = &update
             && model.identity == self.workspace_model.identity
@@ -624,8 +635,8 @@ impl Cagents {
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
-            ModelUpdate::RetirementAnswered { model, .. } => {
-                self.apply_workspace_model_update_inner(ModelUpdate::Read(model))
+            ModelUpdate::RetirementAnswered { .. } => {
+                unreachable!("a retirement answer is applied as the snapshot it carries")
             }
             ModelUpdate::Read(model) => {
                 if !self.install_workspace_model_snapshot(model) {

@@ -717,7 +717,11 @@ impl Cagents {
 
     /// Takes back a revival that received no card, so the channel is not left
     /// empty where nothing would retire it, and stays revivable.
-    pub(super) fn abandon_empty_revival(&mut self, retired: ChannelId) -> Task<Message> {
+    pub(super) fn abandon_empty_revival(
+        &mut self,
+        retired: ChannelId,
+        previous: (Option<ChannelId>, Option<PathBuf>),
+    ) -> Task<Message> {
         let Some(&revived) = self.channel_ui.revived.get(&retired) else {
             return Task::none();
         };
@@ -739,8 +743,27 @@ impl Cagents {
             title_source: channel.title_source,
         };
         self.channel_ui.revived.remove(&retired);
-        self.channel_ui.emptied.push(snapshot);
-        self.retire_channel(revived, false)
+        self.remember_emptied(snapshot);
+        let retired = self.retire_channel(revived, false);
+        // Back where reopening started, not wherever retiring would land.
+        let returned = match previous {
+            (Some(channel), _) if self.durable.channels.iter().any(|row| row.id == channel) => {
+                self.select_channel(channel)
+            }
+            (_, Some(path)) => self.select_worktree(path, false),
+            _ => Task::none(),
+        };
+        Task::batch([retired, returned])
+    }
+
+    /// Keeps a snapshot of a channel this window emptied, newest last.
+    fn remember_emptied(&mut self, snapshot: EmptiedChannel) {
+        let state = &mut self.channel_ui;
+        state.emptied.retain(|emptied| emptied.id != snapshot.id);
+        state.emptied.push(snapshot);
+        if state.emptied.len() > EMPTIED_CHANNELS {
+            state.emptied.remove(0);
+        }
     }
 
     /// Recreates a channel that retired when its last card closed, under its
@@ -779,12 +802,7 @@ impl Cagents {
                 title: channel.title.clone(),
                 title_source: channel.title_source,
             };
-            let state = &mut self.channel_ui;
-            state.emptied.retain(|emptied| emptied.id != id);
-            state.emptied.push(snapshot);
-            if state.emptied.len() > EMPTIED_CHANNELS {
-                state.emptied.remove(0);
-            }
+            self.remember_emptied(snapshot);
         }
         let captured = emptied.into_iter().filter_map(|id| {
             let channel = self.workspace_model.channel(id)?;
@@ -1104,7 +1122,12 @@ impl Cagents {
         self.channel_ui.deleted.insert(id);
         // Only this window's own retirement of an emptied channel is undone by
         // reopening one of its cards; a deletion anywhere is final.
-        if self.channel_work.retiring.remove(&id).is_none() {
+        let own_retirement = self
+            .channel_work
+            .retiring
+            .remove(&id)
+            .is_some_and(|(_, sent)| sent.elapsed() < super::channel_work::RETIREMENT_ANSWERED);
+        if !own_retirement {
             self.channel_ui.emptied.retain(|emptied| emptied.id != id);
         }
         let mut freed_utility = false;
