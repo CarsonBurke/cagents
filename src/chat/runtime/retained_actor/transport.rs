@@ -279,6 +279,18 @@ impl chat::protocol::LaunchCleanup for StartupOwner {
     }
 }
 #[cfg(test)]
+fn fixture_preserve_and_join(actor: &RemoteActor) {
+    actor.preserve().unwrap();
+    // Model the old daemon's exit before rotating its lease. Preserve stops
+    // the observer asynchronously; its last authentication request can still
+    // briefly probe the lease after it drops. Join only that fixture observer,
+    // retaining the actual helper/provider and the old proxy's epoch checks.
+    let worker = actor.0.worker.lock().unwrap().take();
+    if let Some(worker) = worker {
+        worker.join().expect("preserved fixture observer panicked");
+    }
+}
+#[cfg(test)]
 pub(super) fn fixture_source() -> chat::Session {
     let id = crate::model::TerminalId::new();
     chat::Session {
@@ -783,6 +795,9 @@ impl RemoteActor {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Exec resets the process-local saved limit. Restore it before the
+        // helper starts, so its provider and tools inherit the caller's limit.
+        crate::host::descriptor_limit::inherit(&mut command);
         unsafe {
             command.pre_exec(move || {
                 crate::daemon::seal_inherited_descriptors()?;
@@ -1116,6 +1131,13 @@ impl RemoteActor {
                     && resident.close.completed))
                 || resident.changed < state.changed
                 || resident.generation < state.generation
+                // Installation is acknowledged independently of observer
+                // revisions. A state RPC issued before commit can arrive
+                // after its ACK with equal changed/generation values.
+                || (state.installed && !resident.installed)
+                || (matches!(state.native_continuity,
+                    chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL })
+                    && resident.native_continuity != state.native_continuity)
             {
                 return false;
             }
@@ -1184,7 +1206,14 @@ impl RemoteActor {
             .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(snapshot));
         self.0.stop.store(true, Ordering::Release);
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(resident) = resident {
+        if let Some(mut resident) = resident {
+            // A close response may also have been issued before installation
+            // was acknowledged. Keep that actor-scoped fact monotonic while
+            // retaining the exact final snapshot/receipt above unchanged.
+            if state.installed {
+                resident.installed = true;
+                resident.native_continuity = state.native_continuity.clone();
+            }
             *state = Arc::new(resident);
         }
         let state = Arc::make_mut(&mut state);
@@ -1622,8 +1651,11 @@ impl RemoteActor {
     }
     pub fn commit_installation(&self) -> Result<(), String> {
         self.call::<()>("commit", Value::Null)?;
-        self.0.installed.store(true, Ordering::Release);
+        // Use the same publication fence as the observer. No local revision
+        // is invented: the next authentic helper publication owns its clocks.
         {
+            let _publication = self.0.publication.lock().unwrap_or_else(|p| p.into_inner());
+            self.0.installed.store(true, Ordering::Release);
             let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
             let state = Arc::make_mut(&mut state);
             state.installed = true;
@@ -2924,7 +2956,9 @@ impl Server {
             &Ok::<_, String>(self.attached()?),
             Duration::from_secs(30),
         )?;
+        let mut orphans = OrphanSweep::new();
         loop {
+            orphans.run_if_due();
             self.finish_inputs();
             if !self.installed && disconnected(&startup)? {
                 self.actor.close()?;
@@ -2960,6 +2994,7 @@ impl Server {
                             1,
                             crate::descriptor_frame::FrameByteOrder::LittleEndian,
                         );
+                        orphans.run();
                         continue;
                     }
                     let mut finished = false;
@@ -2976,6 +3011,7 @@ impl Server {
                     if finished {
                         break;
                     }
+                    orphans.run();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(20))
@@ -3087,6 +3123,44 @@ fn disconnected(control: &UnixStream) -> Result<bool, String> {
     }
     Ok(event.revents & (libc::POLLHUP | libc::POLLERR) != 0)
 }
+/// This actor is a subreaper, so every orphaned tool descendant of its
+/// provider becomes its child. Reap the exited ones while it serves; the
+/// provider and scope requests spawn through `adopted_orphans`, which reserves
+/// their statuses for their owners. Nothing here signals a live child.
+///
+/// The helper has no log sink, so a sweep failure is retried on the next tick
+/// rather than reported here. Its durable symptom is the per-holder zombie
+/// count that `cagents diagnostics` observes from outside the process.
+struct OrphanSweep {
+    due: Instant,
+}
+impl OrphanSweep {
+    const INTERVAL: Duration = Duration::from_millis(250);
+    /// Bounds one pass so a large backlog cannot stall the serve loop.
+    const LIMIT: usize = 4096;
+
+    fn new() -> Self {
+        Self {
+            due: Instant::now(),
+        }
+    }
+
+    fn run_if_due(&mut self) {
+        if Instant::now() >= self.due {
+            self.run();
+        }
+    }
+
+    fn run(&mut self) {
+        self.due = Instant::now() + Self::INTERVAL;
+        if let Ok(sweep) = crate::daemon::adopted_orphans::reap_exited(Self::LIMIT)
+            && sweep.truncated
+        {
+            // Continue the backlog on the next serve iteration.
+            self.due = Instant::now();
+        }
+    }
+}
 /// Only after the actor's ChildGuard has joined: no competing provider reaper
 /// remains. A child PID cannot be recycled until this sole reaper consumes it.
 fn reap_orphans() -> Result<(), String> {
@@ -3169,6 +3243,8 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
+        // Every child spawned from here on must register with the sweep.
+        crate::daemon::adopted_orphans::become_sweeper();
         let result = (|| {
             crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
             let server = Server::start_after_scope_enrollment(
@@ -3419,6 +3495,155 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         serving.parent.take();
         serving.worker.take().unwrap().join().unwrap().unwrap();
         assert!(!socket.exists() && !record_path.exists());
+    }
+
+    #[test]
+    fn serving_actor_reaps_exited_adopted_orphans_without_touching_live_ones() {
+        const CHILD: &str = "CAGENTS_RETAINED_ORPHAN_SWEEP_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let test = thread::current().name().unwrap().to_owned();
+            let output = ChildCommand::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", root.path())
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("HOME", root.path().join("home"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // This isolated process stands in for the helper: a subreaper that
+        // adopts every orphan its provider's tools leave behind.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let state = |pid: i32| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat[stat.rfind(')')? + 2..].chars().next()
+        };
+        let zombies = || {
+            crate::daemon::owned_children::direct_children()
+                .unwrap()
+                .into_iter()
+                .filter(|pid| state(*pid) == Some('Z'))
+                .count()
+        };
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let cwd = root.path().join("cwd");
+        let home = root.path().join("claude");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let orphaned = root.path().join("orphaned");
+        let mut source = fixture_source();
+        source.launch.recipe.working_directory = cwd.clone();
+        source.launch.recipe.environment = BTreeMap::from([
+            ("HOME".into(), root.path().to_string_lossy().into_owned()),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                home.to_string_lossy().into_owned(),
+            ),
+        ]);
+        source.proof.as_mut().unwrap().boot_id = crate::daemon::read_boot_id().unwrap();
+        let proof = source.proof.clone().unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let (control, parent) = UnixStream::pair().unwrap();
+        let (spec, adapter) = chat::protocol::create(&source.launch).unwrap();
+        let session_id = spec
+            .arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--session-id="))
+            .unwrap()
+            .to_owned();
+        // After initializing, the provider's tools orphan 600 grandchildren in
+        // bursts that exit together after their parents, so their SIGCHLDs
+        // coalesce. One more orphaned daemon shares the provider's stdin, so
+        // both stay alive until the actor, or this process, closes it.
+        let startup = Startup {
+            protocol: PROTOCOL,
+            source: source.clone(),
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                r#"IFS= read -r frame || exit 2
+id=${frame#*\"request_id\":\"}
+id=${id%%\"*}
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"current_permission_mode":"default"}}}\n' "$id"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$1"
+exec 3<&0
+for burst in 1 2 3 4 5 6; do
+  i=0
+  while [ $i -lt 100 ]; do (/bin/sleep 0.2 &); i=$((i + 1)); done
+done
+(/bin/cat <&3 >/dev/null & echo $! > "$2")
+while IFS= read -r frame; do :; done
+"#
+                .into(),
+                "orphan-fixture".into(),
+                session_id,
+                orphaned.to_string_lossy().into_owned(),
+            ],
+            prepared_identity: adapter.prepared_launch_identity().unwrap(),
+            environment: source.launch.recipe.environment.clone(),
+            working_directory: cwd.clone(),
+            directory_fd: None,
+            directory_identity: None,
+            mailbox_recognition: None,
+            provider_directory_observed: false,
+            recovery_environment: BTreeMap::new(),
+        };
+        let server = Server::start_after_scope_enrollment(startup, &control, || Ok(())).unwrap();
+        let provider = server.identity.record.root.clone();
+        let mut parent = Some(parent);
+        let worker = thread::spawn(move || server.serve(control));
+        let attached: Result<Attached, String> =
+            receive(parent.as_ref().unwrap(), TIMEOUT).unwrap();
+        attached.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let live: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&orphaned)
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "provider tools did not finish");
+            thread::sleep(Duration::from_millis(10));
+        };
+        // Every exited orphan is reaped within a bound while both the actor
+        // and its provider keep running.
+        let bound = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = zombies();
+            if remaining == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < bound,
+                "{remaining} exited adopted orphans were not reaped while serving"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(provider.is_current(), "the provider must keep running");
+        assert!(!worker.is_finished(), "the actor must keep serving");
+        // The live adopted daemon is still this actor's unsignalled child.
+        assert_eq!(state(live), Some('S'));
+        assert!(
+            crate::daemon::owned_children::direct_children()
+                .unwrap()
+                .contains(&live)
+        );
+        // Startup EOF retires the actor through its existing cleanup.
+        parent.take();
+        worker.join().unwrap().unwrap();
+        assert!(!provider.is_current(), "original provider must be reaped");
     }
 
     thread_local! {
@@ -4097,6 +4322,7 @@ exec /bin/sleep 60
             .unwrap();
         let mut spec = ProcessSpec::from(&source.launch.recipe);
         spec.execution = Some(context.clone());
+        let limit = crate::host::descriptor_limit::tests::raise_with_fixture_limit();
         // This execs the real retained-helper entry and its real provider
         // spawning path. Omitting the entry seal leaks both inherited FDs.
         let actor = RemoteActor::spawn(spec, source, prepared, BTreeMap::new(), |_| {}).unwrap();
@@ -4112,6 +4338,12 @@ exec /bin/sleep 60
         actor.commit_installation().unwrap();
         let provider = actor.state().provider_process.clone().unwrap();
         assert!(provider.is_current());
+        crate::host::descriptor_limit::tests::assert_process_limit(provider.pid as u32, &limit);
+        crate::host::descriptor_limit::tests::assert_process_limit(
+            actor.native_holder_record().holder.pid as u32,
+            &limit,
+        );
+        crate::host::descriptor_limit::tests::assert_daemon_limit_remains_raised(&limit);
         let inherited = std::fs::read_dir(format!("/proc/{}/fd", provider.pid))
             .unwrap()
             .filter_map(|entry| {
@@ -5057,6 +5289,65 @@ exec /bin/sleep 60
         );
     }
     #[test]
+    fn acknowledged_install_cannot_be_reversed_by_an_inflight_precommit_observation() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("install.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut actor = RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket = socket;
+        actor.0.installed.store(false, Ordering::Release);
+        let before = {
+            let mut state = actor.0.state.lock().unwrap();
+            let state = Arc::make_mut(&mut state);
+            state.installed = false;
+            state.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            state.clone()
+        };
+        let proof = actor.0.proof.clone();
+        let epoch = actor.0.epoch;
+        let peer = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&control, TIMEOUT).unwrap();
+            assert_eq!(request.method, "commit");
+            assert_eq!(request.proof, proof);
+            assert_eq!(request.epoch, Some(epoch));
+            send(&control, &Ok::<Value, String>(Value::Null), TIMEOUT).unwrap();
+        });
+        actor.commit_installation().unwrap();
+        peer.join().unwrap();
+        // This is the exact precommit response an already-issued observer
+        // RPC can return. Equal revisions cannot revoke a successful ACK.
+        assert!(!actor.publish_resident(before.clone()));
+        let installed = actor.state();
+        assert!(installed.installed);
+        assert_eq!(installed.changed, before.changed);
+        assert_eq!(installed.generation, before.generation);
+        assert_eq!(installed.confirmed_session, before.confirmed_session);
+        assert_eq!(
+            installed.native_continuity,
+            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
+        );
+        let mut contradictory = installed.as_ref().clone();
+        contradictory.changed += 1;
+        contradictory.generation += 1;
+        contradictory.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        assert!(!actor.publish_resident(contradictory));
+        let mut next = installed.as_ref().clone();
+        next.changed += 1;
+        next.generation += 1;
+        assert!(actor.publish_resident(next));
+        assert_eq!(actor.state().generation, before.generation + 1);
+        let final_snapshot = Snapshot {
+            exited: true,
+            ..Default::default()
+        };
+        actor.publish_closed_inner(final_snapshot.clone(), Some(before));
+        assert!(actor.state().completed);
+        assert!(actor.state().installed);
+        assert_eq!(actor.state().native_continuity, installed.native_continuity);
+        assert_eq!(actor.snapshot(None), Some(final_snapshot));
+    }
+    #[test]
     fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_response() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let socket = root.path().join("refresh.sock");
@@ -5362,7 +5653,7 @@ done"#;
         let orphaned: Vec<InputReceipt> = actor.call("acknowledged_inputs", Value::Null).unwrap();
         assert_eq!(orphaned.len(), 1);
         assert_eq!(orphaned[0].identity, identity);
-        actor.preserve().unwrap();
+        fixture_preserve_and_join(actor);
         let record = actor.identity().record;
         drop(_lease);
         let mut proof = source.proof.clone().unwrap();

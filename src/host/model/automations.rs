@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use super::{Registry, automation_audit};
+use super::{Registry, automation_audit, automation_notifications};
 use crate::automations::LifecycleCause;
 use crate::automations::{
     Automation, Definition, Firing, FiringState, HistoryCursor, HistoryPage, MAX_HISTORY_PAGE,
@@ -70,6 +70,7 @@ pub(super) fn close_project(
         .map_err(|e| e.to_string())?;
     for record in records {
         let mut automation: Automation = decode(&record)?;
+        let was_enabled = automation.enabled;
         automation.revision = automation
             .revision
             .checked_add(1)
@@ -82,6 +83,9 @@ pub(super) fn close_project(
         write_revision(tx, &automation)?;
         write_automation(tx, &automation)?;
         automation_audit::record(tx, &automation, LifecycleCause::ProjectClosed, None)?;
+        if was_enabled {
+            automation_notifications::queue(tx, &automation, LifecycleCause::ProjectClosed, None)?;
+        }
     }
     Ok(())
 }
@@ -307,6 +311,12 @@ impl Registry {
                 LifecycleCause::StartPaused,
                 Some(firing.id),
             )?;
+            automation_notifications::queue(
+                &tx,
+                &automation,
+                LifecycleCause::StartPaused,
+                Some(firing.id),
+            )?;
         }
         tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
             .map_err(|e| e.to_string())?;
@@ -432,6 +442,12 @@ impl Registry {
         write_firing(&tx, &firing)?;
         write_automation(&tx, &automation)?;
         automation_audit::record(
+            &tx,
+            &automation,
+            LifecycleCause::PrecheckInterrupted,
+            Some(firing.id),
+        )?;
+        automation_notifications::queue(
             &tx,
             &automation,
             LifecycleCause::PrecheckInterrupted,
@@ -1370,6 +1386,12 @@ impl Registry {
                 LifecycleCause::ProjectUnavailable,
                 Some(firing.id),
             )?;
+            automation_notifications::queue(
+                &tx,
+                &automation,
+                LifecycleCause::ProjectUnavailable,
+                Some(firing.id),
+            )?;
         }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(Claimed {
@@ -1418,6 +1440,9 @@ impl Registry {
                 LifecycleCause::PrecheckRecovered,
                 Some(firing.id),
             )?;
+            // The exact cleanup receipt settles only this precheck's stale
+            // pending attention, never a newer pause or another firing.
+            automation_notifications::suppress_precheck(&tx, automation.id, firing.id)?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         }
@@ -1462,6 +1487,12 @@ impl Registry {
         write_automation(&tx, &automation)?;
         if firing.state == FiringState::Interrupted {
             automation_audit::record(
+                &tx,
+                &automation,
+                LifecycleCause::PrecheckPaused,
+                Some(firing.id),
+            )?;
+            automation_notifications::queue(
                 &tx,
                 &automation,
                 LifecycleCause::PrecheckPaused,
@@ -3591,7 +3622,8 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE channel_work_placement_epochs;
+                "DROP TABLE automation_notifications;
+                 DROP TABLE channel_work_placement_epochs;
                 DROP TABLE channel_work_placement_clock;
                 DROP TABLE channel_work_operations;
                 DROP TABLE channel_work_entries;
@@ -3729,5 +3761,557 @@ mod tests {
         let current = registry.automation(created.id).unwrap();
         assert!(!current.enabled && current.blocked.is_none() && current.active_firing.is_none());
         assert_eq!(recovered.revision, current.revision);
+    }
+
+    #[test]
+    fn closing_more_than_1024_enabled_automations_commits_pauses_and_no_run_attention() {
+        use std::collections::BTreeSet;
+        let (mut registry, directory, definition) = fixture();
+        let disabled = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let mut enabled_ids = BTreeSet::new();
+        for index in 0..1025 {
+            let mut next = definition.clone();
+            next.name = format!("Paused fixture {index}");
+            let created = registry
+                .create_automation(next, 100, test_identity())
+                .unwrap();
+            registry
+                .set_automation_enabled(
+                    created.id,
+                    created.revision,
+                    Some(Occurrence {
+                        due_ms: 60_000,
+                        local: "next fixture minute".into(),
+                    }),
+                    true,
+                    200,
+                )
+                .unwrap();
+            enabled_ids.insert(created.id);
+        }
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty(),
+            "creation and explicit enable are not system pause attention"
+        );
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: definition.agent.target.repository.clone(),
+            })
+            .unwrap();
+        assert!(registry.model().unwrap().projects.is_empty());
+        let still_enabled: u64 = registry
+            .db
+            .query_row(
+                "SELECT count(*) FROM automations WHERE enabled<>0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_enabled, 0,
+            "notification capacity cannot undo a safety pause"
+        );
+        let queued = registry
+            .db
+            .prepare("SELECT automation FROM automation_notifications")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|row| Uuid::parse_str(&row.unwrap()).unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(queued, enabled_ids);
+        assert!(
+            !queued.contains(&disabled.id),
+            "already disabled definitions stay quiet"
+        );
+        assert!(
+            registry
+                .automation_history(None, None, 100)
+                .unwrap()
+                .firings
+                .is_empty()
+        );
+        let page = registry.pending_automation_notifications(100).unwrap();
+        assert_eq!(page.len(), 100, "delivery remains a bounded read");
+        let event = page[0].event().clone();
+        assert_eq!(event.cause, LifecycleCause::ProjectClosed);
+        assert!(event.firing.is_none() && !event.enabled);
+        assert_eq!(
+            registry
+                .automation_audit(event.automation, None, 1)
+                .unwrap()
+                .events[0],
+            event,
+            "attention identity comes from the exact committed lifecycle receipt"
+        );
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(
+            registry.pending_automation_notifications(100).unwrap()[0].event(),
+            &event
+        );
+        assert!(!registry.automation(event.automation).unwrap().enabled);
+        assert!(
+            registry
+                .automation_history(None, None, 100)
+                .unwrap()
+                .firings
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn precheck_block_and_exact_cleanup_attention_roll_back_with_their_lifecycle_writes() {
+        use crate::host::automations::precheck::Outcome;
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.precheck = Some(crate::automations::Precheck {
+            command: "true".into(),
+            timeout_seconds: 1,
+        });
+        let created = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                created.id,
+                created.execution_revision,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        assert!(claim.accepted.is_none() && claim.firing.run.is_none());
+        let owner = registry.automation(created.id).unwrap();
+        let audit = registry.automation_audit(created.id, None, 100).unwrap();
+        registry.db.execute_batch(
+            "CREATE TEMP TRIGGER refuse_attention_insert BEFORE INSERT ON main.automation_notifications
+             BEGIN SELECT RAISE(ABORT, 'fixture attention publication failure'); END;",
+        ).unwrap();
+        let error = registry
+            .interrupt_automation_precheck(claim.firing.id, "private shell diagnostic".into(), 300)
+            .unwrap_err();
+        assert!(error.contains("fixture attention publication failure"));
+        assert_eq!(registry.automation(created.id).unwrap(), owner);
+        assert_eq!(
+            registry.automation_firing(claim.firing.id).unwrap(),
+            claim.firing
+        );
+        assert_eq!(
+            registry.automation_audit(created.id, None, 100).unwrap(),
+            audit
+        );
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty()
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER temp.refuse_attention_insert;")
+            .unwrap();
+        registry
+            .interrupt_automation_precheck(claim.firing.id, "private shell diagnostic".into(), 300)
+            .unwrap();
+        let first = registry.pending_automation_notifications(100).unwrap()[0]
+            .event()
+            .clone();
+        assert_eq!(first.cause, LifecycleCause::PrecheckInterrupted);
+        assert_eq!(first.firing, Some(claim.firing.id));
+        assert!(first.blocked && !first.enabled);
+        registry
+            .interrupt_automation_precheck(claim.firing.id, "newer private diagnostic".into(), 301)
+            .unwrap();
+        let pending = registry.pending_automation_notifications(100).unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "newer causal state replaces only current actionable attention"
+        );
+        let latest = pending[0].event().clone();
+        assert!(latest.sequence > first.sequence);
+        let blocked = registry.automation(created.id).unwrap();
+        let audit = registry.automation_audit(created.id, None, 100).unwrap();
+        registry.db.execute_batch(
+            "CREATE TEMP TRIGGER refuse_attention_retirement BEFORE DELETE ON main.automation_notifications
+             BEGIN SELECT RAISE(ABORT, 'fixture exact retirement failure'); END;",
+        ).unwrap();
+        let error = registry
+            .finish_automation_precheck(claim.firing.id, Outcome::Passed, 400)
+            .unwrap_err();
+        assert!(error.contains("fixture exact retirement failure"));
+        assert_eq!(registry.automation(created.id).unwrap(), blocked);
+        assert_eq!(
+            registry.automation_audit(created.id, None, 100).unwrap(),
+            audit
+        );
+        assert_eq!(
+            registry.pending_automation_notifications(100).unwrap()[0].event(),
+            &latest
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER temp.refuse_attention_retirement;")
+            .unwrap();
+        assert!(
+            registry
+                .finish_automation_precheck(claim.firing.id, Outcome::Passed, 400)
+                .unwrap()
+                .is_none()
+        );
+        let recovered = registry.automation(created.id).unwrap();
+        assert!(
+            recovered.active_firing.is_none() && recovered.blocked.is_none() && !recovered.enabled
+        );
+        assert_eq!(
+            registry
+                .automation_audit(created.id, None, 1)
+                .unwrap()
+                .events[0]
+                .cause,
+            LifecycleCause::PrecheckRecovered
+        );
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            registry
+                .automation_firing(claim.firing.id)
+                .unwrap()
+                .run
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn completed_interrupted_precheck_pauses_without_accepting_or_inventing_an_agent_run() {
+        use crate::host::automations::precheck::Outcome;
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.precheck = Some(crate::automations::Precheck {
+            command: "true".into(),
+            timeout_seconds: 1,
+        });
+        let created = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let enabled = registry
+            .set_automation_enabled(
+                created.id,
+                created.revision,
+                Some(Occurrence {
+                    due_ms: 60_000,
+                    local: "first fixture minute".into(),
+                }),
+                true,
+                200,
+            )
+            .unwrap();
+        let first = enabled.next.clone().unwrap();
+        let claim = registry
+            .claim_automation(
+                created.id,
+                enabled.execution_revision,
+                Some(&first),
+                crate::automations::Trigger::Scheduled {
+                    occurrence: first.clone(),
+                },
+                Some(Occurrence {
+                    due_ms: 120_000,
+                    local: "second fixture minute".into(),
+                }),
+                false,
+                60_000,
+            )
+            .unwrap();
+        assert!(
+            registry
+                .finish_automation_precheck(
+                    claim.firing.id,
+                    Outcome::Stopped {
+                        state: FiringState::Interrupted,
+                        skip: None,
+                        diagnostic: "Previous-boot command effects are uncertain".into(),
+                    },
+                    60_001,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let current = registry.automation(created.id).unwrap();
+        assert!(!current.enabled && current.next.is_none() && current.active_firing.is_none());
+        let firing = registry.automation_firing(claim.firing.id).unwrap();
+        assert_eq!(firing.state, FiringState::Interrupted);
+        assert!(firing.run.is_none() && firing.agent.is_none());
+        let pending = registry.pending_automation_notifications(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        let event = pending[0].event();
+        assert_eq!(event.cause, LifecycleCause::PrecheckPaused);
+        assert_eq!(event.firing, Some(firing.id));
+        assert_eq!(
+            &registry
+                .automation_audit(created.id, None, 1)
+                .unwrap()
+                .events[0],
+            event
+        );
+        assert!(!event.enabled);
+    }
+
+    #[test]
+    fn failed_project_pause_attention_keeps_project_definition_and_audit_at_one_commit() {
+        let (mut registry, _directory, definition) = fixture();
+        let created = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let enabled = registry
+            .set_automation_enabled(
+                created.id,
+                created.revision,
+                Some(Occurrence {
+                    due_ms: 60_000,
+                    local: "future fixture minute".into(),
+                }),
+                true,
+                200,
+            )
+            .unwrap();
+        let before = registry.model().unwrap();
+        let audit = registry.automation_audit(created.id, None, 100).unwrap();
+        registry.db.execute_batch(
+            "CREATE TEMP TRIGGER refuse_project_attention BEFORE INSERT ON main.automation_notifications
+             BEGIN SELECT RAISE(ABORT, 'fixture project attention failure'); END;",
+        ).unwrap();
+        let error = registry
+            .apply(&ModelEdit::CloseProject {
+                repository: definition.agent.target.repository.clone(),
+            })
+            .unwrap_err();
+        assert!(error.contains("fixture project attention failure"));
+        let after = registry.model().unwrap();
+        assert_eq!(after.projects, before.projects);
+        assert_eq!(after.sequence, before.sequence);
+        assert_eq!(registry.automation(created.id).unwrap(), enabled);
+        assert_eq!(
+            registry.automation_audit(created.id, None, 100).unwrap(),
+            audit
+        );
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty()
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER temp.refuse_project_attention;")
+            .unwrap();
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: definition.agent.target.repository,
+            })
+            .unwrap();
+        assert!(registry.model().unwrap().projects.is_empty());
+        assert!(!registry.automation(created.id).unwrap().enabled);
+        assert_eq!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn accepted_run_interruption_keeps_execution_attention_without_a_second_automation_notice() {
+        use crate::agent_execution::{State, Update};
+        let (mut registry, _directory, definition) = fixture();
+        let created = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let enabled = registry
+            .set_automation_enabled(
+                created.id,
+                created.revision,
+                Some(Occurrence {
+                    due_ms: 60_000,
+                    local: "future fixture minute".into(),
+                }),
+                true,
+                200,
+            )
+            .unwrap();
+        let claimed = registry
+            .claim_automation(
+                created.id,
+                enabled.execution_revision,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                300,
+            )
+            .unwrap();
+        let accepted = claimed.accepted.unwrap();
+        assert_eq!(claimed.firing.run, Some(accepted.run.id));
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: definition.agent.target.repository,
+            })
+            .unwrap();
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty(),
+            "the accepted run remains the single attention owner even when project closure pauses its schedule"
+        );
+        registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Finished {
+                    state: State::Interrupted,
+                    result: Default::default(),
+                },
+                400,
+            )
+            .unwrap();
+        registry
+            .reconcile_automation_run(accepted.run.id, 401)
+            .unwrap();
+        let firing = registry.automation_firing(claimed.firing.id).unwrap();
+        assert_eq!(firing.run, Some(accepted.run.id));
+        assert_eq!(firing.agent, Some(accepted.agent.id));
+        assert_eq!(firing.state, FiringState::Interrupted);
+        assert_eq!(
+            registry.agent_run(accepted.run.id).unwrap().state,
+            State::Interrupted
+        );
+        assert_eq!(
+            registry
+                .automation_audit(created.id, None, 1)
+                .unwrap()
+                .events[0]
+                .cause,
+            LifecycleCause::RunInterrupted
+        );
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty(),
+            "run_attention keeps the existing AgentRun route; no system no-run duplicate is queued"
+        );
+    }
+
+    #[test]
+    fn prelaunch_failure_and_unavailable_project_queue_only_actual_no_run_pause_receipts() {
+        for pause in [false, true] {
+            let (mut registry, _directory, mut definition) = fixture();
+            definition.precheck = Some(crate::automations::Precheck {
+                command: "true".into(),
+                timeout_seconds: 1,
+            });
+            let created = registry
+                .create_automation(definition, 100, test_identity())
+                .unwrap();
+            let claim = registry
+                .claim_automation(
+                    created.id,
+                    created.execution_revision,
+                    None,
+                    crate::automations::Trigger::Manual {
+                        request: Uuid::new_v4(),
+                    },
+                    None,
+                    true,
+                    200,
+                )
+                .unwrap();
+            assert!(claim.accepted.is_none() && claim.firing.run.is_none());
+            registry
+                .fail_automation_start(
+                    claim.firing.id,
+                    "private authority diagnostic".into(),
+                    300,
+                    pause,
+                )
+                .unwrap();
+            let pending = registry.pending_automation_notifications(100).unwrap();
+            assert_eq!(pending.len(), usize::from(pause));
+            let firing = registry.automation_firing(claim.firing.id).unwrap();
+            assert_eq!(firing.state, FiringState::Failed);
+            assert!(firing.run.is_none() && firing.agent.is_none());
+            if pause {
+                let event = pending[0].event();
+                assert_eq!(event.cause, LifecycleCause::StartPaused);
+                assert_eq!(event.firing, Some(firing.id));
+                assert_eq!(
+                    &registry
+                        .automation_audit(created.id, None, 1)
+                        .unwrap()
+                        .events[0],
+                    event
+                );
+            }
+        }
+        let (mut registry, _directory, definition) = fixture();
+        let created = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: definition.agent.target.repository,
+            })
+            .unwrap();
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty()
+        );
+        let current = registry.automation(created.id).unwrap();
+        let claim = registry
+            .claim_automation(
+                created.id,
+                current.execution_revision,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                300,
+            )
+            .unwrap();
+        assert!(claim.accepted.is_none() && claim.firing.run.is_none());
+        assert_eq!(claim.firing.state, FiringState::Failed);
+        let pending = registry.pending_automation_notifications(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        let event = pending[0].event();
+        assert_eq!(event.cause, LifecycleCause::ProjectUnavailable);
+        assert_eq!(event.firing, Some(claim.firing.id));
+        assert_eq!(
+            &registry
+                .automation_audit(created.id, None, 1)
+                .unwrap()
+                .events[0],
+            event
+        );
+        assert!(!registry.automation(created.id).unwrap().enabled);
     }
 }

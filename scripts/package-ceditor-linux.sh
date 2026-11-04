@@ -57,15 +57,27 @@ esac
 
 # Build each implementation graph separately; never unify host/UI features.
 if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
-    cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
-        --target-dir "$TARGET_DIR" --no-default-features --bin cagents
-    cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
-        --target-dir "$TARGET_DIR" --no-default-features --features host --bin cagentsd
-    cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
-        --target-dir "$TARGET_DIR" --package ceditor
+    command -v python3 >/dev/null 2>&1 || fail 'required command not found: python3'
+    # The package is native-only. Override config build.target with the validated
+    # release target, and consume each exact Cargo executable instead of guessing
+    # whether it lives below a target-triple directory.
+    CLI_BINARY=$(python3 "$SCRIPT_DIR/build-ceditor-product" cagents \
+        --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
+        --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --no-default-features --bin cagents)
+    HOST_BINARY=$(python3 "$SCRIPT_DIR/build-ceditor-product" cagentsd \
+        --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
+        --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --no-default-features --features host --bin cagentsd)
+    EDITOR_BINARY=$(python3 "$SCRIPT_DIR/build-ceditor-product" ceditor \
+        --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
+        --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --package ceditor)
+else
+    # Explicit prebuilt mode retains its documented native release layout.
+    CLI_BINARY=$TARGET_DIR/release/cagents
+    HOST_BINARY=$TARGET_DIR/release/cagentsd
+    EDITOR_BINARY=$TARGET_DIR/release/ceditor
 fi
-for binary in ceditor cagents cagentsd; do
-    [ -x "$TARGET_DIR/release/$binary" ] || fail "missing release binary: $TARGET_DIR/release/$binary"
+for binary in "$EDITOR_BINARY" "$CLI_BINARY" "$HOST_BINARY"; do
+    [ -x "$binary" ] || fail "missing release binary: $binary"
 done
 
 WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ceditor-package.XXXXXX")
@@ -81,8 +93,10 @@ install -d -m 0755 "$PACKAGE_ROOT/bin" "$PACKAGE_ROOT/share/applications" \
     "$PACKAGE_ROOT/share/icons/hicolor/scalable/apps" "$PACKAGE_ROOT/share/doc/ceditor" "$DIST_DIR"
 PRIVATE=$PACKAGE_ROOT/lib/ceditor
 install -d -m 0755 "$PRIVATE/releases/$VERSION/bin"
+install -m 0755 "$EDITOR_BINARY" "$PRIVATE/releases/$VERSION/bin/ceditor"
+install -m 0755 "$CLI_BINARY" "$PRIVATE/releases/$VERSION/bin/cagents"
+install -m 0755 "$HOST_BINARY" "$PRIVATE/releases/$VERSION/bin/cagentsd"
 for binary in ceditor cagents cagentsd; do
-    install -m 0755 "$TARGET_DIR/release/$binary" "$PRIVATE/releases/$VERSION/bin/$binary"
     strip --strip-unneeded "$PRIVATE/releases/$VERSION/bin/$binary"
 done
 printf '%s\n' 'ceditor companions v1' > "$PRIVATE/releases/$VERSION/bin/.ceditor-companions"

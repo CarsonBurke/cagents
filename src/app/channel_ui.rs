@@ -472,7 +472,13 @@ impl Cagents {
                 self.sidebar_state.reveal_project(project_id);
                 let scope = self.open_channel_with_default(id);
                 self.persist();
-                scope
+                Task::batch([
+                    scope,
+                    sidebar::reveal(sidebar::selection_row_focus_id(
+                        sidebar::SelectionRow::Channel(id),
+                    ))
+                    .map(cosmic::Action::App),
+                ])
             }
             // A channel being deleted is not somewhere to go; its row offers
             // nothing, and this refuses anything that raced it.
@@ -1085,11 +1091,25 @@ impl Cagents {
         }
         let previews = &self.notification_ui.previews;
         let allow_previews = self.settings.notifications.message_previews;
+        // One pass groups channels by project, keeping the durable vector's
+        // order, so the refresh stays linear in channels and cards.
+        let mut project_channels = HashMap::<_, Vec<_>>::new();
+        for channel in &durable.channels {
+            project_channels
+                .entry(channel.project_id)
+                .or_default()
+                .push(channel);
+        }
         // A failure outlives nothing: a channel that has gone since, however
         // it went, has nothing left to retry.
-        self.channel_ui
-            .failed
-            .retain(|id, _| durable.channels.iter().any(|channel| channel.id == *id));
+        if !self.channel_ui.failed.is_empty() {
+            let live = durable
+                .channels
+                .iter()
+                .map(|channel| channel.id)
+                .collect::<HashSet<_>>();
+            self.channel_ui.failed.retain(|id, _| live.contains(id));
+        }
         let channel_ui = &self.channel_ui;
         let state = &self.sidebar_state;
         for project in &mut self.sidebar_model.projects {
@@ -1101,10 +1121,11 @@ impl Cagents {
             // ascending creation ranks. Display order is not decided here:
             // `sidebar::channels_in_display_order` owns it, one named ordering
             // helper per row kind beside the one the worktree rows use.
-            for channel in durable
-                .channels
-                .iter()
-                .filter(|channel| channel.project_id == project.id)
+            for channel in project_channels
+                .get(&project.id)
+                .into_iter()
+                .flatten()
+                .copied()
             {
                 let title = if channel.title.is_empty() {
                     Cow::Borrowed(unnamed.as_ref())
@@ -1589,6 +1610,121 @@ mod tests {
             ChannelTitleSource::Provider
         ));
         assert_eq!(app.durable.channels[0].title, "My project name");
+    }
+
+    /// Channel rows are rebuilt on every structural update, so the refresh
+    /// must stay linear: many projects, channels and cards produce exactly the
+    /// rows a per-project scan would, in durable order.
+    #[test]
+    fn sidebar_channel_rows_at_scale_follow_durable_order_per_project() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let template = app.durable.cards[0].clone();
+        let projects = (0..8).map(|_| ProjectId::new()).collect::<Vec<_>>();
+        for (index, project) in projects.iter().enumerate() {
+            app.sidebar_model.projects.push(SidebarProject::new(
+                *project,
+                RepositoryId::new(),
+                format!("project {index}"),
+                format!("/repo-{index}").into(),
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        let durable = Arc::make_mut(&mut app.durable);
+        // Interleave projects so grouping cannot rely on adjacency.
+        for ordinal in 0..200 {
+            let cards = (0..3)
+                .map(|_| {
+                    let mut card = template.clone();
+                    card.id = CardId::new();
+                    durable.cards.push(card.clone());
+                    card.id
+                })
+                .collect::<Vec<_>>();
+            durable.channels.push(ProjectChannel {
+                title_source: Default::default(),
+                id: ChannelId::new(),
+                project_id: projects[ordinal % projects.len()],
+                title: format!("channel {ordinal}"),
+                ordinal: ordinal as u32,
+                shared: false,
+                focused: cards.first().copied(),
+                cards,
+            });
+        }
+        let live = app.durable.channels[7].id;
+        app.channel_ui.failed.insert(live, "kept".into());
+        app.channel_ui
+            .failed
+            .insert(ChannelId::new(), "gone".into());
+
+        app.refresh_sidebar_channels();
+        for project in &app.sidebar_model.projects {
+            let expected = app
+                .durable
+                .channels
+                .iter()
+                .filter(|channel| channel.project_id == project.id)
+                .map(|channel| (channel.id, channel.title.as_str()))
+                .collect::<Vec<_>>();
+            let rows = project
+                .channels
+                .iter()
+                .map(|row| (row.id, row.title.as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected);
+            assert!(project.channels.iter().all(|row| row.has_panes));
+        }
+        assert_eq!(
+            app.channel_ui.failed.keys().copied().collect::<Vec<_>>(),
+            [live],
+            "only live channels keep a failure"
+        );
+
+        // A removed channel leaves its project's rows on the next refresh.
+        let removed = Arc::make_mut(&mut app.durable).channels.remove(0);
+        app.refresh_sidebar_channels();
+        let rows = &app.sidebar_model.projects[0].channels;
+        assert!(rows.iter().all(|row| row.id != removed.id));
+        assert_eq!(rows.len(), 200 / projects.len() - 1);
+    }
+
+    /// The chrome pass resolves channel titles in one sweep; it must present a
+    /// chat exactly as the single-card lookup does.
+    #[test]
+    fn chat_chrome_takes_its_channel_title_like_the_single_card_lookup() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let other = ChannelId::new();
+        let named = ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        let session = chat_session();
+        durable.cards[0].title =
+            super::super::chat_ui::chat_card_title(session.launch.provider).into();
+        durable.cards[0].kind = crate::model::CardKind::Chat(session);
+        let project = ProjectId::new();
+        // An untitled channel first: the first *titled* channel names the chat.
+        for (id, title) in [(other, ""), (named, "Parser rewrite")] {
+            durable.channels.push(ProjectChannel {
+                title_source: crate::model::ChannelTitleSource::Manual,
+                id,
+                project_id: project,
+                title: title.into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        }
+        drop(app.sync_chrome());
+        let state = app.card_state(card).unwrap();
+        assert_eq!(app.card_display_title(state), "Parser rewrite");
+        assert_eq!(app.repository_chrome(state).0, "Parser rewrite");
+        assert_eq!(app.card_chrome[&card].title, "Parser rewrite");
+
+        Arc::make_mut(&mut app.durable).channels[1].title = "Renamed".into();
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome[&card].title, "Renamed");
     }
 
     fn chat_session() -> crate::chat::Session {

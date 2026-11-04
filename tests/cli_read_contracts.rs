@@ -154,6 +154,90 @@ fn configure_remote_fixture(fixture: &Fixture, failing_ssh: bool) {
 }
 
 #[test]
+fn protocol_version_is_local_before_device_selection_or_service_preparation() {
+    if !user_fixture::enter() {
+        return;
+    }
+    let fixture = Fixture::new();
+    configure_remote_fixture(&fixture, false);
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        fixture.root.path().join("bin").display()
+    );
+    for device in ["fixture", "unknown-device"] {
+        for policy in ["none", "flag", "environment"] {
+            let mut args = vec!["--device", device, "daemon", "protocol-version"];
+            if policy == "flag" {
+                args.push("--no-start");
+            }
+            let mut command = fixture.command(&args).env("PATH", &path);
+            if policy == "environment" {
+                command = command.env("CAGENTS_NO_START", "1");
+            }
+            let output = fixture.run(command);
+            assert!(output.success, "{device}/{policy}: {output:?}");
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["command"], "daemon.protocol_version");
+            assert_eq!(
+                value["data"]["protocol_version"],
+                cagents::terminal::ipc::PROTOCOL_VERSION
+            );
+            assert!(output.stderr.is_empty());
+            assert!(!fixture.root.path().join("spawned").exists());
+            assert!(!fixture.root.path().join("ssh-calls").exists());
+        }
+    }
+}
+
+#[test]
+fn local_lifecycle_refuses_remote_selection_before_local_or_remote_effects() {
+    if !user_fixture::enter() {
+        return;
+    }
+    let fixture = Fixture::new();
+    configure_remote_fixture(&fixture, false);
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        fixture.root.path().join("bin").display()
+    );
+    for device in ["fixture", "unknown-device"] {
+        for command in [
+            vec!["daemon", "upgrade", "--yes"],
+            vec!["daemon", "abandon-upgrade", "--yes"],
+            vec!["daemon", "stop-for-rebuild", "--including-subagents"],
+            vec!["daemon", "bridge"],
+            vec![
+                "coordinate-install",
+                "--prefix",
+                "/missing-prefix",
+                "--installer",
+                "/missing-installer",
+            ],
+            vec!["restart-windows", "--instance", "missing-instance"],
+        ] {
+            let mut args = vec!["--device", device];
+            args.extend(command);
+            let output = fixture.run(fixture.command(&args).env("PATH", &path));
+            assert_eq!(output.exit_code, Some(1), "{args:?}: {output:?}");
+            let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(
+                value["error"]["kind"], "daemon_local_only",
+                "{args:?}: {value}"
+            );
+            assert!(output.stdout.is_empty());
+            assert!(!fixture.root.path().join("spawned").exists());
+            assert!(!fixture.root.path().join("ssh-calls").exists());
+        }
+    }
+    assert_eq!(
+        fs::read_dir(fixture.root.path().join("run"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn remote_stop_is_idempotent_and_no_start_reads_report_remote_absence() {
     if !user_fixture::enter() {
         return;

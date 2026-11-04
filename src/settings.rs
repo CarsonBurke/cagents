@@ -22,7 +22,8 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_TOML_INTEGER: u64 = i64::MAX as u64;
 
-pub const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
+pub const MAX_TERMINAL_SCROLLBACK_MIB: usize = 1024;
+const MAX_LEGACY_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
 pub const MAX_TERMINAL_SCROLL_SIZE: usize = 10;
 /// The longest terminal font family name, in bytes.
 pub const MAX_TERMINAL_FONT_FAMILY_BYTES: usize = 128;
@@ -627,8 +628,21 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
     })
 }
 
-const fn default_terminal_scrollback_lines() -> usize {
+/// Approximate the old line preference at 1 KiB per requested line, rounded
+/// up to MiB. Its former direct use as bytes retained almost no history.
+const fn legacy_scrollback_mib(lines: usize) -> usize {
+    if lines > MAX_LEGACY_TERMINAL_SCROLLBACK_LINES {
+        return MAX_TERMINAL_SCROLLBACK_MIB + 1;
+    }
+    lines.div_ceil(1024)
+}
+
+const fn default_legacy_terminal_scrollback_lines() -> usize {
     10_000
+}
+
+const fn default_terminal_scrollback_mib() -> usize {
+    16
 }
 
 const fn default_terminal_scroll_size() -> usize {
@@ -836,8 +850,8 @@ pub struct AppSettings {
     pub sidebar_width: f32,
     pub inspector_width: f32,
     pub default_column_fraction: f32,
-    #[serde(default = "default_terminal_scrollback_lines")]
-    pub terminal_scrollback_lines: usize,
+    #[serde(default = "default_terminal_scrollback_mib")]
+    pub terminal_scrollback_mib: usize,
     #[serde(default)]
     pub link_open_destination: LinkOpenDestination,
     #[serde(default)]
@@ -977,7 +991,7 @@ impl Default for AppSettings {
             sidebar_width: layout_metrics::NAVIGATION_DEFAULT_WIDTH,
             inspector_width: layout_metrics::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: 0.5,
-            terminal_scrollback_lines: 10_000,
+            terminal_scrollback_mib: default_terminal_scrollback_mib(),
             link_open_destination: LinkOpenDestination::default(),
             link_open_gesture: LinkOpenGesture::default(),
             pull_request_open_target: PullRequestOpenTarget::default(),
@@ -1176,7 +1190,7 @@ struct V2TomlSettings {
     terminal_font_family: String,
     sidebar_width: f32,
     default_column_fraction: f32,
-    #[serde(default = "default_terminal_scrollback_lines")]
+    #[serde(default = "default_legacy_terminal_scrollback_lines")]
     terminal_scrollback_lines: usize,
     #[serde(default)]
     link_open_destination: LinkOpenDestination,
@@ -1600,7 +1614,7 @@ impl From<V2TomlSettings> for AppSettings {
             sidebar_width: previous.sidebar_width,
             inspector_width: layout_metrics::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: previous.default_column_fraction,
-            terminal_scrollback_lines: previous.terminal_scrollback_lines,
+            terminal_scrollback_mib: legacy_scrollback_mib(previous.terminal_scrollback_lines),
             link_open_destination: previous.link_open_destination,
             link_open_gesture: previous.link_open_gesture,
             // A version-2 file predates language servers, so it can hold no
@@ -1764,9 +1778,9 @@ impl AppSettings {
                 "default_column_fraction must be between 0.25 and 1.0",
             ));
         }
-        if self.terminal_scrollback_lines > MAX_TERMINAL_SCROLLBACK_LINES {
+        if self.terminal_scrollback_mib > MAX_TERMINAL_SCROLLBACK_MIB {
             return Err(SettingsError::Invalid(
-                "terminal_scrollback_lines must be between 0 and 1000000",
+                "terminal_scrollback_mib must be between 0 and 1024",
             ));
         }
         if self.managed_worktree_directory.trim().is_empty()
@@ -2093,6 +2107,23 @@ fn load_toml(path: &Path) -> Result<Loaded, SettingsError> {
 /// preference. Its value represented lines per wheel notch, so it is the same
 /// setting; the old default of one is promoted to the new default of two.
 fn normalize_current(table: &mut toml::Table) {
+    if let Some(legacy) = table.remove("terminal_scrollback_lines") {
+        // An explicit current value wins, even when it is unreadable. Retain
+        // invalid legacy input under the current key so normal per-setting
+        // diagnostics/preservation apply rather than silently dropping it.
+        table
+            .entry("terminal_scrollback_mib")
+            .or_insert_with(|| match legacy {
+                toml::Value::Integer(lines)
+                    if (0..=MAX_LEGACY_TERMINAL_SCROLLBACK_LINES as i64).contains(&lines) =>
+                {
+                    usize::try_from(lines).map_or(toml::Value::Integer(lines), |lines| {
+                        toml::Value::Integer(legacy_scrollback_mib(lines) as i64)
+                    })
+                }
+                value => value,
+            });
+    }
     // Decoding moves it too; moving it first lets a setting set aside or
     // kept be found under the name this build writes.
     if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts") {
@@ -4244,14 +4275,104 @@ new_thread = "Alt+Shift+G"
     }
 
     #[test]
-    fn terminal_scrollback_is_bounded() {
+    fn legacy_scrollback_lines_migrate_and_save_only_the_explicit_byte_unit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for (lines, mib) in [(0, 0), (1, 1), (10_000, 10), (1_000_000, 977)] {
+            fs::write(&path, format!(
+                "schema_version = 3\nterminal_scrollback_lines = {lines}\nfuture_history = 'keep'\n"
+            )).unwrap();
+            let loaded = load_detailed(&path).unwrap();
+            assert_eq!(loaded.settings.terminal_scrollback_mib, mib);
+            assert_eq!(loaded.set_aside().count(), 0);
+            save(&path, &loaded.settings).unwrap();
+            let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(!saved.contains_key("terminal_scrollback_lines"));
+            assert_eq!(
+                saved["terminal_scrollback_mib"].as_integer(),
+                Some(mib as i64)
+            );
+            assert_eq!(saved["future_history"].as_str(), Some("keep"));
+            assert_eq!(load(&path).unwrap().terminal_scrollback_mib, mib);
+        }
+        assert_eq!(AppSettings::default().terminal_scrollback_mib, 16);
+        assert_eq!(
+            load_current_toml("schema_version = 3")
+                .unwrap()
+                .settings
+                .terminal_scrollback_mib,
+            16
+        );
+    }
+
+    #[test]
+    fn explicit_scrollback_mib_wins_and_invalid_legacy_input_is_not_silent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for legacy in ["10000", "-1", "1000001", "'unreadable'"] {
+            fs::write(&path, format!(
+                "schema_version = 3\nterminal_scrollback_lines = {legacy}\nterminal_scrollback_mib = 32\n"
+            )).unwrap();
+            let loaded = load_detailed(&path).unwrap();
+            assert_eq!(loaded.settings.terminal_scrollback_mib, 32);
+            assert_eq!(loaded.set_aside().count(), 0);
+            save(&path, &loaded.settings).unwrap();
+            let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(!saved.contains_key("terminal_scrollback_lines"));
+            assert_eq!(saved["terminal_scrollback_mib"].as_integer(), Some(32));
+        }
+        for invalid in ["-1", "1000001", "9223372036854775807", "'unreadable'"] {
+            fs::write(
+                &path,
+                format!("schema_version = 3\nterminal_scrollback_lines = {invalid}\n"),
+            )
+            .unwrap();
+            let loaded = load_detailed(&path).unwrap();
+            assert_eq!(loaded.settings.terminal_scrollback_mib, 16);
+            assert_eq!(loaded.set_aside().count(), 1, "{invalid}");
+            save(&path, &loaded.settings).unwrap();
+            let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let original: toml::Table = toml::from_str(&format!("value = {invalid}")).unwrap();
+            assert_eq!(saved["terminal_scrollback_mib"], original["value"]);
+            assert!(!saved.contains_key("terminal_scrollback_lines"));
+        }
+        let invalid_current = load_current_toml(
+            "schema_version = 3\nterminal_scrollback_lines = 10000\nterminal_scrollback_mib = -1\n",
+        )
+        .unwrap();
+        assert_eq!(invalid_current.settings.terminal_scrollback_mib, 16);
+        assert_eq!(invalid_current.set_aside().count(), 1);
+    }
+
+    #[test]
+    fn version_two_scrollback_migration_keeps_legacy_bounds_and_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for (lines, expected) in [
+            (0, Some(0)),
+            (10_000, Some(10)),
+            (1_000_000, Some(977)),
+            (1_000_001, None),
+        ] {
+            fs::write(&path, format!(
+                "schema_version = 2\nmax_hot_cards = 8\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 260.0\ndefault_column_fraction = 0.5\nterminal_scrollback_lines = {lines}\n"
+            )).unwrap();
+            match expected {
+                Some(mib) => assert_eq!(load(&path).unwrap().terminal_scrollback_mib, mib),
+                None => assert!(matches!(load(&path), Err(SettingsError::Invalid(_)))),
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_scrollback_mib_is_bounded() {
         let at_limit = AppSettings {
-            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES,
+            terminal_scrollback_mib: MAX_TERMINAL_SCROLLBACK_MIB,
             ..AppSettings::default()
         };
         assert!(at_limit.validate().is_ok());
         let above_limit = AppSettings {
-            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES + 1,
+            terminal_scrollback_mib: MAX_TERMINAL_SCROLLBACK_MIB + 1,
             ..AppSettings::default()
         };
         assert!(matches!(
