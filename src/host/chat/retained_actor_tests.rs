@@ -361,7 +361,17 @@ fn retained_upgrade_tail(fail_final_save: bool) {
     )
     .unwrap();
     successor.lock().unwrap().notifications = Some(notifications.handle());
-    super::native_recovery::restore(&successor, 0, &prepared.chats[0].source).unwrap();
+    if fail_final_save {
+        // No Ready checkpoint was published; only the exact holder remains.
+        super::native_recovery::restore(&successor, 0, &prepared.chats[0].source).unwrap();
+    } else {
+        // The successor daemon's own startup restore, which reattached this
+        // actor and then refused it as already live on a second pass (#2023).
+        let unattached = super::super::state::restore_upgrade(&successor).unwrap();
+        assert!(unattached.is_empty());
+        assert!(successor.lock().unwrap().startup_recovery().is_none());
+        assert!(store.load().unwrap().is_none());
+    }
     let handle = successor.lock().unwrap().chats[&id].handle.clone();
     assert_eq!(handle.actor_identity(), Some(identity.clone()));
     assert_eq!(

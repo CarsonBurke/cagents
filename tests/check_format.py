@@ -31,6 +31,11 @@ INCLUDED = (
 
 class FormatCheck(unittest.TestCase):
     def setUp(self):
+        # Keep inherited build-lane overrides out of temporary formatter fixtures.
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("CARGO_TARGET_DIR", None)
         self.temporary = tempfile.TemporaryDirectory(prefix="cagents-format-check-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -117,6 +122,44 @@ sys.exit({status})
                 )
                 self.assertIn("cargo diagnostic", result.stderr)
                 self.assertIn("rustfmt diagnostic", result.stderr)
+
+    def test_absolute_cargo_target_keeps_formatter_cache_out_of_checkout(self):
+        target = tempfile.TemporaryDirectory(prefix="cagents-format-target-")
+        self.addCleanup(target.cleanup)
+        _, env = self.mock_tools()
+        env["CARGO_TARGET_DIR"] = target.name
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((Path(target.name) / ".check-format-cache").is_dir())
+        self.assertFalse((self.root / "target").exists())
+
+    def test_relative_cargo_target_uses_checker_checkout_directory(self):
+        target = tempfile.TemporaryDirectory(prefix="cagents-format-target-")
+        self.addCleanup(target.cleanup)
+        _, env = self.mock_tools()
+        env["CARGO_TARGET_DIR"] = os.path.relpath(target.name, self.root)
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((Path(target.name) / ".check-format-cache").is_dir())
+        self.assertFalse((self.root / "target").exists())
+
+    def test_unusable_cargo_target_preserves_formatter_failure_without_local_cache(self):
+        occupied = self.root / "occupied-target"
+        occupied.write_text("preserve this file")
+        _, env = self.mock_tools(rustfmt_status=7)
+        env["CARGO_TARGET_DIR"] = str(occupied)
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn("rustfmt diagnostic", result.stderr)
+        self.assertEqual(occupied.read_text(), "preserve this file")
+        self.assertFalse((self.root / "target").exists())
+
+    def test_empty_cargo_target_retains_default_formatter_cache(self):
+        _, env = self.mock_tools()
+        env["CARGO_TARGET_DIR"] = ""
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / "target" / ".check-format-cache").is_dir())
 
     def test_missing_byte_environment_preserves_ordinary_formatter_status(self):
         helper, args = self.cache_fixture()
@@ -409,6 +452,82 @@ sys.exit({status})
                 with mock.patch.object(helper.subprocess, "run", return_value=traced):
                     with self.assertRaises(helper.Uncacheable):
                         helper.formatter_libraries(helper.InputHashes(), Path("/verified/rustfmt"))
+
+    def test_tool_digests_reuse_only_unchanged_files_within_one_check(self):
+        helper, _args = self.cache_fixture()
+        tool = self.root / "fake/rustfmt"
+        self.write("fake/rustfmt", "first formatter")
+        real_open = Path.open
+        reads = []
+
+        def tracked_open(path, *args, **kwargs):
+            source = real_open(path, *args, **kwargs)
+            if path == tool:
+                source.read = mock.Mock(wraps=source.read)
+                reads.append(source.read)
+            return source
+
+        def snapshot(memo):
+            hasher = helper.InputHashes(memo)
+            helper.tool_file(hasher, tool)
+            return hasher.hexdigest(), hasher.guard.hexdigest()
+
+        memo = {}
+        with mock.patch.object(Path, "open", tracked_open):
+            first = snapshot(memo)
+            self.assertEqual(snapshot(memo), first)
+            self.assertTrue(reads[0].called)
+            self.assertFalse(reads[1].called)
+
+            # Same size and restored mtime must not hide an in-place edit.
+            original = tool.stat()
+            tool.write_text("other formatter")
+            os.utime(tool, ns=(original.st_atime_ns, original.st_mtime_ns))
+            changed = snapshot(memo)
+            self.assertNotEqual(changed, first)
+            self.assertTrue(reads[-1].called)
+
+            # Replacing a file at the same path must also discard its digest.
+            tool.unlink()
+            tool.write_text("first formatter")
+            os.utime(tool, ns=(original.st_atime_ns, original.st_mtime_ns))
+            replaced = snapshot(memo)
+            self.assertEqual(replaced[0], first[0])
+            self.assertNotEqual(replaced[1], first[1])
+            self.assertTrue(reads[-1].called)
+
+            # A later check starts with no remembered bytes, even unchanged.
+            self.assertEqual(snapshot({}), replaced)
+            self.assertTrue(reads[-1].called)
+
+            # The second metadata observation is mandatory on a memo hit too.
+            before = tool.stat()
+            tool.write_text("other formatter")
+            after = tool.stat()
+            with mock.patch.object(helper.os, "fstat", side_effect=(before, after)):
+                with self.assertRaises(helper.Uncacheable):
+                    snapshot(memo)
+            self.assertFalse(reads[-1].called)
+
+    def test_tool_edit_and_restore_during_check_cannot_record_success(self):
+        helper, args = self.cache_fixture()
+        tool = self.root / "fake/rustfmt"
+        self.write("fake/rustfmt", "first formatter")
+
+        def formatter(hasher, _executable):
+            helper.tool_file(hasher, tool)
+
+        def mutate_and_restore(_command):
+            original = tool.stat()
+            tool.write_text("other formatter")
+            tool.write_text("first formatter")
+            os.utime(tool, ns=(original.st_atime_ns, original.st_mtime_ns))
+            return 0
+
+        with mock.patch.object(helper, "rustfmt_binary", side_effect=formatter), \
+                mock.patch.object(helper, "run", side_effect=mutate_and_restore):
+            self.assertEqual(helper.main(args), 0)
+        self.assertFalse(any(helper.CACHE.iterdir()))
 
     def test_external_license_templates_and_missing_toml_parser_disable_cache(self):
         helper, args = self.cache_fixture()

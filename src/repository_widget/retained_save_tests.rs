@@ -6,6 +6,10 @@ use cosmic::iced::futures::StreamExt;
 /// Re-executes exactly one owning test with private filesystem identity. No
 /// environment variable is changed in the parallel parent test process.
 pub(crate) fn isolated_test(name: &str) -> bool {
+    isolated_test_inner(name, false)
+}
+
+fn isolated_test_inner(name: &str, ignored: bool) -> bool {
     const MARKER: &str = "CAGENTS_ROOTED_SAVE_TEST_CHILD";
     const RECEIPT: &str = "CAGENTS_ROOTED_SAVE_TEST_RECEIPT";
     if std::env::var(MARKER).as_deref() == Ok(name) {
@@ -26,6 +30,9 @@ pub(crate) fn isolated_test(name: &str) -> bool {
         .arg("--test-threads=1")
         .env(MARKER, name)
         .env(RECEIPT, &receipt);
+    if ignored {
+        command.arg("--ignored");
+    }
     for (key, leaf) in [
         ("HOME", "home"),
         ("XDG_RUNTIME_DIR", "runtime"),
@@ -408,11 +415,57 @@ async fn root_scope_owned_file_round_trip(path: &Path) {
     assert!(runtime.is_dirty());
     let save = runtime.request_save(card, false);
     assert!(runtime.is_saving());
-    finish(&mut runtime, save).await;
+    let mut completions = Vec::new();
+    if let Some(mut stream) = iced::runtime::task::into_stream(save) {
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(action) = action {
+                if let RepositoryAction::RetainedSaveFinished {
+                    ticket,
+                    revision,
+                    result,
+                    ..
+                } = &action
+                {
+                    // Observe the typed worker result before update flattens its
+                    // error or consumes its outcome. Keep no recovery owner.
+                    let result = match result {
+                        Ok(saved) => format!(
+                            "Ok({:?}); recovery_present={}",
+                            saved.outcome(),
+                            saved.recovery_authority().is_some()
+                        ),
+                        Err(crate::editor::retained_save::RetainedSaveError::Io(error)) => {
+                            format!("Err(Io({error:?})); recovery_present=false")
+                        }
+                        Err(crate::editor::retained_save::RetainedSaveError::Recovery {
+                            message,
+                            ..
+                        }) => format!("Err(Recovery({message:?})); recovery_present=true"),
+                    };
+                    completions.push(format!(
+                        "RetainedSaveFinished ticket={ticket} revision={revision} result={result}"
+                    ));
+                }
+                drop(runtime.update(action));
+            }
+        }
+    }
     assert_eq!(
         std::fs::read_to_string(path).unwrap(),
         submitted,
-        "Save must use the actual qualified edited-file parent despite Root scope"
+        "Save must use the actual qualified edited-file parent despite Root scope; \
+         path={path:?}; completion_count={}; completions={completions:?}; \
+         editor_text={:?}; dirty={}; saving={}; save_error={:?}; \
+         editor_recovery={}; durability_warning={}; conflict={}; custody_pending={}",
+        completions.len(),
+        runtime.editor_text(),
+        runtime.is_dirty(),
+        runtime.is_saving(),
+        runtime.save_error(),
+        runtime.has_editor_recovery(),
+        runtime.has_durability_warning(),
+        runtime.has_save_conflict(),
+        custody.lock().unwrap().is_pending()
     );
     assert!(!runtime.is_dirty());
     assert!(runtime.save_error().is_none());
@@ -426,9 +479,19 @@ async fn root_scope_saves_owned_private_and_sticky_parent_files() {
     ) {
         return;
     }
-    use std::io::Write;
+    use std::{
+        io::Write,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+    };
+    let euid = unsafe { libc::geteuid() };
     for parent in ["/tmp", "/var/tmp"] {
-        let directory = tempfile::tempdir_in(parent).unwrap();
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent)
+            .unwrap();
+        let private_metadata = std::fs::metadata(directory.path()).unwrap();
+        assert_eq!(private_metadata.uid(), euid);
+        assert_eq!(private_metadata.mode() & 0o7777, 0o700);
         let inner = directory.path().join("nested-checkout");
         std::fs::create_dir(&inner).unwrap();
         // The marker exercises nested checkout ancestor cleanup leasing; no
@@ -438,6 +501,82 @@ async fn root_scope_saves_owned_private_and_sticky_parent_files() {
         std::fs::write(&path, "baseline").unwrap();
         root_scope_owned_file_round_trip(&path).await;
 
+        // Qualify our actual edited parent without assuming public temporary
+        // directory ownership. A protected ancestor may still supply recovery;
+        // this asserts the owned-sticky save contract, not a bootstrap route.
+        let sticky_parent = tempfile::Builder::new()
+            .prefix(".cagents-save-owned-sticky-parent-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent)
+            .unwrap();
+        let owned_metadata = std::fs::metadata(sticky_parent.path()).unwrap();
+        assert_eq!(owned_metadata.uid(), euid);
+        assert_eq!(owned_metadata.mode() & 0o7777, 0o700);
+        std::fs::set_permissions(
+            sticky_parent.path(),
+            std::fs::Permissions::from_mode(0o1777),
+        )
+        .unwrap();
+        let sticky_metadata = std::fs::metadata(sticky_parent.path()).unwrap();
+        assert_eq!(sticky_metadata.uid(), euid);
+        assert_eq!(sticky_metadata.mode() & 0o7777, 0o1777);
+        let proof = crate::fs_safety::StickyParent::acquire(std::sync::Arc::new(
+            crate::fs_safety::Root::open(sticky_parent.path()).unwrap(),
+        ))
+        .expect("the newly owned sticky parent must satisfy production qualification");
+        drop(proof);
+
+        let mut file = tempfile::Builder::new()
+            .prefix(".cagents-save-owned-file-")
+            .suffix(".txt")
+            .tempfile_in(sticky_parent.path())
+            .unwrap();
+        file.write_all(b"baseline").unwrap();
+        file.flush().unwrap();
+        root_scope_owned_file_round_trip(file.path()).await;
+    }
+}
+
+// Public temporary-parent ownership is an external capability. Keep its
+// positive contrast distinct from mandatory owned-parent coverage. Foreign
+// ownership alone is not a general save-refusal oracle: a protected ancestor
+// may supply valid save-local recovery.
+#[tokio::test]
+#[ignore = "requires both public temporary parents to satisfy production sticky-parent qualification"]
+async fn root_scope_external_temporary_parent_contrast() {
+    if isolated_test_inner(
+        "repository_widget::retained_save_tests::root_scope_external_temporary_parent_contrast",
+        true,
+    ) {
+        return;
+    }
+    use std::io::Write;
+    let parents = ["/tmp", "/var/tmp"];
+    let qualifications = parents.map(|parent| {
+        crate::fs_safety::Root::open(Path::new(parent))
+            .and_then(|root| crate::fs_safety::StickyParent::acquire(std::sync::Arc::new(root)))
+    });
+    let failures: Vec<_> = parents
+        .iter()
+        .zip(&qualifications)
+        .filter_map(|(parent, result)| {
+            result.as_ref().err().map(|error| {
+                format!(
+                    "parent={parent}; kind={:?}; raw_errno={:?}; error={error}",
+                    error.kind(),
+                    error.raw_os_error()
+                )
+            })
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "ROOT_SCOPE_EXTERNAL_STICKY_UNQUALIFIED: {failures:?}"
+    );
+    drop(qualifications);
+    // Both parents qualified before creating either contrast file. Keep only
+    // the ordinary fixture handles during the unchanged real save helper.
+    for parent in parents {
         let mut file = tempfile::Builder::new()
             .prefix(".cagents-save-owned-file-")
             .suffix(".txt")
