@@ -695,7 +695,12 @@ impl Cagents {
                     &dialog
                         .targets
                         .iter()
-                        .map(|target| target.directory.as_path())
+                        .filter_map(|target| match target.row {
+                            SelectionRow::Worktree(project, id) => {
+                                self.project_target(project, Some(id))
+                            }
+                            _ => None,
+                        })
                         .collect::<Vec<_>>(),
                     "these worktrees",
                 ),

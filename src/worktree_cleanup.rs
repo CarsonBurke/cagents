@@ -150,6 +150,12 @@ fn checked_record(request: &RemovalRequest) -> Result<crate::repository::Worktre
     {
         return Err("Primary, detached, locked or unavailable worktrees are preserved".into());
     }
+    // An ignored worktree nested inside escapes the status check below.
+    if let Some(reason) =
+        crate::repository::nested_worktrees_refusal_in(&record.path, &records, &cancellation)
+    {
+        return Err(reason);
+    }
     if record.branch.as_deref() != Some(format!("refs/heads/{}", request.branch).as_str())
         || record.head_oid.as_deref() != Some(request.head_oid.as_str())
     {
@@ -324,6 +330,17 @@ pub(crate) fn remove_fenced(
             != target.admin_dir
     {
         return Err("Worktree administrative identity changed".into());
+    }
+    // Git removes the directory recursively, a worktree nested inside it
+    // included, uncommitted files and all. Refused before `verify`, which may
+    // already act on the worktree, as by taking a snapshot of it.
+    let records = service
+        .list_worktrees(&target.repository, &cancellation)
+        .map_err(|error| error.to_string())?;
+    if let Some(reason) =
+        crate::repository::nested_worktrees_refusal_in(&target.path, &records, &cancellation)
+    {
+        return Err(reason);
     }
     verify()?;
     // The repository-wide locks confirm that no ref packing or config write
@@ -976,6 +993,99 @@ mod tests {
         request.path = worktree.clone();
         request.branch = "feature".into();
         request.head_oid = git(&worktree, &["rev-parse", "HEAD"]);
+        checked_record(&request).unwrap();
+
+        // A worktree created inside it, in an ignored directory, is invisible
+        // to its status, yet Git would delete it with the outer one.
+        std::fs::write(repository.join(".git/info/exclude"), "/.worktrees/\n").unwrap();
+        let inner = worktree.join(".worktrees/inner");
+        git(
+            &worktree,
+            &["worktree", "add", "-b", "inner", inner.to_str().unwrap()],
+        );
+        std::fs::write(inner.join("unsaved"), "preserve").unwrap();
+        assert!(
+            checked_record(&request)
+                .unwrap_err()
+                .starts_with("This worktree contains another worktree")
+        );
+        // Prunable yet still on disk, its files would still go with it.
+        std::fs::remove_file(inner.join(".git")).unwrap();
+        assert!(
+            git(&repository, &["worktree", "list", "--porcelain"])
+                .split("\n\n")
+                .any(|record| record.contains("/.worktrees/inner\n")
+                    && record.contains("\nprunable"))
+        );
+        assert!(
+            checked_record(&request)
+                .unwrap_err()
+                .starts_with("This worktree contains another worktree")
+        );
+        // Only once its directory is gone does it stop holding the outer one.
+        std::fs::remove_dir_all(&inner).unwrap();
+        checked_record(&request).unwrap();
+        git(&repository, &["worktree", "prune"]);
+        git(&repository, &["branch", "-D", "inner"]);
+        checked_record(&request).unwrap();
+
+        // A separate common repository is absent from A's listing, even
+        // though A's force removal would recursively destroy its files.
+        let foreign_repository = directory.path().join("foreign-repository");
+        std::fs::create_dir(&foreign_repository).unwrap();
+        git(&foreign_repository, &["init", "-b", "main"]);
+        git(
+            &foreign_repository,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "foreign",
+            ],
+        );
+        std::fs::write(foreign_repository.join(".git/info/exclude"), "/ignored\n").unwrap();
+        let foreign = worktree.join(".worktrees/foreign");
+        git(
+            &foreign_repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "foreign",
+                foreign.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(foreign.join("unsaved"), "preserve uncommitted").unwrap();
+        std::fs::write(foreign.join("ignored"), "preserve ignored").unwrap();
+        assert!(git(&worktree, &["status", "--porcelain"]).is_empty());
+        assert!(
+            !git(&repository, &["worktree", "list", "--porcelain"])
+                .contains(foreign.to_str().unwrap())
+        );
+        assert!(
+            checked_record(&request)
+                .unwrap_err()
+                .contains("another repository")
+        );
+        assert_eq!(
+            std::fs::read(foreign.join("unsaved")).unwrap(),
+            b"preserve uncommitted"
+        );
+        assert_eq!(
+            std::fs::read(foreign.join("ignored")).unwrap(),
+            b"preserve ignored"
+        );
+        assert!(
+            !git(&foreign_repository, &["worktree", "list", "--porcelain"]).contains("prunable")
+        );
+        git(
+            &foreign_repository,
+            &["worktree", "remove", "--force", foreign.to_str().unwrap()],
+        );
         checked_record(&request).unwrap();
 
         let admin = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]));

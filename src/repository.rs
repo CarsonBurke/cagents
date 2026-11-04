@@ -6,6 +6,7 @@
 //! straightforward to test with a fake executor.
 
 mod managed_worktrees;
+mod nested_repositories;
 #[cfg(test)]
 pub(crate) use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
 mod worktree_setup_intent;
@@ -132,6 +133,76 @@ pub struct WorktreeRecord {
     pub bare: bool,
     pub lock: WorktreeLock,
     pub prunable_reason: Option<String>,
+}
+
+/// The worktrees among `worktrees` that lie strictly inside `path`, compared
+/// component by component.
+///
+/// `git worktree remove` deletes the directory recursively: a linked worktree
+/// nested inside it goes too, uncommitted and ignored files included, and is
+/// left registered as prunable. No removal may proceed while any exist.
+pub fn nested_worktree_paths<'a>(
+    path: &'a Path,
+    worktrees: impl IntoIterator<Item = &'a Path> + 'a,
+) -> impl Iterator<Item = &'a Path> + 'a {
+    worktrees
+        .into_iter()
+        .filter(move |candidate| *candidate != path && candidate.starts_with(path))
+}
+
+/// Why Git's listing `records` forbids removing the worktree at `path`: it
+/// contains other worktrees that `git worktree remove` would delete with it.
+///
+/// A record Git marks prunable is skipped only once its directory is gone, as
+/// then nothing of it remains to lose. One still on disk, such as a worktree
+/// whose `.git` file was removed, keeps its files, and so keeps blocking; so
+/// does any path whose absence cannot be confirmed.
+/// This also checks the directory itself: another repository's linked
+/// worktrees and ignored clones are absent from this repository's listing.
+/// Call only from a worker, never from a UI update or render path.
+pub fn nested_worktrees_refusal_in(
+    path: &Path,
+    records: &[WorktreeRecord],
+    cancellation: &CancellationToken,
+) -> Option<String> {
+    let present = records.iter().filter(|record| {
+        record.prunable_reason.is_none()
+            || !std::fs::symlink_metadata(&record.path).is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                )
+            })
+    });
+    nested_worktrees_refusal(
+        nested_worktree_paths(path, present.map(|record| record.path.as_path())).count(),
+    )
+    .or_else(|| {
+        // Manual deletion can retire an exact registration whose directory
+        // was already removed. The scanner must confirm absence beneath a
+        // retained root; prunable metadata never excuses existing content.
+        let allow_absent = records
+            .iter()
+            .any(|record| record.path == path && record.prunable_reason.is_some());
+        nested_repositories::refusal(path, cancellation, allow_absent)
+    })
+}
+
+/// Why a worktree containing `nested` other worktrees cannot be removed, or
+/// `None` when it contains none.
+pub fn nested_worktrees_refusal(nested: usize) -> Option<String> {
+    match nested {
+        0 => None,
+        1 => Some(
+            "This worktree contains another worktree, which Git would delete with it. \
+             Delete that worktree first."
+                .into(),
+        ),
+        n => Some(format!(
+            "This worktree contains {n} other worktrees, which Git would delete with it. \
+             Delete those worktrees first."
+        )),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
