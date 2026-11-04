@@ -662,6 +662,13 @@ fn an_unanswered_retirement_fails_reopen_without_guessing_its_outcome() {
     fixture.answer_retirement(true);
     assert_eq!(fixture.app.durable.cards.len(), cards);
     assert!(fixture.app.durable.channels.is_empty());
+    // The picker still shows the timeout and can be dismissed before the
+    // shortcut is used again; shortcuts do not act behind an open modal.
+    drop(
+        fixture
+            .app
+            .update_resume(super::super::resume_ui::Action::Close),
+    );
     fixture.reopen_pane();
     assert_ne!(fixture.active_channel().id, fixture.channel);
     assert_eq!(fixture.active_channel().cards, vec![fixture.resumed().id]);
