@@ -777,6 +777,10 @@ mod tests {
         fs::write(directory.join("tracked.txt"), "original\n").unwrap();
         git(directory, &["add", "tracked.txt"]);
         git(directory, &["commit", "-m", "fixture"]);
+        fixture_snapshot(directory)
+    }
+
+    fn fixture_snapshot(directory: &Path) -> Snapshot {
         let service = RepositoryService::system("git");
         let cancellation = CancellationToken::default();
         let repository = service.discover(directory, &cancellation).unwrap();
@@ -1450,7 +1454,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let base = directory.path().canonicalize().unwrap();
         let first = fixture(&base.join("first"));
-        let second = fixture(&base.join("second"));
+        let second_root = base.join("second");
+        fixture(&second_root);
+        fs::create_dir(second_root.join("src")).unwrap();
+        let later_file = second_root.join("src/later.txt");
+        fs::write(&later_file, "original\n").unwrap();
+        git(&second_root, &["add", "src/later.txt"]);
+        git(&second_root, &["commit", "-m", "tracked nested file"]);
+        let second = fixture_snapshot(&second_root);
         let mut ids = [ProjectId::new(), ProjectId::new()];
         ids.sort();
         let [other, project] = ids;
@@ -1470,7 +1481,6 @@ mod tests {
         let (snapshot, project_plan) = plan(project, second);
         let project_plan = Arc::new(project_plan.unwrap());
         let worktree = snapshot.worktrees[0].0.id;
-        let root = snapshot.worktrees[0].0.path.clone();
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.sidebar_model.projects.clear();
         app.sidebar_model.projects.push(SidebarProject::new(
@@ -1573,7 +1583,7 @@ mod tests {
             generation: 1,
             result: Ok((fresh, plan)),
         }));
-        fs::write(root.join("tracked.txt"), "edit after quota recovery\n").unwrap();
+        fs::write(&later_file, "edit after quota recovery\n").unwrap();
         let changed = wait_for(
             &monitor,
             project,
