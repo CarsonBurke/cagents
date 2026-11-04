@@ -700,23 +700,34 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
 }
 
 /// Whether `successor` is exactly the daemon's prepared resume of the stranded
-/// retained Claude card `source`: the same named conversation, launch and
-/// account under a new allocation with no ownership proof yet. This shape is
+/// retained Claude card `source`: the same conversation, launch and account
+/// under a new allocation with no ownership proof yet. This shape is
 /// no authority by itself; only an authenticated `ChatPrepareResume` answer on
 /// the same daemon stream may produce one.
 pub fn is_retained_resume_successor(source: &Session, successor: &Session) -> bool {
+    let valid = |id: &String| uuid::Uuid::parse_str(id).is_ok();
+    // A pane whose actor never reported its conversation resumes the one the
+    // daemon proved that actor confirmed, or, when it confirmed none, starts
+    // one: either way nothing else of its launch changes.
+    let launch = if source.has_unnamed_retained_claude_actor()
+        && successor.launch.session_id.as_ref().is_none_or(valid)
+    {
+        Launch {
+            session_id: None,
+            ..successor.launch.clone()
+        }
+    } else {
+        successor.launch.clone()
+    };
     matches!(
         source.native_continuity,
         NativeContinuity::RetainedClaudeActor { protocol: 2 }
     ) && source.has_valid_native_continuity()
         && source.launch.provider == Provider::Claude
-        && source
-            .launch
-            .session_id
-            .as_ref()
-            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        && (source.launch.session_id.as_ref().is_some_and(valid)
+            || source.has_unnamed_retained_claude_actor())
         && successor.id != source.id
-        && successor.launch == source.launch
+        && launch == source.launch
         && successor.proof.is_none()
         && successor.terminal.is_none()
         && successor.owned_codex_listener.is_none()

@@ -3991,3 +3991,206 @@ fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
         "nothing the abandoned actor held is resubmitted"
     );
 }
+
+#[test]
+fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
+    let _helper_executable = retained_helper_executable();
+    const MODE: &str = "CAGENTS_UNNAMED_CLAUDE_RESUME_TEST";
+    if std::env::var_os(MODE).is_none() {
+        for mode in ["unconfirmed", "confirmed", "abandoned"] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let root = directory.path();
+            for path in [
+                "home/.claude",
+                "run",
+                "data",
+                "config",
+                "cache",
+                "bin",
+                "project",
+            ] {
+                fs::create_dir_all(root.join(path)).unwrap();
+            }
+            let test = thread::current().name().unwrap().to_owned();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env_clear()
+                .env(
+                    "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+                    retained_helper_executable(),
+                )
+                .env(MODE, mode)
+                .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+                .env("CAGENTS_HOLDER_ROOT", root)
+                .env("HOME", root.join("home"))
+                .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+                .env("XDG_RUNTIME_DIR", root.join("run"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_CACHE_HOME", root.join("cache"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", root.join("bin").display()),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "unnamed resume mode={mode} failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
+    let mode = std::env::var(MODE).unwrap();
+    install_provider(&root.join("bin/claude"));
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let proof = |incarnation| HostSessionProof {
+        host_session_id: HostSessionId::new("unnamed-resume-fixture"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new(incarnation),
+    };
+    let registry_path = root.join("registry.sqlite3");
+    let start_host = |proof: HostSessionProof| {
+        let mut state = HostState::new(proof);
+        state.enable_holder_recovery();
+        state.install_model(super::super::model::Registry::at(&registry_path).unwrap());
+        let host = Arc::new(HostLock::new(state));
+        let notifications = super::super::notifications::Broker::start(
+            &host,
+            crate::notifications::Application::Cagents,
+        )
+        .unwrap();
+        host.lock().unwrap().notifications = Some(notifications.handle());
+        (host, notifications)
+    };
+    let first = proof("first");
+    let lease = crate::daemon::HostLease::acquire(&paths, &first).unwrap();
+    let (host, notifications) = start_host(first);
+    let launch = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        root.join("project"),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let id = launch.id;
+    start_execution(
+        &host,
+        0,
+        launch,
+        Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap()),
+    )
+    .unwrap();
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    let identity = handle.actor_identity().unwrap();
+    struct Cleanup(crate::daemon::holder_registry::Record);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for process in [&self.0.root, &self.0.holder] {
+                if process.is_current() {
+                    unsafe {
+                        libc::kill(process.pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+    let _cleanup = Cleanup(identity.record.clone());
+    wait_until(
+        || handle.attachment_snapshot().ready,
+        "actor never initialized",
+    );
+    // The card saved the descriptor before its provider named anything, as a
+    // card does whose UI never saw the conversation ID.
+    let unnamed = host.lock().unwrap().chats[&id].session.clone();
+    assert!(unnamed.has_unnamed_retained_claude_actor());
+    let mut conversation = None;
+    if mode != "unconfirmed" {
+        handle
+            .command(chat::Command::Prompt {
+                text: "One turn the card never learned the ID of".into(),
+                attachments: Vec::new(),
+                mode: chat::PromptMode::Send,
+            })
+            .unwrap();
+        wait_until(
+            || root.join("provider-done").exists() && handle.confirmed_session_id().is_some(),
+            "fixture provider never confirmed its conversation",
+        );
+        conversation = handle.confirmed_session_id();
+    }
+    drop(handle);
+    if mode == "abandoned" {
+        // The daemon and the actor die together after it confirmed a
+        // conversation, so no retirement records which one.
+        drop(notifications);
+        drop(host);
+        drop(lease);
+        for process in [&identity.record.root, &identity.record.holder] {
+            unsafe {
+                libc::kill(process.pid, libc::SIGKILL);
+            }
+        }
+    } else {
+        // An ordinary close retires the actor with a verified receipt that
+        // records the conversation it confirmed, if any.
+        process(&host, 0, ClientRequest::ChatClose { chat_id: id }).unwrap();
+        drop(notifications);
+        drop(host);
+        drop(lease);
+    }
+    wait_until(
+        || !identity.record.holder.is_current() && !identity.record.root.is_current(),
+        "the ended actor never exited",
+    );
+    let next = proof("successor");
+    let _lease = crate::daemon::HostLease::acquire(&paths, &next).unwrap();
+    let (successor, _notifications) = start_host(next);
+    let prepared = process_inner(
+        &successor,
+        17,
+        ClientRequest::ChatPrepareResume {
+            source: unnamed.clone(),
+        },
+    );
+    if mode == "abandoned" {
+        let refused = prepared
+            .err()
+            .expect("an actor that may have confirmed a conversation never starts a new one");
+        assert!(
+            refused
+                .message
+                .contains("without a retirement that records which conversation"),
+            "{}",
+            refused.message
+        );
+        return;
+    }
+    let ServerResponse::ChatResumePrepared { session } = prepared.unwrap() else {
+        panic!("an unnamed card whose actor retired must prepare a successor");
+    };
+    assert_ne!(session.id, unnamed.id);
+    assert_eq!(
+        session.launch.session_id, conversation,
+        "the successor resumes exactly what the ended actor confirmed, and nothing when it confirmed nothing"
+    );
+    assert!(chat::is_retained_resume_successor(&unnamed, &session));
+    assert_eq!(session.proof, None);
+    assert_eq!(
+        session.native_continuity,
+        chat::NativeContinuity::ReconnectOnly
+    );
+    assert!(
+        successor.lock().unwrap().chats.is_empty(),
+        "resume preparation must not launch a provider"
+    );
+    let prompts = fs::read_to_string(root.join("prompts")).unwrap_or_default();
+    assert_eq!(
+        prompts.lines().count(),
+        usize::from(mode == "confirmed"),
+        "nothing the ended actor held is resubmitted"
+    );
+}

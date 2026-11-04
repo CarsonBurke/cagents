@@ -349,6 +349,111 @@ pub(super) fn inspect_resume_retirement(
     }
 }
 
+const UNRECORDED: &str = "The saved Claude actor ended without a retirement that records which conversation it confirmed, so nothing was resumed or started in its place";
+
+/// What a retained Claude pane that never learned its conversation ID
+/// resumes. Every actor of the pane must be proven ended (a kernel boot
+/// change, a verified retirement, or an exit that left no surviving writer)
+/// and retired, since only a retirement records the conversation an actor
+/// confirmed. `Some` is the one conversation those actors confirmed. `None`
+/// proves that none confirmed one, so the pane starts a conversation in
+/// place: Claude names a conversation it was given before it answers
+/// anything, so an actor that never confirmed one never had a prompt
+/// accepted.
+pub(super) fn unnamed_conversation(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<String>, String> {
+    if !source.has_unnamed_retained_claude_actor() {
+        return Err("Only an unnamed retained Claude pane resumes without its conversation".into());
+    }
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    let Some(saved) = source.proof.as_ref().filter(|saved| saved.is_complete()) else {
+        return Err("The unnamed Claude pane has no complete ownership proof".into());
+    };
+    let previous_boot = saved.boot_id != proof.boot_id;
+    let registry = super::super::agent_execution::registry(host)?;
+    let mut after = None;
+    let mut found = false;
+    let mut learned: Option<String> = None;
+    loop {
+        let page = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_actor_ownerships(after, 128)?;
+        if page.is_empty() {
+            break;
+        }
+        for ownership in page {
+            after = Some(ownership.actor());
+            if ownership.source().id != source.id {
+                continue;
+            }
+            found = true;
+            if ownership.is_pending() {
+                return Err("Pending cleanup intent never grants disk resume authority".into());
+            }
+            let retirement = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .native_actor_retirement(ownership.actor())?;
+            if retirement.as_ref().is_some_and(|r| r.is_pending()) {
+                return Err("Pending cleanup retirement never grants disk resume authority".into());
+            }
+            // Only a retirement records what the actor confirmed. An actor
+            // that ended without one may have confirmed a conversation that
+            // nothing durable names, so it never proves there is none.
+            let recorded = retirement
+                .as_ref()
+                .map(|retirement| retirement.confirmed_session().map(str::to_owned))
+                .ok_or(UNRECORDED);
+            let confirmed = if ownership.owner().boot != proof.boot_id {
+                recorded?
+            } else {
+                match Handle::inspect_retained_retirement(ownership.owner(), &proof)? {
+                    crate::chat::runtime::RetirementInspection::Running => {
+                        return Err(
+                            "The saved Claude actor still executes; no replacement was prepared"
+                                .into(),
+                        );
+                    }
+                    crate::chat::runtime::RetirementInspection::ExitedUnproved => {
+                        if !Handle::inspect_abandoned_actor(ownership.owner(), &proof)? {
+                            return Err("The saved Claude actor ended without retirement and part of it may still be running; no replacement was prepared".into());
+                        }
+                        recorded?
+                    }
+                    crate::chat::runtime::RetirementInspection::Verified(verified) => {
+                        verified.receipt().confirmed_session.clone()
+                    }
+                }
+            };
+            let Some(confirmed) = confirmed else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(&confirmed).is_err()
+                || learned
+                    .replace(confirmed.clone())
+                    .is_some_and(|earlier| earlier != confirmed)
+            {
+                return Err(
+                    "The unnamed Claude pane's actors confirmed different conversations".into(),
+                );
+            }
+        }
+    }
+    // An actor is registered before it starts, so a same-boot pane without
+    // one has no ended actor to vouch for; a live record decides instead.
+    if !found && !previous_boot {
+        return Err("The unnamed Claude pane has no registered actor whose end is proved".into());
+    }
+    Ok(learned)
+}
+
 /// Called only for explicit resume, before the separate Codex close reader.
 /// Returning true grants no provider start, account override or input replay.
 pub(super) fn prepare_resume(host: &SharedHost, source: &Session) -> Result<bool, String> {

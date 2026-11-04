@@ -1331,8 +1331,9 @@ fn restore(
 /// group), and allocates it under a new identity so the old allocation's
 /// census is never reused. Nothing the old actor held is resubmitted: the
 /// successor starts the provider on the saved conversation with no input.
-/// A card that never learned its conversation ID cannot name what to resume,
-/// so it keeps its card and offers Retry; it never becomes a draft.
+/// A card that never learned its conversation ID resumes the one the daemon
+/// proves its ended actor confirmed, or starts one in place when the daemon
+/// proves that actor confirmed none; it never becomes a draft.
 fn resume_retained_claude(
     stream: &mut UnixStream,
     codec: &mut FrameCodec,
@@ -1342,15 +1343,10 @@ fn resume_retained_claude(
     resumed_from: &mut Option<Session>,
     refusal: Option<String>,
 ) -> Result<ClientRequest, StartFailure> {
-    if session.launch.session_id.is_none() {
-        // Claude can write a transcript before it reports the conversation
-        // ID, so a missing ID proves nothing about what is on disk. The card
-        // keeps its conversation and offers Retry rather than a draft.
-        return Err(StartFailure::retry(format!(
-            "The saved native conversation could not be reattached. Its uncertain work was not restarted or resubmitted. {}",
-            refusal.unwrap_or_else(|| "No authenticated native holder was available.".to_owned())
-        )));
-    }
+    // An unnamed card also goes to the daemon: only its retirement evidence
+    // proves which conversation, if any, the ended actor confirmed. Claude can
+    // write a transcript before it reports the conversation ID, so the card
+    // never infers a draft from the missing ID itself.
     let request_id = *attach_request;
     *attach_request += 1;
     codec
@@ -3959,13 +3955,59 @@ mod tests {
     }
 
     #[test]
-    fn stranded_retained_claude_card_without_a_conversation_id_keeps_its_card() {
-        let (result, resumed, asked) =
-            resume_stranded(stranded_claude(None), |_| panic!("nothing to resume"));
-        let failure = result.unwrap_err();
-        assert_eq!(failure.recovery, crate::chat::Recovery::Retry);
+    fn stranded_retained_claude_card_without_a_conversation_id_asks_the_daemon() {
+        // The daemon names what the ended actor confirmed, or proves it
+        // confirmed nothing; the card starts that successor either way.
+        for learned in [Some("6f1f6f1e-4a4b-4c4d-8e8f-909192939495"), None] {
+            let source = stranded_claude(None);
+            let (result, resumed, asked) = resume_stranded(source.clone(), move |source| {
+                let mut successor = source.clone();
+                successor.id = TerminalId::new();
+                successor.proof = None;
+                successor.native_continuity = Default::default();
+                successor.launch.session_id = learned.map(str::to_owned);
+                ServerMessage::Response {
+                    response: ServerResponse::ChatResumePrepared { session: successor },
+                }
+            });
+            let Ok(ClientRequest::ChatStart { session, .. }) = result else {
+                panic!("an unnamed card must start the daemon's successor");
+            };
+            assert_eq!(session.launch.session_id.as_deref(), learned);
+            assert_eq!(resumed, Some(source));
+            assert_eq!(asked, 2, "upgrade lineage, then resume preparation");
+        }
+        // A successor that changes anything but the learned conversation is
+        // refused, as is one naming something that is not a conversation.
+        for changed in [true, false] {
+            let (result, resumed, _) = resume_stranded(stranded_claude(None), move |source| {
+                let mut successor = source.clone();
+                successor.id = TerminalId::new();
+                successor.proof = None;
+                successor.native_continuity = Default::default();
+                if changed {
+                    successor.launch.recipe.arguments.push("--other".into());
+                } else {
+                    successor.launch.session_id = Some("not-a-conversation".into());
+                }
+                ServerMessage::Response {
+                    response: ServerResponse::ChatResumePrepared { session: successor },
+                }
+            });
+            assert!(result.is_err());
+            assert!(resumed.is_none());
+        }
+        // Without a retirement that records the conversation, the daemon
+        // refuses, and the card keeps its conversation behind Retry.
+        let (result, resumed, _) = resume_stranded(stranded_claude(None), |_| {
+            ServerMessage::Error(ipc::ProtocolError::new(
+                ipc::ProtocolErrorCode::TerminalUnavailable,
+                "The saved Claude actor ended without a retirement that records which conversation it confirmed",
+                false,
+            ))
+        });
+        assert_eq!(result.unwrap_err().recovery, crate::chat::Recovery::Retry);
         assert!(resumed.is_none());
-        assert_eq!(asked, 1, "only the upgrade lineage is asked");
     }
 
     #[test]

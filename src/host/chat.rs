@@ -2495,7 +2495,10 @@ fn process_inner(
                 .unwrap_or_else(|p| p.into_inner())
                 .proof()
                 .clone();
-            if !source.has_valid_native_continuity() || source.launch.session_id.is_none() {
+            let unnamed = source.has_unnamed_retained_claude_actor();
+            if !source.has_valid_native_continuity()
+                || (source.launch.session_id.is_none() && !unnamed)
+            {
                 return Err(error("Saved conversation has invalid continuity evidence"));
             }
             if let Some(session) =
@@ -2506,10 +2509,25 @@ fn process_inner(
             if let Some(session) = capacity::prepare_saved_history(host, &source)? {
                 return Ok(ServerResponse::ChatResumePrepared { session });
             }
+            // An unnamed pane resumes the conversation its ended actors
+            // confirmed, through the same checks as a named one; when they
+            // confirmed none, every actor's end is already proved and the
+            // pane starts a conversation in place.
+            let ended = source.clone();
+            let mut source = source;
+            let mut unconfirmed = false;
+            if unnamed {
+                match retained_resume::unnamed_conversation(host, &source).map_err(unavailable)? {
+                    Some(conversation) => source.launch.session_id = Some(conversation),
+                    None => unconfirmed = true,
+                }
+            }
             // Classify retained Claude execution before generic discovery:
             // an exited helper may still await its original parent's wait.
             // Errors/unproved exit never fall back to treating it as live.
-            let retirement = if source.launch.provider == Provider::Claude {
+            let retirement = if unconfirmed {
+                retained_resume::ResumeRetirement::Abandoned
+            } else if source.launch.provider == Provider::Claude {
                 retained_resume::inspect_resume_retirement(host, &source).map_err(unavailable)?
             } else {
                 retained_resume::ResumeRetirement::Unclassified
@@ -2517,8 +2535,8 @@ fn process_inner(
             // A present owner must be restored, not replaced. Missing evidence
             // is never proof of a completed close; a runtime record left by a
             // proved retired or abandoned actor is not a present owner.
-            if !retirement.is_classified() && has_native_owner(&source)? {
-                return Ok(ServerResponse::ChatResumePrepared { session: source });
+            if !retirement.is_classified() && has_native_owner(&ended)? {
+                return Ok(ServerResponse::ChatResumePrepared { session: ended });
             }
             // A kernel boot change proves every process from the saved boot
             // is gone. Unlike missing runtime files within the same boot, it
@@ -2526,7 +2544,7 @@ fn process_inner(
             let previous_boot = source.proof.as_ref().is_some_and(|previous| {
                 previous.is_complete() && previous.boot_id != proof.boot_id
             });
-            let closed = if previous_boot {
+            let closed = if previous_boot || unconfirmed {
                 true
             } else if source.launch.provider == Provider::Claude {
                 retained_resume::prepare_resume_verified(host, &source, retirement.verified())
@@ -2544,7 +2562,7 @@ fn process_inner(
             // The old process is proved ended, as after a daemon stop: its
             // authority and unfinished runs end and its agent stays open, so
             // the successor's start can take the agent over.
-            super::agent_execution::stopped(host, &source).map_err(unavailable)?;
+            super::agent_execution::stopped(host, &ended).map_err(unavailable)?;
             let predecessor = source.id;
             let root = source
                 .terminal
