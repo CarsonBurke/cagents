@@ -118,10 +118,10 @@ pub(crate) fn wait_for(
     loop {
         if let Some(change) = monitor.drain().remove(&id) {
             let ready = predicate(&change);
-            last = Some(change);
             if ready {
                 return change;
             }
+            last = Some(change);
         }
         assert!(Instant::now() < deadline, "{phase}: last change {last:?}");
         std::thread::sleep(Duration::from_millis(10));
