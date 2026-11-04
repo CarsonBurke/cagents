@@ -811,7 +811,7 @@ impl Cagents {
         }
     }
 
-    pub(super) fn retry_observed_chat_notices(&mut self) {
+    pub(in crate::app) fn retry_observed_chat_notices(&mut self) {
         let batches = self
             .cards
             .values_mut()
@@ -843,7 +843,7 @@ impl Cagents {
 
     /// Persistent Notices entry, independent of writer health: a failed read or
     /// scope attestation may never have offered a write to the session writer.
-    pub(super) fn observed_capacity_notice_problem(&self) -> Option<(&'static str, bool)> {
+    pub(in crate::app) fn observed_capacity_notice_problem(&self) -> Option<(&'static str, bool)> {
         let batches = self
             .cards
             .values()
@@ -894,7 +894,7 @@ impl Cagents {
 
     /// The global update postlude calls this. Idle frames inspect only small
     /// flags; filesystem work, journal reads and String conversion run on workers.
-    pub(super) fn persist_observed_chat_notices(&mut self) -> Task<Message> {
+    pub(in crate::app) fn persist_observed_chat_notices(&mut self) -> Task<Message> {
         let mut tasks = self
             .chat_ui
             .notice_ready_cleanup
