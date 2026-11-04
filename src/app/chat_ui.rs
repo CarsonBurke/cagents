@@ -12182,14 +12182,16 @@ pub(super) fn with_attachment_chooser_open_for_test(
     drop(app.update(Message::ChatUi(Action::Attached(target, ticket, Ok(None)))));
 }
 
-/// Sends draft `card`'s first message, returning the launch it starts.
+/// Sends draft `card`'s first message through its save, returning the launch it starts.
 #[cfg(test)]
 pub(super) fn start_draft_for_test(app: &mut Cagents, card: CardId) -> chat::Session {
     let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
         panic!("a draft has a chat runtime");
     };
     let target = runtime.target;
-    drop(app.start_chat_draft(target));
+    let (target, attempt, result) =
+        first_start_checkpoint_tests::checkpoint(app.start_chat_draft(target));
+    drop(app.handle_chat_ui(Action::DraftStartCheckpointed(target, attempt, result)));
     let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
         panic!("a starting draft keeps its chat runtime");
     };
