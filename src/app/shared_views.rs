@@ -2027,7 +2027,9 @@ impl Cagents {
             .map(|card| card.title.as_str())
             .filter(|title| !title.is_empty())
             .unwrap_or("This pane");
-        format!("\u{201c}{title}\u{201d} is open only in this window, so your other windows can't see it. {consequence}")
+        format!(
+            "\u{201c}{title}\u{201d} is open only in this window, so your other windows can't see it. {consequence}"
+        )
     }
 
     fn absence_closes_pane(&self, id: CardId, view: &View) -> bool {
