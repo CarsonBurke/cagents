@@ -250,7 +250,7 @@ fn sigil_of(invocation: &str) -> Option<char> {
 /// and whatever the provider spells its skills with.
 pub(super) fn sigils(snapshot: &Snapshot) -> Vec<char> {
     let mut sigils = vec![COMMAND_SIGIL, '@'];
-    for skill in &snapshot.skills {
+    for skill in snapshot.skills.iter() {
         if let Some(sigil) = sigil_of(&skill.invocation)
             && !sigils.contains(&sigil)
         {
@@ -329,7 +329,7 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
             }
         }
     }
-    for skill in &snapshot.skills {
+    for skill in snapshot.skills.iter() {
         // The slash reaches every skill, because it is how a reader arriving
         // from any agent asks for one; the provider's own sigil reaches only
         // its own skills.
@@ -764,7 +764,7 @@ mod tests {
     fn native_permissions_completion_overrides_provider_dialog_and_is_leading_only() {
         let mut snapshot = snapshot();
         snapshot.capabilities.permission_modes = vec!["auto".into()];
-        snapshot.commands.push(SlashCommand {
+        std::sync::Arc::make_mut(&mut snapshot.commands).push(SlashCommand {
             name: "/PERMISSIONS".into(),
             description: "Terminal permissions dialog".into(),
         });
@@ -839,7 +839,8 @@ mod tests {
                     name: "review".into(),
                     description: "Review the diff".into(),
                 },
-            ],
+            ]
+            .into(),
             skills: vec![
                 Skill {
                     name: "commits".into(),
@@ -851,7 +852,8 @@ mod tests {
                     description: "Review a pull request".into(),
                     invocation: "/pr-review".into(),
                 },
-            ],
+            ]
+            .into(),
             ..Snapshot::default()
         }
     }
@@ -940,11 +942,11 @@ mod tests {
         // A name spelled out ranks above longer ones it opens, so Enter on it
         // sends rather than completing to one of them.
         let mut snapshot = snapshot;
-        snapshot.skills[0].name = "review-fast".into();
-        snapshot.skills[0].invocation = "/review-fast".into();
-        snapshot.commands[1].name = "review-all".into();
-        snapshot.skills[1].name = "review".into();
-        snapshot.skills[1].invocation = "/review".into();
+        std::sync::Arc::make_mut(&mut snapshot.skills)[0].name = "review-fast".into();
+        std::sync::Arc::make_mut(&mut snapshot.skills)[0].invocation = "/review-fast".into();
+        std::sync::Arc::make_mut(&mut snapshot.commands)[1].name = "review-all".into();
+        std::sync::Arc::make_mut(&mut snapshot.skills)[1].name = "review".into();
+        std::sync::Arc::make_mut(&mut snapshot.skills)[1].invocation = "/review".into();
         assert_eq!(
             insertions(&snapshot, "/review|"),
             ["/review", "/review-all", "/review-fast"]
@@ -960,7 +962,8 @@ mod tests {
                 name: "review".into(),
                 description: String::new(),
                 invocation: "/skill:review".into(),
-            }],
+            }]
+            .into(),
             ..Snapshot::default()
         };
         assert_eq!(insertions(&snapshot, "/skill:re|"), ["/skill:review"]);
@@ -983,7 +986,8 @@ mod tests {
                 name: "commits".into(),
                 description: String::new(),
                 invocation: "$commits".into(),
-            }],
+            }]
+            .into(),
             capabilities: Capabilities {
                 compact: true,
                 ..Capabilities::default()
@@ -1003,7 +1007,7 @@ mod tests {
     fn resume_is_the_composers_own_command() {
         let mut snapshot = snapshot();
         assert_eq!(insertions(&snapshot, "/resu|"), ["/resume"]);
-        snapshot.commands.push(SlashCommand {
+        std::sync::Arc::make_mut(&mut snapshot.commands).push(SlashCommand {
             name: "/Resume".into(),
             description: "The provider's picker".into(),
         });
@@ -1032,7 +1036,8 @@ mod tests {
                     description: "repo · Lint".into(),
                     invocation: "[$lint](/repo/.codex/skills/lint/SKILL.md)".into(),
                 },
-            ],
+            ]
+            .into(),
             ..Snapshot::default()
         };
         assert_eq!(sigils(&snapshot), ['/', '@', '$']);
@@ -1064,7 +1069,8 @@ mod tests {
                 name: "steward-pr".into(),
                 description: "Own a pull request".into(),
                 invocation: path.into(),
-            }],
+            }]
+            .into(),
             ..Snapshot::default()
         };
         assert_eq!(insertions(&snapshot, "$ste|"), ["$steward-pr"]);

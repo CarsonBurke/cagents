@@ -6857,7 +6857,7 @@ mod tests {
                 id: id.into(),
                 role: chat::Role::Assistant,
                 content: ItemContent::Text {
-                    text,
+                    text: text.into(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },
@@ -7343,7 +7343,7 @@ mod tests {
             (
                 false,
                 ItemContent::Text {
-                    text: paragraph.clone(),
+                    text: (paragraph.clone()).into(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },
@@ -7353,7 +7353,7 @@ mod tests {
             (
                 true,
                 ItemContent::Text {
-                    text: code.clone(),
+                    text: (code.clone()).into(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },
@@ -7363,7 +7363,7 @@ mod tests {
             (
                 false,
                 ItemContent::Text {
-                    text: nested,
+                    text: (nested).into(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },
@@ -7704,6 +7704,7 @@ mod tests {
                             handle.publish_presentation_for_test(Presentation {
                                 base_generation: previous.generation,
                                 file_changes_unchanged: false,
+                                retained_catalogs: Default::default(),
                                 metadata,
                                 order: vec![item.id.clone()],
                                 changes: vec![change],
@@ -7801,7 +7802,7 @@ mod tests {
             id: "same#opaque-id".into(),
             role: chat::Role::User,
             content: ItemContent::Text {
-                text: format!("{}{suffix}", "A long prompt line.\n".repeat(128)),
+                text: (format!("{}{suffix}", "A long prompt line.\n".repeat(128))).into(),
                 thinking: false,
                 phase: chat::Phase::Final,
             },
@@ -8087,7 +8088,7 @@ mod tests {
             id: "cold-rich".into(),
             role: chat::Role::Assistant,
             content: ItemContent::Text {
-                text: source,
+                text: (source).into(),
                 thinking: false,
                 phase: chat::Phase::Final,
             },
@@ -8286,7 +8287,7 @@ mod tests {
                 id: "cold-rich".into(),
                 role: chat::Role::Assistant,
                 content: ItemContent::Text {
-                    text: source,
+                    text: (source).into(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },
@@ -8734,7 +8735,8 @@ mod tests {
                         .map(|index| {
                             format!("## Old {index}\n\n{}\n\n", "reader source ".repeat(12))
                         })
-                        .collect(),
+                        .collect::<String>()
+                        .into(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },
@@ -9114,7 +9116,8 @@ mod tests {
             };
             *text = (0..120)
                 .map(|index| format!("## New {index}\n\n{}\n\n", "replacement source ".repeat(12)))
-                .collect();
+                .collect::<String>()
+                .into();
             handle.replace_snapshot_for_test(latest);
             app.chat_runtime_mut(target).unwrap().refresh();
             assert!(runtime(&app, target).page_request.is_none());
@@ -9257,7 +9260,7 @@ mod tests {
                 id: "cold-rich".into(),
                 role: chat::Role::Assistant,
                 content: ItemContent::Text {
-                    text: source,
+                    text: (source).into(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },
@@ -10463,7 +10466,8 @@ mod tests {
                 reasoning: vec!["low".into(), "high".into()],
             },
             model("model-b", "Fixture model B"),
-        ];
+        ]
+        .into();
         snapshot.selected_model = Some("model-a".into());
         snapshot.reasoning = Some("low".into());
         app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
@@ -10638,11 +10642,12 @@ mod tests {
                 };
                 if state == 5 || state == 6 {
                     if let ItemContent::Text { text, .. } = &mut items.last_mut().unwrap().content {
-                        *text = if state == 5 {
+                        *text = (if state == 5 {
                             "w".repeat(3000)
                         } else {
                             format!("```rust\n{}\n```", "long_code_token".repeat(1000))
-                        };
+                        })
+                        .into();
                     }
                 }
                 let (mut runtime, _handle) = frame_cost::live_runtime(&items);
@@ -11442,7 +11447,7 @@ mod tests {
                 id: "copy-source".into(),
                 role: chat::Role::Assistant,
                 content: ItemContent::Text {
-                    text: source.clone(),
+                    text: (source.clone()).into(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },
@@ -12028,7 +12033,7 @@ mod tests {
             })
             .map(|(role, id)| chat::Item {
                 content: ItemContent::Text {
-                    text: id.clone(),
+                    text: (id.clone()).into(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },
@@ -12121,7 +12126,7 @@ mod tests {
             id: "answer".into(),
             role: chat::Role::Assistant,
             content: ItemContent::Text {
-                text: body("a"),
+                text: (body("a")).into(),
                 thinking: false,
                 phase: chat::Phase::Final,
             },
@@ -12137,7 +12142,7 @@ mod tests {
         assert_eq!(revision, runtime.cache["answer"].revision);
         assert_eq!(before, fingerprints(&runtime, true));
         items[0].content = ItemContent::Text {
-            text: body("b"),
+            text: (body("b")).into(),
             thinking: false,
             phase: chat::Phase::Final,
         };
@@ -12160,7 +12165,7 @@ mod tests {
         );
         // Rewriting an earlier prefix and appending is not an incremental append either.
         items[0].content = ItemContent::Text {
-            text: format!("{}\nMore", body("c")),
+            text: (format!("{}\nMore", body("c"))).into(),
             thinking: false,
             phase: chat::Phase::Final,
         };
@@ -13609,10 +13614,11 @@ mod prepared_disclosure_tests {
             id: "prepared-thought".into(),
             role: chat::Role::Assistant,
             content: ItemContent::Text {
-                text: format!(
+                text: (format!(
                     "Long **thought** {}\n\n```rust\nlet answer = 42;\n```",
                     "ordinary words ".repeat(10_000)
-                ),
+                ))
+                .into(),
                 thinking: true,
                 phase: chat::Phase::Commentary,
             },

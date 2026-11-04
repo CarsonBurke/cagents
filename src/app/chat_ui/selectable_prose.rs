@@ -1252,7 +1252,7 @@ mod tests {
 
         let cached = CachedItem::new(
             &ItemContent::Text {
-                text: "~~x       x~~".to_owned(),
+                text: ("~~x       x~~".to_owned()).into(),
                 thinking: false,
                 phase: chat::Phase::Final,
             },

@@ -2530,7 +2530,7 @@ mod tests {
     ) -> Element<'static, Message> {
         let mut cached = CachedItem::new(
             &ItemContent::Text {
-                text: body.to_owned(),
+                text: (body.to_owned()).into(),
                 thinking: false,
                 phase: chat::Phase::Final,
             },

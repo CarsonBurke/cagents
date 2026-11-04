@@ -10,6 +10,7 @@ use std::path::PathBuf;
 #[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) mod bundled;
 pub mod directory;
+pub mod inspection;
 pub mod mailbox;
 
 use serde::{Deserialize, Serialize};
@@ -511,6 +512,11 @@ pub enum Operation {
     PeekInbox(mailbox::Inbox),
     /// Settle exact received IDs in the authenticated recipient's mailbox.
     AcknowledgeInbox(mailbox::Receipt),
+    /// Read a bounded cached peer chat page. Grants no control or lifecycle access.
+    InspectChat {
+        session: TerminalId,
+        cursor: Option<inspection::Cursor>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -575,6 +581,7 @@ pub enum Reply {
     Sent(mailbox::Sent),
     Inbox(Vec<mailbox::Message>),
     InboxAcknowledged,
+    ChatPage(inspection::Page),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

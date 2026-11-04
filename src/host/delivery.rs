@@ -111,6 +111,7 @@ fn bulk_page(message: &ServerMessage) -> bool {
                 | ServerResponse::ChatFileChanges { .. }
                 | ServerResponse::ChatFileChangePatches { .. }
                 | ServerResponse::ChatTextCopy { .. }
+                | ServerResponse::Agent(crate::agent_execution::Reply::ChatPage(_))
                 | ServerResponse::ChannelWork(
                     crate::channel_work_api::Response::Snapshot(_)
                         | crate::channel_work_api::Response::Applied(_)
@@ -431,6 +432,58 @@ mod tests {
             board: Box::new(board(revision)),
         };
         envelope
+    }
+
+    #[test]
+    fn peer_pages_share_bulk_credit_keep_request_order_and_release_on_overflow_or_abort() {
+        let peer = |request_id| {
+            let mut page = crate::agent_execution::inspection::Page::new(
+                TerminalId::new(),
+                crate::agent_execution::inspection::Coverage::Cached,
+            );
+            page.at_end = true;
+            let mut envelope = redraw(page.session, 0);
+            envelope.request_id = Some(request_id);
+            envelope.message = ServerMessage::Response {
+                response: ServerResponse::Agent(crate::agent_execution::Reply::ChatPage(page)),
+            };
+            envelope
+        };
+        let queue = DeliveryQueue::new(1, 16);
+        queue.push(peer(1)).unwrap();
+        let mut work = work_board(1);
+        work.request_id = Some(2);
+        work.message = ServerMessage::Response {
+            response: ServerResponse::Work(crate::work::Response::Board(board(1))),
+        };
+        queue.push(work).unwrap();
+        assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 2);
+        assert_eq!(queue.pop().unwrap().request_id, Some(1));
+        queue.push(peer(3)).unwrap();
+        assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 2);
+        assert_eq!(queue.pop().unwrap().request_id, Some(2));
+        assert_eq!(queue.pop().unwrap().request_id, Some(3));
+        assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 0);
+
+        queue.push(peer(4)).unwrap();
+        queue.push(peer(5)).unwrap();
+        assert_eq!(queue.push(peer(6)), Err(DeliveryError::Full));
+        assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 0);
+        assert!(matches!(
+            queue.pop().unwrap().message,
+            ServerMessage::Error(ProtocolError {
+                code: ProtocolErrorCode::QueueFull,
+                retryable: true,
+                ..
+            })
+        ));
+        assert!(queue.pop().is_none());
+
+        let aborted = DeliveryQueue::new(2, 16);
+        aborted.push(peer(7)).unwrap();
+        aborted.abort("test client disconnected");
+        assert_eq!(aborted.state.lock().unwrap().queued_bulk_pages, 0);
+        assert!(aborted.pop().is_none());
     }
 
     #[test]

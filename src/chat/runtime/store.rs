@@ -1,6 +1,9 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
+mod append;
+mod completed;
 mod file_changes;
+pub(crate) mod peer_query;
 mod text_copy;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
@@ -45,6 +48,7 @@ pub(super) struct Window {
     pub has_later: bool,
 }
 pub(crate) struct Store {
+    peer_query: peer_query::State,
     db: Connection,
     copy_cache: uuid::Uuid,
     copy_revision: u64,
@@ -56,6 +60,7 @@ pub(crate) struct Store {
     file_keys: usize,
     applied_files: usize,
     pub(super) file_cwd: Option<PathBuf>,
+    pub(super) presented_catalogs: Option<crate::chat::presentation::Catalogs>,
     pub(super) presented_file_changes: Option<(u64, crate::chat::FileChangesCoverage)>,
     directory: PathBuf,
     _lease: fs::File,
@@ -71,6 +76,11 @@ pub(crate) struct Store {
     pub dirty: bool,
     /// Dirty identities are bounded even while the conversation is hidden.
     changed: Option<std::collections::HashSet<String>>,
+    appended: append::Changes,
+    #[cfg(test)]
+    field_bytes: std::cell::Cell<usize>,
+    #[cfg(test)]
+    publication_work: append::Work,
     pub presented_generation: Option<u64>,
     pub presentation: Option<crate::chat::presentation::Presentation>,
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
@@ -234,7 +244,9 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             db.execute_batch(text_copy::SCHEMA)
                 .map_err(|e| e.to_string())?;
+            let peer_query = peer_query::initialize(&db)?;
             Ok(Self {
+                peer_query,
                 copy_cache: uuid::Uuid::new_v4(),
                 copy_revision: 0,
                 copy_projection: Default::default(),
@@ -246,6 +258,7 @@ impl Store {
                 applied_files: 0,
                 file_cwd: None,
                 presented_file_changes: None,
+                presented_catalogs: None,
                 db,
                 directory: directory.clone(),
                 _lease: lease,
@@ -261,6 +274,11 @@ impl Store {
                 messages: None,
                 dirty: true,
                 changed: Some(Default::default()),
+                appended: Default::default(),
+                #[cfg(test)]
+                field_bytes: std::cell::Cell::new(0),
+                #[cfg(test)]
+                publication_work: Default::default(),
                 presented_generation: None,
                 presentation: None,
                 presented_children: Default::default(),
@@ -375,7 +393,11 @@ impl Store {
         // back to the files it belongs to.
         let mut spans: Vec<usize> = Vec::new();
         let (mut body0, body1, body2) = match &mut item.content {
-            ItemContent::Text { text, .. } => (std::mem::take(text), String::new(), String::new()),
+            ItemContent::Text { text, .. } => (
+                std::mem::take(text).into_owned(),
+                String::new(),
+                String::new(),
+            ),
             // A delivery's body is as unbounded as prose; who sent it is identity.
             ItemContent::Delivery { body, .. } => {
                 (std::mem::take(body), String::new(), String::new())
@@ -456,9 +478,14 @@ impl Store {
         } else {
             false
         };
+        // A replacement may commit before its secondary file index fails.
+        // Mark a non-append change before any replacement write can land,
+        // even if a later secondary-index error prevents the final changed().
+        self.changed(&item.id);
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
+        self.peer_query.guard(&transaction)?;
         transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans]).map_err(|e| e.to_string())?;
         if preserve_input {
             transaction
@@ -472,6 +499,7 @@ impl Store {
         }
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
+        peer_query::replace_item(&transaction, &item.id)?;
         let copy_invalidated = Self::copy_parent_put(
             &transaction,
             &item.id,
@@ -751,7 +779,16 @@ impl Store {
     }
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
-    pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
+    pub fn apply(&mut self, event: Event) -> Result<Vec<Event>, String> {
+        // Reset must revoke pending private text before the generic flush below.
+        let mut event = match event {
+            Event::Reset { reason } => {
+                self.appended.clear();
+                return self.reset_peer_cache(reason);
+            }
+            event => event,
+        };
+        self.peer_query.guard_local()?;
         if let Some(seal) = &self.messages {
             match &mut event {
                 Event::Item(item) => seal.recognize(item),
@@ -805,6 +842,7 @@ impl Store {
                 item.at = at;
                 let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
                 let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+                self.peer_query.guard(&transaction)?;
                 insert_body(&transaction, &id, field, offset as i64, &delta)?;
                 let update = if field == 0 {
                     "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1"
@@ -815,7 +853,7 @@ impl Store {
                     .execute(update, params![id, delta.len(), metadata])
                     .map_err(|error| error.to_string())?;
                 transaction.commit().map_err(|error| error.to_string())?;
-                self.changed(&id);
+                self.append_changed(&id, field as usize, offset);
                 self.dirty = true;
             }
             Event::Item(item) => {
@@ -895,6 +933,11 @@ impl Store {
                 self.dirty = true;
             }
             Event::ItemsRemoved { ids } => {
+                // Secondary removal can fail; old append evidence must not
+                // survive an attempted removal followed by reuse of the ID.
+                for id in &ids {
+                    self.changed(id);
+                }
                 self.files_removed(&ids)?;
                 self.copy_remove(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
@@ -906,30 +949,7 @@ impl Store {
                 transaction.commit().map_err(|e| e.to_string())?;
                 self.dirty = true;
             }
-            Event::Reset { reason } => {
-                self.files_reset()?;
-                self.db
-                    .execute("DELETE FROM copy_sources", [])
-                    .map_err(|e| e.to_string())?;
-                self.copy_cache = uuid::Uuid::new_v4();
-                self.copy_revision = self.copy_revision.wrapping_add(1);
-                self.copy_projection.clear();
-                self.db
-                    .execute("DELETE FROM items", [])
-                    .map_err(|e| e.to_string())?;
-                self.end = None;
-                self.first = None;
-                self.newest = None;
-                self.forward = None;
-                self.paging = false;
-                self.provider_earlier = false;
-                self.cached_earlier = false;
-                self.pending_earlier = None;
-                self.latest_boundary = None;
-                self.dirty = true;
-                out.push(Event::Reset { reason });
-                return Ok(out);
-            }
+            Event::Reset { .. } => unreachable!("Reset is handled before pending text flush"),
             Event::HistoryLoading(false) => {
                 // A failed provider request must not leave its cursor waiting
                 // for an unrelated later history response. Successful pages
@@ -963,6 +983,10 @@ impl Store {
         Ok(out)
     }
     fn flush_text(&mut self) -> Result<Option<String>, String> {
+        self.peer_query.guard_local()?;
+        if self.pending_text.is_some() {
+            self.peer_query.guard(&self.db)?;
+        }
         match self.pending_text.take() {
             Some(pending) => match self.append(&pending.0, pending.1, pending.2, &pending.3) {
                 Ok(warning) => Ok(warning),
@@ -991,7 +1015,7 @@ impl Store {
                     // synthesizes to hold the text names the default rather
                     // than inventing narration the provider never declared.
                     content: ItemContent::Text {
-                        text: String::new(),
+                        text: (String::new()).into(),
                         thinking,
                         phase: Phase::Final,
                     },
@@ -1026,6 +1050,7 @@ impl Store {
             item.at = at;
             let stamped = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
             let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+            self.peer_query.guard(&transaction)?;
             insert_body(&transaction, id, 0, length, delta)?;
             transaction
                 .execute(
@@ -1035,7 +1060,7 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             Self::copy_parent_append(&transaction, id, delta.len())?;
             transaction.commit().map_err(|e| e.to_string())?;
-            self.changed(id);
+            self.append_changed(id, 0, length as usize);
         }
         Ok(warning)
     }
@@ -1092,6 +1117,9 @@ impl Store {
         for row in rows {
             result.extend(row.map_err(|e| e.to_string())?);
         }
+        #[cfg(test)]
+        self.field_bytes
+            .set(self.field_bytes.get().saturating_add(result.len()));
         Ok(result)
     }
     fn body(&self, id: &str, len0: usize, start: usize, end: usize) -> Result<Vec<u8>, String> {
@@ -1129,10 +1157,12 @@ impl Store {
         }
     }
     fn changed(&mut self, id: &str) {
+        self.appended.remove(id);
         if let Some(changed) = &mut self.changed {
             changed.insert(id.into());
             if changed.len() > WINDOW_ITEMS * 2 {
                 self.changed = None;
+                self.appended.clear();
             }
         }
     }
@@ -1146,6 +1176,7 @@ impl Store {
     ) -> Result<Window, String> {
         let _ = self.flush_text()?;
         let mut copy_projection = Vec::new();
+        let mut append_residents = Vec::new();
         let old_copy: std::collections::HashMap<_, _> = previous
             .iter()
             .zip(&self.copy_projection)
@@ -1156,6 +1187,7 @@ impl Store {
             .map(|item| (item.id.as_str(), item))
             .collect();
         let mut reused = std::collections::HashSet::new();
+        let mut proven = std::collections::HashSet::new();
         let records = {
             let query = if self.forward.is_some() {
                 "SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
@@ -1269,6 +1301,15 @@ impl Store {
                         Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                     bytes += size;
                     copy_projection.push(copy_source);
+                    // Preserve the existing reuse shortcut without promoting an
+                    // arbitrary caller-supplied Arc into future append authority.
+                    let trusted = self
+                        .appended
+                        .owns(self.copy_cache, &id, 0, start0, previous)
+                        && self
+                            .appended
+                            .owns(self.copy_cache, &id, 1, start1, previous);
+                    append_residents.push(trusted.then(|| (id.clone(), [start0, start1])));
                     items.push(std::sync::Arc::clone(previous));
                     continue;
                 }
@@ -1276,10 +1317,44 @@ impl Store {
                 if part > 0 {
                     item.id = item_id.into_owned();
                 }
-                let body0 = String::from_utf8(self.field(&id, 0, start0, end0)?)
-                    .map_err(|e| e.to_string())?;
-                let body1 = String::from_utf8(self.field(&id, 1, start1, end1)?)
-                    .map_err(|e| e.to_string())?;
+                let resident = old.get(item.id.as_str()).copied();
+                // The root always rebuilds from current authoritative metadata.
+                // Finished nonroot bodies may share bytes, never their old clocks.
+                let shared_text = (part > 0)
+                    .then(|| {
+                        resident.and_then(|previous| {
+                            self.completed_text_body(
+                                &id,
+                                [[start0, end0], [start1, end1]],
+                                previous,
+                                &base,
+                            )
+                        })
+                    })
+                    .flatten();
+                #[cfg(test)]
+                if let Some(shared) = &shared_text {
+                    self.publication_work.completed_reused.set(
+                        self.publication_work
+                            .completed_reused
+                            .get()
+                            .checked_add(shared.len())
+                            .expect("shared payload byte counter overflow"),
+                    );
+                }
+                let (body0, prefix0) = if shared_text.is_some() {
+                    (String::new(), true)
+                } else {
+                    self.field_reusing(&id, 0, start0, end0, resident)?
+                };
+                let (body1, prefix1) = self.field_reusing(&id, 1, start1, end1, resident)?;
+                if match &item.content {
+                    ItemContent::Text { .. } | ItemContent::Command { .. } => prefix0,
+                    ItemContent::Tool { .. } => prefix1,
+                    _ => false,
+                } {
+                    proven.insert(item.id.clone());
+                }
                 // An inline attachment is never paged: half a base64 payload renders as
                 // nothing, so it is restored whole or replaced by an explanation.
                 let attachment =
@@ -1293,7 +1368,19 @@ impl Store {
                     };
                 let attached = attachment.as_ref().map_or(0, String::len);
                 match &mut item.content {
-                    ItemContent::Text { text, .. } => *text = body0,
+                    ItemContent::Text { text, .. } => {
+                        #[cfg(test)]
+                        if shared_text.is_none() {
+                            self.publication_work.materialized.set(
+                                self.publication_work
+                                    .materialized
+                                    .get()
+                                    .checked_add(body0.len())
+                                    .expect("materialized prose byte counter overflow"),
+                            );
+                        }
+                        *text = shared_text.unwrap_or_else(|| body0.into())
+                    }
                     ItemContent::Delivery { body, .. } => *body = body0,
                     ItemContent::Command {
                         label,
@@ -1389,6 +1476,7 @@ impl Store {
                 bytes += size;
                 first = Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                 copy_projection.push(copy_source);
+                append_residents.push(Some((id.clone(), [start0, start1])));
                 items.push(std::sync::Arc::new(item));
             }
         }
@@ -1415,6 +1503,7 @@ impl Store {
         if self.forward.is_none() {
             items.reverse();
             copy_projection.reverse();
+            append_residents.reverse();
         }
         self.cached_earlier = match first {
             Some((ordinal, part)) => {
@@ -1452,13 +1541,22 @@ impl Store {
             self.forward = None;
             self.end = None;
         }
+        let mut unique = std::collections::HashSet::new();
+        let mut ambiguous = std::collections::HashSet::new();
+        for item in &items {
+            if !unique.insert(item.id.as_str()) {
+                ambiguous.insert(item.id.as_str());
+            }
+        }
+        proven.retain(|id| !ambiguous.contains(id.as_str()));
         let changes = items
             .iter()
             .filter(|item| !reused.contains(&item.id))
             .map(|item| {
-                crate::chat::presentation::ItemChange::between(
+                crate::chat::presentation::ItemChange::between_known(
                     old.get(item.id.as_str()).map(|item| item.as_ref()),
                     item,
+                    proven.contains(&item.id),
                 )
             })
             .collect();
@@ -1469,6 +1567,8 @@ impl Store {
         self.dirty = false;
         self.paging = false;
         self.changed = Some(Default::default());
+        self.appended
+            .publish(self.copy_cache, &items, append_residents);
         Ok(Window {
             items,
             changes,
@@ -1880,6 +1980,243 @@ mod tests {
         );
     }
 
+    /// Original PR1298 200-update producer workload, with canonical metadata
+    /// and serialized presentation replay verified outside the producer spans.
+    #[test]
+    #[ignore = "explicit HOST dev-runtime benchmark; actual owning Cargo opt_level must be 2"]
+    fn append_publication_cost_breakdown() {
+        use crate::chat::{
+            Snapshot,
+            presentation::{ItemChange, Presentation},
+        };
+        const UPDATES: usize = 200;
+        const DELTA: &str = " measured stream delta ";
+        struct Frame {
+            wire: Vec<u8>,
+            order: Vec<String>,
+            canonical: Item,
+        }
+        struct Sample {
+            micros: u128,
+            including_capture_micros: u128,
+            sql: usize,
+            prefix: usize,
+            bodies: usize,
+            reused: usize,
+            wire: usize,
+            body_sha256: String,
+            normalized_wire_sha256: String,
+        }
+        fn current_metadata(item: &Item, canonical: &Item) {
+            assert_eq!(item.role, canonical.role);
+            assert_eq!(item.at, canonical.at);
+            assert_eq!(item.started_at, canonical.started_at);
+            assert!(item.at.is_some() && item.started_at.is_some());
+            assert!(matches!((&item.content, &canonical.content),
+                (ItemContent::Text { thinking: a, phase: b, .. },
+                 ItemContent::Text { thinking: c, phase: d, .. }) if a == c && b == d));
+        }
+        fn prose(items: &[std::sync::Arc<Item>]) -> String {
+            items
+                .iter()
+                .map(|item| {
+                    let ItemContent::Text { text, .. } = &item.content else {
+                        panic!("prose part")
+                    };
+                    text.as_str()
+                })
+                .collect()
+        }
+        fn sample(bytes: usize, reuse: bool) -> Sample {
+            let mut store = Store::at(std::env::temp_dir()).unwrap();
+            store
+                .apply(Event::Item(history_item("measured", &"x".repeat(bytes))))
+                .unwrap();
+            let mut previous = store.window().unwrap().items;
+            let initial = previous.clone();
+            store.field_bytes.set(0);
+            store.publication_work = append::Work::default();
+            store.publication_work.disable_reuse.set(!reuse);
+            let mut frames = Vec::with_capacity(UPDATES);
+            let started = std::time::Instant::now();
+            let mut producer_elapsed = std::time::Duration::ZERO;
+            let mut wire = 0;
+            for _ in 0..UPDATES {
+                let producer_started = std::time::Instant::now();
+                store
+                    .apply(Event::TextDelta {
+                        id: "measured".into(),
+                        role: Role::Assistant,
+                        thinking: false,
+                        delta: DELTA.into(),
+                    })
+                    .unwrap();
+                let next = store.window_reusing(&mut previous).unwrap();
+                let encoded = postcard::to_stdvec(&next.changes).unwrap();
+                wire += encoded.len();
+                previous = next.items;
+                drop(next.changes);
+                producer_elapsed += producer_started.elapsed();
+                // Actual SQL metadata is read after every committed publication,
+                // outside its producer span. Keep only serialized wire/IDs and
+                // empty-body metadata; never retain 200 resident body windows.
+                let metadata: Vec<u8> = store
+                    .db
+                    .query_row(
+                        "SELECT metadata FROM items WHERE id='measured'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let canonical: Item = postcard::from_bytes(&metadata).unwrap();
+                for item in &previous {
+                    current_metadata(item, &canonical);
+                }
+                frames.push(Frame {
+                    wire: encoded,
+                    order: previous.iter().map(|item| item.id.clone()).collect(),
+                    canonical,
+                });
+            }
+            let micros = producer_elapsed.as_micros();
+            let including_capture_micros = started.elapsed().as_micros();
+            let sql = store.field_bytes.get();
+            let prefix = store.publication_work.prefix_copied.get();
+            let bodies = store.publication_work.materialized.get();
+            let reused = store.publication_work.completed_reused.get();
+            let cumulative = UPDATES * bytes + DELTA.len() * UPDATES * (UPDATES + 1) / 2;
+            assert_eq!(
+                bodies + reused,
+                cumulative,
+                "each resident prose byte is materialized or shares an existing inner allocation"
+            );
+            if !reuse {
+                assert_eq!(prefix, 0);
+                assert_eq!(reused, 0);
+                assert_eq!(bodies, cumulative);
+                assert!(
+                    sql >= cumulative,
+                    "reference reads all prose plus boundary probes"
+                );
+            }
+            // Replay unmodified actual wire after timing. Normalize ONLY the two
+            // clocks, and only after checking each against that publication's
+            // canonical SQL metadata. Do not compare real wall-clock values or
+            // pretend the raw wire bytes of separate samples are identical.
+            let mut replay = Snapshot {
+                items: initial,
+                ..Default::default()
+            };
+            let mut expected = "x".repeat(bytes);
+            let mut normalized_wire = Sha256::new();
+            for (index, frame) in frames.into_iter().enumerate() {
+                let changes: Vec<ItemChange> = postcard::from_bytes(&frame.wire).unwrap();
+                let mut normalized = changes.clone();
+                for change in &mut normalized {
+                    let (ItemChange::Replace(item) | ItemChange::Append { item, .. }) = change;
+                    current_metadata(item, &frame.canonical);
+                    item.at = item.at.map(|_| 0);
+                    item.started_at = item.started_at.map(|_| 0);
+                }
+                let normalized = postcard::to_stdvec(&(frame.order.clone(), normalized)).unwrap();
+                normalized_wire.update((normalized.len() as u64).to_le_bytes());
+                normalized_wire.update(normalized);
+                replay = Presentation {
+                    base_generation: index as u64,
+                    file_changes_unchanged: false,
+                    retained_catalogs: Default::default(),
+                    metadata: Snapshot {
+                        generation: index as u64 + 1,
+                        ..Default::default()
+                    },
+                    order: frame.order,
+                    changes,
+                    children: Vec::new(),
+                }
+                .apply(&replay)
+                .unwrap();
+                for item in &replay.items {
+                    current_metadata(item, &frame.canonical);
+                }
+                expected.push_str(DELTA);
+                assert_eq!(prose(&replay.items), expected);
+            }
+            assert_eq!(
+                replay.items, previous,
+                "actual final wire retains full current Items"
+            );
+            let actual = prose(&previous);
+            assert_eq!(actual, expected);
+            Sample {
+                micros,
+                including_capture_micros,
+                sql,
+                prefix,
+                bodies,
+                reused,
+                wire,
+                body_sha256: format!("{:x}", Sha256::digest(actual.as_bytes())),
+                normalized_wire_sha256: format!("{:x}", normalized_wire.finalize()),
+            }
+        }
+        eprintln!(
+            "source_bytes,reuse,updates,elapsed_us,sqlite_read_bytes,prefix_copy_bytes,materialized_resident_prose_bytes,reused_completed_inner_arc_payload_bytes,change_wire_bytes"
+        );
+        for bytes in [64 * 1024, 300 * 1024, 1024 * 1024 + 2000] {
+            let reference = sample(bytes, false);
+            let optimized = sample(bytes, true);
+            assert_eq!(reference.body_sha256, optimized.body_sha256);
+            assert_eq!(
+                reference.normalized_wire_sha256,
+                optimized.normalized_wire_sha256
+            );
+            for (enabled, sample) in [(false, &reference), (true, &optimized)] {
+                eprintln!(
+                    "{bytes},{enabled},200,{},{},{},{},{},{}",
+                    sample.micros,
+                    sample.sql,
+                    sample.prefix,
+                    sample.bodies,
+                    sample.reused,
+                    sample.wire
+                );
+                eprintln!(
+                    "APPEND_PUBLICATION_SAMPLE {}",
+                    serde_json::json!({
+                        "source_bytes": bytes, "reuse": enabled, "updates": UPDATES,
+                        "elapsed_us": sample.micros,
+                        "elapsed_including_validation_capture_us": sample.including_capture_micros,
+                        "sqlite_read_bytes": sample.sql, "prefix_copy_bytes": sample.prefix,
+                        "materialized_resident_prose_bytes": sample.bodies,
+                        "completed_inner_arc_reused_payload_bytes": sample.reused,
+                        "change_wire_bytes": sample.wire, "body_sha256": sample.body_sha256,
+                        "normalized_wire_sha256": sample.normalized_wire_sha256,
+                        "normalization": "only canonical-checked at/started_at clock values; presence and all other data retained",
+                        "timing": "sum of 200 apply/window/serialize/handoff spans; excludes canonical capture and deferred wire replay; total capture-inclusive loop also recorded",
+                    })
+                );
+            }
+            assert!(
+                optimized.sql < reference.sql / 4,
+                "validated appends must avoid reading the resident source from SQLite"
+            );
+            assert!(
+                optimized.prefix > 0,
+                "the root exercises actual prefix copies"
+            );
+            if bytes > PART_BYTES * 2 {
+                assert!(
+                    optimized.bodies < reference.bodies * 3 / 4,
+                    "completed fragments must avoid materializing immutable prose"
+                );
+                assert!(
+                    optimized.reused > 0,
+                    "actual completed inner payloads must share storage"
+                );
+            }
+        }
+    }
+
     #[test]
     fn resident_window_reuses_unchanged_bodies_and_pages_resynchronize() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
@@ -1938,6 +2275,7 @@ mod tests {
         let earlier = store.window_reusing(&mut latest.items).unwrap();
         let replayed = crate::chat::presentation::Presentation {
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
             children: Vec::new(),
             base_generation: 1,
             metadata: crate::chat::Snapshot {
@@ -2523,7 +2861,7 @@ mod tests {
                 id: "large".into(),
                 role: Role::Assistant,
                 content: ItemContent::Text {
-                    text: original.clone(),
+                    text: (original.clone()).into(),
                     thinking: false,
                     phase: Phase::Final,
                 },
@@ -2997,7 +3335,7 @@ mod tests {
             id: "text".into(),
             role: Role::Assistant,
             content: ItemContent::Text {
-                text: String::new(),
+                text: (String::new()).into(),
                 thinking: true,
                 phase: Phase::Final,
             },

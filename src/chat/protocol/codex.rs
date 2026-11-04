@@ -3262,7 +3262,7 @@ fn session_notice(text: String) -> Event {
         id: format!("codex-notice:{}", uuid::Uuid::new_v4()),
         role: Role::System,
         content: ItemContent::Text {
-            text,
+            text: text.into(),
             thinking: false,
             phase: Phase::Commentary,
         },
@@ -3577,7 +3577,7 @@ fn parse_item_with_windows(
         id,
         role,
         content: ItemContent::Text {
-            text,
+            text: text.into(),
             thinking,
             phase: Phase::Final,
         },

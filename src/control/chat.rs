@@ -1,11 +1,14 @@
-//! User-authorized resident handle management; never attaches or interrupts work.
+//! Native chat management and bounded same-channel cache inspection.
 use super::*;
 use crate::terminal_ipc::{ChatCapacity, ChatReleaseInspection};
 pub(super) mod image_assets;
+mod inspection;
 pub use image_assets::ImageAssetCommand;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ChatCommand {
+    /// Read one bounded page of a same-channel peer's cached conversation and tool output.
+    Read(inspection::ReadArgs),
     /// Inspect or explicitly remove images stored on this physical device, without a daemon.
     ImageAssets {
         #[command(subcommand)]
@@ -61,6 +64,12 @@ fn validate_command(command: &ChatCommand) -> Result<(), AppError> {
 }
 
 pub(super) fn execute(command: ChatCommand) -> Result<CommandOutput, AppError> {
+    // Peer inspection carries its issued authority in the Agent request. It
+    // must not enter the terminal-management Authenticate connection below.
+    let command = match command {
+        ChatCommand::Read(arguments) => return inspection::execute(arguments),
+        command => command,
+    };
     validate_command(&command)?;
     let socket = control_daemon_socket()?;
     let mut client =
@@ -77,6 +86,10 @@ fn execute_requests(
 ) -> Result<CommandOutput, AppError> {
     validate_command(&command)?;
     match command {
+        ChatCommand::Read(_) => Err(AppError::new(
+            "chat_read_route",
+            "Chat reads require their separate authority-bearing request route",
+        )),
         ChatCommand::ImageAssets { .. } => Err(AppError::new(
             "image_assets_local_only",
             "Image assets require the local physical-store command route",
