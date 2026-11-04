@@ -1411,6 +1411,24 @@ impl StateStore {
         self.rebind_chat_descriptor(card_id, source, replacement)
     }
 
+    /// Commit the daemon-prepared successor of a stranded retained Claude card.
+    /// The daemon allocated it only after proving the old owner gone; the card
+    /// keeps the same named conversation, launch and account under the new
+    /// allocation that the successor's own start proved.
+    pub fn rebind_chat_resume(
+        &self,
+        card_id: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<()> {
+        if !crate::chat::is_retained_resume_commit(source, replacement) {
+            return Err(StoreError::InvalidState(
+                "The resumed conversation is not the exact successor of the saved one".into(),
+            ));
+        }
+        self.rebind_chat_descriptor(card_id, source, replacement)
+    }
+
     /// Commit a provider-confirmed descriptor transition from authenticated daemon
     /// upgrade lineage. Ordinary snapshots cannot authorize this transition.
     pub fn rebind_chat_upgrade(

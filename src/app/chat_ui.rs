@@ -242,6 +242,7 @@ pub enum Action {
     Ready(Target, Ready),
     AccountCommitted(Target, Ready, Result<(), String>),
     UpgradeCommitted(Target, Ready, Result<(), String>),
+    ResumeCommitted(Target, Ready, Result<(), String>),
     RetainedCopyCommitted(CardId, Result<(), String>),
     /// The result of giving up a conversation's daemon actor after its card
     /// stopped holding it: a closed card, an abandoned start, or a start that
@@ -497,6 +498,7 @@ impl Action {
                 | Self::FlowReady(..)
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
+                | Self::ResumeCommitted(..)
                 | Self::RetainedCopyCommitted(..)
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
@@ -609,6 +611,9 @@ struct Attempt {
     session: chat::Session,
     recovery: Option<AccountRecovery>,
     upgrade_committed: bool,
+    /// Whether the daemon-prepared successor of a stranded retained card has
+    /// been saved in that card's place.
+    resume_committed: bool,
     /// Exact authoritative target; only authenticated upgrade resolution may bind its draft.
     upgrade_admission: Option<chat::Session>,
 }
@@ -6510,6 +6515,7 @@ impl Cagents {
                 intent: chat::Intent::Restore,
                 session: replacement.clone(),
                 upgrade_committed: false,
+                resume_committed: false,
                 upgrade_admission: None,
                 recovery: Some(AccountRecovery {
                     source: source.clone(),
@@ -8299,6 +8305,7 @@ impl Cagents {
                 session: session.clone(),
                 recovery: None,
                 upgrade_committed: false,
+                resume_committed: false,
                 upgrade_admission: upgrade_admission.clone(),
             }),
         );
@@ -9843,6 +9850,42 @@ impl Cagents {
                 }
                 return self.update(Message::ChatUi(Action::Ready(target, ready)));
             }
+            Action::ResumeCommitted(target, ready, result) => {
+                match result {
+                    Ok(()) => {
+                        if let Some(Phase::Starting(attempt)) =
+                            self.chat_ui.phases.get_mut(&target.card)
+                            && attempt.target == target
+                        {
+                            attempt.resume_committed = true;
+                        }
+                    }
+                    Err(error) => {
+                        // The successor's own start cannot be kept without the
+                        // card that names it, so it is given up again; the card
+                        // keeps its saved conversation for the next attempt.
+                        let started = ready
+                            .0
+                            .lock()
+                            .ok()
+                            .and_then(|mut reply| {
+                                let started = reply.take().and_then(Result::ok);
+                                *reply = Some(Err(chat::StartFailure::retry(format!(
+                                    "The reopened conversation was not saved: {error}. Its saved identity is retained; retry to reopen it."
+                                ))));
+                                started
+                            });
+                        let retire = started.map_or_else(Task::none, |handle| {
+                            self.retire_chat(target.card, Some(handle), None)
+                        });
+                        return Task::batch([
+                            retire,
+                            self.update(Message::ChatUi(Action::Ready(target, ready))),
+                        ]);
+                    }
+                }
+                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+            }
             Action::AccountCommitted(target, ready, result) => {
                 match result {
                     Ok(()) => {
@@ -9895,6 +9938,11 @@ impl Cagents {
                     .ok()
                     .and_then(|handle| handle.upgrade_recovery())
                     .map(|(source, _)| source);
+                let resumed_source = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|handle| handle.resumed_from())
+                    .cloned();
                 if !self.card_state(target.card).is_some_and(|card| {
                     card.existence.is_open()
                         && match &card.kind {
@@ -9904,6 +9952,7 @@ impl Cagents {
                                         account_source
                                             .as_ref()
                                             .or(upgrade_source)
+                                            .or(resumed_source.as_ref())
                                             .map_or(session.id == attempt.session.id, |source| {
                                                 session == source
                                             })
@@ -10027,6 +10076,57 @@ impl Cagents {
                                         Err(error) => Err(error),
                                     };
                                     Message::ChatUi(Action::UpgradeCommitted(target, ready, result))
+                                });
+                            }
+                        }
+                        if let Some(source) = &resumed_source {
+                            let replacement = handle.session();
+                            if account_source.is_some()
+                                || source != &attempt.session
+                                || !chat::is_retained_resume_commit(source, &replacement)
+                                || handle
+                                    .snapshot()
+                                    .session_id
+                                    .as_ref()
+                                    .is_some_and(|id| Some(id) != source.launch.session_id.as_ref())
+                            {
+                                self.status = Some(TransientNotice::error(
+                                    "The reopened conversation did not match the saved one. Its saved identity is retained.",
+                                ));
+                                return self.retire_chat(target.card, Some(handle), None);
+                            }
+                            if !attempt.resume_committed {
+                                let receipt = self
+                                    .session
+                                    .as_ref()
+                                    .ok_or_else(|| "Session storage is unavailable".to_owned())
+                                    .and_then(|writer| {
+                                        writer.rebind_chat_resume(
+                                            target.card,
+                                            source.clone(),
+                                            replacement,
+                                        )
+                                    });
+                                self.chat_ui
+                                    .phases
+                                    .insert(target.card, Phase::Starting(attempt));
+                                let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
+                                return cosmic::task::future(async move {
+                                    let result = match receipt {
+                                        Ok(receipt) => tokio::task::spawn_blocking(move || {
+                                            receipt
+                                                .recv()
+                                                .map_err(|error| {
+                                                    format!("Session writer disconnected: {error}")
+                                                })
+                                                .and_then(|result| result)
+                                        })
+                                        .await
+                                        .map_err(|error| error.to_string())
+                                        .and_then(|result| result),
+                                        Err(error) => Err(error),
+                                    };
+                                    Message::ChatUi(Action::ResumeCommitted(target, ready, result))
                                 });
                             }
                         }
@@ -10162,7 +10262,10 @@ impl Cagents {
                         }
                         self.chat_ui.explicit_starts.remove(&target.card);
                         self.resolve_notice(NoticeKey::ChatAttach(target.card));
-                        if account_source.is_some() || attempt.upgrade_admission.is_some() {
+                        if account_source.is_some()
+                            || resumed_source.is_some()
+                            || attempt.upgrade_admission.is_some()
+                        {
                             // Shared projection may already hold the canonical
                             // descriptor. Still save the confirmed draft and
                             // removal of its pending marker after the receipt.
@@ -24884,6 +24987,7 @@ mod tests {
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
+                    resume_committed: false,
                     upgrade_admission: None,
                 }),
             );
@@ -24942,6 +25046,7 @@ mod tests {
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
+                        resume_committed: false,
                         upgrade_admission: None,
                     }),
                 );
@@ -29342,6 +29447,7 @@ mod tests {
                         submit: None,
                     }),
                     upgrade_committed: false,
+                    resume_committed: false,
                     upgrade_admission: None,
                 }),
                 "return" => Phase::Returning {
@@ -29359,6 +29465,7 @@ mod tests {
                         session: other,
                         recovery: None,
                         upgrade_committed: false,
+                        resume_committed: false,
                         upgrade_admission: None,
                     })
                 }
@@ -29643,6 +29750,7 @@ mod tests {
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
+                    resume_committed: false,
                     upgrade_admission: None,
                 }),
             );
@@ -29721,6 +29829,7 @@ mod tests {
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
+                        resume_committed: false,
                         upgrade_admission: None,
                     }),
                 );

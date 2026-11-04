@@ -542,6 +542,8 @@ struct InnerPayload {
     id: TerminalId,
     session: Session,
     upgrade_recovery: Option<UpgradeRecovery>,
+    /// The stranded card this handle's daemon-prepared successor replaces.
+    resumed_from: Option<Session>,
     proof: HostSessionProof,
     wire: Arc<Mutex<Wire>>,
     cancel: UnixStream,
@@ -1111,6 +1113,7 @@ fn restore(
     proof: &HostSessionProof,
     mut session: Session,
     upgrade_recovery: &mut Option<(Session, Session)>,
+    resumed_from: &mut Option<Session>,
     retry_explicit_start: bool,
 ) -> Result<ClientRequest, StartFailure> {
     if session.proof.as_ref() == Some(proof) && !retry_explicit_start {
@@ -1272,6 +1275,21 @@ fn restore(
             Err(message) => refusal = Some(message),
         }
     }
+    if matches!(
+        session.native_continuity,
+        super::NativeContinuity::RetainedClaudeActor { .. }
+    ) && session.launch.provider == crate::agent::Provider::Claude
+    {
+        return resume_retained_claude(
+            stream,
+            codec,
+            attach_request,
+            proof,
+            session,
+            resumed_from,
+            refusal,
+        );
+    }
     if session.native_continuity.retains_provider() {
         return Err(StartFailure::from(format!(
             "The saved native conversation could not be reattached. Its uncertain work was not restarted or resubmitted. {}",
@@ -1303,6 +1321,78 @@ fn restore(
         execution_environment,
     })
 }
+/// A retained Claude card whose helper no daemon hosts any more, typically
+/// because an application update or crash outlived it.
+///
+/// Its conversation is still on disk, so the card asks the daemon for the same
+/// proof-checked successor the resume picker uses: the daemon only prepares
+/// one when the old owner's exit is proved (a previous kernel boot, a verified
+/// retirement, or an exited helper and provider with no surviving process
+/// group), and allocates it under a new identity so the old allocation's
+/// census is never reused. Nothing the old actor held is resubmitted: the
+/// successor starts the provider on the saved conversation with no input.
+/// A card that never learned its conversation has nothing to resume and opens
+/// as a draft instead.
+fn resume_retained_claude(
+    stream: &mut UnixStream,
+    codec: &mut FrameCodec,
+    attach_request: &mut u64,
+    proof: &HostSessionProof,
+    session: Session,
+    resumed_from: &mut Option<Session>,
+    refusal: Option<String>,
+) -> Result<ClientRequest, StartFailure> {
+    if session.launch.session_id.is_none() {
+        return Err(StartFailure::fresh(format!(
+            "The helper that was hosting this conversation is no longer running, and it never recorded a conversation to resume. {}",
+            refusal.unwrap_or_else(|| "No authenticated native holder was available.".to_owned())
+        )));
+    }
+    let request_id = *attach_request;
+    *attach_request += 1;
+    codec
+        .write(
+            stream,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id,
+                proof: Some(proof.clone()),
+                request: ClientRequest::ChatPrepareResume {
+                    source: session.clone(),
+                },
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let prepared = match receive(stream, codec, request_id, Some(proof)) {
+        Ok(ServerResponse::ChatResumePrepared { session: prepared }) => prepared,
+        Ok(_) => return Err("The daemon did not answer the saved conversation's resume".into()),
+        Err(reason) => {
+            return Err(StartFailure::retry(format!(
+                "The saved conversation could not be reopened yet, so nothing was restarted or resent. {reason}"
+            )));
+        }
+    };
+    if prepared == session {
+        // The daemon still sees an owner for this allocation. It is restored,
+        // never replaced, so the card waits for that owner rather than racing it.
+        return Err(StartFailure::retry(format!(
+            "This conversation's previous helper still owns it, so no replacement was started. {}",
+            refusal.unwrap_or_else(|| "Retry once it has finished closing.".to_owned())
+        )));
+    }
+    if !super::is_retained_resume_successor(&session, &prepared) {
+        return Err("The daemon's resume changed the saved conversation".into());
+    }
+    *resumed_from = Some(session);
+    let execution_environment = native_environment(&prepared, true);
+    Ok(ClientRequest::ChatStart {
+        session: prepared,
+        source: None,
+        terminate_source: false,
+        execution_environment,
+    })
+}
+
 impl ClientHandle {
     /// A handle whose snapshot the UI can render without a daemon.
     ///
@@ -1333,6 +1423,7 @@ impl ClientHandle {
                     id: session.id,
                     session,
                     upgrade_recovery: None,
+                    resumed_from: None,
                     proof,
                     wire: Arc::new(Mutex::new(Wire {
                         stream,
@@ -1870,9 +1961,10 @@ impl ClientHandle {
             // retained actor and exact descriptor under this authenticated epoch.
             session.proof = Some(proof.clone());
         }
-        let id = session.id;
+        let mut id = session.id;
         let mut attach_request = 2;
         let mut upgrade_recovery = None;
+        let mut resumed_from = None;
         let request = if let Some(expected) = upgrade_expected {
             if expected.proof.as_ref() != Some(&proof) {
                 return Err("The canonical chat belongs to a different daemon".into());
@@ -1933,9 +2025,17 @@ impl ClientHandle {
                 &proof,
                 session,
                 &mut upgrade_recovery,
+                &mut resumed_from,
                 intent == Intent::RetryStart,
             )?
         };
+        if let ClientRequest::ChatStart { session, .. } = &request
+            && resumed_from.is_some()
+        {
+            // A proved successor is attached under the identity the daemon
+            // allocated for it, never the stranded allocation's.
+            id = session.id;
+        }
         codec
             .write(
                 &mut stream,
@@ -2062,6 +2162,7 @@ impl ClientHandle {
                 id,
                 session,
                 upgrade_recovery,
+                resumed_from,
                 proof: proof.clone(),
                 wire: wire.clone(),
                 cancel,
@@ -2380,6 +2481,11 @@ impl ClientHandle {
             .upgrade_recovery
             .as_ref()
             .map(|recovery| &recovery.sessions)
+    }
+    /// The saved card whose stranded retained owner this successor replaces,
+    /// when the daemon proved that owner gone and prepared a resume.
+    pub(crate) fn resumed_from(&self) -> Option<&Session> {
+        self.inner.resumed_from.as_ref()
     }
     pub(crate) fn authenticated_upgrade_recovery(&self) -> Option<&UpgradeRecovery> {
         self.inner.upgrade_recovery.as_ref()
@@ -3689,6 +3795,176 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// A retained Claude card whose helper no daemon hosts asks the daemon for
+    /// a proved successor, and the answer decides what the card does.
+    fn resume_stranded(
+        source: Session,
+        answer: impl FnOnce(&Session) -> ServerMessage + Send + 'static,
+    ) -> (Result<ClientRequest, StartFailure>, Option<Session>, usize) {
+        let live = host_proof("current");
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let server_proof = live.clone();
+        let expected = source.clone();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let mut answer = Some(answer);
+            let mut asked = 0;
+            while let Ok(Some(request)) = codec.read::<ClientEnvelope>(&mut server) {
+                asked += 1;
+                let message = match request.request {
+                    ClientRequest::ChatList => ServerMessage::Response {
+                        response: ServerResponse::ChatListed { sessions: vec![] },
+                    },
+                    ClientRequest::ResolveUpgradeChat { source } if source == expected => {
+                        ServerMessage::Error(ipc::ProtocolError::new(
+                            ipc::ProtocolErrorCode::TerminalUnavailable,
+                            "The durable native holder is unavailable",
+                            false,
+                        ))
+                    }
+                    ClientRequest::ChatPrepareResume { source } if source == expected => {
+                        (answer.take().unwrap())(&source)
+                    }
+                    other => panic!("unexpected stranded-card request: {other:?}"),
+                };
+                codec
+                    .write(
+                        &mut server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request.request_id),
+                            proof: server_proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            }
+            asked
+        });
+        let mut resumed = None;
+        let result = restore(
+            &mut client,
+            &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+            &mut 2,
+            &live,
+            source,
+            &mut None,
+            &mut resumed,
+            false,
+        );
+        drop(client);
+        (result, resumed, worker.join().unwrap())
+    }
+
+    fn stranded_claude(session_id: Option<&str>) -> Session {
+        let mut source = omp_card(session_id, Some(host_proof("previous")));
+        source.launch.provider = crate::agent::Provider::Claude;
+        source.launch.recipe.program = "claude".into();
+        source.launch.recipe.arguments = vec!["--model".into(), "haiku".into()];
+        source.native_continuity =
+            super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        assert!(source.has_valid_native_continuity());
+        source
+    }
+
+    #[test]
+    fn stranded_retained_claude_card_starts_the_daemon_prepared_successor() {
+        let source = stranded_claude(Some("6f1f6f1e-4a4b-4c4d-8e8f-909192939495"));
+        let (result, resumed, asked) = resume_stranded(source.clone(), |source| {
+            let mut successor = source.clone();
+            successor.id = TerminalId::new();
+            successor.proof = None;
+            successor.native_continuity = Default::default();
+            ServerMessage::Response {
+                response: ServerResponse::ChatResumePrepared { session: successor },
+            }
+        });
+        let Ok(ClientRequest::ChatStart {
+            session,
+            source: None,
+            terminate_source: false,
+            ..
+        }) = result
+        else {
+            panic!("a proved successor must be started: {result:?}");
+        };
+        assert_eq!(asked, 2, "upgrade lineage, then resume preparation");
+        assert_ne!(session.id, source.id);
+        assert_eq!(session.launch, source.launch);
+        assert!(session.proof.is_none());
+        assert!(super::super::is_retained_resume_successor(
+            &source, &session
+        ));
+        assert_eq!(resumed.as_ref(), Some(&source));
+        // The daemon's start proves the successor; only that form commits.
+        let mut started = session.clone();
+        assert!(!super::super::is_retained_resume_commit(&source, &started));
+        started.proof = Some(host_proof("current"));
+        started.native_continuity =
+            super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        assert!(super::super::is_retained_resume_commit(&source, &started));
+        started.launch.recipe.arguments.push("--other".into());
+        assert!(!super::super::is_retained_resume_commit(&source, &started));
+    }
+
+    #[test]
+    fn stranded_retained_claude_card_never_replaces_a_live_or_unproved_owner() {
+        let source = stranded_claude(Some("6f1f6f1e-4a4b-4c4d-8e8f-909192939495"));
+        // A still-present owner is returned unchanged: attach, never replace.
+        let (result, resumed, _) =
+            resume_stranded(source.clone(), |source| ServerMessage::Response {
+                response: ServerResponse::ChatResumePrepared {
+                    session: source.clone(),
+                },
+            });
+        let failure = result.unwrap_err();
+        assert_eq!(failure.recovery, crate::chat::Recovery::Retry);
+        assert!(failure.message.contains("still owns it"));
+        assert!(resumed.is_none());
+        // An unproved exit is refused by the daemon, and the reason is shown.
+        let (result, resumed, _) = resume_stranded(source.clone(), |_| {
+            ServerMessage::Error(ipc::ProtocolError::new(
+                ipc::ProtocolErrorCode::TerminalUnavailable,
+                "The old provider owner has no confirmed close receipt.",
+                false,
+            ))
+        });
+        let failure = result.unwrap_err();
+        assert_eq!(failure.recovery, crate::chat::Recovery::Retry);
+        assert!(failure.message.contains("no confirmed close receipt"));
+        assert!(failure.message.contains("nothing was restarted or resent"));
+        assert!(resumed.is_none());
+        // A successor that changed the conversation is never started.
+        let (result, resumed, _) = resume_stranded(source, |source| {
+            let mut successor = source.clone();
+            successor.id = TerminalId::new();
+            successor.proof = None;
+            successor.native_continuity = Default::default();
+            successor.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            ServerMessage::Response {
+                response: ServerResponse::ChatResumePrepared { session: successor },
+            }
+        });
+        assert!(result.is_err());
+        assert!(resumed.is_none());
+    }
+
+    #[test]
+    fn stranded_retained_claude_card_without_a_conversation_opens_as_a_draft() {
+        let (result, resumed, asked) =
+            resume_stranded(stranded_claude(None), |_| panic!("nothing to resume"));
+        let failure = result.unwrap_err();
+        assert_eq!(failure.recovery, crate::chat::Recovery::Fresh);
+        assert!(resumed.is_none());
+        assert_eq!(asked, 1, "only the upgrade lineage is asked");
+    }
+
     #[test]
     fn explicit_retry_classifies_exact_history_reader_and_live_successor() {
         for state in 0..5 {
@@ -3759,6 +4035,7 @@ mod tests {
                 &proof,
                 source,
                 &mut None,
+                &mut None,
                 true,
             );
             worker.join().unwrap();
@@ -3820,6 +4097,7 @@ mod tests {
             live,
             session,
             &mut recovery,
+            &mut None,
             false,
         );
         (outcome, worker.join().unwrap(), recovery)
@@ -3955,6 +4233,7 @@ mod tests {
             &mut request_id,
             &live,
             omp_card(Some(CONVERSATION), Some(live.clone())),
+            &mut None,
             &mut None,
             false,
         )

@@ -699,6 +699,45 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
     }
 }
 
+/// Whether `successor` is exactly the daemon's prepared resume of the stranded
+/// retained Claude card `source`: the same named conversation, launch and
+/// account under a new allocation with no ownership proof yet. This shape is
+/// no authority by itself; only an authenticated `ChatPrepareResume` answer on
+/// the same daemon stream may produce one.
+pub fn is_retained_resume_successor(source: &Session, successor: &Session) -> bool {
+    matches!(
+        source.native_continuity,
+        NativeContinuity::RetainedClaudeActor { protocol: 2 }
+    ) && source.has_valid_native_continuity()
+        && source.launch.provider == Provider::Claude
+        && source
+            .launch
+            .session_id
+            .as_ref()
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        && successor.id != source.id
+        && successor.launch == source.launch
+        && successor.proof.is_none()
+        && successor.terminal.is_none()
+        && successor.owned_codex_listener.is_none()
+        && successor.native_continuity == NativeContinuity::ReconnectOnly
+}
+
+/// Whether `started` is the daemon's started form of a prepared resume
+/// successor of `source`: started under a complete ownership proof, on the
+/// exact saved conversation, with only the continuity it learned on install.
+pub fn is_retained_resume_commit(source: &Session, started: &Session) -> bool {
+    let mut prepared = started.clone();
+    prepared.proof = None;
+    prepared.native_continuity = NativeContinuity::ReconnectOnly;
+    is_retained_resume_successor(source, &prepared)
+        && started
+            .proof
+            .as_ref()
+            .is_some_and(crate::model::HostSessionProof::is_complete)
+        && started.has_valid_native_continuity()
+}
+
 /// A formerly hosted pane may never have observed its first provider identity.
 /// This narrow transition is usable only after authenticated upgrade resolution,
 /// exact attachment and snapshot confirmation, followed by a writer receipt.
