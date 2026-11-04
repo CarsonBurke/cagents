@@ -259,18 +259,30 @@ impl Installation {
     }
 
     fn state_dir(&self) -> Result<PathBuf, UpdateError> {
-        let path = self.prefix.join(".update");
-        match fs::DirBuilder::new().mode(0o700).create(&path) {
-            Ok(()) => (),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
-            Err(error) => return Err(error.into()),
-        }
-        let meta = fs::symlink_metadata(&path)?;
-        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
-            return Err(invalid("unsafe updater state directory"));
-        }
-        Ok(path)
+        state_dir(&self.prefix)
     }
+}
+
+fn state_dir(prefix: &Path) -> Result<PathBuf, UpdateError> {
+    let path = prefix.join(".update");
+    match fs::DirBuilder::new().mode(0o700).create(&path) {
+        Ok(()) => (),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error.into()),
+    }
+    let meta = fs::symlink_metadata(&path)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err(invalid("unsafe updater state directory"));
+    }
+    Ok(path)
+}
+
+/// Holds the update job lease of the installation at `prefix`, so no job can
+/// run or start while the caller changes what that installation serves.
+/// [`UpdateError::Busy`] means a job is active: its worker keeps the lease for
+/// its whole lifetime, including review and confirmation.
+pub(crate) fn exclude_update_jobs(prefix: &Path) -> Result<File, UpdateError> {
+    acquire_lock(&state_dir(prefix)?)
 }
 
 fn invalid(message: impl Into<String>) -> UpdateError {
@@ -416,12 +428,7 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
 pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
-    let served = served_version_root(&layout)?;
-    if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
-        return Err(invalid(
-            "the installed candidate changed; inspect the installation again",
-        ));
-    }
+    let served = still_served(&layout, executable)?;
     // A newly opened UI may already be current while an older daemon still
     // owns the sessions. Ordinary skew uses that owner's CLI; an authenticated
     // supported source also permits bootstrap from the staged coordinator.
@@ -903,6 +910,19 @@ fn served_version_root(layout: &InstallLayout) -> Result<PathBuf, UpdateError> {
     if served_layout.prefix != layout.prefix || served_layout.version_root != served {
         return Err(invalid(
             "the installation does not serve a complete version of itself",
+        ));
+    }
+    Ok(served)
+}
+
+/// The served version tree, provided it is still the one whose UI `offered`
+/// names. A window offers the tree it last inspected; `current` can since have
+/// been selected elsewhere, and the user approved only what they were shown.
+fn still_served(layout: &InstallLayout, offered: &Path) -> Result<PathBuf, UpdateError> {
+    let served = served_version_root(layout)?;
+    if offered.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
+        return Err(invalid(
+            "the installed candidate changed; inspect the installation again",
         ));
     }
     Ok(served)
