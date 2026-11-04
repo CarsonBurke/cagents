@@ -224,7 +224,7 @@ hayro = { version = "0.7.1", optional = true }
 # Seals the messages the daemon delivers between sessions, so a conversation
 # can tell them apart from text that merely looks like one. Daemon only.
 hmac = { version = "0.12", optional = true }
-image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "pnm"], optional = true }
 iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
 # Exact same package/source as libcosmic's iced; only its hot feature is added.
 iced_hot = { package = "iced", git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, optional = true }

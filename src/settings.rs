@@ -664,6 +664,14 @@ const fn default_focus_follows_mouse() -> bool {
     false
 }
 
+const fn default_editor_auto_close() -> bool {
+    true
+}
+
+const fn default_editor_tab_width() -> u16 {
+    4
+}
+
 const fn default_editor_auto_save() -> bool {
     true
 }
@@ -882,6 +890,10 @@ pub struct AppSettings {
     pub browser_search_url: String,
     #[serde(default)]
     pub editor_wrap_lines: bool,
+    #[serde(default = "default_editor_tab_width")]
+    pub editor_tab_width: u16,
+    #[serde(default = "default_editor_auto_close")]
+    pub editor_auto_close: bool,
     #[serde(default = "default_diff_hide_unchanged")]
     pub diff_hide_unchanged: bool,
     #[serde(default)]
@@ -1006,6 +1018,8 @@ impl Default for AppSettings {
             confirm_multiline_paste: true,
             browser_search_url: default_browser_search_url(),
             editor_wrap_lines: false,
+            editor_tab_width: default_editor_tab_width(),
+            editor_auto_close: default_editor_auto_close(),
             diff_hide_unchanged: default_diff_hide_unchanged(),
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
@@ -1724,6 +1738,11 @@ impl AppSettings {
         if !(8.0..=40.0).contains(&self.terminal_font_size) {
             return Err(SettingsError::Invalid(
                 "terminal_font_size must be between 8 and 40",
+            ));
+        }
+        if !(1..=16).contains(&self.editor_tab_width) {
+            return Err(SettingsError::Invalid(
+                "editor_tab_width must be between 1 and 16".into(),
             ));
         }
         if self

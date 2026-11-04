@@ -37,6 +37,36 @@ impl Editor {
         buffer_from_editor(&self.internal().editor)
     }
 
+    /// Returns the expanded source extent of normal, word or line selection.
+    pub fn selection_bounds(&self) -> Option<(Position, Position)> {
+        self.internal()
+            .editor
+            .selection_bounds()
+            .map(|(start, end)| {
+                (
+                    Position {
+                        line: start.line,
+                        column: start.index,
+                    },
+                    Position {
+                        line: end.line,
+                        column: end.index,
+                    },
+                )
+            })
+    }
+
+    /// Changes native tab stops while retaining text, selection and scroll.
+    pub fn set_tab_width(&mut self, width: u16) {
+        if width == 0 || self.buffer().tab_width() == width {
+            return;
+        }
+        self.with_internal_mut(|internal| {
+            buffer_mut_from_editor(&mut internal.editor).set_tab_width(width);
+            internal.topmost_line_changed = Some(0);
+        });
+    }
+
     /// Creates a [`Weak`] reference to the [`Editor`].
     ///
     /// This is useful to avoid cloning the [`Editor`] when
