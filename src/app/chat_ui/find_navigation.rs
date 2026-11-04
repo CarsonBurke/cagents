@@ -604,10 +604,7 @@ pub(super) fn availability_stream() -> impl iced::futures::Stream<Item = Message
     )
 }
 fn admit() -> Option<Slot> {
-    static WORKER: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    WORKER
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone()
+    application_capacity!(1)
         .try_acquire_owned()
         .ok()
         .map(|permit| Slot(Some(permit)))
@@ -711,6 +708,8 @@ struct RawInput {
     query: String,
     groups: Vec<(String, Vec<RawItem>)>,
     provider: Provider,
+    // Captured on the UI thread; the scan charges it from a worker.
+    metadata: Arc<tokio::sync::Semaphore>,
 }
 struct RawItem {
     item: Arc<chat::Item>,
@@ -1260,7 +1259,8 @@ fn raw_scan_inner(
         }
     }
     let attempt = metadata_epoch();
-    let metadata = metadata_capacity()
+    let metadata = input
+        .metadata
         .clone()
         .try_acquire_many_owned(cost.max(1) as u32)
         .ok()
@@ -1623,11 +1623,7 @@ impl Cagents {
         if !entry.borrow_mut().needs_find_highlights(target) {
             return Task::none();
         }
-        static BUDGET: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
-            std::sync::OnceLock::new();
-        let budget = BUDGET
-            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(16 * 1024 * 1024)))
-            .clone();
+        let budget = application_capacity!(16 * 1024 * 1024);
         let bytes = entry
             .borrow()
             .prepared()
@@ -1816,6 +1812,7 @@ fn capture_raw(runtime: &Runtime) -> RawInput {
         query: runtime.find.clone().unwrap_or_default(),
         groups,
         provider: runtime.session.launch.provider,
+        metadata: metadata_capacity(),
     }
 }
 /// Aggregate source AND repeated query work, decided from lengths and bounded
@@ -2535,6 +2532,7 @@ mod tests {
         let input = RawInput {
             query: query.into(),
             provider: Provider::Claude,
+            metadata: metadata_capacity(),
             groups: vec![(
                 "group".into(),
                 vec![RawItem {
@@ -3268,9 +3266,8 @@ static METADATA_EPOCH: AtomicU64 = AtomicU64::new(0);
 fn metadata_epoch() -> u64 {
     METADATA_EPOCH.load(Ordering::Acquire)
 }
-fn metadata_capacity() -> &'static Arc<tokio::sync::Semaphore> {
-    static METADATA: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    METADATA.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32 * 1024 * 1024)))
+fn metadata_capacity() -> Arc<tokio::sync::Semaphore> {
+    application_capacity!(32 * 1024 * 1024)
 }
 impl Runtime {
     fn fail_find(&mut self, failure: RawFailure) {
