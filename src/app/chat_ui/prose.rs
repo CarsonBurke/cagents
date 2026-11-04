@@ -683,35 +683,42 @@ impl Renderer {
                         let prose_document::Node::Bullet(bullet) = renderer.node() else {
                             unreachable!("bullet path")
                         };
-                        let (marker, items): (Element<'static, Message>, _) = match (bullet, start)
-                        {
-                            (markdown::Bullet::Point { items }, Some(start))
-                            | (markdown::Bullet::Task { items, .. }, Some(start)) => (
-                                iced::widget::text(format!("{}.", index as u64 + start))
-                                    .size(settings.text_size)
-                                    .align_x(iced::alignment::Horizontal::Right)
-                                    .width(
-                                        settings.text_size
-                                            * ((digits.unwrap_or(1.0) / 2.0).ceil() + 1.0),
+                        let (items, task): (_, Option<Element<'static, Message>>) = match bullet {
+                            markdown::Bullet::Point { items } => (items, None),
+                            markdown::Bullet::Task { items, done } => (
+                                items,
+                                Some(
+                                    widget::container(
+                                        iced::widget::checkbox(*done).size(settings.text_size),
+                                    )
+                                    .center_y(
+                                        iced::widget::text::LineHeight::default()
+                                            .to_absolute(settings.text_size),
                                     )
                                     .into(),
-                                items,
+                                ),
                             ),
-                            (markdown::Bullet::Point { items }, None) => (
-                                iced::widget::text("•").size(settings.text_size).into(),
-                                items,
-                            ),
-                            (markdown::Bullet::Task { items, done }, None) => (
-                                widget::container(
-                                    iced::widget::checkbox(*done).size(settings.text_size),
+                        };
+                        let number: Option<Element<'static, Message>> = start.map(|start| {
+                            iced::widget::text(format!("{}.", index as u64 + start))
+                                .font(settings.style.font)
+                                .size(settings.text_size)
+                                .align_x(iced::alignment::Horizontal::Right)
+                                .width(
+                                    settings.text_size
+                                        * ((digits.unwrap_or(1.0) / 2.0).ceil() + 1.0),
                                 )
-                                .center_y(
-                                    iced::widget::text::LineHeight::default()
-                                        .to_absolute(settings.text_size),
-                                )
+                                .into()
+                        });
+                        let marker = match (number, task) {
+                            (Some(number), Some(task)) => iced::widget::row![number, task]
+                                .spacing(settings.spacing.0)
                                 .into(),
-                                items,
-                            ),
+                            (Some(marker), None) | (None, Some(marker)) => marker,
+                            (None, None) => iced::widget::text("•")
+                                .font(settings.style.font)
+                                .size(settings.text_size)
+                                .into(),
                         };
                         let mut prefix = start.map_or_else(
                             || "-".to_owned(),
@@ -1264,6 +1271,292 @@ fn alignment(column: &markdown::Column) -> iced::alignment::Horizontal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_tasks_keep_native_numbers_checked_state_and_copied_markers() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+
+        let source = "8. [x] Finished\n9. [ ] Pending\n   1. [x] Nested finished\n   2. Ordinary nested item\n\n- [ ] Unordered pending\n- Ordinary bullet\n";
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: source.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        for theme in [cosmic::Theme::dark(), cosmic::Theme::light()] {
+            for width in [360.0, 900.0] {
+                let mut element = view(
+                    &cached,
+                    design::markdown_settings(&theme, design::TEXT_PROSE),
+                    target,
+                    None,
+                );
+                let mut tree = Tree::new(element.as_widget());
+                let renderer = crate::app::tests::headless_renderer();
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1200.0)),
+                );
+                let accessible = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    iced::mouse::Cursor::Unavailable,
+                );
+                let nodes: Vec<_> = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .collect();
+                assert_eq!(
+                    nodes
+                        .iter()
+                        .filter(|node| node.node().role() == Role::CheckBox)
+                        .map(|node| node.node().is_selected())
+                        .collect::<Vec<_>>(),
+                    [Some(true), Some(false), Some(true), Some(false)],
+                    "ordered, nested and unordered tasks retain their real native checkbox states"
+                );
+                for marker in ["8.", "9.", "1.", "2.", "•"] {
+                    assert!(
+                        nodes.iter().any(|node| node.node().label() == Some(marker)),
+                        "numbering and ordinary list markers remain visible: {marker}"
+                    );
+                }
+            }
+        }
+
+        // Native app defaults come from the desktop interface font; Markdown
+        // carries its own explicit font. Make that mismatch deliberate rather
+        // than letting the usual default SansSerif mask a missing marker font.
+        use iced::advanced::{renderer::Headless, text::Paragraph as _, widget::tree::Tag};
+        type Paragraph = <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        type TextState = iced::advanced::widget::text::State<Paragraph>;
+        fn markers(tree: &Tree, out: &mut Vec<(String, iced::Font, f32)>) {
+            if tree.tag == Tag::of::<TextState>() {
+                let state = tree.state.downcast_ref::<TextState>();
+                let content = state.paragraph.content();
+                if matches!(content, "8." | "9." | "1." | "2." | "•") {
+                    out.push((
+                        content.to_owned(),
+                        state.paragraph.raw().font(),
+                        state.paragraph.raw().size().0,
+                    ));
+                }
+            }
+            for child in &tree.children {
+                markers(child, out);
+            }
+        }
+        let default_font = iced::Font::MONOSPACE;
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                default_font,
+                iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .expect("actual headless renderer with a distinct interface font");
+        let mut tree = None;
+        for font in [
+            iced::Font::DEFAULT,
+            iced::Font {
+                family: iced::font::Family::Serif,
+                ..iced::Font::DEFAULT
+            },
+        ] {
+            let mut settings =
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            settings.style.font = font;
+            assert_ne!(font, default_font, "fixture must expose renderer fallback");
+            let mut element = view(&cached, settings, target, None);
+            let tree = tree.get_or_insert_with(|| Tree::new(element.as_widget()));
+            element.as_widget_mut().diff(tree);
+            let _ = element.as_widget_mut().layout(
+                tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 1200.0)),
+            );
+            let mut actual = Vec::new();
+            markers(tree, &mut actual);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|marker| marker.0.as_str())
+                    .collect::<Vec<_>>(),
+                ["8.", "9.", "1.", "2.", "•"]
+            );
+            for (marker, actual_font, size) in actual {
+                assert_eq!(
+                    actual_font, font,
+                    "native marker {marker} follows the prose family"
+                );
+                assert_eq!(
+                    size, settings.text_size.0,
+                    "existing marker size remains unchanged"
+                );
+            }
+        }
+
+        let mut builder = selection::Catalog::builder();
+        builder.markdown("checklist", &[0], cached.markdown.items());
+        let catalog = builder.finish();
+        let (start, end) = catalog.endpoints().unwrap();
+        let expected = "8. [x] Finished\n9. [ ] Pending\n   1. [x] Nested finished\n   2. Ordinary nested item\n- [ ] Unordered pending\n- Ordinary bullet";
+        assert_eq!(catalog.copy(start, end).as_deref(), Some(expected));
+        assert_eq!(catalog.copy(end, start).as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn ordered_wrapped_tasks_align_markers_with_first_line_and_keep_authored_state() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        use iced::{Event, Point, Rectangle, Size, mouse};
+        use iced_accessibility::accesskit::Role;
+
+        let label = "Pending wrapped follow-up: review the wide conversation transcript, then resize to the narrow window and confirm that this deliberately long checklist label wraps onto multiple lines while its number and unchecked box stay aligned with the first line; nested completed tasks and ordinary numbered items must remain readable and unchanged.";
+        let source = format!(
+            "Ordered checklist\n\n8. [x] Finished\n9. [ ] Pending\n   1. [x] Nested finished\n   2. Ordinary nested item\n\n10. [ ] {label}\n\n- [ ] Unordered pending\n- Ordinary bullet\n\nThe numbered checklist must show both numbering and completion state. Task markers are read-only transcript content.\n"
+        );
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: source,
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        for theme in [cosmic::Theme::dark(), cosmic::Theme::light()] {
+            let settings = design::markdown_settings(&theme, design::TEXT_PROSE);
+            let line = iced::widget::text::LineHeight::default()
+                .to_absolute(settings.text_size)
+                .0 as f64;
+            let mut heights = Vec::new();
+            for width in [360.0, 900.0] {
+                let mut element = view(&cached, settings, target, None);
+                let mut tree = Tree::new(element.as_widget());
+                let renderer = crate::app::tests::headless_renderer();
+                let viewport = Rectangle::with_size(Size::new(width, 1200.0));
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+                );
+                let accessible = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    mouse::Cursor::Unavailable,
+                );
+                let nodes: Vec<_> = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .collect();
+                let checks: Vec<_> = nodes
+                    .iter()
+                    .filter(|node| node.node().role() == Role::CheckBox)
+                    .map(|node| node.node().bounds().expect("actual checkbox geometry"))
+                    .collect();
+                assert_eq!(checks.len(), 5);
+                for (index, number, body) in [
+                    (0, "8.", "Finished"),
+                    (1, "9.", "Pending"),
+                    (2, "1.", "Nested finished"),
+                    (3, "10.", label),
+                ] {
+                    let number = nodes
+                        .iter()
+                        .find(|node| node.node().label() == Some(number))
+                        .unwrap()
+                        .node()
+                        .bounds()
+                        .expect("actual ordered number geometry");
+                    let text = nodes
+                        .iter()
+                        .find(|node| node.node().value() == Some(body))
+                        .unwrap()
+                        .node()
+                        .bounds()
+                        .expect("actual selectable body geometry");
+                    let check = checks[index];
+                    assert!(number.x1 <= check.x0 && check.x1 < text.x0);
+                    assert!(text.x1 <= f64::from(width) + 0.01);
+                    assert!(check.y0 >= text.y0 - 0.01);
+                    assert!(check.y1 <= text.y0 + line + 0.01);
+                    assert!((number.y0 - text.y0).abs() <= 0.01);
+                    if index == 3 {
+                        assert!(text.y1 - text.y0 > line, "the label must actually wrap");
+                        heights.push(text.y1 - text.y0);
+                    }
+                }
+                assert!(
+                    checks[2].x0 > checks[0].x0,
+                    "nested task retains its indent"
+                );
+                // Transcript checkboxes have no edit callback. Exercise the
+                // real widget's pointer path and re-read authored state.
+                let mut messages = Vec::new();
+                for check in checks {
+                    let cursor = mouse::Cursor::Available(Point::new(
+                        ((check.x0 + check.x1) / 2.0) as f32,
+                        ((check.y0 + check.y1) / 2.0) as f32,
+                    ));
+                    for event in [
+                        mouse::Event::ButtonPressed(mouse::Button::Left),
+                        mouse::Event::ButtonReleased(mouse::Button::Left),
+                    ] {
+                        element.as_widget_mut().update(
+                            &mut tree,
+                            &Event::Mouse(event),
+                            Layout::new(&node),
+                            cursor,
+                            &renderer,
+                            &mut clipboard::Null,
+                            &mut Shell::new(&mut messages),
+                            &viewport,
+                        );
+                    }
+                }
+                let after = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    mouse::Cursor::Unavailable,
+                );
+                assert_eq!(
+                    after
+                        .root()
+                        .iter()
+                        .chain(after.children())
+                        .filter(|node| node.node().role() == Role::CheckBox)
+                        .map(|node| node.node().is_selected())
+                        .collect::<Vec<_>>(),
+                    [
+                        Some(true),
+                        Some(false),
+                        Some(true),
+                        Some(false),
+                        Some(false)
+                    ],
+                );
+            }
+            assert!(
+                heights[0] > heights[1],
+                "narrower layout adds wrapped lines"
+            );
+        }
+    }
 
     #[test]
     fn prepared_palette_maps_are_shared_across_views_in_both_appearances() {

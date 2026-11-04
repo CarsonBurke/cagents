@@ -232,14 +232,19 @@ fn contract() -> AppError {
 }
 
 pub(super) fn execute(command: WorkCommand) -> Result<CommandOutput, AppError> {
+    execute_with_context(command, &ServiceRequestContext::capture())
+}
+
+pub(super) fn execute_with_context(
+    command: WorkCommand,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
+    context.admit_remote()?;
     // Saved input, IDs and page bounds are validated before starting a daemon.
     let prepared = Prepared::new(command)?;
-    let socket = control_daemon_socket()?;
-    let mut client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
-    let authority = Authority::from_environment();
+    let mut client = context.connect()?;
     run(prepared, &mut |request| {
-        client.channel_work(authority.clone(), request, REQUEST_TIMEOUT)
+        client.channel_work(context.authority.clone(), request, REQUEST_TIMEOUT)
     })
 }
 

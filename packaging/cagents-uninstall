@@ -22,6 +22,36 @@ fail() {
     exit 1
 }
 
+PREFIX=
+PREFIX_PROVIDED=0
+PURGE=0
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --prefix)
+            [ "$#" -ge 2 ] || fail '--prefix requires a path'
+            PREFIX=$2
+            PREFIX_PROVIDED=1
+            shift 2
+            ;;
+        --purge)
+            PURGE=1
+            shift
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "unknown option: $1"
+            ;;
+    esac
+done
+
+if [ "${CAGENTS_AGENT_AUTHORITY+x}" = x ]; then
+    fail 'installation and removal require your own terminal; hosted sessions cannot change the installation'
+fi
+
 if [ "$(id -u)" -eq 0 ]; then
     fail 'refusing to run as root'
 fi
@@ -41,29 +71,9 @@ case $CONFIG_HOME in
     /*) ;;
     *) fail 'XDG_CONFIG_HOME must be an absolute path' ;;
 esac
-PREFIX=$DATA_HOME/cagents-install
-PURGE=0
-
-while [ "$#" -gt 0 ]; do
-    case $1 in
-        --prefix)
-            [ "$#" -ge 2 ] || fail '--prefix requires a path'
-            PREFIX=$2
-            shift 2
-            ;;
-        --purge)
-            PURGE=1
-            shift
-            ;;
-        --help|-h)
-            usage
-            exit 0
-            ;;
-        *)
-            fail "unknown option: $1"
-            ;;
-    esac
-done
+if [ "$PREFIX_PROVIDED" -eq 0 ]; then
+    PREFIX=$DATA_HOME/cagents-install
+fi
 
 case $PREFIX in
     /*) ;;
