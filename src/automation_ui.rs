@@ -2556,7 +2556,7 @@ impl State {
                                 .push(crate::design::body(blocked))
                                 .push(crate::design::caption("Open the run to resolve its agent before starting more work or removing this automation."));
                         } else if selected.active_firing.is_some() {
-                            content = content.push(crate::design::caption("A run is in progress. New runs and removal are available after it finishes and releases its agent."));
+                            content = content.push(crate::design::caption("This run must finish and release its agent before another run can start or this automation can be removed."));
                         }
                         content = content.push(
                             widget::row::with_children(vec![
@@ -2602,7 +2602,7 @@ impl State {
                         {
                             content = content.push(button(
                                 if selected.active_firing.is_some() {
-                                    "View active run"
+                                    "View run"
                                 } else {
                                     "View latest run"
                                 },
