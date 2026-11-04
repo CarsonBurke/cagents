@@ -2313,8 +2313,9 @@ pub enum Event {
     Skills(Vec<Skill>),
     /// Upsert a completed/history item without duplicating a streamed item.
     Item(Item),
-    /// Append tool input at its exact byte offset without rewriting prior chunks.
+    /// Provider process ended; carries its readable reason and bounded stderr.
     ProviderExit(ProviderExitDiagnostic),
+    /// Append tool input at its exact byte offset without rewriting prior chunks.
     InputDelta {
         id: String,
         offset: usize,
