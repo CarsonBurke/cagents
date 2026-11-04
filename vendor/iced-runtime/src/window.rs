@@ -631,43 +631,75 @@ pub fn disable_blur<Message>(id: Id) -> Task<Message> {
 #[cfg(test)]
 mod configured_open_tests {
     use super::*;
-    use crate::futures::futures::{FutureExt, StreamExt};
+    use crate::futures::futures::{
+        StreamExt, executor::LocalPool, task::LocalSpawnExt,
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    fn complete_original_stream(
+        future: impl std::future::Future<Output = ()> + 'static,
+    ) {
+        let completed = Rc::new(RefCell::new(None));
+        let result = Rc::clone(&completed);
+        let mut executor = LocalPool::new();
+        executor
+            .spawner()
+            .spawn_local(async move {
+                future.await;
+                *result.borrow_mut() = Some(());
+            })
+            .unwrap();
+        executor.run_until_stalled();
+        assert_eq!(
+            *completed.borrow(),
+            Some(()),
+            "the original stream must finish, not merely become pending"
+        );
+    }
 
     #[test]
     fn checked_open_preserves_the_original_id_and_explicit_error() {
-        let (id, task) = open_configured(Settings::default());
-        let mut stream = task::into_stream(task).unwrap();
-        let action = stream.next().now_or_never().flatten().unwrap();
-        let crate::Action::Window(Action::OpenConfigured(actual, _, sender)) =
-            action
-        else {
-            panic!("expected checked window action");
-        };
-        assert_eq!(actual, id);
-        sender.send(Err(OpenError::ZeroSize)).unwrap();
-        let output = stream.next().now_or_never().flatten().unwrap();
-        assert!(matches!(
-            output,
-            crate::Action::Output(Err(OpenError::ZeroSize))
-        ));
-        assert!(stream.next().now_or_never().flatten().is_none());
+        complete_original_stream(async move {
+            let (id, task) = open_configured(Settings::default());
+            let mut stream = task::into_stream(task).unwrap();
+            let action = stream.next().await.unwrap();
+            let crate::Action::Window(Action::OpenConfigured(
+                actual,
+                _,
+                sender,
+            )) = action
+            else {
+                panic!("expected checked window action");
+            };
+            assert_eq!(actual, id);
+            sender.send(Err(OpenError::ZeroSize)).unwrap();
+            let output = stream.next().await.unwrap();
+            assert!(matches!(
+                output,
+                crate::Action::Output(Err(OpenError::ZeroSize))
+            ));
+            assert!(stream.next().await.is_none());
+        });
     }
 
     #[test]
     fn a_missing_checked_open_result_is_canceled_not_graphics_failure() {
-        let (_, task) = open_configured(Settings::default());
-        let mut stream = task::into_stream(task).unwrap();
-        let action = stream.next().now_or_never().flatten().unwrap();
-        let crate::Action::Window(Action::OpenConfigured(_, _, sender)) =
-            action
-        else {
-            panic!("expected checked window action");
-        };
-        drop(sender);
-        let output = stream.next().now_or_never().flatten().unwrap();
-        assert!(matches!(
-            output,
-            crate::Action::Output(Err(OpenError::Canceled))
-        ));
+        complete_original_stream(async move {
+            let (_, task) = open_configured(Settings::default());
+            let mut stream = task::into_stream(task).unwrap();
+            let action = stream.next().await.unwrap();
+            let crate::Action::Window(Action::OpenConfigured(_, _, sender)) =
+                action
+            else {
+                panic!("expected checked window action");
+            };
+            drop(sender);
+            let output = stream.next().await.unwrap();
+            assert!(matches!(
+                output,
+                crate::Action::Output(Err(OpenError::Canceled))
+            ));
+            assert!(stream.next().await.is_none());
+        });
     }
 }
