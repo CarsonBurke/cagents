@@ -25,7 +25,7 @@ impl Client {
         let variable = workspace_variable(workspace)?;
         let api_key = resolve_key(
             &variable,
-            || std::env::var(&variable).ok(),
+            || std::env::var(&variable),
             || super::credentials::get(workspace),
         )?;
         let mut client = Self::from_key(api_key)?;
@@ -149,11 +149,18 @@ pub(crate) fn workspace_variable(workspace: Option<&str>) -> Result<String, Erro
 
 fn resolve_key(
     variable: &str,
-    environment: impl FnOnce() -> Option<String>,
+    environment: impl FnOnce() -> Result<String, std::env::VarError>,
     keyring: impl FnOnce() -> Result<Option<String>, Error>,
 ) -> Result<String, Error> {
-    if let Some(key) = environment() {
-        return Ok(key);
+    match environment() {
+        Ok(key) => return Ok(key),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(Error::new(
+                "linear_auth_invalid",
+                format!("{variable} must contain valid UTF-8"),
+            ));
+        }
     }
     keyring()?.ok_or_else(|| Error::new(
         "linear_auth_required",
@@ -500,24 +507,60 @@ mod tests {
     #[test]
     fn environment_overrides_keyring_and_keyring_works_without_environment() {
         assert_eq!(
-            resolve_key("LINEAR_API_KEY", || None, || Ok(Some("vault-key".into()))).unwrap(),
+            resolve_key(
+                "LINEAR_API_KEY",
+                || Err(std::env::VarError::NotPresent),
+                || Ok(Some("vault-key".into()))
+            )
+            .unwrap(),
             "vault-key"
         );
         assert_eq!(
             resolve_key(
                 "LINEAR_API_KEY",
-                || Some("env-key".into()),
+                || Ok("env-key".into()),
                 || panic!("keyring must not be touched when overridden")
             )
             .unwrap(),
             "env-key"
         );
         assert_eq!(
-            resolve_key("LINEAR_API_KEY", || None, || Ok(None))
-                .unwrap_err()
-                .kind,
+            resolve_key(
+                "LINEAR_API_KEY",
+                || Err(std::env::VarError::NotPresent),
+                || Ok(None)
+            )
+            .unwrap_err()
+            .kind,
             "linear_auth_required"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_environment_encoding_refuses_before_keyring_without_exposing_the_key() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        for workspace in [None, Some("team_2")] {
+            let variable = workspace_variable(workspace).unwrap();
+            let error = resolve_key(
+                &variable,
+                || {
+                    Err(std::env::VarError::NotUnicode(OsString::from_vec(
+                        b"private-key-\xff".to_vec(),
+                    )))
+                },
+                || panic!("invalid explicit credentials must not consult the keyring"),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, "linear_auth_invalid");
+            assert_eq!(
+                error.message,
+                format!("{variable} must contain valid UTF-8")
+            );
+            assert!(!error.to_string().contains("private-key"));
+            assert!(error.details.is_none());
+        }
     }
 
     #[test]
