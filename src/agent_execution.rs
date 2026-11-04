@@ -601,6 +601,11 @@ pub enum ProviderEvent {
     Finished {
         outcome: crate::notifications::Kind,
     },
+    /// Adapter-local error for this run; it cannot replace another turn's
+    /// current conversation error or outcome.
+    Diagnostic {
+        message: String,
+    },
 }
 
 #[cfg(test)]

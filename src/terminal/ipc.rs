@@ -195,7 +195,11 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 147 preserves main's request tags 0..72 and response tags 0..38,
+/// appends provider-exit output at request 73/response 39, and carries terminal
+/// provider outcome/diagnostic fields in ChatActivity and Snapshot. Draft 146
+/// uses different appended variants and must never be decoded as this contract.
+pub const PROTOCOL_VERSION: u16 = 147;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -549,6 +553,12 @@ pub enum ClientRequest {
         authority: crate::agent_execution::Authority,
         request: crate::channel_work_api::Request,
     },
+    /// Read one bounded page from an opaque, immutable provider-exit log.
+    ChatProviderExitOutput {
+        chat_id: TerminalId,
+        log_id: String,
+        offset: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -722,6 +732,7 @@ pub enum ServerMessage {
         chat_id: TerminalId,
         state: crate::agent::ActivityState,
         generation: u64,
+        outcome: Option<crate::agent::ActivityOutcome>,
     },
     /// A terminal some other client created, delivered only to a connection
     /// that subscribed with [`ClientRequest::WatchTerminals`].
@@ -883,6 +894,16 @@ pub enum ServerResponse {
     },
     Work(crate::work::Response),
     ChannelWork(crate::channel_work_api::Response),
+    /// Raw pages preserve UTF-8 and ANSI sequences across frame boundaries;
+    /// the requesting client cleans the complete bounded output once.
+    ChatProviderExitOutput {
+        chat_id: TerminalId,
+        log_id: String,
+        offset: u64,
+        bytes: Vec<u8>,
+        next_offset: Option<u64>,
+        omitted: u64,
+    },
 }
 
 /// Maximum compact inventory rows in one capacity response.
@@ -2090,6 +2111,138 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn wire_147_provider_exit_append_and_activity_have_exact_postcard_bytes() {
+        assert_eq!(PROTOCOL_VERSION, 147);
+        let chat_id = TerminalId::from_uuid(uuid::Uuid::nil());
+        // UUID's binary representation is a length followed by its 16 bytes.
+        let mut id = vec![16];
+        id.extend_from_slice(&[0; 16]);
+        let request = ClientRequest::ChatProviderExitOutput {
+            chat_id,
+            log_id: "l".into(),
+            offset: 7,
+        };
+        let mut golden = vec![73];
+        golden.extend_from_slice(&id);
+        golden.extend_from_slice(&[1, b'l', 7]);
+        assert_eq!(postcard::to_stdvec(&request).unwrap(), golden);
+        assert_eq!(
+            postcard::from_bytes::<ClientRequest>(&golden).unwrap(),
+            request
+        );
+        // The immediately preceding main-only unit request remains tag 71;
+        // ChannelWork remains 72, before the appended request at 73.
+        assert_eq!(
+            postcard::to_stdvec(&ClientRequest::WatchWork).unwrap(),
+            [71]
+        );
+
+        let response = ServerResponse::ChatProviderExitOutput {
+            chat_id,
+            log_id: "l".into(),
+            offset: 7,
+            bytes: vec![0, 255],
+            next_offset: Some(9),
+            omitted: 3,
+        };
+        let mut golden = vec![39];
+        golden.extend_from_slice(&id);
+        golden.extend_from_slice(&[1, b'l', 7, 2, 0, 255, 1, 9, 3]);
+        assert_eq!(postcard::to_stdvec(&response).unwrap(), golden);
+        assert_eq!(
+            postcard::from_bytes::<ServerResponse>(&golden).unwrap(),
+            response
+        );
+
+        let activity = ServerMessage::ChatActivity {
+            chat_id,
+            state: crate::agent::ActivityState::Idle,
+            generation: 7,
+            outcome: Some(crate::agent::ActivityOutcome::Failed { reason: "x".into() }),
+        };
+        let mut golden = vec![10];
+        golden.extend_from_slice(&id);
+        golden.extend_from_slice(&[1, 7, 1, 2, 1, b'x']);
+        assert_eq!(postcard::to_stdvec(&activity).unwrap(), golden);
+        assert_eq!(
+            postcard::from_bytes::<ServerMessage>(&golden).unwrap(),
+            activity
+        );
+    }
+
+    #[test]
+    fn wire_147_nested_snapshot_has_exact_outcome_and_provider_exit_field_order() {
+        let snapshot = crate::chat::Snapshot {
+            sampled_at: Some(1),
+            generation: 2,
+            turn_generation: 3,
+            finished_at: Some(4),
+            outcome: Some(crate::agent::ActivityOutcome::Failed { reason: "x".into() }),
+            provider_exit: Some(crate::chat::ProviderExitDiagnostic {
+                summary: "s".into(),
+                output: "o".into(),
+                log: Some(crate::chat::ProviderExitLog {
+                    id: "l".into(),
+                    bytes: 7,
+                    omitted: 2,
+                }),
+            }),
+            ..Default::default()
+        };
+        // Frozen positional schema: no serializer-derived expected fields.
+        let mut golden = vec![1, 1, 2, 3, 1, 4, 1, 2, 1, b'x'];
+        golden.extend_from_slice(&[0; 5]); // items, text-copy(3), requests
+        golden.extend_from_slice(&[0; 15]); // capabilities
+        golden.extend_from_slice(&[0; 9]); // models through skills
+        golden.extend_from_slice(&[0; 6]); // usage
+        golden.extend_from_slice(&[0; 6]); // busy, detail, session, continuity, title, error
+        golden.extend_from_slice(&[1, 1, b's', 1, b'o', 1, 1, b'l', 7, 2]);
+        golden.extend_from_slice(&[0; 17]); // read-only reason through forked
+        golden.extend_from_slice(&[0; 10]); // file changes and coverage
+        assert_eq!(postcard::to_stdvec(&snapshot).unwrap(), golden);
+        assert_eq!(
+            postcard::from_bytes::<crate::chat::Snapshot>(&golden).unwrap(),
+            snapshot
+        );
+
+        let response = ServerResponse::ChatSnapshot {
+            chat_id: TerminalId::from_uuid(uuid::Uuid::nil()),
+            snapshot: Some(snapshot),
+        };
+        let mut nested = vec![12, 16];
+        nested.extend_from_slice(&[0; 16]);
+        nested.push(1);
+        nested.extend_from_slice(&golden);
+        assert_eq!(postcard::to_stdvec(&response).unwrap(), nested);
+        assert_eq!(
+            postcard::from_bytes::<ServerResponse>(&nested).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn activity_ipc_preserves_failed_outcome_and_reason() {
+        let message = ServerMessage::ChatActivity {
+            chat_id: TerminalId::new(),
+            state: crate::agent::ActivityState::Idle,
+            generation: 42,
+            outcome: Some(crate::agent::ActivityOutcome::Failed {
+                reason: "Provider exited with status 3".into(),
+            }),
+        };
+        let binary = postcard::to_stdvec(&message).unwrap();
+        let decoded: ServerMessage = postcard::from_bytes(&binary).unwrap();
+        assert!(
+            matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3")
+        );
+        let json = serde_json::to_value(&message).unwrap();
+        let decoded: ServerMessage = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3")
+        );
+    }
 
     #[test]
     fn scrollback_options_keep_legacy_json_and_positional_wire_bytes() {

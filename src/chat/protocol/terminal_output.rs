@@ -13,7 +13,7 @@
 
 /// Output reported whole, without its escape sequences and with each line as
 /// it was last redrawn.
-pub(super) fn display(raw: String) -> String {
+pub(crate) fn display(raw: String) -> String {
     if !raw.bytes().any(interpreted) {
         return raw;
     }

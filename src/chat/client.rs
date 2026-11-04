@@ -880,19 +880,31 @@ impl AccountUsage {
 struct ActivityObservation {
     generation: u64,
     state: ActivityState,
+    outcome: Option<crate::agent::ActivityOutcome>,
     pending: bool,
 }
 
 impl ActivityObservation {
+    #[cfg(test)]
     fn observe(&mut self, generation: u64, state: ActivityState) -> bool {
+        self.observe_outcome(generation, state, None)
+    }
+
+    fn observe_outcome(
+        &mut self,
+        generation: u64,
+        state: ActivityState,
+        outcome: Option<crate::agent::ActivityOutcome>,
+    ) -> bool {
         if generation < self.generation {
             return false;
         }
         self.generation = generation;
-        if self.state == state {
+        if self.state == state && self.outcome == outcome {
             return false;
         }
         self.state = state;
+        self.outcome = outcome;
         !std::mem::replace(&mut self.pending, true)
     }
 
@@ -1329,6 +1341,12 @@ impl ClientHandle {
             boot_id: crate::model::BootId::new("fixture-boot"),
             host_incarnation: crate::model::HostIncarnation::new("fixture-incarnation"),
         };
+        let activity = ActivityObservation {
+            generation: snapshot.generation,
+            state: snapshot.activity(),
+            outcome: snapshot.outcome.clone(),
+            pending: false,
+        };
         Self {
             inner: Arc::new(Inner::new(
                 InnerPayload {
@@ -1345,11 +1363,7 @@ impl ClientHandle {
                     publication: Arc::new(Publications::new(snapshot)),
                     body_requested,
                     user_item_seen: Arc::new(AtomicBool::new(user_item_seen)),
-                    activity: Arc::new(Mutex::new(ActivityObservation {
-                        generation: 0,
-                        state: ActivityState::Idle,
-                        pending: false,
-                    })),
+                    activity: Arc::new(Mutex::new(activity)),
                     observed: Arc::new(Mutex::new(OutputObservation::default())),
                     account_usage: Arc::default(),
                     next: Arc::new(AtomicU64::new(1)),
@@ -1963,8 +1977,9 @@ impl ClientHandle {
                     chat_id,
                     state,
                     generation,
+                    outcome,
                 } if chat_id == id && envelope.request_id.is_none() => {
-                    early_activity = Some((generation, state));
+                    early_activity = Some((generation, state, outcome));
                 }
                 ServerMessage::ChatObserved { chat_id, epoch }
                     if chat_id == id && envelope.request_id.is_none() =>
@@ -2010,10 +2025,11 @@ impl ClientHandle {
         let mut activity = ActivityObservation {
             generation: initial.generation,
             state: initial.activity(),
+            outcome: initial.outcome.clone(),
             pending: false,
         };
-        if let Some((generation, state)) = early_activity {
-            activity.observe(generation, state);
+        if let Some((generation, state, outcome)) = early_activity {
+            activity.observe_outcome(generation, state, outcome);
         }
         let activity = Arc::new(Mutex::new(activity));
         let observed = Arc::new(Mutex::new(early_observed));
@@ -2202,9 +2218,9 @@ impl ClientHandle {
                             wake(Wake::Observed);
                         }
                     },
-                    ServerMessage::ChatActivity { chat_id, state, generation } if chat_id == id => {
+                    ServerMessage::ChatActivity { chat_id, state, generation, outcome } if chat_id == id => {
                         let changed = activity.lock().unwrap_or_else(|p| p.into_inner())
-                            .observe(generation, state);
+                            .observe_outcome(generation, state, outcome);
                         if changed { wake(Wake::Activity); }
                     },
                     ServerMessage::ChatAccountUsage { chat_id, report, observed_at } if chat_id == id => {
@@ -2428,6 +2444,17 @@ impl ClientHandle {
             .unwrap_or_else(|p| p.into_inner());
         activity.take()
     }
+    /// Latest terminal outcome from the small activity stream, including for
+    /// hidden chats whose transcript is intentionally not subscribed.
+    pub fn activity_outcome(&self) -> Option<crate::agent::ActivityOutcome> {
+        self.inner
+            .activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .outcome
+            .clone()
+    }
+
     /// Drains what the provider reported about the account this chat runs
     /// on, oldest first.
     pub fn take_account_usage(&self) -> Vec<(LiveReport, u64)> {
@@ -2916,6 +2943,113 @@ mod tests {
             .recovery,
             super::super::Recovery::Retry,
         );
+    }
+
+    #[test]
+    fn handled_command_refusals_do_not_become_shared_snapshot_errors() {
+        for initial_error in [None, Some("previous unsolicited error".to_owned())] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let seed = initial_error.clone();
+            let (advance_send, advance_receive) = std::sync::mpsc::channel();
+            let (done_send, done_receive) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                server
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let proof = host_proof("live");
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(connect.request_id),
+                    &proof,
+                    ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                );
+                let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                let ClientRequest::ChatStart { session, .. } = start.request else {
+                    panic!("expected chat start")
+                };
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(start.request_id),
+                    &proof,
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatAttached {
+                            session,
+                            snapshot: Snapshot {
+                                generation: 1,
+                                error: seed,
+                                ..Default::default()
+                            },
+                        },
+                    },
+                );
+                let command: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert!(matches!(command.request, ClientRequest::ChatCommand { .. }));
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(command.request_id),
+                    &proof,
+                    ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                        crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+                        "Command was refused",
+                        false,
+                    )),
+                );
+                advance_receive
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    None,
+                    &proof,
+                    ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                        crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+                        "Unsolicited provider failure",
+                        false,
+                    )),
+                );
+                done_receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            let (wake_send, wake_receive) = std::sync::mpsc::channel();
+            let handle = ClientHandle::connect_on(
+                client,
+                omp_card(None, None),
+                Intent::Start,
+                None,
+                false,
+                None,
+                None,
+                None,
+                move |wake| {
+                    let _ = wake_send.send(wake);
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                handle.send(Command::Compact).unwrap_err(),
+                "Command was refused"
+            );
+            assert_eq!(handle.snapshot().error, initial_error);
+            advance_send.send(()).unwrap();
+            while handle.snapshot().error.as_deref() != Some("Unsolicited provider failure") {
+                wake_receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            done_send.send(()).unwrap();
+            worker.join().unwrap();
+        }
     }
 
     #[test]
@@ -3441,6 +3575,7 @@ mod tests {
         let mut activity = ActivityObservation {
             generation: 5,
             state: ActivityState::Working,
+            outcome: None,
             pending: false,
         };
         assert!(!activity.observe(4, ActivityState::Idle));
@@ -4925,6 +5060,7 @@ mod tests {
                     chat_id,
                     state: ActivityState::Working,
                     generation: 2,
+                    outcome: None,
                 },
             );
             stage_tx.send(()).unwrap();
