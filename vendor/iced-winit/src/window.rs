@@ -82,7 +82,7 @@ where
             Window {
                 drag_resize_window_func: super::drag_resize::event_func(
                     window.as_ref(),
-                    resize_border as f64 * window.scale_factor(),
+                    f64::from(resize_border),
                 ),
                 raw: window,
                 state,

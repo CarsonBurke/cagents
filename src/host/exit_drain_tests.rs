@@ -21,11 +21,11 @@ use std::{
 const ROOT: &str = "CAGENTS_EXIT_DRAIN_TEST_ROOT";
 const TEST: &str = "CAGENTS_EXIT_DRAIN_TEST_NAME";
 const SCOPE: &str = "CAGENTS_EXIT_DRAIN_INHERITED_SCOPE";
-static READY: OnceLock<mpsc::Sender<SharedHost>> = OnceLock::new();
+static READY: OnceLock<mpsc::Sender<Result<SharedHost, String>>> = OnceLock::new();
 
 pub(super) fn observe_ready(host: &SharedHost) {
     if let Some(ready) = READY.get() {
-        let _ = ready.send(host.clone());
+        let _ = ready.send(Ok(host.clone()));
     }
 }
 
@@ -326,7 +326,7 @@ fn run_host() -> (
     JoinHandle<()>,
 ) {
     let (ready, observed) = mpsc::channel();
-    READY.set(ready).unwrap();
+    READY.set(ready.clone()).unwrap();
     // A real private launch fence/HostLease is acquired; no daemon guard is
     // fabricated and no process-wide authority marker is removed or changed.
     let admission = DaemonAdmission {
@@ -334,12 +334,72 @@ fn run_host() -> (
     };
     let (complete, completion) = mpsc::channel();
     let thread = thread::spawn(move || {
-        let _ = complete.send(run(admission).map_err(|e| e.to_string()));
+        let result = run(admission).map_err(|e| e.to_string());
+        // The same thread publishes Ready before run can return. Its later
+        // diagnostic cannot overtake readiness or consume the completion result.
+        let diagnostic = match &result {
+            Err(error) => format!("actual host::run failed before readiness: {error}"),
+            Ok(()) => "actual host::run returned before readiness without an error".into(),
+        };
+        let _ = ready.send(Err(diagnostic));
+        let _ = complete.send(result);
     });
     let host = observed
         .recv_timeout(Duration::from_secs(8))
         .expect("actual host::run ready");
+    let host = match host {
+        Ok(host) => host,
+        Err(error) => {
+            // Receiving this diagnostic proves run already returned; the
+            // remaining unbounded-channel send does not wait for a reader.
+            thread.join().unwrap();
+            panic!("{error}");
+        }
+    };
     (host, completion, thread)
+}
+
+#[test]
+fn startup_error_reports_the_actual_host_failure_instead_of_ready_timeout() {
+    const NAME: &str = "host::exit_drain_tests::startup_error_reports_the_actual_host_failure_instead_of_ready_timeout";
+    let Some(_root) = private_runtime(NAME) else {
+        return;
+    };
+    let paths = RuntimePaths::discover().unwrap();
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("startup-error-original"),
+        host_incarnation: HostIncarnation::new("held-private-lease"),
+        boot_id: daemon::read_boot_id().unwrap(),
+    };
+    // Actual run must refuse this independently opened kernel flock before any
+    // producer can start. Neither a synthetic run result nor a sleep supplies it.
+    let lease = HostLease::acquire(&paths, &proof).unwrap();
+    let expected = PlatformError::AlreadyRunning {
+        path: paths.socket.clone(),
+    }
+    .to_string();
+    let panic = match std::panic::catch_unwind(run_host) {
+        Err(panic) => panic,
+        Ok(_) => panic!("actual host::run unexpectedly acquired the held lease"),
+    };
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("startup diagnostic must be a string panic");
+    assert!(
+        message.contains(&expected),
+        "actual startup cause: {message}"
+    );
+    assert!(
+        !message.contains("Timeout"),
+        "masked startup cause: {message}"
+    );
+    assert_lease_held(&paths);
+    assert!(!paths.socket.exists());
+    assert!(!child_reaper::has_outstanding_ownership());
+    drop(lease);
+    assert!(!HostLease::is_held(&paths).unwrap());
 }
 
 #[test]

@@ -25,7 +25,7 @@ if [ "$#" -gt 1 ]; then
     usage
     exit 2
 fi
-for command in cargo jq timeout mktemp; do
+for command in cargo jq timeout mktemp python3; do
     command -v "$command" >/dev/null 2>&1 || { printf '%s\n' "Required command unavailable: $command" >&2; exit 1; }
 done
 : "${XDG_RUNTIME_DIR:?Run inside a graphical desktop session}"
@@ -57,15 +57,14 @@ else
     output=$(mktemp -d /tmp/cagents-redraw-latency.XXXXXXXX)
 fi
 # Keep the three implementation feature graphs isolated, as in run-development.
-cargo build --locked --release --no-default-features --features development --bin cagents
-cargo build --locked --release --no-default-features --features development,host --bin cagentsd
-cargo build --locked --release --no-default-features --features development,latency-harness --bin cagents-ui
-target=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.target_directory')
-if [ -n "${CARGO_BUILD_TARGET:-}" ]; then
-    target=$target/$CARGO_BUILD_TARGET
-fi
-cli=$target/release/cagents
-ui=$target/release/cagents-ui
+# Use Cargo's executable paths: build.target can come from config as well as
+# the environment, and a guessed target/release path can select an older build.
+cli=$(python3 "$root/scripts/build-ceditor-product" cagents \
+    --locked --release --no-default-features --features development --bin cagents)
+python3 "$root/scripts/build-ceditor-product" cagentsd \
+    --locked --release --no-default-features --features development,host --bin cagentsd >/dev/null
+ui=$(python3 "$root/scripts/build-ceditor-product" cagents-ui \
+    --locked --release --no-default-features --features development,latency-harness --bin cagents-ui)
 sandbox=$(mktemp -d /tmp/cagents-latency-runtime.XXXXXXXX)
 cleanup() {
     if [ -n "${active_runtime-}" ]; then

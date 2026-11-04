@@ -1205,8 +1205,8 @@ fn expanded_diagnostic_preview_and_copy_follow_changed_sources_with_the_same_key
             // refresh archives each distinct provider error via note(). The
             // current source is new, while both original diagnostics remain.
             assert_eq!(runtime.snapshot.error.as_deref(), Some(raw_after.as_str()));
-            assert!(runtime.failures.iter().any(|(_, text)| text == &raw_before));
-            assert!(runtime.failures.iter().any(|(_, text)| text == &raw_after));
+            assert!(runtime.failures.iter().any(|note| note.text == *raw_before));
+            assert!(runtime.failures.iter().any(|note| note.text == *raw_after));
             assert!(preview.contains(&raw_before));
             assert!(
                 preview.contains(&raw_after),

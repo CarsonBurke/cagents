@@ -124,7 +124,7 @@ impl OwnedChildren {
     }
 }
 
-fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
+pub(crate) fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
     let mut children = std::collections::BTreeSet::new();
     for task in std::fs::read_dir("/proc/self/task")? {
         let path = task?.path().join("children");
