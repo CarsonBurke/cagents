@@ -6450,6 +6450,10 @@ impl Cagents {
                 session.transcript_path = transcript_path_for(&session.launch, session.id);
             }
             CardKind::Chat(session) => {
+                session.launch.draft_model = self.chat_model_for_duplicate(source_id, session);
+                // A clone asks for a new listener rather than inheriting the
+                // source conversation's allocation and continuity.
+                session.reset_owned_codex_listener();
                 let Some(recipe) =
                     crate::model::agent_recovery::fresh_recipe(&session.launch.recipe)
                 else {
@@ -6458,7 +6462,6 @@ impl Cagents {
                     ));
                     return Task::none();
                 };
-                session.launch.draft_model = self.chat_model_for_duplicate(source_id, session);
                 session.id = TerminalId::new();
                 session.launch.recipe = recipe;
                 session.launch.session_id = None;

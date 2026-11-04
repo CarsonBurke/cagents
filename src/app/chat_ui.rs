@@ -22717,10 +22717,23 @@ mod tests {
             model: "current-model".into(),
             reasoning: Some("high".into()),
         });
+        let original = chat_runtime(&app, card).session.clone();
+        assert!(original.owns_codex_listener());
         drop(app.duplicate_pane(app.card_state(card).unwrap().clone()));
         let copy = app.workspace.focused().unwrap();
         assert_eq!(draft_model_for_test(&app, copy), current);
         assert_eq!(chat_runtime(&app, copy).session.launch.draft_model, current);
+        assert!(chat_runtime(&app, copy).session.is_unstarted());
+        let CardKind::Chat(shared) = &app.card_state(copy).unwrap().kind else {
+            panic!("the cloned descriptor is a chat draft");
+        };
+        assert_eq!(shared.launch.draft_model, current);
+        assert!(shared.is_unstarted());
+        let arguments = &chat_runtime(&app, copy).session.launch.recipe.arguments;
+        let remote = arguments.iter().position(|arg| arg == "--remote").unwrap();
+        assert_eq!(arguments[remote + 1], "unix://");
+        assert_eq!(chat_runtime(&app, card).session, original);
+        assert!(chat_runtime(&app, card).handle().is_some());
 
         // Duplicating a default draft must not pick another conversation's
         // last chosen model, either.
