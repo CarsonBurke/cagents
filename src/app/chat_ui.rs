@@ -23508,6 +23508,12 @@ mod tests {
         saved.session.launch.recipe.program = "claude".into();
         saved.session.launch.recipe.arguments.clear();
         saved.session.launch.recipe.working_directory = project.path().join("removed");
+        // It ran before it was closed, so it carries that start's proof.
+        saved.session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "saved-owner".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "saved-incarnation".into(),
+        });
         let provider_id = saved.session.launch.session_id.clone();
         let _ = app.resume_saved_conversation(saved);
         let reopened = app.workspace.focused().unwrap();

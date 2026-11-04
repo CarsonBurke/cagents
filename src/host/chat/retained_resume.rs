@@ -349,6 +349,60 @@ pub(super) fn inspect_resume_retirement(
     }
 }
 
+/// Whether a prepared resume successor was never started, so a second resume
+/// of it replaces no process and keeps its lineage. Preparation recorded it in
+/// a lineage. Only a start issues an ownership proof, and every Claude start
+/// registers its retained actor before it runs; neither exists for this
+/// allocation, and nothing in this daemon runs, starts or admits it or its
+/// conversation.
+pub(super) fn never_started(host: &SharedHost, source: &Session) -> Result<bool, String> {
+    if source.launch.provider != Provider::Claude
+        || source.native_continuity != crate::chat::NativeContinuity::ReconnectOnly
+        || source.proof.is_some()
+        || source.terminal.is_some()
+        || source.launch.session_id.is_none()
+    {
+        return Ok(false);
+    }
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.chats.contains_key(&source.id) || state.chat_handoffs.contains_key(&source.id) {
+            return Ok(false);
+        }
+    }
+    current_admission(host, source, &proof)?;
+    let registry = super::super::agent_execution::registry(host)?;
+    if registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .session_lineage(source.id)?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let mut after = None;
+    loop {
+        let page = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_actor_ownerships(after, 128)?;
+        if page.is_empty() {
+            return Ok(true);
+        }
+        for ownership in page {
+            after = Some(ownership.actor());
+            if ownership.source().id == source.id {
+                return Ok(false);
+            }
+        }
+    }
+}
+
 const UNRECORDED: &str = "The saved Claude actor ended without a retirement that records which conversation it confirmed, so nothing was resumed or started in its place";
 
 /// What a retained Claude pane that never learned its conversation ID

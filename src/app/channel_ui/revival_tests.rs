@@ -41,6 +41,12 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     session.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
+    // A saved conversation that ran carries the proof of its last start.
+    session.proof = Some(crate::model::HostSessionProof {
+        host_session_id: "saved-owner".into(),
+        boot_id: "fixture-boot".into(),
+        host_incarnation: "saved-incarnation".into(),
+    });
     let durable = Arc::make_mut(&mut app.durable);
     let mut chat = durable.cards[0].clone();
     let card = CardId::new();

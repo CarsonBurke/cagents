@@ -4193,4 +4193,29 @@ fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
         usize::from(mode == "confirmed"),
         "nothing the ended actor held is resubmitted"
     );
+    if mode != "confirmed" {
+        return;
+    }
+    // A prepared successor the card never started resumes again in the same
+    // lineage, so the agent it was prepared to take over still follows it.
+    let ServerResponse::ChatResumePrepared { session: again } = process_inner(
+        &successor,
+        18,
+        ClientRequest::ChatPrepareResume {
+            source: session.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("an unstarted successor must prepare again");
+    };
+    assert_ne!(again.id, session.id);
+    let mut expected = session.clone();
+    expected.id = again.id;
+    assert_eq!(again, expected, "only the allocation changes");
+    let registry = super::super::agent_execution::registry(&successor).unwrap();
+    let registry = registry.lock().unwrap();
+    let lineage = registry.session_lineage(session.id).unwrap();
+    assert!(lineage.is_some());
+    assert_eq!(registry.session_lineage(again.id).unwrap(), lineage);
+    assert!(successor.lock().unwrap().chats.is_empty());
 }

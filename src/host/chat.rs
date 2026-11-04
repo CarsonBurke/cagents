@@ -2544,7 +2544,10 @@ fn process_inner(
             let previous_boot = source.proof.as_ref().is_some_and(|previous| {
                 previous.is_complete() && previous.boot_id != proof.boot_id
             });
-            let closed = if previous_boot || unconfirmed {
+            let closed = if previous_boot
+                || unconfirmed
+                || retained_resume::never_started(host, &source).map_err(unavailable)?
+            {
                 true
             } else if source.launch.provider == Provider::Claude {
                 retained_resume::prepare_resume_verified(host, &source, retirement.verified())
