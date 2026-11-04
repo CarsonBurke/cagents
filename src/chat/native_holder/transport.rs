@@ -530,6 +530,9 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
             }
         })
         .map_err(|error| error.to_string())?;
+    // Only the daemon starts holders. A process that sweeps adopted orphans
+    // would have to register this child through `adopted_orphans`.
+    debug_assert!(!crate::daemon::adopted_orphans::sweeping());
     let child = holder.spawn().map_err(|error| error.to_string())?;
     let pid = child.id() as i32;
     *owner.child.lock().unwrap_or_else(|p| p.into_inner()) = Some(child);
