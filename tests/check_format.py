@@ -453,6 +453,82 @@ sys.exit({status})
                     with self.assertRaises(helper.Uncacheable):
                         helper.formatter_libraries(helper.InputHashes(), Path("/verified/rustfmt"))
 
+    def test_tool_digests_reuse_only_unchanged_files_within_one_check(self):
+        helper, _args = self.cache_fixture()
+        tool = self.root / "fake/rustfmt"
+        self.write("fake/rustfmt", "first formatter")
+        real_open = Path.open
+        reads = []
+
+        def tracked_open(path, *args, **kwargs):
+            source = real_open(path, *args, **kwargs)
+            if path == tool:
+                source.read = mock.Mock(wraps=source.read)
+                reads.append(source.read)
+            return source
+
+        def snapshot(memo):
+            hasher = helper.InputHashes(memo)
+            helper.tool_file(hasher, tool)
+            return hasher.hexdigest(), hasher.guard.hexdigest()
+
+        memo = {}
+        with mock.patch.object(Path, "open", tracked_open):
+            first = snapshot(memo)
+            self.assertEqual(snapshot(memo), first)
+            self.assertTrue(reads[0].called)
+            self.assertFalse(reads[1].called)
+
+            # Same size and restored mtime must not hide an in-place edit.
+            original = tool.stat()
+            tool.write_text("other formatter")
+            os.utime(tool, ns=(original.st_atime_ns, original.st_mtime_ns))
+            changed = snapshot(memo)
+            self.assertNotEqual(changed, first)
+            self.assertTrue(reads[-1].called)
+
+            # Replacing a file at the same path must also discard its digest.
+            tool.unlink()
+            tool.write_text("first formatter")
+            os.utime(tool, ns=(original.st_atime_ns, original.st_mtime_ns))
+            replaced = snapshot(memo)
+            self.assertEqual(replaced[0], first[0])
+            self.assertNotEqual(replaced[1], first[1])
+            self.assertTrue(reads[-1].called)
+
+            # A later check starts with no remembered bytes, even unchanged.
+            self.assertEqual(snapshot({}), replaced)
+            self.assertTrue(reads[-1].called)
+
+            # The second metadata observation is mandatory on a memo hit too.
+            before = tool.stat()
+            tool.write_text("other formatter")
+            after = tool.stat()
+            with mock.patch.object(helper.os, "fstat", side_effect=(before, after)):
+                with self.assertRaises(helper.Uncacheable):
+                    snapshot(memo)
+            self.assertFalse(reads[-1].called)
+
+    def test_tool_edit_and_restore_during_check_cannot_record_success(self):
+        helper, args = self.cache_fixture()
+        tool = self.root / "fake/rustfmt"
+        self.write("fake/rustfmt", "first formatter")
+
+        def formatter(hasher, _executable):
+            helper.tool_file(hasher, tool)
+
+        def mutate_and_restore(_command):
+            original = tool.stat()
+            tool.write_text("other formatter")
+            tool.write_text("first formatter")
+            os.utime(tool, ns=(original.st_atime_ns, original.st_mtime_ns))
+            return 0
+
+        with mock.patch.object(helper, "rustfmt_binary", side_effect=formatter), \
+                mock.patch.object(helper, "run", side_effect=mutate_and_restore):
+            self.assertEqual(helper.main(args), 0)
+        self.assertFalse(any(helper.CACHE.iterdir()))
+
     def test_external_license_templates_and_missing_toml_parser_disable_cache(self):
         helper, args = self.cache_fixture()
         for key in ("license_template_path", '"license_\\u0074emplate_path"'):
