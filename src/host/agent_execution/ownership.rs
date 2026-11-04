@@ -163,6 +163,9 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
             let handle = record.map(|record| record.handle.clone());
             if previous_boot {
                 state.chat_spawning.insert(source.id, source.clone());
+                state
+                    .historical_chat_retirements
+                    .insert(source.id, source.clone());
                 state.inventory_generation += 1;
             }
             (handle, previous_boot)
@@ -172,6 +175,9 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
             impl Drop for HistoricalRetirement<'_> {
                 fn drop(&mut self) {
                     let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+                    if state.historical_chat_retirements.get(&self.1.id) == Some(self.1) {
+                        state.historical_chat_retirements.remove(&self.1.id);
+                    }
                     if state.chat_spawning.get(&self.1.id) == Some(self.1) {
                         state.chat_spawning.remove(&self.1.id);
                         state.inventory_generation += 1;
@@ -197,6 +203,7 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
                 return Err("The historical agent changed before its retirement".into());
             }
             drop(store);
+            drop(_reservation);
             announce(host, &registry);
             return Ok(Reconciliation::Closed);
         }
