@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,7 @@ class PackageLinuxArtifacts(unittest.TestCase):
         self.tools.mkdir()
         self.calls = self.directory / "calls.jsonl"
         self.protocol = self.directory / "protocol-calls"
+        self.prebuilt_bytes = {}
         self.decoys = {}
         for layout in ("release", f"{NATIVE}/release"):
             for name in PRODUCTS:
@@ -60,6 +62,8 @@ if args[0] == 'tree':
     print('fixture v1')
     sys.exit(0)
 assert args[0] == 'build', args
+if 'MOCK_EXPECTED_BUILD_METADATA' in os.environ:
+    assert os.environ.get('CAGENTS_BUILD_METADATA') == os.environ['MOCK_EXPECTED_BUILD_METADATA']
 name = args[args.index('--bin') + 1]
 if os.environ.get('MOCK_BUILD_FAILURE') == name:
     print('fixture compiler failure: ' + name, file=sys.stderr)
@@ -167,29 +171,68 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
     def builds(self):
         return [args for args in self.events("cargo") if args[0] == "build"]
 
+    def prebuilt_product(self, name, *, version=VERSION, output=None, status=0, profile="release"):
+        if output is None:
+            output = f"{name} {version}\n"
+        path = self.target / profile / name
+        version_call = shlex.quote(json.dumps(["version", [name]]))
+        source = ("#!/bin/sh\ncase \"$*\" in\n"
+                  "  --version)\n"
+                  f"    printf '%s\\n' {version_call} >> \"$MOCK_CALLS\"\n"
+                  f"    printf '%s' {shlex.quote(output)}\n    exit {status} ;;\n")
+        if name == "cagents":
+            source += ("  'daemon protocol-version')\n"
+                       "    printf 'fresh\\n' >> \"$MOCK_PROTOCOL\"\n"
+                       "    printf '127\\n' ;;\n")
+        self.executable(path, source + "  *) exit 93 ;;\nesac\n")
+        self.prebuilt_bytes[path] = path.read_bytes()
+
+    def version_probes(self):
+        return [args[0] for args in self.events("version")]
+
+    def forbid_packaging_after_version_failure(self):
+        for name in ("mktemp", "install"):
+            self.tool(name, "raise SystemExit('version rejection must precede packaging')\n")
+
+    def assert_prebuilt_failure(self, result, product, message, *, sentinel=None):
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(message, result.stderr)
+        self.assertIn(product, result.stderr)
+        self.assertEqual(self.builds(), [])
+        self.assertFalse(self.protocol.exists())
+        for tool in ("mktemp", "install", "strip", "readelf", "dpkg-deb"):
+            self.assertEqual(self.events(tool), [], tool)
+        for path, original in self.prebuilt_bytes.items():
+            self.assertEqual(path.read_bytes(), original)
+        if sentinel is None:
+            self.assertFalse(self.dist.exists())
+        else:
+            self.assertEqual(list(self.dist.iterdir()), [sentinel])
+            self.assertEqual(sentinel.read_bytes(), b"existing output\n")
+
     def assert_build_prefix(self, count):
         self.assertEqual([args[args.index("--bin") + 1] for args in self.builds()],
                          list(PRODUCTS[:count]))
 
-    def assert_packages(self, variant, fresh=True):
+    def assert_packages(self, variant, fresh=True, *, version=VERSION, profile="release"):
         name = "cagents" if variant == "full" else "cagents-browserless"
-        archive = self.dist / f"{name}-{VERSION}-{NATIVE}.tar.gz"
-        deb = self.dist / f"{name}_{VERSION}_amd64.deb"
+        archive = self.dist / f"{name}-{version}-{NATIVE}.tar.gz"
+        deb = self.dist / f"{name}_{version}_amd64.deb"
         deb_payload = subprocess.check_output(["dpkg-deb", "--fsys-tarfile", str(deb)],
                                               env=self.environment, timeout=10)
         with tarfile.open(archive, "r:gz") as portable, \
                 tarfile.open(fileobj=io.BytesIO(deb_payload), mode="r:") as debian:
             for product in PRODUCTS:
                 expected = ((self.reported / product / NATIVE / product).read_bytes() if fresh
-                            else (self.target / "release" / product).read_bytes())
-                for payload, prefix in ((portable, f"{name}-{VERSION}/bin/"),
+                            else (self.target / profile / product).read_bytes())
+                for payload, prefix in ((portable, f"{name}-{version}/bin/"),
                                         (debian, f"./usr/libexec/{name}/")):
                     with self.subTest(product=product, prefix=prefix):
                         member = payload.getmember(prefix + product)
                         self.assertEqual(member.mode, 0o755)
                         self.assertEqual(payload.extractfile(member).read(), expected)
             daemon = ((self.reported / "cagentsd" / NATIVE / "cagentsd").read_bytes() if fresh
-                      else (self.target / "release/cagentsd").read_bytes())
+                      else (self.target / profile / "cagentsd").read_bytes())
             marker = debian.extractfile(f"./usr/libexec/{name}/.cagents-daemon-protocol").read()
             self.assertEqual(marker, f"127 {hashlib.sha256(daemon).hexdigest()}\n".encode())
         depends = subprocess.check_output(["dpkg-deb", "--field", str(deb), "Depends"],
@@ -199,7 +242,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         self.assertEqual("xdg-utils" in depends, variant == "browserless")
         checksum = "SHA256SUMS" if variant == "full" else "SHA256SUMS-browserless"
         entries = (self.dist / checksum).read_text().splitlines()
-        expected = {archive.name, deb.name, f"{name}-{VERSION}-sizes.txt"}
+        expected = {archive.name, deb.name, f"{name}-{version}-sizes.txt"}
         if variant == "full":
             expected.add("install.sh")
         self.assertEqual({line.split("  ", 1)[1] for line in entries}, expected)
@@ -221,6 +264,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                     result = self.package(variant)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assert_packages(variant)
+                    self.assertEqual(self.version_probes(), [])
                     common = ["build", "--manifest-path", str(self.checkout / "Cargo.toml"),
                               "--locked", "--profile", "release", "--target-dir", str(self.target),
                               "--target", NATIVE]
@@ -293,20 +337,104 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                         "chmod", "ln", "find", "cat"):
             (self.tools / command).symlink_to(shutil.which(command))
         self.assertIsNone(shutil.which("python3", path=str(self.tools)))
+        self.configuration.write_text('[build]\ntarget="aarch64-unknown-linux-gnu"\n')
         for product in PRODUCTS:
-            body = (self.reported / product / NATIVE / product)
-            body.parent.mkdir(parents=True, exist_ok=True)
-            self.executable(body, "#!/bin/sh\n# prebuilt\n" +
-                            ('printf "fresh\\n" >> "$MOCK_PROTOCOL"\nprintf "127\\n"\n'
-                             if product == "cagents" else "exit 93\n"))
-            shutil.copy2(body, self.target / "release" / product)
+            self.prebuilt_product(product)
         for variant in ("full", "browserless"):
             with self.subTest(variant=variant):
                 self.reset_outputs()
                 result = self.package(variant, CAGENTS_SKIP_BUILD="1", PATH=str(self.tools))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.builds(), [])
+                self.assertEqual(self.version_probes(), ["cagents", "cagents-ui", "cagentsd"])
                 self.assert_packages(variant, fresh=False)
+
+    def test_matching_prebuilt_full_versions_package_exact_bytes(self):
+        for variant in ("full", "browserless"):
+            for version, newline in ((VERSION, "\n"), (VERSION + "+local.1234567", "")):
+                with self.subTest(variant=variant, version=version, newline=newline):
+                    self.reset_outputs()
+                    for product in PRODUCTS:
+                        self.prebuilt_product(product, output=f"{product} {version}" + newline)
+                    result = self.package(variant, CAGENTS_SKIP_BUILD="1", VERSION=version)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(self.builds(), [])
+                    self.assertEqual(self.version_probes(), ["cagents", "cagents-ui", "cagentsd"])
+                    self.assert_packages(variant, fresh=False, version=version)
+                    for path, original in self.prebuilt_bytes.items():
+                        self.assertEqual(path.read_bytes(), original)
+
+    def test_each_prebuilt_product_rejects_mismatched_or_malformed_versions_before_outputs(self):
+        self.forbid_packaging_after_version_failure()
+        version = VERSION + "+local.1234567"
+        for variant in ("full", "browserless"):
+            for product in PRODUCTS:
+                for output in (f"other-product {version}\n", f"{product} 9.9.8\n",
+                               f"{product} {VERSION}\n", f"{product} {VERSION}+local.other\n", "",
+                               f" {product} {version}\n", f"{product} {version} \n",
+                               f"{product} {version}\nextra output\n", f"{product} {version}\n\n"):
+                    with self.subTest(variant=variant, product=product, output=output):
+                        self.reset_outputs()
+                        for companion in PRODUCTS:
+                            self.prebuilt_product(companion, version=version)
+                        self.prebuilt_product(product, output=output)
+                        self.dist.mkdir()
+                        sentinel = self.dist / "existing-output"
+                        sentinel.write_bytes(b"existing output\n")
+                        result = self.package(variant, CAGENTS_SKIP_BUILD="1", VERSION=version)
+                        self.assert_prebuilt_failure(
+                            result, product, "does not report requested version", sentinel=sentinel)
+
+    def test_each_prebuilt_product_requires_success_even_with_matching_output(self):
+        self.forbid_packaging_after_version_failure()
+        for variant in ("full", "browserless"):
+            for product in PRODUCTS:
+                with self.subTest(variant=variant, product=product):
+                    self.reset_outputs()
+                    for companion in PRODUCTS:
+                        self.prebuilt_product(companion)
+                    self.prebuilt_product(product, status=17)
+                    result = self.package(variant, CAGENTS_SKIP_BUILD="1", CAGENTS_SKIP_STRIP="1")
+                    self.assert_prebuilt_failure(result, product, "could not verify prebuilt")
+
+    def test_local_profile_prebuilt_archive_only_validates_and_preserves_inputs(self):
+        version = VERSION + "+local.1234567"
+        for product in PRODUCTS:
+            self.prebuilt_product(product, version=version, profile="local")
+        for variant in ("full", "browserless"):
+            with self.subTest(variant=variant):
+                self.reset_outputs()
+                result = self.package(variant, "--archive-only", CAGENTS_SKIP_BUILD="1",
+                                      CAGENTS_CARGO_PROFILE="local", CAGENTS_SKIP_STRIP="1",
+                                      VERSION=version)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.builds(), [])
+                self.assertEqual(self.events("cargo"), [])
+                self.assertEqual(self.version_probes(), ["cagents", "cagents-ui", "cagentsd"])
+                name = "cagents" if variant == "full" else "cagents-browserless"
+                archive = f"{name}-{version}-{NATIVE}.tar.gz"
+                checksum = "SHA256SUMS" if variant == "full" else "SHA256SUMS-browserless"
+                self.assertEqual({path.name for path in self.dist.iterdir()}, {archive, checksum})
+                digest = hashlib.sha256((self.dist / archive).read_bytes()).hexdigest()
+                self.assertEqual((self.dist / checksum).read_text(), f"{digest}  {archive}\n")
+                with tarfile.open(self.dist / archive, "r:gz") as portable:
+                    for product in PRODUCTS:
+                        self.assertEqual(portable.extractfile(f"{name}-{version}/bin/{product}").read(),
+                                         self.prebuilt_bytes[self.target / "local" / product])
+        self.reset_outputs()
+        self.prebuilt_product("cagentsd", version=VERSION, profile="local")
+        self.forbid_packaging_after_version_failure()
+        result = self.package("full", "--archive-only", CAGENTS_SKIP_BUILD="1",
+                              CAGENTS_CARGO_PROFILE="local", CAGENTS_SKIP_STRIP="1", VERSION=version)
+        self.assert_prebuilt_failure(result, "cagentsd", "does not report requested version")
+
+    def test_normal_build_metadata_still_reaches_cargo_without_prebuilt_probes(self):
+        metadata = "local.1234567"
+        version = VERSION + "+" + metadata
+        result = self.package("full", VERSION=version, MOCK_EXPECTED_BUILD_METADATA=metadata)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.version_probes(), [])
+        self.assert_packages("full", version=version)
 
 
 if __name__ == "__main__":

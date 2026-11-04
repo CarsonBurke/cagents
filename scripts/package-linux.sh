@@ -197,6 +197,21 @@ fi
 for binary in "$CLI_BINARY" "$UI_BINARY" "$HOST_BINARY"; do
     [ -x "$binary" ] || fail "missing release binary: $binary"
 done
+if [ "${CAGENTS_SKIP_BUILD:-0}" = 1 ]; then
+    require_prebuilt_version() {
+        # Preserve output through command substitution so extra lines cannot
+        # disappear. Accept the exact line with or without its final newline.
+        reported=$("$2" --version && printf '.') \
+            || fail "could not verify prebuilt $1 version: $2"
+        expected="$1 $VERSION"
+        [ "$reported" = "$expected." ] \
+            || [ "$reported" = "$(printf '%s\n.' "$expected")" ] \
+            || fail "prebuilt $1 does not report requested version $VERSION: $2"
+    }
+    require_prebuilt_version cagents "$CLI_BINARY"
+    require_prebuilt_version cagents-ui "$UI_BINARY"
+    require_prebuilt_version cagentsd "$HOST_BINARY"
+fi
 
 PROTOCOL_VERSION=$("$CLI_BINARY" daemon protocol-version) \
     || fail 'cannot inspect packaged daemon protocol'
