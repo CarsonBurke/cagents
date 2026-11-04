@@ -2143,7 +2143,7 @@ impl Actor {
                             super::protocol::diagnostic_preview(&self.output[..newline], 200);
                         if hides_frame(&self.output[..newline]) {
                             return Err(format!(
-                                "Provider printed other output on the same line as a protocol message, so it could not be read. Output: {preview}"
+                                "The agent printed other text inside one of its conversation messages, so the conversation could not continue. This usually comes from a wrapper script or shell startup file. Output: {preview}"
                             ));
                         }
                         garbage_lines += 1;
@@ -2157,7 +2157,7 @@ impl Actor {
                         }
                         if garbage_lines >= 8 {
                             return Err(format!(
-                                "Provider printed 8 consecutive invalid protocol lines. Last output: {preview}"
+                                "The agent printed 8 lines in a row that are not part of the conversation, so it was stopped. This usually comes from a wrapper script or shell startup file. Last output: {preview}"
                             ));
                         }
                         last_ignored = Some(preview);
@@ -7624,7 +7624,7 @@ mod tests {
             let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
             let error = snapshot.error.as_deref().unwrap();
             assert!(
-                error.contains("on the same line as a protocol message"),
+                error.contains("inside one of its conversation messages"),
                 "{error}"
             );
             assert!(error.contains("type"), "{error}");
@@ -7670,7 +7670,7 @@ mod tests {
         handle.close().unwrap();
         let error = snapshot.error.as_deref().unwrap();
         assert!(
-            error.contains("8 consecutive invalid protocol lines"),
+            error.contains("8 lines in a row that are not part of the conversation"),
             "{error}"
         );
         assert!(error.contains("offline wrapper diagnostic 7"), "{error}");
@@ -7732,7 +7732,7 @@ mod tests {
             LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
         let error = snapshot.error.as_deref().unwrap();
-        assert!(error.contains("8 consecutive invalid protocol lines"));
+        assert!(error.contains("8 lines in a row that are not part of the conversation"));
         assert!(error.contains("\\u{1b}[31m🦀"));
         assert!(error.len() < 512);
         assert!(!error.chars().any(char::is_control));
