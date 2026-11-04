@@ -1616,7 +1616,9 @@ mod tests {
             "ordinary edit after quota recovery",
             |change| {
                 change.worktrees.contains(&worktree)
-                    && change.coverage.is_none()
+                    // A redundant unchanged configuration can acknowledge
+                    // coverage alongside the edit; its ACK alone has no IDs.
+                    && change.coverage != Some(false)
                     && change.error.is_none()
                     && !change.topology
                     && !change.membership
