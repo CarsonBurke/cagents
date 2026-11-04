@@ -4486,34 +4486,60 @@ mod tests {
         );
         let _ = ui.into_cache();
 
+        let home = app.channel_work.view.home().unwrap();
+        let assert_inert = |app: &Cagents, renderer: &mut cosmic::Renderer| {
+            let mut ui = native(app, Cache::new(), renderer, 900.0);
+            let point = bounds(&ui, "Channel work for Original").center();
+            let messages = click(&mut ui, renderer, point);
+            assert!(
+                !messages.iter().any(|message| matches!(
+                    message,
+                    Message::ChannelWorkNavigation(_) | Message::ChannelWorkEntryPointerPress
+                )),
+                "{messages:?}"
+            );
+            let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            assert!(
+                nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .any(
+                        |node| node.node().label() == Some("Channel work for Original")
+                            && node.node().is_disabled()
+                    ),
+                "the entry is exposed as disabled"
+            );
+        };
+
         app.settings_reset_confirm = true;
         assert!(app.modal_is_open());
-        let mut ui = native(&app, Cache::new(), &mut renderer, 900.0);
-        let point = bounds(&ui, "Channel work for Original").center();
-        let messages = click(&mut ui, &mut renderer, point);
-        assert!(
-            !messages.iter().any(|message| matches!(
-                message,
-                Message::ChannelWorkNavigation(_) | Message::ChannelWorkEntryPointerPress
-            )),
-            "{messages:?}"
-        );
-        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
-        assert!(
-            nodes
-                .root()
-                .iter()
-                .chain(nodes.children())
-                .any(
-                    |node| node.node().label() == Some("Channel work for Original")
-                        && node.node().is_disabled()
-                ),
-            "the entry is exposed as disabled"
-        );
-        let _ = ui.into_cache();
+        assert_inert(&app, &mut renderer);
         app.settings_reset_confirm = false;
 
-        let home = app.channel_work.view.home().unwrap();
+        // The rename surface is not a modal, yet the update loop drops this
+        // navigation behind it: the entry must not look available there.
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(crate::model::ProjectChannel {
+                id: home.channel,
+                project_id: crate::model::ProjectId::new(),
+                title: "Original".into(),
+                title_source: crate::model::ChannelTitleSource::Prompt,
+                ordinal: home.creation_ordinal,
+                shared: false,
+                cards: Vec::new(),
+                focused: None,
+            });
+        drop(
+            app.update(Message::ChromeUi(chrome_ui::Action::RenameChannel(
+                home.channel,
+            ))),
+        );
+        assert!(!app.modal_is_open() && app.chrome_ui.is_open());
+        assert_inert(&app, &mut renderer);
+        drop(app.update(Message::ChromeUi(chrome_ui::Action::RenameCancel)));
+
         app.workspace_model
             .channels
             .iter_mut()

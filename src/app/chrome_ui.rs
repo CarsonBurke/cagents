@@ -68,6 +68,26 @@ pub(super) struct State {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_focused_tab_keeps_its_close_button_down_to_its_minimum_width() {
+        let app = super::super::tests::context_inspector_test_app(true);
+        let id = app.workspace.focused().unwrap();
+        let close = app
+            .card_chrome
+            .get(&id)
+            .map_or_else(
+                || card_control_id(id, "close"),
+                |chrome| chrome.close_id.clone(),
+            )
+            .to_string();
+        let has_close = |width| {
+            let mut tab = app.column_header(id, true, width);
+            super::super::tests::widget_id_counts(&mut tab).contains_key(&close)
+        };
+        assert!(has_close(TAB_CLOSE_MIN_WIDTH));
+        assert!(!has_close(TAB_CLOSE_MIN_WIDTH - 1.0));
+    }
+
+    #[test]
     fn attention_popup_pages_unique_incidents_and_survives_an_empty_project_list() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.sidebar_model.projects.clear();
@@ -1631,6 +1651,11 @@ pub(super) const CHANNEL_WORK_ENTRY_RESERVED_WIDTH: f32 = 82.0;
 pub(super) const CHANNEL_WORK_ENTRY_ICON_ONLY_RESERVED_WIDTH: f32 =
     2.0 * space::S + design::ROW_ICON_SIZE as f32 + space::XXS;
 
+/// The narrowest tab that fits its insets, its icon and both of a
+/// focused tab's commands. Closing outranks the title here: the tooltip still
+/// names the pane.
+const TAB_CLOSE_MIN_WIDTH: f32 = 96.0;
+
 fn command<'a>(
     icon: impl Into<widget::icon::Handle>,
     label: impl Into<Cow<'a, str>>,
@@ -2868,7 +2893,7 @@ impl Cagents {
                     count: None,
                     selected: open,
                     id: Some(channel_work::channel_work_entry_id(navigation.generation)),
-                    on_press: (!self.modal_is_open())
+                    on_press: (!self.shell_inputs_blocked())
                         .then_some(Message::ChannelWorkNavigation(navigation)),
                 },
                 icon: widget::icon(Icon::PullRequest.handle())
@@ -3193,7 +3218,7 @@ impl Cagents {
                 ready.then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
             ));
         }
-        if (focused || self.chrome_ui.hovered_tab == Some(id)) && width >= 112.0 {
+        if (focused || self.chrome_ui.hovered_tab == Some(id)) && width >= TAB_CLOSE_MIN_WIDTH {
             children.push(command(
                 Icon::Close,
                 {
