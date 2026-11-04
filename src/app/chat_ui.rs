@@ -9091,6 +9091,9 @@ impl Cagents {
                         if failure.recovery == chat::Recovery::Fresh
                             && attempt.session.launch.session_id.is_none()
                             && attempt.session.terminal.is_none()
+                            // A provider held this one and may have done work,
+                            // so the reader is told rather than handed a draft.
+                            && !attempt.session.native_continuity.retains_provider()
                             && matches!(
                                 self.card_state(target.card).map(|state| &state.kind),
                                 Some(CardKind::Chat(_))
@@ -9118,7 +9121,20 @@ impl Cagents {
                             self.retire_chat(target.card, None, Some(attempt.session)),
                         ]);
                     }
-                    Err(failure) => {
+                    Err(mut failure) => {
+                        // A new conversation in this pane would no longer be
+                        // the agent's, so the agent's own way out is named.
+                        if failure.recovery == chat::Recovery::Fresh
+                            && self.workspace_model.agents.iter().any(|agent| {
+                                !agent.closed
+                                    && CardId::from_uuid(agent.id.as_uuid()) == target.card
+                            })
+                        {
+                            failure.recovery = chat::Recovery::Retry;
+                            failure
+                                .message
+                                .push_str(" Closing this pane ends the agent.");
+                        }
                         let terminal_switch = matches!(
                             self.card_state(target.card).map(|state| &state.kind),
                             Some(CardKind::Terminal(_))
@@ -9563,6 +9579,10 @@ impl Cagents {
                 let mut session = session.clone();
                 session.launch.session_id = None;
                 session.proof = None;
+                // A provider the old conversation kept is not this one's.
+                if session.native_continuity.retains_provider() {
+                    session.reset_owned_codex_listener();
+                }
                 self.chat_ui.fresh_offers.remove(&card);
                 // A chat runtime whose provider has exited still holds the
                 // daemon's record for the conversation that failed. Closing it
@@ -20197,6 +20217,128 @@ mod tests {
     }
 
     #[test]
+    fn lost_holder_pane_shows_its_transcript_keeps_its_draft_and_resumes_only_when_asked() {
+        for uncertain in [false, true] {
+            let mut f = live_shared_recovery_fixture();
+            let mut live = f.source.proof.clone().unwrap();
+            live.boot_id = "boot-after-restart".into();
+            let reader = f.source.lost_holder_history(&live).unwrap();
+            let question = Arc::new(chat::Item {
+                id: "saved-question".into(),
+                role: chat::Role::User,
+                content: text("SAVED_QUESTION"),
+                started_at: None,
+                at: None,
+            });
+            let answer = Arc::new(chat::Item {
+                id: "saved-answer".into(),
+                role: chat::Role::Assistant,
+                content: text("SAVED_ANSWER"),
+                started_at: None,
+                at: None,
+            });
+            let snapshot = Snapshot {
+                session_id: reader.launch.session_id.clone(),
+                exited: true,
+                read_only_reason: Some(
+                    "Saved conversation history is read-only; no provider was started.".into(),
+                ),
+                items: if uncertain {
+                    vec![question]
+                } else {
+                    vec![question, answer]
+                },
+                ..Snapshot::default()
+            };
+            drop(f.app.update(Message::ChatUi(Action::Reconnect(f.target))));
+            let attempt = f.app.chat_ui.attempt(f.card).unwrap();
+            assert_eq!(attempt.intent, chat::Intent::Restore);
+            assert_eq!(attempt.session, f.source);
+            let admitted = attempt.target;
+            let handle = Arc::new(
+                ClientHandle::fixture_upgrade_handshake(
+                    f.source.clone(),
+                    reader.clone(),
+                    snapshot.clone(),
+                )
+                .unwrap(),
+            );
+            let checkpoint = f.app.update(Message::ChatUi(Action::Ready(
+                admitted,
+                Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+            )));
+            let receipt = account_commit_reply(checkpoint);
+            drop(f.app.update(receipt));
+            assert!(!f.app.chat_start_pending(f.card));
+            assert_live_recovery_content(&f);
+            let target = chat_runtime(&f.app, f.card).target;
+            if let Some(runtime) = f.app.chat_runtime_mut(target) {
+                preparation::drain_fixture(runtime);
+                // The handshake fixture's server has hung up; a real reader's
+                // stays connected, which the host lane exercises end to end.
+                runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+                    reader.clone(),
+                    snapshot.clone(),
+                )));
+            }
+            let runtime = chat_runtime(&f.app, f.card);
+            assert_eq!(runtime.session, reader);
+            assert_eq!(runtime.session.launch, f.source.launch);
+            assert!(runtime.has_connected_saved_history(&runtime.snapshot));
+            assert_eq!(runtime.snapshot.items, snapshot.items);
+            assert!(!runtime.turns.is_empty(), "the pane shows its transcript");
+            f.app.persist();
+            let writer = f.app.session.as_ref().unwrap();
+            writer.flush(Duration::from_secs(10)).unwrap();
+            assert_eq!(
+                writer
+                    .operation_store()
+                    .load_card(f.card, None)
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                CardKind::Chat(reader.clone())
+            );
+
+            // Nothing started on its own; the one action starts this exact one.
+            assert!(f.app.chat_ui.attempt(f.card).is_none());
+            drop(f.app.handle_chat_ui(Action::ResumeSaved(target)));
+            let attempt = f.app.chat_ui.attempt(f.card).unwrap();
+            assert_eq!(attempt.intent, chat::Intent::Start);
+            assert_eq!(attempt.session, reader);
+            assert_live_recovery_content(&f);
+
+            // The provider answering leaves the draft a draft: no prompt was
+            // staged, by this attempt or by the attachment it replaces.
+            let started = attempt.target;
+            let mut running = reader.clone();
+            running.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            answer_start(
+                &mut f.app,
+                started,
+                Ok(Arc::new(ClientHandle::fixture(
+                    running,
+                    Snapshot {
+                        session_id: reader.launch.session_id.clone(),
+                        ready: true,
+                        native_continuity: chat::NativeContinuity::RetainedClaudeActor {
+                            protocol: 2,
+                        },
+                        items: snapshot.items.clone(),
+                        ..Snapshot::default()
+                    },
+                ))),
+            );
+            assert!(!f.app.chat_start_pending(f.card));
+            assert_live_recovery_content(&f);
+            let runtime = chat_runtime(&f.app, f.card);
+            assert!(runtime.pending.is_none());
+            assert!(runtime.handle().unwrap().snapshot().ready);
+            assert_eq!(runtime.handle().unwrap().snapshot().items, snapshot.items);
+        }
+    }
+
+    #[test]
     fn saved_history_explicit_resume_refuses_unsettled_or_executing_attachments() {
         for mutation in 0..6 {
             let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -23711,6 +23853,44 @@ mod tests {
             Err(chat::StartFailure::fresh("fixture: daemon gone")),
         );
         assert!(app.chat_offers_fresh_conversation(card));
+    }
+
+    /// An unnamed conversation a provider held may have done work, so a lost
+    /// holder says so; only the reader's press starts another, under no claim
+    /// on the old one.
+    #[test]
+    fn an_unnamed_provider_lost_with_its_boot_is_explained_not_turned_into_a_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let mut session = chat_runtime(&app, card).session.clone();
+        session.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
+        let target = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure::fresh("fixture: lost with its boot")),
+        );
+        assert!(app.chat_offers_fresh_conversation(card));
+        assert!(
+            !app.chat_ui
+                .phases
+                .values()
+                .any(|phase| matches!(phase, Phase::Starting(_))),
+            "nothing starts on its own"
+        );
+        assert!(!matches!(
+            app.cards.get(&card),
+            Some(CardRuntime::Chat(runtime)) if runtime.choosing()
+        ));
+        let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
+        let attempt = app.chat_ui.attempt(card).unwrap();
+        assert_eq!(attempt.intent, chat::Intent::Start);
+        assert_eq!(attempt.session.launch.session_id, None);
+        assert_eq!(attempt.session.proof, None);
+        assert!(!attempt.session.native_continuity.retains_provider());
     }
 
     #[test]

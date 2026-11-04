@@ -25,7 +25,7 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
     for kind in &sessions {
         if let CardKind::Chat(session) = kind {
             let Some(live) = chats.iter().find(|live| live.id == session.id) else {
-                if may_have_retained_owner(session) {
+                if may_have_retained_owner(session) || missing_actor_needs_daemon(session) {
                     client
                         .close_retained_chat(session.clone())
                         .map_err(|error| error.to_string())?;
@@ -101,6 +101,15 @@ fn may_have_retained_owner(session: &crate::chat::Session) -> bool {
             session.native_continuity,
             crate::chat::NativeContinuity::Durable { .. }
         )
+}
+
+/// A retained Claude conversation with no actor may still name an agent, lost
+/// with an earlier boot, that only the daemon can end. Nothing to close otherwise.
+fn missing_actor_needs_daemon(session: &crate::chat::Session) -> bool {
+    matches!(
+        session.native_continuity,
+        crate::chat::NativeContinuity::RetainedClaudeActor { .. }
+    ) || session.is_saved_claude_history()
 }
 
 fn no_daemon_close_result(sessions: &[CardKind]) -> Result<(), String> {
@@ -2144,5 +2153,25 @@ mod tests {
             app.cards.get(&settings),
             Some(CardRuntime::Settings)
         ));
+    }
+}
+
+#[cfg(test)]
+mod lost_agent_close_tests {
+    use super::*;
+
+    #[test]
+    fn a_pane_with_no_actor_still_asks_the_daemon_when_it_may_name_an_agent() {
+        let mut session = crate::chat::fresh_session(
+            crate::agent::Provider::Claude,
+            crate::model::TerminalId::new(),
+            "/fixture".into(),
+            &crate::account::Account::system(crate::agent::Provider::Claude),
+        )
+        .unwrap();
+        assert!(!missing_actor_needs_daemon(&session), "a draft has nothing");
+        session.native_continuity =
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        assert!(missing_actor_needs_daemon(&session));
     }
 }

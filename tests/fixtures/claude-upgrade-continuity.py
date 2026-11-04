@@ -108,6 +108,7 @@ for line in sys.stdin:
         assert not (root/'prompts').exists(), 'unexpected second prompt or replacement provider'
         assert 'LIVE_WORK_1513' in json.dumps(frame.get('message',{})), 'unexpected fixture prompt'
         with (root/'prompts').open('a') as log: log.write('prompt\n')
+        with (root/'prompt-bodies').open('a') as log: log.write(json.dumps(frame.get('message',{}))+'\n')
         received=frame['uuid']
         send({'type':'system','subtype':'init','session_id':session})
         send({'type':'user','uuid':received,'session_id':session,'parent_tool_use_id':None,'message':{'role':'user','content':[{'type':'text','text':'LIVE_WORK_1513'}]}})
