@@ -869,3 +869,134 @@ for line in sys.stdin:
     );
     drop(cleanup);
 }
+
+/// An ordinary daemon stop ends a managed agent's provider and its turn but
+/// keeps the agent, its pane and its channel, so the next daemon reopens the
+/// card in place instead of tombstoning it. Uses a ReconnectOnly provider (the
+/// Codex-style card that a stop used to close); no private runtime is needed.
+#[test]
+fn ordinary_shutdown_keeps_managed_agents_with_their_panes_and_channels() {
+    use crate::{
+        agent_execution::{
+            Destination, HostedSession, Origin, Spec, State, Submit, Surface, Target, Update,
+        },
+        model::{CardId, CardKind, ProjectKind},
+        workspace_model::{ModelEdit, views::Scope},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let repository = directory.path().canonicalize().unwrap();
+    let mut registry = model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+    registry
+        .apply(&ModelEdit::OpenProject {
+            repository: repository.clone(),
+            name: "Stop fixture".into(),
+            kind: ProjectKind::Folder,
+        })
+        .unwrap();
+    let accepted = registry
+        .submit_agent(
+            &Origin::User,
+            &Submit {
+                name: None,
+                destination: Destination::New(Spec {
+                    provider: crate::agent::Provider::Codex,
+                    account: None,
+                    target: Target {
+                        repository: repository.clone(),
+                        directory: repository.clone(),
+                        placement: None,
+                    },
+                    surface: Surface::Chat,
+                    model: None,
+                    permission_mode: None,
+                    reasoning_effort: None,
+                }),
+                prompt: "Mid-turn when the daemon stops".into(),
+                idempotency_key: "ordinary-stop".into(),
+            },
+            1,
+        )
+        .unwrap();
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("ordinary-stop"),
+        boot_id: crate::model::BootId::new("boot"),
+        host_incarnation: HostIncarnation::new("ordinary-stop"),
+    };
+    let session = chat::Session {
+        id: TerminalId::new(),
+        launch: chat::Launch {
+            provider: crate::agent::Provider::Codex,
+            recipe: LaunchRecipe {
+                program: "/bin/cat".into(),
+                arguments: Vec::new(),
+                working_directory: repository.clone(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            session_id: Some(Uuid::new_v4().to_string()),
+        },
+        native_continuity: Default::default(),
+        owned_codex_listener: None,
+        proof: Some(proof.clone()),
+        terminal: None,
+    };
+    let source = HostedSession::Chat(session.clone());
+    registry
+        .bind_agent(accepted.agent.id, None, source.clone())
+        .unwrap();
+    registry.register_agent_authority(&source).unwrap();
+    registry
+        .update_agent_run(
+            accepted.run.id,
+            accepted.run.revision,
+            Update::Started {
+                provider_key: "turn".into(),
+            },
+            2,
+        )
+        .unwrap();
+    let channel = accepted.agent.channel().unwrap();
+    let scope = Scope::Channel(channel);
+    let pane = crate::workspace_model::views::Pane {
+        id: CardId::from_uuid(accepted.agent.id.as_uuid()),
+        title: "Codex".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 1.0,
+        kind: CardKind::Chat(session.clone()),
+        scope: None,
+    };
+    registry
+        .apply(&ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![pane.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+    let mut state = HostState::new(proof);
+    state.install_model(registry);
+    let handle = quiet_chat(&repository);
+    state
+        .chats
+        .insert(session.id, record(session.clone(), handle.clone()));
+    let host = Arc::new(state::HostLock::new(state));
+
+    finish_chat_shutdown(&host).unwrap();
+
+    assert!(handle.is_completed(), "the provider itself still stops");
+    let registry = agent_execution::registry(&host).unwrap();
+    let registry = registry.lock().unwrap();
+    let agent = registry.agent(accepted.agent.id).unwrap();
+    assert!(!agent.closed, "a daemon stop must not close the agent");
+    assert_eq!(agent.session, Some(source));
+    assert!(registry.retained_agent_authority(session.id).is_err());
+    assert_eq!(
+        registry.agent_run(accepted.run.id).unwrap().state,
+        State::Cancelled
+    );
+    let model = registry.model().unwrap();
+    assert!(model.channel(channel).is_some(), "the channel stays");
+    let view = model.views.iter().find(|view| view.scope == scope).unwrap();
+    assert_eq!(view.panes, vec![pane], "the pane stays in place");
+    assert!(view.retired.is_empty());
+}

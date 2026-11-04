@@ -1840,7 +1840,12 @@ pub(in crate::host) fn reconcile_retired_actors(host: &SharedHost) -> Result<(),
                 // A crash can follow receipt commit but precede capability
                 // retirement. The existing process-identity CAS preserves any
                 // newer authority; this grants no execution from an archive.
-                super::super::agent_execution::retired(host, retired.source())?;
+                // Every ordinary daemon stop leaves such a receipt, so finish
+                // only the process end here: closing the agent or its pane
+                // would undo the resumable stop. An explicit Close interrupted
+                // between its receipt and registry commit stays open but
+                // closable, since the receipt proves its process ended.
+                super::super::agent_execution::stopped(host, retired.source())?;
                 continue;
             }
             let retirement = Handle::inspect_retained_retirement(ownership.owner(), &proof)?;

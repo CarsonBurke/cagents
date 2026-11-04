@@ -275,6 +275,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static SEVENTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static EIGHTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static NINETEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -284,6 +285,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         17 => &SEVENTEEN,
         18 => &EIGHTEEN,
         19 => &NINETEEN,
+        20 => &TWENTY,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -788,6 +790,11 @@ mod tests {
                 19,
                 "ALTER TABLE automation_notifications ADD COLUMN unknown_payload TEXT;",
             ),
+            (20, "DROP TABLE agent_process_ends;"),
+            (
+                20,
+                "ALTER TABLE agent_process_ends ADD COLUMN unknown_payload TEXT;",
+            ),
             (
                 18,
                 "ALTER TABLE channel_work_placement_clock RENAME COLUMN last_epoch TO changed_epoch;",
@@ -1013,8 +1020,10 @@ mod tests {
         for _ in 0..2 {
             let registry = Registry::at(&path).unwrap();
             require_current(&registry.db).unwrap();
-            assert_eq!(inspect(&registry.db).unwrap().version, 19);
+            assert_eq!(inspect(&registry.db).unwrap().version, 20);
             let mut inventory = inspect(&registry.db).unwrap().objects;
+            // Version 20 later adds the stopped-process marker.
+            inventory.retain(|object| object.1 != "agent_process_ends");
             let outbox = inventory
                 .iter()
                 .position(|object| object.1 == "automation_notifications")
@@ -1298,7 +1307,7 @@ mod tests {
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");
