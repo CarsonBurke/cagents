@@ -463,6 +463,13 @@ real-rustfmt fixtures, with no Cargo/application build). Set
 `CHECK_FORMAT_CARGO_FIXTURE=1` for the additional dependency-free temporary Cargo
 fixture; this still runs only `cargo fmt`, with no application build.
 
+The explicit-source stage can reuse a successful check only when its source,
+configuration, environment and formatter inputs match. Each invocation reads
+formatter binaries and libraries once, then reopens them and checks their full
+file identity before reusing those digests for its second snapshot. No tool
+digest or file-metadata shortcut is retained between invocations. Unverifiable
+inputs run the ordinary formatter instead.
+
 For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
 changes, verify both the browserless and integrated lanes. Performance
@@ -483,6 +490,37 @@ unlinked old executable. It installs, upgrades, and removes fixture Debian
 packages using the generated maintainer-script contract, checks
 mixed-generation interruption, and preserves unrelated files and fixture user
 data. It does not signal the host daemon or install anything on the host.
+
+## Installing your checkout
+
+`scripts/install-local` replaces your installed cagents with the committed
+`HEAD`:
+
+```sh
+scripts/install-local --build-host fw16
+```
+
+It builds the three matched executables with the `local` Cargo profile,
+versioned `<version>+local.<short sha>`. That profile keeps release identity
+and optimization but skips link-time optimization and single-unit code
+generation. Each build is incremental, so after the first one only changed
+code is recompiled. The script stages the archive with
+`install.sh --stage-only` and runs `cagents daemon upgrade`, which shows each
+affected session and asks before replacing anything. `--stage-only` stops
+after staging so you can finish from the application's update notice instead.
+
+The build runs in the repository's `.worktrees/.install-local`, a detached
+checkout the script owns, so its target directory stays warm and edits in your
+other checkouts never reach the binaries. With `--build-host`, `HEAD` is pushed
+to `refs/cagents/install-local` in the repository at the same path on that host
+and built there. The archive is copied back, and the script refuses it if it
+needs a newer glibc than this machine has. Uncommitted tracked changes are
+refused so that the version names its exact source. If that version is already
+current, the build is skipped. After staging, older `+local` builds are removed,
+except the two most recent and any that a running process still uses.
+
+Published releases still come from `scripts/build-release-linux`; see
+[Releasing](releasing.md).
 
 ## Troubleshooting
 
