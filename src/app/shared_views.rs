@@ -1839,6 +1839,13 @@ impl Cagents {
                         if !same_session {
                             // A held title belongs to the replaced session.
                             self.reported_title_save.cards.remove(&pane.id);
+                            // Sending in another window replaces a shared draft
+                            // with a new one; what this window wrote stays.
+                            if matches!(&pane.kind, CardKind::Chat(session) if session.is_unstarted())
+                                && self.chat_is_draft(pane.id)
+                            {
+                                self.stash_unsent_chat_draft(pane.id);
+                            }
                             self.cards.remove(&pane.id);
                             self.lifecycle.remove(pane.id);
                             // Card identity survives a session replacement, but
@@ -1868,7 +1875,11 @@ impl Cagents {
                     if !self.cards.contains_key(&pane.id) && !starting {
                         tasks.push(self.attach_shared_pane(pane));
                     } else if let CardKind::Chat(session) = &pane.kind {
-                        tasks.push(self.adopt_shared_draft_session(pane.id, session));
+                        if self.release_draft_started_elsewhere(pane.id, session) {
+                            tasks.push(self.attach_shared_pane(pane));
+                        } else {
+                            tasks.push(self.adopt_shared_draft_session(pane.id, session));
+                        }
                     }
                 }
                 _ => {
