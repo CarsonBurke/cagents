@@ -198,6 +198,11 @@ leaves that daemon running without a socket. An instance's storage remains
 for its next launch; delete `~/.local/share/cagents-development-NAME` and its
 config and state siblings to discard it.
 
+Instances started from one checkout run that checkout's executables, so start
+them all in the same lane: all `--browserless` or all integrated. The two lanes
+write their UI to the same path, and launching the other lane rebuilds it under
+the running instances. Run the other lane from a second checkout.
+
 An idle instance takes about 0.4 GiB: the UI, its daemon, a headless niri
 compositor and the session's portals. Memory rarely limits how many run at
 once; building them does. Each checkout compiles its own matched set, so start
