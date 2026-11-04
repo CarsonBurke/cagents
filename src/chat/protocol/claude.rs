@@ -373,6 +373,26 @@ struct Submission {
     deferred: Option<Vec<Item>>,
     /// Encoded input bounds retained text and image data across the queue.
     deferred_bytes: usize,
+    /// Claude Code has reported this message as queued. Until then it is
+    /// still being admitted, and a request to send it now would find nothing.
+    admitted: bool,
+}
+
+/// A written request to send what is queued now.
+struct SendNowRequest {
+    /// The control request, to tell its answer from an earlier one's.
+    id: String,
+    /// What it was for. Anything queued later waits its own turn.
+    messages: Vec<String>,
+}
+
+/// A Bash task Claude Code reported for the main agent. Every long foreground
+/// command gets one; it matters here from when it leaves the turn's path.
+struct CommandTask {
+    id: String,
+    description: String,
+    background: bool,
+    stopping: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -394,6 +414,14 @@ struct Claude {
     busy: bool,
     /// Only advertised for a CLI whose async input contract we have verified.
     async_input: bool,
+    /// The CLI advertises `interrupt_send_now_v1`. Any other CLI reads the
+    /// same request as a plain interrupt, which would stop background agents.
+    send_now_advertised: bool,
+    send_now: Option<chat::SendNow>,
+    /// What was written for the current request. Until every queued message
+    /// has been admitted, the request is held back and this stays empty.
+    send_now_request: Option<SendNowRequest>,
+    command_tasks: VecDeque<CommandTask>,
     submissions: HashMap<String, Submission>,
     queued: Vec<chat::QueuedMessage>,
     interruption: Option<bool>,
@@ -576,8 +604,169 @@ impl Claude {
             // Headless Claude Code's interrupt aborts the controller its
             // background agents run under, so it stops them with the turn.
             interrupt_stops_background: true,
+            send_queued_now: self.async_input && self.send_now_advertised,
             ..Capabilities::default()
         }
+    }
+    fn set_send_now(&mut self, state: Option<chat::SendNow>, step: &mut Step) {
+        if self.send_now != state {
+            self.send_now = state;
+            step.events.push(Event::SendNow(state));
+        }
+    }
+    /// Takes the request as far as the queue allows. It is safe to say this
+    /// is the person's Send now only for messages the CLI already counts as
+    /// waiting, so a message still being admitted holds the request back.
+    fn request_send_now(&mut self) -> Result<Step, String> {
+        if !self.async_input || !self.send_now_advertised {
+            return Err("This Claude version cannot take queued messages early".into());
+        }
+        let mut step = Step::default();
+        if self.send_now.is_some_and(chat::SendNow::in_flight) {
+            return Ok(step);
+        }
+        if self.queued.is_empty() {
+            self.set_send_now(None, &mut step);
+            return Ok(step);
+        }
+        self.send_now_request = None;
+        self.set_send_now(Some(chat::SendNow::Requested), &mut step);
+        self.release_send_now(&mut step);
+        Ok(step)
+    }
+    fn release_send_now(&mut self, step: &mut Step) {
+        if self.send_now != Some(chat::SendNow::Requested) || self.send_now_request.is_some() {
+            return;
+        }
+        let admitted = self.queued.iter().all(|message| {
+            self.submissions
+                .get(&message.id)
+                .is_none_or(|submission| submission.admitted)
+        });
+        if !admitted {
+            return;
+        }
+        // Naming no message counts everything waiting, which is what the one
+        // queue-level action promises.
+        match self.control(json!({"subtype":"interrupt", "send_now":true})) {
+            Ok(request) => {
+                self.send_now_request = Some(SendNowRequest {
+                    id: string(&request.writes[0], "request_id").into(),
+                    messages: self.queued.iter().map(|m| m.id.clone()).collect(),
+                });
+                step.writes.extend(request.writes);
+            }
+            Err(message) => {
+                self.set_send_now(None, step);
+                step.events.push(Event::Error {
+                    message,
+                    fatal: false,
+                });
+            }
+        }
+    }
+    /// The queue has changed under the request.
+    fn settle_send_now(&mut self, step: &mut Step) {
+        let done = match &self.send_now_request {
+            Some(request) => !self
+                .queued
+                .iter()
+                .any(|queued| request.messages.contains(&queued.id)),
+            None => self.queued.is_empty(),
+        };
+        if done {
+            self.send_now_request = None;
+            self.set_send_now(None, step);
+            return;
+        }
+        self.release_send_now(step);
+    }
+    /// Whether this main-turn result is how the turn made way for the request
+    /// rather than an ending of its own. A failure with its own account of
+    /// itself is still that failure, whatever was in flight.
+    fn result_made_way(&self, frame: &Value) -> bool {
+        if self.send_now_request.is_none() || !self.send_now.is_some_and(chat::SendNow::in_flight) {
+            return false;
+        }
+        match string(frame, "subtype") {
+            "success" => frame["is_error"] != true && frame["stop_reason"] == "tool_use",
+            "error_during_execution" => frame["errors"].as_array().is_none_or(|errors| {
+                errors.iter().all(|error| {
+                    error
+                        .as_str()
+                        .is_some_and(|e| e.starts_with("[ede_diagnostic]"))
+                })
+            }),
+            _ => false,
+        }
+    }
+    fn background_commands(&self) -> Vec<chat::BackgroundCommand> {
+        self.command_tasks
+            .iter()
+            .filter(|task| task.background)
+            .map(|task| chat::BackgroundCommand {
+                id: task.id.clone(),
+                description: task.description.clone(),
+                stopping: task.stopping,
+            })
+            .collect()
+    }
+    /// Follows the main agent's Bash tasks. A subagent's commands belong to
+    /// the subagent, which is stopped as a whole.
+    fn track_command_task(
+        &mut self,
+        task: &str,
+        frame: &Value,
+        patch: &Value,
+        ended: bool,
+        step: &mut Step,
+    ) {
+        let before = self.background_commands();
+        if string(frame, "subtype") == "task_started" {
+            self.command_tasks.retain(|known| known.id != task);
+            if string(frame, "task_type") == "local_bash" && frame["owned_by_subagent"] != true {
+                self.command_tasks.push_back(CommandTask {
+                    id: task.into(),
+                    description: string(frame, "description").into(),
+                    background: frame["is_backgrounded"] == true,
+                    stopping: false,
+                });
+                if self.command_tasks.len() > MAX_TOOLS {
+                    self.command_tasks.pop_front();
+                }
+            }
+        } else if let Some(known) = self.command_tasks.iter_mut().find(|known| known.id == task) {
+            known.background |= patch["is_backgrounded"] == true;
+            if let Some(description) = patch["description"].as_str() {
+                known.description = description.into();
+            }
+        }
+        if ended {
+            self.command_tasks.retain(|known| known.id != task);
+        }
+        let after = self.background_commands();
+        if before != after {
+            step.events.push(Event::BackgroundCommands(after));
+        }
+    }
+    fn stop_background_command(&mut self, id: &str) -> Result<Step, String> {
+        let Some(command) = self
+            .command_tasks
+            .iter_mut()
+            .find(|task| task.background && task.id == id)
+        else {
+            return Err("This command has already finished".into());
+        };
+        if command.stopping {
+            return Ok(Step::default());
+        }
+        let mut step = self.control(json!({"subtype":"stop_task", "task_id":id}))?;
+        if let Some(command) = self.command_tasks.iter_mut().find(|task| task.id == id) {
+            command.stopping = true;
+        }
+        step.events
+            .push(Event::BackgroundCommands(self.background_commands()));
+        Ok(step)
     }
     fn start_turn(&mut self, step: &mut Step) {
         if self.started_generation != Some(self.attention_generation) {
@@ -828,6 +1017,7 @@ impl Claude {
                     mode,
                     deferred,
                     deferred_bytes,
+                    admitted: false,
                 },
             );
         }
@@ -1068,6 +1258,15 @@ impl Claude {
                 && parts.next() == Some(1)
                 && parts.next().is_some_and(|patch| patch >= 286);
         }
+        // The initialize response has a `capabilities` list of its own, which
+        // never names this; only `system/init` speaks for the input transport.
+        if string(data, "subtype") == "init"
+            && let Some(capabilities) = data["capabilities"].as_array()
+        {
+            self.send_now_advertised = capabilities
+                .iter()
+                .any(|capability| capability == "interrupt_send_now_v1");
+        }
         if let Some(models) = data["models"].as_array() {
             self.models = models.iter().filter_map(Model::from_claude).collect();
         }
@@ -1288,7 +1487,9 @@ impl Claude {
         };
         // Explicit meta context is model-only. The wire isSynthetic marker is
         // broader: it also covers intentionally visible compact summaries.
-        if delivered.is_empty() && frame["isMeta"].as_bool() == Some(true) {
+        if delivered.is_empty()
+            && (frame["isMeta"].as_bool() == Some(true) || is_interruption_marker(frame))
+        {
             self.track_carrier(carrier, Vec::new(), child);
             return Ok(());
         }
@@ -2056,6 +2257,8 @@ impl Adapter for Claude {
                 }
                 self.control(json!({"subtype":"cancel_async_message", "message_uuid":id}))
             }
+            Command::SendQueuedNow => self.request_send_now(),
+            Command::StopBackgroundCommand { id } => self.stop_background_command(&id),
             Command::StartQueued { .. }
             | Command::SetInterruptMode { .. }
             | Command::ListBranches
@@ -2341,6 +2544,9 @@ impl Adapter for Claude {
                 self.handed_back.clear();
                 self.submissions.clear();
                 self.queued.clear();
+                self.send_now = None;
+                self.send_now_request = None;
+                self.command_tasks.clear();
                 self.stream_events.clear();
                 self.carrier_items.clear();
                 self.carrier_order.clear();
@@ -2391,6 +2597,24 @@ impl Adapter for Claude {
                     }
                 }
                 if string(response, "subtype") == "error" {
+                    if self
+                        .send_now_request
+                        .as_ref()
+                        .is_some_and(|request| request.id == id)
+                    {
+                        self.send_now_request = None;
+                        self.set_send_now(None, &mut step);
+                    }
+                    if string(&request, "subtype") == "stop_task"
+                        && let Some(task) = self
+                            .command_tasks
+                            .iter_mut()
+                            .find(|task| request["task_id"].as_str() == Some(task.id.as_str()))
+                    {
+                        task.stopping = false;
+                        step.events
+                            .push(Event::BackgroundCommands(self.background_commands()));
+                    }
                     if string(&request, "subtype") == "cancel_async_message"
                         && let Some(id) = request["message_uuid"].as_str()
                     {
@@ -2533,6 +2757,26 @@ impl Adapter for Claude {
                                 ),
                             });
                         }
+                        "interrupt" if request["send_now"] == true => {
+                            // A later result or start says how this ended, and
+                            // may have outrun this answer. Only the request
+                            // still in hand is updated.
+                            if self
+                                .send_now_request
+                                .as_ref()
+                                .is_some_and(|request| request.id == id)
+                            {
+                                let state = match response["response"]["send_now"].as_str() {
+                                    Some("delivering") => chat::SendNow::Delivering,
+                                    Some("stopped") => chat::SendNow::Stopped,
+                                    _ => chat::SendNow::Declined,
+                                };
+                                if state == chat::SendNow::Declined {
+                                    self.send_now_request = None;
+                                }
+                                self.set_send_now(Some(state), &mut step);
+                            }
+                        }
                         "interrupt" => {
                             step.events.push(Event::Status {
                                 busy: self.busy,
@@ -2663,7 +2907,17 @@ impl Adapter for Claude {
                 if frame["parent_tool_use_id"].is_null() {
                     self.observe_title(&mut step);
                 }
-                let can_suggest = frame["parent_tool_use_id"].is_null()
+                // The turn made way for a message the person asked to send now.
+                // What it ended with is that request's doing, not a failure,
+                // and the turn it made way for is the one to report on.
+                let main_turn = frame["parent_tool_use_id"].is_null();
+                let superseded = main_turn && self.result_made_way(&frame);
+                if main_turn {
+                    self.set_send_now(None, &mut step);
+                    self.send_now_request = None;
+                }
+                let can_suggest = !superseded
+                    && frame["parent_tool_use_id"].is_null()
                     && frame["is_error"] != true
                     && frame["subtype"] == "success"
                     && self.interruption.is_none()
@@ -2683,7 +2937,7 @@ impl Adapter for Claude {
                             .map(str::to_owned)
                             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
                     ));
-                    let outcome = if interruption == Some(true) {
+                    let outcome = if interruption == Some(true) || superseded {
                         Kind::Cancelled
                     } else if frame["is_error"].as_bool() == Some(true) {
                         Kind::Failed
@@ -2701,7 +2955,9 @@ impl Adapter for Claude {
                         self.deferred_attention
                             .insert(self.attention_generation, (key, outcome, execution));
                     } else {
-                        step.events.push(Event::TurnFinished { key, outcome });
+                        if !superseded {
+                            step.events.push(Event::TurnFinished { key, outcome });
+                        }
                         if let Some(run) = execution {
                             step.events.push(Event::Execution {
                                 run,
@@ -2765,7 +3021,7 @@ impl Adapter for Claude {
                     }
                 }
                 step.events.push(Event::Usage(self.usage.clone()));
-                if frame["is_error"].as_bool() == Some(true) {
+                if frame["is_error"].as_bool() == Some(true) && !superseded {
                     let errors = content_text(&frame["errors"]);
                     let message = if !errors.is_empty() {
                         errors
@@ -2805,10 +3061,11 @@ impl Adapter for Claude {
                 let state = required(&frame, "state")?;
                 if let Some(id) = frame["command_uuid"].as_str() {
                     if state == "queued" {
-                        if let Some(message) = self.submissions.get(id)
-                            && !self.queued.iter().any(|queued| queued.id == id)
-                        {
-                            self.queued.push(message.preview.clone());
+                        if let Some(submission) = self.submissions.get_mut(id) {
+                            submission.admitted = true;
+                            if !self.queued.iter().any(|queued| queued.id == id) {
+                                self.queued.push(submission.preview.clone());
+                            }
                         }
                     } else if matches!(state, "started" | "completed" | "cancelled" | "discarded") {
                         if state == "started" && self.submissions.contains_key(id) {
@@ -2833,11 +3090,8 @@ impl Adapter for Claude {
                         }
                     }
                     step.events.push(Event::QueueChanged(self.queued.clone()));
+                    self.settle_send_now(&mut step);
                 }
-                step.events.push(Event::Status {
-                    busy: self.busy,
-                    detail: format!("Claude command {}", required(&frame, "state")?),
-                });
             }
             "tool_progress" => {
                 step.events.push(Event::Status {
@@ -3591,6 +3845,24 @@ fn task_status(status: &str, notification: bool) -> Option<ToolStatus> {
         _ if notification => Some(ToolStatus::Succeeded),
         _ => None,
     }
+}
+
+/// Claude Code's note to the model that a turn was cut short. It arrives as a
+/// user message, but nobody wrote it.
+fn is_interruption_marker(frame: &Value) -> bool {
+    let content = &frame["message"]["content"];
+    let text = content
+        .as_str()
+        .or_else(|| match content.as_array()?.as_slice() {
+            [block] if block["type"] == "text" => block["text"].as_str(),
+            _ => None,
+        });
+    string(frame, "type") == "user"
+        && string(&frame["origin"], "kind") != "human"
+        && matches!(
+            text,
+            Some("[Request interrupted by user]" | "[Request interrupted by user for tool use]")
+        )
 }
 
 /// What Claude Code reports about a tool's result beside its text:
@@ -4477,6 +4749,29 @@ impl Claude {
                 if ended.is_some() {
                     self.tasks.retain(|running| running != task);
                 }
+                self.track_command_task(task, frame, patch, ended.is_some(), step);
+                // Send now moved a foreground agent out of the turn's way. No
+                // launch acknowledgement has said so yet.
+                if patch["is_backgrounded"] == true
+                    && ended.is_none()
+                    && let Some((tool, _)) = self
+                        .agent_task_calls
+                        .iter()
+                        .find(|(_, known)| known == task)
+                {
+                    let tool = tool.clone();
+                    self.background_agents.insert(tool.clone());
+                    step.events.push(Event::Subagent {
+                        model: None,
+                        waiting: None,
+                        detail: None,
+                        id: tool,
+                        kind: String::new(),
+                        description: String::new(),
+                        status: Some(ToolStatus::Running),
+                        background: Some(true),
+                    });
+                }
                 if let ItemContent::Tool {
                     input,
                     output,
@@ -4526,8 +4821,15 @@ impl Claude {
                         // an opaque ID shared by multiple scopes is ambiguous.
                         let mut candidates = self.tools.iter().filter(|(key, _)| key.id == tool);
                         let candidate = candidates.next();
-                        candidate.is_some_and(|(_, item)| matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent"))
-                            && candidates.next().is_none()
+                        // A command's call is already on screen as that command.
+                        candidate.is_some_and(|(_, item)| match &item.content {
+                            ItemContent::Tool { name, .. } => name == "Agent",
+                            ItemContent::Command { .. } => {
+                                string(frame, "task_type") == "local_bash"
+                                    || self.command_tasks.iter().any(|known| known.id == task)
+                            }
+                            _ => false,
+                        }) && candidates.next().is_none()
                     });
                 if let Some(tool) = &known_tool {
                     if string(frame, "subtype") == "task_started" {
@@ -7488,10 +7790,12 @@ mod tests {
             let step = adapter
                 .receive(json!({"type":"command_lifecycle","command_uuid":"request","state":state}))
                 .unwrap();
+            assert!(adapter.busy);
             assert!(
-                step.events
+                !step
+                    .events
                     .iter()
-                    .any(|event| matches!(event, Event::Status { busy: true, .. }))
+                    .any(|event| matches!(event, Event::Status { busy: false, .. }))
             );
             assert!(
                 adapter
@@ -12609,5 +12913,785 @@ mod tests {
         let page = history.page().unwrap();
         assert_eq!(page.len(), 2);
         assert_eq!(page[1].tool_calls[&0]["input"]["new_string"], "new-2");
+    }
+
+    /// Plays a recorded CLI session through the adapter. What the recording
+    /// wrote to the CLI is asked of the adapter as the person's commands, and
+    /// the IDs the adapter chose stand in for the recorded ones.
+    mod send_now_replay {
+        use super::*;
+
+        struct Replay {
+            adapter: Claude,
+            events: Vec<Event>,
+            writes: Vec<Value>,
+            names: HashMap<String, String>,
+        }
+
+        fn translate(value: &mut Value, names: &HashMap<String, String>) {
+            match value {
+                Value::String(text) => {
+                    if let Some(name) = names.get(text.as_str()) {
+                        *text = name.clone();
+                    }
+                }
+                Value::Array(values) => values.iter_mut().for_each(|v| translate(v, names)),
+                Value::Object(values) => values.values_mut().for_each(|v| translate(v, names)),
+                _ => {}
+            }
+        }
+
+        impl Replay {
+            fn take(&mut self, step: Step) -> Vec<Value> {
+                self.events.extend(step.events);
+                self.writes.extend(step.writes.iter().cloned());
+                step.writes
+            }
+
+            fn asked(&mut self, frame: &Value) {
+                let (recorded, step) = if frame["type"] == "user" {
+                    let mode = match frame["priority"].as_str() {
+                        Some("next") => PromptMode::Steer,
+                        Some("later") => PromptMode::Queue,
+                        _ => PromptMode::Send,
+                    };
+                    let text = frame["message"]["content"][0]["text"].as_str().unwrap();
+                    let step = self.adapter.send_prompt(text.into(), vec![], mode).unwrap();
+                    (string(frame, "uuid").to_owned(), step)
+                } else {
+                    let request = &frame["request"];
+                    let command = if request["send_now"] == true {
+                        Command::SendQueuedNow
+                    } else if request["subtype"] == "stop_task" {
+                        Command::StopBackgroundCommand {
+                            id: string(request, "task_id").into(),
+                        }
+                    } else {
+                        Command::Interrupt
+                    };
+                    let step = self.adapter.command(command).unwrap();
+                    (string(frame, "request_id").to_owned(), step)
+                };
+                let writes = self.take(step);
+                // Asking to send nothing now writes nothing, so its recorded
+                // answer has no request to belong to.
+                if let Some(write) = writes
+                    .iter()
+                    .find(|write| write["uuid"].is_string() || write["request_id"].is_string())
+                {
+                    let chosen = write["uuid"]
+                        .as_str()
+                        .or(write["request_id"].as_str())
+                        .unwrap();
+                    self.names.insert(recorded, chosen.to_owned());
+                }
+            }
+
+            fn play(name: &str, body: &str) -> Self {
+                Self::play_until(name, body, None)
+            }
+
+            fn play_until(name: &str, body: &str, stop_after: Option<&str>) -> Self {
+                let mut replay = Self {
+                    adapter: Claude {
+                        ready: true,
+                        ..Default::default()
+                    },
+                    events: Vec::new(),
+                    writes: Vec::new(),
+                    names: HashMap::new(),
+                };
+                for line in body.lines() {
+                    let record: Value = serde_json::from_str(line).unwrap();
+                    let mut frame = record["frame"].clone();
+                    match record["dir"].as_str() {
+                        Some("in") => replay.asked(&frame),
+                        Some("out") => {
+                            translate(&mut frame, &replay.names);
+                            let step = replay
+                                .adapter
+                                .receive(frame)
+                                .unwrap_or_else(|error| panic!("{name}: {error}\n{line}"));
+                            replay.take(step);
+                        }
+                        _ => {}
+                    }
+                    if stop_after.is_some_and(|marker| line.contains(marker)) {
+                        break;
+                    }
+                }
+                replay
+            }
+
+            fn errors(&self) -> Vec<&str> {
+                self.events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Error { message, .. } => Some(message.as_str()),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            fn outcomes(&self) -> Vec<crate::notifications::Kind> {
+                self.events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::TurnFinished { outcome, .. } => Some(*outcome),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            fn send_now_states(&self) -> Vec<Option<chat::SendNow>> {
+                self.events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::SendNow(state) => Some(*state),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            fn shown_text(&self) -> Vec<(Role, String)> {
+                let mut shown: Vec<(String, Role, String)> = Vec::new();
+                for event in &self.events {
+                    if let Event::Item(item) = event
+                        && let ItemContent::Text { text, .. } = &item.content
+                    {
+                        shown.retain(|(id, ..)| *id != item.id);
+                        shown.push((item.id.clone(), item.role, text.clone()));
+                    }
+                }
+                shown
+                    .into_iter()
+                    .map(|(_, role, text)| (role, text))
+                    .collect()
+            }
+
+            fn subagent_background(&self, id: &str) -> Option<bool> {
+                self.events.iter().rev().find_map(|event| match event {
+                    Event::Subagent {
+                        id: actual,
+                        background,
+                        ..
+                    } if actual == id && background.is_some() => *background,
+                    _ => None,
+                })
+            }
+
+            fn commands(&self) -> Vec<String> {
+                self.events
+                    .iter()
+                    .rev()
+                    .find_map(|event| match event {
+                        Event::BackgroundCommands(commands) => Some(
+                            commands
+                                .iter()
+                                .map(|command| command.id.clone())
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            }
+        }
+
+        macro_rules! trace {
+            ($name:literal) => {
+                Replay::play(
+                    $name,
+                    include_str!(concat!(
+                        "../../../tests/fixtures/claude-send-now/",
+                        $name,
+                        ".jsonl"
+                    )),
+                )
+            };
+        }
+
+        #[test]
+        fn a_blocked_command_moves_aside_and_stays_visible_until_it_ends() {
+            let replay = trace!("sn_fg_bash_next");
+            assert_eq!(
+                replay.send_now_states()[..3],
+                [
+                    Some(chat::SendNow::Requested),
+                    Some(chat::SendNow::Delivering),
+                    None
+                ]
+            );
+            assert!(replay.errors().is_empty());
+            assert!(replay.events.iter().any(|event| matches!(
+                event,
+                Event::BackgroundCommands(commands)
+                    if commands.iter().any(|command| command.id == "bvt1w4qmy"
+                        && command.description == "Wait 30 seconds in a loop")
+            )));
+            // It ended on its own in the recording, which removes the row.
+            assert!(replay.commands().is_empty());
+            let write = replay
+                .writes
+                .iter()
+                .find(|write| write["request"]["send_now"] == true)
+                .unwrap();
+            assert!(write["request"].get("message_uuid").is_none());
+            assert!(write["request"].get("_cagents_turn").is_none());
+        }
+
+        #[test]
+        fn a_moved_command_is_stopped_through_its_task() {
+            let replay = trace!("m_moved_stop_task");
+            let stop = replay
+                .writes
+                .iter()
+                .find(|write| write["request"]["subtype"] == "stop_task")
+                .expect("the stop reached the CLI");
+            assert!(stop["request"]["task_id"].is_string());
+            assert!(replay.events.iter().any(|event| matches!(
+                event,
+                Event::BackgroundCommands(commands)
+                    if commands.iter().any(|command| command.stopping)
+            )));
+            assert!(replay.commands().is_empty());
+            assert!(replay.errors().is_empty());
+        }
+
+        #[test]
+        fn a_plain_interrupt_does_not_claim_to_stop_a_moved_command() {
+            // In the recording that command runs on past the interrupt.
+            let replay = Replay::play_until(
+                "sn_then_interrupt",
+                include_str!("../../../tests/fixtures/claude-send-now/sn_then_interrupt.jsonl"),
+                Some("\"subtype\":\"task_notification\",\"task_id\":\"be7y7jwtn\""),
+            );
+            assert!(
+                replay.events.iter().any(|event| matches!(
+                    event,
+                    Event::Subagent {
+                        status: Some(ToolStatus::Stopped),
+                        ..
+                    }
+                )),
+                "the interrupt took effect by this point"
+            );
+            assert_eq!(replay.commands(), ["blelkv3pt"]);
+            // It goes when its own end is reported, later in the recording.
+            assert!(trace!("sn_then_interrupt").commands().is_empty());
+        }
+
+        #[test]
+        fn a_moved_foreground_agent_becomes_a_background_subagent() {
+            let replay = trace!("sn_fg_agent_next");
+            assert_eq!(
+                replay.subagent_background("toolu_01CZdjXCnfPDD9Fw7iLKfSih"),
+                Some(true)
+            );
+            assert!(replay.events.iter().any(|event| matches!(
+                event,
+                Event::Subagent { id, status: Some(ToolStatus::Succeeded), .. }
+                    if id == "toolu_01CZdjXCnfPDD9Fw7iLKfSih"
+            )));
+            assert!(replay.errors().is_empty());
+        }
+
+        #[test]
+        fn one_request_delivers_everything_queued() {
+            let replay = trace!("sn_wait_bg_next");
+            // The recording pressed it once with two waiting.
+            assert_eq!(
+                replay
+                    .writes
+                    .iter()
+                    .filter(|write| write["request"]["send_now"] == true)
+                    .count(),
+                1
+            );
+            assert!(replay.adapter.queued.is_empty());
+            let text = replay.shown_text();
+            assert!(text.iter().any(|(_, text)| text.contains("BANANA")));
+            assert!(text.iter().any(|(_, text)| text.contains("CHERRY")));
+            // A subagent's own command is not offered as the main agent's.
+            assert!(!replay.events.iter().any(|event| matches!(
+                event,
+                Event::BackgroundCommands(commands)
+                    if commands.iter().any(|command| command.id == "bsm6j3xqj")
+            )));
+        }
+
+        #[test]
+        fn a_stopped_reply_keeps_its_text_and_is_not_a_failure() {
+            let replay = trace!("k_text_next");
+            assert_eq!(
+                replay.send_now_states()[..3],
+                [
+                    Some(chat::SendNow::Requested),
+                    Some(chat::SendNow::Stopped),
+                    None
+                ]
+            );
+            assert_eq!(replay.errors(), Vec::<&str>::new());
+            let text = replay.shown_text();
+            assert!(
+                text.iter()
+                    .any(|(role, text)| *role == Role::Assistant && text == "1. Ap"),
+                "{text:?}"
+            );
+            assert!(
+                !text.iter().any(|(_, text)| text.contains("[Request")),
+                "{text:?}"
+            );
+            // Only the turn that answered the message reports having finished.
+            assert_eq!(
+                replay.outcomes(),
+                vec![crate::notifications::Kind::Succeeded]
+            );
+        }
+
+        #[test]
+        fn a_turn_that_ended_at_a_tool_boundary_is_not_reported_as_finished() {
+            let replay = trace!("sn_tools_bg_next");
+            assert!(replay.errors().is_empty());
+            let results =
+                include_str!("../../../tests/fixtures/claude-send-now/sn_tools_bg_next.jsonl")
+                    .lines()
+                    .filter(|line| line.contains("\"type\":\"result\""))
+                    .count();
+            assert_eq!(
+                replay.outcomes().len(),
+                results - 1,
+                "the turn that made way reports nothing of its own"
+            );
+            assert!(
+                replay
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::TurnSettled))
+            );
+        }
+
+        #[test]
+        fn an_unanswered_permission_request_is_withdrawn_with_the_turn() {
+            let replay = trace!("p_pending_permission");
+            assert!(replay.errors().is_empty());
+            assert!(replay.adapter.pending.is_empty());
+            assert_eq!(
+                replay.outcomes(),
+                vec![crate::notifications::Kind::Succeeded]
+            );
+        }
+
+        #[test]
+        fn nothing_waiting_is_not_a_failure() {
+            let replay = trace!("sn_nothing");
+            assert!(replay.errors().is_empty());
+            // The recording asked with nothing queued. Nothing is sent or shown.
+            assert!(replay.send_now_states().is_empty());
+            assert!(
+                !replay
+                    .writes
+                    .iter()
+                    .any(|write| write["request"]["send_now"] == true)
+            );
+        }
+
+        #[test]
+        fn stopping_with_the_turn_over_ends_only_what_is_running() {
+            let replay = trace!("i_idle_bg");
+            assert!(
+                !replay
+                    .shown_text()
+                    .iter()
+                    .any(|(_, text)| text.contains("[Request")),
+                "{:?}",
+                replay.shown_text()
+            );
+            assert!(replay.events.iter().any(|event| matches!(
+                event,
+                Event::Subagent {
+                    status: Some(ToolStatus::Stopped),
+                    ..
+                }
+            )));
+        }
+
+        fn working() -> Claude {
+            let mut adapter = Claude {
+                ready: true,
+                busy: true,
+                ..Default::default()
+            };
+            adapter
+                .receive(
+                    json!({"type":"system","subtype":"init","claude_code_version":"2.1.296",
+                    "capabilities":["interrupt_send_now_v1"]}),
+                )
+                .unwrap();
+            adapter
+        }
+
+        fn queued(adapter: &mut Claude, id: &Value) {
+            adapter
+                .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":"queued"}))
+                .unwrap();
+        }
+
+        #[test]
+        fn only_a_cli_that_advertises_it_is_ever_sent_the_request() {
+            for (version, capabilities, offered) in [
+                ("2.1.296", json!(["interrupt_send_now_v1"]), true),
+                ("2.1.296", json!(["interrupt_receipt_v1"]), false),
+                ("2.1.296", json!(null), false),
+                ("2.1.285", json!(["interrupt_send_now_v1"]), false),
+            ] {
+                let mut adapter = Claude {
+                    ready: true,
+                    busy: true,
+                    ..Default::default()
+                };
+                adapter
+                    .receive(
+                        json!({"type":"system","subtype":"init","claude_code_version":version,
+                        "capabilities":capabilities}),
+                    )
+                    .unwrap();
+                assert_eq!(adapter.capabilities().send_queued_now, offered);
+                if !offered {
+                    // Such a CLI reads it as a plain interrupt, which would
+                    // stop the subagents. Delivery stays at the next boundary.
+                    assert!(adapter.command(Command::SendQueuedNow).is_err());
+                }
+            }
+            // The initialize response's own list does not speak for the input
+            // transport, wherever in the startup it lands.
+            let mut adapter = working();
+            adapter.metadata(
+                &json!({"capabilities":["ui_surface_v1"]}),
+                &mut Step::default(),
+            );
+            assert!(adapter.capabilities().send_queued_now);
+        }
+
+        #[test]
+        fn the_request_waits_for_every_message_to_be_admitted() {
+            let mut adapter = working();
+            let first = adapter
+                .send_prompt("first".into(), vec![], PromptMode::Steer)
+                .unwrap()
+                .writes[0]["uuid"]
+                .clone();
+            let second = adapter
+                .send_prompt("second".into(), vec![], PromptMode::Queue)
+                .unwrap()
+                .writes[0]["uuid"]
+                .clone();
+            let held = adapter.command(Command::SendQueuedNow).unwrap();
+            assert!(held.writes.is_empty(), "the CLI would find nothing waiting");
+            assert!(matches!(
+                held.events[..],
+                [Event::SendNow(Some(chat::SendNow::Requested))]
+            ));
+            // Pressing again while held is the same request.
+            assert!(
+                adapter
+                    .command(Command::SendQueuedNow)
+                    .unwrap()
+                    .writes
+                    .is_empty()
+            );
+            let step = adapter
+                .receive(json!({"type":"command_lifecycle","command_uuid":first,"state":"queued"}))
+                .unwrap();
+            assert!(step.writes.is_empty());
+            let step = adapter
+                .receive(json!({"type":"command_lifecycle","command_uuid":second,"state":"queued"}))
+                .unwrap();
+            assert_eq!(step.writes.len(), 1);
+            assert_eq!(step.writes[0]["request"]["send_now"], true);
+            assert!(step.writes[0]["request"].get("message_uuid").is_none());
+            // Nor is pressing again once it has been written.
+            assert!(
+                adapter
+                    .command(Command::SendQueuedNow)
+                    .unwrap()
+                    .writes
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn a_held_request_dissolves_when_the_turn_takes_the_message_itself() {
+            let mut adapter = working();
+            let id = adapter
+                .send_prompt("first".into(), vec![], PromptMode::Steer)
+                .unwrap()
+                .writes[0]["uuid"]
+                .clone();
+            adapter.command(Command::SendQueuedNow).unwrap();
+            let step = adapter
+                .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":"started"}))
+                .unwrap();
+            assert!(step.writes.is_empty());
+            assert!(
+                step.events
+                    .iter()
+                    .any(|event| matches!(event, Event::SendNow(None)))
+            );
+        }
+
+        #[test]
+        fn an_answer_of_nothing_waiting_says_what_is_true_now() {
+            // Still queued: it can be asked for again, and is not a failure.
+            let mut adapter = working();
+            let id = adapter
+                .send_prompt("first".into(), vec![], PromptMode::Steer)
+                .unwrap()
+                .writes[0]["uuid"]
+                .clone();
+            queued(&mut adapter, &id);
+            let write = adapter.command(Command::SendQueuedNow).unwrap().writes[0].clone();
+            let step = adapter
+                .receive(
+                    json!({"type":"control_response","response":{"subtype":"success",
+                    "request_id":write["request_id"],"response":{"send_now":"nothing_waiting"}}}),
+                )
+                .unwrap();
+            assert!(
+                step.events
+                    .iter()
+                    .all(|event| !matches!(event, Event::Error { .. }))
+            );
+            assert!(
+                step.events
+                    .iter()
+                    .any(|event| matches!(event, Event::SendNow(Some(chat::SendNow::Declined))))
+            );
+            assert_eq!(
+                adapter
+                    .command(Command::SendQueuedNow)
+                    .unwrap()
+                    .writes
+                    .len(),
+                1
+            );
+
+            // Already taken in by the turn: the answer comes after the fact
+            // and has nothing left to report.
+            let mut adapter = working();
+            let id = adapter
+                .send_prompt("first".into(), vec![], PromptMode::Steer)
+                .unwrap()
+                .writes[0]["uuid"]
+                .clone();
+            queued(&mut adapter, &id);
+            let write = adapter.command(Command::SendQueuedNow).unwrap().writes[0].clone();
+            adapter
+                .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":"started"}))
+                .unwrap();
+            let step = adapter
+                .receive(
+                    json!({"type":"control_response","response":{"subtype":"success",
+                    "request_id":write["request_id"],"response":{"send_now":"nothing_waiting"}}}),
+                )
+                .unwrap();
+            assert!(
+                step.events
+                    .iter()
+                    .all(|event| !matches!(event, Event::SendNow(_)))
+            );
+            assert_eq!(adapter.send_now, None);
+        }
+
+        #[test]
+        fn a_real_failure_during_send_now_is_still_reported() {
+            let mut adapter = working();
+            let id = adapter
+                .send_prompt("first".into(), vec![], PromptMode::Steer)
+                .unwrap()
+                .writes[0]["uuid"]
+                .clone();
+            queued(&mut adapter, &id);
+            adapter.command(Command::SendQueuedNow).unwrap();
+            let step = adapter
+                .receive(
+                    json!({"type":"result","uuid":"r","subtype":"error_max_turns",
+                    "is_error":true,"stop_reason":"tool_use","errors":["Reached the turn limit"]}),
+                )
+                .unwrap();
+            assert!(step.events.iter().any(|event| matches!(
+                event,
+                Event::Error { message, .. } if message == "Reached the turn limit"
+            )));
+            assert!(step.events.iter().any(|event| matches!(
+                event,
+                Event::TurnFinished {
+                    outcome: crate::notifications::Kind::Failed,
+                    ..
+                }
+            )));
+        }
+
+        #[test]
+        fn a_failure_in_the_abort_shape_with_its_own_account_is_still_reported() {
+            let mut adapter = working();
+            let id = adapter
+                .send_prompt("first".into(), vec![], PromptMode::Steer)
+                .unwrap()
+                .writes[0]["uuid"]
+                .clone();
+            queued(&mut adapter, &id);
+            adapter.command(Command::SendQueuedNow).unwrap();
+            let step = adapter
+                .receive(
+                    json!({"type":"result","uuid":"r","subtype":"error_during_execution",
+                    "is_error":true,"errors":["API Error: overloaded"]}),
+                )
+                .unwrap();
+            assert!(step.events.iter().any(|event| matches!(
+                event,
+                Event::Error { message, .. } if message == "API Error: overloaded"
+            )));
+        }
+
+        #[test]
+        fn a_message_queued_after_the_request_is_not_held_by_it() {
+            let mut adapter = working();
+            let first = adapter
+                .send_prompt("first".into(), vec![], PromptMode::Steer)
+                .unwrap()
+                .writes[0]["uuid"]
+                .clone();
+            queued(&mut adapter, &first);
+            adapter.command(Command::SendQueuedNow).unwrap();
+            let second = adapter
+                .send_prompt("second".into(), vec![], PromptMode::Queue)
+                .unwrap()
+                .writes[0]["uuid"]
+                .clone();
+            queued(&mut adapter, &second);
+            let step = adapter
+                .receive(json!({"type":"command_lifecycle","command_uuid":first,"state":"started"}))
+                .unwrap();
+            assert!(
+                step.events
+                    .iter()
+                    .any(|event| matches!(event, Event::SendNow(None)))
+            );
+            assert_eq!(adapter.queued.len(), 1);
+            // It can be asked for by itself, and the earlier answer cannot
+            // stand in for that request's.
+            let earlier = adapter.command(Command::SendQueuedNow).unwrap().writes[0].clone();
+            let step = adapter
+                .receive(
+                    json!({"type":"control_response","response":{"subtype":"success",
+                    "request_id":earlier["request_id"],"response":{"send_now":"delivering"}}}),
+                )
+                .unwrap();
+            assert!(
+                step.events
+                    .iter()
+                    .any(|event| matches!(event, Event::SendNow(Some(chat::SendNow::Delivering))))
+            );
+        }
+
+        #[test]
+        fn a_refused_request_is_reported_and_can_be_retried() {
+            let mut adapter = working();
+            let id = adapter
+                .send_prompt("first".into(), vec![], PromptMode::Steer)
+                .unwrap()
+                .writes[0]["uuid"]
+                .clone();
+            queued(&mut adapter, &id);
+            let write = adapter.command(Command::SendQueuedNow).unwrap().writes[0].clone();
+            let step = adapter
+                .receive(
+                    json!({"type":"control_response","response":{"subtype":"error",
+                    "request_id":write["request_id"],"error":"no"}}),
+                )
+                .unwrap();
+            assert!(
+                step.events
+                    .iter()
+                    .any(|event| matches!(event, Event::SendNow(None)))
+            );
+            assert!(
+                step.events
+                    .iter()
+                    .any(|event| matches!(event, Event::Error { .. }))
+            );
+            assert_eq!(
+                adapter
+                    .command(Command::SendQueuedNow)
+                    .unwrap()
+                    .writes
+                    .len(),
+                1
+            );
+        }
+
+        #[test]
+        fn lifecycle_notices_do_not_become_status_text() {
+            let mut adapter = working();
+            let id = adapter
+                .send_prompt("first".into(), vec![], PromptMode::Queue)
+                .unwrap()
+                .writes[0]["uuid"]
+                .clone();
+            let step = adapter
+                .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":"queued"}))
+                .unwrap();
+            assert!(
+                !step
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Status { .. }))
+            );
+        }
+
+        #[test]
+        fn a_second_stop_of_a_command_is_not_sent_twice() {
+            let mut adapter = working();
+            adapter
+                .receive(
+                    json!({"type":"system","subtype":"task_started","task_id":"b1",
+                    "description":"Wait","task_type":"local_bash","is_backgrounded":false}),
+                )
+                .unwrap();
+            // Still in the turn's foreground, it is the turn's to stop.
+            assert!(
+                adapter
+                    .command(Command::StopBackgroundCommand { id: "b1".into() })
+                    .is_err()
+            );
+            adapter
+                .receive(
+                    json!({"type":"system","subtype":"task_updated","task_id":"b1",
+                    "patch":{"is_backgrounded":true}}),
+                )
+                .unwrap();
+            let first = adapter
+                .command(Command::StopBackgroundCommand { id: "b1".into() })
+                .unwrap();
+            assert_eq!(first.writes.len(), 1);
+            assert!(
+                adapter
+                    .command(Command::StopBackgroundCommand { id: "b1".into() })
+                    .unwrap()
+                    .writes
+                    .is_empty()
+            );
+            // A refusal hands the control back.
+            let step = adapter
+                .receive(
+                    json!({"type":"control_response","response":{"subtype":"error",
+                    "request_id":first.writes[0]["request_id"],"error":"no"}}),
+                )
+                .unwrap();
+            assert!(step.events.iter().any(|event| matches!(
+                event,
+                Event::BackgroundCommands(commands) if !commands[0].stopping
+            )));
+        }
     }
 }

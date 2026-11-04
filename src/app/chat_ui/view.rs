@@ -341,6 +341,57 @@ enum QueueTiming {
     Leaving,
 }
 
+/// The submit modes the send controls expose, in the order the keyboard
+/// reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
+pub(super) fn submit_modes(
+    snapshot: &chat::Snapshot,
+    resend: Option<PromptMode>,
+) -> &'static [PromptMode] {
+    if !snapshot.busy {
+        return &[PromptMode::Send];
+    }
+    match snapshot.capabilities.steer {
+        // A message taken back from the queue goes back the way it was
+        // queued unless the other chord says otherwise.
+        true if resend == Some(PromptMode::Queue) => &[PromptMode::Queue, PromptMode::Steer],
+        true => &[PromptMode::Steer, PromptMode::Queue],
+        false => &[PromptMode::Queue],
+    }
+}
+
+/// What the messages in the queue are waiting on, as far as can be told.
+fn queue_waiting_on(snapshot: &chat::Snapshot) -> Option<&'static str> {
+    if !snapshot.busy {
+        return None;
+    }
+    if !snapshot
+        .queued_messages
+        .iter()
+        .any(|queued| queued.delivery == chat::QueueDelivery::NextStep)
+    {
+        return Some("waiting for this turn to end");
+    }
+    if !snapshot.requests.is_empty() {
+        return Some("waiting for your decision");
+    }
+    if snapshot
+        .subagents
+        .iter()
+        .any(|agent| agent.status == chat::ToolStatus::Running && !agent.background)
+    {
+        return Some("waiting for the subagent to return");
+    }
+    Some(if activity_label(snapshot) == "Running command" {
+        "waiting for this command to finish"
+    } else {
+        "waiting for the agent's next step"
+    })
+}
+
+fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
+    if count == 1 { one } else { many }
+}
+
 /// One waiting message: when it goes, what it says, and what can be done
 /// with it.
 fn queue_row<'a>(
@@ -1224,35 +1275,48 @@ impl Runtime {
         } else if snapshot.busy
             || snapshot.waiting
             || !snapshot.requests.is_empty()
-            || (working == 0 && waiting == 0)
+            || working > 0
+            || waiting == 0
         {
             parts.push(Self::short_description(label, 72));
         }
-        if failure_label.is_some()
+        // Running subagents are always named, so that the turn having ended
+        // cannot be mistaken for everything having ended, or the reverse.
+        if working > 0 {
+            parts.push(format!(
+                "{working} {} working",
+                plural(working, "subagent", "subagents")
+            ));
+        }
+        let commands = snapshot.background_commands.len();
+        let tally = failure_label.is_some()
             || snapshot.subagents.len() > 1
-            || ((snapshot.waiting || !snapshot.requests.is_empty()) && working > 0)
-        {
-            if working > 0 {
-                parts.push(format!("{working} working"));
-            }
+            || ((snapshot.waiting || !snapshot.requests.is_empty()) && working > 0);
+        if tally {
             if waiting > 0 {
                 parts.push(format!("{waiting} waiting"));
             }
             if failed > 0 {
                 parts.push(format!("{failed} failed"));
             }
-            if !parts.is_empty() {
-                return (
-                    if working > 0 || snapshot.busy {
-                        Some(Icon::AgentWorking)
-                    } else if failure_label.is_some() || failed > 0 {
-                        Some(Icon::Warning)
-                    } else {
-                        glyph
-                    },
-                    parts.join(" · "),
-                );
-            }
+        }
+        if commands > 0 {
+            parts.push(format!(
+                "{commands} background {}",
+                plural(commands, "command", "commands")
+            ));
+        }
+        if (tally || working > 0 || commands > 0) && !parts.is_empty() {
+            return (
+                if working > 0 || snapshot.busy {
+                    Some(Icon::AgentWorking)
+                } else if failure_label.is_some() || (tally && failed > 0) {
+                    Some(Icon::Warning)
+                } else {
+                    glyph
+                },
+                parts.join(" · "),
+            );
         }
         (glyph, Self::short_description(label, 100))
     }
@@ -1299,7 +1363,7 @@ impl Runtime {
             (
                 Some(Icon::AgentWorking),
                 if !snapshot.busy {
-                    "Subagents working"
+                    "Idle"
                 } else if activity_label(snapshot) != "Working" || snapshot.detail.is_empty() {
                     activity_label(snapshot)
                 } else {
@@ -2542,21 +2606,7 @@ impl Runtime {
             .lines()
             .any(|line| !line.text.trim().is_empty());
         let has_draft = has_text || !self.attachments.is_empty();
-        // The submit modes the send controls expose, in the order the keyboard
-        // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
-        let modes: &[PromptMode] = if snapshot.busy {
-            match snapshot.capabilities.steer {
-                // A message taken back from the queue goes back the way it
-                // was queued unless the other chord says otherwise.
-                true if self.resend == Some(PromptMode::Queue) => {
-                    &[PromptMode::Queue, PromptMode::Steer]
-                }
-                true => &[PromptMode::Steer, PromptMode::Queue],
-                false => &[PromptMode::Queue],
-            }
-        } else {
-            &[PromptMode::Send]
-        };
+        let modes = submit_modes(snapshot, self.resend);
         // The placeholder names what the field is for. Spelling out both
         // chords on it meant the one piece of text in an empty composer was
         // keyboard documentation, repeated on every pane, and it went stale
@@ -2702,7 +2752,7 @@ impl Runtime {
                         && !self.permission_picker
                         && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
                     {
-                        return Some(text_editor::Binding::Custom(action(Action::Interrupt(
+                        return Some(text_editor::Binding::Custom(action(Action::EscapeTurn(
                             target,
                         ))));
                     }
@@ -2802,15 +2852,36 @@ impl Runtime {
                 .on_press_maybe(available.then(|| action(Action::Interrupt(target))))
                 .into()
             } else {
+                // Esc is only this control's key while it does the same thing.
+                let key = if self.escape_sends_queued() { "" } else { " (Esc)" };
                 icon(
                     Icon::Stop,
                     if at_stake > 0 {
                         Cow::Owned(format!(
-                            "Cancel active turn (Esc). This also stops {at_stake} background {subagents}"
+                            "Cancel active turn{key}. This also stops {at_stake} background {subagents}"
                         ))
                     } else {
-                        Cow::Borrowed("Cancel active turn (Esc)")
+                        Cow::Owned(format!("Cancel active turn{key}"))
                     },
+                    available,
+                    Action::Interrupt(target),
+                )
+            });
+        } else if self.interrupt_casualties() > 0 {
+            // The turn has ended and these still run. Only this control stops
+            // them; Esc has nothing to do with it.
+            let at_stake = self.interrupt_casualties();
+            let subagents = plural(at_stake, "subagent", "subagents");
+            submissions.push(if self.interrupt_armed.is_some() {
+                crate::ui_controls::button::destructive(format!("Stop {at_stake} {subagents}"))
+                    .icon(Icon::Stop)
+                    .name(format!("Confirm: stop {at_stake} background {subagents}"))
+                    .on_press_maybe(available.then(|| action(Action::Interrupt(target))))
+                    .into()
+            } else {
+                icon(
+                    Icon::Stop,
+                    Cow::Owned(format!("Stop {at_stake} background {subagents}")),
                     available,
                     Action::Interrupt(target),
                 )
@@ -2867,14 +2938,17 @@ impl Runtime {
         content.push(
             widget::container(
                 widget::column::with_children(vec![
-                    widget::column::with_children(self.queue_view().into_iter().chain(
-                        (!attachment_chips.is_empty()).then(|| {
-                            widget::column::with_children(attachment_chips)
-                                .spacing(step::GAP_XS)
-                                .padding([0, step::GAP_M as u16])
-                                .into()
-                        }),
-                    ))
+                    widget::column::with_children(
+                        self.background_commands_view()
+                            .into_iter()
+                            .chain(self.queue_view(enter_sends))
+                            .chain((!attachment_chips.is_empty()).then(|| {
+                                widget::column::with_children(attachment_chips)
+                                    .spacing(step::GAP_XS)
+                                    .padding([0, step::GAP_M as u16])
+                                    .into()
+                            })),
+                    )
                     .spacing(step::GAP_XS)
                     .into(),
                     editor,
@@ -4140,11 +4214,71 @@ impl Runtime {
     /// row is a glance rather than the message, so the list stays a list at
     /// a hundred entries; revising one takes it back into the composer, the
     /// one place that edits text and files.
-    fn queue_view(&self) -> Option<Element<'_, Message>> {
+    /// Commands the main agent left running. They outlive the turn and any
+    /// interrupt, so the person has to be able to see and stop them here.
+    fn background_commands_view(&self) -> Option<Element<'_, Message>> {
+        let commands = &self.snapshot.background_commands;
+        if commands.is_empty() {
+            return None;
+        }
+        let target = self.target;
+        let available = self.pending.is_none() && !self.disconnected && !self.snapshot.exited;
+        let mut rows: Vec<Element<'_, Message>> =
+            vec![design::caption(format!("Running in the background · {}", commands.len())).into()];
+        for command in commands {
+            rows.push(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(Icon::Terminal, design::COMPACT_ICON_SIZE),
+                    design::heading(command.description.as_str())
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                        .width(Length::Fill)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                        ))
+                        .into(),
+                    crate::ui_controls::button::quiet(if command.stopping {
+                        "Stopping…"
+                    } else {
+                        "Stop"
+                    })
+                    .icon(Icon::Stop)
+                    .name("Stop this background command")
+                    .on_press_maybe((available && !command.stopping).then(|| {
+                        action(Action::Command(
+                            target,
+                            Command::StopBackgroundCommand {
+                                id: command.id.clone(),
+                            },
+                        ))
+                    }))
+                    .into(),
+                ])
+                .spacing(step::GAP_S)
+                .padding([space::XS, space::XS])
+                .align_y(Alignment::Center)
+                .into(),
+            );
+        }
+        Some(
+            widget::container(widget::column::with_children(rows).spacing(step::GAP_XS))
+                .width(Length::Fill)
+                .padding(step::GAP_S)
+                .class(design::surface(
+                    Some(design::sunken),
+                    [design::RADIUS_M, design::RADIUS_M, 0.0, 0.0],
+                    false,
+                ))
+                .into(),
+        )
+    }
+
+    fn queue_view(&self, enter_sends: bool) -> Option<Element<'_, Message>> {
         let target = self.target;
         let caps = &self.snapshot.capabilities;
         let sending = self.followups_sending();
-        let available = self.pending.is_none() && !self.disconnected && !self.snapshot.exited;
+        let delivering = self.snapshot.send_now.is_some_and(chat::SendNow::in_flight);
+        let available =
+            self.pending.is_none() && !self.disconnected && !self.snapshot.exited && !delivering;
         let control = |name, label: &'static str, enabled: bool, message: Action| {
             crate::ui_controls::icon_button(name, label)
                 .compact()
@@ -4225,7 +4359,7 @@ impl Runtime {
             }
             rows.push(queue_row(
                 match queued.delivery {
-                    _ if recalling => QueueTiming::Leaving,
+                    _ if recalling || delivering => QueueTiming::Leaving,
                     chat::QueueDelivery::NextStep => QueueTiming::NextStep,
                     chat::QueueDelivery::NextTurn => QueueTiming::NextTurn,
                 },
@@ -4273,11 +4407,26 @@ impl Runtime {
         if self.snapshot.queued_messages.len() == chat::QueuedMessage::LIMIT {
             rows.push(design::caption("Showing the first 128 queued messages").into());
         }
-        let mut header: Vec<Element<'_, Message>> = vec![
-            design::caption(format!("Queued · {count}"))
-                .width(Length::Fill)
-                .into(),
-        ];
+        let send_now_count = self.send_now_count();
+        let title = match (self.snapshot.send_now, queue_waiting_on(&self.snapshot)) {
+            (Some(chat::SendNow::Requested | chat::SendNow::Delivering), _)
+                if send_now_count > 0 =>
+            {
+                format!("Queued · {count} · sending now…")
+            }
+            (Some(chat::SendNow::Stopped), _) if send_now_count > 0 => {
+                format!("Queued · {count} · reply stopped, sending now…")
+            }
+            (Some(chat::SendNow::Declined), _) if send_now_count > 0 => {
+                format!("Queued · {count} · can't be sent early; goes when the turn reaches it")
+            }
+            (_, Some(waiting)) if !self.snapshot.queued_messages.is_empty() => {
+                format!("Queued · {count} · {waiting}")
+            }
+            _ => format!("Queued · {count}"),
+        };
+        let mut header: Vec<Element<'_, Message>> =
+            vec![design::caption(title).width(Length::Fill).into()];
         // The one thing about the queue a reader cannot discover by looking.
         if sending {
             header.push(design::caption("Sending…").into());
@@ -4294,6 +4443,29 @@ impl Runtime {
                 } else {
                     "Alt+↑ to edit the latest queued message"
                 },
+            ));
+        }
+        if send_now_count > 0 {
+            let label: Cow<'_, str> = if send_now_count == 1 {
+                Cow::Borrowed("Send now")
+            } else {
+                Cow::Owned(format!("Send {send_now_count} now"))
+            };
+            let tooltip = format!(
+                "Give this to the agent now (Esc, or {} with nothing typed). \
+                 Subagents keep running. A reply being written may be cut short.",
+                if enter_sends { "Enter" } else { "Ctrl+Enter" }
+            );
+            header.push(crate::interaction::tooltip(
+                crate::ui_controls::button::secondary(label)
+                    .icon(Icon::Send)
+                    .id(card_control_id(self.target.card, "chat-send-now"))
+                    .name(tooltip.clone())
+                    .on_press_maybe(
+                        self.can_send_now()
+                            .then(|| action(Action::SendQueuedNow(target))),
+                    ),
+                tooltip,
             ));
         }
         Some(
@@ -6781,6 +6953,106 @@ mod tests {
     }
 
     #[test]
+    fn conversation_status_tells_the_turn_apart_from_what_outlives_it() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = true;
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "command".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: String::new(),
+                command: "wait".into(),
+                working_directory: "/tmp".into(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            },
+            started_at: None,
+            at: None,
+        }));
+        snapshot.subagents.push(native_child_fixture());
+        assert_eq!(
+            runtime.conversation_status(false).1,
+            "Running command · 1 subagent working"
+        );
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = false;
+        snapshot.items.clear();
+        let mut second = native_child_fixture();
+        second.id = "second".into();
+        snapshot.subagents.push(second);
+        assert_eq!(
+            runtime.conversation_status(false).1,
+            "Idle · 2 subagents working"
+        );
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.subagents.clear();
+        snapshot.finished_at = Some(42);
+        snapshot.background_commands.push(chat::BackgroundCommand {
+            id: "b".into(),
+            description: "Wait".into(),
+            stopping: false,
+        });
+        assert_eq!(
+            runtime.conversation_status(false).1,
+            "Finished · 1 background command"
+        );
+    }
+
+    #[test]
+    fn the_queue_says_what_it_is_waiting_on() {
+        let mut snapshot = chat::Snapshot::default();
+        assert_eq!(
+            queue_waiting_on(&snapshot),
+            None,
+            "an idle turn holds nothing"
+        );
+        snapshot.busy = true;
+        let mut queued = chat::QueuedMessage::new("q".into(), "later".into());
+        snapshot.queued_messages.push(queued.clone());
+        assert_eq!(
+            queue_waiting_on(&snapshot),
+            Some("waiting for this turn to end")
+        );
+        queued.delivery = chat::QueueDelivery::NextStep;
+        snapshot.queued_messages[0] = queued;
+        assert_eq!(
+            queue_waiting_on(&snapshot),
+            Some("waiting for the agent's next step")
+        );
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "command".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: String::new(),
+                command: "wait".into(),
+                working_directory: "/tmp".into(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            },
+            started_at: None,
+            at: None,
+        }));
+        assert_eq!(
+            queue_waiting_on(&snapshot),
+            Some("waiting for this command to finish")
+        );
+        let mut foreground = native_child_fixture();
+        foreground.background = false;
+        snapshot.subagents.push(foreground);
+        assert_eq!(
+            queue_waiting_on(&snapshot),
+            Some("waiting for the subagent to return")
+        );
+    }
+
+    #[test]
     fn conversation_footer_requires_completion_evidence_and_tracks_delegated_waiting() {
         let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
         assert_eq!(runtime.conversation_status(false).1, "Ready");
@@ -6815,7 +7087,10 @@ mod tests {
         Arc::make_mut(&mut runtime.snapshot).error = None;
         let snapshot = Arc::make_mut(&mut runtime.snapshot);
         snapshot.subagents.push(native_child_fixture());
-        assert_eq!(runtime.conversation_status(false).1, "Subagents working");
+        assert_eq!(
+            runtime.conversation_status(false).1,
+            "Idle · 1 subagent working"
+        );
         Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
         assert_eq!(runtime.conversation_status(false).1, "Subagents waiting");
         Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Succeeded;
@@ -11799,14 +12074,14 @@ mod tests {
             true,
             crate::settings::EditorSyntaxTheme::default(),
         );
-        assert!(runtime.queue_view().is_none());
+        assert!(runtime.queue_view(true).is_none());
         runtime.followups.push(super::super::Followup {
             id: 0,
             text: "Local follow-up".into(),
             preview: "Local follow-up".into(),
             attachments: Vec::new(),
         });
-        assert!(runtime.queue_view().is_some());
+        assert!(runtime.queue_view(true).is_some());
         runtime.selected_subagent = Some("child".into());
         let snapshot = Arc::make_mut(&mut runtime.snapshot);
         snapshot.capabilities.queue_remove = true;
@@ -11816,7 +12091,7 @@ mod tests {
             .collect();
         let renderer = crate::app::tests::headless_renderer();
         for width in [320.0, 400.0, 960.0] {
-            let mut element = runtime.queue_view().unwrap();
+            let mut element = runtime.queue_view(true).unwrap();
             let mut tree = iced::advanced::widget::Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -13434,6 +13709,83 @@ mod tests {
         );
     }
     #[test]
+    fn escape_stops_nothing_once_the_turn_is_over() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+
+        let renderer = crate::app::tests::headless_renderer();
+        let viewport = iced::Rectangle::with_size(iced::Size::new(620.0, 720.0));
+        {
+            let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.ready = true;
+            snapshot.busy = false;
+            snapshot.capabilities.interrupt_stops_background = true;
+            snapshot.capabilities.send_queued_now = true;
+            snapshot.subagents.push(native_child_fixture());
+            let target = runtime.target;
+            let shortcuts = crate::settings::KeyboardShortcuts::default();
+            let mut element = runtime.view(
+                None,
+                false,
+                true,
+                &shortcuts,
+                viewport.width,
+                Place {
+                    name: "fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            );
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+            );
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
+                    target.card,
+                    "chat-composer",
+                )),
+            );
+            let escape = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &escape,
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            assert!(
+                !messages.iter().any(|message| matches!(
+                    message,
+                    Message::ChatUi(Action::EscapeTurn(..) | Action::Interrupt(..))
+                )),
+                "only the visible control stops subagents with the turn over"
+            );
+            assert!(runtime.interrupt_armed.is_none());
+        }
+    }
+
+    #[test]
     fn busy_composer_escape_dismisses_actions_before_interrupting() {
         use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
 
@@ -13509,15 +13861,15 @@ mod tests {
                 assert!(
                     !messages
                         .iter()
-                        .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(..))))
+                        .any(|message| matches!(message, Message::ChatUi(Action::EscapeTurn(..))))
                 );
             } else {
                 assert!(
                     messages.iter().any(|message| matches!(
                         message,
-                        Message::ChatUi(Action::Interrupt(actual)) if *actual == target
+                        Message::ChatUi(Action::EscapeTurn(actual)) if *actual == target
                     )),
-                    "the focused busy composer otherwise handles Escape as interruption"
+                    "the focused busy composer otherwise handles Escape as the turn's"
                 );
             }
         }
