@@ -1148,6 +1148,153 @@ impl Cagents {
         }
     }
 
+    fn normalize_shared_repository(&self, pane: &mut Pane) {
+        if let CardKind::Repository(repository) = &mut pane.kind {
+            if let Some(project) =
+                self.project_for_repository(&repository.repository)
+                    .or_else(|| {
+                        self.sidebar_model
+                            .worktree_at(&repository.worktree)
+                            .map(|key| key.project_id)
+                    })
+            {
+                repository.project = project;
+            }
+        }
+    }
+
+    /// A refused descriptor must retain its placement too. Decide this before
+    /// either the old strip or the replacement's ownership is projected.
+    fn defer_fenced_repository_replacements(&mut self, views: &mut Vec<View>) {
+        let mut deferred = HashMap::new();
+        let mut original_orders = HashMap::new();
+        for (destination, incoming) in views
+            .iter()
+            .flat_map(|view| view.panes.iter().map(move |pane| (&view.scope, pane)))
+        {
+            let Some(CardRuntime::Repository(runtime)) = self.cards.get(&incoming.id) else {
+                continue;
+            };
+            if !runtime.blocks_navigation() {
+                continue;
+            }
+            let Some(card) = self
+                .card_state(incoming.id)
+                .filter(|card| card.existence.is_open())
+            else {
+                continue;
+            };
+            let mut replacement = incoming.clone();
+            self.normalize_shared_repository(&mut replacement);
+            if card.kind == replacement.kind {
+                continue;
+            }
+            let scope = self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.cards.contains(&card.id))
+                .map(|channel| Scope::Channel(channel.id))
+                .or_else(|| {
+                    self.card_worktree(card)
+                        .and_then(|path| self.worktree_view_scope(path))
+                });
+            let Some(scope) = scope else {
+                continue;
+            };
+            if *destination == scope {
+                // The ordinary in-place replacement guard below owns this.
+                continue;
+            }
+            let position = original_orders
+                .entry(scope.clone())
+                .or_insert_with(|| self.local_view_cards(&scope))
+                .iter()
+                .position(|id| *id == card.id)
+                .unwrap_or(0);
+            let Some(mut original) =
+                Pane::from_card(card, self.durable.card_scopes.get(&card.id).cloned())
+            else {
+                continue;
+            };
+            original.user_title = self.chrome_ui.user_titles.get(&card.id).cloned();
+            deferred.insert(card.id, (scope, position, original));
+        }
+        if deferred.is_empty() {
+            return;
+        }
+        for view in views.iter_mut() {
+            view.panes.retain(|pane| !deferred.contains_key(&pane.id));
+        }
+        let mut by_scope = HashMap::<Scope, Vec<(usize, Pane)>>::new();
+        for (scope, position, pane) in deferred.into_values() {
+            by_scope.entry(scope).or_default().push((position, pane));
+        }
+        for (scope, mut retained) in by_scope {
+            let original = original_orders.remove(&scope).unwrap_or_default();
+            let index = match views.iter().position(|view| view.scope == scope) {
+                Some(index) => index,
+                None => {
+                    views.push(View::empty(scope));
+                    views.len() - 1
+                }
+            };
+            let view = &mut views[index];
+            let survivors = view
+                .panes
+                .iter()
+                .enumerate()
+                .map(|(index, pane)| (pane.id, index))
+                .collect::<HashMap<_, _>>();
+            let mut anchors = vec![(None, None); original.len()];
+            let mut preceding = None;
+            for (index, id) in original.iter().enumerate() {
+                anchors[index].0 = preceding;
+                if let Some(position) = survivors.get(id) {
+                    preceding = Some(*position);
+                }
+            }
+            let mut following = None;
+            for (index, id) in original.iter().enumerate().rev() {
+                anchors[index].1 = following;
+                if let Some(position) = survivors.get(id) {
+                    following = Some(*position);
+                }
+            }
+            // Keep canonical survivor order, placing retained editors before
+            // their nearest surviving original successor, otherwise after a
+            // predecessor, otherwise at the end. Peer reordering can make
+            // those anchors conflict: the earlier retained editor's anchor
+            // wins, so later retained editors never cross it.
+            retained.sort_by_key(|(position, _)| *position);
+            let survivor_count = view.panes.len();
+            let mut gap = 0;
+            let mut insertions = retained
+                .into_iter()
+                .map(|(position, pane)| {
+                    let desired = anchors
+                        .get(position)
+                        .and_then(|(before, after)| after.or_else(|| before.map(|index| index + 1)))
+                        .unwrap_or(survivor_count);
+                    gap = gap.max(desired);
+                    (gap, pane)
+                })
+                .peekable();
+            let mut projected = Vec::with_capacity(view.panes.len() + insertions.len());
+            for (index, pane) in std::mem::take(&mut view.panes).into_iter().enumerate() {
+                while insertions.peek().is_some_and(|(gap, _)| *gap == index) {
+                    projected.push(insertions.next().expect("checked insertion").1);
+                }
+                projected.push(pane);
+            }
+            projected.extend(insertions.map(|(_, pane)| pane));
+            view.panes = projected;
+        }
+        self.status = Some(TransientNotice::warning(
+            "Another client changed an editor pane. Its editor and location are retained here; wait for pending saves, then resolve any unsaved edits, file recovery or durability warnings before adopting that change.",
+        ));
+    }
+
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
         // A watcher snapshot can announce the destination before the explicit
         // transfer response arrives. Rebase before either snapshot projects.
@@ -1216,6 +1363,7 @@ impl Cagents {
                 }
             }
         }
+        self.defer_fenced_repository_replacements(&mut views);
         let owned = views
             .iter()
             .flat_map(|view| view.panes.iter().map(|pane| pane.id))
@@ -1525,7 +1673,7 @@ impl Cagents {
             let (pending, saved_copy) = self.preserve_pending_shared_upgrade(id);
             tasks.push(pending);
             retained_upgrades.extend(saved_copy);
-            if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving())
+            if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
                 || self.shared_chat_has_local_work(id)
             {
                 self.retain_local_pane(id);
@@ -1540,9 +1688,25 @@ impl Cagents {
                     }
                     self.sync_closed_chat_draft(id);
                 }
-                self.status = Some(TransientNotice::warning(
-                    "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it.",
-                ));
+                let message = match self.cards.get(&id) {
+                    Some(CardRuntime::Repository(runtime)) if runtime.is_saving() => {
+                        "A pane was closed in another client. Its editor is retained here; wait for its save to finish before closing it."
+                    }
+                    Some(CardRuntime::Repository(runtime))
+                        if runtime.is_dirty()
+                            && (runtime.has_editor_recovery()
+                                || runtime.has_durability_warning()) =>
+                    {
+                        "A pane was closed in another client. Its editor is retained here; resolve its file recovery or durability warning, then save any remaining edits before closing it."
+                    }
+                    Some(CardRuntime::Repository(runtime)) if !runtime.is_dirty() => {
+                        "A pane was closed in another client. Its editor is retained here; resolve its file recovery or durability warning before closing it."
+                    }
+                    _ => {
+                        "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it."
+                    }
+                };
+                self.status = Some(TransientNotice::warning(message));
                 continue;
             }
             self.detach_shared_pane(id);
@@ -1561,18 +1725,7 @@ impl Cagents {
                 }
             }
 
-            if let CardKind::Repository(repository) = &mut projected.kind {
-                if let Some(project) =
-                    self.project_for_repository(&repository.repository)
-                        .or_else(|| {
-                            self.sidebar_model
-                                .worktree_at(&repository.worktree)
-                                .map(|key| key.project_id)
-                        })
-                {
-                    repository.project = project;
-                }
-            }
+            self.normalize_shared_repository(&mut projected);
             if let CardKind::Browser(browser) = &mut projected.kind {
                 if let Some(CardKind::Browser(local)) =
                     self.card_state(projected.id).map(|card| &card.kind)
@@ -1655,11 +1808,21 @@ impl Cagents {
             match existing {
                 Some(card) if card.existence.is_open() => {
                     if card.kind != pane.kind
-                        && matches!(self.cards.get(&pane.id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving())
+                        && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&pane.id)
+                        && runtime.blocks_navigation()
                     {
-                        self.status = Some(TransientNotice::warning(
-                            "Another client changed this pane. Save or discard its unsaved edits before adopting that change.",
-                        ));
+                        let message = if runtime.is_saving() {
+                            "Another client changed this pane. Wait for its save to finish before adopting that change."
+                        } else if runtime.is_dirty()
+                            && (runtime.has_editor_recovery() || runtime.has_durability_warning())
+                        {
+                            "Another client changed this pane. Resolve this editor's file recovery or durability warning, then save any remaining edits before adopting that change."
+                        } else if runtime.is_dirty() {
+                            "Another client changed this pane. Save or discard its unsaved edits before adopting that change."
+                        } else {
+                            "Another client changed this pane. Resolve this editor's file recovery or durability warning before adopting that change."
+                        };
+                        self.status = Some(TransientNotice::warning(message));
                         continue;
                     }
                     if card.kind != pane.kind {
@@ -4114,6 +4277,967 @@ mod tests {
         };
         assert!(runtime.is_dirty());
         assert_eq!(runtime.descriptor, original);
+    }
+
+    fn repository_retention_fixture(state: &str) -> (Cagents, ChannelId, Pane) {
+        let (mut app, channel, _, mut pane) = fixture();
+        let runtime = match state {
+            "dirty" => RepositoryRuntime::dirty_fixture(pane.id),
+            "saving" => RepositoryRuntime::post_persist_failure_fixture(pane.id).0,
+            "dirty-saving" => {
+                let (mut runtime, _) = RepositoryRuntime::post_persist_failure_fixture(pane.id);
+                // Keep the real active SaveTicket while a real editor action
+                // makes the current buffer dirty. Do not fake either predicate.
+                drop(runtime.update(RepositoryAction::EditorAction {
+                    card: pane.id,
+                    action: cosmic::widget::text_editor::Action::Edit(
+                        cosmic::widget::text_editor::Edit::Paste(Arc::new("in-flight edit".into())),
+                    ),
+                }));
+                assert!(runtime.is_dirty() && runtime.is_saving());
+                assert!(!runtime.can_save());
+                assert!(!runtime.can_abandon_unsaved_changes());
+                runtime
+            }
+            "dirty-warning" => {
+                let (mut runtime, completion) =
+                    RepositoryRuntime::post_persist_failure_fixture(pane.id);
+                drop(runtime.update(completion));
+                assert!(runtime.is_dirty() && runtime.has_durability_warning());
+                runtime
+            }
+            "warning" => {
+                let (mut runtime, completion) =
+                    RepositoryRuntime::post_persist_failure_fixture(pane.id);
+                drop(runtime.update(completion));
+                // This fixture's submitted B snapshot differs from its A
+                // buffer, so its save receipt initially leaves it dirty.
+                assert!(runtime.is_dirty());
+                let warning = runtime.save_error().unwrap().to_owned();
+                assert!(runtime.has_durability_warning());
+                drop(runtime.update(RepositoryAction::DiscardEdits { card: pane.id }));
+                // Discarding unsaved text does not confirm disk durability.
+                assert_eq!(runtime.editor_text().as_deref(), Some("B\n"));
+                assert_eq!(runtime.save_error(), Some(warning.as_str()));
+                runtime
+            }
+            "recovery" => {
+                let (mut runtime, mut identity) =
+                    RepositoryRuntime::open_fixture(pane.id, "notes.txt", "saved\n");
+                let authority = crate::recovery_authority::RecoverySlot::reserve()
+                    .unwrap()
+                    .retain("pending editor cleanup".into(), || {
+                        Err("cleanup still pending".into())
+                    });
+                // A delayed completion must retain its cleanup authority even
+                // after its document generation has become obsolete. Drive
+                // that real receipt path without starting filesystem work.
+                identity.generation = identity.generation.wrapping_add(1);
+                drop(runtime.update(RepositoryAction::RetainedSaveFinished {
+                    identity,
+                    ticket: u64::MAX,
+                    revision: 0,
+                    saved_text: "saved\n".into(),
+                    result: Err(crate::editor::retained_save::RetainedSaveError::Recovery {
+                        message: "pending editor cleanup".into(),
+                        authority,
+                    }),
+                }));
+                assert!(runtime.has_editor_recovery());
+                runtime
+            }
+            "clean" => RepositoryRuntime::open_fixture(pane.id, "notes.txt", "saved\n").0,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            runtime.is_dirty(),
+            matches!(state, "dirty" | "dirty-warning" | "dirty-saving")
+        );
+        assert_eq!(
+            runtime.is_saving(),
+            matches!(state, "saving" | "dirty-saving")
+        );
+        assert_eq!(
+            runtime.has_durability_warning(),
+            matches!(state, "warning" | "dirty-warning")
+        );
+        assert_eq!(runtime.has_editor_recovery(), state == "recovery");
+        assert_eq!(runtime.blocks_navigation(), state != "clean");
+        pane.kind = CardKind::Repository(runtime.descriptor.clone());
+        let mut view = View::empty(channel);
+        view.panes.push(pane.clone());
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        app.cards
+            .insert(pane.id, CardRuntime::Repository(Box::new(runtime)));
+        (app, channel, pane)
+    }
+
+    fn finish_shared_repository_save_with_warning(app: &mut Cagents, id: CardId) {
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&id) else {
+            panic!("the saving editor must remain attached");
+        };
+        let mut completion = runtime.durable_active_save_completion();
+        let RepositoryAction::SaveFinished {
+            result: Ok(crate::editor::SaveOutcome::Saved { durability, .. }),
+            ..
+        } = &mut completion
+        else {
+            unreachable!()
+        };
+        *durability = crate::editor::SaveDurability::Unconfirmed {
+            error: "injected shared-save directory sync failure".into(),
+        };
+        drop(runtime.update(completion));
+        assert!(!runtime.is_saving());
+        assert!(runtime.is_dirty() && runtime.has_durability_warning());
+        assert!(runtime.blocks_navigation());
+    }
+
+    fn moved_repository_replacement_fixture(
+        state: &str,
+        destination_first: bool,
+    ) -> (Cagents, ChannelId, Pane, Scope) {
+        let (mut app, source, pane) = repository_retention_fixture(state);
+        let CardKind::Repository(original) = &pane.kind else {
+            unreachable!()
+        };
+        let destination_path = PathBuf::from("/repo/peer-destination");
+        app.sidebar_model.projects.push(SidebarProject::new(
+            original.project,
+            RepositoryId::new(),
+            "repo".into(),
+            original.repository.clone(),
+            [original.worktree.clone(), destination_path.clone()]
+                .into_iter()
+                .map(|path| {
+                    crate::sidebar::SidebarWorktree::new(
+                        crate::model::WorktreeId::new(),
+                        path,
+                        None,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+            vec![],
+        ));
+        // Give the original channel a real local scope and a visible strip.
+        // These are the placement facts a refused replacement must preserve.
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.active_channel = Some(source);
+        for channel in &mut durable.channels {
+            channel.project_id = original.project;
+        }
+        durable
+            .card_scopes
+            .insert(pane.id, original.worktree.clone());
+        app.worktree_owners
+            .insert(pane.id, original.worktree.clone());
+        app.workspace_model.views[0].panes[0].scope = Some(original.worktree.clone());
+        drop(app.reconcile_shared_views());
+        assert!(app.workspace.card(pane.id).is_some());
+        assert_eq!(app.local_view_cards(&Scope::Channel(source)), vec![pane.id]);
+
+        let destination = Scope::Worktree {
+            repository: original.repository.clone(),
+            path: destination_path.clone(),
+        };
+        app.shared_views.initialized.insert(destination.clone());
+        let mut changed = pane.clone();
+        let CardKind::Repository(replacement) = &mut changed.kind else {
+            unreachable!()
+        };
+        replacement.worktree = destination_path.clone();
+        replacement.selected_file = Some("peer.txt".into());
+        changed.scope = Some(destination_path);
+        let mut target = View::empty(destination.clone());
+        target.panes.push(changed);
+        let source_view = View::empty(source);
+        app.workspace_model.views = if destination_first {
+            vec![target, source_view]
+        } else {
+            vec![source_view, target]
+        };
+        (app, source, pane, destination)
+    }
+
+    #[test]
+    fn moved_shared_repository_replacement_keeps_fenced_editor_reachable() {
+        for state in ["dirty", "recovery"] {
+            for destination_first in [false, true] {
+                let (mut app, source, pane, destination) =
+                    moved_repository_replacement_fixture(state, destination_first);
+                let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
+                    unreachable!()
+                };
+                let identity = &**before as *const RepositoryRuntime;
+                let descriptor = before.descriptor.clone();
+                let text = before.editor_text();
+                let scope = app.durable.card_scopes.get(&pane.id).cloned();
+                let owner = app.worktree_owners.get(&pane.id).cloned();
+                let incoming = app.workspace_model.views.clone();
+                for _ in 0..2 {
+                    drop(app.reconcile_shared_views());
+                    let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                        panic!("{state}: a refused moved replacement must retain its editor");
+                    };
+                    assert_eq!(&**current as *const RepositoryRuntime, identity, "{state}");
+                    assert_eq!(current.descriptor, descriptor, "{state}");
+                    assert_eq!(current.editor_text(), text, "{state}");
+                    assert!(current.blocks_navigation(), "{state}");
+                    assert_eq!(current.has_editor_recovery(), state == "recovery");
+                    assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+                    assert_eq!(app.durable.card_scopes.get(&pane.id), scope.as_ref());
+                    assert_eq!(app.worktree_owners.get(&pane.id), owner.as_ref());
+                    assert_eq!(app.local_view_cards(&Scope::Channel(source)), vec![pane.id]);
+                    assert!(!app.local_view_cards(&destination).contains(&pane.id));
+                    assert!(app.workspace.card(pane.id).is_some(), "{state}");
+                    assert_eq!(app.workspace_model.views, incoming);
+                }
+
+                // Exercise the real palette routing after leaving the retained
+                // editor. A runtime in memory alone is not a recovery path.
+                let other = app
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id != source)
+                    .unwrap()
+                    .id;
+                drop(app.select_channel(other));
+                assert!(app.workspace.card(pane.id).is_none());
+                drop(app.update_palette(super::super::palette_ui::Action::FocusPane(pane.id)));
+                assert_eq!(app.durable.active_channel, Some(source));
+                assert!(app.workspace.card(pane.id).is_some(), "{state}");
+                assert_eq!(app.workspace.focused(), Some(pane.id));
+                assert!(
+                    matches!(app.cards.get(&pane.id), Some(CardRuntime::Repository(runtime))
+                    if &**runtime as *const RepositoryRuntime == identity)
+                );
+
+                if state == "dirty" {
+                    let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&pane.id) else {
+                        unreachable!()
+                    };
+                    drop(runtime.update(RepositoryAction::DiscardEdits { card: pane.id }));
+                    assert!(!runtime.blocks_navigation());
+                    let expected = incoming
+                        .iter()
+                        .find(|view| view.scope == destination)
+                        .unwrap()
+                        .panes[0]
+                        .kind
+                        .clone();
+                    for _ in 0..2 {
+                        drop(app.reconcile_shared_views());
+                        assert_eq!(app.card_state(pane.id).unwrap().kind, expected);
+                        assert!(
+                            !app.local_view_cards(&Scope::Channel(source))
+                                .contains(&pane.id)
+                        );
+                        assert_eq!(app.local_view_cards(&destination), vec![pane.id]);
+                        assert!(!app.shared_views.retained.contains(&pane.id));
+                        assert!(!app.durable.local_only_cards.contains(&pane.id));
+                        assert_eq!(app.workspace_model.views, incoming);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moved_shared_repository_replacement_adopts_destination_when_editor_is_clean() {
+        for destination_first in [false, true] {
+            let (mut app, source, pane, destination) =
+                moved_repository_replacement_fixture("clean", destination_first);
+            let Scope::Worktree { path, .. } = &destination else {
+                unreachable!()
+            };
+            let expected = app
+                .workspace_model
+                .views
+                .iter()
+                .find(|view| view.scope == destination)
+                .unwrap()
+                .panes[0]
+                .kind
+                .clone();
+            for _ in 0..2 {
+                drop(app.reconcile_shared_views());
+                assert_eq!(app.card_state(pane.id).unwrap().kind, expected);
+                let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+                    panic!("a clean replacement must attach its new repository viewer");
+                };
+                assert_eq!(CardKind::Repository(runtime.descriptor.clone()), expected);
+                assert_eq!(app.durable.card_scopes.get(&pane.id), Some(path));
+                assert_eq!(app.worktree_owners.get(&pane.id), Some(path));
+                assert!(
+                    !app.local_view_cards(&Scope::Channel(source))
+                        .contains(&pane.id)
+                );
+                assert_eq!(app.local_view_cards(&destination), vec![pane.id]);
+                assert!(app.workspace.card(pane.id).is_none());
+                assert!(!app.shared_views.retained.contains(&pane.id));
+            }
+        }
+    }
+
+    #[test]
+    fn moved_shared_repository_replacement_keeps_recovering_worktree_editor_reachable() {
+        for destination_first in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let leases = tempfile::tempdir().unwrap();
+            let path = root.path().canonicalize().unwrap();
+            let (mut app, destination, _, mut pane) = fixture();
+            let descriptor = RepositoryView {
+                project: ProjectId::new(),
+                repository: path.join(".git"),
+                worktree: path.clone(),
+                selected_file: Some("notes.txt".into()),
+            };
+            // Open a real runtime against the fixture-owned directory. No
+            // worker is polled; deliver its initial read and stale recovery
+            // receipt through the same reducer as the existing recovery case.
+            let mut runtime = RepositoryRuntime::file_list_fixture(
+                descriptor.clone(),
+                &["notes.txt", "peer.txt"],
+            );
+            drop(runtime.update(RepositoryAction::OpenFile {
+                card: pane.id,
+                path: "notes.txt".into(),
+            }));
+            let mut load = crate::repository_widget::AsyncIdentity {
+                card: pane.id,
+                worktree: path.clone(),
+                path: "notes.txt".into(),
+                generation: 1,
+            };
+            drop(runtime.update(RepositoryAction::FileLoaded {
+                identity: load.clone(),
+                result: Ok(crate::editor::LoadedFile {
+                    source: load.path.clone(),
+                    content: crate::editor::FileContent::Editable {
+                        text: "saved\n".into(),
+                        content_hash: blake3::hash(b"saved\n"),
+                        markdown: false,
+                    },
+                }),
+            }));
+            assert_eq!(runtime.editor_text().as_deref(), Some("saved\n"));
+            let authority = crate::recovery_authority::RecoverySlot::reserve()
+                .unwrap()
+                .retain("pending editor cleanup".into(), || {
+                    Err("cleanup still pending".into())
+                });
+            load.generation += 1;
+            drop(runtime.update(RepositoryAction::RetainedSaveFinished {
+                identity: load,
+                ticket: u64::MAX,
+                revision: 0,
+                saved_text: "saved\n".into(),
+                result: Err(crate::editor::retained_save::RetainedSaveError::Recovery {
+                    message: "pending editor cleanup".into(),
+                    authority,
+                }),
+            }));
+            assert!(!runtime.is_dirty() && !runtime.is_saving());
+            assert!(runtime.has_editor_recovery() && runtime.blocks_navigation());
+
+            app.sidebar_model.projects.push(SidebarProject::new(
+                descriptor.project,
+                RepositoryId::new(),
+                "repo".into(),
+                descriptor.repository.clone(),
+                vec![crate::sidebar::SidebarWorktree::new(
+                    crate::model::WorktreeId::new(),
+                    path.clone(),
+                    None,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                )],
+                vec![],
+            ));
+            for channel in &mut Arc::make_mut(&mut app.durable).channels {
+                channel.project_id = descriptor.project;
+            }
+            Arc::make_mut(&mut app.durable).active_channel = None;
+            app.active_workspace = Some(path.clone());
+            app.worktree_protections
+                .use_fixture_runtime(leases.path().into());
+            let source = Scope::Worktree {
+                repository: descriptor.repository.clone(),
+                path: path.clone(),
+            };
+            app.shared_views.initialized.insert(source.clone());
+            pane.kind = CardKind::Repository(descriptor.clone());
+            pane.scope = Some(path.clone());
+            let mut original = View::empty(source.clone());
+            original.panes.push(pane.clone());
+            app.workspace_model.views = vec![original, View::empty(destination)];
+            drop(app.reconcile_shared_views());
+            app.cards
+                .insert(pane.id, CardRuntime::Repository(Box::new(runtime)));
+            assert!(app.workspace.card(pane.id).is_some());
+            assert_eq!(app.local_view_cards(&source), vec![pane.id]);
+            let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
+                unreachable!()
+            };
+            let identity = &**before as *const RepositoryRuntime;
+
+            let mut changed = pane.clone();
+            let CardKind::Repository(replacement) = &mut changed.kind else {
+                unreachable!()
+            };
+            replacement.worktree = path.join("peer-location");
+            replacement.selected_file = Some("peer.txt".into());
+            changed.scope = Some(replacement.worktree.clone());
+            let mut target = View::empty(destination);
+            target.panes.push(changed);
+            app.workspace_model.views = if destination_first {
+                vec![target, View::empty(source.clone())]
+            } else {
+                vec![View::empty(source.clone()), target]
+            };
+            let incoming = app.workspace_model.views.clone();
+            for _ in 0..2 {
+                drop(app.reconcile_shared_views());
+                let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                    panic!("the recovering worktree editor must remain attached");
+                };
+                assert_eq!(&**current as *const RepositoryRuntime, identity);
+                assert_eq!(current.descriptor, descriptor);
+                assert_eq!(current.editor_text().as_deref(), Some("saved\n"));
+                assert!(!current.is_dirty() && !current.is_saving());
+                assert!(current.has_editor_recovery() && current.blocks_navigation());
+                assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+                assert_eq!(app.durable.card_scopes.get(&pane.id), Some(&path));
+                assert_eq!(app.worktree_owners.get(&pane.id), Some(&path));
+                assert_eq!(app.local_view_cards(&source), vec![pane.id]);
+                assert!(
+                    !app.local_view_cards(&Scope::Channel(destination))
+                        .contains(&pane.id)
+                );
+                assert!(app.workspace.card(pane.id).is_some());
+                assert_eq!(app.workspace_model.views, incoming);
+            }
+
+            drop(app.select_channel(destination));
+            assert!(app.workspace.card(pane.id).is_none());
+            drop(app.update_palette(super::super::palette_ui::Action::FocusPane(pane.id)));
+            assert_eq!(app.durable.active_channel, None);
+            assert_eq!(app.active_workspace.as_ref(), Some(&path));
+            assert!(app.workspace.card(pane.id).is_some());
+            assert_eq!(app.workspace.focused(), Some(pane.id));
+            assert!(
+                matches!(app.cards.get(&pane.id), Some(CardRuntime::Repository(runtime))
+                if &**runtime as *const RepositoryRuntime == identity
+                    && runtime.has_editor_recovery())
+            );
+            assert_eq!(app.workspace_model.views, incoming);
+        }
+    }
+
+    #[test]
+    fn moved_shared_repository_replacements_keep_relative_order_after_clean_neighbor_changes() {
+        for destination_first in [false, true] {
+            for reordered_survivors in [false, true] {
+                let (mut app, source, mut a, destination) =
+                    moved_repository_replacement_fixture("dirty", destination_first);
+                let CardKind::Repository(original) = a.kind.clone() else {
+                    unreachable!()
+                };
+                a.scope = Some(original.worktree.clone());
+                let clean = |label: &str| Pane {
+                    id: CardId::new(),
+                    title: label.into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 0.5,
+                    kind: CardKind::Browser(BrowserSession {
+                        id: BrowserId::new(),
+                        current_url: "https://example.com".parse().unwrap(),
+                        history: vec![],
+                        history_index: 0,
+                        scroll_x: 0.,
+                        scroll_y: 0.,
+                        fidelity: BrowserRestoreFidelity::UrlOnly,
+                    }),
+                    scope: Some(original.worktree.clone()),
+                };
+                let x = clean("removed predecessor");
+                let b = clean("surviving middle");
+                let d = clean("surviving tail");
+                let mut c = a.clone();
+                c.id = CardId::new();
+                c.title = "recovering editor".into();
+                c.scope = Some(original.worktree.clone());
+                let (mut recovery, mut receipt) =
+                    RepositoryRuntime::open_fixture(c.id, "notes.txt", "saved\n");
+                recovery.descriptor = original.clone();
+                let authority = crate::recovery_authority::RecoverySlot::reserve()
+                    .unwrap()
+                    .retain("pending editor cleanup".into(), || {
+                        Err("cleanup still pending".into())
+                    });
+                receipt.generation = receipt.generation.wrapping_add(1);
+                drop(recovery.update(RepositoryAction::RetainedSaveFinished {
+                    identity: receipt,
+                    ticket: u64::MAX,
+                    revision: 0,
+                    saved_text: "saved\n".into(),
+                    result: Err(crate::editor::retained_save::RetainedSaveError::Recovery {
+                        message: "pending editor cleanup".into(),
+                        authority,
+                    }),
+                }));
+                assert!(!recovery.is_dirty() && recovery.has_editor_recovery());
+                assert!(recovery.blocks_navigation());
+                let mut local = vec![x.clone(), a.clone(), b.clone(), c.clone()];
+                if reordered_survivors {
+                    local.push(d.clone());
+                }
+                let mut source_view = View::empty(source);
+                source_view.panes = local;
+                app.workspace_model.views = vec![source_view, View::empty(destination.clone())];
+                drop(app.reconcile_shared_views());
+                app.cards
+                    .insert(c.id, CardRuntime::Repository(Box::new(recovery)));
+                let identities = [a.id, c.id].map(|id| {
+                    let Some(CardRuntime::Repository(runtime)) = app.cards.get(&id) else {
+                        unreachable!()
+                    };
+                    (
+                        &**runtime as *const RepositoryRuntime,
+                        runtime.editor_text(),
+                        app.worktree_owners.get(&id).cloned(),
+                    )
+                });
+
+                let Scope::Worktree { path, .. } = &destination else {
+                    unreachable!()
+                };
+                let mut target = View::empty(destination.clone());
+                for mut pane in [a.clone(), c.clone()] {
+                    let CardKind::Repository(replacement) = &mut pane.kind else {
+                        unreachable!()
+                    };
+                    replacement.worktree = path.clone();
+                    replacement.selected_file = Some("peer.txt".into());
+                    pane.scope = Some(path.clone());
+                    target.panes.push(pane);
+                }
+                let clean_survivors = if reordered_survivors {
+                    vec![d.clone(), b.clone()]
+                } else {
+                    vec![b.clone()]
+                };
+                let clean_order = clean_survivors
+                    .iter()
+                    .map(|pane| pane.id)
+                    .collect::<Vec<_>>();
+                let expected = if reordered_survivors {
+                    // Canonical clean order wins when old neighbor anchors
+                    // conflict; A's earlier anchor bounds C behind A.
+                    vec![d.id, a.id, c.id, b.id]
+                } else {
+                    // The removed x must not shift A past its surviving b.
+                    vec![a.id, b.id, c.id]
+                };
+                let mut source_view = View::empty(source);
+                source_view.panes = clean_survivors;
+                app.workspace_model.views = if destination_first {
+                    vec![target, source_view]
+                } else {
+                    vec![source_view, target]
+                };
+                let incoming = app.workspace_model.views.clone();
+                for _ in 0..2 {
+                    drop(app.reconcile_shared_views());
+                    assert_eq!(app.local_view_cards(&Scope::Channel(source)), expected);
+                    assert_eq!(app.workspace.order().collect::<Vec<_>>(), expected);
+                    assert_eq!(
+                        app.workspace
+                            .order()
+                            .filter(|id| clean_order.contains(id))
+                            .collect::<Vec<_>>(),
+                        clean_order
+                    );
+                    assert!(!app.card_state(x.id).unwrap().existence.is_open());
+                    for (id, (identity, text, owner)) in [a.id, c.id].into_iter().zip(&identities) {
+                        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&id) else {
+                            panic!("a fenced editor must remain in its original strip");
+                        };
+                        assert_eq!(&**runtime as *const RepositoryRuntime, *identity);
+                        assert_eq!(runtime.editor_text(), *text);
+                        assert!(runtime.blocks_navigation());
+                        assert_eq!(app.worktree_owners.get(&id), owner.as_ref());
+                        assert_eq!(app.durable.card_scopes.get(&id), Some(&original.worktree));
+                        assert!(!app.local_view_cards(&destination).contains(&id));
+                    }
+                    assert_eq!(app.workspace_model.views, incoming);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_repository_removal_preserves_navigation_fences_and_exact_runtime() {
+        for state in [
+            "dirty",
+            "saving",
+            "warning",
+            "recovery",
+            "dirty-warning",
+            "dirty-saving",
+        ] {
+            let (mut app, channel, pane) = repository_retention_fixture(state);
+            let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
+                unreachable!()
+            };
+            let identity = &**before as *const RepositoryRuntime;
+            let text = before.editor_text();
+            let error = before.save_error().map(str::to_owned);
+            app.workspace_model.views[0].panes.clear();
+            for _ in 0..2 {
+                drop(app.reconcile_shared_views());
+                let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                    panic!("{state}: passive removal must retain the fenced editor");
+                };
+                assert_eq!(&**current as *const RepositoryRuntime, identity, "{state}");
+                assert_eq!(current.editor_text(), text, "{state}");
+                assert_eq!(current.save_error().map(str::to_owned), error, "{state}");
+                assert!(current.blocks_navigation(), "{state}");
+                assert_eq!(current.has_editor_recovery(), state == "recovery");
+                assert_eq!(
+                    current.has_durability_warning(),
+                    matches!(state, "warning" | "dirty-warning")
+                );
+                assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+                assert!(app.card_state(pane.id).unwrap().existence.is_open());
+                assert!(app.shared_views.retained.contains(&pane.id));
+                assert!(app.durable.local_only_cards.contains(&pane.id));
+                let notice = app.status.as_ref().unwrap().message.as_str();
+                match state {
+                    "dirty" => assert!(notice.contains("save or discard them before closing")),
+                    "dirty-warning" => {
+                        assert!(notice.contains("resolve its file recovery or durability warning"));
+                        assert!(notice.contains("then save any remaining edits"));
+                        assert!(!notice.contains("discard"));
+                    }
+                    "saving" | "dirty-saving" => {
+                        assert!(notice.contains("wait for its save to finish"));
+                        assert!(!notice.contains("save or discard"));
+                        assert!(!notice.contains("resolve its file recovery"));
+                    }
+                    "warning" | "recovery" => {
+                        assert!(notice.contains("file recovery or durability warning"));
+                        assert!(!notice.contains("unsaved edits"));
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    app.durable.channels.iter().any(|current| {
+                        current.id == channel && current.cards.contains(&pane.id)
+                    })
+                );
+            }
+            if state == "dirty-saving" {
+                finish_shared_repository_save_with_warning(&mut app, pane.id);
+                drop(app.reconcile_shared_views());
+                let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                    panic!("completed save warning must retain the editor");
+                };
+                assert_eq!(&**current as *const RepositoryRuntime, identity);
+                assert_eq!(current.editor_text(), text);
+                assert!(current.has_durability_warning() && current.blocks_navigation());
+                let notice = app.status.as_ref().unwrap().message.as_str();
+                assert!(notice.contains("resolve its file recovery or durability warning"));
+                assert!(!notice.contains("wait for its save"));
+                assert!(!notice.contains("discard"));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_repository_replacement_preserves_navigation_fences_and_exact_runtime() {
+        for state in [
+            "dirty",
+            "saving",
+            "warning",
+            "recovery",
+            "dirty-warning",
+            "dirty-saving",
+        ] {
+            let (mut app, _, pane) = repository_retention_fixture(state);
+            let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
+                unreachable!()
+            };
+            let identity = &**before as *const RepositoryRuntime;
+            let descriptor = before.descriptor.clone();
+            let text = before.editor_text();
+            let error = before.save_error().map(str::to_owned);
+            let CardKind::Repository(replacement) = &mut app.workspace_model.views[0].panes[0].kind
+            else {
+                unreachable!()
+            };
+            replacement.selected_file = Some("other.txt".into());
+            for _ in 0..2 {
+                drop(app.reconcile_shared_views());
+                let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                    panic!("{state}: replacement must retain the fenced editor");
+                };
+                assert_eq!(&**current as *const RepositoryRuntime, identity, "{state}");
+                assert_eq!(current.descriptor, descriptor, "{state}");
+                assert_eq!(current.editor_text(), text, "{state}");
+                assert_eq!(current.save_error().map(str::to_owned), error, "{state}");
+                assert!(current.blocks_navigation(), "{state}");
+                assert_eq!(current.has_editor_recovery(), state == "recovery");
+                assert_eq!(
+                    current.has_durability_warning(),
+                    matches!(state, "warning" | "dirty-warning")
+                );
+                assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+                assert!(app.card_state(pane.id).unwrap().existence.is_open());
+                let notice = app.status.as_ref().unwrap().message.as_str();
+                match state {
+                    "dirty" => assert!(notice.contains("Save or discard its unsaved edits")),
+                    "dirty-warning" => {
+                        assert!(
+                            notice.contains(
+                                "Resolve this editor's file recovery or durability warning"
+                            )
+                        );
+                        assert!(notice.contains("then save any remaining edits"));
+                        assert!(!notice.contains("discard"));
+                    }
+                    "saving" | "dirty-saving" => {
+                        assert!(notice.contains("Wait for its save to finish"));
+                        assert!(!notice.contains("Save or discard"));
+                        assert!(!notice.contains("Resolve this editor's file recovery"));
+                    }
+                    "warning" | "recovery" => {
+                        assert!(notice.contains("file recovery or durability warning"));
+                        assert!(!notice.contains("unsaved edits"));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            if state == "dirty-saving" {
+                finish_shared_repository_save_with_warning(&mut app, pane.id);
+                drop(app.reconcile_shared_views());
+                let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                    panic!("completed save warning must retain the editor");
+                };
+                assert_eq!(&**current as *const RepositoryRuntime, identity);
+                assert_eq!(current.descriptor, descriptor);
+                assert_eq!(current.editor_text(), text);
+                assert!(current.has_durability_warning() && current.blocks_navigation());
+                let notice = app.status.as_ref().unwrap().message.as_str();
+                assert!(
+                    notice.contains("Resolve this editor's file recovery or durability warning")
+                );
+                assert!(!notice.contains("Wait for its save"));
+                assert!(!notice.contains("discard"));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_repository_removal_still_closes_a_clean_editor() {
+        let (mut app, channel, pane) = repository_retention_fixture("clean");
+        app.workspace_model.views[0].panes.clear();
+        drop(app.reconcile_shared_views());
+        assert!(!app.cards.contains_key(&pane.id));
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.shared_views.retained.contains(&pane.id));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|current| { current.id == channel && !current.cards.contains(&pane.id) })
+        );
+    }
+
+    #[test]
+    fn shared_repository_replacement_still_adopts_a_clean_editor() {
+        let (mut app, _, pane) = repository_retention_fixture("clean");
+        let CardKind::Repository(mut replacement) = pane.kind else {
+            unreachable!()
+        };
+        replacement.selected_file = Some("other.txt".into());
+        app.workspace_model.views[0].panes[0].kind = CardKind::Repository(replacement.clone());
+        drop(app.reconcile_shared_views());
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+            panic!("a clean editor must adopt the shared replacement");
+        };
+        assert_eq!(runtime.descriptor, replacement);
+        assert_eq!(runtime.selected_path(), Some(Path::new("other.txt")));
+        assert!(!runtime.blocks_navigation());
+        let identity = &**runtime as *const RepositoryRuntime;
+        drop(app.reconcile_shared_views());
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+            panic!("the adopted editor must remain attached");
+        };
+        assert_eq!(&**runtime as *const RepositoryRuntime, identity);
+        assert_eq!(runtime.descriptor, replacement);
+        assert_eq!(
+            app.card_state(pane.id).unwrap().kind,
+            CardKind::Repository(replacement)
+        );
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.shared_views.retained.contains(&pane.id));
+    }
+
+    fn repository_peer_channel_deletion_fixture(state: &str) -> (Cagents, ChannelId, Pane, Scope) {
+        let (mut app, channel, pane) = repository_retention_fixture(state);
+        let CardKind::Repository(descriptor) = &pane.kind else {
+            unreachable!()
+        };
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.retain(|current| current.id == channel);
+        durable.channels[0].project_id = descriptor.project;
+        app.sidebar_model.projects.push(SidebarProject::new(
+            descriptor.project,
+            RepositoryId::new(),
+            "repo".into(),
+            descriptor.repository.clone(),
+            vec![crate::sidebar::SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                descriptor.worktree.clone(),
+                Some("main".into()),
+            )],
+            Vec::new(),
+        ));
+        app.workspace_model.projects = vec![crate::workspace_model::ModelProject {
+            repository: descriptor.repository.clone(),
+            name: "repo".into(),
+            kind: Default::default(),
+            ordinal: 1,
+        }];
+        app.workspace_model.channels = vec![crate::workspace_model::ModelChannel {
+            id: channel,
+            repository: descriptor.repository.clone(),
+            title: "view".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+        }];
+        let fallback = Scope::Worktree {
+            repository: descriptor.repository.clone(),
+            path: descriptor.worktree.clone(),
+        };
+        app.workspace_model
+            .views
+            .push(View::empty(fallback.clone()));
+        app.shared_views.initialized.insert(fallback.clone());
+        app.known_worktree_roots.insert(descriptor.worktree.clone());
+        drop(app.select_channel(channel));
+        assert_eq!(app.durable.active_channel, Some(channel));
+        assert!(app.workspace.card(pane.id).is_some());
+        (app, channel, pane, fallback)
+    }
+
+    #[test]
+    fn peer_channel_model_deletion_preserves_clean_warning_and_recovery_through_fallback_projection()
+     {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for state in ["warning", "recovery"] {
+            let (mut app, channel, pane, fallback) =
+                repository_peer_channel_deletion_fixture(state);
+            let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
+                unreachable!()
+            };
+            let identity = &**before as *const RepositoryRuntime;
+            let descriptor = before.descriptor.clone();
+            let text = before.editor_text();
+            let error = before.save_error().map(str::to_owned);
+            assert!(!before.is_dirty() && !before.is_saving());
+            let sequence = app.workspace_model.sequence + 1;
+            drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+                sequence,
+                edit: ModelEdit::DeleteChannel { id: channel },
+            }));
+            assert!(app.channel_ui.was_deleted(channel));
+            assert!(
+                !app.durable
+                    .channels
+                    .iter()
+                    .any(|current| current.id == channel)
+            );
+            assert!(
+                app.status
+                    .as_ref()
+                    .unwrap()
+                    .message
+                    .contains("file recovery or durability warning")
+            );
+            // The explicit edit retires the channel before projection. The
+            // following canonical read also removes its stale source view,
+            // so the initialized fallback must preserve this local editor.
+            let mut canonical = app.workspace_model.clone();
+            canonical.sequence += 1;
+            canonical
+                .views
+                .retain(|view| view.scope != Scope::Channel(channel));
+            for _ in 0..2 {
+                drop(app.apply_workspace_model_update(ModelUpdate::Read(canonical.clone())));
+                let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                    panic!(
+                        "{state}: peer deletion must retain recovery through fallback projection"
+                    );
+                };
+                assert_eq!(&**current as *const RepositoryRuntime, identity, "{state}");
+                assert_eq!(current.descriptor, descriptor, "{state}");
+                assert_eq!(current.editor_text(), text, "{state}");
+                assert_eq!(current.save_error().map(str::to_owned), error, "{state}");
+                assert_eq!(current.has_editor_recovery(), state == "recovery");
+                assert_eq!(current.has_durability_warning(), state == "warning");
+                assert!(current.blocks_navigation());
+                assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+                assert!(app.card_state(pane.id).unwrap().existence.is_open());
+                assert!(app.shared_views.retained.contains(&pane.id));
+                assert!(app.durable.local_only_cards.contains(&pane.id));
+                assert!(
+                    !app.durable
+                        .channels
+                        .iter()
+                        .any(|current| current.cards.contains(&pane.id))
+                );
+                assert_eq!(app.durable.active_channel, None);
+                assert_eq!(
+                    app.durable.card_scopes.get(&pane.id),
+                    Some(&descriptor.worktree)
+                );
+                assert_eq!(app.active_workspace.as_ref(), Some(&descriptor.worktree));
+                assert!(app.workspace.card(pane.id).is_some());
+                assert!(app.shared_views.initialized.contains(&fallback));
+                let notice = app.status.as_ref().unwrap().message.as_str();
+                assert!(notice.contains("file recovery or durability warning"));
+                assert!(!notice.contains("save or discard"));
+            }
+        }
+    }
+
+    #[test]
+    fn peer_channel_model_deletion_still_retires_a_clean_editor() {
+        let (mut app, channel, pane, _) = repository_peer_channel_deletion_fixture("clean");
+        let sequence = app.workspace_model.sequence + 1;
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Edited {
+                sequence,
+                edit: ModelEdit::DeleteChannel { id: channel },
+            },
+        ));
+        assert!(app.channel_ui.was_deleted(channel));
+        assert!(!app.cards.contains_key(&pane.id));
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.shared_views.retained.contains(&pane.id));
     }
 
     #[cfg(not(feature = "integrated-browser"))]
