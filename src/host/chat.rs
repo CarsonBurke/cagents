@@ -1747,6 +1747,7 @@ fn start_with_execution(
                 let confirmation = confirm_saved_conversation(
                     &installed_handle,
                     expected,
+                    true,
                     Instant::now() + Duration::from_secs(15),
                     || {
                         crate::daemon::termination_requested()
@@ -2379,6 +2380,7 @@ fn recover_account(
     let confirmation = confirm_saved_conversation(
         &handle,
         source.launch.session_id.as_deref().unwrap(),
+        false,
         Instant::now() + Duration::from_secs(15),
         || crate::daemon::termination_requested(),
     );
@@ -2412,9 +2414,12 @@ fn recover_account(
     response
 }
 
+/// With `require_ready`, confirmation also waits for the provider to answer
+/// initialize, for a caller that goes on to require a ready provider.
 fn confirm_saved_conversation(
     handle: &Handle,
     expected: &str,
+    require_ready: bool,
     deadline: Instant,
     cancelled: impl Fn() -> bool,
 ) -> Result<(), String> {
@@ -2431,11 +2436,12 @@ fn confirm_saved_conversation(
             return Err("The provider exited before confirming the saved conversation; it remains unchanged".into());
         }
         if let Some(actual) = handle.confirmed_session_id() {
-            return if actual == expected {
-                Ok(())
-            } else {
-                Err("The provider opened a different conversation; the saved conversation is unchanged".into())
-            };
+            if actual != expected {
+                return Err("The provider opened a different conversation; the saved conversation is unchanged".into());
+            }
+            if !require_ready || handle.is_ready() {
+                return Ok(());
+            }
         }
         if Instant::now() >= deadline {
             return Err("The provider did not confirm the exact saved conversation in time; it remains unchanged".into());
@@ -5949,24 +5955,54 @@ done
         .unwrap();
         assert_eq!(handle.session_id().as_deref(), Some("saved-conversation"));
         assert!(
-            confirm_saved_conversation(&handle, "saved-conversation", Instant::now(), || false)
-                .is_err()
+            confirm_saved_conversation(
+                &handle,
+                "saved-conversation",
+                false,
+                Instant::now(),
+                || false
+            )
+            .is_err()
         );
         handle.command(Command::Interrupt).unwrap();
         confirm_saved_conversation(
             &handle,
             "saved-conversation",
+            false,
             Instant::now() + Duration::from_secs(5),
             || false,
         )
         .unwrap();
+        // A confirmed identity alone is not a provider that answered initialize.
         assert!(
-            confirm_saved_conversation(&handle, "another-conversation", Instant::now(), || false)
-                .is_err()
+            confirm_saved_conversation(
+                &handle,
+                "saved-conversation",
+                true,
+                Instant::now() + Duration::from_millis(100),
+                || false
+            )
+            .is_err()
         );
         assert!(
-            confirm_saved_conversation(&handle, "saved-conversation", Instant::now(), || true)
-                .is_err()
+            confirm_saved_conversation(
+                &handle,
+                "another-conversation",
+                false,
+                Instant::now(),
+                || false
+            )
+            .is_err()
+        );
+        assert!(
+            confirm_saved_conversation(
+                &handle,
+                "saved-conversation",
+                false,
+                Instant::now(),
+                || true
+            )
+            .is_err()
         );
         handle.close().unwrap();
     }

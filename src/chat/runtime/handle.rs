@@ -543,6 +543,12 @@ impl Handle {
             Owner::Remote(remote) => remote.state().session_id.clone(),
         }
     }
+    pub(crate) fn is_ready(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => local.is_ready(),
+            Owner::Remote(remote) => remote.state().ready,
+        }
+    }
     pub(crate) fn confirmed_session_id(&self) -> Option<String> {
         match &self.0 {
             Owner::Local(local) => local.confirmed_session_id(),

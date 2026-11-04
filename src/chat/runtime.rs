@@ -1220,6 +1220,10 @@ impl LocalHandle {
             .session_id
             .clone()
     }
+    /// Whether the provider answered its initialize handshake.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.0.state.lock().unwrap_or_else(|p| p.into_inner()).ready
+    }
     /// Identity received from the provider, not the speculative launch selector.
     pub(crate) fn confirmed_session_id(&self) -> Option<String> {
         self.0
