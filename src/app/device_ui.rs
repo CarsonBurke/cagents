@@ -2050,8 +2050,11 @@ mod tests {
 
     #[test]
     fn window_close_preserves_device_edits_until_explicit_resolution() {
+        let directory = tempfile::tempdir().unwrap();
         let mut app = loaded_file();
         let window = cosmic::iced::window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        super::super::tests::install_window_close_storage(&mut app, directory.path());
         drop(app.update(Message::WindowCloseRequested(window)));
         assert!(app.exit.is_none());
         assert_eq!(app.transient_work_close, Some(window));
@@ -2078,7 +2081,9 @@ mod tests {
         assert!(app.exit.is_none());
         drop(app.update(Message::CancelTransientWorkClose));
         drop(app.update_device(Action::DiscardChanges));
-        drop(app.update(Message::WindowCloseRequested(window)));
+        // Explicit device resolution permits the real final-save barrier; it
+        // does not make a close committed before storage acknowledges it.
+        super::super::tests::acknowledge_test_window_close(&mut app, window);
         assert!(app.exit.is_some());
     }
 

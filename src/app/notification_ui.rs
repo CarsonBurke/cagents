@@ -2098,19 +2098,23 @@ mod tests {
 
     #[test]
     fn attention_committed_window_close_stops_claiming_viewed_content_during_exit_reap() {
+        let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(true);
         app.context_inspector_open = false;
         let session = live_session(&mut app);
         let card = app.workspace.focused().unwrap();
         let window = window::Id::unique();
         app.core.set_main_window_id(Some(window));
+        super::super::tests::install_window_close_storage(&mut app, directory.path());
         app.refresh_ui.focused = true;
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
         assert_eq!(
             app.notification_ui.focused_session_for_test(),
             Some(session.id)
         );
-        drop(app.update(Message::WindowCloseRequested(window)));
+        // Poll the actual writer barrier and accept its current ACK before
+        // checking presence during the committed exit/reap interval.
+        super::super::tests::acknowledge_test_window_close(&mut app, window);
         assert!(
             app.exit.is_some(),
             "hold the real committed exit before reap completion"

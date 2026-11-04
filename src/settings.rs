@@ -5,6 +5,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -1953,6 +1954,13 @@ pub fn default_path() -> Result<PathBuf, SettingsError> {
 }
 
 fn settings_lock(path: &Path) -> Result<File, SettingsError> {
+    settings_lock_with_deadline(path, None)
+}
+
+fn settings_lock_with_deadline(
+    path: &Path,
+    deadline: Option<Instant>,
+) -> Result<File, SettingsError> {
     use std::os::fd::AsRawFd;
     let parent = settings_parent(path)?;
     prepare_private_directory(parent)?;
@@ -1966,11 +1974,40 @@ fn settings_lock(path: &Path) -> Result<File, SettingsError> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&lock_path)?;
     validate_owned_regular_file(&lock_path, &lock.metadata()?)?;
-    // SAFETY: the returned file owns the locked descriptor until dropped.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(io::Error::last_os_error().into());
+    loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "settings are busy; try closing this window again",
+            )
+            .into());
+        }
+        let operation = libc::LOCK_EX | if deadline.is_some() { libc::LOCK_NB } else { 0 };
+        // SAFETY: the returned file owns the locked descriptor until dropped.
+        if unsafe { libc::flock(lock.as_raw_fd(), operation) } == 0 {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "settings are busy; try closing this window again",
+                )
+                .into());
+            }
+            return Ok(lock);
+        }
+        let error = io::Error::last_os_error();
+        if let Some(deadline) = deadline
+            && matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            )
+        {
+            std::thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        } else {
+            return Err(error.into());
+        }
     }
-    Ok(lock)
 }
 
 /// Applies only fields this window changed since its last successful save.
@@ -1980,8 +2017,18 @@ pub fn save_merged(
     base: &AppSettings,
     desired: &AppSettings,
 ) -> Result<(), SettingsError> {
-    let path = path.as_ref();
-    let _lock = settings_lock(path)?;
+    save_merged_with_lock_deadline(path.as_ref(), base, desired, None)
+}
+
+/// Bound only lock acquisition. The caller awaits the actual write outcome;
+/// no timed-out worker can later acquire the lock and persist a stale save.
+pub(crate) fn save_merged_with_lock_deadline(
+    path: &Path,
+    base: &AppSettings,
+    desired: &AppSettings,
+    deadline: Option<Instant>,
+) -> Result<(), SettingsError> {
+    let _lock = settings_lock_with_deadline(path, deadline)?;
     let current = load_unlocked(path)?.settings;
     let mut current = toml::Value::try_from(current)?;
     merge_changed_fields(
@@ -2042,8 +2089,15 @@ fn load_unlocked(path: &Path) -> Result<Loaded, SettingsError> {
 }
 
 pub fn save(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), SettingsError> {
-    let path = path.as_ref();
-    let _lock = settings_lock(path)?;
+    save_with_lock_deadline(path.as_ref(), settings, None)
+}
+
+pub(crate) fn save_with_lock_deadline(
+    path: &Path,
+    settings: &AppSettings,
+    deadline: Option<Instant>,
+) -> Result<(), SettingsError> {
+    let _lock = settings_lock_with_deadline(path, deadline)?;
     save_unlocked(path, settings)
 }
 
@@ -3307,6 +3361,60 @@ mod tests {
         let restored = load(&path).unwrap();
         assert_eq!(restored.terminal_font_size, 19.0);
         assert_eq!(restored.app_theme, AppTheme::Light);
+    }
+
+    #[test]
+    fn bounded_settings_lock_refuses_without_writing_then_preserves_merge_and_reset() {
+        for reset in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = path_in(&directory);
+            let base = AppSettings::default();
+            let current = AppSettings {
+                terminal_font_size: 19.0,
+                ..base.clone()
+            };
+            save(&path, &current).unwrap();
+            let bytes = fs::read(&path).unwrap();
+            // This is the actual cross-window flock, held through a separate
+            // open descriptor rather than a simulated save failure.
+            let held = settings_lock(&path).unwrap();
+            let desired = AppSettings {
+                chat_expand_tool_groups: !base.chat_expand_tool_groups,
+                ..base.clone()
+            };
+            let started = Instant::now();
+            let deadline = started + Duration::from_millis(30);
+            let refused = if reset {
+                save_with_lock_deadline(&path, &desired, Some(deadline))
+            } else {
+                save_merged_with_lock_deadline(&path, &base, &desired, Some(deadline))
+            };
+            assert!(matches!(refused,
+                Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::TimedOut));
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            drop(held);
+            // The refused call has returned; there is no detached old writer
+            // waiting to overwrite a different window after the lock releases.
+            assert_eq!(load(&path).unwrap(), current);
+            let deadline = Some(Instant::now() + Duration::from_secs(1));
+            if reset {
+                save_with_lock_deadline(&path, &desired, deadline).unwrap();
+                assert_eq!(load(&path).unwrap(), desired);
+            } else {
+                save_merged_with_lock_deadline(&path, &base, &desired, deadline).unwrap();
+                let merged = load(&path).unwrap();
+                assert_eq!(merged.terminal_font_size, current.terminal_font_size);
+                assert_eq!(
+                    merged.chat_expand_tool_groups,
+                    desired.chat_expand_tool_groups
+                );
+            }
+            let final_bytes = fs::read(&path).unwrap();
+            // An already-expired attempt cannot acquire a free lock and write.
+            assert!(save_with_lock_deadline(&path, &base, Some(Instant::now())).is_err());
+            assert_eq!(fs::read(&path).unwrap(), final_bytes);
+        }
     }
 
     #[test]
