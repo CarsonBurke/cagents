@@ -8,6 +8,8 @@ use cagents::instance::{
 };
 use cosmic::{Core, app::cosmic::Cosmic, iced};
 
+cagents::refuse_filtered_test_run!();
+
 const PRODUCT: &str = "cagents-ui";
 const DEFAULT_LOG_FILTER: &str = "cagents=info,warn";
 /// argv has a hard size limit and a dialog cannot show a novel either.

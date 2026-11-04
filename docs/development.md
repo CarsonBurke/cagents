@@ -691,6 +691,12 @@ filter limits execution, not compilation of the selected feature graph, so
 start with the narrow feature lane and `--lib` or `--test NAME` rather than
 `--all-features`.
 
+Product tests live in the library, so select them with `--lib`, not `--bin`.
+`--bin cagents` and `--bin cagents-ui` have no tests and refuse a filter rather
+than pass by running none. `--bin cagentsd` has only a few of its own and does
+not refuse. A filter that matches nothing still exits 0 on any target, so check
+the reported test count before relying on a green run.
+
 The jobs setting is not a hard process or memory limit. In the pinned
 dependencies, parallel `cc` builds share Cargo's jobserver; CMake uses it for
 supported Makefile builds and otherwise may start a separate pool based on
