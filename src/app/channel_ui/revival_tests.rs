@@ -724,3 +724,65 @@ fn a_retirement_answered_behind_newer_metadata_still_retires_the_channel() {
     assert_eq!(revived.title, "Investigation");
     assert_eq!(revived.cards, vec![fixture.resumed().id]);
 }
+
+/// The registry forgets a channel's automatic name when its conversation
+/// leaves. Once it holds the pane that came back, the channel gets the name
+/// back, whether the conversation reconnects or not, and only once.
+#[test]
+fn a_channel_named_from_its_conversation_gets_the_name_back() {
+    let mut fixture = fixture();
+    let source = crate::model::ChannelTitleSource::Prompt;
+    Arc::make_mut(&mut fixture.app.durable).channels[0].title_source = source;
+    fixture.app.workspace_model.channels[0].title_source = source;
+    fixture.close_card();
+    let published = fixture.retire();
+    fixture.reopen_pane();
+    let revived = fixture.active_channel().id;
+    let resumed = fixture.resumed().id;
+
+    // The registry has the revived channel, unnamed now that a conversation
+    // arrived in it, and the conversation that arrived.
+    let mut model = fixture.app.workspace_model.clone();
+    model.channels.retain(|shared| shared.id != revived);
+    model.channels.push(ModelChannel {
+        id: revived,
+        repository: fixture.directory.path().into(),
+        title: String::new(),
+        title_source: source,
+        ordinal: 9,
+    });
+    model.views.push(View {
+        scope: Scope::Channel(revived),
+        revision: 3,
+        panes: vec![Pane::from_card(fixture.app.card_state(resumed).unwrap(), None).unwrap()],
+        retired: vec![],
+    });
+    model.sequence = model
+        .sequence
+        .max(fixture.app.shared_views.snapshot_sequence)
+        + 1;
+    drop(fixture.app.apply_workspace_model_update(
+        super::super::workspace_model_sync::ModelUpdate::Read(model),
+    ));
+
+    assert_eq!(fixture.active_channel().title, "Investigation");
+    assert!(
+        std::iter::from_fn(|| published.try_recv().ok()).any(|edit| edit
+            == ModelEdit::SuggestChannelTitle {
+                id: revived,
+                title: "Investigation".into(),
+                source,
+            }),
+        "every window learns the name back"
+    );
+
+    // A name the channel takes later is its own to keep.
+    Arc::make_mut(&mut fixture.app.durable)
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id == revived)
+        .unwrap()
+        .title = "Later".into();
+    fixture.app.restore_channel_names();
+    assert!(published.try_recv().is_err());
+}

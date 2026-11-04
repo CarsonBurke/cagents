@@ -228,6 +228,12 @@ pub struct State {
     /// never reused, so a revival is a new channel, and every other card
     /// closed in the old one follows it there.
     revived: HashMap<ChannelId, ChannelId>,
+    /// Automatic names to give back to channels a closed card returned to.
+    /// The registry forgets an automatic name when a channel's conversation
+    /// leaves, and a conversation that comes back as a new card does not
+    /// reclaim it until it reports a name of its own, which one that fails
+    /// to reconnect never does.
+    names: HashMap<ChannelId, (String, crate::model::ChannelTitleSource)>,
 }
 
 /// What a channel was when its last card closed: enough to recreate it as the
@@ -676,8 +682,17 @@ impl Cagents {
                 self.channel_work
                     .retire_candidates
                     .retain(|candidate| candidate.channel != id);
-                // No longer empty, so no longer a channel to revive.
-                self.channel_ui.emptied.retain(|emptied| emptied.id != id);
+                // No longer empty, so no longer a channel to revive, but one
+                // whose automatic name left with its conversation.
+                if let Some(index) = self
+                    .channel_ui
+                    .emptied
+                    .iter()
+                    .position(|emptied| emptied.id == id)
+                {
+                    let emptied = self.channel_ui.emptied.remove(index);
+                    self.remember_channel_name(id, emptied.title, emptied.title_source);
+                }
                 (id, Task::none())
             }
             ClosedCardHome::Retired(id) => {
@@ -776,11 +791,74 @@ impl Cagents {
             .iter()
             .position(|emptied| emptied.id == id)?;
         let emptied = self.channel_ui.emptied[index].clone();
-        let revived =
-            self.create_channel(emptied.project_id, emptied.title, emptied.title_source)?;
+        let revived = self.create_channel(
+            emptied.project_id,
+            emptied.title.clone(),
+            emptied.title_source,
+        )?;
         self.channel_ui.emptied.remove(index);
         self.channel_ui.revived.insert(id, revived);
+        self.remember_channel_name(revived, emptied.title, emptied.title_source);
         Some(revived)
+    }
+
+    /// A manual name survives its conversation leaving, so only an automatic
+    /// one needs giving back.
+    fn remember_channel_name(
+        &mut self,
+        id: ChannelId,
+        title: String,
+        source: crate::model::ChannelTitleSource,
+    ) {
+        if source != crate::model::ChannelTitleSource::Manual && !title.is_empty() {
+            self.channel_ui.names.insert(id, (title, source));
+        }
+    }
+
+    /// Gives a channel back the automatic name it had once the registry holds
+    /// the pane that returned to it, which is when it forgets the name. Any
+    /// name it holds by then, the conversation's own or one typed, wins.
+    ///
+    /// The name is the registry's own from before, not a new inference, so it
+    /// needs no live conversation to vouch for it, which one that failed to
+    /// reconnect could not.
+    pub(super) fn restore_channel_names(&mut self) {
+        let names = std::mem::take(&mut self.channel_ui.names);
+        for (id, (title, source)) in names {
+            let Some(index) = self
+                .durable
+                .channels
+                .iter()
+                .position(|channel| channel.id == id)
+            else {
+                continue;
+            };
+            let arrived = self.workspace_model.views.iter().any(|view| {
+                view.scope == crate::workspace_model::views::Scope::Channel(id)
+                    && view
+                        .panes
+                        .iter()
+                        .any(|pane| !view.retired.contains(&pane.id))
+            });
+            let Some(named) = self
+                .workspace_model
+                .channel(id)
+                .map(|shared| !shared.title.is_empty())
+                .filter(|_| arrived)
+            else {
+                self.channel_ui.names.insert(id, (title, source));
+                continue;
+            };
+            if named {
+                continue;
+            }
+            let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
+            channel.title = title.clone();
+            channel.title_source = source;
+            self.publish_model_edit(ModelEdit::SuggestChannelTitle { id, title, source });
+            self.refresh_sidebar_channels();
+            self.persist();
+        }
     }
 
     /// Defer automatic retirement until the canonical view publication settles.

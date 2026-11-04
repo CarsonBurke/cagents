@@ -997,6 +997,7 @@ impl Cagents {
             tasks.push(self.sync_chrome());
         }
         self.refresh_channel_title_suggestions();
+        self.restore_channel_names();
         Task::batch(tasks)
     }
 
