@@ -238,14 +238,16 @@ subcommand=$1
 shift
 
 # Cargo cannot build doctests without running them, so a doctest command
-# keeps its slot throughout.
+# keeps its slot throughout. A command that only builds needs no split.
 runs_separately=false
 case $subcommand in
     test|bench|run) runs_separately=true ;;
 esac
 for argument do
-    [ "$argument" != -- ] || break
-    [ "$argument" != --doc ] || runs_separately=false
+    case $argument in
+        --) break ;;
+        --doc|--no-run) runs_separately=false ;;
+    esac
 done
 
 acquire
