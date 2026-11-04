@@ -1474,6 +1474,18 @@ impl ClientHandle {
         handle
     }
 
+    /// A started resume successor of the stranded retained card `source`.
+    #[cfg(test)]
+    pub(crate) fn fixture_resumed(source: Session, session: Session, snapshot: Snapshot) -> Self {
+        assert!(super::is_retained_resume_commit(&source, &session));
+        let proof = session.proof.clone().unwrap();
+        let mut handle = Self::fixture(session, snapshot);
+        let inner = Arc::get_mut(&mut handle.inner).unwrap();
+        inner.proof = proof;
+        inner.resumed_from = Some(source);
+        handle
+    }
+
     /// Drives the production connect/lineage/attach path for UI writer tests.
     #[cfg(test)]
     pub(crate) fn fixture_upgrade_handshake(
