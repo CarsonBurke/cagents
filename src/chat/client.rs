@@ -1373,9 +1373,11 @@ fn resume_retained_claude(
     };
     if prepared == session {
         // The daemon still sees an owner for this allocation. It is restored,
-        // never replaced, so the card waits for that owner rather than racing it.
+        // never replaced, so the card waits for that owner rather than racing
+        // it. When no daemon can take that owner over, closing the pane is
+        // the way out: it stops the helper and keeps the saved conversation.
         return Err(StartFailure::retry(format!(
-            "This conversation's previous helper still owns it, so no replacement was started. {}",
+            "This conversation's previous helper still owns it, so no replacement was started. {} If retrying does not reconnect it, close this pane to stop that helper; the conversation stays saved and reopens from Resume.",
             refusal.unwrap_or_else(|| "Retry once it has finished closing.".to_owned())
         )));
     }
@@ -3937,6 +3939,10 @@ mod tests {
         let failure = result.unwrap_err();
         assert_eq!(failure.recovery, crate::chat::Recovery::Retry);
         assert!(failure.message.contains("still owns it"));
+        assert!(
+            failure.message.contains("close this pane"),
+            "a refusal that retrying cannot clear names the way out"
+        );
         assert!(resumed.is_none());
         // An unproved exit is refused by the daemon, and the reason is shown.
         let (result, resumed, _) = resume_stranded(source.clone(), |_| {
