@@ -188,6 +188,81 @@ pub(crate) fn owned_file_lock(lock: File, operation: i32) -> io::Result<OwnedLoc
     Ok(OwnedLock(lock))
 }
 
+/// Expected contention with the installation coordinator, distinct from a
+/// filesystem failure or a window that is already open.
+#[derive(Debug, Error)]
+#[error("an update is in progress")]
+pub struct UpdateInProgress;
+
+pub fn is_update_in_progress(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.is::<UpdateInProgress>()
+            || error.downcast_ref::<io::Error>().is_some_and(|error| {
+                error
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<UpdateInProgress>())
+            })
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn update_lock_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        io::Error::new(error.kind(), UpdateInProgress)
+    } else {
+        error
+    }
+}
+
+/// Observe an existing private lock without creating, repairing, or retaining
+/// it. This is a point-in-time status observation, never launch admission.
+#[cfg(feature = "ui")]
+pub(crate) fn private_lock_is_held(path: &Path) -> io::Result<bool> {
+    let named = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let safe = |metadata: &fs::Metadata| {
+        metadata.is_file()
+            && metadata.uid() == current_uid()
+            && metadata.mode() & 0o077 == 0
+            && metadata.nlink() == 1
+    };
+    if !safe(&named) {
+        return Err(io::Error::other("update ownership is unavailable"));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = file.metadata()?;
+    let same = |a: &fs::Metadata, b: &fs::Metadata| a.dev() == b.dev() && a.ino() == b.ino();
+    if !safe(&opened) || !same(&named, &opened) {
+        return Err(io::Error::other("update ownership changed"));
+    }
+    let held = match owned_file_lock(file, libc::LOCK_SH | libc::LOCK_NB) {
+        Ok(_probe) => false,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+        Err(error) => return Err(error),
+    };
+    let current = fs::symlink_metadata(path)?;
+    if !safe(&current) || !same(&opened, &current) {
+        return Err(io::Error::other("update ownership changed"));
+    }
+    Ok(held)
+}
+
+#[cfg(feature = "ui")]
+pub(crate) fn update_fence_held() -> io::Result<bool> {
+    private_lock_is_held(&runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")))
+}
+
 /// A slot owns its full workspace snapshot; terminal identifiers still refer to
 /// the one shared daemon. The old global lock remains held shared, so older
 /// exclusive-lease binaries cannot open any of these stores concurrently.
@@ -224,9 +299,7 @@ impl WindowLease {
             &runtime.join(format!("{APPLICATION_LOCK_FILE}.update")),
             libc::LOCK_SH | libc::LOCK_NB,
         )
-        .map_err(|error| {
-            io::Error::new(error.kind(), format!("an update is in progress: {error}"))
-        })?;
+        .map_err(update_lock_error)?;
         if !IS_DEVELOPMENT && peer_ui_predates_lease(Path::new(PEER_PACKAGE_DIRECTORY)) {
             return Err(io::Error::other(
                 "installed peer UI predates the shared-session lease; upgrade that package first",
@@ -415,20 +488,48 @@ pub fn window_database_path(slot: &str) -> io::Result<PathBuf> {
 }
 
 pub fn window_database_paths() -> io::Result<Vec<PathBuf>> {
-    let primary = window_database_path(PRIMARY_WINDOW)?;
+    window_database_paths_at(window_database_path(PRIMARY_WINDOW)?)
+}
+
+fn window_database_paths_at(primary: PathBuf) -> io::Result<Vec<PathBuf>> {
+    // Old inactive snapshots are retained for ordinary reopening/migration.
+    // Bound enumeration before allocating paths or opening SQLite stores.
+    const MAX_STORES: usize = 1024;
+    const MAX_ENTRIES: usize = 8192;
     let mut paths = vec![primary.clone()];
     let windows = primary.parent().unwrap().join("windows");
     match fs::read_dir(windows) {
         Ok(entries) => {
-            for entry in entries {
+            for (index, entry) in entries.enumerate() {
+                if index >= MAX_ENTRIES {
+                    return Err(io::Error::other(
+                        "Saved window enumeration exceeds its bounded entry limit",
+                    ));
+                }
                 let entry = entry?;
                 if entry.file_type()?.is_dir()
                     && let Some(slot) = entry.file_name().to_str()
                     && validate_window_slot(slot).is_ok()
                 {
                     let path = entry.path().join("sessions.sqlite3");
-                    if path.is_file() {
-                        paths.push(path);
+                    match fs::symlink_metadata(&path) {
+                        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                            if paths.len() >= MAX_STORES {
+                                return Err(io::Error::other(
+                                    "Saved window inventory exceeds its bounded store limit",
+                                ));
+                            }
+                            // Include symlinks so the NOFOLLOW reader reports
+                            // a refusal instead of silently omitting a store.
+                            paths.push(path);
+                        }
+                        Ok(_) => {
+                            return Err(io::Error::other(
+                                "Saved window store is not a regular database file",
+                            ));
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
                     }
                 }
             }
@@ -470,7 +571,7 @@ pub(crate) fn recovery_launch_fence() -> io::Result<OwnedLock> {
         &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")),
         libc::LOCK_SH | libc::LOCK_NB,
     )
-    .map_err(|error| io::Error::new(error.kind(), format!("an update is in progress: {error}")))
+    .map_err(update_lock_error)
 }
 
 static EDITOR_PROTECTION_READY: OnceLock<OwnedLock> = OnceLock::new();
@@ -2300,6 +2401,33 @@ mod tests {
     }
 
     #[test]
+    fn saved_window_enumeration_retains_inactive_stores_and_refuses_excess() {
+        let root = tempdir().unwrap();
+        let primary = root.path().join("sessions.sqlite3");
+        let old = root.path().join("windows/september-copy/sessions.sqlite3");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, "original legacy store bytes").unwrap();
+        let mut expected = vec![primary.clone(), old.clone()];
+        expected.sort();
+        assert_eq!(window_database_paths_at(primary.clone()).unwrap(), expected);
+        assert_eq!(fs::read(&old).unwrap(), b"original legacy store bytes");
+        for index in 0..1023 {
+            let path = root
+                .path()
+                .join(format!("windows/old-{index}/sessions.sqlite3"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, []).unwrap();
+        }
+        assert!(
+            window_database_paths_at(primary)
+                .unwrap_err()
+                .to_string()
+                .contains("bounded store limit")
+        );
+        assert_eq!(fs::read(&old).unwrap(), b"original legacy store bytes");
+    }
+
+    #[test]
     fn window_leases_allow_multiple_slots_and_reuse_only_closed_slots() {
         let runtime = tempdir().unwrap();
         let (primary, name) = WindowLease::acquire_in(runtime.path(), false, None).unwrap();
@@ -2893,6 +3021,75 @@ mod tests {
                 "cagents-ui.lock",
                 "cagents-ui.activate",
             )
+        );
+    }
+}
+
+#[cfg(all(test, feature = "ui"))]
+mod startup_update_tests {
+    use super::*;
+    #[test]
+    fn held_update_fence_is_typed_and_readonly_probe_preserves_original_ownership() {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = runtime
+            .path()
+            .join(format!("{APPLICATION_LOCK_FILE}.update"));
+        let held = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let original = fs::metadata(&path).unwrap();
+        let Err(error) = WindowLease::acquire_in(runtime.path(), false, None) else {
+            panic!("original update fence must block startup")
+        };
+        assert!(is_update_in_progress(&error));
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), "an update is in progress");
+        assert!(private_lock_is_held(&path).unwrap());
+        assert!(owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB).is_err());
+        assert_eq!(fs::metadata(&path).unwrap().ino(), original.ino());
+        assert_eq!(fs::metadata(&path).unwrap().mode(), original.mode());
+        drop(held);
+        assert!(!private_lock_is_held(&path).unwrap());
+        let missing = runtime.path().join("absent");
+        assert!(!private_lock_is_held(&missing).unwrap());
+        assert!(!missing.exists());
+        assert!(!is_update_in_progress(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not an update"
+        )));
+        assert!(!is_update_in_progress(&update_lock_error(
+            io::Error::from_raw_os_error(libc::EACCES)
+        )));
+        assert!(!is_update_in_progress(&io::Error::from_raw_os_error(
+            libc::EAGAIN
+        )));
+    }
+    #[test]
+    fn existing_window_activation_still_uses_the_original_private_protocol_during_an_update() {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let _held = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let (sender, receiver) = async_channel::unbounded();
+        let _listener = UiActivationListener::bind_in(runtime.path(), sender).unwrap();
+        assert!(activate_window_at_with_token(runtime.path(), PRIMARY_WINDOW, None).unwrap());
+        let activation = receiver.recv_blocking().unwrap();
+        assert!(
+            activation.update.is_none()
+                && activation.session.is_none()
+                && activation.token.is_none()
+        );
+        assert!(
+            private_lock_is_held(
+                &runtime
+                    .path()
+                    .join(format!("{APPLICATION_LOCK_FILE}.update"))
+            )
+            .unwrap()
         );
     }
 }

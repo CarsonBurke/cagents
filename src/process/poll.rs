@@ -194,9 +194,9 @@ fn cancellation_descriptor() -> io::Result<Arc<OwnedFd>> {
     }
 }
 
-fn timeout_milliseconds(deadline: Option<Instant>) -> i32 {
+fn timeout_milliseconds(deadline: Option<Instant>, now: Instant) -> i32 {
     deadline.map_or(-1, |deadline| {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(now);
         let millis = remaining.as_millis() + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
         millis.min(i32::MAX as u128) as i32
     })
@@ -350,7 +350,7 @@ pub(super) fn execute(
             libc::poll(
                 watched.as_mut_ptr(),
                 watched.len() as libc::nfds_t,
-                timeout_milliseconds(next_deadline),
+                timeout_milliseconds(next_deadline, Instant::now()),
             )
         };
         if ready < 0 {
@@ -458,6 +458,54 @@ pub(super) fn execute(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn readiness_wait_uses_the_deadline_instead_of_a_polling_interval() {
+        let now = Instant::now();
+        assert_eq!(timeout_milliseconds(None, now), -1);
+        for milliseconds in [15, 5_000, 120_000] {
+            let deadline = now + Duration::from_millis(milliseconds);
+            assert_eq!(
+                timeout_milliseconds(Some(deadline), now),
+                milliseconds as i32
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_wait_rounds_remaining_time_up_and_expires_at_zero() {
+        let now = Instant::now();
+        for (nanoseconds, expected) in [
+            (0, 0),
+            (1, 1),
+            (999_999, 1),
+            (1_000_000, 1),
+            (1_000_001, 2),
+            (999_999_999, 1_000),
+            (1_000_000_000, 1_000),
+            (1_000_000_001, 1_001),
+        ] {
+            let deadline = now + Duration::from_nanos(nanoseconds);
+            assert_eq!(timeout_milliseconds(Some(deadline), now), expected);
+        }
+        assert_eq!(
+            timeout_milliseconds(Some(now), now + Duration::from_nanos(1)),
+            0
+        );
+    }
+
+    #[test]
+    fn readiness_wait_saturates_without_turning_into_an_unbounded_wait() {
+        let now = Instant::now();
+        let maximum = Duration::from_millis(i32::MAX as u64);
+        for remaining in [
+            maximum,
+            maximum + Duration::from_nanos(1),
+            maximum + Duration::from_millis(1),
+        ] {
+            assert_eq!(timeout_milliseconds(Some(now + remaining), now), i32::MAX);
+        }
+    }
 
     #[test]
     fn polled_io_uses_the_retained_directory_after_its_path_is_replaced() {

@@ -297,11 +297,18 @@ fn validate_read_root_for_worktree(root: &Root, worktree: &Path) -> Result<(), F
 /// construct this association; a pure root setter alone cannot admit Save.
 #[derive(Debug, Clone)]
 pub struct FileRead {
+    pub(crate) watch_revision: Option<u64>,
     worktree: PathBuf,
     root: std::sync::Arc<Root>,
     result: Result<LoadedFile, FileIoError>,
 }
 impl FileRead {
+    pub(crate) fn source(&self) -> Option<&Path> {
+        self.result
+            .as_ref()
+            .ok()
+            .map(|loaded| loaded.source.as_path())
+    }
     pub fn worktree(&self) -> &Path {
         &self.worktree
     }
@@ -326,6 +333,7 @@ pub(crate) fn read_file_at(
             Ok(loaded)
         });
     Ok(FileRead {
+        watch_revision: None,
         worktree: worktree.to_owned(),
         root,
         result,

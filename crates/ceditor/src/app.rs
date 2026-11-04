@@ -715,6 +715,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DirectorySearchLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::FileLoadedAt { .. }
+            | RepositoryAction::DocumentChanged { .. }
+            | RepositoryAction::DocumentReloaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::WorkingDiffDue { .. }
@@ -3249,6 +3251,7 @@ impl Application for Editor {
                     if self.core.main_window_id() == Some(window) {
                         let regained = focused && !self.window_focused;
                         self.window_focused = focused;
+                        cagents::ui_controls::animate_activity(focused);
                         if !focused {
                             self.tab_history.finish(self.active);
                         }
@@ -3645,9 +3648,13 @@ impl Application for Editor {
                     let basis_resolved =
                         matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
+                    let background_loaded =
+                        matches!(action, RepositoryAction::DocumentReloaded { .. });
                     let focus_loaded = matches!(
                         action,
-                        RepositoryAction::FileLoaded { .. } | RepositoryAction::FileLoadedAt { .. }
+                        RepositoryAction::FileLoaded { .. }
+                            | RepositoryAction::FileLoadedAt { .. }
+                            | RepositoryAction::DocumentReloaded { .. }
                     ) && self.active == Some(id)
                         && !self.modal_open();
                     let saved = matches!(
@@ -3659,6 +3666,10 @@ impl Application for Editor {
                     let Some(tab) = self.tab_mut(id) else {
                         return Task::none();
                     };
+                    let restoring_reload = tab.runtime.retains_reload_buffer();
+                    // A watched retry can finish a provisional explicit Reload.
+                    // Ordinary automatic reloads never request foreground focus.
+                    let focus_loaded = focus_loaded && (!background_loaded || restoring_reload);
                     let listing_changed = matches!(
                         &action,
                         RepositoryAction::FilesLoaded { result: Ok(_), .. }
@@ -3715,7 +3726,16 @@ impl Application for Editor {
                         }
                     }
                     if focus_loaded {
-                        tasks.push(tab.runtime.focus_editor(id).map(cosmic::Action::App));
+                        if restoring_reload {
+                            if let Some(target) = tab.runtime.loaded_focus_target(id) {
+                                tasks.push(workspace_widget::focus_after_loading(
+                                    cagents::repository_widget::editor_focus_id(id),
+                                    target,
+                                ));
+                            }
+                        } else {
+                            tasks.push(tab.runtime.focus_editor(id).map(cosmic::Action::App));
+                        }
                     }
                     if find_preferences_changed {
                         let (options, preserve) = self.tab(id).unwrap().runtime.find_preferences();
@@ -4710,6 +4730,12 @@ impl Application for Editor {
             frames,
             review_requests,
             self.document_tone_subscription(),
+            Subscription::batch(
+                self.tabs
+                    .iter()
+                    .map(|tab| tab.runtime.document_subscription(tab.id)),
+            )
+            .map(Message::Repository),
         ])
     }
 

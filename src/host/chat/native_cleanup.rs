@@ -18,6 +18,8 @@ impl NativeClose {
 
 #[derive(Clone)]
 struct RetainedPair {
+    // Only a live pair needs a close source. A receipt-proved completed pair
+    // still keeps its exact handle for the replacement fences below.
     source: Option<crate::model::TerminalSession>,
     holder: crate::terminal::holder::Record,
     handle: Option<crate::terminal::TerminalHandle>,
@@ -270,11 +272,9 @@ fn close_retained_inner(
                 .map_err(|error| error.message)?;
         }
         if let Some(pair) = &pending.paired {
-            if let Some(handle) = &pair.handle {
-                handle.close_with_receipt(
-                    pair.source.as_ref().expect("captured worker source"),
-                    &proof,
-                )?;
+            if let Some(source) = &pair.source {
+                let handle = pair.handle.as_ref().expect("captured worker source");
+                handle.close_with_receipt(source, &proof)?;
             } else if !crate::terminal::holder::cleanup::confirmed_owner_with_role(
                 &pair.holder,
                 &proof,
@@ -461,11 +461,55 @@ fn retained_pair(
                     .into(),
             );
         }
+        if state.proof() != proof || !proof.is_complete() {
+            return Err("The paired terminal belongs to a different daemon owner".into());
+        }
+        let handle = current.handle.clone();
+        if handle.is_completed() {
+            // A completed worker has no live projection. Its exact holder's
+            // source-digest receipt can recognize the acknowledged source even
+            // when the observer descriptor and old aliases no longer show it.
+            // Keep this same worker for the later replacement fences.
+            drop(state);
+            let confirmed = match terminal {
+                Some(terminal) => crate::terminal::holder::cleanup::confirmed_with_role(
+                    terminal,
+                    holder,
+                    proof,
+                    original_role.as_ref(),
+                )?,
+                None => crate::terminal::holder::cleanup::confirmed_owner_with_role(
+                    holder,
+                    proof,
+                    original_role.as_ref(),
+                )?,
+            };
+            if !confirmed {
+                return Err(
+                    "The completed paired terminal has not proved its exact teardown".into(),
+                );
+            }
+            return Ok(Some(RetainedPair {
+                source: None,
+                holder: holder.clone(),
+                handle: Some(handle),
+                original_role,
+            }));
+        }
+        // Cleanup owns the authenticated worker, not observer 0's attachment.
+        // A live projection failure must refuse, never use a presentation or
+        // historical descriptor as a substitute ownership proof.
+        let projected = state.native_terminal_projection(holder.terminal)?;
+        if projected.continuity.live_proof().as_ref() != Some(proof) {
+            return Err("The paired terminal belongs to a different daemon owner".into());
+        }
         let descriptor = state
             .descriptor(0, holder.terminal)
             .map_err(|error| error.message)?;
         if terminal.is_some_and(|terminal| {
-            descriptor.session != *terminal && !descriptor.upgrade_sources.contains(terminal)
+            projected != *terminal
+                && descriptor.session != *terminal
+                && !descriptor.upgrade_sources.contains(terminal)
         }) {
             return Err(
                 "The paired terminal does not retain this exact native holder's source identity"
@@ -473,9 +517,9 @@ fn retained_pair(
             );
         }
         return Ok(Some(RetainedPair {
-            source: Some(descriptor.session),
+            source: Some(projected),
             holder: holder.clone(),
-            handle: Some(current.handle.clone()),
+            handle: Some(handle),
             original_role,
         }));
     }

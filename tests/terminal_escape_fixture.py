@@ -74,6 +74,7 @@ class TerminalEscapeFixture(unittest.TestCase):
         reader, writer = socket.socketpair()
         try:
             writer.sendall(PEER["frame"](b"heartbeat", opcode=9) + PEER["frame"]({"id": 4, "method": "models/list"}))
+            writer.shutdown(socket.SHUT_WR)
             pongs = []
             message = PEER["receive"](reader, pongs.append)
             self.assertEqual(pongs, [b"heartbeat"])

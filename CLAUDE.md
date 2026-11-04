@@ -12,7 +12,7 @@ You are a senior app developer tasked with creating a great Agent Development En
 
 ## Pull request screenshots
 
-- PRs that change something people see must include before and after screenshots in the PR description, shown side by side and labeled for the page or interaction state.
+- PRs that change something people see must include before and after screenshots in the PR description. Use only two side-by-side image columns, labeled Before and After; put the page or interaction-state description beneath each pair. Do not add a State, explanation, or other text column beside the images: it reduces their display size.
 - Capture each pair through the actual native app, using the development runner, with the same viewport, scale, theme, data, and interaction state. Identify the before revision and the tested after head. Capture the affected states, including expanded, empty, error, and narrow layouts when the change affects them.
 - Save images as WebP with descriptive names such as `before-channel-prs.webp` and `after-channel-prs.webp`. Check that they show the intended change and contain no secrets or private user content.
 - Keep screenshots off the product PR branch. Commit only the images under `pr-screenshots/` on a separate `<branch>-screenshots` branch, and embed immutable links in the description: `https://github.com/CarsonBurke/cagents/blob/<sha>/pr-screenshots/<name>.webp?raw=true`. Keep the screenshot branch so the images remain reachable.

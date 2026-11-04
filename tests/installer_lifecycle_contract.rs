@@ -78,9 +78,126 @@ fn uninstall_preserves_installation_when_daemon_status_is_untrusted() {
     }
 }
 
+#[test]
+fn installer_entrypoints_refuse_inherited_callers_before_tools_or_purge() {
+    use cagents::process::{
+        CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+    };
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    for role in [
+        OsString::from("inert-fixture-role"),
+        OsString::new(),
+        OsString::from_vec(vec![0xff]),
+    ] {
+        for script in ["install.sh", "packaging/cagents-uninstall"] {
+            let root = tempfile::tempdir().unwrap();
+            for leaf in [
+                "bin",
+                "home",
+                "data/cagents",
+                "config/cagents",
+                "cache/cagents",
+            ] {
+                fs::create_dir_all(root.path().join(leaf)).unwrap();
+            }
+            for leaf in ["data", "config", "cache"] {
+                fs::write(
+                    root.path().join(leaf).join("cagents/saved"),
+                    b"private fixture",
+                )
+                .unwrap();
+            }
+            for name in ["id", "uname", "getconf", "mktemp", "curl", "wget", "rm"] {
+                executable(
+                    &root.path().join("bin").join(name),
+                    "#!/bin/sh\nprintf invoked > \"$HOME/../tool-invoked\"\nexit 91\n",
+                );
+            }
+            let command = || {
+                CommandSpec::new("/bin/sh")
+                    .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
+                    .env("CAGENTS_AGENT_AUTHORITY", &role)
+                    .env("HOME", root.path().join("home"))
+                    .env("XDG_DATA_HOME", root.path().join("data"))
+                    .env("XDG_CONFIG_HOME", root.path().join("config"))
+                    .env("XDG_CACHE_HOME", root.path().join("cache"))
+                    .env("PATH", root.path().join("bin"))
+                    .cwd(root.path())
+                    .timeout(std::time::Duration::from_secs(10))
+                    .output_limits(64 * 1024, 64 * 1024)
+            };
+            let options = if script == "install.sh" {
+                vec![
+                    vec![],
+                    vec!["--stage-only"],
+                    vec!["--uninstall"],
+                    vec!["--purge"],
+                ]
+            } else {
+                vec![vec![], vec!["--purge"]]
+            };
+            for args in options {
+                let output = SystemProcessExecutor
+                    .execute(&command().args(args), &CancellationToken::new())
+                    .unwrap();
+                assert_eq!(output.exit_code, Some(1), "{script}: {output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("require your own terminal"),
+                    "{script}: {output:?}"
+                );
+                assert!(output.stdout.is_empty());
+                assert!(!root.path().join("tool-invoked").exists());
+                for leaf in ["data", "config", "cache"] {
+                    assert_eq!(
+                        fs::read(root.path().join(leaf).join("cagents/saved")).unwrap(),
+                        b"private fixture"
+                    );
+                }
+            }
+            let output = SystemProcessExecutor
+                .execute(
+                    &command().arg("--help").env("PATH", "/usr/bin:/bin"),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert!(output.success, "{script}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).starts_with("Usage:"));
+            assert!(!root.path().join("tool-invoked").exists());
+        }
+    }
+}
+
 fn executable(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+// The CLI-only lane has no built host. Keep this process-boundary fixture
+// beside a private copy of the actual coordinator, as in installer_guard_contract.
+// It checks the real inherited fence and request, not host SQLite/provider panes.
+fn install_source_inspector_fixture(path: &Path) {
+    executable(
+        path,
+        r#"#!/usr/bin/python3
+import json, os, pathlib, subprocess, sys
+assert len(sys.argv) == 3 and sys.argv[1] == '--inspect-upgrade-source'
+request=json.loads(sys.argv[2])
+assert request == {'protocol':int(os.environ['FIXTURE_SOURCE_PROTOCOL']),
+    'proof':None, 'require_resumable':os.environ['FIXTURE_REQUIRE_RESUMABLE']=='true',
+    'reconcile_retained':False}
+assert not any(key in os.environ for key in ['CAGENTS_INSTALL_RESULT_FD',
+    'CAGENTS_INSTALL_OWNER_CLI', 'CAGENTS_ARCHIVE', 'CAGENTS_CHECKSUMS', 'CAGENTS_REPOSITORY'])
+fd=int(os.environ['CAGENTS_UI_UPDATE_GUARD_FD'])
+verified=subprocess.run([os.environ['FIXTURE_REAL_CLI'], 'verify-install-guard', '--stage-only'],
+    pass_fds=(fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+if verified.returncode:
+    sys.stderr.buffer.write(verified.stderr)
+    sys.exit(91)
+with (pathlib.Path(os.environ['HOME'])/'source-inspected').open('a') as inspected:
+    inspected.write(json.dumps(request)+'\n')
+print(json.dumps({'Ok':None}))
+"#,
+    );
 }
 
 // The fixture CLI records every destructive request, not merely its final
@@ -140,6 +257,11 @@ fn coordinated_release_mode(
     stage_only: bool,
 ) {
     let home = tempfile::tempdir().unwrap();
+    let coordinator_bin = home.path().join("coordinator-bin");
+    fs::create_dir(&coordinator_bin).unwrap();
+    let real_cli = coordinator_bin.join("cagents");
+    fs::copy(env!("CARGO_BIN_EXE_cagents"), &real_cli).unwrap();
+    install_source_inspector_fixture(&coordinator_bin.join("cagentsd"));
     let data = home.path().join("data with spaces");
     let prefix = data.join("cagents-install");
     let old_bin = prefix.join("versions/old/bin");
@@ -305,8 +427,21 @@ esac
     if let Some(failure) = publish_failure.filter(|failure| *failure != "pre-cas-candidate") {
         let fail = if failure == "current-changed" {
             "/usr/bin/ln -snf versions/independent \"$FIXTURE_PREFIX/current\"; exit 8"
-        } else if failure == "outer-signal" {
-            "kill -TERM \"$(cat \"$FIXTURE_OUTER_PID_FILE\")\"; sleep 1; exit 8"
+        } else if matches!(failure, "outer-signal" | "outer-signal-invalid-target") {
+            r#"target=$(cat "$FIXTURE_OUTER_PID_FILE") || exit 97
+if [ "$FIXTURE_REJECT_SIGNAL" = true ]; then target=not-a-pid; fi
+# Successful delivery makes the outer installer cancel this tool's group.
+# Keep that TERM from interrupting the builtin send-and-record section.
+trap '' TERM
+if ! kill -TERM "$target"; then
+  printf '%s\n' "$target" > "$FIXTURE_SIGNAL_REJECTED"
+  exit 97
+fi
+printf '%s\n' "$target" > "$FIXTURE_SIGNAL_DELIVERED" || exit 97
+trap - TERM
+# A lost outer cancellation must allow publication to succeed. An unrelated
+# exit failure here would also roll back and hide broken signal forwarding.
+sleep 1"#
         } else if failure == "signal" {
             "kill -TERM \"$PPID\"; exit 8"
         } else {
@@ -396,7 +531,21 @@ esac
     let runtime = home.path().join("runtime");
     fs::create_dir(&runtime).unwrap();
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let outer_signal = matches!(
+        publish_failure,
+        Some("outer-signal" | "outer-signal-invalid-target")
+    );
     let mut command = Command::new("sh");
+    if outer_signal {
+        // Publish from the child before the installer can reach the signal
+        // fixture. exec preserves this PID as the actual outer installer.
+        command.args([
+            "-c",
+            r#"printf '%s\n' "$$" > "$FIXTURE_OUTER_PID_FILE" || exit 97
+exec sh "$@""#,
+            "installer-signal-fixture",
+        ]);
+    }
     command.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"));
     if stage_only {
         command.arg("--stage-only");
@@ -434,7 +583,12 @@ esac
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_RUNTIME_DIR", &runtime)
         .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
-        .env("FIXTURE_REAL_CLI", env!("CARGO_BIN_EXE_cagents"))
+        .env("FIXTURE_REAL_CLI", &real_cli)
+        .env(
+            "FIXTURE_SOURCE_PROTOCOL",
+            cagents::terminal_ipc::PROTOCOL_VERSION.to_string(),
+        )
+        .env("FIXTURE_REQUIRE_RESUMABLE", restart.is_some().to_string())
         .env("FIXTURE_COORDINATOR", coordinator)
         .env("FIXTURE_STAGE_ONLY", stage_only.to_string())
         .env(
@@ -446,6 +600,18 @@ esac
             home.path().join("coordinator-used"),
         )
         .env("FIXTURE_OUTER_PID_FILE", home.path().join("outer-pid"))
+        .env(
+            "FIXTURE_SIGNAL_DELIVERED",
+            home.path().join("signal-delivered"),
+        )
+        .env(
+            "FIXTURE_SIGNAL_REJECTED",
+            home.path().join("signal-rejected"),
+        )
+        .env(
+            "FIXTURE_REJECT_SIGNAL",
+            (publish_failure == Some("outer-signal-invalid-target")).to_string(),
+        )
         .env(
             "CAGENTS_REPOSITORY",
             if download == Some("public") {
@@ -472,8 +638,55 @@ esac
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    fs::write(home.path().join("outer-pid"), output.id().to_string()).unwrap();
+    let outer_pid = output.id();
     let output = output.wait_with_output().unwrap();
+    let source_inspected = home.path().join("source-inspected");
+    if stage_only || !home.path().join("coordinator-used").exists() {
+        assert!(
+            !source_inspected.exists(),
+            "staging and pre-coordinator refusals must not inspect source panes"
+        );
+    } else {
+        let inspections = fs::read_to_string(source_inspected).unwrap_or_else(|error| {
+            panic!("source inspector was not reached: {error}; coordinator output: {output:?}")
+        });
+        assert_eq!(inspections.lines().count(), 1, "{inspections}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(inspections.trim()).unwrap(),
+            serde_json::json!({
+                "protocol": cagents::terminal_ipc::PROTOCOL_VERSION,
+                "proof": null,
+                "require_resumable": restart.is_some(),
+                "reconcile_retained": false,
+            })
+        );
+    }
+    if outer_signal {
+        assert_eq!(
+            fs::read_to_string(home.path().join("outer-pid")).unwrap(),
+            format!("{outer_pid}\n")
+        );
+        if publish_failure == Some("outer-signal-invalid-target") {
+            assert_eq!(
+                fs::read_to_string(home.path().join("signal-delivered"))
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::NotFound,
+                "a rejected injection must never count as delivered"
+            );
+            assert_eq!(
+                fs::read_to_string(home.path().join("signal-rejected")).unwrap(),
+                "not-a-pid\n"
+            );
+        } else {
+            assert_eq!(
+                fs::read_to_string(home.path().join("signal-delivered"))
+                    .expect("outer interruption requires successful signal delivery"),
+                format!("{outer_pid}\n")
+            );
+            assert!(!home.path().join("signal-rejected").exists());
+        }
+    }
     if coordinator == "none" || coordinator == "stage-unsupported" {
         assert!(!output.status.success());
         assert!(
@@ -689,6 +902,18 @@ fn unsupported_coordinators_refuse_before_mutating_the_installation() {
 #[test]
 fn interrupting_the_outer_installer_waits_for_inner_rollback() {
     coordinated_release_fixture(true, 2, Some("outer-signal"), None, None, "installed");
+}
+
+#[test]
+fn rejected_outer_signal_injection_cannot_count_as_delivered() {
+    coordinated_release_fixture(
+        true,
+        2,
+        Some("outer-signal-invalid-target"),
+        None,
+        None,
+        "installed",
+    );
 }
 
 #[test]

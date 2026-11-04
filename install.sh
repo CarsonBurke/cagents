@@ -97,6 +97,10 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+if [ "${CAGENTS_AGENT_AUTHORITY+x}" = x ]; then
+    fail 'installation and removal require your own terminal; hosted sessions cannot change the installation'
+fi
+
 if [ "$STAGE_ONLY" -eq 1 ]; then
     [ "$RESTART_DAEMON" -eq 0 ] && [ "$UNINSTALL" -eq 0 ] \
         && [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] && [ -z "$RELAUNCH_AGENTS" ] \
