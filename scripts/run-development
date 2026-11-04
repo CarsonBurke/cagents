@@ -238,11 +238,18 @@ run_cli() {
 # directory, which stopping the session deletes, so stop the daemon first.
 stop_instance_session() {
     harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) || return 0
+    runtime=$(
+        eval "$harness_env"
+        printf '%s' "$XDG_RUNTIME_DIR"
+    )
     (
         eval "$harness_env"
         socket=$XDG_RUNTIME_DIR/cagents-development-$instance/cagentsd.sock
         if [ -e "$socket" ]; then
-            run_cli daemon stop-for-rebuild --including-subagents >/dev/null
+            if ! output=$(run_cli daemon stop-for-rebuild --including-subagents 2>&1); then
+                printf '%s\n' "$output" >&2
+                exit 1
+            fi
             remaining=100
             while [ -e "$socket" ]; do
                 if [ "$remaining" -eq 0 ]; then
@@ -254,7 +261,36 @@ stop_instance_session() {
             done
         fi
     )
-    niri-harness --session "$harness_session" stop >/dev/null
+    niri-harness --session "$harness_session" stop >/dev/null 2>&1
+    sweep_instance_runtime "$runtime"
+}
+
+# Bus-activated services such as the document portal and gvfs can outlive the
+# harness session, keeping FUSE mounts in its runtime directory, which the
+# harness then leaves behind. Only processes started with that private
+# directory carry it in their environment.
+sweep_instance_runtime() {
+    case $1 in
+        "${XDG_RUNTIME_DIR:?}"/nh-?*) ;;
+        *) return 0 ;;
+    esac
+    [ -d "$1" ] || return 0
+    for environment in /proc/[0-9]*/environ; do
+        if tr '\0' '\n' 2>/dev/null <"$environment" | grep -qxF "XDG_RUNTIME_DIR=$1"; then
+            process=${environment#/proc/}
+            kill "${process%/environ}" 2>/dev/null || :
+        fi
+    done
+    remaining=40
+    while awk -v runtime="$1" '$5 == runtime || index($5, runtime "/") == 1 { found = 1 } END { exit !found }' /proc/self/mountinfo; do
+        if [ "$remaining" -eq 0 ]; then
+            printf '%s\n' "instance $instance runtime retained at $1: a filesystem is still mounted there" >&2
+            return 0
+        fi
+        remaining=$((remaining - 1))
+        sleep 0.05
+    done
+    rm -rf -- "$1"
 }
 
 if [ "$stop_instance" = true ]; then
