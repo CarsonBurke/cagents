@@ -152,9 +152,10 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         self.protocol.unlink(missing_ok=True)
         shutil.rmtree(self.dist, ignore_errors=True)
 
-    def package(self, variant, **overrides):
+    def package(self, variant, *arguments, **overrides):
         return subprocess.run(
-            ["/bin/sh", str(self.checkout / "scripts/package-linux.sh"), "--variant", variant],
+            ["/bin/sh", str(self.checkout / "scripts/package-linux.sh"), "--variant", variant,
+             *arguments],
             cwd=self.directory, env=self.environment | overrides,
             capture_output=True, text=True, timeout=30,
         )
@@ -221,7 +222,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assert_packages(variant)
                     common = ["build", "--manifest-path", str(self.checkout / "Cargo.toml"),
-                              "--locked", "--release", "--target-dir", str(self.target),
+                              "--locked", "--profile", "release", "--target-dir", str(self.target),
                               "--target", NATIVE]
                     defaults = ["--no-default-features"] if variant == "browserless" else []
                     ui = "ui" if variant == "browserless" else "integrated-browser"
@@ -233,6 +234,29 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                     ])
                     for path, original in self.decoys.items():
                         self.assertEqual(path.read_bytes(), original)
+
+    def test_local_profile_archive_only_builds_and_checksums_just_the_archive(self):
+        result = self.package("full", "--archive-only", CAGENTS_CARGO_PROFILE="local")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for args in self.builds():
+            self.assertEqual(args[args.index("--profile") + 1], "local")
+        self.assert_build_prefix(len(PRODUCTS))
+        self.assertEqual([args for args in self.events("cargo") if args[0] == "tree"], [])
+        archive = f"cagents-{VERSION}-{NATIVE}.tar.gz"
+        self.assertEqual({path.name for path in self.dist.iterdir()}, {archive, "SHA256SUMS"})
+        digest = hashlib.sha256((self.dist / archive).read_bytes()).hexdigest()
+        self.assertEqual((self.dist / "SHA256SUMS").read_text(), f"{digest}  {archive}\n")
+        with tarfile.open(self.dist / archive, "r:gz") as portable:
+            for product in PRODUCTS:
+                member = portable.getmember(f"cagents-{VERSION}/bin/{product}")
+                self.assertEqual(portable.extractfile(member).read(),
+                                 (self.reported / product / NATIVE / product).read_bytes())
+
+    def test_unsafe_profile_is_refused_before_building(self):
+        result = self.package("full", CAGENTS_CARGO_PROFILE="../release")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe Cargo profile", result.stderr)
+        self.assertFalse(self.calls.exists() and self.builds())
 
     def test_each_build_failure_preserves_101_before_protocol_or_package_output(self):
         for variant in ("full", "browserless"):
