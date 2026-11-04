@@ -96,6 +96,30 @@ build_commit() {
     )
 }
 
+# Removes local builds other than the current one, the two most recent
+# others (rollback targets), and any version a running process executes from.
+prune_versions() {
+    local versions current name exe kept=0
+    versions=$(realpath -- "$PREFIX/versions")
+    current=$(basename -- "$(readlink -- "$PREFIX/current")")
+    local -A in_use=()
+    for exe in /proc/[0-9]*/exe; do
+        exe=$(readlink -- "$exe" 2>/dev/null) || continue
+        [[ $exe == "$versions"/* ]] || continue
+        exe=${exe#"$versions"/}
+        in_use[${exe%%/*}]=1
+    done
+    while IFS= read -r name; do
+        [[ $name == *+local.* && $name != "$current" && -z ${in_use[$name]:-} ]] || continue
+        if ((kept < 2)); then
+            kept=$((kept + 1))
+            continue
+        fi
+        printf 'Removing old local build %s\n' "$name"
+        rm -rf -- "${versions:?}/$name"
+    done < <(cd "$versions" && ls -1t)
+}
+
 if [[ $PREFIX/current -ef $PREFIX/versions/$VERSION ]]; then
     printf '%s is already current; skipping the build.\n' "$VERSION"
 elif [[ -e $PREFIX/versions/$VERSION ]]; then
@@ -136,6 +160,7 @@ EOF
     CAGENTS_ARCHIVE=$OUTPUT/$ARCHIVE CAGENTS_CHECKSUMS=$OUTPUT/SHA256SUMS \
         sh "$ROOT_DIR/install.sh" --version "$VERSION" --stage-only
     rm -rf -- "$OUTPUT"
+    prune_versions
 fi
 
 if ((STAGE_ONLY)); then
