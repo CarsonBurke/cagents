@@ -702,10 +702,22 @@ impl OutputAdmission {
 pub(super) fn run(target: Target, request: Request) -> Result<Task<Message>, u64> {
     // One shaping job, no waiting worker queue. Deferred live entries become
     // eligible when that job completes; redraw alone cannot create a busy loop.
-    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    let slots = SLOTS
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone();
+    #[cfg(not(test))]
+    let slots = {
+        static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+        SLOTS
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone()
+    };
+    // Like REQUESTS, each libtest thread is its own application: a concurrent
+    // test's shaping job must not defer this one's.
+    #[cfg(test)]
+    let slots = {
+        thread_local! {
+            static SLOTS: Arc<tokio::sync::Semaphore> = Arc::new(tokio::sync::Semaphore::new(1));
+        }
+        SLOTS.with(Arc::clone)
+    };
     run_with_slots(target, request, slots)
 }
 fn run_with_slots(
