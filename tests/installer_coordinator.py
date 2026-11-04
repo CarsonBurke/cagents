@@ -117,11 +117,15 @@ class InstallerCoordinator(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / source, path)
         self.archive = self.directory / ARCHIVE_NAME
-        with tarfile.open(self.archive, "w:gz") as archive:
-            archive.add(self.payload, arcname=TOP)
         self.checksums = self.directory / "SHA256SUMS"
-        self.checksums.write_text(f"{hashlib.sha256(self.archive.read_bytes()).hexdigest()}  {ARCHIVE_NAME}\n")
+        self.package()
         self.environment.update(CAGENTS_ARCHIVE=str(self.archive), CAGENTS_CHECKSUMS=str(self.checksums))
+
+    def package(self, *, exclude=None):
+        with tarfile.open(self.archive, "w:gz") as archive:
+            archive.add(self.payload, arcname=TOP,
+                        filter=lambda entry: None if entry.name == f"{TOP}/{exclude}" else entry)
+        self.checksums.write_text(f"{hashlib.sha256(self.archive.read_bytes()).hexdigest()}  {ARCHIVE_NAME}\n")
 
     @staticmethod
     def write(path, text):
@@ -215,6 +219,22 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.assertFalse(self.prefix.exists())
         self.assertFalse(self.calls.exists())
         self.assertEqual(list(self.downloads.iterdir()), [])
+
+    def assert_missing_member_rejected(self, member):
+        # Recompute the checksum so this reaches the archive completeness gate.
+        self.package(exclude=member)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('archive has an unexpected or incomplete entry structure', result.stderr)
+        self.assertFalse(self.prefix.exists())
+        self.assertFalse(self.calls.exists(), 'an incomplete archive executed its coordinator')
+        self.assertEqual(list(self.downloads.iterdir()), [])
+
+    def test_archive_requires_the_ui_lease_marker_independently_of_autostart(self):
+        self.assert_missing_member_rejected('bin/.cagents-ui-lease-v1')
+
+    def test_archive_requires_autostart_independently_of_the_ui_lease_marker(self):
+        self.assert_missing_member_rejected('share/autostart/dev.cagents.Cagents.Daemon.desktop')
 
 
 if __name__ == "__main__":

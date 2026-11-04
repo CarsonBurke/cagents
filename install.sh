@@ -636,10 +636,10 @@ if ! awk -v top="$TOP_LEVEL" '
     $0 == top "/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg" { required[6] = 1 }
     $0 == top "/share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png" { required[9] = 1 }
     $0 == top "/share/metainfo/dev.cagents.Cagents.metainfo.xml" { required[7] = 1 }
-    $0 == top "/share/autostart/dev.cagents.Cagents.Daemon.desktop" { required[10] = 1 }
+    $0 == top "/share/autostart/dev.cagents.Cagents.Daemon.desktop" { required[11] = 1 }
     $0 == top "/share/doc/cagents/LICENSE" { required[8] = 1 }
     END {
-        for (i = 1; i <= 10; i++) if (!required[i]) exit 1
+        for (i = 1; i <= 11; i++) if (!required[i]) exit 1
     }
 ' "$ARCHIVE_LIST"; then
     fail 'archive has an unexpected or incomplete entry structure'

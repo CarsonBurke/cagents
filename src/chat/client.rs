@@ -122,14 +122,11 @@ struct Wire {
     codec: FrameCodec,
     body_requested: Arc<AtomicBool>,
 }
-type Pending = Arc<
-    Mutex<
-        BTreeMap<
-            u64,
-            crossbeam_channel::Sender<Result<Option<crate::model::TerminalSession>, String>>,
-        >,
-    >,
->;
+struct PendingCommand {
+    prompt: bool,
+    reply: crossbeam_channel::Sender<Result<Option<crate::model::TerminalSession>, String>>,
+}
+type Pending = Arc<Mutex<BTreeMap<u64, PendingCommand>>>;
 type FilePending =
     Arc<Mutex<BTreeMap<u64, crossbeam_channel::Sender<Result<super::FileChangeReply, String>>>>>;
 type TextCopyPending =
@@ -553,6 +550,7 @@ struct InnerPayload {
     // First-prompt receipt evidence survives body eviction, without retaining
     // user text. This is scoped to this exact authenticated connection.
     user_item_seen: Arc<AtomicBool>,
+    prompt_accepted: Arc<AtomicBool>,
     activity: Arc<Mutex<ActivityObservation>>,
     observed: Arc<Mutex<OutputObservation>>,
     account_usage: Arc<Mutex<AccountUsage>>,
@@ -1345,6 +1343,7 @@ impl ClientHandle {
                     publication: Arc::new(Publications::new(snapshot)),
                     body_requested,
                     user_item_seen: Arc::new(AtomicBool::new(user_item_seen)),
+                    prompt_accepted: Arc::new(AtomicBool::new(false)),
                     activity: Arc::new(Mutex::new(ActivityObservation {
                         generation: 0,
                         state: ActivityState::Idle,
@@ -1400,6 +1399,27 @@ impl ClientHandle {
                 response: ServerResponse::ChatAttached { session, snapshot },
             }
         })
+    }
+
+    /// Test-only access to the real start handshake and reader on a private
+    /// socket. It never discovers a daemon or launches a provider.
+    #[cfg(test)]
+    pub(crate) fn fixture_start_on(
+        stream: UnixStream,
+        session: Session,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        Self::connect_on(
+            stream,
+            session,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            wake,
+        )
     }
 
     /// Publishes `snapshot` as the reader thread would on a presentation
@@ -2028,6 +2048,7 @@ impl ClientHandle {
                 .iter()
                 .any(|item| item.role == super::Role::User),
         ));
+        let prompt_accepted = Arc::new(AtomicBool::new(false));
         let publication = Arc::new(Publications::new(initial));
         let next = Arc::new(AtomicU64::new(attach_request + 1));
         let alive = Arc::new(AtomicBool::new(true));
@@ -2047,6 +2068,7 @@ impl ClientHandle {
                 publication: publication.clone(),
                 body_requested: body_requested.clone(),
                 user_item_seen: user_item_seen.clone(),
+                prompt_accepted: prompt_accepted.clone(),
                 activity: activity.clone(),
                 observed: observed.clone(),
                 account_usage: account_usage.clone(),
@@ -2142,7 +2164,7 @@ impl ClientHandle {
                             } else { read_again = true; }
                         }
                         if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&id)) {
-                            let _ = reply.try_send(Ok(terminal));
+                            let _ = reply.reply.try_send(Ok(terminal));
                         }
                         wake(Wake::Changed);
                         continue;
@@ -2160,7 +2182,7 @@ impl ClientHandle {
                     let _=reader_stream.shutdown(Shutdown::Both);
                     let replies=std::mem::take(&mut *pending.lock().unwrap_or_else(|p|p.into_inner()));
                     for (request,reply) in replies {
-                        let _=reply.try_send(if Some(request)==envelope.request_id { Ok(terminal.clone()) } else { Err("Chat was explicitly closed".into()) });
+                        let _=reply.reply.try_send(if Some(request)==envelope.request_id { Ok(terminal.clone()) } else { Err("Chat was explicitly closed".into()) });
                     }
                     for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.try_send(Err("Chat was explicitly closed".into()));}
                     for (_,reply) in std::mem::take(&mut *text_copy_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.try_send(Err("Chat was explicitly closed".into()));}
@@ -2183,8 +2205,14 @@ impl ClientHandle {
                     continue;
                 }
                 if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&id)) {
+                    // Latch the authenticated prompt receipt before either EOF
+                    // or delayed UI delivery can restore its sendable draft.
+                    // Other Accepted replies do not prove prompt acceptance.
+                    if reply.prompt && matches!(&envelope.message, ServerMessage::Response { response: ServerResponse::Accepted }) {
+                        prompt_accepted.store(true, Ordering::Release);
+                    }
                     let result = match &envelope.message { ServerMessage::Response { response: ServerResponse::Accepted | ServerResponse::Detached } => Ok(None), ServerMessage::Error(error) => Err(error.message.clone()), _ => Err("Unexpected chat command response".into()) };
-                    let _ = reply.try_send(result);
+                    let _ = reply.reply.try_send(result);
                     // Request-specific command failures are delivered to the
                     // caller; they do not make presentation unavailable.
                     continue;
@@ -2316,7 +2344,7 @@ impl ClientHandle {
             }
             let _=visibility_stop.try_send(());
             for (_, reply) in std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner())) {
-                let _ = reply.try_send(Err(failure.clone()));
+                let _ = reply.reply.try_send(Err(failure.clone()));
             }
             for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {
                 let _=reply.try_send(Err(failure.clone()));
@@ -2383,6 +2411,12 @@ impl ClientHandle {
 
     pub(crate) fn has_observed_user_item(&self) -> bool {
         self.inner.user_item_seen.load(Ordering::Acquire)
+    }
+
+    /// A prompt receipt can precede its first transcript publication. Either
+    /// authenticated observation forbids offering that prompt as an unsent draft.
+    pub(crate) fn has_accepted_user_input(&self) -> bool {
+        self.has_observed_user_item() || self.inner.prompt_accepted.load(Ordering::Acquire)
     }
 
     /// A renderable publication, absent until a hidden client's full history
@@ -2463,7 +2497,19 @@ impl ClientHandle {
             if pending.len() >= 64 {
                 return Err("Chat client command capacity reached".into());
             }
-            pending.insert(id, reply);
+            pending.insert(
+                id,
+                PendingCommand {
+                    prompt: matches!(
+                        &request,
+                        ClientRequest::ChatCommand {
+                            command: Command::Prompt { .. },
+                            ..
+                        }
+                    ),
+                    reply,
+                },
+            );
         }
         let result = transmit(&self.inner.wire, &self.inner.proof, id, request).and_then(|()| {
             response
