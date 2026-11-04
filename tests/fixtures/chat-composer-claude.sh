@@ -287,6 +287,12 @@ while IFS= read -r frame; do
                 if [ "$subagent_wait" = 1 ] && [ "$turn" -eq 1 ]; then
                     scene_turn=$uuid
                     scene_subagents_start
+                    if [ -e "$config/fixture-subagent-idle" ]; then
+                        emit_record "$(jq -cn '{type:"assistant",uuid:"scene-idle",message:{id:"scene-idle",role:"assistant",content:[{type:"text",text:"The subagents are checking each area. I will report when they finish."}]}}')"
+                        jq -cn --arg session "$session" \
+                            '{type:"result",uuid:"scene-idle-result",subtype:"success",is_error:false,stop_reason:"end_turn",session_id:$session}'
+                        continue
+                    fi
                     if [ -e "$config/fixture-send-now-abort" ]; then
                         jq -cn '{type:"stream_event",event:{type:"message_start",message:{id:"scene-cut-off",role:"assistant"}}}'
                         jq -cn '{type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"text",text:""}}}'

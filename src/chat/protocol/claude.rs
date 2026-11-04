@@ -390,6 +390,8 @@ struct SendNowRequest {
 /// command gets one; it matters here from when it leaves the turn's path.
 struct CommandTask {
     id: String,
+    /// The call on screen as this command.
+    tool: Option<String>,
     description: String,
     background: bool,
     stopping: bool,
@@ -718,7 +720,7 @@ impl Claude {
         task: &str,
         frame: &Value,
         patch: &Value,
-        ended: bool,
+        ended: Option<ToolStatus>,
         step: &mut Step,
     ) {
         let before = self.background_commands();
@@ -727,6 +729,7 @@ impl Claude {
             if string(frame, "task_type") == "local_bash" && frame["owned_by_subagent"] != true {
                 self.command_tasks.push_back(CommandTask {
                     id: task.into(),
+                    tool: frame["tool_use_id"].as_str().map(str::to_owned),
                     description: string(frame, "description").into(),
                     background: frame["is_backgrounded"] == true,
                     stopping: false,
@@ -741,7 +744,20 @@ impl Claude {
                 known.description = description.into();
             }
         }
-        if ended {
+        if let Some(ended) = ended {
+            // The call's own result only said the command was moved aside.
+            let moved = self
+                .command_tasks
+                .iter()
+                .find(|known| known.id == task && known.background)
+                .and_then(|known| known.tool.clone());
+            if let Some(tool) = moved
+                && let Some(item) = self.tools.get_mut(&ScopedId::new(None, &tool))
+                && let ItemContent::Command { status, .. } = &mut item.content
+            {
+                *status = ended;
+                step.events.push(Event::Item(item.clone()));
+            }
             self.command_tasks.retain(|known| known.id != task);
         }
         let after = self.background_commands();
@@ -1751,6 +1767,16 @@ impl Claude {
                                 &Value::Null
                             },
                         );
+                        // Moved aside, the command is still running. Its task
+                        // says when that ends.
+                        if child.is_none()
+                            && self.command_tasks.iter().any(|known| {
+                                known.background && known.tool.as_deref() == Some(tool_id.as_str())
+                            })
+                            && let ItemContent::Command { status, .. } = &mut item.content
+                        {
+                            *status = ToolStatus::Running;
+                        }
                         if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent")
                         {
                             // A nested agent's progress never reaches this
@@ -4749,7 +4775,8 @@ impl Claude {
                 if ended.is_some() {
                     self.tasks.retain(|running| running != task);
                 }
-                self.track_command_task(task, frame, patch, ended.is_some(), step);
+                let command_task = self.command_tasks.iter().any(|known| known.id == task);
+                self.track_command_task(task, frame, patch, ended, step);
                 // Send now moved a foreground agent out of the turn's way. No
                 // launch acknowledgement has said so yet.
                 if patch["is_backgrounded"] == true
@@ -4812,25 +4839,24 @@ impl Claude {
                 });
                 // Lifecycle bookkeeping and notification summaries still need
                 // the synthetic tool. Only its duplicate presentation is hidden.
-                let represented = known_tool
-                    .as_deref()
-                    .or_else(|| frame["tool_use_id"].as_str())
-                    .is_some_and(|tool| {
-                        // Task notifications do not identify a transcript. A
-                        // unique nested Agent is valid prior correlation, but
-                        // an opaque ID shared by multiple scopes is ambiguous.
-                        let mut candidates = self.tools.iter().filter(|(key, _)| key.id == tool);
-                        let candidate = candidates.next();
-                        // A command's call is already on screen as that command.
-                        candidate.is_some_and(|(_, item)| match &item.content {
-                            ItemContent::Tool { name, .. } => name == "Agent",
-                            ItemContent::Command { .. } => {
-                                string(frame, "task_type") == "local_bash"
-                                    || self.command_tasks.iter().any(|known| known.id == task)
-                            }
-                            _ => false,
-                        }) && candidates.next().is_none()
-                    });
+                let represented = command_task
+                    || known_tool
+                        .as_deref()
+                        .or_else(|| frame["tool_use_id"].as_str())
+                        .is_some_and(|tool| {
+                            // Task notifications do not identify a transcript. A
+                            // unique nested Agent is valid prior correlation, but
+                            // an opaque ID shared by multiple scopes is ambiguous.
+                            let mut candidates =
+                                self.tools.iter().filter(|(key, _)| key.id == tool);
+                            let candidate = candidates.next();
+                            // A command's call is already on screen as that command.
+                            candidate.is_some_and(|(_, item)| match &item.content {
+                                ItemContent::Tool { name, .. } => name == "Agent",
+                                ItemContent::Command { .. } => true,
+                                _ => false,
+                            }) && candidates.next().is_none()
+                        });
                 if let Some(tool) = &known_tool {
                     if string(frame, "subtype") == "task_started" {
                         self.ended_agents.retain(|(known, _)| known != tool);
@@ -13006,6 +13032,10 @@ mod tests {
                     let mut frame = record["frame"].clone();
                     match record["dir"].as_str() {
                         Some("in") => replay.asked(&frame),
+                        // The recordings keep no tool input fragments, so a tool
+                        // block streamed from them would close empty over the
+                        // call its assistant frame delivers whole.
+                        Some("out") if frame["event"]["content_block"]["type"] == "tool_use" => {}
                         Some("out") => {
                             translate(&mut frame, &replay.names);
                             let step = replay
@@ -13178,6 +13208,67 @@ mod tests {
             assert_eq!(replay.commands(), ["blelkv3pt"]);
             // It goes when its own end is reported, later in the recording.
             assert!(trace!("sn_then_interrupt").commands().is_empty());
+        }
+
+        /// The moved call's last state, and any row beside it for its task.
+        fn moved_command(replay: &Replay, tool: &str, task: &str) -> (ToolStatus, usize) {
+            let status = replay
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Item(Item {
+                        id,
+                        content: ItemContent::Command { status, .. },
+                        ..
+                    }) if id == tool => Some(*status),
+                    _ => None,
+                })
+                .last()
+                .expect("the command is on screen");
+            let rows = replay
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(event, Event::Item(Item { id, content: ItemContent::Tool { .. }, .. })
+                        if id.contains(task))
+                })
+                .count();
+            (status, rows)
+        }
+
+        #[test]
+        fn a_moved_command_stays_running_as_itself_until_its_task_ends() {
+            let tool = "toolu_01678iwUdm2reU1usTzvNosX";
+            let trace =
+                include_str!("../../../tests/fixtures/claude-send-now/sn_fg_bash_next.jsonl");
+            let moved = Replay::play_until(
+                "sn_fg_bash_next",
+                trace,
+                Some("Command was moved to the background"),
+            );
+            assert_eq!(
+                moved_command(&moved, tool, "bvt1w4qmy"),
+                (ToolStatus::Running, 0)
+            );
+            assert_eq!(moved.commands().len(), 1);
+            let finished = trace!("sn_fg_bash_next");
+            assert_eq!(
+                moved_command(&finished, tool, "bvt1w4qmy"),
+                (ToolStatus::Succeeded, 0)
+            );
+            assert!(finished.commands().is_empty());
+        }
+
+        #[test]
+        fn a_stopped_moved_command_reads_as_stopped() {
+            assert_eq!(
+                moved_command(
+                    &trace!("m_moved_stop_task"),
+                    "toolu_01QEVye51T7q2CpBmmt5ddC5",
+                    "bovfo06h5"
+                ),
+                (ToolStatus::Stopped, 0)
+            );
         }
 
         #[test]

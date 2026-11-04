@@ -84,7 +84,8 @@ subagent report every two seconds until stopped. **Send now**, Esc, or Enter in
 an empty composer moves the command aside, delivers everything queued, and leaves
 the command and subagents running. A `fixture-send-now-abort` file beside it has
 the turn writing a reply instead, so Send now stops the reply and starts a new
-turn. `fixture-admission-delay` and `fixture-send-now-delay` hold a number of
+turn. A `fixture-subagent-idle` file ends the first turn right after the launch,
+leaving the conversation idle with subagents working. `fixture-admission-delay` and `fixture-send-now-delay` hold a number of
 seconds: how late a message's queued notice and the answer to Send now arrive.
 The frames follow `tests/fixtures/claude-send-now/`, recorded from Claude Code
 2.1.296; the scene does not exercise how the provider chooses between those paths

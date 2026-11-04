@@ -4452,7 +4452,7 @@ impl Runtime {
                 Cow::Owned(format!("Send {send_now_count} now"))
             };
             let tooltip = format!(
-                "Give this to the agent now (Esc, or {} with nothing typed). \
+                "Give the agent what is queued now (Esc, or {} with nothing typed). \
                  Subagents keep running. A reply being written may be cut short.",
                 if enter_sends { "Enter" } else { "Ctrl+Enter" }
             );
