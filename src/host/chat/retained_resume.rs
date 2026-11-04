@@ -403,7 +403,7 @@ pub(super) fn never_started(host: &SharedHost, source: &Session) -> Result<bool,
     }
 }
 
-const UNRECORDED: &str = "The saved Claude actor ended without a retirement that records which conversation it confirmed, so nothing was resumed or started in its place";
+const UNRECORDED: &str = "The saved Claude actor ended without a retirement that records which conversation it confirmed, so nothing was resumed or started in its place. Its conversation, if it began one, can be found and reopened with Resume";
 
 /// What a retained Claude pane that never learned its conversation ID
 /// resumes. Every actor of the pane must be proven ended (a kernel boot

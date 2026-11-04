@@ -378,6 +378,8 @@ struct ExecutionEvidence {
     boot: crate::model::BootId,
     native_holders: Result<std::path::PathBuf, String>,
     census: Result<Census, String>,
+    /// The census owners whose retirement is recorded, with what it confirmed.
+    retired: Result<Vec<crate::daemon::holder_registry::Record>, String>,
 }
 
 /// Every retained helper the durable census registered, by pane.
@@ -391,15 +393,16 @@ const MAX_CENSUS_ROWS: usize = 16 * 1024;
 
 impl ExecutionEvidence {
     fn load(boot: &crate::model::BootId) -> Self {
-        let census = crate::instance::project_dirs()
+        let store = crate::instance::project_dirs()
             .ok_or_else(|| "The data directory is unavailable".to_owned())
-            .and_then(|dirs| read_census(&dirs.data_dir().join("workspace-model.sqlite3")));
+            .map(|dirs| dirs.data_dir().join("workspace-model.sqlite3"));
         Self {
             boot: boot.clone(),
             native_holders: crate::daemon::holder_registry::directory(
                 crate::daemon::holder_registry::Kind::Native,
             ),
-            census,
+            census: store.clone().and_then(|path| read_census(&path)),
+            retired: store.and_then(|path| read_retired_owners(&path)),
         }
     }
 
@@ -449,6 +452,10 @@ impl ExecutionEvidence {
             Err(_) => return SavedExecution::Unproved,
         };
         owners.extend(&discovered);
+        // A pane that never learned its conversation resumes only the one a
+        // recorded retirement says its actor confirmed; without that record
+        // its ended actor leaves it nothing to reopen.
+        let unnamed = source.has_unnamed_retained_claude_actor();
         let mut execution = SavedExecution::Ended;
         for owner in owners.into_iter().filter(|owner| owner.boot == self.boot) {
             match crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root) {
@@ -456,9 +463,53 @@ impl ExecutionEvidence {
                 Ok(false) => execution = SavedExecution::Running,
                 Err(_) => return SavedExecution::Unproved,
             }
+            if unnamed
+                && !self
+                    .retired
+                    .as_ref()
+                    .is_ok_and(|retired| retired.contains(owner))
+            {
+                return SavedExecution::Unproved;
+            }
         }
         execution
     }
+}
+
+/// The census owners whose retirement the store records, read like the census.
+fn read_retired_owners(path: &Path) -> Result<Vec<crate::daemon::holder_registry::Record>, String> {
+    use rusqlite::{Connection, OpenFlags, config::DbConfig};
+    let db = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| error.to_string())?;
+    db.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+        .map_err(|error| error.to_string())?;
+    db.busy_timeout(Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
+    let mut statement = db
+        .prepare(
+            "SELECT o.ownership FROM native_actor_ownerships o \
+             JOIN native_actor_retirements r ON r.actor = o.actor ORDER BY o.actor LIMIT ?1",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([MAX_CENSUS_ROWS as i64 + 1], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let mut retired = Vec::new();
+    for (index, row) in rows.enumerate() {
+        if index >= MAX_CENSUS_ROWS {
+            return Err("The retained actor census exceeds its inspection bound".into());
+        }
+        let ownership: crate::host::model::NativeActorOwnership =
+            serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        retired.push(ownership.owner().clone());
+    }
+    Ok(retired)
 }
 
 /// One read transaction over the census, opened read-only: no schema
@@ -799,6 +850,7 @@ mod tests {
             boot: current_boot(),
             native_holders: Ok(holders.to_owned()),
             census: Ok(census),
+            retired: Ok(Vec::new()),
         }
     }
 
@@ -839,15 +891,22 @@ mod tests {
             .unwrap();
         // The census is read while its writer still holds the store open.
         let census = read_census(&path).unwrap();
-        assert_eq!(census, vec![(card.id, retired)]);
+        assert_eq!(census, vec![(card.id, retired.clone())]);
         // Verified retirement removed the discovery record.
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
-        let evidence = evidence(holders.path(), census);
+        let mut evidence = evidence(holders.path(), census);
         assert_eq!(evidence.classify(&card), SavedExecution::Ended);
         assert_eq!(
             evidence.classify(&issued),
+            SavedExecution::Unproved,
+            "a pre-ID card reopens only what a recorded retirement confirmed"
+        );
+        evidence.retired = read_retired_owners(&path);
+        assert_eq!(evidence.retired, Ok(vec![retired.clone()]));
+        assert_eq!(
+            evidence.classify(&issued),
             SavedExecution::Ended,
-            "a pre-ID card whose actor ended holds no live work either"
+            "a pre-ID card whose actor retired holds no live work either"
         );
         drop(registry);
         assert!(read_census(&root.path().join("absent.sqlite3")).is_err());
