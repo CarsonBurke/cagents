@@ -46,19 +46,19 @@ Start with the boundary that owns your change:
 
 ```sh
 # Control CLI: no UI, Ghostty, SQLite, or Servo graph.
-cargo check --locked --no-default-features --bin cagents
+scripts/cargo-gate check --locked --no-default-features --bin cagents
 
 # Terminal daemon: Ghostty/PTY host, no UI or Servo graph.
-cargo check --locked --no-default-features --features host --bin cagentsd
+scripts/cargo-gate check --locked --no-default-features --features host --bin cagentsd
 
 # Browserless UI client: libcosmic, no Ghostty or Servo graph.
-cargo check --locked --no-default-features --features ui --bin cagents-ui
+scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
 
 # Integrated UI client: libcosmic and Servo, no Ghostty graph.
-cargo check --locked --features integrated-browser --bin cagents-ui
+scripts/cargo-gate check --locked --features integrated-browser --bin cagents-ui
 
 # Standalone editor: separate package using the browserless UI graph.
-cargo check --locked --package ceditor --bin ceditor
+scripts/cargo-gate check --locked --package ceditor --bin ceditor
 ```
 
 Changes to ceditor or shared UI, editor, or notification public contracts also
@@ -279,8 +279,9 @@ concurrent compilation jobs**, including `cargo test` and every build in the
 runner. Cargo otherwise uses the logical CPU count, which can create
 substantial RAM pressure on high-core-count or shared machines. Override it
 with standard Cargo controls: `CARGO_BUILD_JOBS` also applies to the runner,
-and `-j` takes precedence for a single invocation. Run the isolated feature
-lanes sequentially, not as concurrent cold builds.
+and `-j` takes precedence for a single invocation; with several build slots,
+`scripts/cargo-gate` sets or caps `CARGO_BUILD_JOBS` to a share of the CPUs.
+Run the isolated feature lanes one after another, each through the gate.
 
 Worktrees can share Cargo's target and build directories. Cargo makes path
 packages relocatable and compares source timestamps, so an older checkout can
@@ -405,9 +406,9 @@ its lane. Cover the boundaries a change touches; prepare the HOST prerequisites
 below before running that lane:
 
 ```sh
-cargo test --locked --no-default-features --all-targets
-cargo test --locked --no-default-features --features host --all-targets
-cargo test --locked --no-default-features --features ui --all-targets
+scripts/cargo-gate test --locked --no-default-features --all-targets
+scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+scripts/cargo-gate test --locked --no-default-features --features ui --all-targets
 ```
 
 HOST fixtures that exec retained actors require
@@ -570,7 +571,7 @@ Published releases still come from `scripts/build-release-linux`; see
 | `required command not found: zig` | Install Zig 0.15.2 and put it on `PATH` (`mise install` reads `mise.toml`). |
 | The UI talks to an old daemon after you changed daemon, host, or IPC code | Relaunch with `--fresh-daemon`. |
 | `development daemon did not stop within 5 seconds` | Look for a lingering development daemon with `pgrep -a cagentsd`, let it exit (or stop that process), then retry `--fresh-daemon`. The socket is `$XDG_RUNTIME_DIR/cagents-development/cagentsd.sock`. |
-| Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and avoid concurrent cold builds; see [resource usage](#build-and-test-resource-usage). |
+| Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and build through `scripts/cargo-gate` rather than starting builds side by side; see [resource usage](#build-and-test-resource-usage). |
 | A UI problem needs logs | Add `--debug --log-file /tmp/cagents-ui.log` and read the file after reproducing. |
 | New links do not open in browserless mode | Install `xdg-utils`, or use a desktop with a working portal. |
 
