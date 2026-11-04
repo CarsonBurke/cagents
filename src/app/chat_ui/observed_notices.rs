@@ -1738,6 +1738,15 @@ mod tests {
         drop(app.insert_chat_card(resumed.clone(), None, None));
         let card = app.workspace.focused().unwrap();
         assert_ne!(card, old_target.card);
+        // Ready suppresses transcript bodies for offscreen panes. Establish
+        // the viewport before attaching so this checks the first visible
+        // grouping, rather than an intentionally unpresented hidden runtime.
+        app.workspace.resize_viewport(1_600.0);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        assert!(app.workspace_surfaces_visible());
         let target = app.chat_ui.attempt(card).unwrap().target;
         let handle = Arc::new(ClientHandle::fixture(resumed, source_snapshot));
         let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle.clone())))));
@@ -1765,6 +1774,8 @@ mod tests {
         assert!(app.chat_ui.attempt(card).is_none());
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+        assert!(runtime.visible.load(Ordering::Relaxed));
+        assert_eq!(runtime.snapshot.items.len(), 2);
         assert_eq!(runtime.turns.len(), 2);
         assert_before_next(runtime);
         let key = runtime.failure_ui.incidents[0].key.clone();
@@ -2566,6 +2577,14 @@ mod tests {
             app.session = Some(writer);
             drop(app.insert_chat_card(runtime.session.clone(), None, None));
             let card = app.workspace.focused().unwrap();
+            // The current snapshot error is observed when its transcript is
+            // presented. A zero-width fixture is offscreen by construction.
+            app.workspace.resize_viewport(1_600.0);
+            assert_eq!(
+                app.workspace.visibility(card),
+                Some(VisibilityClass::Visible)
+            );
+            assert!(app.workspace_surfaces_visible());
             let target = app.chat_ui.attempt(card).unwrap().target;
             let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle.clone())))));
             let initial = app.handle_chat_ui(Action::Ready(target, ready));
@@ -2629,6 +2648,8 @@ mod tests {
             );
             let runtime = app.chat_runtime_mut(target).unwrap();
             assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+            assert!(runtime.visible.load(Ordering::Relaxed));
+            assert_eq!(runtime.snapshot.items.len(), 2);
             assert!(runtime.failures.iter().any(|note| note.text == CAPACITY));
             assert!(
                 runtime
