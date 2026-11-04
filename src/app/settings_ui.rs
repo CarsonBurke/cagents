@@ -1385,6 +1385,7 @@ fn shortcut_input<'a>(
             let mut remaining = chords.clone();
             remaining.remove(index);
             crate::ui_controls::button::quiet(format!("{chord} ×"))
+                .name(format!("Remove {chord} shortcut for {label}"))
                 .on_press(Message::SettingsDraftChanged {
                     field,
                     value: settings::format_chords(&remaining),
@@ -1392,20 +1393,23 @@ fn shortcut_input<'a>(
                 .into()
         })
         .collect();
+    // Record and Reset wrap as one unit, so they never part across lines.
     controls.push(
-        crate::ui_controls::icon_button(Icon::Keyboard, format!("Record shortcut for {label}"))
-            .compact()
-            .on_press(Message::Palette(palette_ui::Action::Record(field)))
-            .into(),
-    );
-    controls.push(
-        crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label} shortcut"))
-            .compact()
-            .on_press_maybe((value != default).then(|| Message::SettingsDraftChanged {
-                field,
-                value: default,
-            }))
-            .into(),
+        widget::row::with_children(vec![
+            crate::ui_controls::icon_button(Icon::Keyboard, format!("Record shortcut for {label}"))
+                .compact()
+                .on_press(Message::Palette(palette_ui::Action::Record(field)))
+                .into(),
+            crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label} shortcut"))
+                .compact()
+                .on_press_maybe((value != default).then(|| Message::SettingsDraftChanged {
+                    field,
+                    value: default,
+                }))
+                .into(),
+        ])
+        .spacing(2)
+        .into(),
     );
     let required = if settings::shortcut_required(index) {
         " · required"
@@ -1445,17 +1449,25 @@ fn shortcut_input<'a>(
         }
     }
     let row = widget::row::with_children(vec![
-        // Reserve Source first. Keep Record and Reset at their natural width
-        // within the remaining space, allowing the action label to wrap.
+        // Reserve Source first, then split the rest between the action and
+        // its keys so neither can take all of it. Key chips wrap within their
+        // column when a narrow pane cannot fit them on one line, with Record
+        // and Reset after the last chip, beside Source.
         widget::row::with_children(vec![
             design::body(format!("{label}{required}"))
-                .width(Length::Fill)
+                .width(Length::FillPortion(1))
                 .into(),
-            widget::row::with_children(controls)
-                .spacing(2)
-                .align_y(Alignment::Center)
-                .width(Length::Shrink)
-                .into(),
+            widget::container(
+                widget::row::with_children(controls)
+                    .spacing(2)
+                    .align_y(Alignment::Center)
+                    .wrap()
+                    .vertical_spacing(2)
+                    .align_x(iced::alignment::Horizontal::Right),
+            )
+            .align_x(iced::alignment::Horizontal::Right)
+            .width(Length::FillPortion(2))
+            .into(),
         ])
         .spacing(space::S)
         .align_y(Alignment::Center)
@@ -1494,7 +1506,7 @@ mod keyboard_table_tests {
     use super::*;
 
     #[test]
-    fn default_shortcut_rows_keep_chips_and_controls_on_one_line() {
+    fn default_shortcut_rows_keep_every_control_visible_and_in_order() {
         use iced::{
             Rectangle, Size,
             advanced::{
@@ -1504,8 +1516,10 @@ mod keyboard_table_tests {
         };
         #[derive(Default)]
         struct Controls {
+            label: &'static str,
             buttons: Vec<Rectangle>,
             source: Option<Rectangle>,
+            label_bounds: Option<Rectangle>,
         }
         impl Operation for Controls {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -1522,6 +1536,8 @@ mod keyboard_table_tests {
             fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
                 if matches!(text, "Default" | "User") {
                     self.source = Some(bounds);
+                } else if text.starts_with(self.label) {
+                    self.label_bounds = Some(bounds);
                 }
             }
         }
@@ -1555,7 +1571,10 @@ mod keyboard_table_tests {
                     &renderer,
                     &layout::Limits::new(Size::new(width, 0.0), Size::new(width, 1000.0)),
                 );
-                let mut controls = Controls::default();
+                let mut controls = Controls {
+                    label: field.label(),
+                    ..Controls::default()
+                };
                 element.as_widget_mut().operate(
                     &mut tree,
                     Layout::new(&node),
@@ -1566,26 +1585,59 @@ mod keyboard_table_tests {
                     controls.buttons.len(),
                     settings::parse_chords(value).len() + 2
                 );
-                let center = controls.buttons[0].center_y();
                 for bounds in &controls.buttons {
                     assert!(
                         bounds.width > 0.0 && bounds.height > 0.0,
                         "{field:?} at{width}: empty native control {bounds:?}"
                     );
                     assert!(
-                        (bounds.center_y() - center).abs() < 0.1,
-                        "{field:?} at{width}: controls wrapped {:?}",
-                        controls.buttons
-                    );
-                    assert!(
                         bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.1,
                         "{field:?} at{width}: clipped native control {bounds:?}"
                     );
                 }
+                // Chips may wrap in a narrow pane, but in reading order: each
+                // follows the previous one on its line or starts a lower line.
                 for pair in controls.buttons.windows(2) {
+                    let same_line = (pair[0].center_y() - pair[1].center_y()).abs() < 4.1;
                     assert!(
-                        pair[0].x + pair[0].width <= pair[1].x + 0.1,
-                        "{field:?} at{width}: controls overlap {:?}",
+                        if same_line {
+                            pair[0].x + pair[0].width <= pair[1].x + 0.1
+                        } else {
+                            pair[1].y >= pair[0].y + pair[0].height - 0.1
+                        },
+                        "{field:?} at{width}: controls out of order {:?}",
+                        controls.buttons
+                    );
+                }
+                // Record and Reset stay together after the last chip.
+                let [.., record, reset] = controls.buttons[..] else {
+                    unreachable!("every row has Record and Reset");
+                };
+                assert!(
+                    (record.center_y() - reset.center_y()).abs() < 0.1,
+                    "{field:?} at{width}: Record and Reset separated {:?}",
+                    controls.buttons
+                );
+                let label = controls
+                    .label_bounds
+                    .expect("the action label remains visible");
+                assert!(
+                    label.width > 0.0
+                        && controls
+                            .buttons
+                            .iter()
+                            .all(|bounds| label.x + label.width <= bounds.x + 0.1),
+                    "{field:?} at{width}: label {label:?} meets {:?}",
+                    controls.buttons
+                );
+                if width == 560.0 {
+                    let center = controls.buttons[0].center_y();
+                    assert!(
+                        controls
+                            .buttons
+                            .iter()
+                            .all(|bounds| (bounds.center_y() - center).abs() < 4.1),
+                        "{field:?} at{width}: controls wrapped {:?}",
                         controls.buttons
                     );
                 }
