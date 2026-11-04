@@ -294,6 +294,17 @@ impl Cagents {
         })
     }
 
+    /// Whether an inspection settled without attaching or proving absence.
+    /// Several of those refusals are races that a later check resolves, and
+    /// one is re-inspected only when a related owner is observed or someone
+    /// reconnects, so a startup gate checks it again itself.
+    pub(super) fn saved_terminal_unavailable(&self, card: CardId) -> bool {
+        !self.terminal_start_in_flight(card)
+            && self
+                .saved_terminal_current(card)
+                .is_some_and(|entry| matches!(entry.disposition, Disposition::Unavailable))
+    }
+
     /// Diagnostics must not reopen a User control connection for an inherited
     /// scoped caller, a pending inspection or a later selected endpoint.
     pub(super) fn saved_terminal_diagnostics_allowed(&self, card: CardId) -> bool {
@@ -673,6 +684,11 @@ impl Cagents {
                 && entry.request == request
             {
                 entry.disposition = Disposition::Unavailable;
+                self.startup_attach_failed(
+                    card,
+                    source.id,
+                    "it changed while it was being checked".into(),
+                );
             }
             return self.finish_terminal_start(card);
         }
@@ -701,14 +717,14 @@ impl Cagents {
                 let entry = self.saved_terminals.entries.get_mut(&card).unwrap();
                 entry.directory = directory;
                 let absent = result.is_ok();
-                if let Err(error) = &result {
-                    tracing::debug!(?card, %error, "saved terminal inspection refused");
-                }
                 entry.disposition = if absent {
                     Disposition::Dormant
                 } else {
                     Disposition::Unavailable
                 };
+                if let Err(error) = result {
+                    self.startup_attach_failed(card, source.id, error);
+                }
                 self.lifecycle.remove(card);
                 let finished = self.finish_terminal_start(card);
                 if absent

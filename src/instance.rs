@@ -1233,13 +1233,13 @@ impl UiUpdateGuard {
         let mut errors = Vec::new();
         for slot in slots {
             if let Err(error) = launch_window_at(executable, false, Some(slot), None) {
-                errors.push(format!("{slot}: {error}"));
+                errors.push((slot.as_str(), error.to_string()));
             }
         }
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(io::Error::other(errors.join("; ")))
+            Err(io::Error::other(relaunch_failure(slots.len(), &errors)))
         }
     }
 
@@ -1251,6 +1251,37 @@ impl UiUpdateGuard {
         self.lock.take();
         Ok(())
     }
+}
+
+/// What the update reports when windows did not reopen cleanly. Someone reads
+/// this: the launcher's handshake prefix goes, and windows stopped by the same
+/// thing share one sentence instead of repeating it per window.
+fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
+    let mut groups: Vec<(Vec<&str>, String)> = Vec::new();
+    for (slot, error) in errors {
+        let text = error
+            .strip_prefix(UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX)
+            .unwrap_or(error);
+        let mut chars = text.chars();
+        let reason = chars
+            .next()
+            .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+            .unwrap_or_default();
+        match groups.iter_mut().find(|(_, known)| *known == reason) {
+            Some((slots, _)) => slots.push(slot),
+            None => groups.push((vec![slot], reason)),
+        }
+    }
+    if let [(slots, reason)] = groups.as_slice()
+        && slots.len() == windows
+    {
+        return reason.clone();
+    }
+    groups
+        .iter()
+        .map(|(slots, reason)| format!("{}: {reason}", slots.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 pub(crate) const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
@@ -2922,6 +2953,27 @@ mod tests {
         assert!(legacy_ui_process_running(proc_root.path()).is_err());
         fs::remove_file(legacy.join("stat")).unwrap();
         assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
+    }
+
+    #[test]
+    fn relaunch_failure_reads_once_per_reason_without_the_handshake_prefix() {
+        let same = format!("{UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX}the service stopped");
+        assert_eq!(
+            relaunch_failure(2, &[("primary", same.clone()), ("window-2", same.clone())]),
+            "The service stopped"
+        );
+        // Windows that opened are not reported as stopped.
+        assert_eq!(
+            relaunch_failure(3, &[("window-2", same.clone()), ("window-3", same.clone())]),
+            "window-2, window-3: The service stopped"
+        );
+        assert_eq!(
+            relaunch_failure(
+                2,
+                &[("primary", same), ("window-2", "no display".to_owned())]
+            ),
+            "primary: The service stopped; window-2: No display"
+        );
     }
 
     #[test]
