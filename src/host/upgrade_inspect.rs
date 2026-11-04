@@ -539,6 +539,7 @@ mod tests {
         Session {
             id: TerminalId::new(),
             launch: Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 recipe: LaunchRecipe {
                     program: "claude".into(),

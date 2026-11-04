@@ -26563,6 +26563,7 @@ mod tests {
                     owned_codex_listener: None,
                     id: TerminalId::new(),
                     launch: crate::chat::Launch {
+                        draft_model: None,
                         provider: crate::agent::Provider::Claude,
                         recipe,
                         session_id: None,
@@ -26663,6 +26664,7 @@ mod tests {
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 recipe,
                 session_id: Some(conversation.into()),

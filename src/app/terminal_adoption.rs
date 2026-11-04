@@ -704,6 +704,7 @@ mod tests {
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 recipe: saved.launch.clone(),
                 session_id: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),

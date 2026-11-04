@@ -33,6 +33,7 @@ fn pane(n: u128) -> Pane {
         kind: CardKind::Chat(crate::chat::Session {
             id: TerminalId::from_uuid(Uuid::from_u128(1000 + n)),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Codex,
                 recipe: crate::model::LaunchRecipe {
                     program: "fixture-codex".into(),

@@ -1194,6 +1194,7 @@ fn provider_session(
     let mut source = Session {
         id: TerminalId::new(),
         launch: Launch {
+            draft_model: None,
             provider: Provider::Codex,
             recipe: LaunchRecipe {
                 program: program.to_string_lossy().into_owned(),

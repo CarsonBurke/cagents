@@ -3288,6 +3288,7 @@ mod tests {
         use crate::{agent::Provider, model::LaunchRecipe};
         const CONVERSATION: &str = "01a0ab66-21d6-7065-9fe5-95f302b669e1";
         let launch = Launch {
+            draft_model: None,
             provider: Provider::Omp,
             recipe: LaunchRecipe {
                 unset_environment: Default::default(),

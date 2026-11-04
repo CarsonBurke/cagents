@@ -336,6 +336,7 @@ fn managed_image_drafts_survive_debounced_shutdown_navigation_and_metadata_only_
             kind: CardKind::Chat(Session {
                 id: TerminalId::new(),
                 launch: Launch {
+                    draft_model: None,
                     provider: Provider::Claude,
                     recipe: LaunchRecipe {
                         program: "claude".into(),

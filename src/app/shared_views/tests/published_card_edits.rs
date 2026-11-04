@@ -215,6 +215,128 @@ fn a_draft_shows_and_starts_on_options_chosen_in_another_window() {
     assert_eq!(started.launch.recipe, session.launch.recipe);
 }
 
+fn listed_model(id: &str) -> crate::chat::Model {
+    crate::chat::Model {
+        id: id.into(),
+        label: id.into(),
+        reasoning: vec!["low".into(), "high".into()],
+    }
+}
+
+#[test]
+fn a_draft_model_and_effort_choice_survive_the_next_shared_projection() {
+    let (mut app, scope, _directory) = shared_channel_app();
+    drop(app.observe_listed_models(Provider::Codex, vec![listed_model("shared-model")]));
+    drop(app.new_native_chat(Provider::Codex, Some("/workspace/chat-fixture".into())));
+    let card = app.workspace.focused().unwrap();
+    let original = chat_session(&app, card);
+    let view = accept_local_view(&mut app, &scope);
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("the card opens as a draft");
+    };
+    let target = runtime.target;
+    drop(app.update(Message::ChatUi(Action::DraftModel(
+        target,
+        Provider::Codex,
+        Some("shared-model".into()),
+    ))));
+    let model = chat_session(&app, card);
+    assert!(publishes(&app, &scope, card, &CardKind::Chat(model)));
+    drop(app.update(Message::ChatUi(Action::Reasoning(
+        target,
+        "shared-model".into(),
+        "high".into(),
+    ))));
+    let chosen = chat_session(&app, card);
+    assert_eq!(chosen.id, original.id);
+    assert_eq!(chosen.launch.recipe, original.launch.recipe);
+    let expected = Some(crate::chat::DraftModel {
+        model: "shared-model".into(),
+        reasoning: Some("high".into()),
+    });
+    assert_eq!(chosen.launch.draft_model, expected);
+    assert!(publishes(
+        &app,
+        &scope,
+        card,
+        &CardKind::Chat(chosen.clone())
+    ));
+    rename_elsewhere(&mut app, view);
+    assert_eq!(chat_session(&app, card), chosen);
+    assert_eq!(
+        crate::app::chat_ui::draft_model_for_test(&app, card),
+        expected
+    );
+    assert_eq!(stored(&app, card).kind, CardKind::Chat(chosen));
+}
+
+#[test]
+fn a_draft_shares_model_effort_and_default_across_provider_moves_and_starts_on_them() {
+    for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+        for choice in [
+            Some(crate::chat::DraftModel {
+                model: "shared-model".into(),
+                reasoning: Some("high".into()),
+            }),
+            None,
+        ] {
+            let (mut app, scope, _directory) = shared_channel_app();
+            drop(app.observe_listed_models(
+                provider,
+                vec![listed_model("window-model"), listed_model("shared-model")],
+            ));
+            // This window remembers a different model for the destination
+            // provider. Neither that preference nor its current draft wins.
+            drop(app.new_native_chat(provider, Some("/workspace/chat-fixture".into())));
+            let remembered = app.workspace.focused().unwrap();
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&remembered) else {
+                panic!("the card opens as a draft");
+            };
+            let target = runtime.target;
+            drop(app.update(Message::ChatUi(Action::DraftModel(
+                target,
+                provider,
+                Some("window-model".into()),
+            ))));
+            drop(app.new_native_chat(Provider::Claude, Some("/workspace/chat-fixture".into())));
+            let card = app.workspace.focused().unwrap();
+            let original = chat_session(&app, card);
+            let mut view = accept_local_view(&mut app, &scope);
+            let mut chosen = crate::chat::fresh_session(
+                provider,
+                original.id,
+                original.launch.recipe.working_directory.clone(),
+                &crate::account::Account::system(provider),
+            )
+            .unwrap();
+            chosen.launch.draft_model = choice.clone();
+            view.revision += 1;
+            view.panes
+                .iter_mut()
+                .find(|pane| pane.id == card)
+                .unwrap()
+                .kind = CardKind::Chat(chosen.clone());
+            app.workspace_model.views = vec![view];
+            drop(app.reconcile_shared_views());
+            assert_eq!(
+                crate::app::chat_ui::draft_model_for_test(&app, card),
+                choice
+            );
+            assert_eq!(
+                crate::app::chat_ui::draft_launch_for_test(&app, card).1,
+                chosen
+            );
+            assert!(
+                app.shared_views.pending.is_empty(),
+                "adoption does not republish"
+            );
+            assert_eq!(stored(&app, card).kind, CardKind::Chat(chosen.clone()));
+            let started = crate::app::chat_ui::start_draft_for_test(&mut app, card);
+            assert_eq!(started.launch, chosen.launch);
+        }
+    }
+}
+
 #[test]
 fn an_adopted_draft_keeps_its_failure_reason_until_its_account_changes() {
     let (mut app, scope, _directory) = shared_channel_app();

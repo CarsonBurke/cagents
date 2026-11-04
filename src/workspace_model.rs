@@ -645,6 +645,7 @@ mod tests {
         let session = crate::chat::Session {
             id: TerminalId::new(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: Provider::Codex,
                 session_id: None,
                 recipe: LaunchRecipe {

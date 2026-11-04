@@ -316,6 +316,7 @@ mod tests {
             source: super::super::Session {
                 id,
                 launch: super::super::Launch {
+                    draft_model: None,
                     provider: Provider::Codex,
                     recipe: crate::model::LaunchRecipe {
                         program: "codex".into(),

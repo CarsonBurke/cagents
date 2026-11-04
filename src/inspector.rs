@@ -2052,6 +2052,7 @@ mod tests {
             owned_codex_listener: None,
             id: source.id,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 recipe: source.launch.clone(),
                 session_id: Some("exact\u{202e}\u{1b}-id".into()),

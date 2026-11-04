@@ -2391,6 +2391,7 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: agent.spec.provider,
                 session_id: None,
                 recipe: console.launch,
@@ -2460,6 +2461,7 @@ mod tests {
                 terminal: None,
                 owned_codex_listener: None,
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider: agent.spec.provider,
                     session_id: None,
                     recipe: console.launch.clone(),
@@ -2588,6 +2590,7 @@ mod tests {
             terminal: Some(console.clone()),
             owned_codex_listener: None,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: agent.spec.provider,
                 session_id: None,
                 recipe: console.launch.clone(),
@@ -2634,6 +2637,7 @@ mod tests {
             terminal: Some(console.clone()),
             owned_codex_listener: None,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: agent.spec.provider,
                 session_id: None,
                 recipe: console.launch.clone(),

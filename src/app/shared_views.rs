@@ -4816,6 +4816,7 @@ mod tests {
             owned_codex_listener: None,
             native_continuity: Default::default(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Codex,
                 session_id: Some("original-thread".into()),
                 recipe: source.launch.clone(),
@@ -5222,6 +5223,7 @@ mod tests {
                 provider_version: "fixture".into(),
             },
             launch: chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 recipe: terminal.launch,
                 session_id: Some("retained-close-fixture".into()),

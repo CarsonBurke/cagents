@@ -1707,6 +1707,7 @@ mod tests {
                 native_continuity: Default::default(),
                 owned_codex_listener: None,
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider: crate::agent::Provider::Codex,
                     session_id: None,
                     recipe: crate::model::LaunchRecipe {
@@ -1771,6 +1772,7 @@ mod tests {
                 native_continuity: Default::default(),
                 owned_codex_listener: None,
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider: crate::agent::Provider::Claude,
                     session_id: None,
                     recipe: crate::model::LaunchRecipe {
@@ -2025,6 +2027,7 @@ mod tests {
                         proof: Some(proof),
                         terminal: Some(session.clone()),
                         launch: chat::Launch {
+                            draft_model: None,
                             provider,
                             recipe,
                             session_id: Some("exact-thread".into()),
@@ -2181,6 +2184,7 @@ mod tests {
                         owned_codex_listener: None,
                         id: chat_id,
                         launch: chat::Launch {
+                            draft_model: None,
                             provider: Provider::Claude,
                             recipe,
                             session_id: None,
@@ -2968,6 +2972,7 @@ mod tests {
                 native_continuity: Default::default(),
                 owned_codex_listener: None,
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider: crate::agent::Provider::Omp,
                     recipe,
                     session_id: None,

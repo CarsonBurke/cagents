@@ -403,6 +403,7 @@ mod tests {
         for provider in Provider::ALL {
             install(Some(provider), &environment, directory.path());
             let launch = crate::chat::Launch {
+                draft_model: None,
                 provider,
                 session_id: None,
                 recipe: crate::model::LaunchRecipe {

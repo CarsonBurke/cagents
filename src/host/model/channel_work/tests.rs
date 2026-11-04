@@ -441,6 +441,7 @@ fn native_source() -> HostedSession {
     HostedSession::Chat(crate::chat::Session {
         id: crate::model::TerminalId::new(),
         launch: crate::chat::Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Codex,
             recipe: crate::model::LaunchRecipe {
                 program: "fixture-codex".into(),

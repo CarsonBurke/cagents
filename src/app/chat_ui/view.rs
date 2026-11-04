@@ -6722,6 +6722,7 @@ mod tests {
             let session = chat::Session {
                 id: crate::model::TerminalId::new(),
                 launch: chat::Launch {
+                    draft_model: None,
                     provider,
                     recipe: crate::model::LaunchRecipe::shell(PathBuf::from("/unused")).unwrap(),
                     session_id: None,
@@ -11786,6 +11787,7 @@ mod tests {
             chat::Session {
                 id: crate::model::TerminalId::new(),
                 launch: chat::Launch {
+                    draft_model: None,
                     provider: Provider::Claude,
                     recipe: crate::model::LaunchRecipe::shell(PathBuf::from("/unused")).unwrap(),
                     session_id: None,

@@ -21,6 +21,7 @@ fn source(owner: &HostSessionProof) -> Session {
     let mut session = super::super::tests::session();
     session.id = id(1);
     session.launch = Launch {
+        draft_model: None,
         provider: Provider::Codex,
         recipe: crate::model::LaunchRecipe {
             program: "codex".into(),

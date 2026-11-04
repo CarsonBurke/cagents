@@ -6386,6 +6386,7 @@ mod tests {
             owned_codex_listener: None,
             id,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Codex,
                 recipe: recipe.clone(),
                 session_id: None,
@@ -6597,6 +6598,7 @@ mod tests {
         let session = crate::chat::Session {
             id: TerminalId::new(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Codex,
                 recipe: LaunchRecipe {
                     program: "codex".into(),

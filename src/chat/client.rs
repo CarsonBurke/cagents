@@ -3470,6 +3470,7 @@ mod tests {
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Omp,
                 recipe: crate::model::LaunchRecipe {
                     unset_environment: Default::default(),

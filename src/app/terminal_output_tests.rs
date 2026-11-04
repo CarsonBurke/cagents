@@ -1025,6 +1025,7 @@ fn refused_optimistic_channel_title_is_restored_by_equal_authoritative_read() {
             owned_codex_listener: None,
             id: crate::model::TerminalId::new(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Omp,
                 recipe: crate::model::LaunchRecipe {
                     unset_environment: Default::default(),

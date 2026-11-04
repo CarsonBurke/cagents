@@ -289,6 +289,7 @@ fn run_pair(mode: &str) {
     let request = Session {
         id,
         launch: Launch {
+            draft_model: None,
             provider: Provider::Codex,
             recipe: exact,
             session_id: Some(ID.into()),
@@ -900,6 +901,7 @@ fn restore_missing_native_with_carried_scope(
     let mut source = Session {
         id: native_id,
         launch: Launch {
+            draft_model: None,
             provider: Provider::Codex,
             recipe: LaunchRecipe {
                 arguments: vec!["--remote".into(), "unix://".into()],

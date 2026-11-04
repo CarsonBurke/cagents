@@ -3770,6 +3770,7 @@ mod tests {
                 owned_codex_listener: None,
                 id,
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider,
                     recipe: LaunchRecipe {
                         program: provider.executable().into(),
@@ -3831,6 +3832,7 @@ mod tests {
             owned_codex_listener: None,
             id: terminal.id,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Omp,
                 recipe: terminal.launch.clone(),
                 session_id: None,
@@ -4678,6 +4680,7 @@ mod tests {
                 native_continuity: Default::default(),
                 owned_codex_listener: None,
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider: crate::agent::Provider::Codex,
                     session_id: Some("saved-conversation".into()),
                     recipe: LaunchRecipe {
@@ -4741,6 +4744,7 @@ mod tests {
             native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
             owned_codex_listener: None,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 session_id: None,
                 recipe: LaunchRecipe {
@@ -4831,6 +4835,7 @@ mod tests {
                 native_continuity: Default::default(),
                 owned_codex_listener: None,
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider: crate::agent::Provider::Claude,
                     session_id: Some("saved-thread".into()),
                     recipe: LaunchRecipe {
@@ -4986,6 +4991,7 @@ mod tests {
             native_continuity: Default::default(),
             owned_codex_listener: None,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 session_id: Some("11111111-1111-4111-8111-111111111111".into()),
                 recipe: LaunchRecipe {
@@ -5163,6 +5169,7 @@ mod tests {
                 native_continuity: Default::default(),
                 owned_codex_listener: None,
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider: crate::agent::Provider::Claude,
                     session_id: Some("11111111-1111-4111-8111-111111111111".into()),
                     recipe: LaunchRecipe {
@@ -6484,6 +6491,7 @@ mod tests {
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Codex,
                 recipe: LaunchRecipe {
                     program: crate::agent::Provider::Codex.executable().into(),

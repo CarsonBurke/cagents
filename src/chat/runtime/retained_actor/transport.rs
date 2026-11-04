@@ -296,6 +296,7 @@ pub(super) fn fixture_source() -> chat::Session {
     chat::Session {
         id,
         launch: chat::Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Claude,
             recipe: crate::model::LaunchRecipe {
                 program: "/bin/cat".into(),
@@ -3699,6 +3700,7 @@ while IFS= read -r frame; do :; done
         let source = chat::Session {
             id: identity.record.terminal,
             launch: chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 recipe: recipe.clone(),
                 session_id: None,
@@ -5178,6 +5180,7 @@ exec /bin/sleep 60
         let source = chat::Session {
             id: crate::model::TerminalId::new(),
             launch: chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 recipe: crate::model::LaunchRecipe {
                     program: "claude".into(),

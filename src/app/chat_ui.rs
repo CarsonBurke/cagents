@@ -4800,6 +4800,7 @@ pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, Str
         owned_codex_listener: session.owned_codex_listener.clone(),
         id: session.id,
         launch: chat::Launch {
+            draft_model: None,
             provider,
             recipe,
             session_id,
@@ -5557,15 +5558,15 @@ impl Cagents {
             runtime.session = session.clone();
             runtime.error = None;
         }
+        runtime.session.launch.draft_model = model.clone().map(|model| chat::DraftModel {
+            model,
+            reasoning: reasoning.clone(),
+        });
+        let session = runtime.session.clone();
         self.remember_chat_model(provider, model, reasoning);
-        let skills = if let Some(session) = moved {
-            self.replace_chat_conversation(target.card, session);
-            self.load_draft_skills(target)
-        } else {
-            Task::none()
-        };
+        self.replace_chat_conversation(target.card, session);
         Task::batch([
-            skills,
+            self.load_draft_skills(target),
             iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
                 .map(cosmic::Action::App),
         ])
@@ -5591,20 +5592,18 @@ impl Cagents {
         }
     }
 
-    /// What a new draft of `provider` shows: the models it listed last, and
-    /// the one last chosen among them.
-    fn chat_draft_snapshot(&self, provider: Provider) -> Snapshot {
+    /// A draft shows its shared choice, including the provider default,
+    /// regardless of the model this window last chose in another draft.
+    fn chat_draft_snapshot(&self, launch: &chat::Launch) -> Snapshot {
+        let provider = launch.provider;
         let models = self
             .account_ui
             .catalog(provider)
             .map(|catalog| catalog.models.clone())
             .unwrap_or_default();
-        let (model, reasoning) = self
-            .chat_ui
-            .last_models
-            .get(&provider)
-            .cloned()
-            .map_or((None, None), |(model, reasoning)| (Some(model), reasoning));
+        let (model, reasoning) = launch.draft_model.as_ref().map_or((None, None), |choice| {
+            (Some(choice.model.clone()), choice.reasoning.clone())
+        });
         draft_snapshot(provider, models, model, reasoning)
     }
 
@@ -5646,6 +5645,7 @@ impl Cagents {
                 return Task::none();
             }
         };
+        session.launch.draft_model = runtime.session.launch.draft_model.clone();
         // A picker choice is a pin, even if it chooses the same home as the
         // automatic router. Keep it across saves, restarts and terminal views.
         session
@@ -5966,7 +5966,7 @@ impl Cagents {
         }
         let provider = session.launch.provider;
         let moved = runtime.session.launch.provider != provider;
-        let fresh = moved.then(|| self.chat_draft_snapshot(provider));
+        let fresh = self.chat_draft_snapshot(&session.launch);
         let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
             return Task::none();
         };
@@ -5976,7 +5976,7 @@ impl Cagents {
         let rehomed = moved
             || previous.launch.recipe.environment != session.launch.recipe.environment
             || previous.launch.recipe.working_directory != session.launch.recipe.working_directory;
-        if let Some(fresh) = fresh {
+        if moved {
             // Pickers listed the earlier provider's choices.
             runtime.model_picker = None;
             runtime.account_picker = false;
@@ -5984,8 +5984,16 @@ impl Cagents {
             runtime.permission_picker = false;
             runtime.footer_picker = false;
             runtime.snapshot = Arc::new(fresh);
-        } else if rehomed {
-            Arc::make_mut(&mut runtime.snapshot).skills.clear();
+        } else {
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.selected_model = fresh.selected_model;
+            snapshot.reasoning = fresh.reasoning;
+            if previous.launch.draft_model != session.launch.draft_model {
+                runtime.reasoning_picker = false;
+            }
+            if rehomed {
+                snapshot.skills.clear();
+            }
         }
         Arc::make_mut(&mut runtime.snapshot).permission_mode =
             draft_permission_mode(&session.launch.recipe, provider);
@@ -6419,7 +6427,7 @@ impl Cagents {
         }
         let account = self.default_account_for_directory(provider, &working_directory);
         let automatic = self.automatic_accounts_for_directory(provider, &working_directory);
-        let session = match fresh_chat_session(
+        let mut session = match fresh_chat_session(
             provider,
             TerminalId::new(),
             working_directory.clone(),
@@ -6432,6 +6440,14 @@ impl Cagents {
                 return Task::none();
             }
         };
+        session.launch.draft_model =
+            self.chat_ui
+                .last_models
+                .get(&provider)
+                .map(|(model, reasoning)| chat::DraftModel {
+                    model: model.clone(),
+                    reasoning: reasoning.clone(),
+                });
         let scope = if self.durable.active_channel.is_none()
             && self.active_workspace.as_deref() != Some(working_directory.as_path())
         {
@@ -6604,11 +6620,10 @@ impl Cagents {
         Task::batch([retire, skills])
     }
 
-    /// Puts a draft of `session` in card `card`, on the model last chosen for
-    /// its provider.
+    /// Puts a draft of `session` in card `card`, showing its shared model choice.
     fn open_chat_draft(&mut self, card: CardId, session: chat::Session) -> Task<Message> {
         self.chat_ui.capacity_offers.remove(&card);
-        let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
+        let mut snapshot = self.chat_draft_snapshot(&session.launch);
         snapshot.permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
         let target = self.chat_ui.next_target(card);
@@ -7931,13 +7946,16 @@ impl Cagents {
     /// can be moved to another model, account or provider where the started
     /// conversation could not.
     fn revert_chat_draft(&mut self, target: Target, error: Option<String>) -> Task<Message> {
-        let Some(provider) = self
-            .chat_card_runtime_mut(target)
-            .map(|runtime| runtime.session.launch.provider)
-        else {
+        let Some(launch) = self.chat_card_runtime_mut(target).and_then(|runtime| {
+            runtime
+                .queued
+                .as_ref()
+                .map(|queued| queued.draft.launch.clone())
+        }) else {
             return Task::none();
         };
-        let mut snapshot = self.chat_draft_snapshot(provider);
+        let provider = launch.provider;
+        let mut snapshot = self.chat_draft_snapshot(&launch);
         let Some(runtime) = self.chat_card_runtime_mut(target) else {
             return Task::none();
         };
@@ -11280,8 +11298,14 @@ impl Cagents {
                         return Task::none();
                     }
                     Arc::make_mut(&mut runtime.snapshot).reasoning = Some(reasoning.clone());
+                    runtime.session.launch.draft_model = Some(chat::DraftModel {
+                        model: model.clone(),
+                        reasoning: Some(reasoning.clone()),
+                    });
+                    let session = runtime.session.clone();
                     self.remember_chat_model(provider, Some(model), Some(reasoning));
-                    return Task::none();
+                    self.replace_chat_conversation(target.card, session);
+                    return self.load_draft_skills(target);
                 }
                 let command = Command::SetModel {
                     model,
@@ -11753,6 +11777,21 @@ pub(super) fn draft_launch_for_test(
     )
 }
 
+#[cfg(test)]
+pub(super) fn draft_model_for_test(app: &Cagents, card: CardId) -> Option<chat::DraftModel> {
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("a draft has a chat runtime");
+    };
+    runtime
+        .snapshot
+        .selected_model
+        .clone()
+        .map(|model| chat::DraftModel {
+            model,
+            reasoning: runtime.snapshot.reasoning.clone(),
+        })
+}
+
 /// The reason draft `card` last failed to start, which it shows.
 #[cfg(test)]
 pub(super) fn draft_error_for_test(app: &mut Cagents, card: CardId) -> &mut Option<String> {
@@ -11792,12 +11831,21 @@ pub(super) fn start_draft_for_test(app: &mut Cagents, card: CardId) -> chat::Ses
     let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
         panic!("a starting draft keeps its chat runtime");
     };
-    runtime
+    let queued = runtime
         .queued
         .as_ref()
-        .expect("the first message waits for its conversation")
-        .draft
-        .clone()
+        .expect("the first message waits for its conversation");
+    assert_eq!(
+        queued.model,
+        queued
+            .draft
+            .launch
+            .draft_model
+            .as_ref()
+            .map(|choice| { (choice.model.clone(), choice.reasoning.clone()) }),
+        "the first message queues the shared model and effort"
+    );
+    queued.draft.clone()
 }
 
 #[cfg(test)]
@@ -22551,6 +22599,139 @@ mod tests {
             label: id.into(),
             reasoning: reasoning.iter().map(|&effort| effort.into()).collect(),
         }
+    }
+
+    #[test]
+    fn draft_model_choice_reopens_and_survives_account_change() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.observe_listed_models(
+            Provider::Codex,
+            vec![fixture_model("gpt-b", &["low", "high"])],
+        ));
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        drop(app.choose_draft_model(target, Provider::Codex, Some("gpt-b".into())));
+        drop(app.update(Message::ChatUi(Action::Reasoning(
+            target,
+            "gpt-b".into(),
+            "high".into(),
+        ))));
+        let choice = Some(chat::DraftModel {
+            model: "gpt-b".into(),
+            reasoning: Some("high".into()),
+        });
+        let next = draft_chat(&mut app);
+        assert_eq!(
+            draft_model_for_test(&app, next),
+            choice,
+            "a new draft remembers it"
+        );
+
+        let managed = app.account_ui.add_managed_fixture(Provider::Codex, 22);
+        drop(app.choose_chat_account(target, managed));
+        let session = chat_runtime(&app, card).session.clone();
+        assert_eq!(session.launch.draft_model, choice);
+        app.remember_chat_model(
+            Provider::Codex,
+            Some("window-model".into()),
+            Some("low".into()),
+        );
+        drop(app.open_chat_draft(card, session));
+        assert_eq!(draft_model_for_test(&app, card), choice);
+
+        // An explicit provider default stays a default even when this window
+        // has subsequently remembered another conversation's model.
+        let target = chat_runtime(&app, card).target;
+        drop(app.choose_draft_model(target, Provider::Codex, None));
+        let session = chat_runtime(&app, card).session.clone();
+        app.remember_chat_model(
+            Provider::Codex,
+            Some("window-model".into()),
+            Some("low".into()),
+        );
+        drop(app.open_chat_draft(card, session));
+        assert_eq!(draft_model_for_test(&app, card), None);
+    }
+
+    #[test]
+    fn draft_model_choice_survives_returned_first_message_and_changed_preference()
+    {
+        for refused in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.observe_listed_models(
+                Provider::Codex,
+                vec![fixture_model("gpt-b", &["low", "high"])],
+            ));
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            drop(app.choose_draft_model(target, Provider::Codex, Some("gpt-b".into())));
+            drop(app.update(Message::ChatUi(Action::Reasoning(
+                target,
+                "gpt-b".into(),
+                "high".into(),
+            ))));
+            let choice = chat_runtime(&app, card).session.launch.draft_model.clone();
+            write(&mut app, card, "hello");
+            submit(&mut app, card);
+            let started = chat_runtime_attempt(&app, card);
+            app.remember_chat_model(
+                Provider::Codex,
+                Some("window-model".into()),
+                Some("low".into()),
+            );
+            if refused {
+                let handle = fixture_handle(&app, card, None);
+                handle.replace_snapshot_for_test(Snapshot {
+                    models: vec![fixture_model("gpt-b", &["low", "high"])],
+                    ready: true,
+                    ..Snapshot::default()
+                });
+                answer_start(&mut app, started, Ok(handle));
+                assert_eq!(pending_step(&app, card), Some(QueuedStep::Model));
+                settle(&mut app, card, Ok(()));
+                assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
+                app.remember_chat_model(
+                    Provider::Codex,
+                    Some("window-model".into()),
+                    Some("low".into()),
+                );
+                settle(&mut app, card, Err("fixture refusal".into()));
+            } else {
+                let target = chat_runtime(&app, card).target;
+                drop(app.update(Message::ChatUi(Action::CancelQueued(target))));
+            }
+            assert!(chat_runtime(&app, card).choosing());
+            assert_eq!(draft_model_for_test(&app, card), choice);
+            assert_eq!(chat_runtime(&app, card).session.launch.draft_model, choice);
+            assert_eq!(chat_runtime(&app, card).composer.text().trim(), "hello");
+        }
+    }
+
+    #[test]
+    fn draft_model_choice_accepts_skills_rediscovered_for_the_new_launch() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        let previous = chat_runtime(&app, card).session.launch.clone();
+        drop(app.choose_draft_model(target, Provider::Codex, Some("gpt-b".into())));
+        let chosen = chat_runtime(&app, card).session.launch.clone();
+        let skill = chat::Skill {
+            name: "review".into(),
+            description: "Review the change".into(),
+            invocation: "[$review](/skills/review/SKILL.md)".into(),
+        };
+        drop(app.update(Message::ChatUi(Action::DraftSkills(
+            target,
+            previous,
+            vec![skill.clone()],
+        ))));
+        assert!(chat_runtime(&app, card).snapshot.skills.is_empty());
+        drop(app.update(Message::ChatUi(Action::DraftSkills(
+            target,
+            chosen,
+            vec![skill.clone()],
+        ))));
+        assert_eq!(chat_runtime(&app, card).snapshot.skills, vec![skill]);
     }
 
     /// A draft with "hello" written on `model` of the Codex catalog, which

@@ -1024,6 +1024,7 @@ mod tests {
                 proof: None,
                 terminal: None,
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider: crate::agent::Provider::Claude,
                     session_id: None,
                     recipe: crate::model::LaunchRecipe {

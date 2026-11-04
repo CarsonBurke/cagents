@@ -641,6 +641,7 @@ mod tests {
         let source = chat::Session {
             id,
             launch: chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 session_id: None,
                 recipe: crate::model::LaunchRecipe {

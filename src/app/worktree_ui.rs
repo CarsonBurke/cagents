@@ -1545,6 +1545,7 @@ mod tests {
             owned_codex_listener: None,
             id: source.id,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Omp,
                 recipe: source.launch.clone(),
                 session_id: None,

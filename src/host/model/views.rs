@@ -1150,6 +1150,7 @@ mod tests {
             original.kind = CardKind::Chat(crate::chat::Session {
                 id: terminal.id,
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider: crate::agent::Provider::Codex,
                     recipe: terminal.launch.clone(),
                     session_id: Some("first-thread".into()),
@@ -1319,6 +1320,7 @@ mod tests {
         original.kind = CardKind::Chat(crate::chat::Session {
             id: terminal.id,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 recipe: terminal.launch.clone(),
                 session_id: Some("thread-one".into()),
@@ -1669,6 +1671,7 @@ mod tests {
                 HostedSession::Chat(crate::chat::Session {
                     id: terminal.id,
                     launch: crate::chat::Launch {
+                        draft_model: None,
                         provider: Provider::Claude,
                         recipe: terminal.launch.clone(),
                         session_id: None,
@@ -1789,6 +1792,7 @@ mod tests {
                 HostedSession::Chat(crate::chat::Session {
                     id: terminal.id,
                     launch: crate::chat::Launch {
+                        draft_model: None,
                         provider: Provider::Claude,
                         recipe: terminal.launch.clone(),
                         session_id: Some(uuid::Uuid::new_v4().to_string()),
@@ -2085,6 +2089,7 @@ mod tests {
                 HostedSession::Chat(crate::chat::Session {
                     id: terminal.id,
                     launch: crate::chat::Launch {
+                        draft_model: None,
                         provider: Provider::Claude,
                         recipe: terminal.launch.clone(),
                         session_id: Some(uuid::Uuid::new_v4().to_string()),

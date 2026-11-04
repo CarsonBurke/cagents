@@ -191,6 +191,17 @@ pub struct Launch {
     pub recipe: LaunchRecipe,
     /// An exact provider conversation identifier, never a latest-session selector.
     pub session_id: Option<String>,
+    /// The model and effort chosen before a draft's first message. The
+    /// first-message queue applies this after the provider lists its models.
+    /// A running conversation's snapshot remains authoritative afterwards.
+    #[serde(default)]
+    pub draft_model: Option<DraftModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftModel {
+    pub model: String,
+    pub reasoning: Option<String>,
 }
 
 impl Launch {
@@ -2487,6 +2498,7 @@ mod retained_native_pair_tests {
         let previous = Session {
             id,
             launch: Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 recipe: recipe.clone(),
                 session_id: confirmed.then(|| uuid::Uuid::new_v4().to_string()),
@@ -2727,6 +2739,7 @@ mod tests {
     #[test]
     fn terminal_handoff_uses_confirmed_claude_permissions_without_changing_identity() {
         let launch = Launch {
+            draft_model: None,
             provider: Provider::Claude,
             recipe: LaunchRecipe {
                 program: "claude".into(),
@@ -3023,6 +3036,7 @@ mod tests {
     #[test]
     fn the_persisted_native_launch_rebuilds_an_exact_resume_for_the_checkpoint() {
         let launch = Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Omp,
             recipe: LaunchRecipe {
                 unset_environment: Default::default(),
@@ -3060,6 +3074,7 @@ mod tests {
             owned_codex_listener: None,
             id: crate::model::TerminalId::new(),
             launch: Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Codex,
                 recipe: LaunchRecipe {
                     unset_environment: Default::default(),
@@ -3220,6 +3235,7 @@ pub(crate) fn fresh_session(
         owned_codex_listener: None,
         id,
         launch: Launch {
+            draft_model: None,
             provider,
             recipe,
             session_id: None,

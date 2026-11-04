@@ -5134,6 +5134,7 @@ mod tests {
             native_continuity: Default::default(),
             owned_codex_listener: None,
             launch: chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 recipe,
                 session_id: Some(SESSION.into()),
@@ -5932,6 +5933,7 @@ for line in sys.stdin:
                 owned_codex_listener: None,
                 id: TerminalId::new(),
                 launch: Launch {
+                    draft_model: None,
                     provider: Provider::Claude,
                     recipe: LaunchRecipe {
                         unset_environment: Default::default(),
@@ -6087,6 +6089,7 @@ for line in sys.stdin:
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 recipe: LaunchRecipe {
                     unset_environment: Default::default(),
@@ -6471,6 +6474,7 @@ for line in sys.stdin:
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: Launch {
+                draft_model: None,
                 provider: Provider::Omp,
                 recipe: recipe.clone(),
                 session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
@@ -7333,6 +7337,7 @@ for line in sys.stdin:
                 crate::chat::Session {
                     id,
                     launch: crate::chat::Launch {
+                        draft_model: None,
                         provider: crate::agent::Provider::Claude,
                         recipe: recipe.clone(),
                         session_id: None,
@@ -8083,6 +8088,7 @@ for line in sys.stdin:
             terminal: None,
             proof: Some(state.proof().clone()),
             launch: chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 session_id: Some(CONVERSATION.into()),
                 recipe: LaunchRecipe {

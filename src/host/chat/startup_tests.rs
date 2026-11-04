@@ -60,6 +60,7 @@ fn managed_codex_start_releases_bundle_lease_before_provider_spawn() {
         proof: None,
         terminal: None,
         launch: chat::Launch {
+            draft_model: None,
             provider: Provider::Codex,
             recipe: LaunchRecipe {
                 program: program.to_str().unwrap().into(),

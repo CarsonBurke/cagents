@@ -2208,6 +2208,7 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 session_id: None,
                 recipe: LaunchRecipe {
@@ -2438,6 +2439,7 @@ mod tests {
                 terminal: None,
                 owned_codex_listener: None,
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider: Provider::Claude,
                     session_id: None,
                     recipe: LaunchRecipe {
@@ -2854,6 +2856,7 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 session_id: None,
                 recipe: LaunchRecipe {

@@ -269,6 +269,7 @@ fn a_registered_but_not_live_native_source_cannot_declare_work() {
         native_continuity: Default::default(),
         owned_codex_listener: None,
         launch: crate::chat::Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Codex,
             session_id: None,
             recipe: crate::model::LaunchRecipe {

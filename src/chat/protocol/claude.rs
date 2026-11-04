@@ -6552,6 +6552,7 @@ mod tests {
             json!({"type":"user","sessionId":id,"cwd":cwd,"message":{"content":"Review encrypted bundles"}}),
             json!({"type":"summary","summary":"Bundle encryption and throughput"}))).unwrap();
         let launch = Launch {
+            draft_model: None,
             provider: Provider::Claude,
             session_id: Some(id.clone()),
             recipe: crate::model::LaunchRecipe {
@@ -11527,6 +11528,7 @@ mod tests {
         drop(file);
         std::fs::remove_dir(&cwd).unwrap();
         let launch = Launch {
+            draft_model: None,
             provider: Provider::Claude,
             session_id: Some(id.into()),
             recipe: crate::model::LaunchRecipe {
@@ -11632,6 +11634,7 @@ mod tests {
             assert!(child.wait().unwrap().success());
         }
         let launch = Launch {
+            draft_model: None,
             provider: Provider::Claude,
             session_id: Some(id.into()),
             recipe: crate::model::LaunchRecipe {
@@ -11668,6 +11671,7 @@ mod tests {
     fn launch_preserves_explicit_policy_without_replaying_or_implicitly_resuming() {
         let id = "00000000-0000-4000-8000-000000000001";
         let mut launch = Launch {
+            draft_model: None,
             provider: Provider::Claude,
             session_id: Some(id.into()),
             recipe: crate::model::LaunchRecipe {
@@ -11725,6 +11729,7 @@ mod tests {
         )
         .unwrap();
         let mut launch = Launch {
+            draft_model: None,
             provider: Provider::Claude,
             session_id: None,
             recipe: crate::model::LaunchRecipe {

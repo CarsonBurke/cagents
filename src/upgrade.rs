@@ -1819,6 +1819,7 @@ mod tests {
         let source = crate::chat::Session {
             id: TerminalId::new(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 recipe: LaunchRecipe {
                     program: "claude".into(),
@@ -2431,6 +2432,7 @@ mod tests {
         let mut source = crate::chat::Session {
             id: TerminalId::new(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Codex,
                 recipe: LaunchRecipe {
                     program: "codex".into(),
@@ -2545,6 +2547,7 @@ mod tests {
             let source = crate::chat::Session {
                 id: TerminalId::new(),
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider: crate::agent::Provider::Claude,
                     recipe: LaunchRecipe {
                         program: "claude".into(),
@@ -2644,6 +2647,7 @@ mod tests {
         let mut source = crate::chat::Session {
             id: TerminalId::new(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Codex,
                 recipe: LaunchRecipe {
                     program: "codex".into(),
@@ -2925,6 +2929,7 @@ mod tests {
             let source = crate::chat::Session {
                 id: TerminalId::new(),
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider: crate::agent::Provider::Codex,
                     recipe: LaunchRecipe {
                         program: "codex".into(),

@@ -472,6 +472,7 @@ mod tests {
         let issued = Session {
             id: TerminalId::new(),
             launch: Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 session_id: None,
                 recipe: LaunchRecipe {

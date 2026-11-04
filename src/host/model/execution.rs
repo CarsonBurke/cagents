@@ -1867,6 +1867,7 @@ mod tests {
             native_continuity: Default::default(),
             id: crate::model::TerminalId::new(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 recipe: crate::model::LaunchRecipe {
                     program: "claude".into(),
