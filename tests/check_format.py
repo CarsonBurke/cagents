@@ -31,6 +31,11 @@ INCLUDED = (
 
 class FormatCheck(unittest.TestCase):
     def setUp(self):
+        # Keep inherited build-lane overrides out of temporary formatter fixtures.
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("CARGO_TARGET_DIR", None)
         self.temporary = tempfile.TemporaryDirectory(prefix="cagents-format-check-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -117,6 +122,44 @@ sys.exit({status})
                 )
                 self.assertIn("cargo diagnostic", result.stderr)
                 self.assertIn("rustfmt diagnostic", result.stderr)
+
+    def test_absolute_cargo_target_keeps_formatter_cache_out_of_checkout(self):
+        target = tempfile.TemporaryDirectory(prefix="cagents-format-target-")
+        self.addCleanup(target.cleanup)
+        _, env = self.mock_tools()
+        env["CARGO_TARGET_DIR"] = target.name
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((Path(target.name) / ".check-format-cache").is_dir())
+        self.assertFalse((self.root / "target").exists())
+
+    def test_relative_cargo_target_uses_checker_checkout_directory(self):
+        target = tempfile.TemporaryDirectory(prefix="cagents-format-target-")
+        self.addCleanup(target.cleanup)
+        _, env = self.mock_tools()
+        env["CARGO_TARGET_DIR"] = os.path.relpath(target.name, self.root)
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((Path(target.name) / ".check-format-cache").is_dir())
+        self.assertFalse((self.root / "target").exists())
+
+    def test_unusable_cargo_target_preserves_formatter_failure_without_local_cache(self):
+        occupied = self.root / "occupied-target"
+        occupied.write_text("preserve this file")
+        _, env = self.mock_tools(rustfmt_status=7)
+        env["CARGO_TARGET_DIR"] = str(occupied)
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn("rustfmt diagnostic", result.stderr)
+        self.assertEqual(occupied.read_text(), "preserve this file")
+        self.assertFalse((self.root / "target").exists())
+
+    def test_empty_cargo_target_retains_default_formatter_cache(self):
+        _, env = self.mock_tools()
+        env["CARGO_TARGET_DIR"] = ""
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / "target" / ".check-format-cache").is_dir())
 
     def test_missing_byte_environment_preserves_ordinary_formatter_status(self):
         helper, args = self.cache_fixture()

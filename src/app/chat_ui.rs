@@ -5939,6 +5939,76 @@ impl Cagents {
         }
     }
 
+    /// Shows and launches in draft `card` the launch options another window
+    /// chose for it, which the shared view brought here.
+    ///
+    /// The shared pane keeps the draft's conversation, so its runtime stays
+    /// attached, but the runtime still holds the options this window had: it
+    /// would show them, start the conversation on them, and build any later
+    /// choice of its own from them, dropping the other window's. A draft
+    /// already sending its first message keeps the launch it is sending.
+    pub(super) fn adopt_shared_draft_session(
+        &mut self,
+        card: CardId,
+        session: &chat::Session,
+    ) -> Task<Message> {
+        // A conversation another window started is not a launch option; it
+        // is attached, or recovered, as the conversation it is. An operation
+        // already under way on the card keeps the launch it began with.
+        if !session.is_unstarted() || self.chat_start_pending(card) {
+            return Task::none();
+        }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return Task::none();
+        };
+        if !runtime.choosing() || runtime.session.id != session.id || runtime.session == *session {
+            return Task::none();
+        }
+        let provider = session.launch.provider;
+        let moved = runtime.session.launch.provider != provider;
+        let fresh = moved.then(|| self.chat_draft_snapshot(provider));
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+            return Task::none();
+        };
+        let previous = std::mem::replace(&mut runtime.session, session.clone());
+        // Which skills exist depends on the provider's home and directory, so
+        // a list found for others is wrong until discovery answers again.
+        let rehomed = moved
+            || previous.launch.recipe.environment != session.launch.recipe.environment
+            || previous.launch.recipe.working_directory != session.launch.recipe.working_directory;
+        if let Some(fresh) = fresh {
+            // Pickers listed the earlier provider's choices.
+            runtime.model_picker = None;
+            runtime.account_picker = false;
+            runtime.reasoning_picker = false;
+            runtime.permission_picker = false;
+            runtime.footer_picker = false;
+            runtime.snapshot = Arc::new(fresh);
+        } else if rehomed {
+            Arc::make_mut(&mut runtime.snapshot).skills.clear();
+        }
+        Arc::make_mut(&mut runtime.snapshot).permission_mode =
+            draft_permission_mode(&session.launch.recipe, provider);
+        if rehomed {
+            // A failed start's reason belongs to the account it failed on.
+            runtime.error = None;
+            runtime.completion.restart(true);
+        }
+        let target = runtime.target;
+        self.load_draft_skills(target)
+    }
+
+    /// Catches draft `card` up, once it can choose again, with launch options
+    /// another window chose while it could not: while its file chooser was
+    /// open or its first message was on the way.
+    fn adopt_stored_draft_session(&mut self, card: CardId) -> Task<Message> {
+        let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| state.kind.clone())
+        else {
+            return Task::none();
+        };
+        self.adopt_shared_draft_session(card, &session)
+    }
+
     pub(super) fn chat_scroll_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         let keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(key),
@@ -7919,7 +7989,7 @@ impl Cagents {
                     .abandoned
                     .insert(attempt.target, attempt.session);
             }
-            return Task::none();
+            return self.adopt_stored_draft_session(target.card);
         }
         self.revert_chat_draft(target, None)
     }
@@ -11038,14 +11108,22 @@ impl Cagents {
                         return Task::none();
                     }
                     runtime.attachment_chooser_pending = None;
-                    if !runtime.attachment_bookmarks.contains_key(&id.id) {
-                        return Task::none();
-                    }
-                    match result {
-                        Ok(Some(paths)) => return self.stage_chat_attachments(target, id, paths),
-                        Ok(None) => runtime.cancel_attachment_insert(id.id, None),
-                        Err(error) => runtime.cancel_attachment_insert(id.id, Some(error)),
-                    }
+                    let staged = if !runtime.attachment_bookmarks.contains_key(&id.id) {
+                        Task::none()
+                    } else {
+                        match result {
+                            Ok(Some(paths)) => self.stage_chat_attachments(target, id, paths),
+                            Ok(None) => {
+                                runtime.cancel_attachment_insert(id.id, None);
+                                Task::none()
+                            }
+                            Err(error) => {
+                                runtime.cancel_attachment_insert(id.id, Some(error));
+                                Task::none()
+                            }
+                        }
+                    };
+                    return Task::batch([staged, self.adopt_stored_draft_session(target.card)]);
                 }
             }
             Action::Dropped(target, payload) => {
@@ -11234,7 +11312,9 @@ impl Cagents {
                     Arc::make_mut(&mut runtime.snapshot).permission_mode = Some(mode);
                     let session = runtime.session.clone();
                     self.replace_chat_conversation(target.card, session);
-                    return Task::none();
+                    // Skills found for the earlier launch are not accepted for
+                    // this one, so a discovery under way would be dropped.
+                    return self.load_draft_skills(target);
                 }
                 return self.chat_send(target, Command::SetPermissionMode { mode }, false);
             }
@@ -11654,6 +11734,70 @@ impl Cagents {
         }
         Task::none()
     }
+}
+
+/// The permission mode draft `card` shows in its footer, and the launch its
+/// first message would start.
+#[cfg(test)]
+pub(super) fn draft_launch_for_test(
+    app: &Cagents,
+    card: CardId,
+) -> (Option<String>, chat::Session) {
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("a draft has a chat runtime");
+    };
+    assert!(runtime.choosing(), "the draft can still change its options");
+    (
+        runtime.snapshot.permission_mode.clone(),
+        runtime.session.clone(),
+    )
+}
+
+/// The reason draft `card` last failed to start, which it shows.
+#[cfg(test)]
+pub(super) fn draft_error_for_test(app: &mut Cagents, card: CardId) -> &mut Option<String> {
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+        panic!("a draft has a chat runtime");
+    };
+    &mut runtime.error
+}
+
+/// Runs `during` while draft `card`'s file chooser is open, then dismisses the
+/// chooser as its dialog would.
+#[cfg(test)]
+pub(super) fn with_attachment_chooser_open_for_test(
+    app: &mut Cagents,
+    card: CardId,
+    during: impl FnOnce(&mut Cagents),
+) {
+    let _admission = attachment_draft::test_admission();
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+        panic!("a draft has a chat runtime");
+    };
+    let target = runtime.target;
+    let ticket = runtime.begin_attachment_insert();
+    runtime.attachment_chooser_pending = Some(ticket.id);
+    during(app);
+    drop(app.update(Message::ChatUi(Action::Attached(target, ticket, Ok(None)))));
+}
+
+/// Sends draft `card`'s first message, returning the launch it starts.
+#[cfg(test)]
+pub(super) fn start_draft_for_test(app: &mut Cagents, card: CardId) -> chat::Session {
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("a draft has a chat runtime");
+    };
+    let target = runtime.target;
+    drop(app.start_chat_draft(target));
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("a starting draft keeps its chat runtime");
+    };
+    runtime
+        .queued
+        .as_ref()
+        .expect("the first message waits for its conversation")
+        .draft
+        .clone()
 }
 
 #[cfg(test)]

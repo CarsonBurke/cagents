@@ -574,12 +574,11 @@ mod tests {
     fn launched_server_exit_observation_preserves_original_child_ownership() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("missing.sock");
-        let child = Process::new("/bin/sh")
-            .args(["-c", "exit 7"])
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let mut provider = ChildGuard::new(child).unwrap();
+        let mut provider = ChildGuard::spawn(
+            Process::new("/bin/sh")
+                .args(["-c", "exit 7"])
+                .process_group(0),
+        );
         assert_eq!(
             join_launched(&path, || startup_halt_reason(Some(&provider), false)).unwrap_err(),
             "Codex server exited before opening its local socket"
@@ -591,8 +590,7 @@ mod tests {
         provider.terminate().unwrap();
         assert_eq!(provider.child.try_wait().unwrap().unwrap().code(), Some(7));
 
-        let child = Process::new("/bin/true").process_group(0).spawn().unwrap();
-        let mut provider = ChildGuard::new(child).unwrap();
+        let mut provider = ChildGuard::spawn(Process::new("/bin/true").process_group(0));
         provider.child.wait().unwrap();
         assert_eq!(
             join_launched(&path, || startup_halt_reason(Some(&provider), false)).unwrap_err(),

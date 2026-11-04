@@ -1701,6 +1701,8 @@ impl Cagents {
                     let starting = matches!(&pane.kind, CardKind::Chat(session) if self.chat_start_matches(pane.id, session));
                     if !self.cards.contains_key(&pane.id) && !starting {
                         tasks.push(self.attach_shared_pane(pane));
+                    } else if let CardKind::Chat(session) = &pane.kind {
+                        tasks.push(self.adopt_shared_draft_session(pane.id, session));
                     }
                 }
                 _ => {

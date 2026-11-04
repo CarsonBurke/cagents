@@ -329,24 +329,29 @@ not being changed.
 
 Optional systemd user scopes receive numeric PIDs in the OS user manager's PID
 namespace. Before submitting one, the daemon connects to the fixed
-`/run/user/UID/systemd/private` peer and requires its kernel credentials, exact
-peer pidfd and active PID namespace to match this caller. The proof retains the
-connection, pidfd and namespace descriptor through the existing user-bus
-request. It does not infer the manager's identity from a bus broker, a nonzero
-peer PID, a hardcoded namespace inode or a numeric `/proc/PID` lookup.
+`/run/user/UID/systemd/private` peer and requires its kernel credentials and
+exact peer pidfd to match this caller. The pidfd's procfs fdinfo must then name
+exactly one PID namespace, ours, read from a procfs whose own view is our
+namespace. The manager holds `CAP_WAKE_ALARM`, so ptrace-gated routes such as
+`PIDFD_GET_PID_NAMESPACE` or `/proc/PID/ns` are denied to the daemon and cannot
+serve as proof. The proof retains the connection and pidfd through the existing
+user-bus request. It does not infer the manager's identity from a bus broker, a
+nonzero peer PID, a hardcoded namespace inode or a numeric `/proc/PID` lookup.
 
 This relies on the existing trusted OS manager and its well-known user-bus
 service routing; it does not protect against a hostile same-user replacement
 of those OS services. The request's routing and launch authority are unchanged.
-If the peer, namespace ioctl or required access cannot be proved, no scope
-request is attempted and ordinary launch is retained without claiming separate
-OOM isolation. An actual request or membership failure in a proved context
+Both namespace reports are read with `openat2` beneath one `/proc` descriptor
+verified as procfs, without crossing mounts or magic links. If the peer or its
+namespace cannot be proved, no scope request is attempted, ordinary launch is
+retained without claiming separate OOM isolation, and the refusal's reason is
+returned to the caller. An actual request or membership failure in a proved context
 still reports failure. Scope-dependent tests report unqualified isolation when
 that same proof is unavailable, and keep their strict membership assertions
 when it is available. Kernel-peer regressions use private Unix sockets without
 submitting requests to the OS manager.
 
-See the [kernel pidfd namespace API](https://github.com/torvalds/linux/blob/master/include/uapi/linux/pidfd.h)
+See the [kernel pidfd fdinfo format](https://github.com/torvalds/linux/blob/master/fs/pidfs.c)
 and [systemd's numeric scope PID handling](https://github.com/systemd/systemd/blob/main/src/core/dbus-scope.c).
 
 ## Testing
@@ -478,6 +483,37 @@ unlinked old executable. It installs, upgrades, and removes fixture Debian
 packages using the generated maintainer-script contract, checks
 mixed-generation interruption, and preserves unrelated files and fixture user
 data. It does not signal the host daemon or install anything on the host.
+
+## Installing your checkout
+
+`scripts/install-local` replaces your installed cagents with the committed
+`HEAD`:
+
+```sh
+scripts/install-local --build-host fw16
+```
+
+It builds the three matched executables with the `local` Cargo profile,
+versioned `<version>+local.<short sha>`. That profile keeps release identity
+and optimization but skips link-time optimization and single-unit code
+generation. Each build is incremental, so after the first one only changed
+code is recompiled. The script stages the archive with
+`install.sh --stage-only` and runs `cagents daemon upgrade`, which shows each
+affected session and asks before replacing anything. `--stage-only` stops
+after staging so you can finish from the application's update notice instead.
+
+The build runs in the repository's `.worktrees/.install-local`, a detached
+checkout the script owns, so its target directory stays warm and edits in your
+other checkouts never reach the binaries. With `--build-host`, `HEAD` is pushed
+to `refs/cagents/install-local` in the repository at the same path on that host
+and built there. The archive is copied back, and the script refuses it if it
+needs a newer glibc than this machine has. Uncommitted tracked changes are
+refused so that the version names its exact source. If that version is already
+current, the build is skipped. After staging, older `+local` builds are removed,
+except the two most recent and any that a running process still uses.
+
+Published releases still come from `scripts/build-release-linux`; see
+[Releasing](releasing.md).
 
 ## Troubleshooting
 
