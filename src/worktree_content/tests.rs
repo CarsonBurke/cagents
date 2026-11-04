@@ -1182,9 +1182,12 @@ fn a_driver_named_like_an_attribute_state_voids_the_proof() {
 }
 
 /// A stand-in for Git LFS's clean filter: the pointer of what it reads.
+// Like git-lfs, a file that already is a pointer cleans to itself. Machines with
+// git-lfs configured globally would otherwise hide a fixture that re-hashes it.
 const LFS_CLEAN: &str = "sh -c 'f=$(mktemp); cat >\"$f\"; \
+    if head -n1 \"$f\" | grep -q \"^version https://git-lfs\"; then cat \"$f\"; else \
     printf \"version https://git-lfs.github.com/spec/v1\\noid sha256:%s\\nsize %s\\n\" \
-    \"$(sha256sum \"$f\" | cut -d\" \" -f1)\" \"$(wc -c <\"$f\" | tr -d \" \")\"; rm \"$f\"'";
+    \"$(sha256sum \"$f\" | cut -d\" \" -f1)\" \"$(wc -c <\"$f\" | tr -d \" \")\"; fi; rm \"$f\"'";
 
 #[test]
 fn lfs_files_are_judged_by_their_pointer_without_smudging() {

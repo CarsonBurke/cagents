@@ -2610,6 +2610,9 @@ mod tests {
                 "large unchanged body ".repeat(50_000)
             ));
             let (mut runtime, handle) = view::prepared_runtime_for_test(&[(*source).clone()]);
+            // This setup publication can share the exact Item with the later
+            // metadata predecessor. Observe its independent client owner too.
+            let initial_client_retired = handle.observe_snapshot_retirement_for_test();
             let mut snapshot = (*handle.snapshot()).clone();
             snapshot.generation += 1;
             snapshot.busy = growing;
@@ -2622,6 +2625,9 @@ mod tests {
                 text.push_str("\n\nActual growing tail");
             }
             handle.publish_delta_snapshot_for_test(snapshot);
+            initial_client_retired
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the initial client's exact publication must retire");
             runtime.refresh();
             drain_fixture(&mut runtime);
             retirement_barrier();
@@ -2642,12 +2648,18 @@ mod tests {
                 assert!(!entry.running);
                 entry.shared.latest.lock().unwrap().version
             });
+            let client_retired = handle.observe_snapshot_retirement_for_test();
             let mut snapshot = (*handle.snapshot()).clone();
             snapshot.generation += 1;
             Arc::make_mut(&mut snapshot.items[0]).at = Some(1_700_000_000_000);
             handle.publish_delta_snapshot_for_test(snapshot);
             assert!(handle.known_append(&old, &handle.snapshot().items[0]));
             drop(old);
+            // Client disposal is independent of presentation retirement. Wait
+            // before refresh, where the metadata guard samples actual owners.
+            client_retired
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the metadata predecessor's exact client publication must retire");
             let parser_before = markdown::parser_work_bytes_on_thread();
             runtime.refresh();
             assert_eq!(
