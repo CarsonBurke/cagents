@@ -2504,7 +2504,8 @@ impl State {
                     continue;
                 }
                 has_matching_rows = true;
-                rows.push(
+                rows.push(crate::ui_controls::owned(
+                    entry.number,
                     button::custom(widget::column::with_children(vec![
                         design::body(entry.title.as_str()).into(),
                         design::caption(format!(
@@ -2522,9 +2523,8 @@ impl State {
                     .on_press_maybe((!modal_open).then_some(Action::BrowserFenced {
                         generation: self.list_generation,
                         action: Box::new(Action::OpenNumber(entry.number)),
-                    }))
-                    .into(),
-                );
+                    })),
+                ));
             }
         }
         if matches!(self.list, ListState::Ready(_)) && !has_matching_rows {
@@ -2708,17 +2708,22 @@ pub fn browser_row<'a>(
     ])
     .spacing(space::S)
     .align_y(Alignment::Center);
-    crate::interaction::hover(
-        button::custom(content)
-            .class(sidebar_button_style(selected))
-            .name(format!(
-                "Review pull request #{} {}",
-                pull_request.number, pull_request.title
-            ))
-            .selected(selected)
-            .padding([space::XS, space::S])
-            .width(Length::Fill)
-            .on_press_maybe((!modal_open).then_some(Action::Select(pull_request.number))),
+    // Rows are positional: a refresh that inserts or removes a pull request
+    // above a held row must not move its press or focus to another number.
+    crate::ui_controls::owned(
+        pull_request.number,
+        crate::interaction::hover(
+            button::custom(content)
+                .class(sidebar_button_style(selected))
+                .name(format!(
+                    "Review pull request #{} {}",
+                    pull_request.number, pull_request.title
+                ))
+                .selected(selected)
+                .padding([space::XS, space::S])
+                .width(Length::Fill)
+                .on_press_maybe((!modal_open).then_some(Action::Select(pull_request.number))),
+        ),
     )
 }
 
@@ -4322,6 +4327,57 @@ pub(crate) mod tests {
         assert!(matches!(
             &state.take_effects()[..],
             [Effect::OpenFile { path, .. }] if *path == self::path("a.rs")
+        ));
+    }
+
+    /// A refresh that inserts a pull request above a held row shifts every
+    /// row down one position. The press must stay with the pull request it
+    /// started on rather than selecting whichever number now occupies it.
+    #[test]
+    fn refresh_cannot_move_a_held_row_press_to_another_pull_request() {
+        use crate::ui_controls::accessibility_probe::headless_renderer;
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Point, Size, mouse};
+
+        let mut renderer = headless_renderer();
+        let mut cache = Cache::new();
+        let mut frame = |numbers: &[u64], event: mouse::Event| {
+            let pull_requests = numbers
+                .iter()
+                .copied()
+                .map(pull_request)
+                .collect::<Vec<_>>();
+            let rows = pull_requests
+                .iter()
+                .map(|pull_request| browser_row(pull_request, None, false, false))
+                .collect::<Vec<_>>();
+            let mut ui = UserInterface::build(
+                widget::column::with_children(rows).width(Length::Fixed(320.0)),
+                Size::new(320.0, 400.0),
+                std::mem::replace(&mut cache, Cache::new()),
+                &mut renderer,
+            );
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[Event::Mouse(event)],
+                mouse::Cursor::Available(Point::new(160.0, 10.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            cache = ui.into_cache();
+            messages
+        };
+        let press = mouse::Event::ButtonPressed(mouse::Button::Left);
+        let release = mouse::Event::ButtonReleased(mouse::Button::Left);
+
+        assert!(frame(&[7, 9], press).is_empty());
+        assert!(frame(&[8, 7, 9], release).is_empty());
+        assert!(frame(&[8, 7, 9], press).is_empty());
+        assert!(matches!(
+            frame(&[8, 7, 9], release).as_slice(),
+            [Action::Select(8)]
         ));
     }
 
