@@ -1582,6 +1582,13 @@ impl State {
                 confirmation.details.toggle(section);
             } else {
                 self.details.toggle(section);
+                if matches!(section, DetailSection::Changes)
+                    && self.details.changes
+                    && self.lifecycle.is_none()
+                    && self.selected.is_some()
+                {
+                    return self.update(Action::Lifecycle);
+                }
             }
             return None;
         }
@@ -2613,6 +2620,60 @@ impl State {
                         );
                     }
                 }
+                if self.selected.is_some() {
+                    content = content
+                        .push(crate::design::horizontal_rule())
+                        .push(disclosure(
+                            "Changes",
+                            DetailSection::Changes,
+                            self.details.changes,
+                            busy,
+                        ));
+                }
+                if self.selected.is_some() && self.details.changes {
+                    content = content.push(crate::design::title("Changes")).push(button(
+                        "Refresh changes",
+                        Action::Lifecycle,
+                        !busy,
+                    ));
+                    if let Some(page) = &self.lifecycle {
+                        if page.events.is_empty() {
+                            content = content.push(crate::design::body("No recorded changes."));
+                        }
+                        for event in &page.events {
+                            let actor = event.actor.label();
+                            content = content.push(crate::design::body(format!(
+                                "{} · {} · {} · Revision {}",
+                                timestamp(event.occurred_ms),
+                                event.cause.label(),
+                                actor,
+                                event.revision,
+                            )));
+                            if let Some(firing) = event.firing {
+                                content = content.push(button(
+                                    "View related run",
+                                    Action::Run(firing),
+                                    !busy,
+                                ));
+                            }
+                        }
+                        if page.earlier_events_unavailable {
+                            content = content.push(crate::design::body(
+                                "Earlier changes are unavailable. Who made them and why are unknown.",
+                            ));
+                        }
+                        if page.next.is_some()
+                            && page.events.len() < crate::automations::MAX_LIFECYCLE_EVENTS
+                        {
+                            content =
+                                content.push(button("Older changes", Action::MoreLifecycle, !busy));
+                        }
+                    } else {
+                        content = content.push(crate::design::body(
+                            "Load recorded changes to see when this automation was edited, paused or enabled.",
+                        ));
+                    }
+                }
                 if self.selected.is_some() || self.all_history {
                     if self.selected.is_some() {
                         content = content.push(crate::design::title("Run history"));
@@ -2691,64 +2752,6 @@ impl State {
                     }
                     if self.history_next.is_some() {
                         content = content.push(button("Older runs", Action::MoreHistory, !busy));
-                    }
-                }
-                if self.selected.is_some() {
-                    content = content
-                        .push(crate::design::horizontal_rule())
-                        .push(disclosure(
-                            "Changes",
-                            DetailSection::Changes,
-                            self.details.changes,
-                            busy,
-                        ));
-                }
-                if self.selected.is_some() && self.details.changes {
-                    content = content.push(crate::design::title("Changes")).push(button(
-                        "Refresh lifecycle",
-                        Action::Lifecycle,
-                        !busy,
-                    ));
-                    if let Some(page) = &self.lifecycle {
-                        if page.events.is_empty() {
-                            content =
-                                content.push(crate::design::body("No recorded lifecycle events."));
-                        }
-                        for event in &page.events {
-                            let actor = event.actor.label();
-                            content = content.push(crate::design::body(format!(
-                                "{} · {} · {} · Revision {}",
-                                timestamp(event.occurred_ms),
-                                event.cause.label(),
-                                actor,
-                                event.revision,
-                            )));
-                            if let Some(firing) = event.firing {
-                                content = content.push(button_owned(
-                                    format!("Inspect run {firing}"),
-                                    Action::Run(firing),
-                                    !busy,
-                                ));
-                            }
-                        }
-                        if page.earlier_events_unavailable {
-                            content = content.push(crate::design::body(
-                                "Earlier lifecycle events are unavailable. Their actor and cause are unknown.",
-                            ));
-                        }
-                        if page.next.is_some()
-                            && page.events.len() < crate::automations::MAX_LIFECYCLE_EVENTS
-                        {
-                            content = content.push(button(
-                                "Older lifecycle events",
-                                Action::MoreLifecycle,
-                                !busy,
-                            ));
-                        }
-                    } else {
-                        content = content.push(crate::design::body(
-                            "Load lifecycle receipts to inspect changes to this automation.",
-                        ));
                     }
                 }
             }
@@ -3445,7 +3448,7 @@ fn progress_label(pending: Pending) -> &'static str {
         Pending::Save => "Saving automation…",
         Pending::Mutate => "Updating automation…",
         Pending::History { .. } => "Loading run history…",
-        Pending::Lifecycle { .. } => "Loading lifecycle…",
+        Pending::Lifecycle { .. } => "Loading changes…",
         Pending::Run => "Loading run…",
         Pending::OpenRun => "Opening agent…",
         // Background reads draw no progress, but name themselves should one
@@ -4571,6 +4574,45 @@ mod tests {
             state.history[0].id, older.id,
             "the paged snapshot stays stable"
         );
+    }
+
+    #[test]
+    fn opening_changes_loads_the_selected_scope_once_and_keeps_its_receipts() {
+        let owner = automation();
+        let mut state = State {
+            selected: Some(owner.clone()),
+            ..Default::default()
+        };
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Audit {
+                id, before: None, ..
+            },
+        }) = state.update(Action::ToggleDetail(DetailSection::Changes))
+        else {
+            panic!("opening Changes reads its selected automation");
+        };
+        assert_eq!(id, owner.id);
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Audit(crate::automations::LifecyclePage {
+                events: vec![],
+                next: None,
+                earlier_events_unavailable: false,
+            }))),
+        });
+        assert!(
+            state
+                .update(Action::ToggleDetail(DetailSection::Changes))
+                .is_none()
+        );
+        assert!(!state.details.changes);
+        assert!(
+            state
+                .update(Action::ToggleDetail(DetailSection::Changes))
+                .is_none()
+        );
+        assert!(state.details.changes && state.lifecycle.is_some());
     }
 
     #[test]
