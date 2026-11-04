@@ -1377,7 +1377,7 @@ fn resume_retained_claude(
         // it. When no daemon can take that owner over, closing the pane is
         // the way out: it stops the helper and keeps the saved conversation.
         return Err(StartFailure::retry(format!(
-            "This conversation's previous helper still owns it, so no replacement was started. {} If retrying does not reconnect it, close this pane to stop that helper; the conversation stays saved and reopens from Resume.",
+            "An earlier process still holds this conversation, so nothing was started in its place. {} If retrying does not reconnect it, close this pane to end that process; the conversation stays saved and reopens from Resume.",
             refusal.unwrap_or_else(|| "Retry once it has finished closing.".to_owned())
         )));
     }
@@ -3938,7 +3938,7 @@ mod tests {
             });
         let failure = result.unwrap_err();
         assert_eq!(failure.recovery, crate::chat::Recovery::Retry);
-        assert!(failure.message.contains("still owns it"));
+        assert!(failure.message.contains("still holds this conversation"));
         assert!(
             failure.message.contains("close this pane"),
             "a refusal that retrying cannot clear names the way out"
