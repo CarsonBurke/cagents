@@ -722,6 +722,13 @@ impl Monitor {
     /// [`drain`](Self::drain). It may run for every event, so it must only
     /// signal (a bounded `try_send`, a condvar notify) and never block.
     pub fn start(wake: impl Fn() + Send + Sync + 'static) -> std::io::Result<Self> {
+        Self::start_with_limit(wake, MAX_DIRECTORIES)
+    }
+
+    pub(crate) fn start_with_limit(
+        wake: impl Fn() + Send + Sync + 'static,
+        directory_limit: usize,
+    ) -> std::io::Result<Self> {
         let (commands, requests) = mpsc::sync_channel(1);
         let configuration = Arc::new(Mutex::new(Configuration::default()));
         let desired_configuration = configuration.clone();
@@ -788,7 +795,7 @@ impl Monitor {
                     // A recursive metadata watch already owns its descendants.
                     // Avoid overlapping registrations, whose removal can also
                     // remove a descendant's native watch on some backends.
-                    let mut registrations = Registrations::within(&projects, MAX_DIRECTORIES);
+                    let mut registrations = Registrations::within(&projects, directory_limit);
                     registrations.coalesce_recursive();
                     let Registrations {
                         desired,
@@ -1671,7 +1678,7 @@ mod tests {
             &mut registered,
             &registrations.desired,
             &registrations.owners,
-            &BTreeSet::from([covering]),
+            &BTreeSet::from([covering.clone()]),
             &mut failures,
         );
         assert_eq!(
@@ -1679,6 +1686,41 @@ mod tests {
             ids,
             "a failed surviving recursive watch must report every covered owner"
         );
+        assert!(!registered.contains_key(&covering));
+        std::fs::rename(&unavailable, &covering).unwrap();
+        failures.clear();
+        assert_eq!(
+            reconcile(
+                &mut watcher,
+                &mut registered,
+                &registrations.desired,
+                &registrations.owners,
+                &BTreeSet::new(),
+                &mut failures,
+            ),
+            ids,
+            "retrying a restored recursive watch must recover every covered owner"
+        );
+        assert!(failures.is_empty());
+        pending.changes.clear();
+        while receiver.try_recv().is_ok() {}
+        // This previously untouched ref cannot be mistaken for callbacks from
+        // either HEAD edit before the failed rearm.
+        let later_ref = common_b.join("refs/heads/after-retry");
+        std::fs::write(&later_ref, "0123456789012345678901234567890123456789\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("nested repository ref edit after failed rearm retry");
+            if event.paths.contains(&later_ref)
+                && matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))
+            {
+                assert!(pending.event(Ok(event)));
+                assert!(pending.changes[&b_id].references);
+                break;
+            }
+        }
     }
 
     #[test]
@@ -1974,20 +2016,19 @@ mod tests {
         // identity for the replacement this test expects us to re-register.
         let original_directory = std::fs::File::open(&source).unwrap();
         let original_identity = original_directory.metadata().unwrap();
-        std::fs::remove_dir_all(&source).unwrap();
+        // Keep the retired directory intact. Its files emit no removal/data
+        // callbacks that could satisfy the later ordinary-edit assertion.
+        let retired_source = source.with_file_name("retired-src");
+        std::fs::rename(&source, &retired_source).unwrap();
         std::fs::create_dir(&source).unwrap();
         let replacement_identity = std::fs::metadata(&source).unwrap();
         assert_ne!(
             (original_identity.dev(), original_identity.ino()),
             (replacement_identity.dev(), replacement_identity.ino())
         );
-        std::fs::write(&file, "third").unwrap();
-        wait_for(
-            &monitor,
-            project.id,
-            "directory removal/recreation",
-            |change| change.membership,
-        );
+        wait_for(&monitor, project.id, "directory replacement", |change| {
+            change.membership
+        });
         // The replacement holds a distinct inode. The separate unchanged-identity
         // contract covers retirement even when the inode is reused.
         monitor.0.configure(vec![Arc::new(project.clone())]);

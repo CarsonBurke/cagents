@@ -1445,6 +1445,163 @@ mod tests {
     }
 
     #[test]
+    fn native_quota_failure_polls_then_recovers_and_reads_a_later_edit() {
+        use git_watch::test_support::wait_for;
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let first = fixture(&base.join("first"));
+        let second = fixture(&base.join("second"));
+        let mut ids = [ProjectId::new(), ProjectId::new()];
+        ids.sort();
+        let [other, project] = ids;
+        let plan = |id, snapshot| {
+            read_local(
+                id,
+                snapshot,
+                git_watch::Change {
+                    topology: true,
+                    ..Default::default()
+                },
+                CancellationToken::default(),
+            )
+            .unwrap()
+        };
+        let (_, other_plan) = plan(other, first);
+        let (snapshot, project_plan) = plan(project, second);
+        let project_plan = Arc::new(project_plan.unwrap());
+        let worktree = snapshot.worktrees[0].0.id;
+        let root = snapshot.worktrees[0].0.path.clone();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model.projects.clear();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            snapshot.repository.id,
+            "Recovering repository".into(),
+            snapshot.repository.common_dir.clone(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.repository_generations.insert(project, 1);
+        app.refresh_ui.git.entries.insert(
+            project,
+            Entry {
+                snapshot: snapshot.clone(),
+                generation: 1,
+                plan: Some(project_plan.clone()),
+                archived: Vec::new(),
+                remote_started: false,
+                cancellation: None,
+                read_failure: None,
+                read_full_scan: false,
+                pending: Default::default(),
+                fallback: None,
+                last_full_scan: Instant::now(),
+            },
+        );
+        // One real repository fits; a second competes for the same bounded
+        // coordinator budget. No global kernel-watch exhaustion is required.
+        let monitor = git_watch::Monitor::start_with_limit(|| {}, 6).unwrap();
+        monitor.configure(vec![Arc::new(other_plan.unwrap()), project_plan.clone()]);
+        let failure = wait_for(&monitor, project, "native quota failure", |change| {
+            change.coverage == Some(false) && change.error.is_some()
+        });
+        assert_eq!(
+            failure.error.as_deref(),
+            Some("directory watch limit reached")
+        );
+        let initial_read = read_local_with_plan(
+            project,
+            snapshot.clone(),
+            failure.clone(),
+            CancellationToken::default(),
+            Some(&project_plan),
+        )
+        .unwrap();
+        app.refresh_ui.git.changed(project, failure);
+        drop(app.start_git_reads());
+        drop(app.update_git(Action::Read {
+            project,
+            generation: 1,
+            result: Ok(initial_read),
+        }));
+        let entry = app.refresh_ui.git.entries.get_mut(&project).unwrap();
+        assert!(entry.fallback.is_some());
+        entry.last_full_scan = Instant::now() - FALLBACK_INTERVAL;
+        drop(app.git_fallback_tick());
+        assert!(app.refresh_ui.git.entries[&project].read_full_scan);
+        let (fresh, recovered_plan) = read_local_with_plan(
+            project,
+            snapshot,
+            git_watch::Change {
+                topology: true,
+                membership: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+            Some(&project_plan),
+        )
+        .unwrap();
+        drop(app.update_git(Action::Read {
+            project,
+            generation: 1,
+            result: Ok((fresh, recovered_plan)),
+        }));
+        // Closing the competing project frees the budget. Use the real
+        // consumer's recovered inventory and real coordinator acknowledgement.
+        monitor.configure(vec![
+            app.refresh_ui.git.entries[&project].plan.clone().unwrap(),
+        ]);
+        let recovered = wait_for(&monitor, project, "native quota recovery", |change| {
+            change.coverage == Some(true) && change.error.is_none()
+        });
+        app.refresh_ui.git.changed(project, recovered);
+        assert!(app.refresh_ui.git.entries[&project].fallback.is_none());
+        // Settle the recovery read before the next edit, as the application
+        // does, so its own configure acknowledgement cannot satisfy this edge.
+        let entry = &app.refresh_ui.git.entries[&project];
+        let (fresh, plan) = read_local_with_plan(
+            project,
+            entry.snapshot.clone(),
+            entry.pending.clone(),
+            CancellationToken::default(),
+            entry.plan.as_deref(),
+        )
+        .unwrap();
+        drop(app.start_git_reads());
+        drop(app.update_git(Action::Read {
+            project,
+            generation: 1,
+            result: Ok((fresh, plan)),
+        }));
+        fs::write(root.join("tracked.txt"), "edit after quota recovery\n").unwrap();
+        let changed = wait_for(
+            &monitor,
+            project,
+            "ordinary edit after quota recovery",
+            |change| {
+                change.worktrees.contains(&worktree)
+                    && change.coverage.is_none()
+                    && change.error.is_none()
+                    && !change.topology
+                    && !change.membership
+                    && !change.references
+            },
+        );
+        app.refresh_ui.git.changed(project, changed.clone());
+        assert!(app.refresh_ui.git.queue.contains(&project));
+        let entry = &app.refresh_ui.git.entries[&project];
+        let (fresh, _) = read_local_with_plan(
+            project,
+            entry.snapshot.clone(),
+            changed,
+            CancellationToken::default(),
+            entry.plan.as_deref(),
+        )
+        .unwrap();
+        assert!(fresh.worktrees[0].1.as_ref().unwrap().dirty.is_dirty());
+    }
+
+    #[test]
     fn successful_watch_rearm_stops_fallback_without_requesting_a_read() {
         let directory = tempfile::tempdir().unwrap();
         let snapshot = fixture(&directory.path().join("repo"));

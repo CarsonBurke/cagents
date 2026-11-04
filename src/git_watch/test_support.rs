@@ -101,11 +101,18 @@ pub(crate) fn reconfigure_then_observe(
                 && change.error.is_none()
                 && change.coverage.is_none()
                 && !change.topology
+                && !change.membership
+                && !change.references
         },
     );
 }
 
-fn wait_for(monitor: &Monitor, id: ProjectId, phase: &str, predicate: impl Fn(&Change) -> bool) {
+pub(crate) fn wait_for(
+    monitor: &Monitor,
+    id: ProjectId,
+    phase: &str,
+    predicate: impl Fn(&Change) -> bool,
+) -> Change {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut last = None;
     loop {
@@ -113,7 +120,7 @@ fn wait_for(monitor: &Monitor, id: ProjectId, phase: &str, predicate: impl Fn(&C
             let ready = predicate(&change);
             last = Some(change);
             if ready {
-                return;
+                return change;
             }
         }
         assert!(Instant::now() < deadline, "{phase}: last change {last:?}");
