@@ -66,7 +66,6 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
 }
 
 fn list_human<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> String {
-    use crate::agent::ActivityState;
     use crate::agent_execution::directory::Owner;
     super::format::table(
         ["SESSION", "PROVIDER", "STATE", "CONTEXT"],
@@ -107,13 +106,12 @@ fn list_human<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> String {
                 [
                     entry.id.to_string(),
                     entry.provider.map_or("shell", |p| p.executable()).into(),
-                    match entry.state {
-                        ActivityState::Unknown => "unknown",
-                        ActivityState::Idle => "idle",
-                        ActivityState::Working => "working",
-                        ActivityState::Waiting => "waiting",
+                    crate::agent_execution::ProviderActivity {
+                        turn: entry.state,
+                        background_agents: entry.background_agents,
+                        waiting_agents: entry.waiting_agents,
                     }
-                    .into(),
+                    .label(),
                     context.join("; "),
                 ]
             })
@@ -171,6 +169,8 @@ mod tests {
             }),
             channel_repository: None,
             state: ActivityState::Waiting,
+            background_agents: 0,
+            waiting_agents: 0,
             directory: Some("/fixture/linked".into()),
             worktree: Some("/fixture/linked".into()),
             project: Some("/fixture/.git".into()),
@@ -220,6 +220,19 @@ mod tests {
         }
         assert!(!human.contains('\u{1b}'));
         assert_eq!(serde_json::to_value(&entry).unwrap(), before);
+    }
+
+    #[test]
+    fn a_session_row_separates_its_idle_turn_from_its_background_agents() {
+        let mut entry = entry();
+        entry.state = ActivityState::Idle;
+        entry.background_agents = 2;
+        let human = list_human(std::iter::once(&entry));
+        assert!(human.contains("idle; 2 background agents"), "{human}");
+        entry.state = ActivityState::Working;
+        entry.background_agents = 1;
+        let human = list_human(std::iter::once(&entry));
+        assert!(human.contains("working; 1 background agent "), "{human}");
     }
 
     #[test]

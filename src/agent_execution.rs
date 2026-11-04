@@ -470,6 +470,10 @@ pub struct Run {
     /// Opaque correlation key for the submitted provider request. This is not
     /// a provider session ID and need not be a provider-generated turn ID.
     pub provider_key: Option<String>,
+    /// When this prompt began waiting for another turn to end. Set only while
+    /// the prompt is proved not to have reached the provider.
+    #[serde(default)]
+    pub queued_ms: Option<u64>,
     pub result: ResultSummary,
 }
 
@@ -517,6 +521,8 @@ pub enum Operation {
 pub enum Control {
     /// Interrupt the latest run while it is active.
     Interrupt { including_subagents: bool },
+    /// Withdraw a prompt that hasn't been sent, leaving everything else running.
+    WithdrawQueued,
     /// Answer one displayed request with one of its explicit actions.
     Answer {
         request_id: String,
@@ -556,6 +562,47 @@ pub struct Summary {
     pub agent: Agent,
     pub run: RunId,
     pub state: State,
+    /// Absent when no live provider backs the agent.
+    pub provider: Option<ProviderActivity>,
+}
+
+/// What a live provider is doing now, which a run's state doesn't say: a turn
+/// can run without an accepted run, and delegated work outlives the turn that
+/// started it. A provider takes a new prompt when its turn is idle, whatever
+/// its background agents are doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderActivity {
+    pub turn: crate::agent::ActivityState,
+    pub background_agents: u32,
+    /// How many of those stopped with background work of their own still
+    /// running, so that what they've reported so far may be interim.
+    #[serde(default)]
+    pub waiting_agents: u32,
+}
+
+impl ProviderActivity {
+    pub fn label(self) -> String {
+        let turn = match self.turn {
+            crate::agent::ActivityState::Unknown => "unknown",
+            crate::agent::ActivityState::Idle => "idle",
+            crate::agent::ActivityState::Working => "working",
+            crate::agent::ActivityState::Waiting => "waiting",
+        };
+        let agents = match self.background_agents {
+            0 => turn.to_owned(),
+            1 => format!("{turn}; 1 background agent"),
+            count => format!("{turn}; {count} background agents"),
+        };
+        match self.waiting_agents {
+            0 => agents,
+            1 => format!(
+                "{agents}; 1 waiting on its own background work, so its result so far may be interim"
+            ),
+            count => format!(
+                "{agents}; {count} waiting on their own background work, so their results so far may be interim"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -564,6 +611,7 @@ pub enum Reply {
     Status {
         agent: Agent,
         run: Run,
+        provider: Option<ProviderActivity>,
     },
     Listed(Vec<Summary>),
     Closed(Agent),
@@ -572,6 +620,13 @@ pub enum Reply {
     AccountInfo(crate::account::info::Report),
     /// Requests still pending after a read or a control.
     Requests(Vec<chat::Request>),
+    /// What an interrupt did. It may stop a turn, withdraw an unsent prompt,
+    /// both, or, with the owner's request still pending, only the latter.
+    Interrupted {
+        requests: Vec<chat::Request>,
+        interrupted: bool,
+        withdrawn: Option<RunId>,
+    },
     Sent(mailbox::Sent),
     Inbox(Vec<mailbox::Message>),
     InboxAcknowledged,
@@ -581,10 +636,20 @@ pub enum Reply {
 /// outcome must never be assigned to the agent's currently active run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Update {
-    Started { provider_key: String },
+    Started {
+        provider_key: String,
+    },
     Waiting,
     Resumed,
-    Finished { state: State, result: ResultSummary },
+    Finished {
+        state: State,
+        result: ResultSummary,
+    },
+    /// The provider is busy with another turn; the prompt was not sent.
+    Queued,
+    /// Committed immediately before the prompt is handed to the provider, so
+    /// that a queued run stays proof that it was never sent.
+    Dequeued,
 }
 
 /// Adapter-local evidence. Settlement freezes the result before a deferred

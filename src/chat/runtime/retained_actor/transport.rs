@@ -129,6 +129,9 @@ pub(crate) struct Resident {
     pub failure: Option<String>,
     pub confirmed_session: Option<String>,
     pub background_subagents: Vec<String>,
+    /// Absent from a helper started by an older build.
+    #[serde(default)]
+    pub provider: Option<crate::agent_execution::ProviderActivity>,
     pub interrupt_subagents: Vec<String>,
     pub account_reports: Vec<Update>,
     next_input: u64,
@@ -382,6 +385,7 @@ impl RemoteActor {
             failure: None,
             confirmed_session: None,
             background_subagents: Vec::new(),
+            provider: None,
             interrupt_subagents: Vec::new(),
             account_reports: Vec::new(),
             next_input: 1,
@@ -626,6 +630,12 @@ impl RemoteActor {
     }
     pub fn owns_work(&self) -> bool {
         !self.0.preserved.load(Ordering::Acquire) && self.state().owns_work
+    }
+    /// Whether the actor is gone or this attachment no longer speaks for it,
+    /// either of which no later turn can change.
+    pub fn has_exited(&self) -> bool {
+        let state = self.state();
+        state.completed || state.close.exited || state.failure.is_some()
     }
     pub fn state(&self) -> Arc<Resident> {
         self.0
@@ -2243,6 +2253,7 @@ impl Server {
         let actor_failure = self.actor.failure();
         let confirmed_session = self.actor.confirmed_session_id();
         let background_subagents = self.actor.background_subagents();
+        let provider = Some(self.actor.provider_activity());
         let interrupt_subagents = self.actor.interrupt_subagents();
         let account_reports = self
             .account_reports
@@ -2292,6 +2303,7 @@ impl Server {
             failure,
             confirmed_session,
             background_subagents,
+            provider,
             interrupt_subagents,
             account_reports,
             next_input: journal.next_input()?,
