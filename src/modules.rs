@@ -100,6 +100,8 @@ pub mod persistence;
 pub mod process;
 pub mod project_location;
 #[cfg(feature = "ui")]
+pub mod project_search;
+#[cfg(feature = "ui")]
 pub mod pull_request_review;
 pub mod recovery_authority;
 #[cfg(feature = "ui")]

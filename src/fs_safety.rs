@@ -220,10 +220,23 @@ pub enum ResolveError {
         /// needs to tell that apart from an unsearchable parent directory,
         /// which reports the same errno from a different object.
         write_refused: bool,
+        /// Descriptor exhaustion is a resource failure, not an unreadable file
+        /// that a traversal may silently skip.
+        resource_exhausted: bool,
     },
 }
 
 impl ResolveError {
+    pub fn is_resource_exhausted(&self) -> bool {
+        matches!(
+            self,
+            Self::Io {
+                resource_exhausted: true,
+                ..
+            }
+        )
+    }
+
     pub fn is_already_exists(&self) -> bool {
         matches!(
             self,
@@ -285,6 +298,7 @@ impl ResolveError {
             already_exists: error.kind() == io::ErrorKind::AlreadyExists,
             not_found: error.kind() == io::ErrorKind::NotFound,
             write_refused,
+            resource_exhausted: matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)),
         }
     }
 
@@ -295,6 +309,7 @@ impl ResolveError {
             already_exists: false,
             not_found: false,
             write_refused: false,
+            resource_exhausted: false,
         }
     }
 }
@@ -2058,6 +2073,28 @@ pub(crate) mod tests {
         // same directory: identity is only ever taken from a descriptor that
         // already refuses one.
         assert!(through_link.is_err(), "a symlinked root must be refused");
+    }
+
+    #[test]
+    fn descriptor_exhaustion_remains_typed_without_classifying_other_failures() {
+        let path = Path::new("fixture");
+        for code in [libc::EMFILE, libc::ENFILE] {
+            assert!(
+                ResolveError::io(path, &io::Error::from_raw_os_error(code)).is_resource_exhausted()
+            );
+        }
+        for code in [libc::EACCES, libc::EPERM, libc::ENOENT, libc::EEXIST] {
+            assert!(
+                !ResolveError::io(path, &io::Error::from_raw_os_error(code))
+                    .is_resource_exhausted()
+            );
+        }
+        assert!(!ResolveError::message(path, "Too many open files").is_resource_exhausted());
+        assert!(
+            !ResolveError::io(path, &io::Error::other("Too many open files"))
+                .is_resource_exhausted()
+        );
+        assert!(!ResolveError::escaped(path).is_resource_exhausted());
     }
 
     #[test]

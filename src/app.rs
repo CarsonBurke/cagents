@@ -37,6 +37,7 @@ mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
 mod saved_terminal;
+mod search_ui;
 mod session_recovery;
 mod settings_ui;
 mod shared_views;
@@ -2304,6 +2305,7 @@ impl PullRequestDialog {
 pub enum ContextTab {
     #[default]
     Files,
+    Search,
     Changes,
     PullRequest,
     Details,
@@ -2409,11 +2411,18 @@ async fn flush_workspace(
 }
 
 impl ContextTab {
-    const ALL: [Self; 4] = [Self::Files, Self::Changes, Self::PullRequest, Self::Details];
+    const ALL: [Self; 5] = [
+        Self::Files,
+        Self::Search,
+        Self::Changes,
+        Self::PullRequest,
+        Self::Details,
+    ];
 
     const fn label(self) -> &'static str {
         match self {
             Self::Files => "Files",
+            Self::Search => "Search",
             // The panel holds the Changes, Branch, and History views; naming
             // it after the first of them said "Changes" twice.
             Self::Changes => "Source control",
@@ -2773,6 +2782,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::SettingsDraftChanged { .. }
         | Message::ResetSettings
         | Message::DismissStatus => true,
+        Message::ProjectSearch(action) => !matches!(action, search_ui::Action::Progress { .. } | search_ui::Action::Run(_) | search_ui::Action::QueryFocus(_)),
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
         Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
         Message::ChatUi(action) => !action.allowed_while_modal(),
@@ -3089,11 +3099,12 @@ pub enum SettingsField {
     ShortcutFocusPane9,
     ShortcutToggleProjects,
     ShortcutRenamePane,
+    ShortcutSearchInProject,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 38] = [
+    const SHORTCUTS: [Self; 39] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3132,6 +3143,7 @@ impl SettingsField {
         Self::ShortcutFocusPane9,
         Self::ShortcutToggleProjects,
         Self::ShortcutRenamePane,
+        Self::ShortcutSearchInProject,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3175,6 +3187,7 @@ impl SettingsField {
             Self::ConfirmMultilinePaste => "Confirm multiline paste",
             Self::ShortcutToggleProjects => "Toggle Projects sidebar",
             Self::ShortcutRenamePane => "Rename focused pane",
+            Self::ShortcutSearchInProject => "Search in selected project",
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
             Self::ShortcutChatPermissions => "Choose chat permission mode",
@@ -3276,6 +3289,7 @@ impl SettingsField {
             Self::ShortcutNewTerminal
             | Self::ShortcutToggleProjects
             | Self::ShortcutRenamePane
+            | Self::ShortcutSearchInProject
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
             | Self::ShortcutChatPermissions
@@ -3334,6 +3348,7 @@ enum SettingsFeedback {
 struct ShortcutDraft {
     toggle_projects: String,
     rename_pane: String,
+    search_in_project: String,
     command_palette: String,
     new_native_thread: String,
     chat_permissions: String,
@@ -3377,6 +3392,7 @@ impl ShortcutDraft {
         Self {
             toggle_projects: settings::format_chords(&shortcuts.toggle_projects),
             rename_pane: settings::format_chords(&shortcuts.rename_pane),
+            search_in_project: settings::format_chords(&shortcuts.search_in_project),
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
             chat_permissions: settings::format_chords(&shortcuts.chat_permissions),
@@ -3608,6 +3624,9 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.toggle_projects = value
             }
             SettingsField::ShortcutRenamePane => self.keyboard_shortcuts.rename_pane = value,
+            SettingsField::ShortcutSearchInProject => {
+                self.keyboard_shortcuts.search_in_project = value
+            }
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
             }
@@ -3707,6 +3726,10 @@ fn settings_update(
         }
         SettingsField::ShortcutRenamePane => {
             next.keyboard_shortcuts.rename_pane = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSearchInProject => {
+            next.keyboard_shortcuts.search_in_project = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutCommandPalette => {
@@ -4620,6 +4643,7 @@ pub enum Message {
     },
     FocusAdjacent(crate::workspace::FocusDirection),
     FocusProjectSearch,
+    ProjectSearch(search_ui::Action),
     TerminalFind(terminal_ui::Action),
     ZoomFont {
         card: CardId,
@@ -5148,6 +5172,7 @@ pub struct Cagents {
     cards: HashMap<CardId, CardRuntime>,
     terminal_working_directories: HashMap<CardId, PathBuf>,
     terminal_find: HashMap<CardId, terminal_ui::Find>,
+    search_ui: search_ui::State,
     terminal_review_card: Option<CardId>,
     terminal_review_revision: u64,
     terminal_review_identity: Option<crate::model::TerminalId>,
@@ -14137,6 +14162,7 @@ impl Application for Cagents {
             cards: HashMap::new(),
             terminal_working_directories: HashMap::new(),
             terminal_find: HashMap::new(),
+            search_ui: search_ui::State::default(),
             terminal_review_card: None,
             terminal_review_revision: 0,
             terminal_review_identity: None,
@@ -17302,6 +17328,9 @@ impl Application for Cagents {
                 if let Some(task) = self.palette_key_event(&event) {
                     return task;
                 }
+                if let Some(task) = self.project_search_key_event(&event) {
+                    return task;
+                }
                 if let Some(task) = self.chrome_key_event(&event) {
                     return task;
                 }
@@ -17592,10 +17621,14 @@ impl Application for Cagents {
             }
             Message::ToggleContextInspector if self.modal_is_open() => Task::none(),
             Message::TerminalFind(action) => self.handle_terminal_find(action),
+            Message::ProjectSearch(action) => self.update_project_search(action),
             Message::ToggleContextInspector => {
                 self.set_context_inspector_open(!self.context_inspector_open)
             }
             Message::SelectContextTab(tab) => {
+                if tab == ContextTab::Search {
+                    return self.update_project_search(search_ui::Action::Open);
+                }
                 if self.active_folder_scope()
                     && matches!(tab, ContextTab::Changes | ContextTab::PullRequest)
                 {
@@ -18074,6 +18107,7 @@ impl Application for Cagents {
         }
         self.refresh_sidebar_worktree_panes();
         let binding = self.rebind_source_control();
+        let search_binding = self.rebind_project_search();
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             let selected = self
                 .workspace
@@ -18096,6 +18130,7 @@ impl Application for Cagents {
         Task::batch([
             task,
             binding,
+            search_binding,
             chrome,
             deferred,
             pull_request,
@@ -29190,6 +29225,7 @@ mod tests {
             durable,
             terminal_working_directories: HashMap::new(),
             terminal_find: HashMap::new(),
+            search_ui: search_ui::State::default(),
             terminal_context: None,
             terminal_paste: None,
             cards: card_id

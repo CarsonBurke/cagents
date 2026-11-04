@@ -352,21 +352,11 @@ impl Cagents {
                     .as_ref()
                     .map(|watch| watch.monitor.drain())
                     .unwrap_or_default();
-                for (project, change) in changes {
-                    if let Some(error) = &change.error
-                        && self
-                            .refresh_ui
-                            .git
-                            .entries
-                            .get(&project)
-                            .is_some_and(|entry| entry.fallback.as_ref() != Some(error))
-                    {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "Local Git watching unavailable; checking once a minute: {error}"
-                        )));
-                    }
-                    self.refresh_ui.git.changed(project, change);
-                }
+                let tasks = changes
+                    .into_iter()
+                    .map(|(project, change)| self.apply_git_watch_change(project, change))
+                    .collect::<Vec<_>>();
+                return Task::batch([Task::batch(tasks), self.start_git_reads()]);
             }
             Action::Read {
                 project,
@@ -451,6 +441,28 @@ impl Cagents {
             }
         }
         self.start_git_reads()
+    }
+
+    pub(super) fn apply_git_watch_change(
+        &mut self,
+        project: ProjectId,
+        change: git_watch::Change,
+    ) -> Task<Message> {
+        let search = self.retire_project_search_roots(project, &change.retired_roots);
+        if let Some(error) = &change.error
+            && self
+                .refresh_ui
+                .git
+                .entries
+                .get(&project)
+                .is_some_and(|entry| entry.fallback.as_ref() != Some(error))
+        {
+            self.status = Some(TransientNotice::warning(format!(
+                "Local Git watching unavailable; checking once a minute: {error}"
+            )));
+        }
+        self.refresh_ui.git.changed(project, change);
+        search
     }
 
     fn start_git_reads(&mut self) -> Task<Message> {

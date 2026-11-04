@@ -1095,6 +1095,13 @@ impl EditorDocument {
         }
     }
 
+    /// A programmatic location change is an edit-group boundary, including
+    /// a jump back to the same caret position.
+    fn navigate_to(&mut self, cursor: text_editor::Cursor) {
+        self.history.seal();
+        self.content.set_cursor(cursor);
+    }
+
     /// Brings the derived state up to date after the text changed.
     fn text_changed(&mut self) {
         self.revision = self.revision.wrapping_add(1).max(1);
@@ -2318,6 +2325,10 @@ pub struct RepositoryRuntime {
     retained_viewports: VecDeque<(PathBuf, FileViewportAnchors)>,
     restored_navigation: Option<crate::model::RepositoryNavigation>,
     pending_editor_navigation: Option<(PathBuf, crate::model::EditorNavigation)>,
+    /// Only search navigation carries scan evidence; ordinary restored editor
+    /// positions retain their existing clamping behavior.
+    pending_search_location: Option<(AsyncIdentity, usize, crate::project_search::LineIdentity)>,
+    search_result_changed: bool,
     pending_editor_focus: Option<AsyncIdentity>,
     next_save_ticket: u64,
     next_diff_request: u64,
@@ -2510,6 +2521,8 @@ impl RepositoryRuntime {
             retained_viewports: VecDeque::new(),
             restored_navigation: None,
             pending_editor_navigation: None,
+            pending_search_location: None,
+            search_result_changed: false,
             pending_editor_focus: None,
             next_save_ticket: 0,
             lsp_document: None,
@@ -3174,6 +3187,10 @@ impl RepositoryRuntime {
         {
             return;
         }
+        if self.pending_search_location.take().is_some() {
+            self.pending_editor_navigation = None;
+        }
+        self.search_result_changed = false;
         self.restored_navigation = Some(navigation.clone());
     }
 
@@ -3646,9 +3663,7 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &mut self.document else {
             unreachable!("the validated editor remains mounted");
         };
-        // Typing after a jump is a new undo step, like typing after a click.
-        document.history.seal();
-        document.content.set_cursor(text_editor::Cursor {
+        document.navigate_to(text_editor::Cursor {
             position,
             selection: None,
         });
@@ -6236,6 +6251,7 @@ impl RepositoryRuntime {
                     // A location requested for the rejected disk read must not
                     // move the retained buffer's original caret or selection.
                     self.pending_editor_navigation = None;
+                    self.pending_search_location = None;
                     // The accepted read can finish while another surface or
                     // dialog owns the keyboard. Let the shell restore focus
                     // only when this editor is mounted and owns input again.
@@ -6257,6 +6273,10 @@ impl RepositoryRuntime {
                 let loaded_focus = (matches!(self.document, DocumentState::Loading { .. })
                     || self.restores_editor_navigation(&identity))
                 .then(|| identity.clone());
+                let search_location = self
+                    .pending_search_location
+                    .take()
+                    .map(|(requested, line, expected)| (requested == identity, line, expected));
                 self.document = match result {
                     Ok(LoadedFile {
                         source,
@@ -6338,6 +6358,17 @@ impl RepositoryRuntime {
                         DocumentState::Failed { path, message }
                     }
                 };
+                if let Some((same_request, line, expected)) = search_location
+                    && (!same_request
+                        || !matches!(&self.document, DocumentState::Editable(document)
+                            if document.content.line(line).is_some_and(|line| expected.matches(&line.text))))
+                {
+                    // Never let the native editor clamp a stale search range
+                    // into unrelated content in a newly loaded document.
+                    self.pending_editor_navigation = None;
+                    self.search_result_changed =
+                        !matches!(self.document, DocumentState::Failed { .. });
+                }
                 if let DocumentState::Editable(document) = &mut self.document {
                     self.pending_editor_focus = loaded_focus;
                     if let Some((path, editor)) = self.pending_editor_navigation.take()
@@ -7601,6 +7632,127 @@ impl RepositoryRuntime {
         self.request_diff(identity, basis, old_path)
     }
 
+    /// Open a scan result only if its physical line still matches the native
+    /// document. Deferred reads validate against their actual loaded content.
+    pub fn open_search_result(
+        &mut self,
+        card: CardId,
+        matched: &crate::project_search::Match,
+    ) -> Task<RepositoryAction> {
+        if self.blocks_navigation() || crate::repository::RepoPath::parse(&matched.path).is_err() {
+            return Task::none();
+        }
+        if self.selected_path() == Some(matched.path.as_path())
+            && let DocumentState::Editable(document) = &self.document
+            && !document
+                .content
+                .line(matched.line)
+                .is_some_and(|line| matched.line_identity.matches(&line.text))
+        {
+            self.search_result_changed = true;
+            self.source_surface = SourceSurface::Editor;
+            self.markdown_mode = MarkdownMode::Edit;
+            return self.focus_editor(card);
+        }
+        let task = self.open_file_location(
+            card,
+            matched.path.clone(),
+            matched.line,
+            matched.column,
+            matched.length,
+        );
+        if self.selected_path() == Some(matched.path.as_path())
+            && matches!(self.document, DocumentState::Loading { .. })
+            && self.pending_editor_navigation.is_some()
+        {
+            self.pending_search_location = Some((
+                self.current_identity(card, matched.path.clone()),
+                matched.line,
+                matched.line_identity,
+            ));
+        }
+        task
+    }
+
+    /// Open a repository-relative location, even before the directory listing
+    /// arrives. Coordinates are zero-based native line/UTF-8 byte positions.
+    /// The requested range is clamped when the asynchronous file read finishes.
+    pub fn open_file_location(
+        &mut self,
+        card: CardId,
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        selection_bytes: usize,
+    ) -> Task<RepositoryAction> {
+        if crate::repository::RepoPath::parse(&path).is_err() {
+            return Task::none();
+        }
+        self.pending_search_location = None;
+        self.search_result_changed = false;
+        let caret = text_editor::Position { line, column };
+        let selection = (selection_bytes > 0).then_some(text_editor::Position {
+            line,
+            column: column.saturating_add(selection_bytes),
+        });
+        if self.selected_path() == Some(path.as_path())
+            && let DocumentState::Editable(document) = &mut self.document
+        {
+            self.language
+                .retire_completions(&mut self.completion_intent);
+            document.navigate_to(text_editor::Cursor {
+                position: caret,
+                selection,
+            });
+            document
+                .content
+                .restore_scroll_position(text_editor::ScrollPosition {
+                    line: line.saturating_sub(10),
+                    vertical: 0.0,
+                    horizontal: 0.0,
+                });
+            self.source_surface = SourceSurface::Editor;
+            self.markdown_mode = MarkdownMode::Edit;
+            return self.focus_editor(card);
+        }
+        if self.blocks_navigation() {
+            return Task::none();
+        }
+        let loading_same = self.selected_path() == Some(path.as_path())
+            && matches!(self.document, DocumentState::Loading { .. });
+        let task = if loading_same {
+            Task::none()
+        } else {
+            let file = self.file(&path).cloned().unwrap_or(RepositoryFile {
+                path: path.clone(),
+                ..RepositoryFile::default()
+            });
+            if file.directory {
+                return Task::none();
+            }
+            self.open_file_entry(card, file)
+        };
+        if self.selected_path() != Some(path.as_path())
+            || !matches!(self.document, DocumentState::Loading { .. })
+        {
+            return task;
+        }
+        self.pending_editor_navigation = Some((
+            path,
+            crate::model::EditorNavigation {
+                caret: crate::model::EditorPosition { line, column },
+                selection: selection.map(|position| crate::model::EditorPosition {
+                    line: position.line,
+                    column: position.column,
+                }),
+                scroll_line: line.saturating_sub(10),
+                scroll_vertical: 0.0,
+                scroll_horizontal: 0.0,
+            },
+        ));
+        task
+    }
+
     fn open_file(&mut self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {
         let file = match self.file(&path).cloned() {
             Some(file) => file,
@@ -7631,6 +7783,8 @@ impl RepositoryRuntime {
         }
         self.pending_fragment = None;
         self.pending_editor_navigation = None;
+        self.pending_search_location = None;
+        self.search_result_changed = false;
         self.pending_editor_focus = None;
         if self.descriptor.selected_file.is_some() {
             self.descriptor.selected_file = Some(file.path.clone());
@@ -7724,6 +7878,8 @@ impl RepositoryRuntime {
         self.push_lsp_close();
         self.pending_fragment = None;
         self.pending_editor_navigation = None;
+        self.pending_search_location = None;
+        self.search_result_changed = false;
         self.pending_editor_focus = None;
         self.restored_navigation = None;
         self.committed_selection = None;
@@ -9823,6 +9979,28 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             ])
             .spacing(space::S)
             .into(),
+        );
+    }
+    if runtime.search_result_changed {
+        rows.push(
+            widget::container(
+            widget::row::with_children([
+                crate::design::body(
+                    "This search result no longer matches the file. Reload the file and run project search again.",
+                )
+                .width(Length::Fill)
+                .into(),
+                icon_button(Icon::Refresh, "Reload file from disk")
+                    .on_press_maybe(
+                        (!runtime.blocks_navigation()).then_some(RepositoryAction::Reload { card }),
+                    )
+                    .into(),
+            ])
+            .spacing(space::S),
+        )
+        .class(cosmic::theme::Container::Secondary)
+        .padding(space::M)
+        .into()
         );
     }
     rows.push(content);
@@ -12570,6 +12748,363 @@ mod tests {
         assert!(matches!(runtime.files, FileListState::Ready(_)));
         assert!(matches!(runtime.document, DocumentState::Editable(_)));
         assert_eq!(runtime.selected_path(), Some(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn search_locations_use_native_utf8_ranges_without_discarding_a_dirty_buffer() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "éλ hit\nsecond\n");
+        let path = runtime.selected_path().unwrap().to_path_buf();
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!()
+        };
+        document.dirty = true;
+        let text = document.content.text();
+        drop(runtime.open_file_location(card, path.clone(), 0, 5, 3));
+        let navigation = runtime.navigation().unwrap().editor.unwrap();
+        assert_eq!(
+            navigation.caret,
+            crate::model::EditorPosition { line: 0, column: 5 }
+        );
+        assert_eq!(
+            navigation.selection,
+            Some(crate::model::EditorPosition { line: 0, column: 8 })
+        );
+        assert_eq!(runtime.editor_text().unwrap(), text);
+        assert_eq!(runtime.selected_text().as_deref(), Some("hit"));
+        assert!(runtime.is_dirty());
+        let before = runtime.navigation();
+        drop(runtime.open_file_location(card, "another.rs".into(), 0, 0, 1));
+        drop(runtime.open_file_location(card, "../outside.rs".into(), 0, 0, 1));
+        assert_eq!(runtime.navigation(), before);
+        assert_eq!(runtime.selected_path(), Some(path.as_path()));
+        assert!(runtime.pending_editor_navigation.is_none());
+        // A byte inside a multibyte scalar clamps to its original boundary.
+        drop(runtime.open_file_location(card, path, 0, 1, usize::MAX));
+        let navigation = runtime.navigation().unwrap().editor.unwrap();
+        assert_eq!(navigation.caret.column, 0);
+        assert_eq!(navigation.selection.unwrap().column, 8);
+    }
+
+    #[test]
+    fn file_location_jumps_separate_same_position_deletions_in_undo() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "abcd\n");
+        let path = runtime.selected_path().unwrap().to_path_buf();
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!()
+        };
+        document.history_time = Some(Instant::now());
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Delete),
+        }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("bcd\n"));
+        drop(runtime.open_file_location(card, path, 0, 0, 0));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Delete),
+        }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("cd\n"));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("bcd\n"));
+        assert!(runtime.is_dirty());
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("abcd\n"));
+        assert!(!runtime.is_dirty());
+    }
+
+    #[test]
+    fn cached_file_and_search_jumps_retire_the_previous_completion_intent() {
+        let (_directory, matched) = scanned_location("foo\nhit\n");
+        for search in [false, true] {
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "foo\nhit\n");
+            runtime.set_lsp_document(Some(LspDocumentId(1)));
+            runtime.set_editor_completions(vec![completion_item(
+                completion_edit(
+                    LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 3)),
+                    "old",
+                ),
+                vec![],
+            )]);
+            let held = runtime.editor_completion_targets(card).remove(0);
+            let intent = runtime.editor_completion_intent();
+            if search {
+                drop(runtime.open_search_result(card, &matched));
+            } else {
+                drop(runtime.open_file_location(card, matched.path.clone(), 1, 0, 3));
+            }
+            assert_ne!(runtime.editor_completion_intent(), intent);
+            assert!(runtime.language.completions.is_empty());
+            assert_eq!(runtime.selected_text().as_deref(), Some("hit"));
+            assert!(!runtime.apply_completion_target(card, &held));
+            assert_eq!(runtime.editor_text().as_deref(), Some("foo\nhit\n"));
+            assert!(!runtime.is_dirty());
+        }
+    }
+
+    #[test]
+    fn deferred_search_location_applies_after_the_requested_loading_path() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, "loading.rs");
+        drop(runtime.open_file_location(card, "loading.rs".into(), 1, 2, 3));
+        assert_eq!(
+            runtime.pending_editor_navigation.as_ref().unwrap().0,
+            Path::new("loading.rs")
+        );
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity,
+            result: Ok(LoadedFile {
+                source: "loading.rs".into(),
+                content: FileContent::Editable {
+                    text: "first\néhit!\n".into(),
+                    content_hash: blake3::hash("first\néhit!\n".as_bytes()),
+                    markdown: false,
+                },
+            }),
+        }));
+        assert!(runtime.pending_editor_navigation.is_none());
+        let navigation = runtime.navigation().unwrap().editor.unwrap();
+        assert_eq!(
+            navigation.caret,
+            crate::model::EditorPosition { line: 1, column: 2 }
+        );
+        assert_eq!(
+            navigation.selection,
+            Some(crate::model::EditorPosition { line: 1, column: 5 })
+        );
+    }
+
+    fn scanned_location(text: &str) -> (tempfile::TempDir, crate::project_search::Match) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("notes.txt"), text).unwrap();
+        let mut found = Vec::new();
+        crate::project_search::search(
+            directory.path(),
+            &crate::project_search::Options {
+                query: "hit".into(),
+                ..crate::project_search::Options::default()
+            },
+            &crate::process::CancellationToken::default(),
+            |progress| {
+                if let crate::project_search::Progress::Batch(batch) = progress {
+                    found.extend(batch);
+                }
+                true
+            },
+        );
+        assert_eq!(found.len(), 1, "the real scanner must produce the location");
+        (directory, found.pop().unwrap())
+    }
+
+    fn search_location_runtime(directory: &Path) -> RepositoryRuntime {
+        RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(),
+            repository: directory.into(),
+            worktree: directory.into(),
+            selected_file: Some("notes.txt".into()),
+        })
+    }
+
+    #[test]
+    fn scanned_search_location_refuses_changed_cached_lines_without_moving_the_cursor() {
+        let (_directory, matched) = scanned_location("first\r\né hit!\r\nlast");
+        for changed in [
+            "first\né zip!\nlast",           // same UTF-8 byte length, different content
+            "first\ninserted\né hit!\nlast", // match moved to a later line
+            "é hit!\nlast",                  // match moved to an earlier line
+            "first",                         // original line is missing
+        ] {
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, changed);
+            drop(runtime.open_file_location(card, "notes.txt".into(), 0, 0, 2));
+            let before = runtime.navigation();
+            drop(runtime.open_search_result(card, &matched));
+            assert_eq!(
+                runtime.navigation(),
+                before,
+                "a stale click cannot select new bytes"
+            );
+            assert!(runtime.search_result_changed);
+            assert_eq!(runtime.editor_text().as_deref(), Some(changed));
+            assert!(!runtime.is_dirty());
+            assert!(!runtime.blocks_navigation());
+            assert!(
+                runtime.save_error().is_none(),
+                "stale search is not a save failure"
+            );
+        }
+        // Physical line-ending changes do not change UTF-8 columns/content.
+        for ending in ["\n", "\r\n", "\r", "\n\r"] {
+            let text = format!("first{ending}é hit!{ending}last");
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, &text);
+            drop(runtime.open_search_result(card, &matched));
+            assert_eq!(runtime.selected_text().as_deref(), Some("hit"));
+            assert!(!runtime.search_result_changed);
+        }
+    }
+
+    #[tokio::test]
+    async fn scanned_search_location_validates_the_actual_deferred_file_read() {
+        for (loaded, valid) in [
+            ("first\r\né zip!\r\nlast", false),
+            ("first\ninserted\né hit!\nlast", false),
+            ("first", false),
+            ("first\né hit!\nlast", true),
+            ("first\n\ré hit!\n\rlast", true),
+        ] {
+            let (directory, matched) = scanned_location("first\r\né hit!\r\nlast");
+            let card = CardId::new();
+            let mut runtime = search_location_runtime(directory.path());
+            let task = runtime.open_search_result(card, &matched);
+            assert!(runtime.pending_search_location.is_some());
+            // The worker has not been polled: change disk after the click as
+            // well as after the scan, then consume its real FileLoadedAt.
+            std::fs::write(directory.path().join("notes.txt"), loaded).unwrap();
+            finish_navigation_task(&mut runtime, task).await;
+            assert!(
+                runtime.original_read_attested,
+                "the actual owned file read must complete"
+            );
+            assert_eq!(runtime.editor_text().as_deref(), Some(loaded));
+            assert_eq!(runtime.search_result_changed, !valid);
+            assert_eq!(runtime.selected_text().as_deref(), valid.then_some("hit"));
+            assert!(runtime.pending_search_location.is_none());
+            assert!(runtime.pending_editor_navigation.is_none());
+            assert_eq!(
+                runtime.take_restored_editor_focus(card),
+                Some(editor_focus_id(card)),
+                "both a selected match and a stale-result notice keep the accepted read's focus handoff"
+            );
+            assert!(runtime.take_restored_editor_focus(card).is_none());
+            assert!(!runtime.is_dirty());
+            assert!(runtime.save_error().is_none());
+        }
+    }
+
+    #[test]
+    fn cached_stale_search_result_reveals_editor_notice_from_diff_without_losing_history() {
+        let (_directory, matched) = scanned_location("first\né hit!\nlast");
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "first\né zip!\nlast");
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+        }));
+        let redo_text = runtime.editor_text().unwrap();
+        drop(runtime.step_history(card, false));
+        assert!(!runtime.is_dirty());
+        assert!(
+            matches!(&runtime.document, DocumentState::Editable(document)
+            if document.history.can_redo())
+        );
+        runtime.source_surface = SourceSurface::Diff;
+        runtime.markdown_mode = MarkdownMode::Preview;
+        assert!(!runtime.editable_surface_visible());
+        assert!(runtime.editor_focus_target(card).is_none());
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!()
+        };
+        let cursor = document.content.cursor();
+        let text = runtime.editor_text();
+        let selected = runtime.selected_text();
+
+        drop(runtime.open_search_result(card, &matched));
+
+        assert_eq!(runtime.source_surface, SourceSurface::Editor);
+        assert_eq!(runtime.markdown_mode, MarkdownMode::Edit);
+        assert!(
+            runtime.editable_surface_visible(),
+            "the notice's Editor path is visible"
+        );
+        assert_eq!(
+            runtime.editor_focus_target(card),
+            Some(editor_focus_id(card))
+        );
+        assert!(
+            runtime.search_result_changed,
+            "the visible editor mounts the warning"
+        );
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!()
+        };
+        assert_eq!(document.content.cursor(), cursor);
+        assert_eq!(runtime.editor_text(), text);
+        assert_eq!(
+            runtime.selected_text(),
+            selected,
+            "never select the stale range"
+        );
+        assert!(!runtime.is_dirty());
+        assert!(runtime.save_error().is_none());
+        // The refusal changed only the shown surface: the original edit can
+        // still be redone through the normal editor history path.
+        drop(runtime.step_history(card, true));
+        assert_eq!(runtime.editor_text().as_deref(), Some(redo_text.as_str()));
+    }
+
+    #[tokio::test]
+    async fn ordinary_navigation_supersedes_a_search_guard_for_the_same_inflight_file() {
+        for restore in [false, true] {
+            let (directory, matched) = scanned_location("first\né hit!\nlast");
+            let card = CardId::new();
+            let mut runtime = search_location_runtime(directory.path());
+            let search = runtime.open_search_result(card, &matched);
+            let search_identity = runtime.current_identity(card, matched.path.clone());
+            std::fs::write(directory.path().join("notes.txt"), "other\né zip!\nlast").unwrap();
+            let task = if restore {
+                let mut navigation = runtime.navigation().unwrap();
+                navigation.editor = Some(crate::model::EditorNavigation {
+                    caret: crate::model::EditorPosition { line: 0, column: 0 },
+                    selection: Some(crate::model::EditorPosition { line: 0, column: 5 }),
+                    scroll_line: 0,
+                    scroll_vertical: 0.0,
+                    scroll_horizontal: 0.0,
+                });
+                runtime.restore_navigation(&navigation);
+                assert!(runtime.pending_search_location.is_none());
+                // Restoring ordinary saved navigation starts its own read.
+                let task = runtime.initial_load(card);
+                drop(search);
+                task
+            } else {
+                drop(runtime.open_file_location(card, matched.path.clone(), 0, 0, 5));
+                assert_eq!(
+                    runtime.current_identity(card, matched.path.clone()),
+                    search_identity
+                );
+                search
+            };
+            assert!(runtime.pending_search_location.is_none());
+            finish_navigation_task(&mut runtime, task).await;
+            assert_eq!(runtime.selected_text().as_deref(), Some("other"));
+            assert!(!runtime.search_result_changed);
+            assert!(runtime.pending_editor_navigation.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_search_read_drops_its_guard_before_a_later_ordinary_reopen() {
+        let (directory, matched) = scanned_location("first\né hit!\nlast");
+        let card = CardId::new();
+        let mut runtime = search_location_runtime(directory.path());
+        let task = runtime.open_search_result(card, &matched);
+        std::fs::remove_file(directory.path().join("notes.txt")).unwrap();
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(matches!(runtime.document, DocumentState::Failed { .. }));
+        assert!(runtime.pending_search_location.is_none());
+        assert!(runtime.pending_editor_navigation.is_none());
+        assert!(
+            !runtime.search_result_changed,
+            "retain the actual file-read error"
+        );
+        std::fs::write(directory.path().join("notes.txt"), "other\né zip!\nlast").unwrap();
+        let task = runtime.open_file_location(card, matched.path, 0, 0, 5);
+        finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(runtime.selected_text().as_deref(), Some("other"));
+        assert!(!runtime.search_result_changed);
     }
 
     #[test]
