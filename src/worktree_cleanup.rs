@@ -105,10 +105,11 @@ impl FencedTarget {
     }
 }
 
-#[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn automatic_retention_reason(path: &Path) -> String {
+/// Refusal for an older client that still requests automatic removal.
+#[cfg(feature = "host")]
+fn automatic_retention_reason(path: &Path) -> String {
     format!(
-        "Kept {}: automatic cleanup cannot exclude new files written by other programs. Review the worktree, then choose Delete worktree and confirm if you want to discard its files. The directory and branch have been retained.",
+        "Kept {}: merged worktrees are no longer deleted automatically. Choose Delete worktree and confirm to remove it.",
         path.display()
     )
 }
@@ -983,7 +984,7 @@ mod tests {
             let refusal = prepared
                 .remove(|_| panic!("automatic retention must not request destructive admission"))
                 .unwrap_err();
-            assert!(refusal.contains("automatic cleanup cannot exclude new files"));
+            assert!(refusal.contains("no longer deleted automatically"));
             assert!(refusal.contains("Delete worktree and confirm"));
             assert_eq!(std::fs::read(&file).unwrap(), b"late external data");
             assert_eq!(std::fs::read(admin.join("HEAD")).unwrap(), head_before);

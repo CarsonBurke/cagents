@@ -230,11 +230,13 @@ pub enum Action {
     /// Runs a failed deletion again. The user confirmed it once already.
     RetryDelete(WorktreeId),
     AwaitSessions(Target, WorktreeRemovalCapture),
-    AutomaticallyDeleted {
+    /// An eligible merged worktree was kept. `ignored` names the user files
+    /// that only an explicitly confirmed deletion would discard.
+    MergedWorktreeKept {
         target: Target,
         generation: u64,
         request: crate::worktree_cleanup::RemovalRequest,
-        result: Result<Option<RemovedWorktree>, String>,
+        ignored: Vec<String>,
     },
     Deleted {
         target: Target,
@@ -463,13 +465,33 @@ impl Cagents {
                 retained: false,
             },
         );
-        let reason = crate::worktree_cleanup::automatic_retention_reason(&request.path);
-        cosmic::task::message(Message::ProjectUi(Action::AutomaticallyDeleted {
-            target,
-            generation,
-            request,
-            result: Err(reason),
-        }))
+        let path = request.path.clone();
+        cosmic::task::future(async move {
+            let inventory = tokio::task::spawn_blocking(move || {
+                crate::repository::RepositoryService::system("git")
+                    .notable_ignored_files(&path, &crate::process::CancellationToken::new())
+            })
+            .await;
+            // The notice is still useful without the inventory; deletion keeps
+            // its own confirmation either way.
+            let ignored = match inventory {
+                Ok(Ok(files)) => files.iter().map(ToString::to_string).collect(),
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "could not list ignored files in merged worktree");
+                    Vec::new()
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "ignored-file inventory task failed");
+                    Vec::new()
+                }
+            };
+            Message::ProjectUi(Action::MergedWorktreeKept {
+                target,
+                generation,
+                request,
+                ignored,
+            })
+        })
     }
 
     pub(super) fn selected_project_removal_blocker(&self, project: ProjectId) -> Option<String> {
@@ -1447,11 +1469,11 @@ impl Cagents {
                 }
                 return self.start_worktree_deletion(target);
             }
-            Action::AutomaticallyDeleted {
+            Action::MergedWorktreeKept {
                 target,
                 generation,
                 request,
-                result,
+                ignored,
             } => {
                 let Some(id) = target.worktree else {
                     return Task::none();
@@ -1486,8 +1508,6 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                // A local notification cannot certify removal. Even an
-                // unexpected success receipt must never tombstone its row.
                 self.project_ui
                     .automatic_attempts
                     .get_mut(&id)
@@ -1496,10 +1516,7 @@ impl Cagents {
                 // Automatic cleanup has no user confirmation to reuse. Keep
                 // this out of Deletion.failure: its RetryDelete action is an
                 // already-confirmed destructive operation.
-                self.status = Some(TransientNotice::warning(match result {
-                    Err(reason) => reason,
-                    Ok(_) => "Worktree kept: automatic checks keep files. Review it, then choose Delete worktree and confirm to discard its files.".into(),
-                }));
+                self.status = Some(merged_worktree_kept_notice(&target.label, &ignored));
                 return Task::none();
             }
             Action::Deleted {
@@ -1961,9 +1978,9 @@ impl Cagents {
             super::notice_body(&target.label),
             super::notice_detail(target.path.display().to_string()),
             super::notice_detail(
-                "Git will remove this worktree directory, including uncommitted and untracked files. The branch is retained. \
-                 Terminals and chats running in it, including detached ones, are closed \
-                 first.",
+                "Git will remove this worktree directory, including uncommitted, untracked and ignored files such as .env. \
+                 The branch is retained. Terminals and chats running in it, including detached ones, \
+                 are closed first.",
             ),
         ];
         if let Some(warning) = self.worktree_deletion_warning(target) {
@@ -1999,6 +2016,24 @@ impl Cagents {
             480.0,
         ))
     }
+}
+
+/// Names a few ignored files inline; the notice details list all of them.
+fn merged_worktree_kept_notice(label: &str, ignored: &[String]) -> TransientNotice {
+    const INLINE: usize = 3;
+    if ignored.is_empty() {
+        return TransientNotice::warning(format!(
+            "{label} is merged. Its worktree was kept; choose Delete worktree when you no longer need it."
+        ));
+    }
+    let mut names = ignored[..ignored.len().min(INLINE)].join(", ");
+    if ignored.len() > INLINE {
+        names.push_str(&format!(" and {} more", ignored.len() - INLINE));
+    }
+    TransientNotice::warning(format!(
+        "{label} is merged. Its worktree was kept because it holds ignored files: {names}. Deleting it would discard them."
+    ))
+    .with_details(ignored.join("\n"))
 }
 
 fn launch_task(executable: PathBuf, path: PathBuf, editor: bool) -> Task<Message> {
@@ -2679,7 +2714,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_receipt_keeps_editor_documents_and_cards_even_on_unexpected_success() {
+    fn merged_worktree_notice_keeps_editor_documents_and_cards() {
         removal_callback_test(|| {
             let (mut app, _root, target) = removal_lsp_app();
             let (original, original_doc) = removal_editor(&mut app, &target, false);
@@ -2714,16 +2749,11 @@ mod tests {
                     retained: false,
                 },
             );
-            drop(app.update(Message::ProjectUi(Action::AutomaticallyDeleted {
+            drop(app.update(Message::ProjectUi(Action::MergedWorktreeKept {
                 target: target.clone(),
                 generation: 1,
                 request,
-                result: Ok(Some(RemovedWorktree {
-                    common_dir: target.repository.join(".git"),
-                    admin_dir: target.repository.join(".git/worktrees/feature"),
-                    path: target.path.clone(),
-                    branch: Some("refs/heads/feature".into()),
-                })),
+                ignored: vec![".env".into()],
             })));
             assert!(app.project_ui.automatic_attempts[&target.worktree.unwrap()].retained);
             assert!(app.project_ui.deletions.is_empty());
@@ -2976,7 +3006,6 @@ mod tests {
             .request
             .clone();
         let generation = app.project_ui.automatic_attempts[&linked.id].generation;
-        let reason = "Kept: external writes cannot be excluded; choose Delete worktree and confirm";
         // A row replacement invalidates the queued notice even before a new
         // eligibility pass has had a chance to replace its attempt identity.
         let notice_before = app.status.as_ref().map(|notice| notice.message.clone());
@@ -2986,11 +3015,11 @@ mod tests {
             .find(|row| row.id == linked.id)
             .unwrap()
             .branch = Some("replacement".into());
-        drop(app.handle_project_action(Action::AutomaticallyDeleted {
+        drop(app.handle_project_action(Action::MergedWorktreeKept {
             target: target.clone(),
             generation,
             request: request.clone(),
-            result: Err("stale row".into()),
+            ignored: Vec::new(),
         }));
         assert!(!app.project_ui.automatic_attempts[&linked.id].retained);
         assert_eq!(
@@ -3003,16 +3032,19 @@ mod tests {
             .find(|row| row.id == linked.id)
             .unwrap()
             .branch = Some("feature".into());
-        drop(app.handle_project_action(Action::AutomaticallyDeleted {
+        drop(app.handle_project_action(Action::MergedWorktreeKept {
             target: target.clone(),
             generation,
             request: request.clone(),
-            result: Err(reason.into()),
+            ignored: vec![".env".into(), "data.db".into()],
         }));
         assert_eq!(row(&app, linked.id).unwrap().path, linked.path);
         assert_eq!(row(&app, linked.id).unwrap().deletion, None);
         assert!(app.project_ui.deletions.is_empty());
-        assert!(app.status.as_ref().unwrap().message.contains(reason));
+        let notice = app.status.as_ref().unwrap();
+        assert!(notice.message.contains("is merged"));
+        assert!(notice.message.contains(".env, data.db"));
+        assert_eq!(notice.details.as_deref(), Some(".env\ndata.db"));
         let session = app.session.as_ref().unwrap();
         session.flush(Duration::from_secs(5)).unwrap();
         let retained = session
@@ -3074,11 +3106,11 @@ mod tests {
         let other_target = app.project_target(project, Some(other.id)).unwrap();
         let other_request = app.project_ui.automatic_attempts[&other.id].request.clone();
         let other_generation = app.project_ui.automatic_attempts[&other.id].generation;
-        drop(app.handle_project_action(Action::AutomaticallyDeleted {
+        drop(app.handle_project_action(Action::MergedWorktreeKept {
             target: other_target,
             generation: other_generation,
             request: other_request,
-            result: Err(reason.into()),
+            ignored: vec![".env".into(), "data.db".into()],
         }));
         assert!(app.project_ui.deletions.is_empty());
 
@@ -3117,22 +3149,14 @@ mod tests {
         let fresh_request = fresh.request.clone();
         let pending_at = fresh.at;
         let notice = app.status.as_ref().unwrap().message.clone();
-        // Both a late retained result and a stale removal receipt from the
-        // previous binding must leave the newer operation and row untouched.
-        for result in [
-            Err("stale refusal".into()),
-            Ok(Some(RemovedWorktree {
-                common_dir: repository.join(".git"),
-                admin_dir: repository.join(".git/worktrees/feature"),
-                path: linked.path.clone(),
-                branch: Some("refs/heads/feature".into()),
-            })),
-        ] {
-            drop(app.handle_project_action(Action::AutomaticallyDeleted {
+        // A late notice from the previous binding must leave the newer
+        // operation and row untouched.
+        {
+            drop(app.handle_project_action(Action::MergedWorktreeKept {
                 target: target.clone(),
                 generation,
                 request: request.clone(),
-                result,
+                ignored: Vec::new(),
             }));
             assert!(app.project_ui.deletions.is_empty());
             assert_eq!(app.project_ui.automatic_attempts[&linked.id].at, pending_at);
@@ -3143,11 +3167,11 @@ mod tests {
             assert_eq!(app.status.as_ref().unwrap().message, notice);
             assert!(row(&app, linked.id).is_some());
         }
-        drop(app.handle_project_action(Action::AutomaticallyDeleted {
+        drop(app.handle_project_action(Action::MergedWorktreeKept {
             target: target.clone(),
             generation: fresh_generation,
             request: fresh_request,
-            result: Err(reason.into()),
+            ignored: vec![".env".into(), "data.db".into()],
         }));
         assert!(app.project_ui.deletions.is_empty());
 
@@ -3168,11 +3192,11 @@ mod tests {
         assert!(app.project_ui.dialog.is_none());
         let manual_at = app.project_ui.deletions[&linked.id].started_at;
         let notice = app.status.as_ref().unwrap().message.clone();
-        drop(app.handle_project_action(Action::AutomaticallyDeleted {
+        drop(app.handle_project_action(Action::MergedWorktreeKept {
             target,
             generation: queued.generation,
             request: queued.request,
-            result: Err("late retained result".into()),
+            ignored: Vec::new(),
         }));
         assert_eq!(app.project_ui.deletions[&linked.id].started_at, manual_at);
         assert!(app.project_ui.deletions[&linked.id].failure.is_none());
