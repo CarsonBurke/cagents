@@ -467,6 +467,13 @@ real-rustfmt fixtures, with no Cargo/application build). Set
 `CHECK_FORMAT_CARGO_FIXTURE=1` for the additional dependency-free temporary Cargo
 fixture; this still runs only `cargo fmt`, with no application build.
 
+The explicit-source stage can reuse a successful check only when its source,
+configuration, environment and formatter inputs match. Each invocation reads
+formatter binaries and libraries once, then reopens them and checks their full
+file identity before reusing those digests for its second snapshot. No tool
+digest or file-metadata shortcut is retained between invocations. Unverifiable
+inputs run the ordinary formatter instead.
+
 For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
 changes, verify both the browserless and integrated lanes. Performance
