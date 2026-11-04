@@ -293,6 +293,8 @@ enum NoticeKey {
     AccountLink,
     /// Telling panes whether they are on screen.
     SurfaceVisibility,
+    /// One accepted retention conflict, including later conflicts on the same card.
+    RetentionIncident(CardId, uuid::Uuid),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

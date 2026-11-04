@@ -14,7 +14,7 @@ pub(in crate::app) fn closed_draft_source_matches(
 }
 
 impl Cagents {
-    pub(super) fn chat_closed_elsewhere(&self, card: CardId) -> bool {
+    pub(in crate::app) fn chat_closed_elsewhere(&self, card: CardId) -> bool {
         self.shared_views.closed_chats.get(&card).is_some_and(|source| {
             matches!(self.card_state(card).map(|card| &card.kind), Some(CardKind::Chat(session)) if closed_draft_source_matches(source, session))
                 && !self.workspace_model.views.iter().any(|view| view.panes.iter().any(|pane| pane.id == card))
