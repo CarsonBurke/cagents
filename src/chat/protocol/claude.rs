@@ -1782,15 +1782,19 @@ impl Claude {
         let Some(tool) = reported.filter(|tool| self.agent_tool(tool)) else {
             return Ok(None);
         };
+        // A launch acknowledgement's agentId need not match the task ID that
+        // later reports on it. While the reported Agent is still running in the
+        // background, that acknowledgement alone does not contradict its tool.
         if !started
             && (self
                 .agent_task_calls
                 .iter()
                 .any(|(known, bound)| known == tool && bound != task)
-                || self
-                    .agent_calls
-                    .iter()
-                    .any(|(bound, known)| known == tool && bound != task))
+                || (!self.background_agents.contains(tool)
+                    && self
+                        .agent_calls
+                        .iter()
+                        .any(|(bound, known)| known == tool && bound != task)))
         {
             return Err(());
         }
@@ -1832,7 +1836,20 @@ impl Claude {
                 }
             }
         }
-        if (self.agent_tool(tool) || background) && (background || started || ended.is_some()) {
+        // The child's own result already settled this Agent with its exact
+        // diagnostic. Repeating the same terminal status would clear it.
+        let settled = !started
+            && ended.is_some()
+            && !self.background_agents.contains(tool)
+            && self
+                .tools
+                .get(&ScopedId::new(None, tool))
+                .and_then(|item| item.content.status())
+                == Some(status);
+        if !settled
+            && (self.agent_tool(tool) || background)
+            && (background || started || ended.is_some())
+        {
             step.events.push(Event::Subagent {
                 model: None,
                 waiting: None,
@@ -10546,9 +10563,12 @@ mod tests {
                 "message": {"role": "user", "content": "<task-notification>\n<task-id>b1</task-id>\n<summary>Monitor event: \"queue\"</summary>\n<event>6329:queued</event>\n</task-notification>"}
             }))
             .unwrap();
-        assert!(!event.events.iter().any(
-            |event| matches!(event, Event::Item(item) if item.id == "claude-task:b1")
-        ));
+        assert!(
+            !event
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(item) if item.id == "claude-task:b1"))
+        );
         let row = &adapter.tools[&ScopedId::new(None, "claude-task:b1")];
         assert_eq!(row.content.status(), Some(ToolStatus::Running));
     }
