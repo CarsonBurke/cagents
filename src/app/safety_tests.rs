@@ -1375,6 +1375,9 @@ fn enter_on_a_focused_button_leaves_the_next_click_to_the_control_under_the_poin
         runtime::user_interface::{Cache, UserInterface},
     };
 
+    // The Enter-activated button comes first: a row offers each event to its
+    // children in order, so a latched button would take the click's release
+    // before the button under the pointer sees it.
     let keyboard_id = widget::Id::new("enter.contract.keyboard");
     let pointer_id = widget::Id::new("enter.contract.pointer");
     let element: Element<'static, u8> = widget::row([
