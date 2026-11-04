@@ -36,7 +36,9 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         return None;
     }
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path();
+    // Ordinary fixture paths must agree with canonical project keys even when
+    // the caller's temporary directory has a symlinked parent.
+    let root = directory.path().canonicalize().unwrap();
     for path in [
         "bin",
         "home/.claude",
@@ -78,7 +80,7 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
                 "absent"
             },
         )
-        .env("CAGENTS_EXECUTION_FIXTURE", root)
+        .env("CAGENTS_EXECUTION_FIXTURE", &root)
         .env("HOME", root.join("home"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CONFIG_HOME", root.join("config"))
