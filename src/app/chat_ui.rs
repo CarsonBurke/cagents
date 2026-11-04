@@ -28,6 +28,9 @@ mod find;
 mod find_navigation;
 mod flow_layout;
 mod fold;
+mod goal;
+mod goal_dispatch;
+mod goal_focus;
 mod hover;
 pub(super) mod images;
 mod layout;
@@ -234,6 +237,10 @@ pub enum Action {
         Result<Vec<Attachment>, String>,
     ),
     Submit(Target, PromptMode),
+    GoalPanel(Target, bool),
+    GoalIntent(Target, goal_dispatch::Control),
+    /// Recheck only the exact unsent Goal's bounded model wait.
+    GoalModelWake(Target, std::sync::Weak<()>),
     /// Recalls the message sent before the one the composer shows, or the
     /// unsent draft again once the recall has walked forward past the newest.
     HistoryOlder(Target),
@@ -450,6 +457,7 @@ impl Action {
                 | Self::RetainedCloseFinished(..)
                 | Self::Retired(..)
                 | Self::DispatchQueued(..)
+                | Self::GoalModelWake(..)
                 | Self::ClearCopied(..)
                 | Self::DisarmInterrupt(..)
                 | Self::Files(..)
@@ -489,6 +497,8 @@ impl Action {
             | Self::ResumeAfterSignIn(target)
             | Self::AcceptSuggestion(target, _)
             | Self::Submit(target, _)
+            | Self::GoalPanel(target, _)
+            | Self::GoalIntent(target, _)
             | Self::DiscardClosedDraft(target, _)
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
@@ -2043,6 +2053,9 @@ pub(super) struct Runtime {
     closed_elsewhere: bool,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
+    goal_open: bool,
+    goal_focus: goal_focus::Controller,
+    goal_pending: Option<goal_dispatch::Pending>,
     /// Messages held here for the next turn, oldest first.
     followups: Vec<Followup>,
     next_followup: u64,
@@ -2277,6 +2290,9 @@ fn submission(
     attachments: &[Attachment],
     mode: PromptMode,
 ) -> Result<Command, &'static str> {
+    if chat::goal::parse(text).is_some() {
+        return Err("Native goals must use the goal controls, not a prompt or queued message.");
+    }
     match (mode, slash_invocation(text, snapshot)) {
         (_, Some(SlashInvocation::Permissions)) => {
             Err("Permissions are managed in the native permissions panel.")
@@ -2932,6 +2948,7 @@ impl Runtime {
     /// retire old insert ownership before those callbacks become unreachable.
     fn retarget(&mut self, target: Target) {
         if self.target != target {
+            self.cancel_goal_for_target(target);
             self.cancel_attachment_jobs();
             self.attachment_chooser_pending = None;
             self.target = target;
@@ -2971,6 +2988,9 @@ impl Runtime {
             connection,
             closed_elsewhere: false,
             queued: None,
+            goal_open: false,
+            goal_focus: goal_focus::Controller::default(),
+            goal_pending: None,
             followups: Vec::new(),
             next_followup: 0,
             recalling: Vec::new(),
@@ -3278,7 +3298,10 @@ impl Runtime {
     /// Whether this draft's provider, model and account can still change: it
     /// has not started, and its first message is not on its way.
     fn choosing(&self) -> bool {
-        self.is_draft() && self.queued.is_none() && self.attachment_chooser_pending.is_none()
+        self.is_draft()
+            && self.queued.is_none()
+            && self.goal_pending.is_none()
+            && self.attachment_chooser_pending.is_none()
     }
     /// Highlights the transcript's code blocks in `theme` from now on.
     pub(super) fn set_syntax_theme(&mut self, theme: crate::settings::EditorSyntaxTheme) {
@@ -4456,6 +4479,7 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         if !visible {
+            self.goal_focus.clear();
             self.find_navigation.cancel_all();
             self.preparation.clear_local();
             if let Some(queued) = &mut self.queued {
@@ -4553,7 +4577,10 @@ impl Runtime {
     /// visibility recorded here.
     fn present(&self) -> Result<(), String> {
         let retain_body = self.visible.load(Ordering::Relaxed);
-        let interested = retain_body || self.queued.is_some() || !self.followups.is_empty();
+        let interested = retain_body
+            || self.queued.is_some()
+            || self.goal_pending.is_some()
+            || !self.followups.is_empty();
         match self.handle() {
             Some(handle) if handle.is_connected() => {
                 match handle.set_interest(interested, retain_body) {
@@ -4581,6 +4608,8 @@ impl Runtime {
             "chat-subagent-search"
         } else if self.model_picker.is_some() {
             "chat-model-search"
+        } else if self.goal_open {
+            "chat-goal-close"
         } else {
             "chat-composer"
         }
@@ -5329,9 +5358,9 @@ impl Cagents {
             .and_then(|card| self.cards.get(&card))
             .is_some_and(|card| {
                 matches!(card, CardRuntime::Chat(runtime)
-                if runtime.picker_keyboard
+                if runtime.goal_open || (runtime.picker_keyboard
                     && (runtime.account_picker || (runtime.permission_picker
-                        && runtime.permissions_form.page == permissions::Page::Blocked)))
+                        && runtime.permissions_form.page == permissions::Page::Blocked))))
             })
     }
 
@@ -5355,7 +5384,9 @@ impl Cagents {
             },
             _ => None,
         })?;
-        let ring: Vec<_> = if runtime.account_picker {
+        let ring: Vec<_> = if runtime.goal_open {
+            runtime.goal_controls()
+        } else if runtime.account_picker {
             let accounts = self.chat_accounts(
                 runtime.session.launch.provider,
                 &runtime.session.launch.recipe,
@@ -5692,6 +5723,15 @@ impl Cagents {
                 .get(account::routing::AUTOMATIC_MARKER)
                 .map(String::as_str)
                 != Some("1")
+            || chat::goal::parse(&runtime.composer.text()).is_some()
+            || goal_dispatch::blocks_automatic(
+                runtime
+                    .handle()
+                    .map(|handle| handle.snapshot())
+                    .as_deref()
+                    .unwrap_or(runtime.snapshot.as_ref()),
+            )
+            || runtime.goal_pending.is_some()
             || slash_invocation(&runtime.composer.text(), &runtime.snapshot).is_some()
         {
             return None;
@@ -6381,7 +6421,10 @@ impl Cagents {
             || runtime.footer_picker
             || runtime.account_picker
             || runtime.composer_actions
-            || runtime.branch_picker;
+            || runtime.branch_picker
+            || runtime.goal_open;
+        runtime.goal_open = false;
+        runtime.goal_focus.clear();
         runtime.reasoning_picker = false;
         runtime.permission_picker = false;
         runtime.footer_picker = false;
@@ -6748,6 +6791,12 @@ impl Cagents {
     pub(super) fn chat_forget(&mut self, card: CardId) {
         self.chat_ui.explicit_starts.remove(&card);
         self.chat_ui.capacity_offers.remove(&card);
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            runtime.cancel_unsent_goal();
+        }
+        if let Some(runtime) = self.chat_ui.parked.get_mut(&card) {
+            runtime.cancel_unsent_goal();
+        }
         // The runtime is about to be dropped, so its unsent text is captured
         // here rather than lost. `chat_forget` is the single place a chat
         // runtime stops existing while its card lives on.
@@ -8093,6 +8142,19 @@ impl Cagents {
         let Some(handle) = runtime.handle().cloned() else {
             return Task::none();
         };
+        if let Command::Goal {
+            thread_id,
+            revision,
+            ..
+        } = &command
+        {
+            if !goal_dispatch::current_goal(runtime, &handle).is_some_and(|goal| {
+                &goal.thread_id == thread_id && goal.revision == *revision && !goal.pending
+            }) {
+                runtime.error = Some("The native goal changed; check it before acting.".into());
+                return Task::none();
+            }
+        }
         let request = if let Command::Answer {
             request_id, action, ..
         } = &command
@@ -8192,7 +8254,11 @@ impl Cagents {
             sent_attachments,
             queued: step,
         });
-        runtime.error = None;
+        runtime.error = if runtime.supersede_waiting_goal_model(&command) {
+            Some("The selected model or reasoning changed before the goal was sent. Your input is kept; submit it again.".into())
+        } else {
+            None
+        };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || handle.send(command))
                 .await
@@ -8202,12 +8268,24 @@ impl Cagents {
         })
     }
     pub(super) fn handle_chat_ui(&mut self, action: Action) -> Task<Message> {
+        let goal_focus = match &action {
+            Action::Wake(target, Wake::Changed) => {
+                self.cards.get(&target.card).and_then(|card| match card {
+                    CardRuntime::Chat(runtime) if runtime.target == *target => {
+                        runtime.goal_focus.before_refresh(runtime)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        };
         let closed_refresh = match &action {
             Action::Ready(target, _) => Some(target.card),
             _ => None,
         };
         let restore = match &action {
-            Action::AccountPicker(target, false)
+            Action::GoalPanel(target, false)
+            | Action::AccountPicker(target, false)
             | Action::PermissionPicker(target, false)
             | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
@@ -8220,6 +8298,7 @@ impl Cagents {
                     CardRuntime::Chat(runtime)
                         if runtime.target == *target
                             && (runtime.picker_keyboard
+                                || runtime.goal_open
                                 || runtime.model_picker.is_some()
                                 || runtime.child_picker.is_some()) =>
                     {
@@ -8230,16 +8309,41 @@ impl Cagents {
             }
             _ => None,
         };
+        let goal_before = self
+            .workspace
+            .focused()
+            .and_then(|card| match self.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) => Some((runtime.target, runtime.goal_open)),
+                _ => None,
+            });
+        let goal_close = matches!(&action, Action::GoalPanel(_, false));
         let task = self.handle_chat_ui_inner(action);
         self.reconcile_chat_failure_presentations();
         if let Some(card) = closed_refresh {
             self.sync_closed_chat_draft(card);
         }
+        if let Some((target, false)) = goal_before
+            && self.workspace.focused() == Some(target.card)
+            && !self.workspace_inputs_blocked()
+            && self
+                .chat_runtime_mut(target)
+                .is_some_and(|runtime| runtime.goal_open)
+        {
+            return Task::batch([
+                task,
+                iced::widget::operation::focus(card_control_id(target.card, "chat-goal-close"))
+                    .map(cosmic::Action::App),
+            ]);
+        }
         if let Some(target) = restore
+            && (!goal_close
+                || (self.workspace.focused() == Some(target.card)
+                    && !self.workspace_inputs_blocked()))
             && let Some(runtime) = self.chat_runtime_mut(target)
             && !runtime.account_picker
             && !runtime.permission_picker
             && runtime.model_picker.is_none()
+            && !runtime.goal_open
         {
             runtime.picker_keyboard = false;
             return Task::batch([
@@ -8248,7 +8352,10 @@ impl Cagents {
                     .map(cosmic::Action::App),
             ]);
         }
-        task
+        match goal_focus {
+            Some(ticket) => Task::batch([task, self.restore_goal_focus(ticket)]),
+            None => task,
+        }
     }
 
     pub(super) fn reconcile_chat_failure_presentations(&mut self) {
@@ -8358,6 +8465,17 @@ impl Cagents {
         }
         if matches!(&action, Action::Submit(target, _) if self.chat_closed_elsewhere(target.card)) {
             return Task::none();
+        }
+        if let Action::AccountPicker(target, true)
+        | Action::PermissionPicker(target, true)
+        | Action::FooterPicker(target, true)
+        | Action::ModelPicker(target, true)
+        | Action::ReasoningPicker(target, true)
+        | Action::SubagentPicker(target, true) = &action
+            && let Some(runtime) = self.chat_runtime_mut(*target)
+        {
+            runtime.goal_open = false;
+            runtime.goal_focus.clear();
         }
         match action {
             Action::CopyClosedDraft(target, revision) => {
@@ -8499,6 +8617,7 @@ impl Cagents {
                 }
                 return self.dispatch_queued(target);
             }
+            Action::GoalModelWake(target, witness) => return self.goal_model_wake(target, witness),
             Action::CancelQueued(target) => return self.cancel_queued(target),
             Action::Switch(card) => {
                 if let Some(reason) = self.chat_switch_blocker(card) {
@@ -8741,6 +8860,11 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
+                if result.is_err() {
+                    if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                        runtime.fail_goal_start(&attempt.session);
+                    }
+                }
                 let recovery = attempt.recovery.take();
                 let automatic_submit = recovery.as_ref().and_then(|recovery| recovery.submit);
                 let account_committed =
@@ -8961,6 +9085,7 @@ impl Cagents {
                             if let Some(queued) = &mut runtime.queued {
                                 queued.presentation = prompt::LocalPresentation::default();
                             }
+                            runtime.bind_started_goal(&attempt.session, target, &session, &handle);
                             runtime.retarget(target);
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
@@ -9065,6 +9190,7 @@ impl Cagents {
                             usage,
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
+                            self.dispatch_goal(target),
                             focus,
                         ]);
                     }
@@ -9399,6 +9525,7 @@ impl Cagents {
                             self.list_chat_models(target.card),
                             self.resume_current_find(target, true),
                             self.dispatch_queued(target),
+                            self.dispatch_goal(target),
                             self.resume_history_navigation(target),
                             fork.map_or_else(Task::none, |session| {
                                 let scope = if let Some(channel) = self
@@ -9842,6 +9969,19 @@ impl Cagents {
                     }
                 }
             }
+            Action::GoalPanel(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    if open {
+                        runtime.open_goal_panel();
+                    } else {
+                        // A queued close only hides presentation. It cannot
+                        // cancel an intent created after that button rendered.
+                        runtime.goal_open = false;
+                        runtime.goal_focus.clear();
+                    }
+                }
+            }
+            Action::GoalIntent(target, control) => return self.goal_control(target, control),
             Action::Submit(target, mode) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -9854,6 +9994,12 @@ impl Cagents {
                         || runtime.snapshot.read_only_reason.is_some())
                 {
                     return Task::none();
+                }
+                if let Some(parsed) = self
+                    .chat_runtime_mut(target)
+                    .and_then(|runtime| chat::goal::parse(&runtime.composer.text()))
+                {
+                    return self.submit_goal(target, mode, parsed);
                 }
                 if let Some((account, generation, revision)) =
                     self.automatic_chat_account(target, mode)
@@ -10251,6 +10397,12 @@ impl Cagents {
                 }
             }
             Action::Command(target, command) => {
+                if matches!(&command, Command::Goal { .. }) {
+                    if let Some(runtime) = self.chat_runtime_mut(target) {
+                        runtime.error = Some("Use the current native goal controls so the original actor stays bound.".into());
+                    }
+                    return Task::none();
+                }
                 if matches!(command, Command::Compact | Command::Branch { .. })
                     && let Some(runtime) = self.chat_runtime_mut(target)
                 {
@@ -10445,11 +10597,15 @@ impl Cagents {
                     return Task::none();
                 }
                 let pending = runtime.pending.take().unwrap();
+                let goal_command = runtime.goal_command_matches(id);
                 let provider = runtime.session.launch.provider;
                 if result.is_ok()
                     && let Some((model, reasoning)) = pending.model.clone()
                 {
                     self.remember_chat_model(provider, Some(model), reasoning);
+                }
+                if goal_command {
+                    return self.goal_command_finished(target, id, result);
                 }
                 if let Some(step) = pending.queued {
                     return self.queued_step_finished(target, step, pending.first_prompt, result);
@@ -10528,6 +10684,7 @@ impl Cagents {
                 // wake the follow-up again once the command releases it.
                 return Task::batch([
                     self.dispatch_queued(target),
+                    self.dispatch_goal(target),
                     self.resume_history_navigation(target),
                 ]);
             }
@@ -25292,6 +25449,98 @@ mod tests {
         );
         assert!(!Action::OpenChangedFile(target, "/reported".into()).allowed_while_modal());
     }
+    #[test]
+    fn goal_panel_excludes_other_pickers_and_escape_restores_only_its_focused_composer() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("goal-picker-lifecycle"));
+        app.workspace.focus(card).unwrap();
+        let target = chat_runtime(&app, card).target;
+        write(&mut app, card, "draft kept while inspecting goal");
+        let rt = app.chat_runtime_mut(target).unwrap();
+        rt.attachments.push(Attachment::file("kept.txt"));
+        rt.composer.perform(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        ));
+        let before = (
+            rt.composer.text(),
+            rt.composer.cursor(),
+            rt.attachments.clone(),
+            rt.revision,
+        );
+        let close = card_control_id(card, "chat-goal-close");
+        let composer = card_control_id(card, "chat-composer");
+
+        for picker in [
+            Action::ModelPicker(target, true),
+            Action::PermissionPicker(target, true),
+            Action::FooterPicker(target, true),
+            Action::ReasoningPicker(target, true),
+            Action::ComposerActions(target, true),
+            Action::SubagentPicker(target, true),
+        ] {
+            drop(app.handle_chat_ui(picker));
+            assert!(!chat_runtime(&app, card).goal_open);
+            let task = app.handle_chat_ui(Action::GoalPanel(target, true));
+            let rt = chat_runtime(&app, card);
+            assert!(rt.goal_open);
+            assert!(rt.model_picker.is_none());
+            assert!(rt.child_picker.is_none());
+            assert!(
+                !rt.permission_picker
+                    && !rt.account_picker
+                    && !rt.footer_picker
+                    && !rt.reasoning_picker
+                    && !rt.composer_actions
+            );
+            assert!(!rt.branch_picker);
+            assert_eq!(rt.focus_control(), "chat-goal-close");
+            assert!(app.chat_picker_owns_keyboard());
+            assert_eq!(task_focuses(task, &close), (true, false));
+        }
+        let stale = Target {
+            generation: target.generation + 1,
+            ..target
+        };
+        let task = app.handle_chat_ui(Action::GoalPanel(stale, false));
+        assert!(chat_runtime(&app, card).goal_open);
+        assert_eq!(task_focuses(task, &composer), (false, true));
+
+        let key = keyboard::Key::Named(keyboard::key::Named::Escape);
+        let task = app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured: true,
+        });
+        assert!(!chat_runtime(&app, card).goal_open);
+        assert!(!app.chat_picker_owns_keyboard());
+        assert_eq!(task_focuses(task, &composer), (true, false));
+        let rt = chat_runtime(&app, card);
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision
+            ),
+            before
+        );
+        assert!(!app.dismiss_chat_picker());
+
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let other = draft_chat(&mut app);
+        assert_eq!(app.workspace.focused(), Some(other));
+        let task = app.handle_chat_ui(Action::GoalPanel(target, false));
+        assert!(!chat_runtime(&app, card).goal_open);
+        assert_eq!(task_focuses(task, &composer), (false, true));
+    }
+
     #[test]
     fn composer_actions_navigate_dismiss_and_ignore_stale_targets() {
         let mut app = crate::app::tests::context_inspector_test_app(false);

@@ -298,10 +298,14 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
             })
             .filter(|(name, _)| {
                 !name.eq_ignore_ascii_case(RESUME_COMMAND)
+                    && !name.eq_ignore_ascii_case("goal")
                     && !(permissions_available(snapshot)
                         && name.eq_ignore_ascii_case(PERMISSIONS_COMMAND))
             })
-            .chain([(RESUME_COMMAND, "Return to a saved conversation")]);
+            .chain([
+                (RESUME_COMMAND, "Return to a saved conversation"),
+                ("goal", "Inspect or change the native Codex thread goal"),
+            ]);
         // Compaction is a capability rather than an advertised command for
         // some providers; the composer answers to it either way, so the list
         // says so too.
@@ -931,7 +935,14 @@ mod tests {
         let snapshot = snapshot();
         assert_eq!(
             insertions(&snapshot, "/|"),
-            ["/clear", "/review", "/resume", "/commits", "/pr-review"]
+            [
+                "/clear",
+                "/review",
+                "/resume",
+                "/goal",
+                "/commits",
+                "/pr-review"
+            ]
         );
         // Mid-message a command would be sent as words; a skill still works.
         assert_eq!(insertions(&snapshot, "then /|"), ["/commits", "/pr-review"]);

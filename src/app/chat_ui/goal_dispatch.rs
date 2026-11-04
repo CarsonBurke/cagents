@@ -1,0 +1,3173 @@
+//! Native goal intent custody. Nothing in this path is a prompt or follow-up.
+use super::*;
+use crate::chat::goal::{Operation, Outcome, ReadState, Status, Support};
+use std::sync::Weak;
+
+#[derive(Clone)]
+struct Binding {
+    target: Target,
+    session: chat::Session,
+    handle: Weak<ClientHandle>,
+}
+impl Binding {
+    fn capture(runtime: &Runtime) -> Option<Self> {
+        let handle = runtime.handle()?;
+        (handle.is_connected() && handle.session() == runtime.session).then(|| Self {
+            target: runtime.target,
+            session: runtime.session.clone(),
+            handle: Arc::downgrade(handle),
+        })
+    }
+    fn matches(&self, runtime: &Runtime) -> bool {
+        self.target == runtime.target
+            && self.session == runtime.session
+            && self
+                .handle
+                .upgrade()
+                .zip(runtime.handle())
+                .is_some_and(|(original, current)| {
+                    Arc::ptr_eq(&original, current)
+                        && current.is_connected()
+                        && current.session() == self.session
+                })
+    }
+}
+
+/// Includes the native actor witness: a Target and reused epoch alone are not
+/// authority to redirect an already queued button callback to another actor.
+#[derive(Clone)]
+pub struct Control {
+    binding: Binding,
+    thread: String,
+    intent: goal::Intent,
+}
+
+#[derive(Clone)]
+struct Input {
+    revision: u64,
+    text: String,
+}
+impl Input {
+    fn matches(&self, runtime: &Runtime) -> bool {
+        runtime.revision == self.revision
+            && runtime.composer.text() == self.text
+            && runtime.attachments.is_empty()
+            && runtime.pastes_pending == 0
+            && runtime.attachment_chooser_pending.is_none()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Stage {
+    Waiting,
+    Model(u64),
+    Native {
+        revision: u64,
+        command: u64,
+        accepted: bool,
+    },
+}
+#[derive(Clone)]
+enum PendingSource {
+    Typed,
+    Panel { thread: String, revision: u64 },
+}
+
+#[derive(Clone)]
+pub(super) struct Pending {
+    operation: Operation,
+    source: PendingSource,
+    input: Option<Input>,
+    start: Option<chat::Session>,
+    binding: Option<Binding>,
+    selection: Option<(String, Option<String>)>,
+    model: Option<(String, Option<String>)>,
+    model_sent: bool,
+    model_wait: Option<(Instant, Arc<()>)>,
+    model_rechecking: bool,
+    wait_for_ready: bool,
+    stage: Stage,
+}
+
+impl Pending {
+    fn native_command(&self, current: &chat::goal::Snapshot) -> (Command, u64) {
+        let (thread, revision) = match &self.source {
+            PendingSource::Typed => (&current.thread_id, current.revision),
+            PendingSource::Panel { thread, revision } => (thread, *revision),
+        };
+        (
+            Command::Goal {
+                thread_id: thread.clone(),
+                revision,
+                operation: self.operation.clone(),
+            },
+            revision,
+        )
+    }
+
+    fn look_again(&mut self, target: Target, wait: Duration) -> Task<Message> {
+        if std::mem::replace(&mut self.model_rechecking, true) {
+            return Task::none();
+        }
+        let witness = Arc::downgrade(&self.model_wait.as_ref().expect("model wait started").1);
+        cosmic::task::future(async move {
+            tokio::time::sleep(wait).await;
+            Message::ChatUi(Action::GoalModelWake(target, witness))
+        })
+    }
+}
+
+pub(super) fn blocks_automatic(snapshot: &Snapshot) -> bool {
+    snapshot.goal.as_ref().is_some_and(|goal| {
+        goal.pending
+            || goal.uncertain
+            || match (&goal.support, &goal.read) {
+                (Support::Unsupported, _) => true,
+                (Support::Supported, ReadState::Known(None)) => false,
+                (Support::Supported, ReadState::Known(Some(goal))) => {
+                    !matches!(goal.status, Status::Paused | Status::Complete)
+                }
+                _ => true,
+            }
+    })
+}
+
+/// Read the current handle publication at the dispatch boundary, not the last
+/// rendered panel. All command paths additionally retain their original source.
+pub(super) fn current_goal(
+    runtime: &Runtime,
+    handle: &Arc<ClientHandle>,
+) -> Option<chat::goal::Snapshot> {
+    goal_in_snapshot(runtime, handle, &handle.snapshot())
+}
+
+/// Selection and Goal revision must come from one immutable publication. A
+/// newer publication may invalidate this witness, never upgrade its revision.
+fn goal_in_snapshot(
+    runtime: &Runtime,
+    handle: &Arc<ClientHandle>,
+    latest: &Snapshot,
+) -> Option<chat::goal::Snapshot> {
+    if runtime.session.launch.provider != Provider::Codex
+        || runtime.selected_subagent.is_some()
+        || runtime.disconnected
+        || !handle.is_connected()
+        || runtime
+            .handle()
+            .is_none_or(|current| !Arc::ptr_eq(current, handle))
+        || handle.session() != runtime.session
+    {
+        return None;
+    }
+    let goal = latest.goal.as_ref()?;
+    (!latest.exited
+        && latest.session_id.as_deref() == Some(goal.thread_id.as_str())
+        && runtime.session.launch.session_id.as_deref() == Some(goal.thread_id.as_str()))
+    .then(|| goal.clone())
+}
+
+impl Runtime {
+    /// One view hook; the parent composer and its text/caret/attachments are
+    /// never replaced by opening, closing or pressing a goal control.
+    pub(in crate::app) fn goal_panel(&self) -> Option<Element<'_, Message>> {
+        if !self.goal_open {
+            return None;
+        }
+        let binding = Binding::capture(self);
+        let observed = self.snapshot.goal.as_ref();
+        let presentation = self.goal_presentation();
+        let target = self.target;
+        let thread = observed.map_or_else(String::new, |goal| goal.thread_id.clone());
+        let focus = self.goal_focus.controls(self, presentation);
+        let panel = goal::panel_with_focus(
+            presentation,
+            self.goal_control_ids(),
+            focus,
+            move |intent| {
+                // Disabled controls never call the reducer. Keep the callback pure
+                // even for an unavailable observation; there is no I/O here.
+                let binding = binding.clone().unwrap_or_else(|| Binding {
+                    target,
+                    session: self.session.clone(),
+                    handle: Weak::new(),
+                });
+                Message::ChatUi(Action::GoalIntent(
+                    target,
+                    Control {
+                        binding,
+                        thread: thread.clone(),
+                        intent,
+                    },
+                ))
+            },
+        );
+        Some(
+            crate::ui_controls::owned(
+                (
+                    target,
+                    self.handle().map(|handle| Arc::as_ptr(handle) as usize),
+                ),
+                widget::column::with_children(vec![
+                    crate::ui_controls::button::quiet("Close goal panel")
+                        .id(card_control_id(target.card, "chat-goal-close"))
+                        .on_press(Message::ChatUi(Action::GoalPanel(target, false)))
+                        .into(),
+                    panel,
+                ])
+                .spacing(design::space::S)
+                .width(Length::Fill),
+            )
+            .into(),
+        )
+    }
+
+    fn goal_presentation(&self) -> goal::Presentation<'_> {
+        let live = self.handle().and_then(|handle| current_goal(self, handle));
+        let observed = self.snapshot.goal.as_ref();
+        let current = live
+            .as_ref()
+            .zip(observed)
+            .is_some_and(|(live, observed)| live == observed)
+            && self.pending.is_none()
+            && self.goal_pending.is_none();
+        let support = observed.map_or(
+            if self.session.launch.provider == Provider::Codex {
+                Support::Unknown
+            } else {
+                Support::Unsupported
+            },
+            |goal| goal.support,
+        );
+        goal::Presentation {
+            support,
+            read: observed.map_or(&ReadState::Unknown, |goal| &goal.read),
+            pending: observed.is_some_and(|goal| goal.pending) || self.goal_pending.is_some(),
+            preparing: self
+                .goal_pending
+                .as_ref()
+                .is_some_and(|pending| !matches!(pending.stage, Stage::Native { .. })),
+            uncertain: observed.is_some_and(|goal| goal.uncertain),
+            current,
+            work_ready: self.handle().is_some_and(|handle| {
+                let latest = handle.snapshot();
+                latest.ready && latest.read_only_reason.is_none()
+            }),
+            observation_revision: observed.map_or(0, |goal| goal.revision),
+        }
+    }
+
+    fn goal_control_ids(&self) -> [widget::Id; 4] {
+        ["check", "pause", "resume", "clear"]
+            .map(|control| card_control_id(self.target.card, &format!("chat-goal-{control}")))
+    }
+
+    pub(super) fn goal_controls(&self) -> Vec<widget::Id> {
+        let presentation = self.goal_presentation();
+        std::iter::once(card_control_id(self.target.card, "chat-goal-close"))
+            .chain(
+                self.goal_control_ids()
+                    .into_iter()
+                    .zip([
+                        Operation::Get,
+                        Operation::Pause,
+                        Operation::Resume,
+                        Operation::Clear,
+                    ])
+                    .filter_map(|(id, operation)| {
+                        presentation.control_enabled(&operation).then_some(id)
+                    }),
+            )
+            .collect()
+    }
+
+    pub(super) fn open_goal_panel(&mut self) {
+        self.model_picker = None;
+        self.reasoning_picker = false;
+        self.permission_picker = false;
+        self.footer_picker = false;
+        self.account_picker = false;
+        self.composer_actions = false;
+        self.branch_picker = false;
+        self.child_picker = None;
+        self.picker_keyboard = false;
+        self.picker_focus = 0;
+        self.goal_open = true;
+    }
+
+    pub(super) fn cancel_unsent_goal(&mut self) {
+        if self
+            .goal_pending
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.stage, Stage::Waiting))
+        {
+            self.goal_pending = None;
+            let _ = self.present();
+        }
+    }
+
+    /// Called only after the replacement command has its own admitted slot.
+    /// A local model choice never releases Model/Native physical custody.
+    pub(super) fn supersede_waiting_goal_model(&mut self, command: &Command) -> bool {
+        let Command::SetModel { model, reasoning } = command else {
+            return false;
+        };
+        let superseded = self.goal_pending.as_ref().is_some_and(|pending| {
+            matches!(pending.stage, Stage::Waiting)
+                && matches!(
+                    pending.operation,
+                    Operation::SetObjective(_) | Operation::Resume
+                )
+                && pending
+                    .selection
+                    .as_ref()
+                    .is_none_or(|selection| selection.0 != *model || selection.1 != *reasoning)
+        });
+        if superseded {
+            self.goal_pending = None;
+            let _ = self.present();
+        }
+        superseded
+    }
+    pub(super) fn cancel_goal_for_target(&mut self, target: Target) {
+        if self.goal_pending.as_ref().is_some_and(|pending| {
+            matches!(pending.stage, Stage::Waiting)
+                && pending
+                    .binding
+                    .as_ref()
+                    .is_none_or(|binding| binding.target != target)
+        }) {
+            self.goal_pending = None;
+        }
+    }
+
+    pub(super) fn fail_goal_start(&mut self, session: &chat::Session) {
+        if self
+            .goal_pending
+            .as_ref()
+            .is_some_and(|pending| pending.start.as_ref() == Some(session))
+        {
+            self.goal_pending = None;
+        }
+    }
+    pub(super) fn bind_started_goal(
+        &mut self,
+        original: &chat::Session,
+        target: Target,
+        session: &chat::Session,
+        handle: &Arc<ClientHandle>,
+    ) {
+        let Some(pending) = &mut self.goal_pending else {
+            return;
+        };
+        if pending.start.as_ref() != Some(original) {
+            return;
+        }
+        // Ready has already admitted the exact start result and canonical card.
+        // Do not transfer a deferred intent into account recovery/another start.
+        if self.session != *original
+            || session.id != original.id
+            || session.launch.provider != original.launch.provider
+        {
+            self.goal_pending = None;
+            self.error = Some(
+                "The goal's original conversation changed; submit it explicitly again.".into(),
+            );
+            return;
+        }
+        pending.start = None;
+        pending.binding = Some(Binding {
+            target,
+            session: session.clone(),
+            handle: Arc::downgrade(handle),
+        });
+    }
+    pub(super) fn goal_command_matches(&self, command: u64) -> bool {
+        self.goal_pending
+            .as_ref()
+            .is_some_and(|pending| match pending.stage {
+                Stage::Model(id) | Stage::Native { command: id, .. } => command == id,
+                Stage::Waiting => false,
+            })
+    }
+    pub(super) fn observe_goal_completion(&mut self, snapshot: &Snapshot) {
+        let Some(pending) = self.goal_pending.as_ref() else {
+            return;
+        };
+        let Stage::Native {
+            revision,
+            accepted: true,
+            ..
+        } = pending.stage
+        else {
+            return;
+        };
+        if pending
+            .binding
+            .as_ref()
+            .is_none_or(|binding| !binding.matches(self))
+        {
+            self.goal_pending = None;
+            return;
+        }
+        let Some(goal) = &snapshot.goal else { return };
+        if snapshot.session_id.as_deref() != Some(goal.thread_id.as_str())
+            || self.session.launch.session_id.as_deref() != Some(goal.thread_id.as_str())
+            || goal.pending
+        {
+            return;
+        }
+        let result = goal
+            .last_result
+            .filter(|result| result.revision == revision);
+        let Some(result) = result else {
+            if goal.revision > revision {
+                self.error = Some("The native goal changed before its result was confirmed. Check the goal; your input is kept.".into());
+                self.goal_pending = None;
+            }
+            return;
+        };
+        let input = pending.input.clone();
+        let objective_matches = match &pending.operation {
+            Operation::SetObjective(expected) => matches!(&goal.read,
+                ReadState::Known(Some(observed)) if &observed.objective == expected),
+            _ => true,
+        };
+        self.goal_pending = None;
+        match result.outcome {
+            Outcome::Confirmed => {
+                if !objective_matches {
+                    self.error = Some("The provider confirmed a different current goal objective. Its actual observation is shown; your input is kept.".into());
+                    return;
+                }
+                if input.as_ref().is_some_and(|input| input.matches(self)) {
+                    self.replace_draft(text_editor::Content::new());
+                }
+                self.error = None;
+            }
+            Outcome::Uncertain => self.error = Some("The native goal result is unconfirmed. Check the goal before trying a change again; your input is kept.".into()),
+            Outcome::Unsupported => self.error = Some("Native goals are not supported by this provider connection; your input is kept.".into()),
+        }
+        let _ = self.present();
+    }
+}
+
+impl Cagents {
+    fn goal_source_current(&self, target: Target) -> bool {
+        matches!((self.card_state(target.card), self.cards.get(&target.card)),
+            (Some(card), Some(CardRuntime::Chat(runtime))) if runtime.target == target
+                && matches!(&card.kind, CardKind::Chat(session) if session == &runtime.session))
+    }
+
+    pub(super) fn submit_goal(
+        &mut self,
+        target: Target,
+        mode: PromptMode,
+        parsed: Result<Operation, chat::goal::Error>,
+    ) -> Task<Message> {
+        if !self.goal_source_current(target) {
+            return Task::none();
+        }
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        runtime.open_goal_panel();
+        let refusal = if mode != PromptMode::Send {
+            Some(
+                "Native goals cannot be queued or steered. Use Send to request the goal change."
+                    .to_owned(),
+            )
+        } else if runtime.session.launch.provider != Provider::Codex {
+            Some("Native goals are supported only by Codex connections; this input will not be sent as a prompt.".into())
+        } else if runtime.selected_subagent.is_some() {
+            Some("Return to the parent conversation before using its native goal controls.".into())
+        } else if runtime.pastes_pending > 0
+            || runtime.attachment_chooser_pending.is_some()
+            || !runtime.attachments.is_empty()
+        {
+            Some("Finish the paste and remove attachments before requesting a native goal; all input is kept.".into())
+        } else if runtime.goal_pending.is_some()
+            || runtime.pending.is_some()
+            || runtime.queued.is_some()
+            || !runtime.followups.is_empty()
+        {
+            Some("Finish the pending chat or goal request before submitting a native goal.".into())
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            runtime.error = Some(refusal);
+            return Task::none();
+        }
+        let operation = match parsed {
+            Ok(operation) => operation,
+            Err(error) => {
+                runtime.error = Some(error.to_string());
+                return Task::none();
+            }
+        };
+        let draft = runtime.is_draft();
+        let mut session = runtime.session.clone();
+        if draft {
+            session.id = TerminalId::new();
+        }
+        let binding = if draft {
+            None
+        } else {
+            Binding::capture(runtime)
+        };
+        if !draft && binding.is_none() {
+            runtime.error = Some(
+                "Reconnect the original conversation before requesting its native goal.".into(),
+            );
+            return Task::none();
+        }
+        runtime.goal_pending = Some(Pending {
+            operation,
+            source: PendingSource::Typed,
+            input: Some(Input {
+                revision: runtime.revision,
+                text: runtime.composer.text(),
+            }),
+            start: draft.then(|| session.clone()),
+            binding,
+            selection: runtime
+                .snapshot
+                .selected_model
+                .clone()
+                .map(|model| (model, runtime.snapshot.reasoning.clone())),
+            model: draft
+                .then(|| {
+                    runtime
+                        .snapshot
+                        .selected_model
+                        .clone()
+                        .map(|model| (model, runtime.snapshot.reasoning.clone()))
+                })
+                .flatten(),
+            model_sent: false,
+            model_wait: None,
+            model_rechecking: false,
+            wait_for_ready: draft,
+            stage: Stage::Waiting,
+        });
+        runtime.error = None;
+        runtime.model_picker = None;
+        runtime.account_picker = false;
+        runtime.reasoning_picker = false;
+        if draft {
+            runtime.session = session.clone();
+            self.replace_chat_conversation(target.card, session.clone());
+            self.start_chat(target.card, session, chat::Intent::Start, None, false)
+        } else {
+            self.dispatch_goal(target)
+        }
+    }
+
+    pub(super) fn goal_control(&mut self, target: Target, control: Control) -> Task<Message> {
+        if self.admit_goal_control(target, control) {
+            self.dispatch_goal(target)
+        } else {
+            Task::none()
+        }
+    }
+
+    fn admit_goal_control(&mut self, target: Target, control: Control) -> bool {
+        if !self.goal_source_current(target) {
+            return false;
+        }
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return false;
+        };
+        if !runtime.goal_open {
+            return false;
+        }
+        if let Err(error) = control.intent.operation.validate() {
+            runtime.error = Some(error.to_string());
+            return false;
+        }
+        let Some(handle) = runtime.handle().cloned() else {
+            return false;
+        };
+        let valid = control.binding.matches(runtime)
+            && runtime.goal_pending.is_none()
+            && runtime.pending.is_none()
+            && runtime.queued.is_none()
+            && current_goal(runtime, &handle).is_some_and(|goal| {
+                goal.thread_id == control.thread
+                    && goal.revision == control.intent.observation_revision
+                    && !goal.pending
+                    && (control.intent.operation == Operation::Get || !goal.uncertain)
+            });
+        if !valid {
+            runtime.error = Some("The goal control is stale or its conversation is unavailable. Check the current goal.".into());
+            return false;
+        }
+        // An old callback must not dismiss a picker opened after it rendered.
+        // Presentation changes belong to the same validated native binding.
+        runtime.open_goal_panel();
+        runtime.goal_pending = Some(Pending {
+            operation: control.intent.operation,
+            source: PendingSource::Panel {
+                thread: control.thread,
+                revision: control.intent.observation_revision,
+            },
+            input: None,
+            start: None,
+            binding: Some(control.binding),
+            selection: runtime
+                .snapshot
+                .selected_model
+                .clone()
+                .map(|model| (model, runtime.snapshot.reasoning.clone())),
+            model: None,
+            model_sent: false,
+            model_wait: None,
+            model_rechecking: false,
+            wait_for_ready: false,
+            stage: Stage::Waiting,
+        });
+        true
+    }
+
+    pub(super) fn dispatch_goal(&mut self, target: Target) -> Task<Message> {
+        let was_pending = self
+            .chat_card_runtime_mut(target)
+            .is_some_and(|runtime| runtime.goal_pending.is_some());
+        let task = self.dispatch_goal_inner(target);
+        if was_pending {
+            if let Some(runtime) = self.chat_card_runtime_mut(target) {
+                if runtime.goal_pending.is_none() {
+                    let _ = runtime.present();
+                }
+            }
+        }
+        task
+    }
+
+    pub(super) fn goal_model_wake(&mut self, target: Target, witness: Weak<()>) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        let Some(pending) = runtime.goal_pending.as_ref() else {
+            return Task::none();
+        };
+        if !matches!(pending.stage, Stage::Waiting)
+            || pending
+                .binding
+                .as_ref()
+                .is_none_or(|binding| !binding.matches(runtime))
+            || !pending.model_wait.as_ref().is_some_and(|(_, current)| {
+                witness
+                    .upgrade()
+                    .is_some_and(|original| Arc::ptr_eq(&original, current))
+            })
+        {
+            return Task::none();
+        }
+        runtime.goal_pending.as_mut().unwrap().model_rechecking = false;
+        self.dispatch_goal(target)
+    }
+
+    fn dispatch_goal_inner(&mut self, target: Target) -> Task<Message> {
+        if self.chat_start_pending(target.card)
+            || self.chat_closed_elsewhere(target.card)
+            || self
+                .card_state(target.card)
+                .is_none_or(|state| !state.existence.is_open())
+        {
+            return Task::none();
+        }
+        if !self.goal_source_current(target) {
+            if let Some(runtime) = self.chat_card_runtime_mut(target) {
+                runtime.goal_pending = None;
+                runtime.error = Some(
+                    "The goal's original saved conversation changed. Your input is kept.".into(),
+                );
+            }
+            return Task::none();
+        }
+        let Some(runtime) = self.chat_card_runtime_mut(target) else {
+            return Task::none();
+        };
+        if let Some(handle) = runtime.handle().cloned() {
+            runtime.observe_goal_completion(&handle.snapshot());
+        }
+        let Some(mut pending) = runtime.goal_pending.take() else {
+            return Task::none();
+        };
+        if pending.start.is_some() {
+            runtime.goal_pending = Some(pending);
+            return Task::none();
+        }
+        if pending
+            .binding
+            .as_ref()
+            .is_none_or(|binding| !binding.matches(runtime))
+            || pending
+                .input
+                .as_ref()
+                .is_some_and(|input| !input.matches(runtime))
+            || runtime.selected_subagent.is_some()
+        {
+            runtime.error = Some(
+                "The goal's original conversation or input changed. Submit it explicitly again."
+                    .into(),
+            );
+            return Task::none();
+        }
+        if !matches!(pending.stage, Stage::Waiting) {
+            runtime.goal_pending = Some(pending);
+            return Task::none();
+        }
+        // Once armed, this local model wait stays absolute even if readiness
+        // is lost or an unrelated physical command still owns its own slot.
+        if pending.model.is_some()
+            && pending
+                .model_wait
+                .as_ref()
+                .is_some_and(|(since, _)| since.elapsed() >= MODEL_PATIENCE)
+        {
+            runtime.error = Some("The selected model and reasoning were not confirmed in time. The goal was not sent; choose a model and submit again. Your input is kept.".into());
+            return Task::none();
+        }
+        let handle = runtime.handle().unwrap().clone();
+        let latest = handle.snapshot();
+        let goal = goal_in_snapshot(runtime, &handle, &latest);
+        // The reader can publish between panel admission and dispatch without
+        // a UI wake. That invalidates the control; it cannot upgrade its target
+        // or wait for another goal's physical request and act on its result.
+        if let PendingSource::Panel { thread, revision } = &pending.source {
+            if goal
+                .as_ref()
+                .is_none_or(|goal| &goal.thread_id != thread || goal.revision != *revision)
+            {
+                runtime.error = Some("The goal changed before this control was sent. Check the current goal and try again; your input is kept.".into());
+                return Task::none();
+            }
+        }
+        if runtime.pending.is_some() {
+            runtime.goal_pending = Some(pending);
+            return Task::none();
+        }
+        if latest.exited || runtime.disconnected {
+            runtime.error = Some(
+                "The original conversation cannot accept a native goal; your input is kept.".into(),
+            );
+            return Task::none();
+        }
+        if (!latest.ready || latest.read_only_reason.is_some())
+            && (matches!(
+                pending.operation,
+                Operation::SetObjective(_) | Operation::Resume
+            ) || pending.model.is_some())
+        {
+            if pending.wait_for_ready && latest.read_only_reason.is_none() {
+                runtime.goal_pending = Some(pending);
+            } else {
+                runtime.error = Some("The original conversation is not ready for goal work. Check, pause or clear remain available; your input is kept.".into());
+            }
+            return Task::none();
+        }
+        let model_command = if let Some((model, reasoning)) = &pending.model {
+            let waited = pending
+                .model_wait
+                .get_or_insert_with(|| (Instant::now(), Arc::new(())))
+                .0
+                .elapsed();
+            if waited >= MODEL_PATIENCE {
+                runtime.error = Some("The selected model and reasoning were not confirmed in time. The goal was not sent; choose a model and submit again. Your input is kept.".into());
+                return Task::none();
+            }
+            if latest.selected_model.as_ref() == Some(model) && &latest.reasoning == reasoning {
+                pending.model = None;
+                pending.model_wait = None;
+                pending.model_rechecking = false;
+                None
+            } else if pending.model_sent {
+                let task = pending.look_again(target, MODEL_PATIENCE - waited);
+                runtime.goal_pending = Some(pending);
+                return task;
+            } else if latest.models.iter().any(|candidate| &candidate.id == model) {
+                Some(Command::SetModel {
+                    model: model.clone(),
+                    reasoning: reasoning.clone(),
+                })
+            } else if latest.models.is_empty() {
+                let task = pending.look_again(target, MODEL_PATIENCE - waited);
+                runtime.goal_pending = Some(pending);
+                return task;
+            } else {
+                runtime.error = Some("The selected model is unavailable. The goal was not sent; choose a model and submit again.".into());
+                return Task::none();
+            }
+        } else {
+            None
+        };
+        let (command, revision) = if let Some(command) = model_command {
+            (command, None)
+        } else {
+            // The chosen model may have been staged before a probe or another
+            // Goal finished. Another attached client can replace it meanwhile.
+            // Keep the original selection through the whole unsent preparation;
+            // an unspecified effort leaves the provider's choice unconstrained.
+            if matches!(
+                pending.operation,
+                Operation::SetObjective(_) | Operation::Resume
+            ) && pending
+                .selection
+                .as_ref()
+                .is_some_and(|(model, reasoning)| {
+                    latest.selected_model.as_ref() != Some(model)
+                        || (reasoning.is_some() && &latest.reasoning != reasoning)
+                })
+            {
+                runtime.error = Some("The selected model or reasoning changed before the goal was sent. Your input is kept; choose a model and submit again.".into());
+                return Task::none();
+            }
+            let Some(goal) = goal else {
+                runtime.goal_pending = Some(pending);
+                return Task::none();
+            };
+            if goal.pending {
+                runtime.goal_pending = Some(pending);
+                return Task::none();
+            }
+            if goal.support == Support::Unsupported {
+                runtime.error = Some("Native goals are not supported by this provider connection; your input is kept.".into());
+                return Task::none();
+            }
+            if goal.uncertain && pending.operation != Operation::Get {
+                runtime.error = Some("Check the unconfirmed native goal before requesting another change; your input is kept.".into());
+                return Task::none();
+            }
+            let (command, revision) = pending.native_command(&goal);
+            (command, Some(revision))
+        };
+        runtime.goal_pending = Some(pending);
+        let task = self.chat_send(target, command, false);
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return task;
+        };
+        if let Some(command) = runtime.pending.as_ref().map(|pending| pending.id) {
+            if let Some(pending) = &mut runtime.goal_pending {
+                pending.stage = match revision {
+                    Some(revision) => Stage::Native {
+                        revision,
+                        command,
+                        accepted: false,
+                    },
+                    None => {
+                        pending.model_sent = true;
+                        Stage::Model(command)
+                    }
+                };
+            }
+        } else {
+            runtime.goal_pending = None;
+        }
+        let _ = runtime.present();
+        task
+    }
+
+    pub(super) fn goal_command_finished(
+        &mut self,
+        target: Target,
+        command: u64,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if !runtime.goal_command_matches(command) {
+            return Task::none();
+        }
+        if let Err(error) = result {
+            runtime.goal_pending = None;
+            let _ = runtime.present();
+            runtime.error = Some(format!(
+                "Native goal dispatch was not confirmed: {error}. Your input is kept; check the current goal."
+            ));
+            return Task::none();
+        }
+        if let Some(pending) = &mut runtime.goal_pending {
+            match &mut pending.stage {
+                Stage::Model(_) => pending.stage = Stage::Waiting,
+                Stage::Native { accepted, .. } => *accepted = true,
+                Stage::Waiting => {}
+            }
+        }
+        runtime.refresh();
+        self.dispatch_goal(target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const THREAD: &str = "0199a2b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b";
+
+    fn runtime(app: &Cagents, card: CardId) -> &Runtime {
+        match &app.cards[&card] {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => panic!("chat fixture"),
+        }
+    }
+    fn draft(app: &mut Cagents, provider: Provider) -> (CardId, Target) {
+        drop(app.new_native_chat(provider, Some(PathBuf::from("/workspace/chat-fixture"))));
+        let card = app.workspace.focused().unwrap();
+        (card, runtime(app, card).target)
+    }
+    fn write(app: &mut Cagents, target: Target, text: &str) {
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::new());
+        drop(app.handle_chat_ui(Action::Composer(
+            target,
+            text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(text.into()))),
+        )));
+    }
+    fn goal(revision: u64) -> chat::goal::Snapshot {
+        chat::goal::Snapshot {
+            thread_id: THREAD.into(),
+            revision,
+            support: Support::Supported,
+            read: ReadState::Known(None),
+            pending: false,
+            uncertain: false,
+            last_result: None,
+        }
+    }
+    fn ready(app: &mut Cagents, card: CardId, snapshot: Snapshot) -> Target {
+        let attempt = app.chat_ui.attempt(card).unwrap();
+        let target = attempt.target;
+        let mut session = attempt.session.clone();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: "fixture-host".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "fixture-incarnation".into(),
+        };
+        if session.launch.provider == Provider::Codex {
+            session.claim_owned_codex_listener(Path::new("/daemon-temp-root"), &proof);
+        }
+        session.proof = Some(proof);
+        let handle = Arc::new(ClientHandle::fixture(session, snapshot));
+        drop(app.handle_chat_ui(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+        )));
+        target
+    }
+    fn live() -> (Cagents, CardId, Target) {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, _) = draft(&mut app, Provider::Codex);
+        let session = runtime(&app, card).session.clone();
+        drop(app.start_chat(card, session, chat::Intent::Start, None, false));
+        let target = ready(
+            &mut app,
+            card,
+            Snapshot {
+                session_id: Some(THREAD.into()),
+                ready: true,
+                goal: Some(goal(8)),
+                ..Snapshot::default()
+            },
+        );
+        assert!(runtime(&app, card).pending.is_none());
+        assert!(Binding::capture(runtime(&app, card)).is_some());
+        (app, card, target)
+    }
+    fn acknowledge(app: &mut Cagents, card: CardId, result: Result<(), String>) {
+        let runtime = runtime(app, card);
+        let (target, id) = (runtime.target, runtime.pending.as_ref().unwrap().id);
+        drop(app.handle_chat_ui(Action::CommandFinished(target, id, result)));
+    }
+    fn publish(app: &mut Cagents, card: CardId, mut snapshot: Snapshot) {
+        let target = runtime(app, card).target;
+        snapshot.generation = runtime(app, card).handle().unwrap().snapshot().generation + 1;
+        runtime(app, card)
+            .handle()
+            .unwrap()
+            .publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+    }
+    fn finish_native(app: &mut Cagents, card: CardId, revision: u64, outcome: Outcome) {
+        let mut next = (*runtime(app, card).handle().unwrap().snapshot()).clone();
+        let goal = next.goal.as_mut().unwrap();
+        goal.revision = revision + 2;
+        goal.pending = false;
+        goal.uncertain = outcome == Outcome::Uncertain;
+        goal.support = if outcome == Outcome::Unsupported {
+            Support::Unsupported
+        } else {
+            Support::Supported
+        };
+        goal.last_result = Some(chat::goal::Completion { revision, outcome });
+        if outcome == Outcome::Confirmed {
+            if let Some(Pending {
+                operation: Operation::SetObjective(objective),
+                ..
+            }) = runtime(app, card).goal_pending.as_ref()
+            {
+                goal.read = ReadState::Known(Some(chat::goal::Goal {
+                    thread_id: THREAD.into(),
+                    objective: objective.clone(),
+                    status: Status::Blocked,
+                    token_budget: None,
+                    tokens_used: 1,
+                    time_used_seconds: 1,
+                    created_at: 1,
+                    updated_at: 1,
+                }));
+            }
+        }
+        publish(app, card, next);
+    }
+    fn control(runtime: &Runtime, operation: Operation) -> Control {
+        let goal = runtime.handle().unwrap().snapshot().goal.clone().unwrap();
+        Control {
+            binding: Binding::capture(runtime).unwrap(),
+            thread: goal.thread_id,
+            intent: goal::Intent {
+                operation,
+                observation_revision: goal.revision,
+            },
+        }
+    }
+
+    fn panel_control_fixture(operation: Operation) -> (Cagents, CardId, Target, Control) {
+        let (mut app, card, target) = live();
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        let mut observed = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        observed.selected_model = Some("chosen-model".into());
+        observed.reasoning = Some("low".into());
+        let history_image = Attachment {
+            path: "kept-history.png".into(),
+            reference: Some(chat::ImageReference {
+                id: uuid::Uuid::new_v4(),
+                number: 1,
+                device: uuid::Uuid::new_v4(),
+                name: "kept-history.png".into(),
+                sha256: "1".repeat(64),
+                extension: "png".into(),
+            }),
+        };
+        // A real wake rebuilds recall history from the reader publication.
+        // Seed that source, not disposable runtime-only history vectors. The
+        // valid image reference is intentionally unavailable on this device;
+        // recalling its immutable metadata does not require decoding a file.
+        observed.items = vec![
+            Arc::new(chat::Item {
+                started_at: None,
+                id: "panel-history/input/0".into(),
+                role: chat::Role::User,
+                content: ItemContent::Text {
+                    text: "An earlier ordinary prompt".into(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+            }),
+            Arc::new(chat::Item {
+                started_at: None,
+                id: "panel-history/input/1".into(),
+                role: chat::Role::User,
+                content: ItemContent::Image {
+                    path: history_image.path.to_str().unwrap().into(),
+                    description: history_image.label(),
+                    reference: history_image.reference.clone(),
+                },
+                at: None,
+            }),
+        ];
+        observed.goal.as_mut().unwrap().read = ReadState::Known(Some(chat::goal::Goal {
+            thread_id: THREAD.into(),
+            objective: "Original panel goal".into(),
+            status: if operation == Operation::Resume {
+                Status::Paused
+            } else {
+                Status::Active
+            },
+            token_budget: None,
+            tokens_used: 10,
+            time_used_seconds: 2,
+            created_at: 1,
+            updated_at: 2,
+        }));
+        publish(&mut app, card, observed);
+        write(
+            &mut app,
+            target,
+            "Unrelated draft, keep its caret and attachment",
+        );
+        let rt = app.chat_runtime_mut(target).unwrap();
+        rt.composer.perform(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        ));
+        rt.attachments
+            .push(Attachment::file("kept-panel-draft.txt"));
+        assert_eq!(rt.history, ["An earlier ordinary prompt"]);
+        assert_eq!(rt.history_images, [vec![history_image]]);
+        assert!(rt.history_cursor.is_none());
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let rt = runtime(&app, card);
+        assert!(rt.snapshot.ready && !rt.disconnected);
+        assert_eq!(rt.snapshot.goal, rt.handle().unwrap().snapshot().goal);
+        assert!(rt.goal_presentation().current);
+        let requested = control(rt, operation);
+        (app, card, target, requested)
+    }
+
+    fn deferred_model_goal(catalog: bool) -> (Cagents, CardId, Target) {
+        deferred_goal(catalog, Some("low"), "/goal set Keep selected model")
+    }
+    fn deferred_goal(
+        catalog: bool,
+        reasoning: Option<&str>,
+        input: &str,
+    ) -> (Cagents, CardId, Target) {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = draft(&mut app, Provider::Codex);
+        // Model/effort actions use the visible picker publication. Mount the
+        // actual card before Ready instead of relying on an unmeasured view.
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        write(&mut app, target, input);
+        let snapshot = Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot);
+        snapshot.selected_model = Some("chosen-model".into());
+        snapshot.reasoning = reasoning.map(str::to_owned);
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        let target = ready(
+            &mut app,
+            card,
+            Snapshot {
+                session_id: Some(THREAD.into()),
+                ready: true,
+                selected_model: Some("original-model".into()),
+                reasoning: Some("low".into()),
+                models: if catalog {
+                    ["chosen-model", "replacement-model"]
+                        .into_iter()
+                        .map(|id| chat::Model {
+                            id: id.into(),
+                            label: id.into(),
+                            reasoning: vec!["low".into(), "high".into()],
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                goal: Some(goal(8)),
+                ..Snapshot::default()
+            },
+        );
+        (app, card, target)
+    }
+
+    fn model_timer_output(task: Task<Message>) -> (Target, Weak<()>) {
+        use iced::futures::StreamExt;
+
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let message = executor.block_on(async {
+            let mut stream = iced::runtime::task::into_stream(task).unwrap();
+            tokio::time::timeout(MODEL_PATIENCE + Duration::from_secs(3), async {
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                        return message;
+                    }
+                }
+                panic!("the actual model timer must produce its owning action");
+            })
+            .await
+            .unwrap()
+        });
+        let Message::ChatUi(Action::GoalModelWake(target, witness)) = message else {
+            panic!("model timer must not dispatch provider work")
+        };
+        (target, witness)
+    }
+
+    #[test]
+    fn explicit_model_or_effort_replacement_retires_only_an_admitted_unsent_goal() {
+        for effort in [false, true] {
+            let (mut app, card, target) = deferred_model_goal(true);
+            let before = {
+                let rt = runtime(&app, card);
+                (
+                    rt.composer.text(),
+                    rt.composer.cursor(),
+                    rt.attachments.clone(),
+                    rt.revision,
+                )
+            };
+            let physical = runtime(&app, card).pending.as_ref().unwrap().id;
+            drop(app.handle_chat_ui(Action::Model(target, "replacement-model".into())));
+            assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, physical);
+            assert!(matches!(
+                runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+                Stage::Model(_)
+            ));
+            acknowledge(&mut app, card, Ok(()));
+            assert!(runtime(&app, card).goal_presentation().preparing);
+            drop(app.handle_chat_ui(Action::Model(target, "not-listed".into())));
+            assert!(
+                runtime(&app, card).goal_pending.is_some(),
+                "rejected choice cannot cancel intent"
+            );
+            drop(app.handle_chat_ui(Action::Command(
+                target,
+                Command::SetModel {
+                    model: "chosen-model".into(),
+                    reasoning: Some("low".into()),
+                },
+            )));
+            assert!(
+                runtime(&app, card).goal_pending.is_some(),
+                "same selection preserves intent"
+            );
+            acknowledge(&mut app, card, Ok(()));
+            if effort {
+                let mut selected = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+                selected.selected_model = Some("chosen-model".into());
+                selected.goal.as_mut().unwrap().pending = true;
+                publish(&mut app, card, selected);
+                drop(app.handle_chat_ui(Action::Reasoning(
+                    target,
+                    "chosen-model".into(),
+                    "high".into(),
+                )));
+            } else {
+                drop(app.handle_chat_ui(Action::Model(target, "replacement-model".into())));
+            }
+            assert!(runtime(&app, card).goal_pending.is_none());
+            assert!(
+                runtime(&app, card)
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .model
+                    .is_some()
+            );
+            assert!(
+                runtime(&app, card)
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("before the goal was sent")
+            );
+            let rt = runtime(&app, card);
+            assert_eq!(
+                (
+                    rt.composer.text(),
+                    rt.composer.cursor(),
+                    rt.attachments.clone(),
+                    rt.revision,
+                ),
+                before
+            );
+            acknowledge(&mut app, card, Ok(()));
+            assert!(
+                runtime(&app, card).goal_pending.is_none() && runtime(&app, card).pending.is_none()
+            );
+            assert!(runtime(&app, card).queued.is_none());
+        }
+    }
+
+    #[test]
+    fn missing_goal_model_catalog_expires_from_its_actual_timer_without_a_provider_wake() {
+        let (mut app, card, target) = deferred_model_goal(false);
+        assert!(runtime(&app, card).pending.is_none());
+        let before = {
+            let rt = runtime(&app, card);
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+            )
+        };
+        // ready() drops returned tasks. Re-arm this same owning wait and drive
+        // its real timer output, without provider traffic or a synthetic Wake.
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .goal_pending
+            .as_mut()
+            .unwrap()
+            .model_rechecking = false;
+        let task = app.dispatch_goal(target);
+        let (actual, witness) = model_timer_output(task);
+        assert_eq!(actual, target);
+        drop(app.handle_chat_ui(Action::GoalModelWake(target, witness.clone())));
+        assert!(
+            runtime(&app, card).goal_pending.is_none() && runtime(&app, card).pending.is_none()
+        );
+        assert!(
+            runtime(&app, card)
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("not confirmed in time")
+        );
+        let rt = runtime(&app, card);
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+            ),
+            before
+        );
+        // A stale timer cannot inherit a successor with the same exact input.
+        let mut checking = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        checking.goal.as_mut().unwrap().pending = true;
+        publish(&mut app, card, checking);
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        let successor = runtime(&app, card).goal_pending.as_ref().unwrap().clone();
+        drop(app.handle_chat_ui(Action::GoalModelWake(target, witness)));
+        assert!(runtime(&app, card).goal_pending.is_some());
+        assert!(matches!(successor.stage, Stage::Waiting));
+        assert!(runtime(&app, card).pending.is_none());
+    }
+
+    #[test]
+    fn armed_model_timer_expires_waiting_work_behind_readiness_or_another_command_only() {
+        for blocked in 0..4 {
+            let (mut app, card, target) = deferred_model_goal(false);
+            // Preserve the same absolute deadline but shorten this fixture's
+            // remaining wait. The parent above drives the full real ten seconds.
+            let pending = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .goal_pending
+                .as_mut()
+                .unwrap();
+            pending.model_wait.as_mut().unwrap().0 =
+                Instant::now() - (MODEL_PATIENCE - Duration::from_millis(250));
+            pending.model_rechecking = false;
+            let timer = app.dispatch_goal(target);
+            match blocked {
+                0 => {
+                    let mut unready = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+                    unready.ready = false;
+                    publish(&mut app, card, unready);
+                }
+                1 => drop(app.handle_chat_ui(Action::Command(target, Command::ListBranches))),
+                2 => {
+                    let mut listed = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+                    listed.models = vec![chat::Model {
+                        id: "chosen-model".into(),
+                        label: "Chosen".into(),
+                        reasoning: vec!["low".into()],
+                    }];
+                    publish(&mut app, card, listed);
+                    assert!(matches!(
+                        runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+                        Stage::Model(_)
+                    ));
+                    // Even changed input cannot make a stale timer release an
+                    // in-flight model request before its actual callback.
+                    write(&mut app, target, "new unsent input");
+                }
+                3 => {
+                    let replacement = Arc::new(ClientHandle::fixture(
+                        runtime(&app, card).session.clone(),
+                        (*runtime(&app, card).handle().unwrap().snapshot()).clone(),
+                    ));
+                    app.chat_runtime_mut(target).unwrap().connection =
+                        Connection::Live(replacement);
+                }
+                _ => unreachable!(),
+            }
+            assert!(runtime(&app, card).goal_pending.is_some());
+            let physical = runtime(&app, card)
+                .pending
+                .as_ref()
+                .map(|pending| pending.id);
+            assert_eq!(physical.is_some(), matches!(blocked, 1 | 2));
+            let before = {
+                let rt = runtime(&app, card);
+                (
+                    rt.composer.text(),
+                    rt.composer.cursor(),
+                    rt.attachments.clone(),
+                    rt.revision,
+                )
+            };
+            let error = runtime(&app, card).error.clone();
+            let (actual, witness) = model_timer_output(timer);
+            assert_eq!(actual, target);
+            drop(app.handle_chat_ui(Action::GoalModelWake(target, witness)));
+            let rt = runtime(&app, card);
+            assert_eq!(rt.pending.as_ref().map(|pending| pending.id), physical);
+            assert_eq!(
+                (
+                    rt.composer.text(),
+                    rt.composer.cursor(),
+                    rt.attachments.clone(),
+                    rt.revision,
+                ),
+                before
+            );
+            if blocked < 2 {
+                assert!(rt.goal_pending.is_none());
+                assert!(
+                    rt.error
+                        .as_deref()
+                        .unwrap()
+                        .contains("not confirmed in time")
+                );
+                if physical.is_some() {
+                    acknowledge(&mut app, card, Ok(()));
+                    assert!(runtime(&app, card).goal_pending.is_none());
+                }
+            } else {
+                assert!(rt.goal_pending.is_some());
+                assert_eq!(rt.error, error);
+            }
+        }
+    }
+
+    #[test]
+    fn external_selection_drift_during_probe_refuses_unsent_goal_and_preserves_input() {
+        for input in ["/goal set Keep selected model", "/goal resume"] {
+            // Different model, different explicit effort, unchanged selection,
+            // and unspecified effort with a provider-retained effort value.
+            for changed in 0..4 {
+                let reasoning = (changed != 3).then_some("low");
+                let (mut app, card, target) = deferred_goal(true, reasoning, input);
+                acknowledge(&mut app, card, Ok(()));
+                let witness = Arc::downgrade(
+                    &runtime(&app, card)
+                        .goal_pending
+                        .as_ref()
+                        .unwrap()
+                        .model_wait
+                        .as_ref()
+                        .unwrap()
+                        .1,
+                );
+                let mut selected = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+                selected.selected_model = Some("chosen-model".into());
+                selected.reasoning = reasoning.map(str::to_owned);
+                selected.goal.as_mut().unwrap().pending = true;
+                publish(&mut app, card, selected);
+                let pending = runtime(&app, card).goal_pending.as_ref().unwrap();
+                assert!(matches!(pending.stage, Stage::Waiting));
+                assert!(pending.model.is_none() && pending.model_wait.is_none());
+                assert!(witness.upgrade().is_none());
+                let before = {
+                    let rt = runtime(&app, card);
+                    (
+                        rt.composer.text(),
+                        rt.composer.cursor(),
+                        rt.attachments.clone(),
+                        rt.revision,
+                    )
+                };
+                let next_command = runtime(&app, card).next_command;
+                let mut next = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+                next.goal.as_mut().unwrap().pending = false;
+                match changed {
+                    0 => next.selected_model = Some("replacement-model".into()),
+                    1 | 3 => next.reasoning = Some("high".into()),
+                    _ => {}
+                }
+                // This is the same Actor publication an attached client's
+                // SetModel produces; no local model-choice action runs here.
+                publish(&mut app, card, next);
+                let rt = runtime(&app, card);
+                assert_eq!(
+                    (
+                        rt.composer.text(),
+                        rt.composer.cursor(),
+                        rt.attachments.clone(),
+                        rt.revision,
+                    ),
+                    before
+                );
+                if changed < 2 {
+                    assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+                    assert_eq!(rt.next_command, next_command);
+                    assert!(
+                        rt.error
+                            .as_deref()
+                            .unwrap()
+                            .contains("before the goal was sent")
+                    );
+                } else {
+                    assert_eq!(rt.next_command, next_command + 1);
+                    assert!(matches!(
+                        rt.goal_pending.as_ref().unwrap().stage,
+                        Stage::Native { .. }
+                    ));
+                }
+                // The retired model wait cannot mutate either disposition.
+                let physical = rt.pending.as_ref().map(|pending| pending.id);
+                let error = rt.error.clone();
+                drop(app.handle_chat_ui(Action::GoalModelWake(target, witness)));
+                assert_eq!(runtime(&app, card).pending.as_ref().map(|p| p.id), physical);
+                assert_eq!(runtime(&app, card).error, error);
+            }
+        }
+    }
+
+    #[test]
+    fn model_staging_publication_supplies_the_new_goal_revision_for_set_and_resume() {
+        for input in ["/goal set Keep selected model", "/goal resume"] {
+            let (mut app, card, target) = deferred_goal(true, Some("low"), input);
+            acknowledge(&mut app, card, Ok(()));
+            let before = runtime(&app, card).handle().unwrap().snapshot();
+            let revision = before.goal.as_ref().unwrap().revision + 1;
+            let mut staged = (*before).clone();
+            staged.selected_model = Some("chosen-model".into());
+            // An accepted changed Actor selection publishes Models and the
+            // advanced Goal control revision together, before this UI wake.
+            staged.goal.as_mut().unwrap().revision = revision;
+            publish(&mut app, card, staged);
+            let rt = runtime(&app, card);
+            assert!(matches!(
+                rt.goal_pending.as_ref().unwrap().stage,
+                Stage::Native { revision: actual, .. } if actual == revision
+            ));
+            assert!(rt.pending.as_ref().unwrap().model.is_none());
+            assert_eq!(rt.composer.text().trim(), input);
+            assert!(rt.error.is_none());
+        }
+    }
+
+    #[test]
+    fn panel_goal_admission_retains_revision_across_publication_before_ui_wake() {
+        for operation in [
+            Operation::Clear,
+            Operation::Pause,
+            Operation::Resume,
+            Operation::Get,
+        ] {
+            for changed in [true, false] {
+                let (mut app, card, target, requested) = panel_control_fixture(operation.clone());
+                let original = requested.intent.observation_revision;
+                let handle = runtime(&app, card).handle().unwrap().clone();
+                let session = runtime(&app, card).session.clone();
+                let before = {
+                    let rt = runtime(&app, card);
+                    (
+                        rt.composer.text(),
+                        rt.composer.cursor(),
+                        rt.attachments.clone(),
+                        rt.revision,
+                        rt.history.clone(),
+                        rt.history_images.clone(),
+                        rt.history_cursor,
+                    )
+                };
+                let next_command = runtime(&app, card).next_command;
+                assert!(app.admit_goal_control(target, requested));
+                let rt = runtime(&app, card);
+                let pending = rt.goal_pending.as_ref().unwrap();
+                assert!(matches!(pending.stage, Stage::Waiting));
+                assert!(matches!(&pending.source,
+                    PendingSource::Panel { thread, revision }
+                        if thread == THREAD && *revision == original));
+                assert_eq!(pending.operation, operation);
+                assert!(pending.input.is_none() && pending.model.is_none());
+                assert!(pending.binding.as_ref().unwrap().matches(rt));
+                assert!(rt.pending.is_none());
+                assert_eq!(rt.next_command, next_command);
+
+                let mut next = (*handle.snapshot()).clone();
+                next.generation += 1;
+                if changed {
+                    let goal = next.goal.as_mut().unwrap();
+                    goal.revision += 1;
+                    let ReadState::Known(Some(observed)) = &mut goal.read else {
+                        panic!()
+                    };
+                    observed.objective = "A newer goal from the same conversation".into();
+                    observed.tokens_used += 1;
+                }
+                // The actual reader publishes before emitting Wake::Changed.
+                // Deliberately leave the rendered runtime at the admitted R.
+                handle.publish_snapshot_for_test(next);
+                let rt = runtime(&app, card);
+                assert_eq!(rt.snapshot.goal.as_ref().unwrap().revision, original);
+                assert_eq!(
+                    handle.snapshot().goal.as_ref().unwrap().revision,
+                    original + u64::from(changed)
+                );
+                assert!(rt.snapshot.generation < handle.snapshot().generation);
+                drop(app.dispatch_goal(target));
+                let rt = runtime(&app, card);
+                assert_eq!(rt.session, session);
+                assert_eq!(rt.target, target);
+                assert!(Arc::ptr_eq(rt.handle().unwrap(), &handle));
+                assert_eq!(
+                    (
+                        rt.composer.text(),
+                        rt.composer.cursor(),
+                        rt.attachments.clone(),
+                        rt.revision,
+                        rt.history.clone(),
+                        rt.history_images.clone(),
+                        rt.history_cursor
+                    ),
+                    before
+                );
+                if changed {
+                    assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+                    assert_eq!(rt.next_command, next_command);
+                    assert!(
+                        rt.error
+                            .as_deref()
+                            .unwrap()
+                            .contains("Check the current goal")
+                    );
+                    drop(app.dispatch_goal(target));
+                    drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+                    let rt = runtime(&app, card);
+                    assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+                    assert_eq!(rt.next_command, next_command);
+                } else {
+                    let pending = rt.goal_pending.as_ref().unwrap();
+                    let native = rt.pending.as_ref().unwrap();
+                    let id = native.id;
+                    assert!(matches!(pending.stage,
+                        Stage::Native { revision, command, accepted: false }
+                            if revision == original && command == id));
+                    assert_eq!(rt.next_command, next_command + 1);
+                    assert!(native.model.is_none() && native.sent.is_none());
+                    assert!(native.draft_revision.is_none() && native.sent_attachments.is_empty());
+                    assert_eq!(
+                        pending.native_command(handle.snapshot().goal.as_ref().unwrap()),
+                        (
+                            Command::Goal {
+                                thread_id: THREAD.into(),
+                                revision: original,
+                                operation: operation.clone()
+                            },
+                            original
+                        )
+                    );
+                    assert!(rt.error.is_none());
+                    // A later observation cannot retire a request already in
+                    // physical custody or replace its original Native revision.
+                    let mut newer = (*handle.snapshot()).clone();
+                    newer.generation += 1;
+                    newer.goal.as_mut().unwrap().revision += 1;
+                    handle.publish_snapshot_for_test(newer);
+                    drop(app.dispatch_goal(target));
+                    let rt = runtime(&app, card);
+                    assert_eq!(rt.pending.as_ref().unwrap().id, id);
+                    assert_eq!(rt.next_command, next_command + 1);
+                    assert!(matches!(rt.goal_pending.as_ref().unwrap().stage,
+                        Stage::Native { revision, command, accepted: false }
+                            if revision == original && command == id));
+                }
+                let rt = runtime(&app, card);
+                assert_eq!(
+                    (
+                        rt.composer.text(),
+                        rt.composer.cursor(),
+                        rt.attachments.clone(),
+                        rt.revision,
+                        rt.history.clone(),
+                        rt.history_images.clone(),
+                        rt.history_cursor
+                    ),
+                    before
+                );
+                assert!(rt.queued.is_none() && rt.followups.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn panel_goal_lost_observation_retires_before_pending_or_readiness_wait() {
+        for operation in [Operation::Clear, Operation::Pause, Operation::Resume] {
+            for publication in 0..4 {
+                let (mut app, card, target, requested) = panel_control_fixture(operation.clone());
+                assert!(app.admit_goal_control(target, requested));
+                let handle = runtime(&app, card).handle().unwrap().clone();
+                let before = runtime(&app, card).next_command;
+                let mut next = (*handle.snapshot()).clone();
+                next.generation += 1;
+                match publication {
+                    0 => {
+                        let goal = next.goal.as_mut().unwrap();
+                        goal.revision += 1;
+                        goal.pending = true;
+                        next.ready = false;
+                    }
+                    1 => next.goal = None,
+                    2 => next.goal.as_mut().unwrap().thread_id = "another-thread".into(),
+                    _ => next.exited = true,
+                }
+                handle.publish_snapshot_for_test(next);
+                drop(app.dispatch_goal(target));
+                let rt = runtime(&app, card);
+                assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+                assert_eq!(rt.next_command, before);
+                assert!(
+                    rt.error
+                        .as_deref()
+                        .unwrap()
+                        .contains("Check the current goal")
+                );
+                // Restoring an eligible publication cannot replay the retired
+                // click, even when the actor subsequently wakes the UI.
+                let mut restored = (*rt.snapshot).clone();
+                restored.generation = handle.snapshot().generation + 1;
+                handle.publish_snapshot_for_test(restored);
+                drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+                assert!(runtime(&app, card).goal_pending.is_none());
+                assert!(runtime(&app, card).pending.is_none());
+                assert_eq!(runtime(&app, card).next_command, before);
+            }
+        }
+    }
+
+    #[test]
+    fn stale_panel_goal_retires_without_releasing_an_unrelated_physical_command() {
+        let (mut app, card, target, requested) = panel_control_fixture(Operation::Clear);
+        assert!(app.admit_goal_control(target, requested));
+        drop(app.chat_send(target, Command::Refresh, false));
+        let rt = runtime(&app, card);
+        let id = rt.pending.as_ref().unwrap().id;
+        let next_command = rt.next_command;
+        assert!(matches!(
+            rt.goal_pending.as_ref().unwrap().stage,
+            Stage::Waiting
+        ));
+        let handle = rt.handle().unwrap().clone();
+        let mut next = (*handle.snapshot()).clone();
+        next.generation += 1;
+        next.goal.as_mut().unwrap().revision += 1;
+        handle.publish_snapshot_for_test(next);
+        drop(app.dispatch_goal(target));
+        let rt = runtime(&app, card);
+        assert!(rt.goal_pending.is_none());
+        assert_eq!(rt.pending.as_ref().unwrap().id, id);
+        assert_eq!(rt.next_command, next_command);
+        assert!(
+            rt.error
+                .as_deref()
+                .unwrap()
+                .contains("Check the current goal")
+        );
+        drop(app.dispatch_goal(target));
+        assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, id);
+        acknowledge(&mut app, card, Ok(()));
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert!(runtime(&app, card).goal_pending.is_none());
+        assert!(runtime(&app, card).pending.is_none());
+        assert_eq!(runtime(&app, card).next_command, next_command);
+    }
+
+    #[test]
+    fn selection_and_goal_revision_share_a_publication_and_never_upgrade_at_handoff() {
+        let (mut app, card, target) = live();
+        write(&mut app, target, "/goal set Keep the original selection");
+        let mut selected = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        selected.selected_model = Some("chosen-model".into());
+        selected.reasoning = Some("low".into());
+        publish(&mut app, card, selected);
+        let handle = runtime(&app, card).handle().unwrap().clone();
+        let captured = handle.snapshot();
+        let original = captured.goal.as_ref().unwrap().clone();
+        let mut changed = (*captured).clone();
+        changed.selected_model = Some("replacement-model".into());
+        changed.goal.as_mut().unwrap().revision += 1;
+        publish(&mut app, card, changed);
+        // Simulate a concurrent Actor selection publication between the UI's
+        // capture and Goal extraction. The production helper reads this exact
+        // immutable capture, rather than loading the newer Goal revision.
+        assert_eq!(captured.selected_model.as_deref(), Some("chosen-model"));
+        assert_eq!(
+            goal_in_snapshot(runtime(&app, card), &handle, &captured),
+            Some(original.clone())
+        );
+        assert_eq!(
+            current_goal(runtime(&app, card), &handle).unwrap().revision,
+            original.revision + 1
+        );
+        let before = {
+            let rt = runtime(&app, card);
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+            )
+        };
+        let next_command = runtime(&app, card).next_command;
+        drop(app.chat_send(
+            target,
+            Command::Goal {
+                thread_id: original.thread_id,
+                revision: original.revision,
+                operation: Operation::SetObjective("Keep the original selection".into()),
+            },
+            false,
+        ));
+        let rt = runtime(&app, card);
+        assert!(rt.pending.is_none());
+        assert_eq!(rt.next_command, next_command);
+        assert!(rt.error.as_deref().unwrap().contains("goal changed"));
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn delayed_model_confirmation_dispatches_once_and_timer_cannot_release_native_or_rebound_work()
+    {
+        let (mut app, card, target) = deferred_model_goal(true);
+        acknowledge(&mut app, card, Ok(()));
+        let witness = Arc::downgrade(
+            &runtime(&app, card)
+                .goal_pending
+                .as_ref()
+                .unwrap()
+                .model_wait
+                .as_ref()
+                .unwrap()
+                .1,
+        );
+        let mut selected = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        selected.selected_model = Some("chosen-model".into());
+        selected.goal.as_mut().unwrap().revision += 1;
+        publish(&mut app, card, selected);
+        let native = runtime(&app, card).pending.as_ref().unwrap().id;
+        assert!(matches!(
+            runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+            Stage::Native { .. }
+        ));
+        assert!(!runtime(&app, card).goal_presentation().preparing);
+        assert!(
+            runtime(&app, card)
+                .goal_pending
+                .as_ref()
+                .unwrap()
+                .model_wait
+                .is_none()
+        );
+        assert!(witness.upgrade().is_none());
+        drop(app.handle_chat_ui(Action::GoalModelWake(target, witness.clone())));
+        assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, native);
+        acknowledge(&mut app, card, Ok(()));
+        drop(app.handle_chat_ui(Action::Model(target, "replacement-model".into())));
+        assert!(matches!(
+            runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+            Stage::Native { .. }
+        ));
+        let physical = runtime(&app, card).pending.as_ref().unwrap().id;
+        let error = runtime(&app, card).error.clone();
+        let replacement = Arc::new(ClientHandle::fixture(
+            runtime(&app, card).session.clone(),
+            (*runtime(&app, card).handle().unwrap().snapshot()).clone(),
+        ));
+        app.chat_runtime_mut(target).unwrap().connection = Connection::Live(replacement);
+        drop(app.handle_chat_ui(Action::GoalModelWake(target, witness)));
+        assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, physical);
+        assert!(runtime(&app, card).goal_pending.is_some());
+        assert_eq!(runtime(&app, card).error, error);
+        assert_eq!(
+            runtime(&app, card).composer.text().trim(),
+            "/goal set Keep selected model"
+        );
+    }
+
+    #[test]
+    fn local_model_replacement_preserves_waiting_read_pause_and_clear_intents() {
+        for text in ["/goal", "/goal pause", "/goal clear"] {
+            let (mut app, card, target) = live();
+            drop(app.update(Message::Viewport {
+                generation: app.workspace_view_generation,
+                event: WorkspaceViewportEvent::Resized(1_600.0),
+            }));
+            let mut checking = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+            checking.goal.as_mut().unwrap().pending = true;
+            checking.models = vec![chat::Model {
+                id: "replacement-model".into(),
+                label: "Replacement".into(),
+                reasoning: vec![],
+            }];
+            publish(&mut app, card, checking);
+            write(&mut app, target, text);
+            drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+            assert!(matches!(
+                runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+                Stage::Waiting
+            ));
+            drop(app.handle_chat_ui(Action::Model(target, "replacement-model".into())));
+            assert!(runtime(&app, card).goal_pending.is_some());
+            assert!(
+                runtime(&app, card)
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .model
+                    .is_some()
+            );
+            assert_eq!(runtime(&app, card).composer.text().trim(), text);
+        }
+    }
+
+    #[test]
+    fn busy_goal_input_has_a_real_send_button_and_composer_chord() {
+        use iced::advanced::{
+            clipboard,
+            widget::{Operation as WidgetOperation, operation},
+        };
+        use iced::runtime::{UserInterface, user_interface::Cache};
+
+        struct Bounds(Vec<(widget::Id, iced::Rectangle)>);
+        impl WidgetOperation for Bounds {
+            fn traverse(&mut self, children: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+                children(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.push((id.clone(), bounds));
+                }
+            }
+        }
+
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for width in [320.0, 800.0] {
+            for input in [
+                "/goal",
+                "/goal set Keep this scoped",
+                "/goal pause",
+                "/goal resume",
+                "/goal clear",
+                "\n  \u{2003}/GoAl pause",
+            ] {
+                for keyboard in [false, true] {
+                    let (mut app, card, target) = live();
+                    drop(app.update(Message::Viewport {
+                        generation: app.workspace_view_generation,
+                        event: WorkspaceViewportEvent::Resized(width),
+                    }));
+                    let mut busy = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+                    busy.busy = true;
+                    busy.capabilities.steer = true;
+                    busy.capabilities.queue = true;
+                    publish(&mut app, card, busy);
+                    write(&mut app, target, input);
+                    let mut ui = UserInterface::build(
+                        app.chat_view(card),
+                        iced::Size::new(width, 750.0),
+                        Cache::new(),
+                        &mut renderer,
+                    );
+                    let mut controls = Bounds(Vec::new());
+                    ui.operate(&renderer, &mut controls);
+                    let button = controls
+                        .0
+                        .iter()
+                        .find(|(id, _)| id == &card_control_id(card, "chat-submit-send"))
+                        .expect("busy Goal input must expose the actual Send control")
+                        .1;
+                    for role in ["chat-submit-steer", "chat-submit-queue"] {
+                        assert!(
+                            !controls
+                                .0
+                                .iter()
+                                .any(|(id, _)| id == &card_control_id(card, role))
+                        );
+                    }
+                    let mut messages = Vec::new();
+                    let (events, cursor) = if keyboard {
+                        ui.operate(
+                            &renderer,
+                            &mut operation::focusable::focus(card_control_id(
+                                card,
+                                "chat-composer",
+                            )),
+                        );
+                        let key = keyboard::Key::Named(keyboard::key::Named::Enter);
+                        (
+                            vec![iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                                key: key.clone(),
+                                modified_key: key,
+                                physical_key: keyboard::key::Physical::Code(
+                                    keyboard::key::Code::Enter,
+                                ),
+                                location: keyboard::Location::Standard,
+                                modifiers: keyboard::Modifiers::CTRL,
+                                text: None,
+                                repeat: false,
+                            })],
+                            iced::mouse::Cursor::Unavailable,
+                        )
+                    } else {
+                        let pointer = iced::Point::new(button.center_x(), button.center_y());
+                        (
+                            vec![
+                                iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                                    position: pointer,
+                                }),
+                                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                                    iced::mouse::Button::Left,
+                                )),
+                                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                                    iced::mouse::Button::Left,
+                                )),
+                            ],
+                            iced::mouse::Cursor::Available(pointer),
+                        )
+                    };
+                    ui.update(
+                        &events,
+                        cursor,
+                        &mut renderer,
+                        &mut clipboard::Null,
+                        &mut messages,
+                    );
+                    drop(ui);
+                    let submissions = messages
+                        .into_iter()
+                        .filter(|message| matches!(message, Message::ChatUi(Action::Submit(..))))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        submissions.len(),
+                        1,
+                        "one actual input event dispatches once"
+                    );
+                    assert!(
+                        matches!(&submissions[0], Message::ChatUi(Action::Submit(bound, PromptMode::Send)) if *bound == target)
+                    );
+                    for message in submissions {
+                        drop(app.update(message));
+                    }
+                    assert!(matches!(
+                        runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+                        Stage::Native { .. }
+                    ));
+                    assert_eq!(runtime(&app, card).composer.text().trim(), input.trim());
+                    assert!(runtime(&app, card).queued.is_none());
+                    assert!(runtime(&app, card).followups.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_old_panel_close_preserves_a_newer_waiting_goal_and_all_composer_state() {
+        let (mut app, card, target) = live();
+        let mut probing = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        probing.goal.as_mut().unwrap().pending = true;
+        publish(&mut app, card, probing);
+        write(&mut app, target, "/goal set Goal A");
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        assert!(matches!(
+            runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+            Stage::Waiting
+        ));
+        let old_close = Action::GoalPanel(target, false);
+
+        let mut observed = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        observed.goal = Some(goal(9));
+        publish(&mut app, card, observed);
+        assert!(matches!(
+            runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+            Stage::Native { revision: 9, .. }
+        ));
+        acknowledge(&mut app, card, Ok(()));
+        finish_native(&mut app, card, 9, Outcome::Confirmed);
+        assert!(runtime(&app, card).goal_pending.is_none());
+
+        let mut probing = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        probing.goal.as_mut().unwrap().pending = true;
+        publish(&mut app, card, probing);
+        write(&mut app, target, "/goal set Goal B");
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        let rt = app.chat_runtime_mut(target).unwrap();
+        rt.composer.perform(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        ));
+        rt.attachments
+            .push(Attachment::file("keep-after-submit.txt"));
+        let before = (
+            rt.composer.text(),
+            rt.composer.cursor(),
+            rt.attachments.clone(),
+            rt.revision,
+        );
+        let request = rt.goal_pending.as_ref().unwrap().clone();
+        assert!(matches!(request.stage, Stage::Waiting));
+        assert_eq!(request.operation, Operation::SetObjective("Goal B".into()));
+        assert!(rt.goal_open);
+        drop(app.handle_chat_ui(old_close));
+        let rt = runtime(&app, card);
+        assert!(!rt.goal_open);
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision
+            ),
+            before
+        );
+        let retained = rt.goal_pending.as_ref().unwrap();
+        assert!(matches!(retained.stage, Stage::Waiting));
+        assert_eq!(retained.operation, request.operation);
+        assert_eq!(
+            retained.input.as_ref().unwrap().revision,
+            request.input.as_ref().unwrap().revision
+        );
+        assert_eq!(
+            retained.input.as_ref().unwrap().text,
+            request.input.as_ref().unwrap().text
+        );
+        assert!(retained.binding.as_ref().unwrap().matches(rt));
+        assert!(rt.pending.is_none());
+        assert!(rt.queued.is_none());
+        assert!(rt.followups.is_empty());
+        // Target retirement, rather than presentation dismissal, still owns
+        // cancellation of an intent that has not reached the provider.
+        app.chat_runtime_mut(target).unwrap().cancel_unsent_goal();
+        assert!(runtime(&app, card).goal_pending.is_none());
+        assert_eq!(runtime(&app, card).composer.text(), before.0);
+    }
+
+    #[test]
+    fn goal_keyboard_ring_focuses_real_enabled_card_controls_and_wraps_without_mutating_input() {
+        use iced::advanced::widget::{Operation as WidgetOperation, operation};
+        use iced::futures::StreamExt;
+
+        struct Focused(Option<widget::Id>);
+        impl WidgetOperation for Focused {
+            fn traverse(&mut self, children: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+                children(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+        let (mut app, card, target) = live();
+        // Mount the card through the same viewport event as the real UI before
+        // asking its presentation which native Goal controls can take focus.
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        // Exposure requests history asynchronously. Deliver the fixture's
+        // original full publication, then its real wake, before using it.
+        let hydrated = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        publish(&mut app, card, hydrated);
+        let rt = runtime(&app, card);
+        assert!(rt.snapshot.ready);
+        assert_eq!(rt.snapshot.goal, rt.handle().unwrap().snapshot().goal);
+        assert!(rt.goal_presentation().current);
+        write(&mut app, target, "ordinary unsent draft");
+        let before = runtime(&app, card).composer.text();
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        assert_eq!(
+            runtime(&app, card).goal_controls(),
+            vec![
+                card_control_id(card, "chat-goal-close"),
+                card_control_id(card, "chat-goal-check"),
+            ]
+        );
+        let mut tasks = Vec::new();
+        for backwards in [false, false, true] {
+            let key = keyboard::Key::Named(keyboard::key::Named::Tab);
+            let event = keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+                location: keyboard::Location::Standard,
+                modifiers: if backwards {
+                    keyboard::Modifiers::SHIFT
+                } else {
+                    keyboard::Modifiers::empty()
+                },
+                text: None,
+                repeat: false,
+            };
+            tasks.push(
+                app.chat_picker_key(&event)
+                    .expect("goal owns its existing picker key path"),
+            );
+        }
+        assert_eq!(runtime(&app, card).composer.text(), before);
+        assert!(runtime(&app, card).pending.is_none());
+        assert!(runtime(&app, card).goal_pending.is_none());
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = iced::runtime::UserInterface::build(
+            runtime(&app, card).goal_panel().unwrap(),
+            iced::Size::new(360.0, 650.0),
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus(card_control_id(card, "chat-goal-close")),
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for (task, expected) in tasks.into_iter().zip(["check", "close", "check"]) {
+            executor.block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                while let Some(action) = stream.next().await {
+                    match action {
+                        iced::runtime::Action::Widget(mut operation) => {
+                            ui.operate(&renderer, operation.as_mut())
+                        }
+                        _ => panic!("picker navigation must only issue a focus operation"),
+                    }
+                }
+            });
+            let mut focused = Focused(None);
+            ui.operate(&renderer, &mut focused);
+            assert_eq!(
+                focused.0,
+                Some(card_control_id(card, &format!("chat-goal-{expected}")))
+            );
+        }
+    }
+
+    #[test]
+    fn goal_submit_preserves_disabled_conversation_draft_without_dispatch() {
+        for state in 0..3 {
+            let (mut app, card, target) = live();
+            write(&mut app, target, "/goal set Keep this unsent");
+            let current = app.chat_runtime_mut(target).unwrap();
+            match state {
+                0 => current.disconnected = true,
+                1 => Arc::make_mut(&mut current.snapshot).exited = true,
+                _ => {
+                    Arc::make_mut(&mut current.snapshot).read_only_reason =
+                        Some("Retained history".into());
+                }
+            }
+            let draft = current.composer.text();
+            let launch = current.session.launch.clone();
+            drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+            let runtime = runtime(&app, card);
+            assert_eq!(runtime.composer.text(), draft);
+            assert_eq!(runtime.session.launch, launch);
+            assert!(!runtime.goal_open);
+            assert!(runtime.goal_pending.is_none());
+            assert!(runtime.pending.is_none() && runtime.queued.is_none());
+            assert!(runtime.followups.is_empty());
+            assert!(app.chat_ui.attempt(card).is_none());
+        }
+    }
+
+    #[test]
+    fn goal_submit_precedes_automatic_account_routing_and_never_creates_a_prompt_queue() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 105);
+        let (card, target) = draft(&mut app, Provider::Codex);
+        let now = chat::now_ms().unwrap();
+        for (id, status) in [
+            (
+                Account::system(Provider::Codex).id(),
+                account::UsageStatus::Limited,
+            ),
+            (alternate.clone(), account::UsageStatus::Ok),
+        ] {
+            let owner = app.account_ui.probe_owner(&id).unwrap();
+            drop(
+                app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
+                    owner,
+                    id,
+                    outcome: account::probe::Outcome::Answered {
+                        identity: None,
+                        catalog: None,
+                        snapshot: account::UsageSnapshot::state(status, "", now),
+                    },
+                })),
+            );
+        }
+        write(&mut app, target, "ordinary message");
+        assert_eq!(
+            app.automatic_chat_account(target, PromptMode::Send)
+                .unwrap()
+                .0
+                .id(),
+            alternate
+        );
+        write(&mut app, target, "/GoAl set Keep this exact account");
+        let before = runtime(&app, card).session.launch.clone();
+        let input = runtime(&app, card).composer.text();
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        let runtime = runtime(&app, card);
+        assert!(runtime.queued.is_none());
+        assert!(runtime.followups.is_empty());
+        assert!(runtime.pending.is_none());
+        assert_eq!(runtime.composer.text(), input);
+        assert_eq!(runtime.session.launch, before);
+        assert_eq!(
+            runtime.goal_pending.as_ref().unwrap().operation,
+            Operation::SetObjective("Keep this exact account".into())
+        );
+        assert_eq!(app.chat_ui.attempt(card).unwrap().session.launch, before);
+        assert!(submission(&input, &runtime.snapshot, &[], PromptMode::Queue).is_err());
+    }
+
+    #[test]
+    fn goal_input_refusals_preserve_draft_paste_attachments_and_unrelated_followups() {
+        for (provider, mode, text) in [
+            (Provider::Claude, PromptMode::Send, "/goal work"),
+            (Provider::Codex, PromptMode::Queue, "/goal work"),
+            (Provider::Codex, PromptMode::Steer, "/goal work"),
+            (Provider::Codex, PromptMode::Send, "/goal pause unexpected"),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (card, target) = draft(&mut app, provider);
+            write(&mut app, target, text);
+            let before = runtime(&app, card).composer.text();
+            drop(app.handle_chat_ui(Action::Submit(target, mode)));
+            let runtime = runtime(&app, card);
+            assert_eq!(runtime.composer.text(), before);
+            assert!(
+                runtime.goal_pending.is_none()
+                    && runtime.queued.is_none()
+                    && runtime.pending.is_none()
+            );
+            assert!(runtime.error.is_some());
+            assert!(!app.chat_start_pending(card));
+        }
+        let (mut app, card, target) = live();
+        write(&mut app, target, "/goal set preserve accepted paste");
+        app.chat_runtime_mut(target).unwrap().pastes_pending = 1;
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        assert_eq!(runtime(&app, card).pastes_pending, 1);
+        assert!(runtime(&app, card).submit_after_paste.is_none());
+        assert!(runtime(&app, card).goal_pending.is_none());
+        let rt = app.chat_runtime_mut(target).unwrap();
+        rt.pastes_pending = 0;
+        rt.attachments.push(Attachment::file("kept-attachment.txt"));
+        let attachments = rt.attachments.clone();
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        assert_eq!(runtime(&app, card).attachments, attachments);
+        assert!(runtime(&app, card).goal_pending.is_none());
+        let rt = app.chat_runtime_mut(target).unwrap();
+        rt.attachments.clear();
+        rt.followups.push(Followup {
+            id: 1,
+            text: "unrelated".into(),
+            preview: "unrelated".into(),
+            attachments: vec![],
+        });
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        assert_eq!(runtime(&app, card).followups[0].text, "unrelated");
+        assert!(runtime(&app, card).goal_pending.is_none());
+    }
+
+    #[test]
+    fn native_confirmation_not_transport_acceptance_consumes_only_unchanged_goal_input() {
+        for edit_after_dispatch in [false, true] {
+            let (mut app, card, target) = live();
+            write(&mut app, target, "/goal set original objective");
+            let source = runtime(&app, card).composer.text();
+            drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+            let rt = runtime(&app, card);
+            assert!(matches!(
+                rt.goal_pending.as_ref().unwrap().stage,
+                Stage::Native { revision: 8, .. }
+            ));
+            let pending = rt.pending.as_ref().unwrap();
+            assert!(
+                pending.sent.is_none()
+                    && pending.first_prompt.is_none()
+                    && pending.draft_revision.is_none()
+                    && pending.queued.is_none()
+            );
+            acknowledge(&mut app, card, Ok(()));
+            assert_eq!(runtime(&app, card).composer.text(), source);
+            assert!(runtime(&app, card).goal_pending.is_some());
+            assert!(runtime(&app, card).transition_blocker().is_none());
+            assert!(
+                runtime(&app, card).handoff_blocker().is_none(),
+                "native result wait is not a new Return/Close gate"
+            );
+            if edit_after_dispatch {
+                write(&mut app, target, "new unsent draft");
+            }
+            finish_native(&mut app, card, 8, Outcome::Confirmed);
+            let rt = runtime(&app, card);
+            assert!(rt.goal_pending.is_none());
+            assert_eq!(
+                rt.composer.text().trim(),
+                if edit_after_dispatch {
+                    "new unsent draft"
+                } else {
+                    ""
+                }
+            );
+            assert!(
+                rt.history.is_empty(),
+                "a goal is not a prompt-history message"
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_unsupported_wrong_revision_and_rejected_dispatch_never_consume_or_replay_input() {
+        for outcome in [Outcome::Uncertain, Outcome::Unsupported] {
+            let (mut app, card, target) = live();
+            write(&mut app, target, "/goal clear");
+            drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+            acknowledge(&mut app, card, Ok(()));
+            finish_native(&mut app, card, 8, outcome);
+            assert_eq!(runtime(&app, card).composer.text().trim(), "/goal clear");
+            assert!(
+                runtime(&app, card).goal_pending.is_none() && runtime(&app, card).pending.is_none()
+            );
+            assert!(runtime(&app, card).error.is_some());
+        }
+        let (mut app, card, target) = live();
+        write(&mut app, target, "/goal pause");
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        acknowledge(&mut app, card, Err("dispatch unknown".into()));
+        finish_native(&mut app, card, 8, Outcome::Confirmed);
+        assert_eq!(runtime(&app, card).composer.text().trim(), "/goal pause");
+        assert!(runtime(&app, card).goal_pending.is_none());
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        let revision = match runtime(&app, card).goal_pending.as_ref().unwrap().stage {
+            Stage::Native { revision, .. } => revision,
+            _ => panic!("native"),
+        };
+        acknowledge(&mut app, card, Ok(()));
+        finish_native(&mut app, card, revision + 10, Outcome::Confirmed);
+        assert_eq!(runtime(&app, card).composer.text().trim(), "/goal pause");
+        assert!(runtime(&app, card).goal_pending.is_none());
+        let (mut app, card, target) = live();
+        write(&mut app, target, "/goal set requested objective");
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        acknowledge(&mut app, card, Ok(()));
+        let mut different = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        let observed = different.goal.as_mut().unwrap();
+        observed.revision = 10;
+        observed.read = ReadState::Known(Some(chat::goal::Goal {
+            thread_id: THREAD.into(),
+            objective: "provider's different objective".into(),
+            status: Status::Blocked,
+            token_budget: None,
+            tokens_used: 1,
+            time_used_seconds: 1,
+            created_at: 1,
+            updated_at: 1,
+        }));
+        observed.last_result = Some(chat::goal::Completion {
+            revision: 8,
+            outcome: Outcome::Confirmed,
+        });
+        publish(&mut app, card, different);
+        assert_eq!(
+            runtime(&app, card).composer.text().trim(),
+            "/goal set requested objective"
+        );
+        assert!(
+            runtime(&app, card)
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("different current goal objective")
+        );
+        assert!(runtime(&app, card).goal_pending.is_none());
+    }
+
+    #[test]
+    fn stale_goal_control_preserves_a_newer_model_picker_and_its_field_focus() {
+        use iced::advanced::widget::{Operation as WidgetOperation, operation};
+        use iced::futures::StreamExt;
+
+        struct Focused(Option<widget::Id>);
+        impl WidgetOperation for Focused {
+            fn traverse(&mut self, children: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+                children(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+        let (mut app, card, target) = live();
+        write(&mut app, target, "keep the unsent draft");
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let old = control(runtime(&app, card), Operation::Get);
+        let mut newer = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        newer.goal.as_mut().unwrap().revision += 1;
+        publish(&mut app, card, newer);
+        let open = app.handle_chat_ui(Action::ModelPicker(target, true));
+        drop(app.handle_chat_ui(Action::ModelQuery(target, "selected query".into())));
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachments
+            .push(Attachment::file("retained-file.txt"));
+        let before = {
+            let rt = runtime(&app, card);
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+            )
+        };
+        let search_id = card_control_id(card, "chat-model-search");
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let search = widget::text_input("Model", "selected query")
+            .id(search_id.clone())
+            .on_input(move |query| Message::ChatUi(Action::ModelQuery(target, query)));
+        let mut ui = iced::runtime::UserInterface::build(
+            search,
+            iced::Size::new(360.0, 120.0),
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let mut stream = iced::runtime::task::into_stream(open).unwrap();
+            while let Some(action) = stream.next().await {
+                match action {
+                    iced::runtime::Action::Widget(mut operation) => {
+                        ui.operate(&renderer, operation.as_mut());
+                    }
+                    _ => panic!("opening the model picker must only focus its search field"),
+                }
+            }
+        });
+        let mut focused = Focused(None);
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.0, Some(search_id.clone()));
+
+        let rejected = app.handle_chat_ui(Action::GoalIntent(target, old));
+        assert_eq!(
+            rejected.units(),
+            0,
+            "a stale control cannot issue a focus or native task"
+        );
+        let rt = runtime(&app, card);
+        assert_eq!(rt.model_picker.as_deref(), Some("selected query"));
+        assert!(!rt.goal_open);
+        assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision
+            ),
+            before
+        );
+        let mut focused = Focused(None);
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.0, Some(search_id));
+
+        // A fresh control from the explicitly reopened panel submits its read.
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let fresh = control(runtime(&app, card), Operation::Get);
+        let accepted = app.handle_chat_ui(Action::GoalIntent(target, fresh));
+        assert!(accepted.units() > 0);
+        let rt = runtime(&app, card);
+        assert!(rt.goal_open && rt.model_picker.is_none());
+        assert!(rt.goal_pending.is_some() && rt.pending.is_some());
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn retained_goal_control_cannot_dismiss_a_same_revision_model_picker() {
+        use iced::advanced::widget::{Operation as WidgetOperation, operation};
+        use iced::futures::StreamExt;
+
+        struct Focused(Option<widget::Id>);
+        impl WidgetOperation for Focused {
+            fn traverse(&mut self, children: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+                children(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+        let (mut app, card, target) = live();
+        write(&mut app, target, "keep selected draft and attachment");
+        attachment_draft::move_to(
+            &mut app.chat_runtime_mut(target).unwrap().composer,
+            text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 4 },
+                selection: Some(text_editor::Position { line: 0, column: 0 }),
+            },
+        );
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachments
+            .push(Attachment::file("retained-picker-file.txt"));
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let held = control(runtime(&app, card), Operation::Get);
+        let revision = held.intent.observation_revision;
+        let original = runtime(&app, card).handle().unwrap().clone();
+
+        let open = app.handle_chat_ui(Action::ModelPicker(target, true));
+        drop(app.handle_chat_ui(Action::ModelQuery(target, "newer picker query".into())));
+        app.chat_runtime_mut(target).unwrap().error = Some("newer picker feedback".into());
+        let before = {
+            let rt = runtime(&app, card);
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+                rt.error.clone(),
+                rt.session.clone(),
+                rt.target,
+                rt.picker_keyboard,
+                rt.picker_focus,
+            )
+        };
+        let search_id = card_control_id(card, "chat-model-search");
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let search = widget::text_input("Model", "newer picker query")
+            .id(search_id.clone())
+            .on_input(move |query| Message::ChatUi(Action::ModelQuery(target, query)));
+        let mut ui = iced::runtime::UserInterface::build(
+            search,
+            iced::Size::new(360.0, 120.0),
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let mut stream = iced::runtime::task::into_stream(open).unwrap();
+            while let Some(action) = stream.next().await {
+                match action {
+                    iced::runtime::Action::Widget(mut operation) => {
+                        ui.operate(&renderer, operation.as_mut());
+                    }
+                    _ => panic!("opening the model picker must only focus its search field"),
+                }
+            }
+        });
+        let mut focused = Focused(None);
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.0, Some(search_id.clone()));
+        assert_eq!(
+            runtime(&app, card)
+                .handle()
+                .unwrap()
+                .snapshot()
+                .goal
+                .as_ref()
+                .unwrap()
+                .revision,
+            revision,
+            "the newer picker does not change the native Goal observation"
+        );
+        assert!(!runtime(&app, card).goal_open);
+
+        let rejected = app.handle_chat_ui(Action::GoalIntent(target, held));
+        assert_eq!(
+            rejected.units(),
+            0,
+            "a retained same-revision Goal control must preserve the newer model picker"
+        );
+        let rt = runtime(&app, card);
+        assert_eq!(rt.model_picker.as_deref(), Some("newer picker query"));
+        assert!(!rt.goal_open);
+        assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+        assert!(Arc::ptr_eq(rt.handle().unwrap(), &original));
+        assert_eq!(
+            rt.handle()
+                .unwrap()
+                .snapshot()
+                .goal
+                .as_ref()
+                .unwrap()
+                .revision,
+            revision
+        );
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+                rt.error.clone(),
+                rt.session.clone(),
+                rt.target,
+                rt.picker_keyboard,
+                rt.picker_focus
+            ),
+            before
+        );
+        let mut focused = Focused(None);
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.0, Some(search_id));
+    }
+
+    #[test]
+    fn retained_goal_control_cannot_reopen_a_publicly_closed_panel() {
+        let (mut app, card, target) = live();
+        write(&mut app, target, "keep the closed panel draft");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachments
+            .push(Attachment::file("retained-closed-file.txt"));
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let held = control(runtime(&app, card), Operation::Get);
+        let revision = held.intent.observation_revision;
+        drop(app.handle_chat_ui(Action::GoalPanel(target, false)));
+        app.chat_runtime_mut(target).unwrap().error = Some("keep current feedback".into());
+        let before = {
+            let rt = runtime(&app, card);
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+                rt.error.clone(),
+                rt.focus_control(),
+            )
+        };
+        assert!(!runtime(&app, card).goal_open);
+        assert_eq!(
+            runtime(&app, card)
+                .handle()
+                .unwrap()
+                .snapshot()
+                .goal
+                .as_ref()
+                .unwrap()
+                .revision,
+            revision,
+            "closing the panel does not change the native Goal observation"
+        );
+        let rejected = app.handle_chat_ui(Action::GoalIntent(target, held));
+        assert_eq!(
+            rejected.units(),
+            0,
+            "a retained same-revision Goal control must not reopen a closed panel"
+        );
+        let rt = runtime(&app, card);
+        assert!(!rt.goal_open && rt.model_picker.is_none());
+        assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+                rt.error.clone(),
+                rt.focus_control()
+            ),
+            before
+        );
+
+        // The public reopen creates a genuinely current button presentation.
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let fresh = control(runtime(&app, card), Operation::Get);
+        let accepted = app.handle_chat_ui(Action::GoalIntent(target, fresh));
+        assert!(accepted.units() > 0);
+        drop(accepted);
+        assert!(runtime(&app, card).goal_pending.is_some());
+        assert!(runtime(&app, card).pending.is_some());
+        acknowledge(&mut app, card, Ok(()));
+        finish_native(&mut app, card, revision, Outcome::Confirmed);
+        assert!(runtime(&app, card).goal_pending.is_none());
+        assert!(runtime(&app, card).pending.is_none());
+        assert_eq!(runtime(&app, card).composer.text(), before.0);
+        assert_eq!(runtime(&app, card).composer.cursor(), before.1);
+        assert_eq!(runtime(&app, card).attachments, before.2);
+    }
+
+    #[test]
+    fn goal_callbacks_cannot_retarget_actor_thread_observation_or_selected_child() {
+        let (mut app, card, target) = live();
+        write(&mut app, target, "unrelated draft and caret");
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let old = control(runtime(&app, card), Operation::Get);
+        let held_original = runtime(&app, card).handle().unwrap().clone();
+        let replacement = Arc::new(ClientHandle::fixture(
+            runtime(&app, card).session.clone(),
+            (*held_original.snapshot()).clone(),
+        ));
+        app.chat_runtime_mut(target).unwrap().connection = Connection::Live(replacement);
+        drop(app.handle_chat_ui(Action::GoalIntent(target, old)));
+        assert!(runtime(&app, card).pending.is_none());
+        let old = control(runtime(&app, card), Operation::Get);
+        let mut newer = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        newer.goal.as_mut().unwrap().revision += 1;
+        publish(&mut app, card, newer);
+        drop(app.handle_chat_ui(Action::GoalIntent(target, old)));
+        assert!(runtime(&app, card).pending.is_none());
+        let mut wrong_thread = control(runtime(&app, card), Operation::Get);
+        wrong_thread.thread = "foreign-thread".into();
+        drop(app.handle_chat_ui(Action::GoalIntent(target, wrong_thread)));
+        assert!(runtime(&app, card).pending.is_none());
+        app.chat_runtime_mut(target).unwrap().selected_subagent = Some("child".into());
+        let child = control(runtime(&app, card), Operation::Get);
+        drop(app.handle_chat_ui(Action::GoalIntent(target, child)));
+        assert!(runtime(&app, card).pending.is_none());
+        write(&mut app, target, "/goal clear");
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        assert!(runtime(&app, card).pending.is_none());
+        app.chat_runtime_mut(target).unwrap().selected_subagent = None;
+        write(&mut app, target, "unrelated draft and caret");
+        let before = runtime(&app, card).composer.cursor();
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let fresh = control(runtime(&app, card), Operation::Get);
+        drop(app.handle_chat_ui(Action::GoalIntent(target, fresh)));
+        acknowledge(&mut app, card, Ok(()));
+        finish_native(&mut app, card, 9, Outcome::Confirmed);
+        assert_eq!(
+            runtime(&app, card).composer.text().trim(),
+            "unrelated draft and caret"
+        );
+        assert_eq!(runtime(&app, card).composer.cursor(), before);
+        assert!(runtime(&app, card).goal_pending.is_none());
+        drop(held_original);
+        // An adopted actor may have an authoritative confirmed_thread before
+        // native resume is admitted. Read/stop remain available without Ready.
+        let mut blocked = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        blocked.ready = false;
+        let mut observed = goal(20);
+        observed.read = ReadState::Known(Some(chat::goal::Goal {
+            thread_id: THREAD.into(),
+            objective: "retained active goal".into(),
+            status: Status::Active,
+            token_budget: None,
+            tokens_used: 1,
+            time_used_seconds: 1,
+            created_at: 1,
+            updated_at: 1,
+        }));
+        blocked.goal = Some(observed);
+        publish(&mut app, card, blocked);
+        write(&mut app, target, "/goal resume");
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        assert!(runtime(&app, card).pending.is_none());
+        assert_eq!(runtime(&app, card).composer.text().trim(), "/goal resume");
+        assert!(
+            runtime(&app, card)
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("not ready for goal work")
+        );
+        for operation in [Operation::Get, Operation::Pause, Operation::Clear] {
+            drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+            let requested = control(runtime(&app, card), operation);
+            let revision = requested.intent.observation_revision;
+            drop(app.handle_chat_ui(Action::GoalIntent(target, requested)));
+            assert!(runtime(&app, card).pending.is_some());
+            acknowledge(&mut app, card, Ok(()));
+            finish_native(&mut app, card, revision, Outcome::Confirmed);
+            assert!(!runtime(&app, card).snapshot.ready);
+            assert_eq!(runtime(&app, card).composer.text().trim(), "/goal resume");
+        }
+    }
+
+    #[test]
+    fn typed_draft_goal_waits_for_original_start_model_and_probe_without_a_literal_prompt() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = draft(&mut app, Provider::Codex);
+        write(&mut app, target, "/goal set Keep selected model");
+        {
+            let rt = app.chat_runtime_mut(target).unwrap();
+            let snapshot = Arc::make_mut(&mut rt.snapshot);
+            snapshot.selected_model = Some("chosen-model".into());
+            snapshot.reasoning = Some("low".into());
+        }
+        let original_launch = runtime(&app, card).session.launch.clone();
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        assert_eq!(
+            app.chat_ui.attempt(card).unwrap().session.launch,
+            original_launch
+        );
+        let mut checking = goal(1);
+        checking.pending = true;
+        let target = ready(
+            &mut app,
+            card,
+            Snapshot {
+                session_id: Some(THREAD.into()),
+                ready: true,
+                models: vec![chat::Model {
+                    id: "chosen-model".into(),
+                    label: "Chosen model".into(),
+                    reasoning: vec!["low".into()],
+                }],
+                goal: Some(checking),
+                ..Snapshot::default()
+            },
+        );
+        assert!(runtime(&app, card).queued.is_none());
+        assert!(matches!(
+            runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+            Stage::Model(_)
+        ));
+        assert_eq!(
+            runtime(&app, card).pending.as_ref().unwrap().model,
+            Some(("chosen-model".into(), Some("low".into())))
+        );
+        acknowledge(&mut app, card, Ok(()));
+        assert!(
+            runtime(&app, card).pending.is_none(),
+            "no duplicate model request while its snapshot is pending"
+        );
+        let mut selected = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        selected.selected_model = Some("chosen-model".into());
+        selected.reasoning = Some("low".into());
+        publish(&mut app, card, selected);
+        assert!(
+            runtime(&app, card).pending.is_none(),
+            "goal probe still owns its physical slot"
+        );
+        assert!(runtime(&app, card).goal_pending.is_some());
+        assert_eq!(
+            runtime(&app, card).composer.text().trim(),
+            "/goal set Keep selected model"
+        );
+        let mut observed = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        observed.goal = Some(goal(3));
+        publish(&mut app, card, observed);
+        assert!(matches!(
+            runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+            Stage::Native { revision: 3, .. }
+        ));
+        acknowledge(&mut app, card, Ok(()));
+        assert_eq!(
+            runtime(&app, card).composer.text().trim(),
+            "/goal set Keep selected model"
+        );
+        finish_native(&mut app, card, 3, Outcome::Confirmed);
+        assert!(runtime(&app, card).composer.text().trim().is_empty());
+        assert!(runtime(&app, card).queued.is_none());
+        assert_eq!(runtime(&app, card).target, target);
+    }
+
+    #[test]
+    fn failed_start_and_replaced_source_retire_goal_intent_without_retry_or_draft_loss() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = draft(&mut app, Provider::Codex);
+        write(&mut app, target, "/goal set original draft");
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        let failed = super::super::refused_switch_message(&app, card, "test refusal");
+        drop(app.update(failed));
+        assert!(runtime(&app, card).goal_pending.is_none());
+        assert_eq!(
+            runtime(&app, card).composer.text().trim(),
+            "/goal set original draft"
+        );
+        assert!(runtime(&app, card).queued.is_none());
+        let (mut app, card, target) = live();
+        write(&mut app, target, "/goal set original source");
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        acknowledge(&mut app, card, Ok(()));
+        let replacement = Arc::new(ClientHandle::fixture(
+            runtime(&app, card).session.clone(),
+            (*runtime(&app, card).handle().unwrap().snapshot()).clone(),
+        ));
+        app.chat_runtime_mut(target).unwrap().connection = Connection::Live(replacement);
+        finish_native(&mut app, card, 8, Outcome::Confirmed);
+        assert_eq!(
+            runtime(&app, card).composer.text().trim(),
+            "/goal set original source"
+        );
+        assert!(runtime(&app, card).goal_pending.is_none());
+    }
+
+    #[test]
+    fn native_goal_activity_blocks_automatic_account_handoff_between_turns_without_faking_turn_busy()
+     {
+        let (mut app, card, target) = live();
+        // Ready behind an unmeasured workspace deliberately keeps its old
+        // presentation. Real exposure must hydrate it before an idle routing
+        // positive can distinguish Goal activity from ordinary loading.
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        // Exposure requests history asynchronously. Deliver the fixture's
+        // original full publication, then its real wake, before using it.
+        let hydrated = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        publish(&mut app, card, hydrated);
+        let rt = runtime(&app, card);
+        assert!(rt.snapshot.ready && !rt.snapshot.busy && !rt.disconnected);
+        assert_eq!(rt.snapshot.goal, rt.handle().unwrap().snapshot().goal);
+        assert!(rt.goal_presentation().current);
+        assert_eq!(
+            rt.session
+                .launch
+                .recipe
+                .environment
+                .get(account::routing::AUTOMATIC_MARKER)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            app.chat_account(Provider::Codex, &rt.session.launch.recipe),
+            Some(Account::system(Provider::Codex).id())
+        );
+        let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 106);
+        let now = chat::now_ms().unwrap();
+        for (id, status) in [
+            (
+                Account::system(Provider::Codex).id(),
+                account::UsageStatus::Limited,
+            ),
+            (alternate.clone(), account::UsageStatus::Ok),
+        ] {
+            let owner = app.account_ui.probe_owner(&id).unwrap();
+            drop(
+                app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
+                    owner,
+                    id,
+                    outcome: account::probe::Outcome::Answered {
+                        identity: None,
+                        catalog: None,
+                        snapshot: account::UsageSnapshot::state(status, "", now),
+                    },
+                })),
+            );
+        }
+        assert_eq!(
+            app.automatic_account(&Account::system(Provider::Codex))
+                .map(|account| account.id()),
+            Some(alternate.clone()),
+            "current quota and identity evidence offers this alternate before Goal policy"
+        );
+        write(&mut app, target, "ordinary unsent message");
+        assert_eq!(
+            app.automatic_chat_account(target, PromptMode::Send)
+                .unwrap()
+                .0
+                .id(),
+            alternate
+        );
+        for (status, blocked) in [
+            (Status::Active, true),
+            (Status::Blocked, true),
+            (Status::UsageLimited, true),
+            (Status::BudgetLimited, true),
+            (Status::Paused, false),
+            (Status::Complete, false),
+        ] {
+            let mut next = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+            let mut observed = goal(next.generation + 1);
+            observed.read = ReadState::Known(Some(chat::goal::Goal {
+                thread_id: THREAD.into(),
+                objective: "continue task".into(),
+                status,
+                token_budget: None,
+                tokens_used: 0,
+                time_used_seconds: 0,
+                created_at: 1,
+                updated_at: 1,
+            }));
+            next.goal = Some(observed);
+            assert!(!next.busy);
+            publish(&mut app, card, next);
+            assert_eq!(
+                app.automatic_chat_account(target, PromptMode::Send)
+                    .is_none(),
+                blocked
+            );
+        }
+        for kind in 0..4 {
+            let mut next = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+            let mut observed = goal(next.generation + 1);
+            match kind {
+                0 => observed.pending = true,
+                1 => observed.uncertain = true,
+                2 => {
+                    observed.support = Support::Unknown;
+                    observed.read = ReadState::Unknown;
+                }
+                _ => {
+                    observed.support = Support::Unsupported;
+                    observed.read = ReadState::Unknown;
+                }
+            }
+            next.goal = Some(observed);
+            publish(&mut app, card, next);
+            assert!(
+                app.automatic_chat_account(target, PromptMode::Send)
+                    .is_none()
+            );
+        }
+        let mut next = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        next.goal = None; // Ordinary pre-goal actors keep the existing routing contract.
+        publish(&mut app, card, next);
+        assert_eq!(
+            app.automatic_chat_account(target, PromptMode::Send)
+                .unwrap()
+                .0
+                .id(),
+            alternate
+        );
+    }
+}

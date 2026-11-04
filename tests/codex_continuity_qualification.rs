@@ -20,9 +20,21 @@
 //! locally, then run
 //!
 //! ```sh
+//! Run each of the three continuity scenarios explicitly; the separate GUI
+//! model-only ignored parent requires an owned stdin pipe, not Cargo stdin.
+//!
 //! CAGENTS_QUALIFY_CODEX=/path/to/native/codex cargo test --locked \
 //!     --no-default-features --features host \
-//!     --test codex_continuity_qualification -- --ignored --test-threads=1
+//!     --test codex_continuity_qualification a_running_command_survives_a_killed_daemon \
+//!     -- --exact --ignored --test-threads=1
+//! CAGENTS_QUALIFY_CODEX=/path/to/native/codex cargo test --locked \
+//!     --no-default-features --features host \
+//!     --test codex_continuity_qualification a_yielded_command_poll_survives_a_killed_daemon \
+//!     -- --exact --ignored --test-threads=1
+//! CAGENTS_QUALIFY_CODEX=/path/to/native/codex cargo test --locked \
+//!     --no-default-features --features host \
+//!     --test codex_continuity_qualification a_pending_approval_survives_a_killed_daemon_unanswered \
+//!     -- --exact --ignored --test-threads=1
 //! ```
 //!
 //! and keep the allowlist entry only if all three pass. The path must name the
@@ -32,6 +44,15 @@
 
 #[path = "support/hosted_agent_cleanup.rs"]
 mod hosted_agent_cleanup;
+
+// Reviewed private pipe-capture dependency, imported unchanged from PR1695.
+#[path = "support/private_cli_capture.rs"]
+mod private_cli_capture;
+
+#[path = "codex_continuity_qualification/goal.rs"]
+mod goal;
+#[path = "support/codex_goal_model.rs"]
+mod goal_model;
 
 use cagents::{
     chat::{Command as ChatCommand, NativeContinuity, Session, Snapshot},
@@ -69,6 +90,9 @@ const APPROVAL_MARKER: &str = "approved-command-ran";
 /// One request the provider made to the model endpoint.
 #[derive(Clone, Debug)]
 struct ModelRequest {
+    /// Actual provider request settings, rather than the UI's staged choice.
+    model: Option<String>,
+    reasoning: Option<String>,
     /// Every user prompt in the request's input, in order.
     prompts: Vec<String>,
     /// The tool output the request ends with, when it reports one.
@@ -80,43 +104,346 @@ struct ModelRequest {
 /// A scripted Responses API. It answers a prompt with the tool call its
 /// scenario names, and a tool output with either the next call or a final
 /// message, so the provider's own turn loop does the rest.
+#[derive(Clone, Copy)]
+enum ModelMode {
+    Continuity,
+    Goal,
+}
+
 struct Model {
     port: u16,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
+    over_limit: Arc<std::sync::atomic::AtomicBool>,
+    goal_response_gate: Arc<Mutex<Option<Arc<GoalResponseGate>>>>,
+}
+
+/// SDK2 and SDK3 opt into pacing completed Responses, not native Goal commands
+/// or turns. Other Continuity cases and the external GUI endpoint stay unpaced.
+struct GoalResponseGate {
+    state: Mutex<GoalResponseState>,
+    changed: std::sync::Condvar,
+}
+
+struct GoalResponseState {
+    permitted_through: usize,
+    held: usize,
+    cancelled: bool,
+    timed_out: bool,
+}
+
+impl GoalResponseGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GoalResponseState {
+                permitted_through: 1, // The ordinary initial turn only.
+                held: 0,
+                cancelled: false,
+                timed_out: false,
+            }),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn permit_through(&self, number: usize) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Keep the existing eight-request refusal meaningful. No refill,
+        // automatic credit or late permission after cancellation is allowed.
+        if number > 8 || number < state.permitted_through || state.cancelled {
+            return false;
+        }
+        state.permitted_through = number;
+        self.changed.notify_all();
+        true
+    }
+
+    fn release_after_confirmed_pause(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(next) = state
+            .permitted_through
+            .checked_add(1)
+            .filter(|next| *next <= 8)
+        else {
+            return false;
+        };
+        if state.cancelled {
+            return false;
+        }
+        // Pause prevents the next continuation, but does not interrupt a
+        // response already in progress. Let exactly that one settle.
+        state.permitted_through = next;
+        self.changed.notify_all();
+        true
+    }
+
+    fn wait(&self, number: usize, deadline: Instant) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.held += 1;
+        self.changed.notify_all();
+        while !state.cancelled && number > state.permitted_through {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.timed_out = true;
+                state.cancelled = true;
+                self.changed.notify_all();
+                break;
+            }
+            (state, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.held -= 1;
+        self.changed.notify_all();
+        !state.cancelled
+    }
+
+    fn cancel(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.cancelled = true;
+        self.changed.notify_all();
+    }
+}
+
+/// Declare after Fixture: its drop wakes held HTTP handlers BEFORE Fixture's
+/// public agent/daemon cleanup, including on an assertion panic. The model's
+/// slot remains permanently cancelled, so cleanup cannot bypass the gate.
+struct GoalResponsePacing(Arc<GoalResponseGate>);
+
+impl GoalResponsePacing {
+    fn permit_through(&self, number: usize) {
+        assert!(
+            self.0.permit_through(number),
+            "invalid Goal response allowance"
+        );
+    }
+
+    fn after_confirmed_pause(&self) {
+        assert!(
+            self.0.release_after_confirmed_pause(),
+            "invalid paused response allowance"
+        );
+    }
+
+    fn has_held_response(&self) -> bool {
+        let state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.held == 1 && !state.cancelled && !state.timed_out
+    }
+
+    fn assert_healthy(&self) {
+        let state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !state.timed_out && !state.cancelled,
+            "Goal response gate failed closed"
+        );
+    }
+}
+
+impl Drop for GoalResponsePacing {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[test]
+fn goal_response_permits_are_bounded_and_owner_drop_wakes_held_responses() {
+    fn held(gate: &GoalResponseGate) {
+        let state = gate.state.lock().unwrap();
+        let (state, wait) = gate
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(20), |state| state.held == 0)
+            .unwrap();
+        assert!(!wait.timed_out() && state.held == 1);
+    }
+    let gate = Arc::new(GoalResponseGate::new());
+    let owner = GoalResponsePacing(gate.clone());
+    assert!(gate.wait(1, Instant::now()));
+    assert!(!gate.permit_through(9));
+    assert_eq!(gate.state.lock().unwrap().permitted_through, 1);
+    let (sent, received) = std::sync::mpsc::channel();
+    let waiting = gate.clone();
+    let worker = thread::spawn(move || {
+        sent.send(waiting.wait(2, Instant::now() + Duration::from_secs(20)))
+            .unwrap();
+    });
+    held(&gate);
+    assert!(matches!(
+        received.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert!(gate.permit_through(2));
+    assert!(received.recv_timeout(Duration::from_secs(20)).unwrap());
+    worker.join().unwrap();
+    assert!(
+        !gate.permit_through(1),
+        "old credits cannot reset the allowance"
+    );
+    assert!(gate.release_after_confirmed_pause());
+    assert_eq!(gate.state.lock().unwrap().permitted_through, 3);
+    let (sent, received) = std::sync::mpsc::channel();
+    let waiting = gate.clone();
+    let worker = thread::spawn(move || {
+        sent.send(waiting.wait(4, Instant::now() + Duration::from_secs(20)))
+            .unwrap();
+    });
+    held(&gate);
+    drop(owner); // The same guard used before Fixture's public cleanup.
+    assert!(!received.recv_timeout(Duration::from_secs(20)).unwrap());
+    worker.join().unwrap();
+    assert!(!gate.permit_through(4));
+    assert!(!gate.release_after_confirmed_pause());
+    assert!(
+        !gate.wait(1, Instant::now()),
+        "cancellation cannot reply even to an old allowance"
+    );
+    let expired = GoalResponseGate::new();
+    assert!(!expired.wait(2, Instant::now()));
+    let state = expired.state.lock().unwrap();
+    assert!(state.timed_out && state.cancelled && state.held == 0);
+    drop(state);
+    assert!(
+        !expired.permit_through(2),
+        "expiry never auto-releases a successful response"
+    );
+    let bounded = GoalResponseGate::new();
+    assert!(bounded.permit_through(8));
+    assert!(!bounded.release_after_confirmed_pause());
+    assert_eq!(bounded.state.lock().unwrap().permitted_through, 8);
 }
 
 impl Model {
-    fn start() -> Self {
+    fn start(mode: ModelMode) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let over_limit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rejected = over_limit.clone();
+        let goal_response_gate = Arc::new(Mutex::new(None::<Arc<GoalResponseGate>>));
+        let response_gate = goal_response_gate.clone();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let seen = seen.clone();
-                thread::spawn(move || serve(stream, &seen));
+                let rejected = rejected.clone();
+                let gate = response_gate.lock().unwrap().clone();
+                thread::spawn(move || {
+                    serve_with_goal_gate(stream, &seen, mode, &rejected, gate.as_deref())
+                });
             }
         });
-        Self { port, requests }
+        Self {
+            port,
+            requests,
+            over_limit,
+            goal_response_gate,
+        }
     }
 
     fn requests(&self) -> Vec<ModelRequest> {
         self.requests.lock().unwrap().clone()
     }
+
+    fn pace_goal_responses(&self) -> GoalResponsePacing {
+        assert!(
+            self.requests().is_empty(),
+            "install pacing before starting the SDK"
+        );
+        let gate = Arc::new(GoalResponseGate::new());
+        let mut slot = self.goal_response_gate.lock().unwrap();
+        assert!(slot.is_none(), "Goal response pacing was already installed");
+        *slot = Some(gate.clone());
+        GoalResponsePacing(gate)
+    }
 }
 
-fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
+/// Keep the external Goal fixture's header/chunk lines bounded without
+/// changing the existing Continuity parser or Responses implementation.
+fn model_line(
+    reader: &mut impl BufRead,
+    line: &mut String,
+    mode: ModelMode,
+) -> std::io::Result<usize> {
+    if matches!(mode, ModelMode::Goal) {
+        let count = reader.take(16 * 1024 + 1).read_line(line)?;
+        if count > 16 * 1024 {
+            return Err(std::io::Error::other(
+                "Goal model line exceeded fixture bound",
+            ));
+        }
+        Ok(count)
+    } else {
+        reader.read_line(line)
+    }
+}
+
+fn serve(
+    stream: TcpStream,
+    seen: &Mutex<Vec<ModelRequest>>,
+    mode: ModelMode,
+    over_limit: &std::sync::atomic::AtomicBool,
+) {
+    serve_with_goal_gate(stream, seen, mode, over_limit, None);
+}
+
+fn serve_with_goal_gate(
+    stream: TcpStream,
+    seen: &Mutex<Vec<ModelRequest>>,
+    mode: ModelMode,
+    over_limit: &std::sync::atomic::AtomicBool,
+    goal_response_gate: Option<&GoalResponseGate>,
+) {
+    if matches!(mode, ModelMode::Goal) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+    }
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+    let request_line_read = model_line(&mut reader, &mut request_line, mode);
+    let request_line_bytes = if matches!(mode, ModelMode::Goal) {
+        request_line_read.expect("Goal model request line could not be read")
+    } else {
+        request_line_read.unwrap_or(0)
+    };
+    if request_line_bytes == 0 {
         return;
     }
     let mut length = 0;
     let mut chunked = false;
     let mut conversation = None;
+    let mut header_bytes = request_line.len();
     loop {
         let mut header = String::new();
-        reader.read_line(&mut header).unwrap();
+        model_line(&mut reader, &mut header, mode).unwrap();
+        if matches!(mode, ModelMode::Goal) {
+            header_bytes += header.len();
+            assert!(
+                header_bytes <= 32 * 1024,
+                "Goal model headers exceeded fixture bound"
+            );
+        }
         let header = header.trim_end();
         if header.is_empty() {
             break;
@@ -126,6 +453,9 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
         match name.to_ascii_lowercase().as_str() {
             "content-length" => length = value.parse().unwrap(),
             "transfer-encoding" => chunked = value.eq_ignore_ascii_case("chunked"),
+            "content-encoding" if matches!(mode, ModelMode::Goal) => {
+                panic!("Goal model does not accept encoded request bodies")
+            }
             "content-encoding" => panic!("the fixture cannot read a {value} request body"),
             "session_id" | "conversation_id" => conversation = Some(value.to_owned()),
             _ => {}
@@ -135,8 +465,14 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
     if chunked {
         loop {
             let mut size = String::new();
-            reader.read_line(&mut size).unwrap();
+            model_line(&mut reader, &mut size, mode).unwrap();
             let size = usize::from_str_radix(size.trim(), 16).unwrap();
+            if matches!(mode, ModelMode::Goal) {
+                assert!(
+                    body.len().saturating_add(size) <= 2 * 1024 * 1024,
+                    "Goal model request exceeded fixture bound"
+                );
+            }
             let mut chunk = vec![0; size + 2];
             reader.read_exact(&mut chunk).unwrap();
             if size == 0 {
@@ -145,6 +481,12 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
             body.extend_from_slice(&chunk[..size]);
         }
     } else {
+        if matches!(mode, ModelMode::Goal) {
+            assert!(
+                length <= 2 * 1024 * 1024,
+                "Goal model request exceeded fixture bound"
+            );
+        }
         body.resize(length, 0);
         reader.read_exact(&mut body).unwrap();
     }
@@ -182,7 +524,16 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
         });
     let number = {
         let mut seen = seen.lock().unwrap();
+        // Goal controls may trigger native continuation. Answer no tools, and
+        // refuse beyond this finite fixture bound rather than feeding a loop.
+        if matches!(mode, ModelMode::Goal) && seen.len() >= 8 {
+            over_limit.store(true, std::sync::atomic::Ordering::Release);
+            let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            return;
+        }
         seen.push(ModelRequest {
+            model: body["model"].as_str().map(str::to_owned),
+            reasoning: body["reasoning"]["effort"].as_str().map(str::to_owned),
             prompts: prompts.clone(),
             output: output.clone(),
             conversation: conversation
@@ -190,6 +541,15 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
         });
         seen.len()
     };
+    // The request counter's mutex has been released. This wait holds neither
+    // a host/Window lock nor a socket operation; native Get/Pause/Clear remain
+    // serviceable while a no-tool model response is held. Expiry closes this
+    // connection without a successful response and cannot qualify the case.
+    if let Some(gate) = goal_response_gate
+        && !gate.wait(number, Instant::now() + Duration::from_secs(20))
+    {
+        return;
+    }
     let id = format!("response-{number}");
     let shell = |call: &str, command: String, yield_ms: u64| {
         tool_call(
@@ -200,6 +560,10 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
     };
     let scenario = prompts.last().map(String::as_str).unwrap_or_default();
     let item = match &output {
+        _ if matches!(mode, ModelMode::Goal) => json!({
+            "type":"message", "role":"assistant", "id":format!("message-{number}"),
+            "content":[{"type":"output_text", "text":"GOAL_FIXTURE_OBSERVED_NO_TOOLS"}]
+        }),
         Some(output) if last["call_id"] == "yield-start" => {
             // The command yielded; poll it the way a model does, with a wait
             // that outlasts it.
@@ -422,6 +786,20 @@ impl Fixture {
     }
 
     fn new() -> Self {
+        Self::with_model_mode(ModelMode::Continuity)
+    }
+
+    fn with_model_mode(mode: ModelMode) -> Self {
+        assert!(
+            [
+                "CAGENTS_AGENT_AUTHORITY",
+                "CAGENTS_AGENT_TOKEN",
+                "CAGENTS_SESSION_TOKEN"
+            ]
+            .iter()
+            .all(|name| std::env::var_os(name).is_none()),
+            "Private daemon bootstrap requires a genuine User terminal or CI context; hosted authority must not be stripped"
+        );
         let codex = std::env::var_os(CODEX).unwrap_or_else(|| {
             panic!("set {CODEX} to the native Codex executable this run qualifies")
         });
@@ -465,7 +843,7 @@ impl Fixture {
             .unwrap();
         assert!(initialized.status.success(), "{initialized:?}");
         symlink(&codex, root.path().join("bin/codex")).unwrap();
-        let model = Model::start();
+        let model = Model::start(mode);
         // No sandbox, so a command's fate depends only on the approval policy
         // each scenario asks for; no retries, so a resent request is visible
         // as a request rather than absorbed.
@@ -518,7 +896,7 @@ unified_exec = true
     fn await_daemon(&self) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let output = self.output(&["daemon", "status"]);
+            let output = self.output_until(&["daemon", "status"], deadline);
             if output.status.success()
                 && serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"]["running"]
                     == true
@@ -531,23 +909,15 @@ unified_exec = true
     }
 
     fn output(&self, arguments: &[&str]) -> Output {
-        let mut child = Self::command(self.root.path(), Path::new(env!("CARGO_BIN_EXE_cagents")))
-            .arg("--json")
-            .args(arguments)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(90);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let output = child.wait_with_output().unwrap();
-                panic!("CLI timed out: {arguments:?}: {output:?}");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        let output = child.wait_with_output().unwrap();
+        self.output_until(arguments, Instant::now() + Duration::from_secs(90))
+    }
+
+    fn output_until(&self, arguments: &[&str], deadline: Instant) -> Output {
+        let spec = private_cli_capture::private_cli(self.root.path())
+            .env("TERM", "xterm-256color")
+            .args(arguments.iter().copied());
+        let output = private_cli_capture::capture(spec, deadline)
+            .unwrap_or_else(|failure| panic!("CLI failed: {arguments:?}: {failure:?}"));
         self.agents.observe(&output);
         output
     }

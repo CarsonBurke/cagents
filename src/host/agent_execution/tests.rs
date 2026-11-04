@@ -2159,6 +2159,15 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
                 "thread/read" => {
                     json!({"thread":{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","turns":[]}})
                 }
+                "thread/goal/get" => {
+                    // Synthetic read-only inactive metadata; the version above
+                    // retains this parent's holder-identity purpose, not SDK evidence.
+                    assert_eq!(
+                        frame["params"]["threadId"],
+                        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+                    );
+                    json!({"goal":null})
+                }
                 method => panic!("unexpected Codex request {method}"),
             };
             websocket

@@ -4,7 +4,9 @@
 mod cleanup;
 mod transport;
 pub(crate) use cleanup::{Detached, closed_pair_holder, closed_source, confirm_pair_closed};
-pub(crate) use transport::{Holder, adopt, inspect, spawn};
+#[cfg(test)]
+pub(crate) use transport::spawn;
+pub(crate) use transport::{Holder, adopt, inspect, spawn_with_account_scope};
 
 use crate::{
     agent::Provider,
@@ -26,6 +28,10 @@ pub(crate) struct Recovery {
     pub server_identity: Option<super::protocol::ServerIdentity>,
     pub server_process: Option<crate::daemon::holder_registry::Process>,
     pub execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    /// Original admitted physical home, retained only by this private holder.
+    /// Absence in older holders is not permission to resolve a new pathname.
+    #[serde(default)]
+    pub goal_account_scope: Option<crate::account::scope::LaunchAccountScope>,
 }
 
 impl Recovery {
@@ -45,6 +51,11 @@ impl Recovery {
         application: &str,
         adopted: bool,
     ) -> Result<(), String> {
+        if self.goal_account_scope.as_ref().is_some_and(|scope| {
+            scope.provider != Provider::Codex || !scope.canonical_home.is_absolute()
+        }) {
+            return Err("Native holder has invalid original goal account scope".into());
+        }
         if self.paired_holder.as_ref().is_some_and(|record| {
             self.source
                 .terminal
@@ -342,6 +353,7 @@ mod tests {
             server_identity: None,
             server_process: None,
             execution_environment: Default::default(),
+            goal_account_scope: None,
         }
     }
 
@@ -709,5 +721,40 @@ mod tests {
         assert_eq!(recovery.source, original);
         assert!(recovery.previous_sources.is_empty());
         assert!(!recovery.is_durable());
+    }
+
+    #[test]
+    fn recovery_retains_original_goal_scope_without_recapturing_legacy_or_missing_paths() {
+        let mut original = recovery();
+        let boot = original.source.proof.as_ref().unwrap().boot_id.clone();
+        original.goal_account_scope = Some(crate::account::scope::LaunchAccountScope {
+            provider: Provider::Codex,
+            canonical_home: "/synthetic/original-codex-home".into(),
+            device: 12,
+            inode: 34,
+            registered_id: None,
+            purge_ids: Vec::new(),
+        });
+        // This private metadata is not a current path or authentication check.
+        // Missing paths must not disable read/pause/clear on an existing actor.
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let restored: Recovery = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.goal_account_scope, original.goal_account_scope);
+        restored.validate(&boot).unwrap();
+        let mut legacy = serde_json::to_value(&original).unwrap();
+        legacy.as_object_mut().unwrap().remove("goal_account_scope");
+        let legacy: Recovery = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.goal_account_scope.is_none());
+        legacy.validate(&boot).unwrap();
+        for (provider, path) in [
+            (Provider::Claude, "/synthetic/home"),
+            (Provider::Codex, "relative"),
+        ] {
+            let mut malformed = original.clone();
+            let scope = malformed.goal_account_scope.as_mut().unwrap();
+            scope.provider = provider;
+            scope.canonical_home = path.into();
+            assert!(malformed.validate(&boot).is_err());
+        }
     }
 }

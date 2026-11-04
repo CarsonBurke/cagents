@@ -19,6 +19,7 @@ app-server 0.159.3, and Oh My Pi 18.2.9.
 | Child transcripts and lifecycle | Supported | Supported, including nested children | Supported |
 | Child approvals | Provider permission requests | Explicit, labeled child requests | Provider input dialogs |
 | Direct child messaging, stop and restart controls | No native controls | Remaining native UI gap | RPC unavailable |
+| Native goals: objective, status, pause/resume/clear | API unavailable | Native Goal API where supported; commands and state panel | RPC unavailable |
 | Suggested next prompt | Optional SDK suggestion | Optional experimental prediction API | API unavailable |
 | Model, reasoning, attachments, skills, compaction | Supported where provider advertises them | Supported | Supported |
 | Runtime permission policy | Provider modes; source-labelled rules and Auto context with live-session edits | Common policy presets | Launch/settings configuration |
@@ -41,11 +42,18 @@ Older versions retain local follow-up delivery after the current turn: each
 follow-up is its own queue entry, and they are sent together as one prompt.
 
 Codex retains additional typed APIs without corresponding native UI controls:
-queue reordering, review, plan/collaboration modes, goals and background terminal
+queue reordering, review, plan/collaboration modes and background terminal
 management. Arbitrary TUI slash commands have no equivalent app-server
 dispatcher. OMP's extension-specific terminal interfaces and full session tree
 also remain provider-specific surfaces. These distinctions are not represented
 as working native buttons.
+
+Native Goal integration uses the Codex 0.160.0-generated app-server contract:
+`thread/goal/get`, `thread/goal/set`, `thread/goal/clear` and goal notifications.
+This API contract is distinct from durable-continuity qualification. Missing or
+unsupported Goal reads never establish that an older retained thread is safe
+to resume. See [native goals](user-guide.md#native-goals) for commands and
+recovery behavior.
 
 Codex owner recovery requires positive evidence: reconnect to the retained
 owner, or resume after confirmed close or a kernel boot change. Uncertain

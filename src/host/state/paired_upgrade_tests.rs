@@ -16,6 +16,16 @@ use std::{
 
 const ID: &str = "12345678-1234-4234-8234-123456789abc";
 
+fn inactive_goal(snapshot: &crate::chat::Snapshot) -> bool {
+    snapshot.goal.as_ref().is_some_and(|goal| {
+        goal.thread_id == ID
+            && goal.support == crate::chat::goal::Support::Supported
+            && matches!(&goal.read, crate::chat::goal::ReadState::Known(None))
+            && !goal.pending
+            && !goal.uncertain
+    })
+}
+
 fn isolated() -> bool {
     isolated_with_environment(&[])
 }
@@ -158,6 +168,12 @@ impl Peer {
                                     {"type":"agentMessage","id":"old-answer","text":"existing paired answer","phase":"final_answer"}]}],"nextCursor":null}})
                         }
                         "model/list" | "skills/list" | "thread/list" | "thread/queue/list" => serde_json::json!({"data":[],"nextCursor":null}),
+                        "thread/goal/get" => {
+                            // Synthetic inactive metadata, independent of the
+                            // legacy identity exercised by this paired fixture.
+                            assert_eq!(frame["params"]["threadId"], ID);
+                            serde_json::json!({"goal":null})
+                        }
                         _ => panic!("unrequested provider work: {method}"),
                     };
                     client.send(tungstenite::Message::Text(serde_json::json!({"id":frame["id"],"result":result}).to_string().into())).is_ok()
@@ -361,6 +377,7 @@ fn run_pair(mode: &str) {
         if session.launch.session_id.as_deref() == Some(ID)
             && snapshot.ready
             && !snapshot.history_loading
+            && inactive_goal(&snapshot)
         {
             break session;
         }
@@ -523,7 +540,7 @@ fn run_pair(mode: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         let snapshot = loop {
             let snapshot = current_actor.snapshot(None).unwrap();
-            if snapshot.ready && !snapshot.history_loading {
+            if snapshot.ready && !snapshot.history_loading && inactive_goal(&snapshot) {
                 break snapshot;
             }
             assert!(
@@ -556,6 +573,7 @@ fn run_pair(mode: &str) {
     }
     let methods = peer.finish();
     assert!(methods.iter().any(|method| method == "thread/resume"));
+    assert!(methods.iter().any(|method| method == "thread/goal/get"));
     assert!(!methods.iter().any(|method| method == "turn/start"));
 }
 
