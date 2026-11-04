@@ -4792,11 +4792,7 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = (Target, 
 /// a bare "Native chat" left the reader unable to tell which agent a tab was
 /// talking to.
 pub(super) fn chat_card_title(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Omp => "OMP chat",
-        Provider::Claude => "Claude chat",
-        Provider::Codex => "Codex chat",
-    }
+    provider.chat_title()
 }
 
 fn observed_launch(session: &TerminalSession) -> Option<LaunchRecipe> {

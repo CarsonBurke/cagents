@@ -1,7 +1,11 @@
 use super::*;
 use crate::{
+    agent_execution::{
+        Authority, Operation, Reply,
+        directory::{Entry, Scope as DirectoryScope, Surface},
+    },
     model::{CardId, CardKind},
-    workspace_model::views::{Change, Pane, Scope, View},
+    workspace_model::views::{Change, Pane, Scope, View, shared_kind},
 };
 
 fn session_id(pane: &Pane) -> Option<TerminalId> {
@@ -121,13 +125,22 @@ pub(super) fn move_pane(
     let mut pane_id: Option<CardId> = None;
     for attempt in 0..3 {
         let model = client.read_workspace_model().map_err(protocol_error)?;
-        let (view, pane) = find_pane(
+        let (view, pane) = match find_pane(
             &model,
             pane_id
                 .map(|id| id.to_string())
                 .as_deref()
                 .unwrap_or(target),
-        )?;
+        ) {
+            Ok(found) => found,
+            // A session no view holds has nothing to transfer. Having read the
+            // pane earlier in this command means it was closed meanwhile, which
+            // is not the same request.
+            Err(error) if error.kind == "not_found" && pane_id.is_none() => {
+                return attach_session(client, target, to, error);
+            }
+            Err(error) => return Err(error),
+        };
         pane_id = Some(pane.id);
         let channel = model
             .channel(to)
@@ -167,30 +180,221 @@ pub(super) fn move_pane(
                     "The daemon did not confirm the requested pane placement",
                 )
             })?;
-        let channel = result.channel(to).ok_or_else(|| {
-            AppError::new(
-                "protocol",
-                "The daemon did not return the destination channel",
-            )
-        })?;
-        return Ok(CommandOutput {
-            command: "channel.move",
-            data: json!({ "pane": pane, "placement": destination, "channel": channel, "sequence": result.sequence }),
-            human: format!(
-                "{}\t{}\t{}\t{}",
-                pane.id,
-                to,
-                channel.repository.display(),
-                channel.title
-            ),
-        });
+        return placed_output(&result, pane, to, false);
     }
     unreachable!("the final revision conflict is returned")
+}
+
+fn placed_output(
+    model: &WorkspaceModel,
+    pane: &Pane,
+    to: ChannelId,
+    attached: bool,
+) -> Result<CommandOutput, AppError> {
+    let channel = model.channel(to).ok_or_else(|| {
+        AppError::new(
+            "protocol",
+            "The daemon did not return the destination channel",
+        )
+    })?;
+    Ok(CommandOutput {
+        command: "channel.move",
+        data: json!({
+            "pane": pane,
+            "placement": Scope::Channel(to),
+            "channel": channel,
+            "sequence": model.sequence,
+            "attached": attached,
+        }),
+        human: format!(
+            "{}\t{}\t{}\t{}",
+            pane.id,
+            to,
+            channel.repository.display(),
+            channel.title
+        ),
+    })
+}
+
+fn holder(model: &WorkspaceModel, session: TerminalId) -> Option<(&View, &Pane)> {
+    model.views.iter().find_map(|view| {
+        view.panes
+            .iter()
+            .find(|pane| session_id(pane) == Some(session))
+            .map(|pane| (view, pane))
+    })
+}
+
+/// Gives a live session that no view holds a pane in `to`.
+///
+/// Only membership changes: the pane carries the daemon's own descriptor, and a
+/// window that shows it attaches to the running process by session ID. Nothing
+/// here starts, closes or sends to the session, so a working turn carries on.
+fn attach_session(
+    client: &mut ControlClient,
+    target: &str,
+    to: ChannelId,
+    unmatched: AppError,
+) -> Result<CommandOutput, AppError> {
+    // A name or ID prefix can only ever have meant an agent or a pane.
+    let Ok(id) = target.trim().parse::<TerminalId>() else {
+        return Err(unmatched);
+    };
+    let Reply::Directory(directory) = client
+        .agent(
+            Authority::from_environment(),
+            Operation::Directory(DirectoryScope::All),
+        )
+        .map_err(protocol_error)?
+    else {
+        return Err(AppError::new(
+            "protocol",
+            "The daemon did not return its session directory",
+        ));
+    };
+    let entry = directory
+        .caller
+        .iter()
+        .chain(&directory.sessions)
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| {
+            AppError::new(
+                "not_found",
+                format!("No shared pane or live session matches {id}"),
+            )
+        })?;
+    if entry.delegation.is_some() {
+        return Err(AppError::new(
+            "invalid_target",
+            "This session belongs to a managed agent, and the daemon places its pane",
+        ));
+    }
+    let pane = Pane {
+        id: CardId::new(),
+        title: attached_title(entry),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 0.5,
+        kind: shared_kind(&hosted_kind(client, entry)?),
+        // A filing would override where the launch directory already places it.
+        scope: None,
+    };
+    let destination = Scope::Channel(to);
+    let operation = uuid::Uuid::new_v4();
+    for attempt in 0..3 {
+        let model = client.read_workspace_model().map_err(protocol_error)?;
+        let channel = model
+            .channel(to)
+            .ok_or_else(|| AppError::new("not_found", format!("Channel {to} is no longer open")))?;
+        if entry.project.as_deref() != Some(channel.repository.as_path()) {
+            return Err(AppError::new(
+                "invalid_target",
+                "This session's directory is not in the destination channel's project",
+            ));
+        }
+        if holder(&model, id).is_some() {
+            return Err(placed_meanwhile());
+        }
+        let expected_revision = model
+            .views
+            .iter()
+            .find(|view| view.scope == destination)
+            .map_or(0, |view| view.revision);
+        let result = client.edit_workspace_model(ModelEdit::ChangeView {
+            scope: destination.clone(),
+            expected_revision,
+            operation,
+            change: Change::Insert {
+                pane: pane.clone(),
+                before: None,
+            },
+        });
+        let result = match result {
+            Err(ControlError::Remote {
+                code: ProtocolErrorCode::ViewConflict,
+                ..
+            }) if attempt < 2 => continue,
+            result => result.map_err(protocol_error)?,
+        };
+        // Inserting a session another client placed first changes nothing and
+        // still succeeds, so success alone does not mean this pane landed.
+        return match holder(&result, id) {
+            Some((view, placed)) if view.scope == destination => {
+                placed_output(&result, placed, to, true)
+            }
+            Some(_) => Err(placed_meanwhile()),
+            None => Err(AppError::new(
+                "protocol",
+                "The daemon did not confirm the requested pane placement",
+            )),
+        };
+    }
+    unreachable!("the final revision conflict is returned")
+}
+
+fn placed_meanwhile() -> AppError {
+    AppError::new(
+        "conflict",
+        "Another client placed this session while attaching it; run the command again to move it",
+    )
+}
+
+fn attached_title(entry: &Entry) -> String {
+    if let Some(title) = entry.title.as_deref().filter(|title| !title.is_empty()) {
+        return title.to_owned();
+    }
+    match (entry.surface, entry.provider) {
+        (Surface::Chat, Some(provider)) => provider.chat_title().to_owned(),
+        (Surface::Terminal, Some(provider)) => provider.label().to_owned(),
+        (_, None) => "Terminal".to_owned(),
+    }
+}
+
+/// The daemon's exact descriptor of a listed session, refused unless this
+/// daemon is the one hosting it: a window would refuse to attach anything else.
+fn hosted_kind(client: &mut ControlClient, entry: &Entry) -> Result<CardKind, AppError> {
+    let (kind, proof) = match entry.surface {
+        Surface::Chat => {
+            let session = client
+                .list_chats()
+                .map_err(protocol_error)?
+                .into_iter()
+                .find(|session| session.id == entry.id);
+            let proof = session.as_ref().and_then(|session| session.proof.clone());
+            (session.map(CardKind::Chat), proof)
+        }
+        Surface::Terminal => {
+            let session = client
+                .list()
+                .map_err(protocol_error)?
+                .into_iter()
+                .find(|descriptor| descriptor.session.id == entry.id)
+                .map(|descriptor| descriptor.session);
+            let proof = session
+                .as_ref()
+                .and_then(|session| session.continuity.live_proof());
+            (session.map(CardKind::Terminal), proof)
+        }
+    };
+    let kind = kind.ok_or_else(|| {
+        AppError::new(
+            "not_found",
+            format!("Session {} is no longer running", entry.id),
+        )
+    })?;
+    if proof.as_ref() != Some(client.proof()) {
+        return Err(AppError::new(
+            "invalid_target",
+            format!("Session {} is not hosted by this daemon", entry.id),
+        ));
+    }
+    Ok(kind)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_execution::directory;
     use crate::{
         agent::Provider,
         agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target},
@@ -619,6 +823,16 @@ mod tests {
                     &model_response(read.request_id, model.clone()),
                 )
                 .unwrap();
+                if failure == "pane" {
+                    let directory: ClientEnvelope =
+                        read_frame(&mut server_stream).unwrap().unwrap();
+                    assert!(matches!(directory.request, ClientRequest::Agent { .. }));
+                    write_frame(
+                        &mut server_stream,
+                        &directory_response(directory.request_id, vec![]),
+                    )
+                    .unwrap();
+                }
                 if failure == "unconfirmed" {
                     let edit: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
                     assert!(matches!(
@@ -648,5 +862,403 @@ mod tests {
             drop(client);
             server.join().unwrap();
         }
+    }
+
+    fn directory_response(request_id: u64, sessions: Vec<Entry>) -> ServerEnvelope {
+        envelope(
+            request_id,
+            ServerMessage::Response {
+                response: ServerResponse::Agent(Reply::Directory(
+                    crate::agent_execution::directory::Directory {
+                        caller: None,
+                        scope: DirectoryScope::All,
+                        sessions,
+                    },
+                )),
+            },
+        )
+    }
+
+    fn unplaced_chat() -> crate::chat::Session {
+        crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: Provider::Claude,
+                recipe: LaunchRecipe {
+                    program: "/bin/claude".into(),
+                    arguments: vec![],
+                    working_directory: "/repo/tree".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+            },
+            proof: Some(proof()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+        }
+    }
+
+    fn unplaced_entry(id: TerminalId, surface: directory::Surface) -> Entry {
+        Entry {
+            id,
+            surface,
+            provider: Some(Provider::Claude),
+            title: None,
+            channel: None,
+            view_scope: None,
+            channel_repository: None,
+            state: crate::agent::ActivityState::Working,
+            directory: Some("/repo/tree".into()),
+            worktree: Some("/repo/tree".into()),
+            project: Some("/repo".into()),
+            project_name: Some("repo".into()),
+            delegation: None,
+            relation: crate::agent_execution::directory::Relation::Peer,
+            lineage: crate::agent_execution::Lineage(id),
+        }
+    }
+
+    /// Everything an attach may ask the daemon. Any other request, such as a
+    /// start, attach, send or close, fails the test: attaching changes
+    /// membership and nothing else. Returns the edits received.
+    struct FakeDaemon {
+        models: Vec<WorkspaceModel>,
+        sessions: Vec<Entry>,
+        chats: Vec<crate::chat::Session>,
+        terminals: Vec<crate::terminal::ipc::TerminalDescriptor>,
+        /// What each successive edit answers; `None` is a revision conflict.
+        edits: Vec<Option<WorkspaceModel>>,
+    }
+
+    impl FakeDaemon {
+        fn serve(self, mut stream: UnixStream) -> thread::JoinHandle<Vec<ModelEdit>> {
+            let Self {
+                mut models,
+                sessions,
+                chats,
+                terminals,
+                mut edits,
+            } = self;
+            thread::spawn(move || {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut received = Vec::new();
+                while let Some(frame) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
+                    let id = frame.request_id;
+                    let response = |response| envelope(id, ServerMessage::Response { response });
+                    let reply = match frame.request {
+                        ClientRequest::Connect { .. } => response(ServerResponse::Connected {
+                            proof: proof(),
+                            resumed: vec![],
+                        }),
+                        ClientRequest::ReadWorkspaceModel => {
+                            let model = if models.len() > 1 {
+                                models.remove(0)
+                            } else {
+                                models[0].clone()
+                            };
+                            model_response(id, model)
+                        }
+                        ClientRequest::Agent {
+                            operation: Operation::Directory(DirectoryScope::All),
+                            ..
+                        } => directory_response(id, sessions.clone()),
+                        ClientRequest::ChatList => response(ServerResponse::ChatListed {
+                            sessions: chats.clone(),
+                        }),
+                        ClientRequest::List => response(ServerResponse::Listed {
+                            terminals: terminals.clone(),
+                        }),
+                        ClientRequest::EditWorkspaceModel { edit } => {
+                            received.push(edit);
+                            match edits.remove(0) {
+                                Some(model) => model_response(id, model),
+                                None => envelope(
+                                    id,
+                                    ServerMessage::Error(ProtocolError::new(
+                                        ProtocolErrorCode::ViewConflict,
+                                        "concurrent view edit",
+                                        true,
+                                    )),
+                                ),
+                            }
+                        }
+                        other => panic!("attaching may not send {other:?}"),
+                    };
+                    write_frame(&mut stream, &reply).unwrap();
+                }
+                received
+            })
+        }
+    }
+
+    fn insert_of(edit: &ModelEdit) -> (&Scope, u64, uuid::Uuid, &Pane) {
+        let ModelEdit::ChangeView {
+            scope,
+            expected_revision,
+            operation,
+            change: Change::Insert { pane, before: None },
+        } = edit
+        else {
+            panic!("attaching may only insert one pane at the end: {edit:?}")
+        };
+        (scope, *expected_revision, *operation, pane)
+    }
+
+    fn with_pane(mut model: WorkspaceModel, scope: Scope, pane: Pane) -> WorkspaceModel {
+        match model.views.iter_mut().find(|view| view.scope == scope) {
+            Some(view) => {
+                view.revision += 1;
+                view.panes.push(pane);
+            }
+            None => model.views.push(View {
+                scope,
+                revision: 1,
+                panes: vec![pane],
+                retired: vec![],
+            }),
+        }
+        model.sequence += 1;
+        model
+    }
+
+    fn pane_for(session: &crate::chat::Session) -> Pane {
+        Pane {
+            id: CardId::new(),
+            title: "elsewhere".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            kind: CardKind::Chat(session.clone()),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn channel_move_attaches_a_live_session_without_a_pane_using_the_daemons_descriptor() {
+        let (model, _, to) = fixture();
+        let chat = unplaced_chat();
+        let placed = |pane| with_pane(model.clone(), Scope::Channel(to), pane);
+        let expected = Pane {
+            id: CardId::new(),
+            title: String::new(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            kind: CardKind::Chat(chat.clone()),
+            scope: None,
+        };
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = FakeDaemon {
+            models: vec![model.clone()],
+            sessions: vec![unplaced_entry(chat.id, directory::Surface::Chat)],
+            chats: vec![chat.clone()],
+            terminals: vec![],
+            edits: vec![None, Some(placed(expected.clone()))],
+        }
+        .serve(server_stream);
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let output = move_pane(&mut client, &chat.id.to_string(), to).unwrap();
+        drop(client);
+        let edits = server.join().unwrap();
+
+        // A conflict retries the same request, so a lost reply cannot place twice.
+        let (scope, revision, first_operation, first) = insert_of(&edits[0]);
+        let (_, _, second_operation, second) = insert_of(&edits[1]);
+        assert_eq!(edits.len(), 2);
+        assert_eq!((first_operation, first), (second_operation, second));
+        assert_eq!(scope, &Scope::Channel(to));
+        assert_eq!(revision, 0, "the destination channel has never held a pane");
+        assert_eq!(first.kind, CardKind::Chat(chat), "descriptor is unchanged");
+        assert_eq!(first.title, "Claude chat");
+        assert_eq!(first.scope, None);
+        assert_eq!(output.data["attached"], json!(true));
+        assert_eq!(output.data["placement"], json!(Scope::Channel(to)));
+        assert_eq!(
+            output.human,
+            format!("{}\t{to}\t/repo\tchannel", expected.id)
+        );
+    }
+
+    #[test]
+    fn channel_move_attaches_a_live_provider_terminal_and_keeps_its_title() {
+        let (model, pane, to) = fixture();
+        let CardKind::Terminal(mut session) = pane.kind.clone() else {
+            unreachable!()
+        };
+        session.id = TerminalId::new();
+        let descriptor = crate::terminal::ipc::TerminalDescriptor {
+            screen_lost_after_crash: false,
+            session: session.clone(),
+            generation: 1,
+            event_sequence: 0,
+            oldest_event_sequence: 0,
+            attached: false,
+            transcript: None,
+            activity: None,
+            agent_activity: None,
+            upgrade_sources: vec![],
+            upgrade_relaunches: vec![],
+            title: None,
+        };
+        let mut entry = unplaced_entry(session.id, directory::Surface::Terminal);
+        entry.title = Some("deploy".into());
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let answer = with_pane(
+            model.clone(),
+            Scope::Channel(to),
+            Pane {
+                id: CardId::new(),
+                title: "deploy".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 0.5,
+                kind: CardKind::Terminal(session.clone()),
+                scope: None,
+            },
+        );
+        let server = FakeDaemon {
+            models: vec![model],
+            sessions: vec![entry],
+            chats: vec![],
+            terminals: vec![descriptor],
+            edits: vec![Some(answer)],
+        }
+        .serve(server_stream);
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        move_pane(&mut client, &session.id.to_string(), to).unwrap();
+        drop(client);
+        let edits = server.join().unwrap();
+        let (_, _, _, inserted) = insert_of(&edits[0]);
+        assert_eq!(inserted.kind, CardKind::Terminal(session));
+        assert_eq!(inserted.title, "deploy");
+    }
+
+    #[test]
+    fn channel_move_refuses_a_session_it_cannot_truthfully_attach_before_editing() {
+        for (failure, kind) in [
+            ("unknown", "not_found"),
+            ("ended", "not_found"),
+            ("agent", "invalid_target"),
+            ("other project", "invalid_target"),
+            ("outside every project", "invalid_target"),
+            ("other daemon", "invalid_target"),
+            ("channel closed", "not_found"),
+            ("placed meanwhile", "conflict"),
+        ] {
+            let (mut model, _, to) = fixture();
+            let chat = unplaced_chat();
+            let mut entry = unplaced_entry(chat.id, directory::Surface::Chat);
+            let mut listed = chat.clone();
+            let mut sessions = vec![];
+            let mut chats = vec![];
+            let mut models = vec![model.clone()];
+            match failure {
+                "unknown" => {}
+                "ended" => sessions.push(entry.clone()),
+                _ => {
+                    match failure {
+                        "agent" => {
+                            entry.delegation = Some(crate::agent_execution::directory::Delegation {
+                                agent: model.agents[0].id,
+                                owner: crate::agent_execution::directory::Owner::User,
+                                run: None,
+                                run_state: None,
+                            })
+                        }
+                        "other project" => entry.project = Some("/other".into()),
+                        "outside every project" => entry.project = None,
+                        "other daemon" => {
+                            listed.proof = Some(HostSessionProof {
+                                host_session_id: HostSessionId::new("earlier"),
+                                ..proof()
+                            })
+                        }
+                        "channel closed" => {
+                            model.channels.retain(|channel| channel.id != to);
+                            models = vec![model.clone()];
+                        }
+                        "placed meanwhile" => {
+                            let scope = model.views[0].scope.clone();
+                            models.push(with_pane(model.clone(), scope, pane_for(&chat)));
+                        }
+                        _ => unreachable!(),
+                    }
+                    sessions.push(entry.clone());
+                    chats.push(listed);
+                }
+            }
+            let (client_stream, server_stream) = UnixStream::pair().unwrap();
+            let server = FakeDaemon {
+                models,
+                sessions,
+                chats,
+                terminals: vec![],
+                edits: vec![],
+            }
+            .serve(server_stream);
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            let error = move_pane(&mut client, &chat.id.to_string(), to)
+                .err()
+                .unwrap_or_else(|| panic!("{failure} must be refused"));
+            assert_eq!(error.kind, kind, "{failure}: {}", error.message);
+            drop(client);
+            assert!(server.join().unwrap().is_empty(), "{failure} sent an edit");
+        }
+    }
+
+    #[test]
+    fn channel_move_reports_an_insert_the_daemon_did_not_place_here() {
+        for (placed_elsewhere, kind) in [(false, "protocol"), (true, "conflict")] {
+            let (model, _, to) = fixture();
+            let chat = unplaced_chat();
+            // Inserting a session that another client already placed is an
+            // accepted no-op, so the reply has to be checked, not trusted.
+            let answer = if placed_elsewhere {
+                let scope = model.views[0].scope.clone();
+                with_pane(model.clone(), scope, pane_for(&chat))
+            } else {
+                model.clone()
+            };
+            let (client_stream, server_stream) = UnixStream::pair().unwrap();
+            let server = FakeDaemon {
+                models: vec![model],
+                sessions: vec![unplaced_entry(chat.id, directory::Surface::Chat)],
+                chats: vec![chat.clone()],
+                terminals: vec![],
+                edits: vec![Some(answer)],
+            }
+            .serve(server_stream);
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            let error = move_pane(&mut client, &chat.id.to_string(), to)
+                .err()
+                .unwrap();
+            assert_eq!(error.kind, kind);
+            drop(client);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn channel_move_treats_a_handle_that_is_not_a_session_id_as_an_agent_or_pane() {
+        let (model, _, to) = fixture();
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = FakeDaemon {
+            models: vec![model],
+            sessions: vec![],
+            chats: vec![],
+            terminals: vec![],
+            edits: vec![],
+        }
+        .serve(server_stream);
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let error = move_pane(&mut client, "no-such-agent", to).err().unwrap();
+        assert_eq!(error.kind, "not_found");
+        assert!(error.message.contains("No shared pane matches"));
+        drop(client);
+        server.join().unwrap();
     }
 }

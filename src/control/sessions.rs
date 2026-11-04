@@ -88,6 +88,16 @@ fn list_human<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> String {
                 {
                     context.push(format!("worktree view {}", path.display()));
                 }
+                if entry.has_no_pane() {
+                    context.push(if entry.project.is_some() {
+                        format!(
+                            "no pane; show it with: cagents channel move {} --to CHANNEL_ID",
+                            entry.id
+                        )
+                    } else {
+                        "no pane".to_owned()
+                    });
+                }
                 match (entry.relation, entry.delegation.as_ref().map(|d| &d.owner)) {
                     (Relation::Myself, _) => context.push("me".into()),
                     (Relation::Parent, _) => context.push("my parent".into()),
@@ -220,6 +230,23 @@ mod tests {
         }
         assert!(!human.contains('\u{1b}'));
         assert_eq!(serde_json::to_value(&entry).unwrap(), before);
+    }
+
+    #[test]
+    fn readable_session_rows_say_when_a_session_has_no_pane_and_how_to_show_it() {
+        let mut entry = entry();
+        let id = entry.id;
+        let attach = format!("no pane; show it with: cagents channel move {id} --to CHANNEL_ID");
+        assert!(!list_human(std::iter::once(&entry)).contains("no pane"));
+        // A delegated session is placed through its agent, whatever its view.
+        entry.view_scope = None;
+        assert!(!list_human(std::iter::once(&entry)).contains("no pane"));
+        entry.delegation = None;
+        assert!(list_human(std::iter::once(&entry)).contains(&attach));
+        // A channel only accepts sessions of its own project.
+        entry.project = None;
+        let human = list_human(std::iter::once(&entry));
+        assert!(human.contains("no pane") && !human.contains("channel move"));
     }
 
     #[test]

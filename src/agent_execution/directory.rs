@@ -118,6 +118,12 @@ pub struct Directory {
 }
 
 impl Entry {
+    /// A provider session the daemon hosts that no window can currently show:
+    /// it has no pane in any view, and no agent record that would place one.
+    pub fn has_no_pane(&self) -> bool {
+        self.provider.is_some() && self.view_scope.is_none() && self.delegation.is_none()
+    }
+
     /// One line for people and agents scanning a list. IDs are printed whole
     /// because they are what every other command takes.
     pub fn line(&self) -> String {
@@ -151,6 +157,9 @@ impl Entry {
         }
         if let Some(super::Placement::Worktree { path, .. }) = &self.view_scope {
             line.push_str(&format!(" [worktree view: {}]", path.display()));
+        }
+        if self.has_no_pane() {
+            line.push_str(" [no pane]");
         }
         line.push_str(relation);
         if self.lineage.0 != self.id {
