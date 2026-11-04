@@ -7,15 +7,27 @@ use crate::chat::{
 use std::{fs::File, os::unix::fs::MetadataExt, path::PathBuf};
 
 pub(super) struct ClaudeTitles {
-    config: PathBuf,
-    cwd: PathBuf,
+    source: Source,
     previous: Option<(String, String)>,
     transcript: Option<Transcript>,
 }
 
+enum Source {
+    Live {
+        config: PathBuf,
+        cwd: PathBuf,
+    },
+    /// A clone of the History body's original open file. Never resolve its
+    /// recorded cwd or reopen a replacement pathname just to get a title.
+    History {
+        file: File,
+        cwd: PathBuf,
+    },
+}
+
 struct Transcript {
     id: String,
-    path: PathBuf,
+    path: Option<PathBuf>,
     cwd: PathBuf,
     device: u64,
     inode: u64,
@@ -48,25 +60,41 @@ impl ClaudeTitles {
             }
         };
         Some(Self {
-            config,
-            cwd: recipe.working_directory.clone(),
+            source: Source::Live {
+                config,
+                cwd: recipe.working_directory.clone(),
+            },
             previous: None,
             transcript: None,
         })
     }
 
-    pub(super) fn update(&mut self, id: &str) -> Option<String> {
-        let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
-        if !cwd.is_absolute() {
-            return None;
+    pub(super) fn from_history(file: File, cwd: PathBuf) -> Self {
+        Self {
+            source: Source::History { file, cwd },
+            previous: None,
+            transcript: None,
         }
-        let path = crate::agent::claude_transcript(&self.config, &cwd, id).ok()?;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = File::options()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)
-            .ok()?;
+    }
+
+    pub(super) fn update(&mut self, id: &str) -> Option<String> {
+        let (cwd, path, mut file) = match &self.source {
+            Source::Live { config, cwd } => {
+                let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+                if !cwd.is_absolute() {
+                    return None;
+                }
+                let path = crate::agent::claude_transcript(config, &cwd, id).ok()?;
+                use std::os::unix::fs::OpenOptionsExt;
+                let file = File::options()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&path)
+                    .ok()?;
+                (cwd, Some(path), file)
+            }
+            Source::History { file, cwd } => (cwd.clone(), None, file.try_clone().ok()?),
+        };
         let metadata = file.metadata().ok()?;
         if !metadata.is_file() {
             return None;

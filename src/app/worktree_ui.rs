@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::ChannelId;
+use crate::{chat, model::ChannelId};
 
 /// Ownership comes from the launch recipe, never a shell's current directory or
 /// OSC title. Component-aware matching also keeps `repo-fix` outside `repo`.
@@ -685,6 +685,86 @@ impl Cagents {
         self.select_worktree_checked(path, create_if_empty).1
     }
 
+    /// A saved transcript can have a logical directory even when there is no
+    /// directory to lease. This grants no execution/protection capability:
+    /// retained live owners still need ordinary selection, and provider
+    /// admission stays unchanged.
+    pub(super) fn select_conversation_worktree(
+        &mut self,
+        session: &chat::Session,
+        path: PathBuf,
+    ) -> (bool, Task<Message>) {
+        let cwd = &session.launch.recipe.working_directory;
+        let owner = if !crate::device::is_remote()
+            && !session.native_continuity.retains_provider()
+            && session.launch.needs_read_only_history()
+        {
+            self.refresh_worktree_owners(Some(cwd))
+        } else {
+            None
+        };
+        if let Some(owner) = owner.filter(|owner| {
+            (path == *cwd || path == *owner)
+                && owner.is_absolute()
+                && !owner.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    )
+                })
+                && matches!(std::fs::metadata(owner), Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound)
+        }) {
+            // A deleted indexed root still owns its former nested sessions.
+            // Only actual absence permits a logical view; an existing root or
+            // any other metadata error must keep ordinary lease admission.
+            let was_channel = self.durable.active_channel.is_some();
+            self.snapshot_workspace_scope();
+            Arc::make_mut(&mut self.durable).active_channel = None;
+            let roots = self
+                .known_worktree_roots
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>();
+            let mut scoped = scope_descriptor(
+                &self.durable,
+                &owner,
+                &roots,
+                &self.worktree_owners,
+                self.worktree_focus.get(&owner).copied(),
+            );
+            // A read-only directory view must not expose a terminal, editor,
+            // or another conversation that needs live directory admission.
+            scoped.cards.retain(|card| {
+                card_directory(card).is_none()
+                    || matches!(&card.kind, CardKind::Chat(session)
+                        if !session.native_continuity.retains_provider()
+                            && session.launch.needs_read_only_history())
+            });
+            if !scoped
+                .focused
+                .is_some_and(|id| scoped.cards.iter().any(|card| card.id == id))
+            {
+                scoped.focused = scoped.cards.first().map(|card| card.id);
+            }
+            // Reopening the active logical History view must not unmount its
+            // native surfaces. Compare the actual filtered projection, after
+            // checking owner absence; returned owners still need protection.
+            if self.active_workspace.as_ref() == Some(&owner)
+                && !was_channel
+                && self
+                    .workspace
+                    .order()
+                    .eq(scoped.cards.iter().map(|card| card.id))
+            {
+                return (true, Task::none());
+            }
+            let offset = self.worktree_offsets.get(&owner).copied();
+            return (true, self.install_workspace_scope(scoped, owner, offset));
+        }
+        self.select_worktree_checked(path, false)
+    }
+
     /// A synchronous success witness for callers that expose a new draft only
     /// after worktree protection and scope selection succeeded. A no-op selection
     /// is successful; a refused protection is not.
@@ -925,7 +1005,7 @@ impl Cagents {
             Arc::make_mut(&mut self.durable).active_channel = None;
         }
         if let Some(scope) = self.durable.active_worktree.clone() {
-            return self.select_worktree(scope, false);
+            return self.restore_directory_scope(scope);
         }
         let focused = self.durable.focused.and_then(|id| {
             self.durable
@@ -953,7 +1033,28 @@ impl Cagents {
         // becomes an ownership source for that scope.
         self.worktree_focus
             .insert(root.clone(), focused.map_or(owner.id, |card| card.id));
-        self.select_worktree(root, false)
+        self.restore_directory_scope(root)
+    }
+
+    fn restore_directory_scope(&mut self, path: PathBuf) -> Task<Message> {
+        let history = self.durable.cards.iter().find_map(|card| {
+            if !card.existence.is_open() || self.card_worktree(card) != Some(path.as_path()) {
+                return None;
+            }
+            match &card.kind {
+                CardKind::Chat(session)
+                    if !session.native_continuity.retains_provider()
+                        && session.launch.needs_read_only_history() =>
+                {
+                    Some(session.clone())
+                }
+                _ => None,
+            }
+        });
+        match history {
+            Some(session) => self.select_conversation_worktree(&session, path).1,
+            None => self.select_worktree(path, false),
+        }
     }
 
     pub(super) fn terminal_insertion_indices(&self) -> (usize, usize) {
@@ -969,6 +1070,108 @@ impl Cagents {
 mod tests {
     use super::*;
     use crate::model::{BrowserId, BrowserRestoreFidelity, ProjectChannel};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reopening_existing_missing_history_never_exposes_a_same_directory_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let protections = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let mut live = terminal(missing.to_str().unwrap());
+        let CardKind::Terminal(terminal) = &mut live.kind else {
+            unreachable!()
+        };
+        terminal.launch.program = "claude".into();
+        terminal.launch.arguments = vec!["--resume".into(), uuid::Uuid::new_v4().to_string()];
+        let terminal_catalog = chat_ui::conversion(terminal).unwrap();
+        assert!(terminal_catalog.launch.needs_read_only_history());
+        let mut history = repository(missing.to_str().unwrap());
+        let mut session = chat::fresh_session(
+            crate::agent::Provider::Claude,
+            TerminalId::new(),
+            missing.clone(),
+            &crate::account::Account::system(crate::agent::Provider::Claude),
+        )
+        .unwrap();
+        session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(session.launch.needs_read_only_history());
+        history.kind = CardKind::Chat(session.clone());
+        history.title = "Exact saved History".into();
+        let mut retained = history.clone();
+        retained.id = CardId::new();
+        let mut retained_session = session.clone();
+        retained_session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let retained_catalog = retained_session.clone();
+        retained_session.native_continuity =
+            chat::NativeContinuity::RetainedClaudeActor { protocol: 1 };
+        retained.kind = CardKind::Chat(retained_session);
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.worktree_protections
+            .use_fixture_runtime(protections.path().into());
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![live.clone(), retained.clone(), history.clone()],
+            ..WorkspaceState::default()
+        });
+        let (selected, task) = app.select_worktree_checked(directory.path().into(), false);
+        drop(task);
+        assert!(selected);
+        let original_cards = app.durable.cards.clone();
+        // Catalog records intentionally omit the retained owner's continuity;
+        // terminal conversion has that same ReconnectOnly shape. Neither can
+        // authorize exposing the actual target through a History-only view.
+        for (card, catalog) in [(retained.id, retained_catalog), (live.id, terminal_catalog)] {
+            assert!(!catalog.native_continuity.retains_provider());
+            app.resume_ui.open = true;
+            app.resume_ui.query = "preserve this selection".into();
+            let task = app.resume_saved_conversation(crate::persistence::SavedConversation {
+                card,
+                title: "Catalog copy".into(),
+                session: catalog,
+                open: true,
+                updated_at_unix_ms: 1,
+            });
+            assert_eq!(
+                task.units(),
+                0,
+                "refusal must not queue FocusCard or provider work"
+            );
+            drop(task);
+            assert!(app.resume_ui.open && app.resume_ui.error.is_some());
+            assert_eq!(app.resume_ui.query, "preserve this selection");
+            assert_eq!(app.active_workspace.as_deref(), Some(directory.path()));
+            assert!(app.workspace.cards().is_empty());
+            assert_eq!(app.durable.cards, original_cards);
+            assert!(!missing.exists());
+        }
+        app.resume_ui.open = true;
+        drop(
+            app.resume_saved_conversation(crate::persistence::SavedConversation {
+                card: history.id,
+                title: history.title.clone(),
+                session,
+                open: true,
+                updated_at_unix_ms: 1,
+            }),
+        );
+        assert!(!app.resume_ui.open && app.resume_ui.error.is_none());
+        assert_eq!(app.active_workspace.as_deref(), Some(missing.as_path()));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), [history.id]);
+        assert_eq!(app.workspace.focused(), Some(history.id));
+        assert_eq!(app.durable.cards.len(), 3, "reuse the exact original card");
+        assert!(app.workspace.card(retained.id).is_none());
+        assert_eq!(app.card_state(retained.id).unwrap().kind, retained.kind);
+        assert_eq!(app.card_state(live.id).unwrap().kind, live.kind);
+        assert!(app.card_state(live.id).unwrap().existence.is_open());
+        assert_eq!(
+            app.card_state(live.id).unwrap().exposure,
+            Exposure::Offscreen
+        );
+        let (selected, task) = app.select_worktree_checked(missing.clone(), true);
+        drop(task);
+        assert!(!selected, "the view did not create a real directory lease");
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), [history.id]);
+        assert!(!missing.exists());
+    }
 
     #[test]
     fn selected_worktrees_and_channels_never_mix_unrelated_panes() {
