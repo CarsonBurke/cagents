@@ -7,7 +7,28 @@ use std::collections::BTreeMap;
 /// Closes the daemon's live sessions behind `sessions`, by the identities the
 /// daemon itself reports rather than the saved descriptors, together with the
 /// source terminal a converted chat keeps running.
+///
+/// An agent that still runs as one of these conversations stays open: this
+/// also gives up allocations nobody asked to close, such as a failed start.
 pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
+    close_sessions_with(sessions, OpenAgents::Keep)
+}
+
+/// [`close_sessions`] for conversations the user closed, which retires an
+/// open agent that still runs as one whose actor is gone. A daemon stop keeps
+/// such agents open while their conversations come back without a live
+/// actor, and closing the card is how the user ends them.
+pub(super) fn close_sessions_retiring_agents(sessions: Vec<CardKind>) -> Result<(), String> {
+    close_sessions_with(sessions, OpenAgents::Retire)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenAgents {
+    Keep,
+    Retire,
+}
+
+fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Result<(), String> {
     if !sessions
         .iter()
         .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
@@ -22,10 +43,19 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
     let terminals = client.list().map_err(|error| error.to_string())?;
     let chats = client.list_chats().map_err(|error| error.to_string())?;
     let terminal_ids = channel_terminal_ids(&sessions, &chats);
+    // Read only once a conversation turns out not to be live, the state a
+    // daemon stop leaves an open agent's conversation in.
+    let mut agents = None;
     for kind in &sessions {
         if let CardKind::Chat(session) = kind {
             let Some(live) = chats.iter().find(|live| live.id == session.id) else {
-                if may_have_retained_owner(session) {
+                if may_have_retained_owner(session)
+                    || (open_agents == OpenAgents::Retire
+                        && bound_to_open_agent(
+                            session,
+                            read_open_agents(&mut agents, &mut client)?,
+                        ))
+                {
                     client
                         .close_retained_chat(session.clone())
                         .map_err(|error| error.to_string())?;
@@ -53,7 +83,10 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
                 {
                     return Err(error.to_string());
                 }
-                if may_have_retained_owner(live) {
+                if may_have_retained_owner(live)
+                    || (open_agents == OpenAgents::Retire
+                        && bound_to_open_agent(live, read_open_agents(&mut agents, &mut client)?))
+                {
                     // Disappearance from actor inventory can mean retained
                     // ownership, not process exit. Demand its close receipt.
                     client
@@ -101,6 +134,41 @@ fn may_have_retained_owner(session: &crate::chat::Session) -> bool {
             session.native_continuity,
             crate::chat::NativeContinuity::Durable { .. }
         )
+}
+
+/// The registry's open agents, read on first use.
+fn read_open_agents<'a>(
+    agents: &'a mut Option<Vec<crate::agent_execution::Agent>>,
+    client: &mut crate::control::ControlClient,
+) -> Result<&'a [crate::agent_execution::Agent], String> {
+    if agents.is_none() {
+        let model = client
+            .read_workspace_model()
+            .map_err(|error| error.to_string())?;
+        *agents = Some(
+            model
+                .agents
+                .into_iter()
+                .filter(|agent| !agent.closed)
+                .collect(),
+        );
+    }
+    Ok(agents.as_deref().unwrap_or_default())
+}
+
+/// Whether an open agent still runs as this conversation, which the daemon
+/// finds by the conversation's identity when it retires the agent.
+fn bound_to_open_agent(
+    session: &crate::chat::Session,
+    agents: &[crate::agent_execution::Agent],
+) -> bool {
+    agents.iter().any(|agent| {
+        !agent.closed
+            && matches!(
+                &agent.session,
+                Some(crate::agent_execution::HostedSession::Chat(bound)) if bound.id == session.id
+            )
+    })
 }
 
 fn no_daemon_close_result(sessions: &[CardKind]) -> Result<(), String> {
@@ -1115,10 +1183,11 @@ impl Cagents {
             },
         );
         let close = cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || close_sessions(sessions))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
+            let result =
+                tokio::task::spawn_blocking(move || close_sessions_retiring_agents(sessions))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
             Message::ChannelUi(Action::SessionsClosed(id, operation, result))
         });
         Task::batch([leave, close])
@@ -2532,3 +2601,75 @@ mod tests {
 
 #[cfg(test)]
 mod revival_tests;
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+    use crate::agent_execution::{
+        Agent, HostedSession, Origin, Placement, Spec, Surface, Target as AgentTarget,
+    };
+
+    fn conversation(continuity: crate::chat::NativeContinuity) -> crate::chat::Session {
+        let mut session = crate::chat::fresh_session(
+            crate::agent::Provider::Claude,
+            TerminalId::new(),
+            "/repo".into(),
+            &crate::account::Account::system(crate::agent::Provider::Claude),
+        )
+        .unwrap();
+        session.native_continuity = continuity;
+        session
+    }
+
+    fn agent(session: &crate::chat::Session) -> Agent {
+        let placement = Placement::Channel(ChannelId::new());
+        Agent {
+            id: crate::model::AgentId::new(),
+            name: None,
+            origin: Origin::Automation {
+                id: uuid::Uuid::new_v4(),
+            },
+            spec: Spec {
+                provider: crate::agent::Provider::Claude,
+                account: None,
+                target: AgentTarget {
+                    repository: "/repo".into(),
+                    directory: "/repo".into(),
+                    placement: Some(placement.clone()),
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement,
+            session: Some(HostedSession::Chat(session.clone())),
+            console: None,
+            created_ms: 0,
+            closed: false,
+        }
+    }
+
+    /// A conversation a stopped daemon left without a live actor still runs
+    /// as its open agent, so closing it retires that agent. One no agent runs
+    /// as, and that nothing retained can own, asks the daemon nothing it
+    /// could only refuse.
+    #[test]
+    fn a_conversation_an_open_agent_runs_as_is_closed_through_the_daemon() {
+        for continuity in [
+            crate::chat::NativeContinuity::ReconnectOnly,
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+        ] {
+            let session = conversation(continuity);
+            assert!(!may_have_retained_owner(&session));
+            let mut bound = agent(&session);
+            assert!(bound_to_open_agent(&session, &[bound.clone()]));
+
+            let other = conversation(crate::chat::NativeContinuity::ReconnectOnly);
+            assert!(!bound_to_open_agent(&other, &[bound.clone()]));
+            assert!(!bound_to_open_agent(&session, &[]));
+            bound.closed = true;
+            assert!(!bound_to_open_agent(&session, &[bound]));
+        }
+    }
+}
