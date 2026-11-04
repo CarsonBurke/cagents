@@ -829,6 +829,35 @@ pub(super) fn stopped(host: &SharedHost, session: &chat::Session) -> Result<(), 
     Ok(())
 }
 
+/// Bind the agent of a resumed conversation to `successor`, the process that
+/// just started under a new chat ID. The predecessor is found through the
+/// lineage the successor joined when its resume was prepared, so a retry after
+/// a failed start, or a daemon restart between preparation and start, still
+/// finds it. A successor that started its own lineage adopts nothing.
+pub(in crate::host) fn adopt_resumed(
+    host: &SharedHost,
+    successor: &chat::Session,
+) -> Result<bool, String> {
+    let Ok(registry) = registry(host) else {
+        return Ok(false);
+    };
+    let agents = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .lineage_agents(successor.id)?;
+    let mut predecessors = agents.into_iter().filter_map(|agent| match agent.session {
+        Some(HostedSession::Chat(session)) => Some(session),
+        _ => None,
+    });
+    let Some(predecessor) = predecessors.next() else {
+        return Ok(false);
+    };
+    if predecessors.next().is_some() {
+        return Err("More than one open agent claims the resumed conversation's lineage".into());
+    }
+    adopt_successor(host, &predecessor, successor)
+}
+
 /// Bind a stopped agent to the process that resumed its conversation under a
 /// new chat ID. `Registry::adopt_successor` states the exact contract; no
 /// execution authority is issued here. Takes the agent's dispatch gate, so

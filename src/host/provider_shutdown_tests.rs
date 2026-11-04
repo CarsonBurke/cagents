@@ -999,6 +999,46 @@ fn ordinary_shutdown_keeps_managed_agents_with_their_panes_and_channels() {
     let model = registry.model().unwrap();
     assert!(model.channel(channel).is_some(), "the channel stays");
     let view = model.views.iter().find(|view| view.scope == scope).unwrap();
-    assert_eq!(view.panes, vec![pane], "the pane stays in place");
+    assert_eq!(view.panes, vec![pane.clone()], "the pane stays in place");
     assert!(view.retired.is_empty());
+    drop(registry);
+
+    // Resuming the conversation records its successor in the stopped
+    // session's lineage; once that successor runs, it takes the agent over.
+    let proof = host.lock().unwrap().proof().clone();
+    let successor = chat::Session {
+        id: TerminalId::new(),
+        proof: Some(proof),
+        ..session.clone()
+    };
+    let unrelated = chat::Session {
+        id: TerminalId::new(),
+        ..successor.clone()
+    };
+    let registry = agent_execution::registry(&host).unwrap();
+    registry
+        .lock()
+        .unwrap()
+        .succeed(successor.id, session.id, None, |_| false)
+        .unwrap();
+    assert!(
+        !agent_execution::adopt_resumed(&host, &unrelated).unwrap(),
+        "a session outside the lineage adopts nothing"
+    );
+    assert!(agent_execution::adopt_resumed(&host, &successor).unwrap());
+    let registry = registry.lock().unwrap();
+    let agent = registry.agent(accepted.agent.id).unwrap();
+    assert!(!agent.closed);
+    assert_eq!(agent.session, Some(HostedSession::Chat(successor.clone())));
+    assert!(registry.agent_for_session(session.id).unwrap().is_none());
+    let model = registry.model().unwrap();
+    let view = model.views.iter().find(|view| view.scope == scope).unwrap();
+    assert_eq!(
+        view.panes,
+        vec![crate::workspace_model::views::Pane {
+            kind: CardKind::Chat(successor),
+            ..pane
+        }],
+        "the pane follows the agent to its successor"
+    );
 }

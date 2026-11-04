@@ -2541,6 +2541,10 @@ fn process_inner(
                     "The old provider owner has no confirmed close receipt. Restore its original pane and close it before reopening; no replacement was started.",
                 ));
             }
+            // The old process is proved ended, as after a daemon stop: its
+            // authority and unfinished runs end and its agent stays open, so
+            // the successor's start can take the agent over.
+            super::agent_execution::stopped(host, &source).map_err(unavailable)?;
             let predecessor = source.id;
             let root = source
                 .terminal
@@ -2672,7 +2676,8 @@ fn process_inner(
             } else {
                 client_session(host, session)
             };
-            start(
+            let id = session.id;
+            let response = start(
                 host,
                 client,
                 session,
@@ -2680,7 +2685,23 @@ fn process_inner(
                 terminate_source,
                 None,
                 execution_environment,
-            )
+            )?;
+            // A resumed conversation keeps the agent its stopped predecessor
+            // bound: its row, pane and channel move to the running successor.
+            // The provider already runs, so a refusal leaves the agent with
+            // the ended process (still closable) rather than failing the start.
+            let started = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .chats
+                .get(&id)
+                .map(|record| record.session.clone());
+            if let Some(started) = started
+                && let Err(error) = super::agent_execution::adopt_resumed(host, &started)
+            {
+                tracing::warn!(chat=%id, %error, "The resumed conversation did not take over its agent");
+            }
+            Ok(response)
         }
         ClientRequest::ChatAttach { session } => {
             if let Some(response) = upgrade_resolution::attach(host, client, &session)? {

@@ -1971,6 +1971,10 @@ pub(in crate::host) fn reconcile_retired_actors(host: &SharedHost) -> Result<(),
                         .map_err(String::as_str),
                     receipt.confirmed_session.as_deref(),
                 )?;
+            // The receipt proves the process ended. Record that like any other
+            // stop, so its agent stays open and a resumed successor can adopt
+            // it this boot, not only after the next startup.
+            super::super::agent_execution::stopped(host, &receipt.source)?;
         }
     }
 }
