@@ -64,6 +64,19 @@ pub(super) fn close_sessions(
     // Query live identities: a saved descriptor can predate an upgrade or handoff.
     let terminals = client.list().map_err(|error| error.to_string())?;
     let chats = client.list_chats().map_err(|error| error.to_string())?;
+    // The daemon's record keeps a chat's ID when its conversation is replaced,
+    // for example by Start Fresh in another window. Close nothing unless every
+    // live record is still the conversation the user reviewed.
+    if sessions.iter().any(|kind| {
+        matches!(kind, CardKind::Chat(session) if chats
+            .iter()
+            .any(|live| live.id == session.id && !live_chat_is_reviewed(session, live)))
+    }) {
+        return Err(
+            "A conversation in this channel changed after you confirmed, or this window has not opened it yet. Open the channel's conversations to review them, then choose Delete channel again."
+                .into(),
+        );
+    }
     let terminal_ids = channel_terminal_ids(&sessions, &chats);
     for kind in &sessions {
         if let CardKind::Chat(session) = kind {
@@ -198,6 +211,20 @@ fn connect(
         Err(error) => Err(format!(
             "Cannot reach the daemon to close sessions: {error}"
         )),
+    }
+}
+
+/// Whether the daemon's live chat is the reviewed conversation rather than a
+/// replacement that reuses its ID. A hosted session proof names one daemon
+/// session; without one, the exact provider conversation must match.
+fn live_chat_is_reviewed(reviewed: &crate::chat::Session, live: &crate::chat::Session) -> bool {
+    match (&reviewed.proof, &reviewed.launch.session_id) {
+        (Some(proof), _) => live.proof.as_ref() == Some(proof),
+        (None, Some(conversation)) => live.launch.session_id.as_ref() == Some(conversation),
+        // A conversation that had not started when the user reviewed it may
+        // close only if it still has not: one that started since has content
+        // the user never saw, or this window never learned its identity.
+        (None, None) => live.proof.is_none() && live.launch.session_id.is_none(),
     }
 }
 
@@ -1013,6 +1040,14 @@ impl Cagents {
             .any(|card| self.pending_terminal_spawn(*card) || self.chat_start_pending(*card))
         {
             Some("Wait for this channel's panes to finish opening, then delete it again.".into())
+        } else if self
+            .shared_views
+            .blocked
+            .contains(&crate::workspace_model::views::Scope::Channel(id))
+        {
+            // Another window's panes in this channel cannot be shown here
+            // yet, so the user cannot review everything deletion removes.
+            Some("This channel has panes from another window that are not shown here yet. Resolve this window's unsent draft in a copy of one of them, then delete the channel again.".into())
         } else {
             None
         }
@@ -1052,6 +1087,20 @@ impl Cagents {
                 self.card_state(*card)
                     .is_some_and(|state| state.existence.is_open())
             })
+        {
+            return false;
+        }
+        // Deletion retires every canonical placement in this channel, including
+        // panes another window added that this window has not projected.
+        let scope = crate::workspace_model::views::Scope::Channel(id);
+        if self.shared_views.blocked.contains(&scope)
+            || self
+                .workspace_model
+                .views
+                .iter()
+                .filter(|view| view.scope == scope)
+                .flat_map(|view| &view.panes)
+                .any(|pane| !attempt.members.contains(&pane.id))
         {
             return false;
         }
@@ -1945,6 +1994,51 @@ mod tests {
             assert!(
                 app.channel_ui.is_deleting(channel) || app.channel_ui.was_deleted(channel),
                 "a fresh confirmation accepts reviewed contents"
+            );
+        }
+    }
+
+    /// A peer can move canonical pane B into this channel while this window
+    /// cannot project the channel (an alias of B holds an unsent draft here).
+    /// Deleting the channel retires every canonical placement, so consent to
+    /// the projected members alone must not cover B.
+    #[test]
+    fn channel_delete_refuses_canonical_panes_this_window_cannot_show() {
+        use crate::workspace_model::views::{Pane, Scope, View};
+        for change in ["blocked", "canonical"] {
+            let (mut app, channel, _, conversation) = channel_with_a_conversation();
+            let (tx, publications) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+            if change == "blocked" {
+                app.shared_views.blocked.insert(Scope::Channel(channel));
+            } else {
+                let mut transferred = app.card_state(conversation).unwrap().clone();
+                transferred.id = CardId::new();
+                if let CardKind::Chat(session) = &mut transferred.kind {
+                    session.id = crate::model::TerminalId::new();
+                }
+                let panes = [conversation]
+                    .iter()
+                    .map(|card| Pane::from_card(app.card_state(*card).unwrap(), None).unwrap())
+                    .chain([Pane::from_card(&transferred, None).unwrap()])
+                    .collect();
+                app.workspace_model.views.push(View {
+                    scope: Scope::Channel(channel),
+                    revision: 1,
+                    panes,
+                    retired: Vec::new(),
+                });
+            }
+            drop(app.handle_channel_ui(Action::ConfirmDelete));
+            assert!(!app.channel_ui.deletion_running(), "{change}");
+            assert!(app.channel_ui.closing.is_empty(), "{change}");
+            assert!(!app.channel_ui.was_deleted(channel), "{change}");
+            assert!(app.durable.channels.iter().any(|row| row.id == channel));
+            assert!(
+                !std::iter::from_fn(|| publications.try_recv().ok())
+                    .any(|edit| matches!(edit, ModelEdit::DeleteChannel { id } if id == channel)),
+                "{change}: no channel deletion reaches the canonical placements"
             );
         }
     }

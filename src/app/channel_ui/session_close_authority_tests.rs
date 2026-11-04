@@ -293,6 +293,15 @@ fn owning_delete(role: &str) {
             app.chat_ui = crate::app::chat_ui::State::with_drafts(drafts.clone());
             Arc::make_mut(&mut app.durable).chat_drafts = drafts;
         }
+        // An attached conversation records its hosted session proof.
+        if let Some(CardKind::Chat(session)) = Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|state| state.id == card)
+            .map(|state| &mut state.kind)
+        {
+            session.proof = Some(proof());
+        }
         let saved = app.card_state(card).cloned();
         let drafts = app.persistent_workspace().chat_drafts.clone();
         let focused = app.workspace.focused();
@@ -695,4 +704,107 @@ fn isolated(roles: &[&str], exercise: fn(&str)) {
         assert!(stdout.contains("1 passed; 0 failed; 0 ignored;"));
         assert!(!root.join("ssh-entered").exists());
     }
+}
+
+/// Start Fresh in another window keeps the chat's ID while replacing its
+/// conversation. A close confirmed for the original must not reach the
+/// replacement, and nothing else in the channel closes either.
+fn replaced_conversation(_role: &str) {
+    let replacement_proof = HostSessionProof {
+        host_session_id: HostSessionId::new("channel-close-replacement"),
+        boot_id: BootId::new("channel-close-boot"),
+        host_incarnation: HostIncarnation::new("channel-close-incarnation"),
+    };
+    let reviewed_with = |proof: Option<HostSessionProof>, conversation: Option<&str>| {
+        let mut session = tests::chat_session();
+        session.proof = proof;
+        session.launch.session_id = conversation.map(str::to_owned);
+        session
+    };
+    let cases = [
+        // A hosted proof names one daemon session.
+        (
+            reviewed_with(Some(proof()), Some("original")),
+            Some(replacement_proof.clone()),
+            None,
+        ),
+        // Without a proof, the exact provider conversation must match.
+        (reviewed_with(None, Some("original")), Some(proof()), None),
+        (
+            reviewed_with(None, Some("original")),
+            Some(proof()),
+            Some("replacement"),
+        ),
+        // An identity this window never learned cannot be told apart.
+        (reviewed_with(None, None), Some(proof()), None),
+    ];
+    for (reviewed, live_proof, live_conversation) in cases {
+        let mut live = reviewed.clone();
+        live.proof = live_proof;
+        live.launch.session_id = live_conversation.map(str::to_owned);
+        // The converted chat's source terminal is still running.
+        let mut terminal = TerminalDescriptor::relaunchable(
+            crate::model::TerminalId::new(),
+            reviewed.launch.recipe.clone(),
+            None,
+        );
+        let hosted = proof();
+        terminal.session.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: hosted.host_session_id,
+            boot_id: hosted.boot_id,
+            host_incarnation: hosted.host_incarnation,
+        };
+        let mut reviewed_terminal = reviewed.clone();
+        reviewed_terminal.terminal = Some(terminal.session.clone());
+        let mut live_terminal = live.clone();
+        live_terminal.terminal = Some(terminal.session.clone());
+        let listed = vec![terminal.clone()];
+        let peer = Peer::new(move |server| {
+            let mut connection = server
+                .connect(&Authority::default(), None, false)
+                .expect("user connection");
+            connection.terminals(listed);
+            connection.chats(vec![live_terminal]);
+            // No attach or close follows: neither the replacement nor the
+            // reviewed conversation's source terminal.
+            connection.eof();
+        });
+        let result = close_sessions(
+            vec![CardKind::Chat(reviewed_terminal)],
+            &SessionCloseContext::capture(crate::workspace_model::NO_REGISTRY),
+        );
+        peer.finished();
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    // The unchanged conversation still closes.
+    let reviewed = reviewed_with(Some(proof()), Some("original"));
+    let live = reviewed.clone();
+    let peer = Peer::new(move |server| {
+        let mut connection = server
+            .connect(&Authority::default(), None, false)
+            .expect("user connection");
+        connection.terminals(vec![]);
+        connection.chats(vec![live.clone()]);
+        let close = connection.close_chat(&live);
+        connection.response(
+            &close,
+            ServerResponse::ChatClosed {
+                chat_id: live.id,
+                snapshot: Default::default(),
+            },
+        );
+        connection.eof();
+    });
+    let result = close_sessions(
+        vec![CardKind::Chat(reviewed)],
+        &SessionCloseContext::capture(crate::workspace_model::NO_REGISTRY),
+    );
+    peer.finished();
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn channel_close_refuses_a_conversation_replaced_after_confirmation() {
+    isolated(&["user"], replaced_conversation);
 }
