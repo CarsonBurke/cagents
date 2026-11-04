@@ -21,13 +21,16 @@ Usage: scripts/install-local [--build-host HOST] [--stage-only] [--yes] [--inter
 Builds HEAD with the `local` Cargo profile as version <version>+local.<sha>,
 stages it with install.sh --stage-only, and runs `cagents daemon upgrade`.
 
+The build runs in the repository's .worktrees/.install-local, a detached
+checkout this script owns, so its target directory stays warm between runs
+and edits in other checkouts never reach the binaries.
+
   --build-host HOST  Build on HOST over ssh, then install here. HEAD is pushed
-                     to HOST's checkout at the same path relative to $HOME and
-                     built in its .worktrees/install-local with a warm target.
+                     to the repository at the same path relative to $HOME.
   --stage-only       Stop after staging; finish from the application's notice.
   --yes, --interrupt Passed to `cagents daemon upgrade`.
 
-Only committed source is built. CARGO_BUILD_JOBS defaults to every CPU.
+CARGO_BUILD_JOBS defaults to every CPU of the build host.
 EOF
 }
 
@@ -47,78 +50,84 @@ done
 ((STAGE_ONLY == 0 || ${#UPGRADE_ARGS[@]} == 0)) || fail '--yes and --interrupt apply to the upgrade, not --stage-only'
 
 cd "$ROOT_DIR"
-# A version names exactly one source; uncommitted edits would make it lie.
+# Only HEAD is built; refuse rather than silently leave tracked edits out.
 [[ -z $(git status --porcelain --untracked-files=no) ]] || fail 'commit or discard tracked changes first'
 COMMIT=$(git rev-parse --verify HEAD)
 SHORT=$(git rev-parse --short=9 HEAD)
 MANIFEST_VERSION=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}' Cargo.toml)
 VERSION=$MANIFEST_VERSION+local.$SHORT
+# Worktrees share their repository's objects; address the main checkout.
+REPOSITORY=$(dirname -- "$(git rev-parse --path-format=absolute --git-common-dir)")
 PREFIX=${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install
 ARCHIVE=cagents-$VERSION-x86_64-unknown-linux-gnu.tar.gz
 OUTPUT=${TMPDIR:-/var/tmp}/cagents-install-local/$VERSION
+BUILD_REF=refs/cagents/install-local
 
-# Runs on the build host from a checkout of COMMIT. Each Cargo invocation is
-# incremental in the checkout's own target directory.
-build() {
-    local checkout=$1 output=$2
+# Checks out COMMIT in the script-owned build checkout and packages it into
+# OUTPUT. Runs unchanged on this host or, through `declare -f`, on a build host.
+build_commit() {
+    local repository=$1 commit=$2 version=$3 output=$4 jobs=$5
+    local checkout=$repository/.worktrees/.install-local
+    if [[ ! -e $checkout ]]; then
+        git -C "$repository" worktree add --quiet --detach "$checkout" "$commit"
+    elif git -C "$checkout" symbolic-ref --quiet HEAD >/dev/null; then
+        echo "install-local: $checkout is on a branch; it is not this script's checkout" >&2
+        return 1
+    fi
+    git -C "$checkout" checkout --quiet --force --detach "$commit"
     rm -rf -- "$output"
     mkdir -p -- "$output"
     (
         cd "$checkout"
         # rustup selects rust-toolchain.toml; mise supplies the pinned Zig.
         export PATH=$HOME/.cargo/bin:$PATH
-        export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-$(nproc)}
+        export CARGO_BUILD_JOBS=${jobs:-$(nproc)}
         local tools=()
         if command -v mise >/dev/null; then
+            # This checkout only ever holds commits chosen by this script.
+            mise trust --quiet mise.toml
             tools=(mise exec --)
         fi
-        VERSION=$VERSION CAGENTS_CARGO_PROFILE=local CAGENTS_DIST_DIR=$output \
+        VERSION=$version CAGENTS_CARGO_PROFILE=local CAGENTS_DIST_DIR=$output \
             "${tools[@]}" scripts/package-linux.sh --variant full --archive-only
     )
 }
 
-if [[ -e $PREFIX/versions/$VERSION ]]; then
-    printf '%s is already installed; skipping the build.\n' "$VERSION"
-elif [[ -z $BUILD_HOST ]]; then
-    build "$ROOT_DIR" "$OUTPUT"
+if [[ $PREFIX/current -ef $PREFIX/versions/$VERSION ]]; then
+    printf '%s is already current; skipping the build.\n' "$VERSION"
+elif [[ -e $PREFIX/versions/$VERSION ]]; then
+    fail "$PREFIX/versions/$VERSION exists but is not current; remove it to reinstall"
 else
-    # Worktrees share their repository's objects; address the main checkout.
-    REPOSITORY=$(dirname -- "$(git rev-parse --path-format=absolute --git-common-dir)")
-    REMOTE_REPOSITORY=${REPOSITORY#"$HOME"/}
-    [[ $REMOTE_REPOSITORY != "$REPOSITORY" ]] || fail 'the repository must be under $HOME to locate it on the build host'
-    REMOTE_OUTPUT=/var/tmp/cagents-install-local/$VERSION
-    git push --quiet --force "ssh://$BUILD_HOST/~/$REMOTE_REPOSITORY" "$COMMIT:refs/heads/install-local"
-    # The host's login shell may not be POSIX; run the build under bash.
-    # shellcheck disable=SC2029
-    ssh "$BUILD_HOST" bash -s -- "$REMOTE_REPOSITORY" "$COMMIT" "$VERSION" "$REMOTE_OUTPUT" <<EOF
+    if [[ -z $BUILD_HOST ]]; then
+        build_commit "$REPOSITORY" "$COMMIT" "$VERSION" "$OUTPUT" "${CARGO_BUILD_JOBS:-}" </dev/null
+    else
+        REMOTE_REPOSITORY=${REPOSITORY#"$HOME"/}
+        [[ $REMOTE_REPOSITORY != "$REPOSITORY" ]] || fail 'the repository must be under $HOME to locate it on the build host'
+        REMOTE_OUTPUT=/var/tmp/cagents-install-local/$VERSION
+        git push --quiet --force "ssh://$BUILD_HOST/~/$REMOTE_REPOSITORY" "$COMMIT:$BUILD_REF"
+        # The host's login shell may not be POSIX, so bash reads this script
+        # from stdin; keep the build from consuming the rest of it.
+        # shellcheck disable=SC2029
+        ssh "$BUILD_HOST" bash -s -- \
+            "$REMOTE_REPOSITORY" "$COMMIT" "$VERSION" "$REMOTE_OUTPUT" "${CARGO_BUILD_JOBS:-}" <<EOF
 set -euo pipefail
-$(declare -f build)
-repository=\$HOME/\$1 commit=\$2 VERSION=\$3 output=\$4
-checkout=\$repository/.worktrees/install-local
-if [[ ! -d \$checkout ]]; then
-    git -C "\$repository" worktree add --detach "\$checkout" "\$commit"
-fi
-git -C "\$checkout" checkout --quiet --force --detach "\$commit"
-# This checkout only ever holds commits pushed by this script.
-if command -v mise >/dev/null; then
-    mise trust --quiet "\$checkout/mise.toml"
-fi
-build "\$checkout" "\$output"
+$(declare -f build_commit)
+build_commit "\$HOME/\$1" "\$2" "\$3" "\$4" "\$5" </dev/null
 EOF
-    rm -rf -- "$OUTPUT"
-    mkdir -p -- "$OUTPUT"
-    scp -q "$BUILD_HOST:$REMOTE_OUTPUT/$ARCHIVE" "$BUILD_HOST:$REMOTE_OUTPUT/SHA256SUMS" "$OUTPUT/"
-    # shellcheck disable=SC2029
-    ssh "$BUILD_HOST" rm -rf -- "$REMOTE_OUTPUT"
-fi
+        rm -rf -- "$OUTPUT"
+        mkdir -p -- "$OUTPUT"
+        scp -q "$BUILD_HOST:$REMOTE_OUTPUT/$ARCHIVE" "$BUILD_HOST:$REMOTE_OUTPUT/SHA256SUMS" "$OUTPUT/"
+        # shellcheck disable=SC2029
+        ssh "$BUILD_HOST" rm -rf -- "$REMOTE_OUTPUT"
+    fi
 
-if [[ ! -e $PREFIX/versions/$VERSION ]]; then
     # A remote build may link against a newer glibc than this host provides.
     have=$(getconf GNU_LIBC_VERSION | awk '{ print $2 }')
     tar -xzf "$OUTPUT/$ARCHIVE" -C "$OUTPUT" "cagents-$VERSION/bin"
-    need=$(for binary in "$OUTPUT/cagents-$VERSION"/bin/cagents*; do
-        [[ -L $binary ]] || readelf --version-info "$binary"
+    need=$(for binary in cagents cagentsd cagents-ui; do
+        LC_ALL=C readelf --wide --version-info "$OUTPUT/cagents-$VERSION/bin/$binary"
     done | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/GLIBC_//' | sort -Vu | tail -n1)
+    [[ -n $need ]] || fail 'could not determine the glibc the build requires'
     [[ $(printf '%s\n%s\n' "$need" "$have" | sort -V | tail -n1) == "$have" ]] \
         || fail "the build requires glibc $need; this host has $have"
     CAGENTS_ARCHIVE=$OUTPUT/$ARCHIVE CAGENTS_CHECKSUMS=$OUTPUT/SHA256SUMS \

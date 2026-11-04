@@ -502,11 +502,14 @@ code is recompiled. The script stages the archive with
 affected session and asks before replacing anything. `--stage-only` stops
 after staging so you can finish from the application's update notice instead.
 
-With `--build-host`, `HEAD` is pushed to the same repository path on that host
-and built in its `.worktrees/install-local`. The archive is copied back, and
-the script refuses it if it needs a newer glibc than this machine has.
-Uncommitted changes are refused so that the version names its exact source.
-Rebuilding an installed version is skipped.
+The build runs in the repository's `.worktrees/.install-local`, a detached
+checkout the script owns, so its target directory stays warm and edits in your
+other checkouts never reach the binaries. With `--build-host`, `HEAD` is pushed
+to `refs/cagents/install-local` in the repository at the same path on that host
+and built there. The archive is copied back, and the script refuses it if it
+needs a newer glibc than this machine has. Uncommitted tracked changes are
+refused so that the version names its exact source. If that version is already
+current, the build is skipped.
 
 Published releases still come from `scripts/build-release-linux`; see
 [Releasing](releasing.md).
