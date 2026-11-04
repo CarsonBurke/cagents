@@ -204,6 +204,24 @@ fn settings_category_controls<'a>(
     let invalid = context.invalid;
     let testing_notification = context.testing_notification;
     match category {
+        SettingsCategory::Agents => vec![settings_group(
+            "Concurrent agents",
+            "Accepted, running, waiting and interrupted agents reserve capacity. These settings belong to this installation’s local daemon; remote devices use their own saved limits. Changes apply to the next submission without restarting the daemon; existing work keeps its reservations.",
+            vec![
+                setting_input(
+                    "Maximum reservations for one authenticated caller or session lineage (1–4096).",
+                    &draft.agent_caller_limit,
+                    SettingsField::AgentCallerLimit,
+                    invalid,
+                ),
+                setting_input(
+                    "Maximum reservations shared by every caller and automation (1–4096).",
+                    &draft.agent_global_limit,
+                    SettingsField::AgentGlobalLimit,
+                    invalid,
+                ),
+            ],
+        )],
         SettingsCategory::Notifications => {
             use crate::notifications::Field;
             let fields = [
@@ -1166,6 +1184,7 @@ fn category_icon(category: SettingsCategory) -> Icon {
         SettingsCategory::General => Icon::Settings,
         SettingsCategory::Appearance => Icon::Display,
         SettingsCategory::Terminal => Icon::Terminal,
+        SettingsCategory::Agents => Icon::Users,
         SettingsCategory::Links => Icon::WebBrowser,
         SettingsCategory::Keyboard => Icon::Keyboard,
         SettingsCategory::NativeChat => Icon::Chat,

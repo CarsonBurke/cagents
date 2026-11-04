@@ -140,6 +140,42 @@ pub(super) fn submit(
     authority: &Authority,
     request: Submit,
 ) -> Result<Accepted, String> {
+    submit_with_limits(host, authority, request).map_err(|error| error.to_string())
+}
+
+pub(super) fn concurrency_limits() -> Result<crate::agent_execution::ConcurrencyLimits, String> {
+    admission_limits().map_err(|error| error.to_string())
+}
+
+fn admission_limits()
+-> Result<crate::agent_execution::ConcurrencyLimits, crate::agent_execution::AcceptanceError> {
+    use crate::{agent_execution::AcceptanceError, settings::SettingsError};
+    let Some(path) = crate::instance::settings_path() else {
+        return Ok(Default::default());
+    };
+    match crate::settings::try_load_detailed(path) {
+        Ok(loaded) if loaded.has_unreadable_setting("agent_concurrency") => {
+            Err(AcceptanceError::PolicyUnavailable {
+                message: "Cannot read agent concurrency settings: saved limits contain a value this version cannot use. Correct the saved limits before starting new work.".into(),
+                retryable: false,
+            })
+        }
+        Ok(loaded) => Ok(loaded.settings.agent_concurrency),
+        Err(SettingsError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Default::default())
+        }
+        Err(error) => Err(AcceptanceError::PolicyUnavailable {
+            retryable: matches!(&error, SettingsError::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            message: format!("Cannot read agent concurrency settings: {error}"),
+        }),
+    }
+}
+
+fn submit_with_limits(
+    host: &SharedHost,
+    authority: &Authority,
+    request: Submit,
+) -> Result<Accepted, crate::agent_execution::AcceptanceError> {
     request.validate()?;
     let origin = origin(host, authority)?;
     let registry = registry(host)?;
@@ -150,6 +186,7 @@ pub(super) fn submit(
     {
         return Ok(previous);
     }
+    let limits = admission_limits()?;
     let selected = if let Destination::New(spec) = &request.destination {
         let mut selected = spec.clone();
         let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()?;
@@ -168,7 +205,7 @@ pub(super) fn submit(
     let accepted = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .submit_agent_with_spec(&origin, &request, selected.as_ref(), now())?;
+        .submit_agent_with_limits(&origin, &request, selected.as_ref(), limits, now())?;
     announce(host, &registry);
     dispatch_accepted(host, accepted.clone())?;
     Ok(accepted)
@@ -721,6 +758,15 @@ fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
 
 fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent, String> {
     let origin = origin(host, authority)?;
+    close_as_origin(host, &origin, id, false)
+}
+
+fn close_as_origin(
+    host: &SharedHost,
+    origin: &Origin,
+    id: AgentId,
+    interrupted_only: bool,
+) -> Result<Agent, String> {
     let gate = agent_gate(host, id);
     let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host)?;
@@ -728,6 +774,16 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .preflight_agent_close(&origin, id)?;
+    if interrupted_only
+        && registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .latest_agent_run(id)?
+            .state
+            != State::Interrupted
+    {
+        return Err("Agent is no longer interrupted; it was not closed".into());
+    }
     if agent.closed {
         // Older daemons closed the worker without retiring its shared pane.
         // Repeating close repairs only that retained presentation; it does not
@@ -836,7 +892,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     Ok(result)
 }
 
-/// Preserve typed mailbox backpressure at the service boundary. Existing
+/// Preserve typed capacity, policy and mailbox refusals at the service boundary. Existing
 /// operations retain their original validation and String-returning API.
 pub(super) fn process_request(
     host: &SharedHost,
@@ -847,8 +903,86 @@ pub(super) fn process_request(
         crate::agent_execution::Operation::SendMessage(outgoing) => {
             mailbox::send(host, &authority, outgoing).map(crate::agent_execution::Reply::Sent)
         }
+        crate::agent_execution::Operation::Submit(request) => {
+            submit_with_limits(host, &authority, request)
+                .map(crate::agent_execution::Reply::Accepted)
+        }
+        crate::agent_execution::Operation::Console { agent, command } => {
+            console_with_limits(host, &authority, agent, command)
+        }
+        crate::agent_execution::Operation::Capacity => capacity_with_limits(host, &authority),
         other => process(host, authority, other).map_err(Into::into),
     }
+}
+
+fn close_interrupted(
+    host: &SharedHost,
+    authority: &Authority,
+    all: bool,
+    after: Option<AgentId>,
+) -> Result<crate::agent_execution::CloseInterrupted, String> {
+    let caller = origin(host, authority)?;
+    if all && authority.token().is_some() {
+        return Err("Only a user may close interrupted agents across all callers".into());
+    }
+    let registry = registry(host)?;
+    let mut candidates = {
+        let store = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let report = store.agent_capacity(&caller, Default::default())?;
+        if all {
+            report.global.holders
+        } else {
+            report.caller.holders
+        }
+    };
+    candidates.retain(|holder| {
+        holder.state == State::Interrupted && after.is_none_or(|previous| holder.id > previous)
+    });
+    candidates.sort_unstable_by_key(|holder| holder.id);
+    let has_more = candidates.len() > crate::agent_execution::INTERRUPTED_CLEANUP_BATCH;
+    candidates.truncate(crate::agent_execution::INTERRUPTED_CLEANUP_BATCH);
+    let next = has_more.then(|| candidates.last().expect("nonempty cleanup batch").id);
+    let mut result = crate::agent_execution::CloseInterrupted {
+        closed: Vec::new(),
+        failed: Vec::new(),
+        next,
+    };
+    for holder in candidates {
+        if holder.state != State::Interrupted {
+            continue;
+        }
+        // Keep the authenticated caller as the gate-time authorization fence.
+        // A lineage migration between the census and close must not authorize
+        // this caller to close a newly reassigned conversation.
+        let owner = if all {
+            match registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent(holder.id)
+            {
+                Ok(agent) => agent.origin,
+                Err(message) => {
+                    result
+                        .failed
+                        .push(crate::agent_execution::CloseFailure::new(
+                            holder.id, message,
+                        ));
+                    continue;
+                }
+            }
+        } else {
+            caller.clone()
+        };
+        match close_as_origin(host, &owner, holder.id, true) {
+            Ok(closed) => result.closed.push(closed.id),
+            Err(message) => result
+                .failed
+                .push(crate::agent_execution::CloseFailure::new(
+                    holder.id, message,
+                )),
+        }
+    }
+    Ok(result)
 }
 
 pub(super) fn process(
@@ -858,6 +992,12 @@ pub(super) fn process(
 ) -> Result<crate::agent_execution::Reply, String> {
     use crate::agent_execution::{Operation, Reply, Summary};
     match operation {
+        Operation::Capacity => {
+            capacity_with_limits(host, &authority).map_err(|error| error.to_string())
+        }
+        Operation::CloseInterrupted { all, after } => {
+            close_interrupted(host, &authority, all, after).map(Reply::InterruptedClosed)
+        }
         Operation::Console { agent, command } => console(host, &authority, agent, command),
         Operation::Submit(request) => submit(host, &authority, request).map(Reply::Accepted),
         Operation::Status(id) => {
@@ -1258,6 +1398,31 @@ fn console(
     id: AgentId,
     command: crate::agent_execution::ConsoleCommand,
 ) -> Result<crate::agent_execution::Reply, String> {
+    console_with_limits(host, authority, id, command).map_err(|error| error.to_string())
+}
+
+fn capacity_with_limits(
+    host: &SharedHost,
+    authority: &Authority,
+) -> Result<crate::agent_execution::Reply, crate::agent_execution::AcceptanceError> {
+    let origin = origin(host, authority)?;
+    let limits = admission_limits()?;
+    let store = registry(host)?;
+    let result = store
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_capacity(&origin, limits)?;
+    Ok(crate::agent_execution::Reply::Capacity(result))
+}
+
+/// Keep policy refusals typed at the wire boundary without changing the
+/// console's existing ownership, per-agent gate or interaction sequencing.
+fn console_with_limits(
+    host: &SharedHost,
+    authority: &Authority,
+    id: AgentId,
+    command: crate::agent_execution::ConsoleCommand,
+) -> Result<crate::agent_execution::Reply, crate::agent_execution::AcceptanceError> {
     use crate::agent_execution::{ConsoleCommand, ConsoleView, Reply};
     let (_, caller) = caller(host, authority)?;
     let registry = registry(host)?;
@@ -1298,19 +1463,27 @@ fn console(
         } => {
             let gate = agent_gate(host, id);
             let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let request = Submit {
+                name: None,
+                destination: Destination::Existing(id),
+                prompt,
+                idempotency_key,
+            };
+            request.validate()?;
+            // An exact accepted retry needs no new reservation. Preserve its
+            // receipt even if saved policy has since become unreadable.
+            if let Some(previous) = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .previous_agent_acceptance(&agent.origin, &request)?
+            {
+                return Ok(Reply::Accepted(previous));
+            }
+            let limits = admission_limits()?;
             let accepted = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .submit_agent(
-                    &agent.origin,
-                    &Submit {
-                        name: None,
-                        destination: Destination::Existing(id),
-                        prompt,
-                        idempotency_key,
-                    },
-                    now(),
-                )?;
+                .submit_agent_with_limits(&agent.origin, &request, None, limits, now())?;
             registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())

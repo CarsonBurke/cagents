@@ -372,6 +372,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 300,
             )
             .unwrap()

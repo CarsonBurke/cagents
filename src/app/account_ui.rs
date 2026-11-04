@@ -4432,6 +4432,7 @@ impl Cagents {
                     .align_y(Alignment::Center)
                     .into(),
                 iced::widget::Space::new().width(Length::Fill).into(),
+                self.agent_capacity_control(),
                 self.device_status_control(),
             ])
             .align_y(Alignment::Center),

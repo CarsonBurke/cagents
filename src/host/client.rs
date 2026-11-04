@@ -93,7 +93,7 @@ impl Drop for Registration {
     }
 }
 
-/// Keep an actual terminal or native chat Close's result queueable until its handler has
+/// Keep a destructive close result queueable until its handler has
 /// removed custody and serve_with has enqueued the correlated reply. This is
 /// not a remote ACK: existing close_after_drain settles the actual writer.
 struct CheckedCloseReply {
@@ -296,7 +296,8 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                 | ClientRequest::ChatClose { .. }
                 | ClientRequest::ChatCloseRetained { .. }
                 | ClientRequest::Agent {
-                    operation: crate::agent_execution::Operation::Close(_),
+                    operation: crate::agent_execution::Operation::Close(_)
+                        | crate::agent_execution::Operation::CloseInterrupted { .. },
                     ..
                 }
         ) {
@@ -757,6 +758,13 @@ pub(super) fn process_request(
                     crate::agent_execution::AcceptanceError::MailboxFull(message) => {
                         ProtocolError::new(ProtocolErrorCode::QueueFull, message, true)
                     }
+                    crate::agent_execution::AcceptanceError::LimitReached(details) => {
+                        ProtocolError::agent_limit_reached(details)
+                    }
+                    crate::agent_execution::AcceptanceError::PolicyUnavailable {
+                        message,
+                        retryable,
+                    } => ProtocolError::new(ProtocolErrorCode::Internal, message, retryable),
                 })?;
             Ok((ServerResponse::Agent(reply), Vec::new(), false))
         }
@@ -2642,6 +2650,313 @@ mod tests {
             super::super::state::HostState::new(proof.clone()),
         ));
         (proof, host)
+    }
+
+    /// Cross the real framed connection and request guard before and after the
+    /// batch retires its last undispatched reservation. These are fixture User
+    /// requests; no actor/provider is dispatched and no authority is changed.
+    #[test]
+    fn interrupted_agent_batch_reply_custody_survives_exit_and_failure_paths() {
+        use crate::agent_execution::{
+            ConcurrencyLimits, Destination, Operation, Origin, Reply, Spec, State, Submit, Surface,
+            Target,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        const CASE: &str = "CAGENTS_EXIT_DRAIN_TEST_CASE";
+        let name = thread::current().name().unwrap().to_owned();
+        let cases = match std::env::var(CASE) {
+            Ok(case) => vec![case],
+            Err(_) => ["success", "sealed", "peer-disconnected", "delivery-closed"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        };
+        thread_local! {
+            static PAUSE: std::cell::RefCell<Option<(
+                Arc<AtomicUsize>, mpsc::Sender<()>, mpsc::Receiver<()>
+            )>> = const { std::cell::RefCell::new(None) };
+        }
+        fn batch_then_pause(
+            host: &SharedHost,
+            client: ClientId,
+            request: ClientRequest,
+        ) -> Result<RequestOutcome, ProtocolError> {
+            PAUSE.with(|pause| {
+                pause
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .fetch_add(1, Ordering::SeqCst);
+            });
+            let result = process_request(host, client, request);
+            if matches!(
+                &result,
+                Ok((ServerResponse::Agent(Reply::InterruptedClosed(_)), _, _))
+            ) {
+                assert!(
+                    host.lock().unwrap().ordinary_exit_cleanup_blocked(),
+                    "the real batch handler must retain reply custody after releasing its last reservation"
+                );
+                PAUSE.with(|pause| {
+                    let (_, closed, resume) = pause.borrow_mut().take().unwrap();
+                    closed.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+            }
+            result
+        }
+        fn send(
+            stream: &mut UnixStream,
+            proof: &HostSessionProof,
+            id: u64,
+            request: ClientRequest,
+        ) {
+            FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+                .write(
+                    stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: id,
+                        proof: Some(proof.clone()),
+                        request,
+                    },
+                )
+                .unwrap();
+        }
+        fn reply(stream: &mut UnixStream, id: u64) -> ServerMessage {
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            loop {
+                let envelope = codec
+                    .read::<ServerEnvelope>(stream)
+                    .unwrap()
+                    .expect("interrupted batch lost its correlated wire reply");
+                if envelope.request_id == Some(id) {
+                    return envelope.message;
+                }
+            }
+        }
+        for case in cases {
+            assert!(
+                ["success", "sealed", "peer-disconnected", "delivery-closed"]
+                    .contains(&case.as_str())
+            );
+            let Some(_root) =
+                super::super::exit_drain_tests::private_runtime_case(&name, Some(&case))
+            else {
+                continue;
+            };
+            let (proof, host) = panic_test_host("interrupted-batch-reply-custody");
+            let directory = tempfile::tempdir().unwrap();
+            let repository = directory.path().canonicalize().unwrap();
+            let mut store =
+                super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+            store
+                .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                    repository: repository.clone(),
+                    name: "Interrupted fixture".into(),
+                    kind: crate::model::ProjectKind::Folder,
+                })
+                .unwrap();
+            let accepted = store
+                .submit_agent(
+                    &Origin::User,
+                    &Submit {
+                        name: None,
+                        destination: Destination::New(Spec {
+                            provider: crate::agent::Provider::Claude,
+                            account: None,
+                            target: Target {
+                                repository: repository.clone(),
+                                directory: repository,
+                                placement: None,
+                            },
+                            surface: Surface::Chat,
+                            model: None,
+                            permission_mode: None,
+                            reasoning_effort: None,
+                        }),
+                        prompt: "Never dispatched".into(),
+                        idempotency_key: "interrupted-batch-reply-fixture".into(),
+                    },
+                    1,
+                )
+                .unwrap();
+            store.interrupt_unproven_agent_runs(2).unwrap();
+            let original_run = store.agent_run(accepted.run.id).unwrap();
+            assert_eq!(original_run.state, State::Interrupted);
+            assert!(!store.agent(accepted.agent.id).unwrap().closed);
+            assert_eq!(
+                store
+                    .agent_capacity(&Origin::User, ConcurrencyLimits::default())
+                    .unwrap()
+                    .global
+                    .running,
+                1
+            );
+            let before = store.model().unwrap();
+            host.lock().unwrap().install_model(store);
+            let registry = super::super::agent_execution::registry(&host).unwrap();
+            let (mut stream, server_stream) = UnixStream::pair().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let entered = Arc::clone(&calls);
+            let (closed_tx, closed_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let serving_host = Arc::clone(&host);
+            let serving = thread::spawn(move || {
+                PAUSE.with(|pause| *pause.borrow_mut() = Some((entered, closed_tx, resume_rx)));
+                serve_with(server_stream, 1, serving_host, batch_then_pause);
+                done_tx.send(()).unwrap();
+            });
+            send(
+                &mut stream,
+                &proof,
+                1,
+                ClientRequest::Connect {
+                    expected_host: Some(proof.clone()),
+                    resume: Vec::new(),
+                },
+            );
+            assert!(matches!(
+                reply(&mut stream, 1),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected { .. }
+                }
+            ));
+            let delivery = Arc::clone(host.lock().unwrap().clients.get(&1).unwrap());
+            let sealed = (case == "sealed").then(|| {
+                let drain = super::super::begin_ordinary_exit(&host).unwrap();
+                assert!(drain.try_seal_absence());
+                let mut state = host.lock().unwrap();
+                assert!(!state.ordinary_exit_cleanup_blocked());
+                state.close_ordinary_exit_registration();
+                drain
+            });
+            send(
+                &mut stream,
+                &proof,
+                2,
+                ClientRequest::Agent {
+                    authority: crate::agent_execution::Authority::default(),
+                    operation: Operation::CloseInterrupted {
+                        all: false,
+                        after: None,
+                    },
+                },
+            );
+            if let Some(drain) = sealed {
+                let ServerMessage::Error(error) = reply(&mut stream, 2) else {
+                    panic!("sealed batch must be refused before its handler runs");
+                };
+                assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+                assert!(!error.retryable);
+                assert!(
+                    error
+                        .message
+                        .contains("sealed terminal cleanup and client delivery")
+                );
+                done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                serving.join().unwrap();
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "sealed request reached the effectful batch handler"
+                );
+                let store = registry.lock().unwrap();
+                assert_eq!(store.model().unwrap(), before);
+                assert!(!store.agent(accepted.agent.id).unwrap().closed);
+                assert_eq!(store.agent_run(accepted.run.id).unwrap(), original_run);
+                assert_eq!(
+                    store
+                        .agent_capacity(&Origin::User, ConcurrencyLimits::default())
+                        .unwrap()
+                        .global
+                        .running,
+                    1
+                );
+                assert!(drain.try_seal_absence());
+                assert!(!host.lock().unwrap().ordinary_exit_cleanup_blocked());
+                continue;
+            }
+            closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            {
+                let store = registry.lock().unwrap();
+                assert!(store.agent(accepted.agent.id).unwrap().closed);
+                assert_eq!(store.agent_run(accepted.run.id).unwrap(), original_run);
+                assert_eq!(
+                    store
+                        .agent_capacity(&Origin::User, ConcurrencyLimits::default())
+                        .unwrap()
+                        .global
+                        .running,
+                    0
+                );
+            }
+            assert!(host.lock().unwrap().chats.is_empty());
+            let drain = super::super::begin_ordinary_exit(&host).unwrap();
+            assert!(drain.try_seal_absence());
+            let mut cleanup_error = None;
+            assert!(host.lock().unwrap().ordinary_exit_cleanup_blocked());
+            assert!(!super::super::finish_shutdown_owners(
+                &host,
+                &mut cleanup_error,
+                false
+            ));
+            if case == "peer-disconnected" {
+                stream.shutdown(std::net::Shutdown::Both).unwrap();
+            } else if case == "delivery-closed" {
+                // Real queue refusal, after the real handler committed its
+                // result but before serve_with attempts push_response.
+                delivery.close_after_drain();
+            }
+            resume_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while host.lock().unwrap().ordinary_exit_cleanup_blocked() {
+                assert!(
+                    Instant::now() < deadline,
+                    "batch reply custody leaked after enqueue/failure"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(super::super::finish_shutdown_owners(
+                &host,
+                &mut cleanup_error,
+                false
+            ));
+            assert!(cleanup_error.is_none());
+            let deliveries = {
+                let mut state = host.lock().unwrap();
+                assert!(drain.try_seal_absence());
+                state.close_ordinary_exit_registration()
+            };
+            super::super::close_shutdown_deliveries(&host, &deliveries);
+            if case == "success" {
+                assert!(matches!(reply(&mut stream, 2), ServerMessage::Response {
+                    response: ServerResponse::Agent(Reply::InterruptedClosed(result)),
+                } if result.closed == [accepted.agent.id] && result.failed.is_empty() && result.next.is_none()));
+                let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+                while let Some(envelope) = codec.read::<ServerEnvelope>(&mut stream).unwrap() {
+                    assert_eq!(envelope.request_id, None);
+                    assert!(matches!(envelope.message, ServerMessage::HostShuttingDown));
+                }
+            }
+            stream.shutdown(std::net::Shutdown::Both).ok();
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            serving.join().unwrap();
+            assert!(host.lock().unwrap().clients.is_empty());
+            assert!(!host.lock().unwrap().ordinary_exit_cleanup_blocked());
+        }
     }
 
     #[test]

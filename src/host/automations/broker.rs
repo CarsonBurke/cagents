@@ -20,7 +20,7 @@ use crate::{
     automations::{Firing, FiringState, SessionMode, Trigger},
     host::{
         agent_execution,
-        model::Claimed,
+        model::{AutomationPrecheckError, Claimed},
         state::{HostLock, SharedHost},
     },
 };
@@ -190,6 +190,7 @@ impl Handle {
         }
         service::validate_target(&host, &automation.definition, &automation.target_identity)?;
         agent_execution::selected_account(&automation.definition.agent)?;
+        let limits = agent_execution::concurrency_limits();
         let claim = self
             .0
             .registry
@@ -202,6 +203,7 @@ impl Handle {
                 Trigger::Manual { request },
                 automation.next,
                 confirmed,
+                limits,
                 service::now()?,
             )?;
         let firing = claim.firing.clone();
@@ -427,6 +429,7 @@ impl Handle {
             }
         }
         checking |= self.sweep_prechecks()?;
+        let mut policy_unavailable: Option<String> = None;
         for firing in active {
             if let Some(run) = firing.run {
                 let reconciled = self
@@ -458,8 +461,20 @@ impl Handle {
                 firing.state,
                 FiringState::Prechecking | FiringState::Interrupted
             ) {
-                checking |= self.observe_precheck(host, &firing, now)?;
+                match self.observe_precheck(host, &firing, policy_unavailable.as_deref(), now) {
+                    Ok(pending) => checking |= pending,
+                    Err(AutomationPrecheckError::PolicyUnavailable(message)) => {
+                        policy_unavailable.get_or_insert(message);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
+        }
+        // Existing owners still need exact cleanup and provider release when
+        // policy is unreadable. Report the first refusal after that census,
+        // before considering any due work or new acceptance in this tick.
+        if let Some(error) = policy_unavailable {
+            return Err(error);
         }
         // Four jobs per wake keeps a burst of slow filesystem validation from
         // starving completion/cleanup handling. Remaining due rows wake again.
@@ -491,6 +506,7 @@ impl Handle {
                 } else {
                     previous
                 };
+                let limits = agent_execution::concurrency_limits();
                 let claim = self
                     .0
                     .registry
@@ -505,6 +521,7 @@ impl Handle {
                         },
                         Some(plan.next),
                         false,
+                        limits,
                         now,
                     )?;
                 checking |= claim.created
@@ -626,8 +643,9 @@ impl Handle {
         &self,
         host: &SharedHost,
         firing: &Firing,
+        unavailable_policy: Option<&str>,
         now: u64,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, AutomationPrecheckError> {
         let status = {
             let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
             workers
@@ -644,7 +662,11 @@ impl Handle {
                 return Ok(true);
             }
             Ok(Status::Complete(outcome)) => {
-                let accepted = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).finish_automation_precheck(firing.id, outcome, now)?;
+                // Once this tick has refused policy-dependent acceptance, its
+                // remaining census only maintains existing owners. A later
+                // receipt cannot start new work if the writer recovers midway.
+                let limits = unavailable_policy.map_or_else(agent_execution::concurrency_limits, |message| Err(message.to_owned()));
+                let accepted = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).finish_automation_precheck(firing.id, outcome, limits, now)?;
                 if let Some(accepted) = accepted {
                     let automation = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).automation(firing.automation)?;
                     match service::validate_target(host, &automation.definition, &automation.target_identity) {
@@ -774,6 +796,9 @@ fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifi
         },
     })
 }
+
+#[cfg(test)]
+mod policy_contention_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1079,6 +1104,7 @@ mod tests {
                         },
                         None,
                         true,
+                        crate::host::agent_execution::concurrency_limits(),
                         200,
                     )
                     .unwrap();
@@ -1134,6 +1160,7 @@ mod tests {
                         },
                         Some(next.clone()),
                         false,
+                        crate::host::agent_execution::concurrency_limits(),
                         300,
                     )
                     .unwrap();
@@ -1211,6 +1238,7 @@ mod tests {
                                 local: "later".into(),
                             }),
                             false,
+                            crate::host::agent_execution::concurrency_limits(),
                             400,
                         )
                         .unwrap()
@@ -1331,6 +1359,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -1422,6 +1451,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();

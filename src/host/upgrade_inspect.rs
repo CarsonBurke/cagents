@@ -443,6 +443,33 @@ mod tests {
     };
 
     #[test]
+    fn frozen_127_inspection_uses_the_existing_source_ownership_fence() {
+        let request = |protocol| Request {
+            protocol,
+            proof: None,
+            require_resumable: true,
+            reconcile_retained: false,
+        };
+        // No socket is contacted without a complete authenticated proof. This
+        // also proves the literal predecessor reaches the existing inspector
+        // instead of being lost when the destination protocol changes.
+        assert_eq!(
+            connect(&request(127), Instant::now() + Duration::from_secs(1))
+                .err()
+                .unwrap(),
+            "Saved conversations have no authenticated source service"
+        );
+        for protocol in [126, 128, 138, 140] {
+            assert_eq!(
+                connect(&request(protocol), Instant::now() + Duration::from_secs(1))
+                    .err()
+                    .unwrap(),
+                "Source protocol has no qualified migration inspector; source windows remain usable"
+            );
+        }
+    }
+
+    #[test]
     fn cold_terminal_history_never_requires_replaying_a_launch_or_inventing_an_exit() {
         let mut source = crate::terminal_ipc::TerminalDescriptor::relaunchable(
             TerminalId::new(),
