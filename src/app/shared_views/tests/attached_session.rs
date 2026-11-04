@@ -1,11 +1,14 @@
-//! A session that lost its pane comes back when a pane holding it reappears,
-//! whichever card identity that pane uses, and stays back across a reload.
+//! What one window does when a pane holding a session reaches it, given the
+//! cards it already has for that session: closed, idle, or holding unsent text.
+//! These start from that card state rather than replaying how it arose, and they
+//! drop the tasks a reconcile returns, so neither a provider nor the daemon's
+//! `cagents channel move` runs here.
 use super::published_card_edits::{accept_local_view, shared_channel_app, stored};
 use super::*;
 use crate::agent::Provider;
 
-/// A window showing one started chat whose pane a shared projection then removed:
-/// the card is saved closed although the daemon still hosts its process.
+/// A started chat whose card this window has saved closed, the state a session
+/// is left in when a shared projection removes its pane while it keeps running.
 fn detached_live_chat() -> (Cagents, Scope, View, Pane, tempfile::TempDir) {
     let (mut app, scope, directory) = shared_channel_app();
     let _ = app.new_native_chat(Provider::Claude, Some("/workspace/chat-fixture".into()));
@@ -115,4 +118,156 @@ fn an_attached_session_shows_once_beside_its_closed_card_and_after_a_reload() {
     assert!(reloaded.workspace.card(attached.id).is_some());
     assert!(reloaded.workspace.card(closed.id).is_none());
     assert_eq!(open_panes_of(&reloaded, &attached.kind), [attached.id]);
+}
+
+/// A live chat this window shows from a card no shared view holds, as a first
+/// send leaves it, plus an empty destination channel.
+fn local_only_chat() -> (Cagents, View, Pane, tempfile::TempDir) {
+    let (mut app, scope, directory) = shared_channel_app();
+    let _ = app.new_native_chat(Provider::Claude, Some("/workspace/chat-fixture".into()));
+    let card = app.workspace.focused().unwrap();
+    let Some(CardKind::Chat(chat)) = app.card_state_mut(card).map(|state| &mut state.kind) else {
+        panic!("the card holds a chat");
+    };
+    chat.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+    let kind = app.card_state(card).unwrap().kind.clone();
+    app.retain_local_pane(card);
+    app.persist();
+    let destination = ChannelId::new();
+    Arc::make_mut(&mut app.durable)
+        .channels
+        .push(ProjectChannel {
+            id: destination,
+            project_id: ProjectId::new(),
+            title: "destination".into(),
+            title_source: Default::default(),
+            ordinal: 2,
+            shared: true,
+            cards: vec![],
+            focused: None,
+        });
+    let destination = Scope::Channel(destination);
+    app.shared_views.initialized.insert(destination.clone());
+    let Scope::Channel(id) = destination else {
+        unreachable!()
+    };
+    let mut view = View::empty(id);
+    view.revision = 1;
+    let mut own = View::empty(match scope {
+        Scope::Channel(id) => id,
+        _ => unreachable!(),
+    });
+    own.revision = 1;
+    app.workspace_model.views = vec![own, view.clone()];
+    let attached = Pane {
+        id: CardId::new(),
+        title: "Attached chat".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 0.5,
+        kind,
+        scope: None,
+    };
+    (app, view, attached, directory)
+}
+
+fn publish_attached(app: &mut Cagents, view: &mut View, attached: &Pane) {
+    view.revision += 1;
+    view.panes = vec![attached.clone()];
+    let scope = view.scope.clone();
+    let slot = app
+        .workspace_model
+        .views
+        .iter_mut()
+        .find(|candidate| candidate.scope == scope)
+        .unwrap();
+    *slot = view.clone();
+    drop(app.reconcile_shared_views());
+}
+
+#[test]
+fn attaching_a_session_with_an_idle_local_card_replaces_that_card() {
+    let (mut app, mut view, attached, _directory) = local_only_chat();
+    let card = app.workspace.focused().unwrap();
+    publish_attached(&mut app, &mut view, &attached);
+    assert!(app.shared_views.blocked.is_empty());
+    assert_eq!(open_panes_of(&app, &attached.kind), [attached.id]);
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+}
+
+#[test]
+fn unsent_text_holds_an_attached_session_until_it_clears_then_moves_it() {
+    let (mut app, mut view, attached, _directory) = local_only_chat();
+    let card = app.workspace.focused().unwrap();
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(card, "unsent".into())]));
+    publish_attached(&mut app, &mut view, &attached);
+    assert!(app.shared_views.blocked.contains(&view.scope));
+    assert_eq!(open_panes_of(&app, &attached.kind), [card]);
+    assert!(app.shared_views.blocked_aliases.contains(&card));
+
+    // Nothing has changed yet, so a reconcile is not due.
+    drop(app.reconcile_cleared_blocked_aliases());
+    assert_eq!(open_panes_of(&app, &attached.kind), [card]);
+
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::new());
+    drop(app.reconcile_cleared_blocked_aliases());
+    assert!(app.shared_views.blocked.is_empty());
+    assert_eq!(open_panes_of(&app, &attached.kind), [attached.id]);
+}
+
+/// Closing the held card lets go of it and its draft, so the pane can show.
+#[test]
+fn closing_a_blocked_card_shows_the_attached_pane() {
+    let (mut app, mut view, attached, _directory) = local_only_chat();
+    let card = app.workspace.focused().unwrap();
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(card, "unsent".into())]));
+    publish_attached(&mut app, &mut view, &attached);
+    assert!(app.another_pane_holds_session(card));
+
+    drop(app.begin_chat_close(card));
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+    assert_eq!(open_panes_of(&app, &attached.kind), [attached.id]);
+    assert!(app.shared_views.blocked.is_empty());
+    assert!(!app.shared_chat_has_local_work(card));
+}
+
+#[test]
+fn a_terminal_attached_beside_its_closed_card_shows_once() {
+    let (mut app, scope, _directory) = shared_channel_app();
+    let terminal = crate::app::fresh_terminal_session(LaunchRecipe {
+        program: "/bin/sh".into(),
+        arguments: vec![],
+        working_directory: "/workspace/chat-fixture".into(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    });
+    let kind = CardKind::Terminal(terminal);
+    let closed = CardState {
+        id: CardId::new(),
+        generation: app.durable.generation,
+        title: "Terminal".into(),
+        width_fraction: 0.5,
+        existence: crate::app::project_ui::removed_existence("pane closed in another client"),
+        exposure: Exposure::Offscreen,
+        residency: Residency::Cold,
+        kind: kind.clone(),
+    };
+    let closed_id = closed.id;
+    Arc::make_mut(&mut app.durable).cards.push(closed);
+    let Scope::Channel(channel) = scope else {
+        unreachable!()
+    };
+    let mut view = View::empty(channel);
+    let attached = Pane {
+        id: CardId::new(),
+        title: "Terminal".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 0.5,
+        kind: kind.clone(),
+        scope: None,
+    };
+    publish(&mut app, &mut view, attached.clone());
+    assert_eq!(open_panes_of(&app, &kind), [attached.id]);
+    assert!(!app.card_state(closed_id).unwrap().existence.is_open());
 }

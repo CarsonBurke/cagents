@@ -118,9 +118,10 @@ pub struct Directory {
 }
 
 impl Entry {
-    /// A provider session the daemon hosts that no window can currently show:
-    /// it has no pane in any view, and no agent record that would place one.
-    pub fn has_no_pane(&self) -> bool {
+    /// A provider session no shared view holds, with no agent record to place
+    /// one. A window may still show it from a card it has not published, so this
+    /// does not by itself mean the session is hidden.
+    pub fn has_no_shared_pane(&self) -> bool {
         self.provider.is_some() && self.view_scope.is_none() && self.delegation.is_none()
     }
 
@@ -158,8 +159,8 @@ impl Entry {
         if let Some(super::Placement::Worktree { path, .. }) = &self.view_scope {
             line.push_str(&format!(" [worktree view: {}]", path.display()));
         }
-        if self.has_no_pane() {
-            line.push_str(" [no pane]");
+        if self.has_no_shared_pane() {
+            line.push_str(" [no shared pane]");
         }
         line.push_str(relation);
         if self.lineage.0 != self.id {

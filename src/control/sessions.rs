@@ -52,6 +52,7 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
     };
     let directory = read(scope)?;
     let mut human = list_human(directory.caller.iter().chain(directory.sessions.iter()));
+    human.push_str(&no_shared_pane_guidance(&directory));
     if let Scope::Project(project) = &directory.scope {
         human.push_str(&format!(
             "\n(project {}; --all for every project)",
@@ -63,6 +64,51 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
         data: json!({ "me": directory.caller, "scope": directory.scope, "sessions": directory.sessions }),
         human,
     })
+}
+
+/// What to do about a listed session that no shared view holds. Empty when
+/// there is none.
+fn no_shared_pane_guidance(directory: &Directory) -> String {
+    let unplaced = directory
+        .caller
+        .iter()
+        .chain(&directory.sessions)
+        .filter(|entry| entry.has_no_shared_pane())
+        .collect::<Vec<_>>();
+    if unplaced.is_empty() {
+        return String::new();
+    }
+    let attachable = unplaced
+        .iter()
+        .filter(|entry| entry.project.is_some())
+        .collect::<Vec<_>>();
+    let mut guidance =
+        "\n\nA session with no shared pane may still be open in a window.".to_owned();
+    if let [entry] = attachable.as_slice() {
+        let path = entry.directory.as_deref().map_or_else(
+            || "PATH".to_owned(),
+            |path| super::format::plain(&path.display().to_string()),
+        );
+        guidance.push_str(&format!(
+            " If none shows it, put it in a channel:\n  cagents channel move {} --to CHANNEL_ID\nFind a channel with `cagents channel list --repository {path}`, or create one with `cagents channel spawn --repository {path}`.",
+            entry.id
+        ));
+    } else if !attachable.is_empty() {
+        guidance.push_str(
+            " If none shows one, put it in a channel:\n  cagents channel move SESSION --to CHANNEL_ID\nFind a channel with `cagents channel list --repository PATH`, or create one with `cagents channel spawn --repository PATH`.",
+        );
+    }
+    if attachable.len() < unplaced.len() {
+        guidance.push_str(
+            "\nA session outside every open project can't go in a channel until its project is open: `cagents project open PATH`.",
+        );
+    }
+    if directory.caller.is_some() && !attachable.is_empty() {
+        guidance.push_str(
+            "\nRun that from a terminal outside cagents, or reopen the conversation with Resume conversation in the app. Sessions inside cagents can't place panes.",
+        );
+    }
+    guidance
 }
 
 fn list_human<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> String {
@@ -88,15 +134,8 @@ fn list_human<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> String {
                 {
                     context.push(format!("worktree view {}", path.display()));
                 }
-                if entry.has_no_pane() {
-                    context.push(if entry.project.is_some() {
-                        format!(
-                            "no pane; show it with: cagents channel move {} --to CHANNEL_ID",
-                            entry.id
-                        )
-                    } else {
-                        "no pane".to_owned()
-                    });
+                if entry.has_no_shared_pane() {
+                    context.push("no shared pane".to_owned());
                 }
                 match (entry.relation, entry.delegation.as_ref().map(|d| &d.owner)) {
                     (Relation::Myself, _) => context.push("me".into()),
@@ -233,20 +272,44 @@ mod tests {
     }
 
     #[test]
-    fn readable_session_rows_say_when_a_session_has_no_pane_and_how_to_show_it() {
+    fn sessions_with_no_shared_pane_are_marked_and_explain_what_works_from_here() {
+        let directory = |caller: Option<Entry>, sessions: Vec<Entry>| Directory {
+            caller,
+            scope: Scope::All,
+            sessions,
+        };
         let mut entry = entry();
         let id = entry.id;
-        let attach = format!("no pane; show it with: cagents channel move {id} --to CHANNEL_ID");
-        assert!(!list_human(std::iter::once(&entry)).contains("no pane"));
         // A delegated session is placed through its agent, whatever its view.
         entry.view_scope = None;
-        assert!(!list_human(std::iter::once(&entry)).contains("no pane"));
+        assert!(!list_human(std::iter::once(&entry)).contains("no shared pane"));
+        assert_eq!(
+            no_shared_pane_guidance(&directory(None, vec![entry.clone()])),
+            ""
+        );
+
         entry.delegation = None;
-        assert!(list_human(std::iter::once(&entry)).contains(&attach));
+        assert!(list_human(std::iter::once(&entry)).contains("no shared pane"));
+        let outside = no_shared_pane_guidance(&directory(None, vec![entry.clone()]));
+        assert!(outside.contains(&format!("cagents channel move {id} --to CHANNEL_ID")));
+        assert!(outside.contains("cagents channel list --repository /fixture/linked"));
+        assert!(outside.contains("cagents channel spawn --repository /fixture/linked"));
+        assert!(!outside.contains("outside cagents"));
+
+        let mut me = entry.clone();
+        me.id = "00000000-0000-4000-8000-000000000009".parse().unwrap();
+        me.relation = Relation::Myself;
+        me.view_scope = Some(crate::agent_execution::Placement::Channel(
+            crate::model::ChannelId::new(),
+        ));
+        let inside = no_shared_pane_guidance(&directory(Some(me), vec![entry.clone()]));
+        assert!(inside.contains("from a terminal outside cagents"));
+
         // A channel only accepts sessions of its own project.
         entry.project = None;
-        let human = list_human(std::iter::once(&entry));
-        assert!(human.contains("no pane") && !human.contains("channel move"));
+        let unopened = no_shared_pane_guidance(&directory(None, vec![entry]));
+        assert!(unopened.contains("cagents project open"));
+        assert!(!unopened.contains("channel move"));
     }
 
     #[test]

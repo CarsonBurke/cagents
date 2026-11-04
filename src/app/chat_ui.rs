@@ -7232,6 +7232,12 @@ impl Cagents {
             *close_requested = true;
             return Task::none();
         }
+        // The session is that pane's now, and closing this card must not end it.
+        if self.another_pane_holds_session(card) {
+            self.chat_ui.drafts.remove(&card);
+            self.chat_ui.draft_attachments.remove(&card);
+            return self.release_card_held_elsewhere(card);
+        }
         // Only a live conversation is ever parked behind its terminal.
         if let Some(runtime) = self.chat_ui.parked.get(&card)
             && let Some(handle) = runtime.handle().cloned()
@@ -20864,6 +20870,39 @@ mod tests {
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert_eq!(chat_runtime(&app, card).composer.text(), draft);
         assert_eq!(chat_runtime(&app, card).attachments, attachments);
+    }
+
+    /// `cagents channel move` can give a session a shared pane while this window
+    /// still shows it from a local card. That card's close button is not a request
+    /// to end the session.
+    #[test]
+    fn closing_a_card_only_ends_its_session_when_no_other_pane_holds_it() {
+        use crate::{
+            model::ChannelId,
+            workspace_model::views::{Pane, View},
+        };
+        for held_elsewhere in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            if held_elsewhere {
+                let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+                pane.id = CardId::new();
+                let mut view = View::empty(ChannelId::new());
+                view.panes.push(pane);
+                app.workspace_model.views = vec![view];
+            }
+            drop(app.begin_chat_close(card));
+            assert_eq!(
+                app.chat_ui.transition_pending(),
+                !held_elsewhere,
+                "a close reaches the session only when nothing else holds it"
+            );
+            assert_eq!(
+                app.card_state(card).unwrap().existence.is_open(),
+                !held_elsewhere,
+                "released at once, or open until the session's close finishes"
+            );
+        }
     }
 
     #[test]

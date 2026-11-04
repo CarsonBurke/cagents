@@ -1474,6 +1474,12 @@ mod tests {
                 assert!(!reader.subscribers.contains_key(&0));
                 assert!(!reader.observations.contains_key(&0));
             }
+            assert!(
+                !crate::host::agent_execution::live_sessions(&host)
+                    .iter()
+                    .any(|live| live.id == source.id),
+                "a reader has no provider process, so it is not offered as a running session"
+            );
             assert!(!marker.exists(), "automatic restore launched a provider");
             if index == 0 {
                 let mut older_alias = source.clone();

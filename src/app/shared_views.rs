@@ -84,6 +84,8 @@ pub(super) struct State {
     pub defaults: HashMap<CardId, TerminalSession>,
     default_requests: HashSet<CardId>,
     pub blocked: HashSet<Scope>,
+    /// Open cards whose local work is holding up a shared pane of their session.
+    blocked_aliases: HashSet<CardId>,
     pub adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
     pub restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     restoration_requests: HashMap<CardId, TerminalId>,
@@ -1450,6 +1452,7 @@ impl Cagents {
 
     fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
         self.shared_views.blocked = blocked_managed_view_scopes(&self.workspace_model, views);
+        self.shared_views.blocked_aliases.clear();
         let mut attention_owners: HashMap<_, usize> = HashMap::new();
         for pane in views.iter().flat_map(|view| &view.panes) {
             if let Some(resource) = attention_resource(&pane.kind) {
@@ -1511,9 +1514,17 @@ impl Cagents {
                                 self.shared_views.blocked.insert(scope);
                             }
                         }
-                        self.status = Some(TransientNotice::warning(
-                            "A shared pane has a new identity. Finish or discard its local draft before adopting it.",
-                        ));
+                        self.status = Some(if local_work {
+                            self.shared_views.blocked_aliases.insert(alias);
+                            TransientNotice::warning(format!(
+                                "\u{201c}{}\u{201d} was also placed in a shared channel. It moves there once you send or clear what you've written here.",
+                                shared.title
+                            ))
+                        } else {
+                            TransientNotice::warning(
+                                "A shared pane has a new identity. Finish or discard its local draft before adopting it.",
+                            )
+                        });
                         continue;
                     }
                     adoptions.push((view.scope.clone(), alias, shared.clone()));
@@ -1553,6 +1564,48 @@ impl Cagents {
                 channel.cards.retain(|id| *id != alias);
             }
         }
+    }
+
+    /// Nothing else reconciles when a blocked card's local work clears, and until
+    /// then the views it blocks neither publish nor project.
+    pub(super) fn reconcile_cleared_blocked_aliases(&mut self) -> Task<Message> {
+        let cleared = self
+            .shared_views
+            .blocked_aliases
+            .iter()
+            .any(|card| !self.shared_chat_has_local_work(*card));
+        if cleared {
+            self.reconcile_shared_views()
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Whether a different pane in a shared view holds the session `card` shows.
+    pub(super) fn another_pane_holds_session(&self, card: CardId) -> bool {
+        let Some(state) = self.card_state(card) else {
+            return false;
+        };
+        self.workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .any(|pane| pane.id != card && views::same_resource(&pane.kind, &state.kind))
+    }
+
+    /// Lets go of a card whose session a shared pane holds. The session belongs
+    /// to that pane now, so only this card and its local work go away.
+    pub(super) fn release_card_held_elsewhere(&mut self, card: CardId) -> Task<Message> {
+        self.shared_views.retained.remove(&card);
+        self.shared_views.blocked_aliases.remove(&card);
+        self.detach_shared_pane(card);
+        let durable = Arc::make_mut(&mut self.durable);
+        durable.local_only_cards.remove(&card);
+        for channel in &mut durable.channels {
+            channel.cards.retain(|id| *id != card);
+        }
+        self.persist();
+        self.reconcile_shared_views()
     }
 
     fn prepare_terminal_restoration(&mut self, pane: &Pane) {

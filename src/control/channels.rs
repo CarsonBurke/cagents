@@ -124,7 +124,7 @@ pub(super) fn move_pane(
     let operation = uuid::Uuid::new_v4();
     let mut pane_id: Option<CardId> = None;
     for attempt in 0..3 {
-        let model = client.read_workspace_model().map_err(protocol_error)?;
+        let model = client.read_workspace_model().map_err(placement_error)?;
         let (view, pane) = match find_pane(
             &model,
             pane_id
@@ -167,7 +167,7 @@ pub(super) fn move_pane(
                 code: ProtocolErrorCode::ViewConflict,
                 ..
             }) if attempt < 2 => continue,
-            result => result.map_err(protocol_error)?,
+            result => result.map_err(placement_error)?,
         };
         let pane = result
             .views
@@ -180,9 +180,26 @@ pub(super) fn move_pane(
                     "The daemon did not confirm the requested pane placement",
                 )
             })?;
-        return placed_output(&result, pane, to, false);
+        let channel = placed_channel(&result, to)?;
+        let human = format!(
+            "{}\t{}\t{}\t{}",
+            pane.id,
+            to,
+            channel.repository.display(),
+            channel.title
+        );
+        return placed_output(&result, pane, to, false, human);
     }
     unreachable!("the final revision conflict is returned")
+}
+
+fn placed_channel(model: &WorkspaceModel, to: ChannelId) -> Result<&ModelChannel, AppError> {
+    model.channel(to).ok_or_else(|| {
+        AppError::new(
+            "protocol",
+            "The daemon did not return the destination channel",
+        )
+    })
 }
 
 fn placed_output(
@@ -190,30 +207,39 @@ fn placed_output(
     pane: &Pane,
     to: ChannelId,
     attached: bool,
+    human: String,
 ) -> Result<CommandOutput, AppError> {
-    let channel = model.channel(to).ok_or_else(|| {
-        AppError::new(
-            "protocol",
-            "The daemon did not return the destination channel",
-        )
-    })?;
     Ok(CommandOutput {
         command: "channel.move",
         data: json!({
             "pane": pane,
             "placement": Scope::Channel(to),
-            "channel": channel,
+            "channel": placed_channel(model, to)?,
             "sequence": model.sequence,
             "attached": attached,
         }),
-        human: format!(
-            "{}\t{}\t{}\t{}",
-            pane.id,
-            to,
-            channel.repository.display(),
-            channel.title
-        ),
+        human,
     })
+}
+
+/// A hosted session cannot place panes, whatever is running in it: the daemon
+/// cannot tell a person at an in-app shell from an agent. Say where this works.
+fn placement_error(error: ControlError) -> AppError {
+    let denied = matches!(
+        error,
+        ControlError::Remote {
+            code: ProtocolErrorCode::PermissionDenied,
+            ..
+        }
+    );
+    let mut error = protocol_error(error);
+    if denied {
+        error.message = "A session running inside cagents, including a shell in this app, can't \
+            place panes. Run this from a terminal outside cagents, or reopen the conversation \
+            with Resume conversation in the app."
+            .to_owned();
+    }
+    error
 }
 
 fn holder(model: &WorkspaceModel, session: TerminalId) -> Option<(&View, &Pane)> {
@@ -240,12 +266,14 @@ fn attach_session(
     let Ok(id) = target.trim().parse::<TerminalId>() else {
         return Err(unmatched);
     };
+    // A connection that got this far acts for the user: the daemon refuses this
+    // read on one authenticated for a session.
     let Reply::Directory(directory) = client
         .agent(
-            Authority::from_environment(),
+            Authority::default(),
             Operation::Directory(DirectoryScope::All),
         )
-        .map_err(protocol_error)?
+        .map_err(placement_error)?
     else {
         return Err(AppError::new(
             "protocol",
@@ -266,7 +294,7 @@ fn attach_session(
     if entry.delegation.is_some() {
         return Err(AppError::new(
             "invalid_target",
-            "This session belongs to a managed agent, and the daemon places its pane",
+            "This session belongs to an agent. Move it with the agent's name or ID, as listed by `cagents sessions`.",
         ));
     }
     let pane = Pane {
@@ -282,15 +310,28 @@ fn attach_session(
     let destination = Scope::Channel(to);
     let operation = uuid::Uuid::new_v4();
     for attempt in 0..3 {
-        let model = client.read_workspace_model().map_err(protocol_error)?;
+        let model = client.read_workspace_model().map_err(placement_error)?;
         let channel = model
             .channel(to)
             .ok_or_else(|| AppError::new("not_found", format!("Channel {to} is no longer open")))?;
-        if entry.project.as_deref() != Some(channel.repository.as_path()) {
-            return Err(AppError::new(
-                "invalid_target",
-                "This session's directory is not in the destination channel's project",
-            ));
+        match entry.project.as_deref() {
+            Some(project) if project == channel.repository => {}
+            Some(_) => {
+                return Err(AppError::new(
+                    "invalid_target",
+                    format!(
+                        "This session belongs to {}; choose a channel in that project",
+                        entry.project_name.as_deref().unwrap_or("another project")
+                    ),
+                ));
+            }
+            None => {
+                return Err(AppError::new(
+                    "invalid_target",
+                    "This session's directory is not in an open project. Open the project with \
+                     `cagents project open`, then try again.",
+                ));
+            }
         }
         if holder(&model, id).is_some() {
             return Err(placed_meanwhile());
@@ -314,13 +355,22 @@ fn attach_session(
                 code: ProtocolErrorCode::ViewConflict,
                 ..
             }) if attempt < 2 => continue,
-            result => result.map_err(protocol_error)?,
+            result => result.map_err(placement_error)?,
         };
         // Inserting a session another client placed first changes nothing and
         // still succeeds, so success alone does not mean this pane landed.
         return match holder(&result, id) {
             Some((view, placed)) if view.scope == destination => {
-                placed_output(&result, placed, to, true)
+                let channel = placed_channel(&result, to)?;
+                let title = match channel.title.as_str() {
+                    "" => "Untitled channel",
+                    title => title,
+                };
+                let human = format!(
+                    "Attached session {id} to channel \"{title}\" in {}. Open that channel to see it.",
+                    entry.project_name.as_deref().unwrap_or("its project"),
+                );
+                placed_output(&result, placed, to, true, human)
             }
             Some(_) => Err(placed_meanwhile()),
             None => Err(AppError::new(
@@ -335,7 +385,7 @@ fn attach_session(
 fn placed_meanwhile() -> AppError {
     AppError::new(
         "conflict",
-        "Another client placed this session while attaching it; run the command again to move it",
+        "Another window placed this session while it was being attached. Run the command again to move it here.",
     )
 }
 
@@ -357,7 +407,7 @@ fn hosted_kind(client: &mut ControlClient, entry: &Entry) -> Result<CardKind, Ap
         Surface::Chat => {
             let session = client
                 .list_chats()
-                .map_err(protocol_error)?
+                .map_err(placement_error)?
                 .into_iter()
                 .find(|session| session.id == entry.id);
             let proof = session.as_ref().and_then(|session| session.proof.clone());
@@ -366,7 +416,7 @@ fn hosted_kind(client: &mut ControlClient, entry: &Entry) -> Result<CardKind, Ap
         Surface::Terminal => {
             let session = client
                 .list()
-                .map_err(protocol_error)?
+                .map_err(placement_error)?
                 .into_iter()
                 .find(|descriptor| descriptor.session.id == entry.id)
                 .map(|descriptor| descriptor.session);
@@ -385,7 +435,10 @@ fn hosted_kind(client: &mut ControlClient, entry: &Entry) -> Result<CardKind, Ap
     if proof.as_ref() != Some(client.proof()) {
         return Err(AppError::new(
             "invalid_target",
-            format!("Session {} is not hosted by this daemon", entry.id),
+            format!(
+                "Session {} belongs to an earlier daemon run and can't be attached. Reopen it with Resume conversation in the app.",
+                entry.id
+            ),
         ));
     }
     Ok(kind)
@@ -1079,7 +1132,13 @@ mod tests {
         assert_eq!(output.data["placement"], json!(Scope::Channel(to)));
         assert_eq!(
             output.human,
-            format!("{}\t{to}\t/repo\tchannel", expected.id)
+            format!(
+                "Attached session {} to channel \"channel\" in repo. Open that channel to see it.",
+                match &expected.kind {
+                    CardKind::Chat(session) => session.id,
+                    _ => unreachable!(),
+                }
+            )
         );
     }
 
@@ -1260,5 +1319,68 @@ mod tests {
         assert!(error.message.contains("No shared pane matches"));
         drop(client);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn channel_move_succeeds_when_another_client_places_the_session_in_this_channel_first() {
+        let (model, _, to) = fixture();
+        let chat = unplaced_chat();
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let theirs = pane_for(&chat);
+        let answer = with_pane(model.clone(), Scope::Channel(to), theirs.clone());
+        let server = FakeDaemon {
+            models: vec![model],
+            sessions: vec![unplaced_entry(chat.id, directory::Surface::Chat)],
+            chats: vec![chat.clone()],
+            terminals: vec![],
+            edits: vec![Some(answer)],
+        }
+        .serve(server_stream);
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let output = move_pane(&mut client, &chat.id.to_string(), to).unwrap();
+        drop(client);
+        server.join().unwrap();
+        assert_eq!(
+            output.data["pane"],
+            serde_json::to_value(&theirs).unwrap(),
+            "the reported pane is the one the channel holds, not the one offered"
+        );
+    }
+
+    #[test]
+    fn channel_move_returns_the_third_straight_conflict_without_placing_anything() {
+        let (model, _, to) = fixture();
+        let chat = unplaced_chat();
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = FakeDaemon {
+            models: vec![model],
+            sessions: vec![unplaced_entry(chat.id, directory::Surface::Chat)],
+            chats: vec![chat.clone()],
+            terminals: vec![],
+            edits: vec![None, None, None],
+        }
+        .serve(server_stream);
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let error = move_pane(&mut client, &chat.id.to_string(), to)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, "protocol");
+        drop(client);
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_denied_placement_says_where_it_can_be_run() {
+        let error = placement_error(ControlError::Remote {
+            code: ProtocolErrorCode::PermissionDenied,
+            message: "An agent session's connection may only read terminals".into(),
+            retryable: false,
+        });
+        assert_eq!(error.kind, "protocol");
+        assert!(error.message.contains("terminal outside cagents"));
+        assert_eq!(
+            error.details.unwrap(),
+            json!({"code": ProtocolErrorCode::PermissionDenied, "retryable": false})
+        );
     }
 }

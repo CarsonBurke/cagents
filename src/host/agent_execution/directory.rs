@@ -231,7 +231,8 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let mut live = Vec::new();
     for (id, record) in &state.chats {
-        if record.handle.is_completed() {
+        // A reader of a saved transcript has no provider process to reach.
+        if record.handle.is_completed() || record.handle.is_read_only_history() {
             continue;
         }
         live.push(Live {

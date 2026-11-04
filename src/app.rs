@@ -17707,7 +17707,10 @@ impl Application for Cagents {
                 self.flush_document_tone()
             }
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
-            Message::ChatUi(action) => self.handle_chat_ui(action),
+            Message::ChatUi(action) => {
+                let handled = self.handle_chat_ui(action);
+                Task::batch([handled, self.reconcile_cleared_blocked_aliases()])
+            }
             Message::ResetSettings => {
                 if self.settings_reset_confirm {
                     return Task::none();
