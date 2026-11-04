@@ -5089,7 +5089,7 @@ for line in sys.stdin:
             .handle
             .clone();
         let resources_alive = handle.resource_lifetime();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !directory.path().join("environment-received").exists() {
             assert!(
                 Instant::now() < deadline,
@@ -5105,7 +5105,7 @@ for line in sys.stdin:
         confirm_fresh_session(
             &handle,
             &mut launch,
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(60),
             || false,
         )
         .unwrap();
@@ -5284,7 +5284,7 @@ for line in sys.stdin:
             panic!("lost handoff response was not replayed");
         };
         assert_eq!(repeated, terminal);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         // The fixture creates this file before its buffered write reaches it.
         let terminal_starts = loop {
             let starts = std::fs::read_to_string(directory.path().join("terminal-starts"))

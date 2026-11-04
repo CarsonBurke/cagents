@@ -2856,13 +2856,6 @@ mod tests {
 
     #[test]
     fn metadata_retirement_pressure_uses_normal_admission_and_idle_release_without_retry() {
-        // This fills the process-wide preparation budget, which would leave a
-        // concurrent test's preparation waiting.
-        if crate::repository_widget::retained_save_tests::isolated_test(
-            "app::chat_ui::preparation::tests::metadata_retirement_pressure_uses_normal_admission_and_idle_release_without_retry",
-        ) {
-            return;
-        }
         use iced::futures::StreamExt;
         for (growing, large_id) in [(false, false), (true, false), (false, true)] {
             let mut source = item(&if large_id {
