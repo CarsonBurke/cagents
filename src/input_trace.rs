@@ -452,14 +452,51 @@ impl Operation for RetainNativeFocus {
 /// Some native widgets skip outside-click handling after a sibling captures
 /// the pointer. Complete only that missing unfocus step, after the chosen
 /// widget has processed its own press. Never grant focus from hit testing.
+///
+/// Focusable bounds inside a scrollable are reported in its content
+/// coordinates, so the window point is translated by every enclosing scroll
+/// offset before it is compared with them.
 struct UnfocusOutside {
     point: Point,
+    /// The scroll translation of the content currently being traversed.
+    translation: Vector,
+    /// A scrollable reports its translation just before traversing its content.
+    entering: Vector,
     cleared: bool,
+}
+
+impl UnfocusOutside {
+    fn new(point: Point) -> Self {
+        Self {
+            point,
+            translation: Vector::ZERO,
+            entering: Vector::ZERO,
+            cleared: false,
+        }
+    }
 }
 
 impl Operation for UnfocusOutside {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        let outer = self.translation;
+        self.translation = outer + std::mem::take(&mut self.entering);
         operate(self);
+        self.translation = outer;
+    }
+
+    fn container(&mut self, _id: Option<&cosmic::iced::widget::Id>, _bounds: Rectangle) {
+        self.entering = Vector::ZERO;
+    }
+
+    fn scrollable(
+        &mut self,
+        _id: Option<&cosmic::iced::widget::Id>,
+        _bounds: Rectangle,
+        _content_bounds: Rectangle,
+        translation: Vector,
+        _state: &mut dyn cosmic::iced::advanced::widget::operation::Scrollable,
+    ) {
+        self.entering = translation;
     }
 
     fn focusable(
@@ -468,7 +505,8 @@ impl Operation for UnfocusOutside {
         bounds: Rectangle,
         state: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
     ) {
-        if state.is_focused() && !bounds.contains(self.point) {
+        self.entering = Vector::ZERO;
+        if state.is_focused() && !bounds.contains(self.point + self.translation) {
             state.unfocus();
             self.cleared = true;
         }
@@ -587,10 +625,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
         if self.focus_regions.is_some()
             && let Some(point) = pressed_position(event, cursor)
         {
-            let mut unfocus = UnfocusOutside {
-                point,
-                cleared: false,
-            };
+            let mut unfocus = UnfocusOutside::new(point);
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 layout,
@@ -797,10 +832,7 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
         if self.focus_regions.is_some()
             && let Some(point) = pressed_position(event, cursor)
         {
-            let mut unfocus = UnfocusOutside {
-                point,
-                cleared: false,
-            };
+            let mut unfocus = UnfocusOutside::new(point);
             self.content
                 .as_overlay_mut()
                 .operate(layout, renderer, &mut unfocus);
@@ -1579,6 +1611,153 @@ mod tests {
             query.region(&[(editor, FocusedPane::Editor.into())]).pane,
             FocusedPane::Editor
         );
+    }
+
+    #[test]
+    fn outside_click_unfocus_compares_scrolled_fields_in_their_content_coordinates() {
+        use cosmic::iced::advanced::{clipboard, widget::operation};
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+
+        #[derive(Clone, Debug)]
+        enum Probe {
+            Input,
+            Key,
+        }
+        type Ui<'a> = UserInterface<'a, Probe, Theme, Renderer>;
+        /// The focused field's ID, or its bounds when `of` names a field.
+        struct Fields<'a> {
+            of: Option<&'a cosmic::iced::widget::Id>,
+            focused: Option<cosmic::iced::widget::Id>,
+            bounds: Option<Rectangle>,
+        }
+        impl Operation for Fields<'_> {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&cosmic::iced::widget::Id>,
+                bounds: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.focused = id.cloned();
+                }
+                if id.is_some() && id == self.of {
+                    self.bounds = Some(bounds);
+                }
+            }
+        }
+        fn query<'a>(
+            ui: &mut Ui<'_>,
+            renderer: &Renderer,
+            of: Option<&'a cosmic::iced::widget::Id>,
+        ) -> Fields<'a> {
+            let mut fields = Fields {
+                of,
+                focused: None,
+                bounds: None,
+            };
+            ui.operate(renderer, &mut fields);
+            fields
+        }
+        fn click(ui: &mut Ui<'_>, renderer: &mut Renderer, point: Point) {
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[
+                    Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(point),
+                renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+        }
+
+        // A field 300px down a 100px-high list, and a field above the list
+        // whose window and content coordinates coincide.
+        for scrolled in [true, false] {
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let trace = InputTrace::default();
+            let list = cosmic::iced::widget::Id::new("trace.scroll.list");
+            let deep = cosmic::iced::widget::Id::new("trace.scroll.deep");
+            let top = cosmic::iced::widget::Id::new("trace.scroll.top");
+            let gap = || -> Element<'static, Probe> {
+                cosmic::widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(300.0))
+                    .into()
+            };
+            let element = observe_keyboard_events(
+                cosmic::widget::column::with_children(vec![
+                    cosmic::widget::text_input("Top", "")
+                        .id(top.clone())
+                        .on_input(|_| Probe::Input)
+                        .width(Length::Fixed(200.0))
+                        .into(),
+                    cosmic::iced::widget::scrollable(cosmic::widget::column::with_children(vec![
+                        gap(),
+                        cosmic::widget::text_input("Deep", "")
+                            .id(deep.clone())
+                            .on_input(|_| Probe::Input)
+                            .width(Length::Fixed(200.0))
+                            .into(),
+                        gap(),
+                    ]))
+                    .id(list.clone())
+                    .height(Length::Fixed(100.0))
+                    .into(),
+                ]),
+                &trace,
+                Vec::new(),
+                |_, _, _, _| Probe::Key,
+            );
+            let mut ui = UserInterface::build(
+                element,
+                Size::new(400.0, 400.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            let (target, point) = if scrolled {
+                let bounds = query(&mut ui, &renderer, Some(&deep))
+                    .bounds
+                    .expect("deep field is laid out");
+                ui.operate(
+                    &renderer,
+                    &mut operation::scrollable::scroll_to(
+                        list.clone(),
+                        operation::scrollable::AbsoluteOffset {
+                            x: None,
+                            y: Some(280.0),
+                        },
+                    ),
+                );
+                // Content bounds less the scroll offset: where it is drawn.
+                (
+                    &deep,
+                    Point::new(bounds.x + 20.0, bounds.center_y() - 280.0),
+                )
+            } else {
+                let bounds = query(&mut ui, &renderer, Some(&top))
+                    .bounds
+                    .expect("top field is laid out");
+                (&top, Point::new(bounds.x + 20.0, bounds.center_y()))
+            };
+            click(&mut ui, &mut renderer, point);
+            assert_eq!(
+                query(&mut ui, &renderer, None).focused.as_ref(),
+                Some(target),
+                "scrolled={scrolled}: a clicked field keeps the focus it just took"
+            );
+            click(&mut ui, &mut renderer, Point::new(390.0, 390.0));
+            assert_eq!(
+                query(&mut ui, &renderer, None).focused,
+                None,
+                "scrolled={scrolled}: a click outside every field still clears focus"
+            );
+        }
     }
 
     #[test]
