@@ -679,7 +679,7 @@ impl<'a, Message: 'a + Clone> Widget<Message, crate::Theme, crate::Renderer>
             y,
             width,
             height,
-        } = layout.bounds();
+        } = layout.bounds() - layout.virtual_offset();
         let bounds = Rect::new(x as f64, y as f64, (x + width) as f64, (y + height) as f64);
         let is_hovered = state.state.downcast_ref::<State>().is_hovered;
 

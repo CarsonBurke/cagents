@@ -3,6 +3,7 @@ pub(crate) use account_lifecycle::Reservation as AccountReservation;
 mod activity;
 mod agent_execution;
 mod automations;
+mod channel_work;
 mod chat;
 mod client;
 mod delivery;
@@ -285,6 +286,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     let _agent_activity = activity::Monitor::start(&host)?;
     let listener = listener_before_restore(&paths, || {
         let restored = (|| -> io::Result<()> {
+            chat::retained_actor::reconcile_previous_boot_history(&host)
+                .map_err(io::Error::other)?;
             let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
             state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
             if let Some(detail) = host

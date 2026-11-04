@@ -18,7 +18,11 @@ const LEGACY_NAME: &str = "cagents-agents";
 /// unedited, so it is upgraded in place; anything else is user content and is
 /// never replaced. Append only: when `SKILL.md` changes, a test fails until its
 /// new hash is appended, which keeps every earlier revision upgradable.
-const BUNDLED: &[&str] = &["246f4a5f0a2d614ccf3ff204a967bcacf99cac23d257ceed87a2d994802b12a4"];
+const BUNDLED: &[&str] = &[
+    "246f4a5f0a2d614ccf3ff204a967bcacf99cac23d257ceed87a2d994802b12a4",
+    "91ef5d665ff6c64fef61cb960a70b6432f3e5aeec91de41ea20b5fc9f81add53",
+    "da0498ddc44bae2ae3ea33e0dc7f8965c4289cb555accfce353461c3f221b75a",
+];
 
 /// Recognized copies of the retired cagents-agents skill, used only for cleanup.
 const LEGACY_BUNDLED: &[&str] = &[
@@ -184,8 +188,12 @@ fn retire_bundle(root: &Path, name: &str, hashes: &[&str]) -> io::Result<()> {
     let destination = skill.join("SKILL.md");
     let (content, metadata) = match read_regular(&destination, libc::O_NOFOLLOW) {
         Ok(value) => value,
-        Err(error) if error.raw_os_error() == Some(libc::ELOOP)
-            || error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error)
+            if error.raw_os_error() == Some(libc::ELOOP)
+                || error.kind() == io::ErrorKind::AlreadyExists =>
+        {
+            return Ok(());
+        }
         Err(error) => return Err(error),
     };
     if metadata.nlink() != 1 || !hashes.contains(&sha256(&content).as_str()) {
@@ -201,8 +209,23 @@ fn retire_bundle(root: &Path, name: &str, hashes: &[&str]) -> io::Result<()> {
             != (directory_metadata.dev(), directory_metadata.ino())
         || !current.is_file()
         || current.nlink() != 1
-        || (current.dev(), current.ino(), current.len(), current.mtime(), current.mtime_nsec(), current.ctime(), current.ctime_nsec())
-            != (metadata.dev(), metadata.ino(), metadata.len(), metadata.mtime(), metadata.mtime_nsec(), metadata.ctime(), metadata.ctime_nsec())
+        || (
+            current.dev(),
+            current.ino(),
+            current.len(),
+            current.mtime(),
+            current.mtime_nsec(),
+            current.ctime(),
+            current.ctime_nsec(),
+        ) != (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
     {
         return Err(preserved("changed during retirement"));
     }
@@ -482,20 +505,32 @@ mod tests {
             share_managed_skills(&root, &system).unwrap();
             assert!(!root.join("skills").exists());
             match previous {
-                "missing" => {},
+                "missing" => {}
                 "empty" => fs::create_dir(root.join("skills")).unwrap(),
-                "legacy" => { legacy(&root); },
+                "legacy" => {
+                    legacy(&root);
+                }
                 "current" => install_at(&root, false).unwrap(),
-                "both" => { install_at(&root, false).unwrap(); legacy(&root); },
+                "both" => {
+                    install_at(&root, false).unwrap();
+                    legacy(&root);
+                }
                 _ => unreachable!(),
             }
             let personal = system.join("skills/cagents/SKILL.md");
             fs::create_dir_all(personal.parent().unwrap()).unwrap();
             fs::write(&personal, b"personal revision one").unwrap();
             share_managed_skills(&root, &system).unwrap();
-            assert_eq!(fs::read_link(root.join("skills")).unwrap(), system.join("skills"), "{previous}");
+            assert_eq!(
+                fs::read_link(root.join("skills")).unwrap(),
+                system.join("skills"),
+                "{previous}"
+            );
             fs::write(&personal, b"personal revision two").unwrap();
-            assert_eq!(fs::read(installed(&root)).unwrap(), b"personal revision two");
+            assert_eq!(
+                fs::read(installed(&root)).unwrap(),
+                b"personal revision two"
+            );
             share_managed_skills(&root, &system).unwrap();
         }
     }
@@ -509,12 +544,22 @@ mod tests {
         fs::create_dir_all(system.join("skills")).unwrap();
         share_managed_skills(&root, &system).unwrap();
         assert!(fs::read_link(root.join("skills")).unwrap().is_absolute());
-        assert_eq!(root.join("skills").canonicalize().unwrap(), system.join("skills").canonicalize().unwrap());
+        assert_eq!(
+            root.join("skills").canonicalize().unwrap(),
+            system.join("skills").canonicalize().unwrap()
+        );
     }
 
     #[test]
     fn managed_skill_sharing_preserves_current_edits_resources_and_existing_links() {
-        for case in ["edited", "resources", "hard-link", "skill-link", "skills-link", "dangling-link"] {
+        for case in [
+            "edited",
+            "resources",
+            "hard-link",
+            "skill-link",
+            "skills-link",
+            "dangling-link",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().join("account");
             let system = directory.path().join("system");
@@ -523,13 +568,17 @@ mod tests {
             let path = installed(&root);
             let outside = directory.path().join("outside");
             if case == "skills-link" || case == "dangling-link" {
-                if case == "skills-link" { fs::create_dir(&outside).unwrap(); }
+                if case == "skills-link" {
+                    fs::create_dir(&outside).unwrap();
+                }
                 std::os::unix::fs::symlink(&outside, root.join("skills")).unwrap();
             } else {
                 install_at(&root, false).unwrap();
                 match case {
                     "edited" => fs::write(&path, b"account edit").unwrap(),
-                    "resources" => fs::write(path.parent().unwrap().join("notes.md"), b"keep").unwrap(),
+                    "resources" => {
+                        fs::write(path.parent().unwrap().join("notes.md"), b"keep").unwrap()
+                    }
                     "hard-link" => fs::hard_link(&path, &outside).unwrap(),
                     "skill-link" => {
                         fs::rename(&path, &outside).unwrap();
@@ -542,8 +591,15 @@ mod tests {
             if case == "skills-link" || case == "dangling-link" {
                 assert_eq!(fs::read_link(root.join("skills")).unwrap(), outside);
             } else {
-                assert!(fs::symlink_metadata(root.join("skills")).unwrap().is_dir(), "{case}");
-                let expected = if case == "edited" { b"account edit".as_slice() } else { CONTENT.as_bytes() };
+                assert!(
+                    fs::symlink_metadata(root.join("skills")).unwrap().is_dir(),
+                    "{case}"
+                );
+                let expected = if case == "edited" {
+                    b"account edit".as_slice()
+                } else {
+                    CONTENT.as_bytes()
+                };
                 assert_eq!(fs::read(&path).unwrap(), expected, "{case}");
             }
         }
@@ -558,10 +614,17 @@ mod tests {
         share_managed_skills(&root, &system).unwrap();
         assert!(!root.exists());
         fs::create_dir_all(root.join("skills/custom")).unwrap();
-        fs::write(root.join("skills/custom/SKILL.md"), b"personal account skill").unwrap();
+        fs::write(
+            root.join("skills/custom/SKILL.md"),
+            b"personal account skill",
+        )
+        .unwrap();
         share_managed_skills(&root, &system).unwrap();
         assert!(fs::symlink_metadata(root.join("skills")).unwrap().is_dir());
-        assert_eq!(fs::read(root.join("skills/custom/SKILL.md")).unwrap(), b"personal account skill");
+        assert_eq!(
+            fs::read(root.join("skills/custom/SKILL.md")).unwrap(),
+            b"personal account skill"
+        );
     }
 
     #[test]
@@ -570,7 +633,10 @@ mod tests {
         let path = legacy(directory.path());
         install_at(directory.path(), false).unwrap();
         assert!(!path.parent().unwrap().exists());
-        assert_eq!(fs::read(installed(directory.path())).unwrap(), CONTENT.as_bytes());
+        assert_eq!(
+            fs::read(installed(directory.path())).unwrap(),
+            CONTENT.as_bytes()
+        );
         install_at(directory.path(), false).unwrap();
     }
 
@@ -588,7 +654,14 @@ mod tests {
 
     #[test]
     fn legacy_edits_links_and_extra_resources_are_preserved() {
-        for case in ["edited", "file-link", "directory-link", "hard-link", "resources", "fifo"] {
+        for case in [
+            "edited",
+            "file-link",
+            "directory-link",
+            "hard-link",
+            "resources",
+            "fifo",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let path = legacy(directory.path());
             let outside = directory.path().join("outside");
@@ -616,7 +689,11 @@ mod tests {
             install_at(directory.path(), false).unwrap();
             assert!(fs::symlink_metadata(&path).is_ok(), "{case}");
             if case != "fifo" {
-                let expected = if case == "edited" { b"personal legacy skill".as_slice() } else { LEGACY };
+                let expected = if case == "edited" {
+                    b"personal legacy skill".as_slice()
+                } else {
+                    LEGACY
+                };
                 assert_eq!(fs::read(&path).unwrap(), expected, "{case}");
             }
         }

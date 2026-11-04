@@ -700,12 +700,23 @@ pub(super) fn preflight_retirement(
 }
 
 fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
-    host.lock()
-        .unwrap_or_else(|p| p.into_inner())
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    // A holder or waiter keeps its Arc alive, so pruning cannot split an
+    // active agent's serialization. Failed and repeated closes need no
+    // special cleanup, and unused entries survive only until the next lookup.
+    state
         .execution_gates
-        .entry(id)
-        .or_default()
-        .clone()
+        .retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = state
+        .execution_gates
+        .get(&id)
+        .and_then(std::sync::Weak::upgrade)
+    {
+        return gate;
+    }
+    let gate = Arc::new(Mutex::new(()));
+    state.execution_gates.insert(id, Arc::downgrade(&gate));
+    gate
 }
 
 fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent, String> {
@@ -822,11 +833,22 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         .execution_startups
         .remove(&id);
     announce(host, &registry);
-    host.lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .execution_gates
-        .remove(&id);
     Ok(result)
+}
+
+/// Preserve typed mailbox backpressure at the service boundary. Existing
+/// operations retain their original validation and String-returning API.
+pub(super) fn process_request(
+    host: &SharedHost,
+    authority: Authority,
+    operation: crate::agent_execution::Operation,
+) -> Result<crate::agent_execution::Reply, crate::agent_execution::AcceptanceError> {
+    match operation {
+        crate::agent_execution::Operation::SendMessage(outgoing) => {
+            mailbox::send(host, &authority, outgoing).map(crate::agent_execution::Reply::Sent)
+        }
+        other => process(host, authority, other).map_err(Into::into),
+    }
 }
 
 pub(super) fn process(
@@ -884,9 +906,9 @@ pub(super) fn process(
         Operation::Control { agent, command } => {
             control(host, &authority, agent, command).map(Reply::Requests)
         }
-        Operation::SendMessage(outgoing) => {
-            mailbox::send(host, &authority, outgoing).map(Reply::Sent)
-        }
+        Operation::SendMessage(outgoing) => mailbox::send(host, &authority, outgoing)
+            .map(Reply::Sent)
+            .map_err(|error| error.to_string()),
         Operation::Inbox(query) => mailbox::inbox(host, &authority, query).map(Reply::Inbox),
         Operation::PeekInbox(query) => mailbox::peek(host, &authority, query).map(Reply::Inbox),
         Operation::AcknowledgeInbox(receipt) => {

@@ -86,6 +86,26 @@ pub struct NavigationOrder {
     pub items: Vec<NavigationItem>,
 }
 
+/// Complete a saved mixed order using the same placement as the sidebar:
+/// newly discovered channels precede saved destinations; new worktrees follow.
+/// Existing destinations retain their relative order before an explicit move.
+pub fn merge_navigation_fallback(items: &mut Vec<NavigationItem>, fallback: &[NavigationItem]) {
+    let mut known = std::collections::HashSet::new();
+    items.retain(|item| known.insert(item.clone()));
+    let mut channels = Vec::new();
+    let mut worktrees = Vec::new();
+    for item in fallback {
+        if known.insert(item.clone()) {
+            match item {
+                NavigationItem::Channel(_) => channels.push(item.clone()),
+                NavigationItem::Worktree(_) => worktrees.push(item.clone()),
+            }
+        }
+    }
+    items.splice(0..0, channels);
+    items.extend(worktrees);
+}
+
 pub fn reorder_navigation(
     items: &mut Vec<NavigationItem>,
     source: &NavigationItem,
@@ -253,11 +273,7 @@ impl WorkspaceModel {
                         self.navigation_orders.len() - 1
                     });
                 let items = &mut self.navigation_orders[index].items;
-                for item in fallback {
-                    if !items.contains(item) {
-                        items.push(item.clone());
-                    }
-                }
+                merge_navigation_fallback(items, fallback);
                 reorder_navigation(items, source, before.as_ref());
             }
             ModelEdit::RetitleChannel { id, title } => {
@@ -298,6 +314,9 @@ impl WorkspaceModel {
                     channel.title_source = *source;
                 }
             }
+            // Requires canonical work and pane evidence; an optimistic client
+            // cannot infer whether retirement was accepted.
+            ModelEdit::RetireEmptyChannel { .. } | ModelEdit::ChannelWorkChanged { .. } => {}
             ModelEdit::DeleteChannel { id } => {
                 self.channels.retain(|channel| channel.id != *id);
             }
@@ -382,6 +401,12 @@ pub enum ModelEdit {
         expected_revision: u64,
         title: String,
         source: crate::model::ChannelTitleSource,
+    },
+    /// Daemon-only invalidation after a committed channel-work transaction.
+    ChannelWorkChanged { home: crate::channel_work::Home },
+    RetireEmptyChannel {
+        home: crate::channel_work::Home,
+        expected_view_revision: u64,
     },
 }
 
@@ -468,7 +493,9 @@ impl ModelEdit {
             | Self::SuggestChannelTitle { .. }
             | Self::SuggestConversationTitle { .. }
             | Self::DeleteChannel { .. }
-            | Self::AgentsChanged) => edit,
+            | Self::AgentsChanged
+            | Self::ChannelWorkChanged { .. }
+            | Self::RetireEmptyChannel { .. }) => edit,
         })
     }
 }
@@ -528,6 +555,38 @@ mod tests {
     use crate::model::ChannelTitleSource;
 
     #[test]
+    fn navigation_folding_keeps_missing_channels_above_the_saved_mixed_order() {
+        let repository = PathBuf::from("/repo/.git");
+        let worktree = NavigationItem::Worktree("/repo".into());
+        let old = NavigationItem::Channel(ChannelId::new());
+        let first = NavigationItem::Channel(ChannelId::new());
+        let newest = NavigationItem::Channel(ChannelId::new());
+        let added_worktree = NavigationItem::Worktree("/repo/.worktrees/new".into());
+        let mut model = WorkspaceModel::default();
+        model.navigation_orders.push(NavigationOrder {
+            repository: repository.clone(),
+            items: vec![worktree.clone(), old.clone()],
+        });
+        let visible = vec![
+            newest.clone(),
+            first.clone(),
+            worktree.clone(),
+            old.clone(),
+            added_worktree,
+        ];
+        model.fold(
+            1,
+            &ModelEdit::ReorderNavigation {
+                repository,
+                source: worktree,
+                before: Some(old),
+                fallback: visible.clone(),
+            },
+        );
+        assert_eq!(model.navigation_orders[0].items, visible);
+    }
+
+    #[test]
     fn conversation_title_proof_roundtrips_without_changing_existing_edit_prefix() {
         let old = ModelEdit::SuggestChannelTitle {
             id: ChannelId::new(),
@@ -545,6 +604,32 @@ mod tests {
         let bytes = postcard::to_allocvec(&edit).unwrap();
         assert_eq!(bytes[0], 12);
         assert_eq!(postcard::from_bytes::<ModelEdit>(&bytes).unwrap(), edit);
+    }
+
+    #[test]
+    fn channel_work_edits_preserve_captured_home_and_retirement_revision() {
+        let home = crate::channel_work::Home {
+            registry: Uuid::new_v4(),
+            channel: ChannelId::new(),
+            creation_ordinal: 73,
+        };
+        for (edit, tag) in [
+            (ModelEdit::ChannelWorkChanged { home }, 13),
+            (
+                ModelEdit::RetireEmptyChannel {
+                    home,
+                    expected_view_revision: u64::MAX,
+                },
+                14,
+            ),
+        ] {
+            let canonical = edit.clone().canonicalized().unwrap();
+            assert_eq!(canonical, edit);
+            assert_eq!(canonical.clone().canonicalized().unwrap(), edit);
+            let bytes = postcard::to_allocvec(&canonical).unwrap();
+            assert_eq!(bytes[0], tag);
+            assert_eq!(postcard::from_bytes::<ModelEdit>(&bytes).unwrap(), edit);
+        }
     }
 
     #[test]

@@ -6,8 +6,8 @@ PROGRAM=prepare-release-smoke-rootfs
 CACHE=${CAGENTS_RELEASE_SMOKE_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/cagents-release-smoke/ubuntu-24.04-amd64"}
 BASE_URL=https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.3-base-amd64.tar.gz
 BASE_SHA256=6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9
-CACHE_ID="cagents-release-smoke-v2 ubuntu-24.04.3 amd64 $BASE_SHA256"
-PROVISION_MARKER=.cagents-release-smoke-provisioned-v2
+CACHE_ID="cagents-release-smoke-v3 ubuntu-24.04.3 amd64 $BASE_SHA256"
+PROVISION_MARKER=.cagents-release-smoke-provisioned-v3
 fail() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
 while (($#)); do
     case $1 in
@@ -103,7 +103,7 @@ FAKEROOTDONTTRYCHOWN=1 /usr/bin/fakeroot-sysv -- /bin/sh -ec '
     test "$(stat -c %u:%g /tmp/ownership-probe)" = 0:50
 '
 apt-get -o Dir::Bin::dpkg=/usr/local/sbin/cagents-dpkg install --yes --no-install-recommends \
-    ca-certificates tzdata curl git libc6 libfontconfig1 libfreetype6 libgcc-s1 libstdc++6 \
+    ca-certificates tzdata curl git libsecret-tools libc6 libegl1 libfontconfig1 libfreetype6 libgcc-s1 libstdc++6 \
     libwayland-client0 libxkbcommon0 zlib1g xdg-utils jq fakeroot libfakeroot
 dpkg --compare-versions "$(dpkg-query -W -f='${Version}' git)" ge 2.36
 audit=$(dpkg --audit)

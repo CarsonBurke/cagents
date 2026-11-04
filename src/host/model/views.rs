@@ -497,6 +497,7 @@ pub(super) fn apply(
     register(transaction, scope)?;
     let mut view = read(transaction, scope)?;
     let mut changed = false;
+    let mut deferred_target = None;
     match edit {
         ModelEdit::SeedView { panes, closed, .. } => {
             // Migration is additive, including old independent windows. Closed
@@ -567,7 +568,9 @@ pub(super) fn apply(
                             .revision
                             .checked_add(1)
                             .ok_or("view revision exhausted")?;
-                        write(transaction, &target)?;
+                        // Publish only after the source relinquishes its
+                        // active placement, inside this same transaction.
+                        deferred_target = Some(target);
                         transfer_agent(transaction, &pane, destination, &repository)?;
                         transaction
                             .execute(
@@ -673,6 +676,9 @@ pub(super) fn apply(
             .ok_or("view revision exhausted")?;
         write(transaction, &view)?;
     }
+    if let Some(target) = deferred_target {
+        write(transaction, &target)?;
+    }
     Ok(changed || !existed)
 }
 
@@ -755,6 +761,7 @@ pub(super) fn adopt_authenticated_agent_pane(
         return Ok(false);
     };
     let mut view = read(db, &scope)?;
+    let before = view.clone();
     if view.retired.contains(&id) || view.panes.iter().filter(|pane| pane.id == id).count() != 1 {
         return Ok(false);
     }
@@ -808,6 +815,7 @@ pub(super) fn adopt_authenticated_agent_pane(
         .revision
         .checked_add(1)
         .ok_or("view revision exhausted")?;
+    channel_work::placement::observe_view_transition(db, &before, &view)?;
     // Holder continuity does not start a new channel naming choice, including
     // learning a previously unobserved provider thread. Preserve all placement,
     // presentation, retirement and naming state outside the descriptor itself.
@@ -823,7 +831,48 @@ pub(super) fn adopt_authenticated_agent_pane(
     Ok(true)
 }
 
+/// Record removal before foreign-key cascades erase canonical membership.
+/// Like normal view writes, this must participate in the deleting transaction.
+pub(super) fn retire_channel_placements(db: &Connection, channel: ChannelId) -> Result<(), String> {
+    retire_scope_placements(db, &Scope::Channel(channel))
+}
+
+pub(super) fn retire_project_placements(db: &Connection, repository: &Path) -> Result<(), String> {
+    if db.is_autocommit() {
+        return Err("Placement removal requires the canonical view transaction".into());
+    }
+    let repository = repository_key(repository)?;
+    let scopes = {
+        let mut statement = db
+            .prepare(
+                "SELECT s.scope FROM shared_view_scopes s
+             LEFT JOIN channels c ON c.id=s.channel
+             WHERE s.repository=?1 OR c.repository=?1",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([repository], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?
+    };
+    for raw in scopes {
+        let scope = parse_scope(&raw)?;
+        retire_scope_placements(db, &scope)?;
+    }
+    Ok(())
+}
+
+fn retire_scope_placements(db: &Connection, scope: &Scope) -> Result<(), String> {
+    let before = read(db, scope)?;
+    let mut after = before.clone();
+    after.panes.clear();
+    channel_work::placement::observe_view_transition(db, &before, &after)
+}
+
 fn write(db: &Connection, view: &View) -> Result<(), String> {
+    let before = read(db, &view.scope)?;
+    channel_work::placement::observe_view_transition(db, &before, view)?;
     if let Scope::Channel(id) = &view.scope {
         let primary = |view: &View| {
             view.panes.iter().find_map(|pane| match &pane.kind {
@@ -836,7 +885,7 @@ fn write(db: &Connection, view: &View) -> Result<(), String> {
                 _ => None,
             })
         };
-        if primary(&read(db, &view.scope)?) != primary(view) {
+        if primary(&before) != primary(view) {
             // A new primary conversation starts a new automatic naming choice.
             // Manual/legacy names describe the channel and survive all moves.
             db.execute(
@@ -844,6 +893,7 @@ fn write(db: &Connection, view: &View) -> Result<(), String> {
                 [id.to_string()],
             )
             .map_err(|error| error.to_string())?;
+            channel_work::renamed_in(db, *id)?;
         }
     }
     db.execute("INSERT INTO shared_views(scope, revision, panes, retired) VALUES (?1, ?2, ?3, ?4)
@@ -1075,6 +1125,97 @@ mod tests {
         Pane {
             kind: CardKind::Terminal(terminal),
             ..pane()
+        }
+    }
+
+    #[test]
+    fn primary_chat_change_keeps_work_home_title_in_the_canonical_transaction() {
+        for manual in [false, true] {
+            let (mut registry, _directory, _, _) = setup();
+            let channel = ChannelId::new();
+            // Default titles are manual/legacy names. This case must own a
+            // genuinely inferred channel before testing automatic clearing.
+            registry
+                .apply(&ModelEdit::CreateChannel {
+                    id: channel,
+                    repository: "/repo".into(),
+                    title: "Initial inferred title".into(),
+                    title_source: crate::model::ChannelTitleSource::Prompt,
+                })
+                .unwrap();
+            let mut original = live_source_pane();
+            let CardKind::Terminal(terminal) = original.kind else {
+                unreachable!()
+            };
+            original.kind = CardKind::Chat(crate::chat::Session {
+                id: terminal.id,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Codex,
+                    recipe: terminal.launch.clone(),
+                    session_id: Some("first-thread".into()),
+                },
+                proof: terminal.continuity.live_proof(),
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            });
+            seed(&mut registry, channel, vec![original.clone()]);
+            registry
+                .apply(&if manual {
+                    ModelEdit::RetitleChannel {
+                        id: channel,
+                        title: "User chosen".into(),
+                    }
+                } else {
+                    ModelEdit::SuggestChannelTitle {
+                        id: channel,
+                        title: "Provider chosen".into(),
+                        source: crate::model::ChannelTitleSource::Provider,
+                    }
+                })
+                .unwrap();
+            assert_eq!(
+                registry.model().unwrap().channel(channel).unwrap().title,
+                if manual {
+                    "User chosen"
+                } else {
+                    "Provider chosen"
+                },
+                "establish the naming source before replacing the primary thread"
+            );
+            let mut successor = original.clone();
+            let CardKind::Chat(chat) = &mut successor.kind else {
+                unreachable!()
+            };
+            chat.launch.session_id = Some("replacement-thread".into());
+            let update = edit(
+                &mut registry,
+                channel,
+                Change::Update {
+                    before: original,
+                    pane: successor,
+                },
+            );
+            registry.apply(&update).unwrap();
+            let model = registry.model().unwrap();
+            let canonical = model.channel(channel).unwrap();
+            assert_eq!(canonical.title, if manual { "User chosen" } else { "" });
+            let title: String = registry
+                .db
+                .query_row(
+                    "SELECT title FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
+                    params![channel.to_string(), canonical.ordinal],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                title, canonical.title,
+                "retained title follows the exact current canonical incarnation"
+            );
+            assert!(
+                channel_work::renamed_in(&registry.db, channel).is_err(),
+                "title synchronization cannot escape the canonical transaction"
+            );
         }
     }
 
@@ -2106,4 +2247,6 @@ mod tests {
             assert_eq!(replay.agent.placement, Scope::Channel(a));
         }
     }
+
+    include!("views/placement_tests.rs");
 }

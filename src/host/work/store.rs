@@ -185,10 +185,7 @@ impl Store {
         item: &str,
         column: Option<Column>,
     ) -> Result<(), String> {
-        let key = (
-            pins::repository.eq(bytes(repository)),
-            pins::item.eq(item),
-        );
+        let key = (pins::repository.eq(bytes(repository)), pins::item.eq(item));
         match column {
             Some(column) => diesel::insert_into(pins::table)
                 .values((key.0, key.1, pins::placement.eq(column.as_str())))
@@ -348,7 +345,10 @@ mod tests {
                     (repository.clone(), "branch:feature".to_owned()),
                     Column::InReview
                 ),
-                ((repository.clone(), "branch:other".to_owned()), Column::Stale),
+                (
+                    (repository.clone(), "branch:other".to_owned()),
+                    Column::Stale
+                ),
             ])
         );
         assert_eq!(
@@ -386,8 +386,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("work.sqlite3");
         drop(Store::open(&file).unwrap());
-        let mut connection =
-            SqliteConnection::establish(file.to_str().unwrap()).unwrap();
+        let mut connection = SqliteConnection::establish(file.to_str().unwrap()).unwrap();
         connection.batch_execute("PRAGMA user_version=2;").unwrap();
         drop(connection);
         assert!(

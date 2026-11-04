@@ -427,6 +427,31 @@ impl Cagents {
         }
     }
 
+    /// A reported title waiting for its deferred save is not published yet:
+    /// the pane keeps the title this window last shared for it, so neither an
+    /// edit nor a captured baseline carries the newer one before that save.
+    fn hold_reported_title(&self, scope: &Scope, pane: &mut Pane) {
+        if !self.reported_title_save.cards.contains(&pane.id) {
+            return;
+        }
+        // A pane moving to `scope` in this same save is still in its source's
+        // baseline; a move publishes no title, so hold that one too.
+        let in_scope = self.shared_views.baseline.get(scope).into_iter();
+        let elsewhere = self
+            .shared_views
+            .baseline
+            .iter()
+            .filter(|(other, _)| *other != scope)
+            .map(|(_, panes)| panes);
+        if let Some(shared) = in_scope
+            .chain(elsewhere)
+            .flatten()
+            .find(|shared| shared.id == pane.id)
+        {
+            pane.title.clone_from(&shared.title);
+        }
+    }
+
     fn local_view_panes(&self, scope: &Scope) -> Vec<Pane> {
         self.local_view_cards(scope)
             .into_iter()
@@ -442,6 +467,7 @@ impl Cagents {
                     self.durable.card_scopes.get(&id).cloned(),
                 )?;
                 pane.user_title = self.chrome_ui.user_titles.get(&id).cloned();
+                self.hold_reported_title(scope, &mut pane);
                 pane.pending_terminal_start = matches!(pane.kind, CardKind::Terminal(_))
                     && (self.durable.pending_terminal_creations.contains(&id)
                         || self
@@ -584,6 +610,7 @@ impl Cagents {
                     let mut pane =
                         Pane::from_card(cards.get(id)?, self.durable.card_scopes.get(id).cloned())?;
                     pane.user_title = self.chrome_ui.user_titles.get(id).cloned();
+                    self.hold_reported_title(scope, &mut pane);
                     pane.pending_terminal_start = matches!(pane.kind, CardKind::Terminal(_))
                         && (self.durable.pending_terminal_creations.contains(id)
                             || pending.contains(id));
@@ -1276,7 +1303,9 @@ impl Cagents {
         }
         self.shared_views.applying = false;
         // Adopt all canonical descriptors before an ordered migration checkpoint.
-        self.persist();
+        // Held reported titles stay held: publishing them on every view
+        // acknowledgment would publish each title again as its own echo.
+        self.save_workspace();
         if let Some(path) = self.shared_views.deferred_default.take() {
             if self.active_workspace.as_ref() == Some(&path) && self.workspace.cards().is_empty() {
                 tasks.push(self.add_default_pane(path, settings::DefaultPane::Terminal));
@@ -1587,6 +1616,9 @@ impl Cagents {
             }
             match &pane.user_title {
                 Some(title) => {
+                    // A user's name takes precedence over a reported title,
+                    // which must not be published back with it.
+                    self.reported_title_save.cards.remove(&pane.id);
                     self.chrome_ui.user_titles.insert(pane.id, title.clone());
                 }
                 None => {
@@ -1639,14 +1671,25 @@ impl Cagents {
                             (a, b) => a == b,
                         };
                         if !same_session {
+                            // A held title belongs to the replaced session.
+                            self.reported_title_save.cards.remove(&pane.id);
                             self.cards.remove(&pane.id);
                             self.lifecycle.remove(pane.id);
+                            // Card identity survives a session replacement, but
+                            // the previous actor's attention does not. This is
+                            // retirement, not evidence that its news was read.
+                            self.sidebar_state.forget_card_attention(pane.id);
                         }
                     }
                     let mut kind = pane.kind.clone();
                     preserve_observed_terminal_exit(&card, &mut kind);
+                    // A reported title waiting for its save is newer than the
+                    // shared one, which it replaces when that save publishes it.
+                    let reported = self.reported_title_save.cards.contains(&pane.id);
                     if let Some(current) = self.card_state_mut(pane.id) {
-                        current.title = pane.title.clone();
+                        if !reported {
+                            current.title = pane.title.clone();
+                        }
                         current.width_fraction = pane.width_fraction;
                         current.kind = kind;
                     }
@@ -1658,6 +1701,8 @@ impl Cagents {
                     let starting = matches!(&pane.kind, CardKind::Chat(session) if self.chat_start_matches(pane.id, session));
                     if !self.cards.contains_key(&pane.id) && !starting {
                         tasks.push(self.attach_shared_pane(pane));
+                    } else if let CardKind::Chat(session) = &pane.kind {
+                        tasks.push(self.adopt_shared_draft_session(pane.id, session));
                     }
                 }
                 _ => {
@@ -1883,9 +1928,16 @@ impl Cagents {
         }
         for (index, pane) in panes.iter().enumerate() {
             if self.workspace.card(pane.id).is_none() {
+                // A held reported title is newer than the shared one.
+                let held = self
+                    .reported_title_save
+                    .cards
+                    .contains(&pane.id)
+                    .then(|| self.card_state(pane.id).map(|card| card.title.as_str()))
+                    .flatten();
                 if let Ok(card) = WorkspaceCard::new(
                     pane.id,
-                    pane.user_title.as_deref().unwrap_or_else(|| {
+                    pane.user_title.as_deref().or(held).unwrap_or_else(|| {
                         browser_host::presentation_title(&pane.kind, &pane.title)
                     }),
                     CardWidth::Fraction(pane.width_fraction),
@@ -1899,15 +1951,18 @@ impl Cagents {
                     }
                 }
             } else {
-                let _ = self.workspace.rename_card(
-                    pane.id,
-                    pane.user_title
-                        .as_deref()
-                        .unwrap_or_else(|| {
-                            browser_host::presentation_title(&pane.kind, &pane.title)
-                        })
-                        .to_owned(),
-                );
+                // A held reported title is newer than the shared one.
+                if pane.user_title.is_some() || !self.reported_title_save.cards.contains(&pane.id) {
+                    let _ = self.workspace.rename_card(
+                        pane.id,
+                        pane.user_title
+                            .as_deref()
+                            .unwrap_or_else(|| {
+                                browser_host::presentation_title(&pane.kind, &pane.title)
+                            })
+                            .to_owned(),
+                    );
+                }
                 if self
                     .workspace
                     .card(pane.id)
@@ -2005,6 +2060,7 @@ fn same_attention_update_source(left: &CardKind, right: &CardKind) -> bool {
 #[cfg(test)]
 mod tests {
     mod history_start;
+    mod published_card_edits;
     mod startup_admission;
 
     use super::*;
@@ -4300,6 +4356,152 @@ mod tests {
         session
     }
 
+    /// A terminal's reported title is published with its deferred save, not
+    /// with each view acknowledgment. Until then a view edit from another
+    /// window, carrying the older shared title, must not take it back.
+    #[test]
+    fn a_reported_title_awaiting_its_save_survives_shared_view_edits() {
+        let (mut app, channel, _, _) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        drop(app.insert_terminal_card(attention_terminal_source(), None));
+        let card = app.workspace.focused().unwrap();
+        let shared = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        let mut view = View::empty(channel);
+        view.panes.push(shared.clone());
+        app.workspace_model.views = vec![view.clone()];
+        drop(app.reconcile_shared_views());
+        app.shared_views.pending.clear();
+        let publishes_title = |app: &Cagents| {
+            app.shared_views.pending.iter().any(|(_, scope, change)| {
+                *scope == Scope::Channel(channel)
+                    && matches!(change, Change::Update { pane, .. } if pane.id == card && pane.title == "build done")
+            })
+        };
+
+        assert!(app.apply_reported_title(card, "build done".into()));
+        drop(app.save_reported_titles_soon(card));
+        let mut wider = shared.clone();
+        wider.width_fraction = 0.75;
+        view.apply(&Change::Update {
+            before: shared,
+            pane: wider,
+        })
+        .unwrap();
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        let state = app.card_state(card).unwrap();
+        assert_eq!(state.title, "build done");
+        assert_eq!(
+            state.width_fraction, 0.75,
+            "the other window's edit applies"
+        );
+        assert_eq!(
+            app.workspace.card(card).unwrap().accessible_name,
+            "build done",
+            "the pane keeps its newer name"
+        );
+        assert!(
+            !publishes_title(&app),
+            "an acknowledgment does not publish it"
+        );
+        assert!(app.reported_title_save.cards.contains(&card));
+
+        drop(app.update(Message::ReportedTitleSaveDue));
+        assert!(publishes_title(&app), "its save publishes it");
+        assert!(app.reported_title_save.cards.is_empty());
+        assert_eq!(app.card_state(card).unwrap().title, "build done");
+    }
+
+    /// Every save other than reconciliation's own publishes held titles, so
+    /// exiting, which saves, never leaves one unpublished.
+    #[test]
+    fn a_save_publishes_held_reported_titles() {
+        let (mut app, channel, _, _) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        drop(app.insert_terminal_card(attention_terminal_source(), None));
+        let card = app.workspace.focused().unwrap();
+        let shared = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        let mut view = View::empty(channel);
+        view.panes.push(shared);
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        app.shared_views.pending.clear();
+
+        assert!(app.apply_reported_title(card, "build done".into()));
+        drop(app.save_reported_titles_soon(card));
+        app.persist();
+        assert!(app.reported_title_save.cards.is_empty());
+        assert!(app.shared_views.pending.iter().any(|(_, _, change)| {
+            matches!(change, Change::Update { pane, .. } if pane.id == card && pane.title == "build done")
+        }));
+    }
+
+    /// A name given in another window replaces a held reported title, which
+    /// must then not be published back over that window's rename.
+    #[test]
+    fn a_shared_rename_releases_a_held_reported_title() {
+        let (mut app, channel, _, _) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        drop(app.insert_terminal_card(attention_terminal_source(), None));
+        let card = app.workspace.focused().unwrap();
+        let shared = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        let mut view = View::empty(channel);
+        view.panes.push(shared.clone());
+        app.workspace_model.views = vec![view.clone()];
+        drop(app.reconcile_shared_views());
+        app.shared_views.pending.clear();
+
+        assert!(app.apply_reported_title(card, "build done".into()));
+        drop(app.save_reported_titles_soon(card));
+        let mut renamed = shared.clone();
+        renamed.user_title = Some("Release".into());
+        renamed.title = "Release".into();
+        view.apply(&Change::Update {
+            before: shared,
+            pane: renamed,
+        })
+        .unwrap();
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+
+        assert!(app.reported_title_save.cards.is_empty());
+        assert_eq!(app.card_state(card).unwrap().title, "Release");
+        assert_eq!(app.workspace.card(card).unwrap().accessible_name, "Release");
+        app.shared_views.pending.clear();
+        drop(app.update(Message::ReportedTitleSaveDue));
+        assert!(
+            !app.shared_views.pending.iter().any(|(_, _, change)| {
+                matches!(change, Change::Update { pane, .. } if pane.title == "build done")
+            }),
+            "the replaced reported title is not published"
+        );
+    }
+
+    /// A pane moving between views in the save that captures it is still in
+    /// its source's baseline. The move carries no title, so the held title
+    /// must not enter the destination's baseline unpublished.
+    #[test]
+    fn a_held_reported_title_stays_held_for_a_pane_moving_between_views() {
+        let (mut app, source, destination, mut pane) = fixture();
+        pane.title = "shared title".into();
+        app.shared_views
+            .baseline
+            .insert(Scope::Channel(source), vec![pane.clone()]);
+        let mut local = pane.clone();
+        local.title = "held title".into();
+        app.reported_title_save.cards.insert(pane.id);
+        app.hold_reported_title(&Scope::Channel(destination), &mut local);
+        assert_eq!(local.title, "shared title");
+
+        app.reported_title_save.cards.clear();
+        local.title = "held title".into();
+        app.hold_reported_title(&Scope::Channel(destination), &mut local);
+        assert_eq!(local.title, "held title", "a published title is not held");
+    }
+
     #[test]
     fn attention_passive_shared_removal_forgets_closed_unread_without_retaining_a_ghost() {
         let (mut app, channel, _, _) = fixture();
@@ -4387,6 +4589,142 @@ mod tests {
         drop(app.update_notifications(notification_ui::Action::Snapshot(snapshot)));
         assert!(!app.sidebar_state.has_card_update(card));
         assert!(!app.notification_ui.acknowledged_for_test(id));
+    }
+
+    #[test]
+    fn same_card_session_replacement_retires_old_attention_without_reading_its_notice() {
+        use crate::agent::{Activity, ActivityState, Provider};
+
+        let (mut app, channel, _, mut original) = fixture();
+        app.refresh_ui.focused = false;
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        let old_session = attention_terminal_source();
+        original.kind = CardKind::Terminal(old_session.clone());
+        let mut unrelated = original.clone();
+        unrelated.id = CardId::new();
+        unrelated.kind = CardKind::Terminal(attention_terminal_source());
+        let mut view = View::empty(channel);
+        view.panes = vec![original.clone(), unrelated.clone()];
+        app.workspace_model.views = vec![view.clone()];
+        drop(app.project_shared_view(&view, &HashSet::from([original.id, unrelated.id])));
+        assert!(app.terminal_start_in_flight(original.id));
+        assert!(matches!(
+            app.cards.get(&original.id),
+            Some(CardRuntime::Loading)
+        ));
+
+        let notice = uuid::Uuid::new_v4();
+        let snapshot = crate::notifications::Snapshot {
+            diagnostic: None,
+            notices: vec![crate::notifications::Notice {
+                id: notice,
+                delivered: true,
+                acknowledged: false,
+                window: None,
+                event: crate::notifications::Event {
+                    content: None,
+                    target: crate::notifications::Target::Session(old_session.id),
+                    source_session: Some(old_session.id),
+                    provider: Some(Provider::Codex),
+                    directory: Some(old_session.launch.working_directory.clone()),
+                    destination: None,
+                    evidence: crate::notifications::Evidence {
+                        key: "unseen-before-same-card-replacement".into(),
+                        kind: crate::notifications::Kind::Succeeded,
+                    },
+                },
+            }],
+        };
+        drop(app.update_notifications(notification_ui::Action::Snapshot(snapshot.clone())));
+        let waiting = Activity {
+            provider: Provider::Codex,
+            state: ActivityState::Waiting,
+        };
+        app.observe_agent_activity_for_card(original.id, Some(waiting));
+        app.observe_agent_update_for_card(unrelated.id);
+        assert_eq!(app.sidebar_state.card_activity(original.id), Some(waiting));
+        assert!(app.sidebar_state.has_card_update(original.id));
+        assert!(app.sidebar_state.has_card_update(unrelated.id));
+        app.shared_views.pending.clear();
+
+        // A genuine presentation-only view update must preserve the source's
+        // existing attention while the attachment task is still outstanding.
+        let mut metadata = original.clone();
+        metadata.title = "same terminal, renamed".into();
+        view.apply(&Change::Update {
+            before: original.clone(),
+            pane: metadata.clone(),
+        })
+        .unwrap();
+        app.workspace_model.views = vec![view.clone()];
+        drop(app.reconcile_shared_views());
+        assert_eq!(app.sidebar_state.card_activity(original.id), Some(waiting));
+        assert!(app.sidebar_state.has_card_update(original.id));
+
+        // The same pane ID may subsequently name an entirely new terminal.
+        // Its real Loading/error projection must not borrow its predecessor's
+        // activity or unread state, even before the new start can settle.
+        let replacement_session = attention_terminal_source();
+        assert_ne!(replacement_session.id, old_session.id);
+        let mut replacement = metadata.clone();
+        replacement.kind = CardKind::Terminal(replacement_session.clone());
+        view.apply(&Change::Update {
+            before: metadata,
+            pane: replacement.clone(),
+        })
+        .unwrap();
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        assert_eq!(app.card_state(original.id).unwrap().kind, replacement.kind);
+        assert!(matches!(
+            app.cards.get(&original.id),
+            Some(CardRuntime::Loading)
+        ));
+        assert!(app.terminal_start_in_flight(original.id));
+        assert_eq!(app.sidebar_state.card_activity(original.id), None);
+        assert!(!app.sidebar_state.has_card_update(original.id));
+        assert!(app.sidebar_state.has_card_update(unrelated.id));
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+        assert!(!app.notification_ui.snapshot.notices[0].acknowledged);
+
+        // Neither a delayed old attachment failure nor its still-unread
+        // journal snapshot can assign old-session news to the replacement.
+        drop(app.update(Message::TerminalStarted {
+            card: original.id,
+            terminal: old_session.id,
+            result: Err("old attachment failed after session replacement".into()),
+        }));
+        assert!(matches!(
+            app.cards.get(&original.id),
+            Some(CardRuntime::Loading)
+        ));
+        drop(app.update_notifications(notification_ui::Action::Snapshot(snapshot)));
+        assert_eq!(app.sidebar_state.card_activity(original.id), None);
+        assert!(!app.sidebar_state.has_card_update(original.id));
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+
+        // Fresh source observations remain usable. This invokes the App's
+        // observer contract; no fixture start task or real host is executed.
+        app.observe_agent_activity_for_card(original.id, Some(waiting));
+        assert_eq!(app.sidebar_state.card_activity(original.id), Some(waiting));
+        assert!(app.sidebar_state.has_card_update(original.id));
+        drop(app.update(Message::TerminalStarted {
+            card: original.id,
+            terminal: replacement_session.id,
+            result: Err("replacement attachment unavailable".into()),
+        }));
+        assert!(matches!(
+            app.cards.get(&original.id),
+            Some(CardRuntime::Failed(_))
+        ));
+        assert_eq!(app.sidebar_state.card_activity(original.id), None);
+        assert!(
+            app.sidebar_state.has_card_update(original.id),
+            "fresh unread is not read by a runtime failure"
+        );
+        assert!(app.sidebar_state.has_card_update(unrelated.id));
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
     }
 
     #[test]

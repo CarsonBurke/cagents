@@ -6,23 +6,26 @@ You are a senior app developer tasked with creating a great Agent Development En
 
 - Use Issues, worktrees and PRs to manage your work.
 - Do your work in PRs against `main`.
-- Oversee, sub review, and merge PRs as you see reasonable; and sync main.
+- The lead owns the complete user outcome through implementation, independent review, validation and merge. Give parallel workers explicit boundaries; review the assembled experience before calling it ready. A subtask passing tests does not establish that the feature works well.
+- For a change people interact with, state the user's task and intended before/after behavior in the PR. Follow the latest approved design and corrections across the affected flow; preserve necessary controls and information when simplifying it.
+- For interaction changes, ask an independent reviewer to assess the user experience as well as correctness. Give them the intended flow, actual native evidence and tested head, not just a diff. The reviewer reports concrete usability failures and missing evidence; the lead resolves usability blockers and the evidence gaps that prevent validating the changed flow before calling it ready or merging. A broken primary flow, lost essential controls or unexplained recurring stalls cannot be waived by listing a follow-up. Refresh the affected evidence and review when later edits change the flow; retain earlier evidence only where it still applies. Record nonblocking limitations separately, merge qualified work and sync main.
 
 ## Pull request screenshots
 
-- PRs that change something people see must include before and after screenshots in the PR description, shown side by side and labeled for the page or interaction state.
+- PRs that change something people see must include before and after screenshots in the PR description. Use only two side-by-side image columns, labeled Before and After; put the page or interaction-state description beneath each pair. Do not add a State, explanation, or other text column beside the images: it reduces their display size.
 - Capture each pair through the actual native app, using the development runner, with the same viewport, scale, theme, data, and interaction state. Identify the before revision and the tested after head. Capture the affected states, including expanded, empty, error, and narrow layouts when the change affects them.
 - Save images as WebP with descriptive names such as `before-channel-prs.webp` and `after-channel-prs.webp`. Check that they show the intended change and contain no secrets or private user content.
 - Keep screenshots off the product PR branch. Commit only the images under `pr-screenshots/` on a separate `<branch>-screenshots` branch, and embed immutable links in the description: `https://github.com/CarsonBurke/cagents/blob/<sha>/pr-screenshots/<name>.webp?raw=true`. Keep the screenshot branch so the images remain reachable.
-- Refresh the comparison when a later change alters the visible result. If a state could not be captured, say exactly what is missing; mockups or fixture screenshots must be labeled and do not establish actual native UI validation.
+- Refresh the comparison when a later change alters the visible result. If a state could not be captured, say exactly what is missing; mockups and component-rendered fixtures must be labeled and do not establish actual native UI validation. Fixtures loaded into the running native app can validate interaction; identify which provider or production behavior they do not exercise.
 
-## Development and product
+## Design for the person using the app
 
-- We use iced/cosmic for our UI. It can be very performant, scalable and maintainable when done right.
-- cosmic comes with a lot of priors in the form of widgets and theming. Some of this is useful but don't over rely on it. We will often want our own custom components with our own design language, especially for more complex UI and better UX.
-  - When working on UI, think like a skilled web/app designer.
-  - Think about UI/UX like linear, vscode, zed IDE, and Orca ADE.
-- Things need to be performant, scalable, and powerful. Think about how users will use the app and how to maximize their power with it, and ensure the app isn't holding them back; examples: can't run too many agents because it's laggy or ram hungry; or feature is missing that would otherwise improve their workflow.
+- Use iced/cosmic components and theming where they serve the interaction; build custom components where they do not. Start from what the user needs to understand or do, rather than exposing the backend's structure.
+- Give each view a clear primary action and visual hierarchy. Keep routine activity compact, disclose technical detail on demand, and make state, scope and recovery understandable. Internal prompts, skill instructions, transport identifiers and implementation notes are not user messages. Avoid duplicate navigation and contradictory-looking states.
+- Exercise the complete changed flow in the actual native app. Choose representative data and states: populated and empty, working and finished, errors or stale data where relevant, and narrow and wide layouts. Check keyboard focus, hover targets, scrolling and transitions, not only a static happy-path screenshot. Use fixtures when sufficient and label them; use a live provider only when the behavior requires one.
+- Judge responsiveness with realistic conversation length and concurrent agents. For changes to rendering, polling or data preparation, compare before/after frame stalls and resource use on the same workload. A spinner or hover freezing with unrelated updates is a product defect even when tests pass. Keep expensive work off the UI path.
+- The independent reviewer should ask: Can the user finish the intended task? Is important information visible at the right time? Do the labels and states make sense without implementation knowledge? What breaks during interaction or at realistic scale? Inspect the native evidence and exercise uncertain behavior; identify untested claims explicitly. Review effort should match the affected behavior, not expand into an unrelated redesign.
+- When review or user feedback exposes a pattern, check neighboring instances and fix the shared cause. Do not close the issue merely because the pictured instance changed; capture the applicable regression with a focused test or repeatable interaction, and link any bounded follow-up.
 
 ## Choose the cheapest correct build lane
 
@@ -59,6 +62,6 @@ You are a senior app developer tasked with creating a great Agent Development En
 - For UI changes, launch the actual native UI with the development runner and exercise the changed path. A successful compile alone is insufficient.
   - If you need live testing with an agent (fixture isn't sufficient) you must use the cheapest model, such as haiku/luna on low reasoning.
 - For browser or feature-boundary changes, verify both browserless and integrated lanes.
-- Use `cargo fmt --check` after Rust edits.
+- Use `scripts/check-format` after Rust edits. It checks Cargo roots and the Rust source trees hidden behind `include!` macros without rewriting files.
 
 The full runner option reference, test lanes, resource guidance, and troubleshooting are in `docs/development.md`.

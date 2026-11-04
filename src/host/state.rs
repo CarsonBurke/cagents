@@ -292,7 +292,9 @@ pub(crate) struct HostState {
     /// Seals the messages the courier delivers and recognizes them in
     /// transcripts. Absent without the registry that keeps its key.
     pub(super) mailbox_seal: Option<Arc<crate::agent_execution::mailbox::Seal>>,
-    pub(super) execution_gates: BTreeMap<crate::model::AgentId, Arc<Mutex<()>>>,
+    /// Operations own their gates, including while waiting to acquire them.
+    /// Weak entries let later lookups reclaim gates after every caller leaves.
+    pub(super) execution_gates: BTreeMap<crate::model::AgentId, Weak<Mutex<()>>>,
     pub(super) execution_startups: BTreeMap<
         crate::model::AgentId,
         (
@@ -640,8 +642,11 @@ impl HostState {
             .iter()
             .filter(|(_, presence)| {
                 source_session.is_some_and(|session| presence.sessions.contains(&session))
-                    || (matches!(target, crate::notifications::Target::AgentRun(_))
-                        && presence.application == Application::Cagents)
+                    || (matches!(
+                        target,
+                        crate::notifications::Target::AgentRun(_)
+                            | crate::notifications::Target::Automation { .. }
+                    ) && presence.application == Application::Cagents)
                     || preferred.is_some_and(|destination| *destination == presence.destination())
             })
             .max_by_key(|(_, presence)| {
@@ -3069,6 +3074,32 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
 /// [`restore_upgrade_from`].
 const RESTORE_TERMINATED: &str = "daemon termination was requested during upgrade restore";
 
+/// The one path that restores a checkpointed chat. Each chat takes exactly
+/// one: a second attempt on a retained conversation finds the actor the first
+/// attempt reattached and refuses it, failing the whole restore.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatRestore {
+    /// A managed Codex CLI, whose thread server must exist before its TUI.
+    CodexListener,
+    /// A provider that outlived the previous daemon. It is reattached, and a
+    /// refusal is that conversation's problem alone; it is never relaunched.
+    Retained,
+    /// Relaunched from its checkpointed launch once carried terminals return.
+    Relaunch,
+}
+
+impl ChatRestore {
+    fn of(chat: &crate::upgrade::handoff::Chat) -> Self {
+        if chat.source.native_continuity.retains_provider() {
+            Self::Retained
+        } else if super::chat::owns_codex_listener(&chat.source) {
+            Self::CodexListener
+        } else {
+            Self::Relaunch
+        }
+    }
+}
+
 /// Replays a checkpoint, abandoning the replay as soon as termination is
 /// requested.
 ///
@@ -3111,7 +3142,7 @@ fn restore_upgrade_from(
     if checkpoint
         .chats
         .iter()
-        .any(|chat| !chat.source.native_continuity.retains_provider())
+        .any(|chat| ChatRestore::of(chat) != ChatRestore::Retained)
     {
         checkpoint.require_ready().map_err(|error| format!(
             "{error}. Evidence: {}. After inspecting the exact provider conversations, `cagents daemon abandon-upgrade --yes` archives this checkpoint and permits an empty daemon start; native sessions then require explicit manual recovery",
@@ -3124,7 +3155,7 @@ fn restore_upgrade_from(
     for chat in &checkpoint.chats {
         // A private holder authenticates the exact still-running server. Its
         // presence is the purpose of adoption, not permission to relaunch it.
-        if chat.source.native_continuity.retains_provider() {
+        if ChatRestore::of(chat) == ChatRestore::Retained {
             continue;
         }
         let terminal = TerminalSession {
@@ -3166,9 +3197,7 @@ fn restore_upgrade_from(
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
-            if super::chat::owns_codex_listener(&chat.source)
-                && !chat.source.native_continuity.retains_provider()
-            {
+            if ChatRestore::of(chat) == ChatRestore::CodexListener {
                 super::chat::restore_upgrade(host, chat)?;
             }
         }
@@ -3219,7 +3248,7 @@ fn restore_upgrade_from(
         // thread's rollout, is that conversation's problem to report, not a
         // reason to keep every other session and the daemon itself down.
         for chat in &checkpoint.chats {
-            if !chat.source.native_continuity.retains_provider() {
+            if ChatRestore::of(chat) != ChatRestore::Retained {
                 continue;
             }
             if crate::daemon::termination_requested() {
@@ -3323,7 +3352,7 @@ fn restore_upgrade_from(
                 .map_err(|error| error.message)?;
         }
         for chat in &checkpoint.chats {
-            if super::chat::owns_codex_listener(&chat.source) {
+            if ChatRestore::of(chat) != ChatRestore::Relaunch {
                 continue;
             }
             if crate::daemon::termination_requested() {
@@ -4307,7 +4336,7 @@ fn start_terminal_view_owned_reserved(
         rows: options.rows,
         cell_width_px: options.cell_width_px,
         cell_height_px: options.cell_height_px,
-        max_scrollback: options.max_scrollback,
+        max_scrollback_bytes: options.max_scrollback_bytes,
         initially_visible: options.initially_visible,
         theme: options.theme,
         execution_environment,
@@ -4636,7 +4665,7 @@ fn validate_spawn_options(options: &TerminalSpawnOptions) -> Result<(), Protocol
         || !(1..=500).contains(&options.rows)
         || !(1..=4096).contains(&options.cell_width_px)
         || !(1..=4096).contains(&options.cell_height_px)
-        || options.max_scrollback > 1_000_000
+        || options.max_scrollback_bytes > TerminalConfig::MAX_SCROLLBACK_BYTES
     {
         return Err(ProtocolError::new(
             ProtocolErrorCode::InvalidRequest,
@@ -4988,6 +5017,36 @@ mod tests {
 
     fn test_host() -> HostState {
         test_host_with_incarnation("test-incarnation")
+    }
+
+    #[test]
+    fn terminal_spawn_accepts_byte_budgets_and_refuses_over_limit_before_spawn() {
+        assert_eq!(
+            TerminalSpawnOptions::default().max_scrollback_bytes,
+            16 * 1024 * 1024
+        );
+        for bytes in [0, 16 * 1024 * 1024, TerminalConfig::MAX_SCROLLBACK_BYTES] {
+            let options = TerminalSpawnOptions {
+                max_scrollback_bytes: bytes,
+                ..Default::default()
+            };
+            validate_spawn_options(&options).unwrap();
+        }
+        let error = validate_spawn_options(&TerminalSpawnOptions {
+            max_scrollback_bytes: TerminalConfig::MAX_SCROLLBACK_BYTES + 1,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+        assert!(!error.retryable);
+        // A byte budget does not relax any independent dimension guard.
+        assert!(
+            validate_spawn_options(&TerminalSpawnOptions {
+                columns: 0,
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -5546,6 +5605,60 @@ mod tests {
         assert!(matches!(delivery.pop().unwrap().message,
             ServerMessage::NotificationActivated { target: actual } if actual == target));
         assert!(editor.pop().is_none());
+    }
+
+    #[test]
+    fn automation_notification_routes_to_cagents_without_a_provider_and_reconnects_once() {
+        use crate::notifications::{Application, Presence, Target};
+        let mut host = test_host();
+        let agents = host.register_client(1);
+        host.watch_notifications(
+            1,
+            Presence {
+                window: "primary".into(),
+                ..Default::default()
+            },
+        );
+        let editor = host.register_client(2);
+        host.watch_notifications(
+            2,
+            Presence {
+                window: "primary".into(),
+                application: Application::Ceditor,
+                ..Default::default()
+            },
+        );
+        let id = uuid::Uuid::new_v4();
+        let first = Target::Automation { id, sequence: 41 };
+        let destination = host.activate_notification_destination(first.clone(), None, None, None);
+        assert_eq!(destination.application, Application::Cagents);
+        assert_eq!(destination.window, "primary");
+        assert!(matches!(agents.pop().unwrap().message,
+            ServerMessage::NotificationActivated { target } if target == first));
+        drop(host.unregister_client(1));
+        let replacement = Target::Automation { id, sequence: 42 };
+        let cold = host.activate_notification_destination(replacement.clone(), None, None, None);
+        assert_eq!(cold.application, Application::Cagents);
+        assert_eq!(cold.window, "primary");
+        // A same-window editor does not receive or consume Cagents attention.
+        let editor_presence = Presence {
+            window: "primary".into(),
+            application: Application::Ceditor,
+            ..Default::default()
+        };
+        assert_eq!(host.watch_notifications(2, editor_presence), None);
+        editor.close_after_drain();
+        assert!(editor.pop().is_none());
+        host.register_client(3);
+        let returned = Presence {
+            window: "primary".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            host.watch_notifications(3, returned.clone()),
+            Some(replacement)
+        );
+        assert_eq!(host.watch_notifications(3, returned), None);
     }
 
     #[test]
@@ -6167,8 +6280,95 @@ for line in sys.stdin:
         restored_handle.close().unwrap();
     }
 
+    fn upgrade_fixture_in_fresh_process() -> bool {
+        // Capability validation consults process-global retained child custody.
+        // These metadata-only fixtures need a fresh service, not another test's
+        // legitimate retained ownership. Preserve the caller's environment.
+        const SELECTOR_ENV: &str = "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR";
+        let current = std::thread::current();
+        let selector = current.name().expect("named test thread");
+        match std::env::var_os(SELECTOR_ENV) {
+            Some(value) => {
+                assert_eq!(value, selector, "unexpected fixture selector");
+                true
+            }
+            None => {
+                struct OriginalChild(std::process::Child);
+                impl Drop for OriginalChild {
+                    fn drop(&mut self) {
+                        let _ = self.0.kill();
+                        let _ = self.0.wait();
+                    }
+                }
+                let mut output = tempfile::tempdir().unwrap();
+                output.disable_cleanup(true);
+                eprintln!("Upgrade fixture output: {}", output.path().display());
+                let stdout_path = output.path().join("stdout");
+                let stderr_path = output.path().join("stderr");
+                let mut child = OriginalChild(
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            selector,
+                            "--nocapture",
+                            "--test-threads=1",
+                            "--color=never",
+                        ])
+                        .env(SELECTOR_ENV, selector)
+                        .stdout(fs::File::create(&stdout_path).unwrap())
+                        .stderr(fs::File::create(&stderr_path).unwrap())
+                        .spawn()
+                        .unwrap(),
+                );
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let status = loop {
+                    if let Some(status) = child.0.try_wait().unwrap() {
+                        break status;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.0.kill();
+                        let _ = child.0.wait();
+                        let retained = output.keep();
+                        panic!(
+                            "upgrade fixture timed out; retained at {}; stdout: {}; stderr: {}",
+                            retained.display(),
+                            fs::read_to_string(&stdout_path).unwrap_or_default(),
+                            fs::read_to_string(&stderr_path).unwrap_or_default()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                let stdout = fs::read_to_string(stdout_path).unwrap();
+                let stderr = fs::read_to_string(stderr_path).unwrap();
+                let named = stdout
+                    .lines()
+                    .filter(|line| *line == format!("test {selector} ... ok"))
+                    .count()
+                    == 1;
+                let summaries = stdout
+                    .lines()
+                    .filter(|line| line.starts_with("test result:"))
+                    .collect::<Vec<_>>();
+                let qualified = summaries.len() == 1
+                    && summaries[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;");
+                if !status.success() || !named || !qualified {
+                    let retained = output.keep();
+                    panic!(
+                        "upgrade fixture child failed: {status}; retained at {}; stdout: {stdout}; stderr: {stderr}",
+                        retained.display()
+                    );
+                }
+                output.close().unwrap();
+                false
+            }
+        }
+    }
+
     #[test]
     fn upgrade_commit_failure_preserves_live_control_authority() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
         // An open directory descriptor is retained but cannot create files after
@@ -6189,6 +6389,9 @@ for line in sys.stdin:
 
     #[test]
     fn upgrade_rejects_stale_inventory_and_pending_reservations_without_shutdown() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         let mut state = test_host();
         let now = Instant::now();
         let stale = state.shutdown_preflight(now).unwrap().capability;
@@ -6205,6 +6408,9 @@ for line in sys.stdin:
 
     #[test]
     fn committed_upgrade_fences_control_and_retains_checkpoint_until_close() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
         let host = Arc::new(crate::host::state::HostLock::new(test_host()));
@@ -6242,6 +6448,9 @@ for line in sys.stdin:
 
     #[test]
     fn a_handoff_no_window_can_still_save_stops_refusing_the_upgrade() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{Launch, Session},
@@ -6305,7 +6514,10 @@ for line in sys.stdin:
         let live = retain(Instant::now() + Duration::from_secs(3600));
         let failure =
             prepare_upgrade_with(&host, live, || Store::open(directory.path())).unwrap_err();
-        assert!(failure.message.contains("not durably acknowledged"));
+        assert!(
+            failure.message.contains("not durably acknowledged"),
+            "expected the live receipt to block upgrade; actual error: {failure:?}"
+        );
         // Nothing is destroyed by a refused upgrade: the window this receipt
         // belongs to can still replay its replacement afterwards.
         assert!(
@@ -6712,13 +6924,41 @@ for line in sys.stdin:
         // This existing synchronous observation follows them on the same FIFO.
         let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
         restored.observe_agent().unwrap();
-        let capability = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .shutdown_preflight(Instant::now())
-            .unwrap()
-            .capability;
-        prepare_upgrade_with(&host, capability, || Store::open(directory.path())).unwrap();
+        // A separate idle probe can resume the shell before host preparation
+        // observes it again. Retry only this exact fixture's active-shell
+        // refusal; success keeps the actual preparation snapshot frozen.
+        let expected_active = upgrade_error(upgrade_blockers_message(
+            &[describe_upgrade_blocker(&descriptor.session)],
+            false,
+        ));
+        let prepare_started = Instant::now();
+        let mut prepare_attempts = 0;
+        loop {
+            assert!(
+                prepare_started.elapsed() < Duration::from_secs(5),
+                "restored shell never became eligible after {prepare_attempts} preparation attempts"
+            );
+            prepare_attempts += 1;
+            let capability = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                assert_eq!(state.terminals.len(), 1);
+                assert!(state.chats.is_empty());
+                assert!(state.terminals[&source.id].handle.same_worker(&restored));
+                state.shutdown_preflight(Instant::now()).unwrap().capability
+            };
+            match prepare_upgrade_with(&host, capability, || Store::open(directory.path())) {
+                Ok(counts) => {
+                    assert_eq!(counts, (1, 0));
+                    break;
+                }
+                Err(error) if error == expected_active => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!(
+                    "unexpected restored-shell preparation failure after {prepare_attempts} attempts: {error:?}"
+                ),
+            }
+        }
         finish_upgrade(&host).unwrap();
         let store = Store::open(directory.path()).unwrap();
         let second = store.load().unwrap().unwrap();
