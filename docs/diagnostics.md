@@ -66,3 +66,19 @@ only chooses its filter and does not enable raw capture on its own. Raw debug
 output can contain application data: its caller-selected file has caller-managed
 retention and is never returned by `cagents diagnostics`. No support upload or
 network telemetry is performed.
+
+`cagents diagnostics` also reports the current transcript-cache directory count
+and total regular-file bytes under this instance's runtime directory. This is a
+filesystem observation, separate from recorded product health, and never starts
+or contacts the daemon or opens a transcript database. A missing runtime directory
+reports zero; an unavailable runtime path or failed scan reports unavailable
+(`transcript_caches: null` in JSON).
+
+The count includes active caches, orphaned caches, and caches retained to preserve
+semantic journal evidence. Bytes are the sum of direct regular-file lengths,
+including database, journal, image and lease files; they are not resident memory,
+an orphan-only total, or a promise of reclaimable space. Symlink cache entries
+and symlink files are excluded. Writers may change files while they are observed.
+The command neither reclaims these directories nor changes journal settings.
+Current lease and checked semantic-journal disposal rules remain responsible for
+safe reclamation.
