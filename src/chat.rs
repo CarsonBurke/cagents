@@ -1564,6 +1564,23 @@ pub struct TextCopySources {
     pub children: std::collections::BTreeMap<String, Vec<Option<TextCopySource>>>,
 }
 
+impl Command {
+    /// Whether the command gives the provider work: a turn, a reply to its
+    /// question, or a queued or provider command it runs.
+    pub fn gives_work(&self) -> bool {
+        matches!(
+            self,
+            Self::ResumeAfterLogin { .. }
+                | Self::Prompt { .. }
+                | Self::Answer { .. }
+                | Self::Compact
+                | Self::Slash { .. }
+                | Self::StartQueued { .. }
+                | Self::Branch { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     /// Verify login on the same live actor without replaying any failed prompt.

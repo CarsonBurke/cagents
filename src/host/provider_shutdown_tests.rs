@@ -1036,9 +1036,41 @@ fn ordinary_shutdown_keeps_managed_agents_with_their_panes_and_channels() {
     assert_eq!(
         view.panes,
         vec![crate::workspace_model::views::Pane {
-            kind: CardKind::Chat(successor),
+            kind: CardKind::Chat(successor.clone()),
             ..pane
         }],
         "the pane follows the agent to its successor"
+    );
+    drop(registry);
+    let registry = agent_execution::registry(&host).unwrap();
+
+    // A successor given no work is only a reopening its card may give up:
+    // ending it leaves the agent stopped, for the next resume to take over.
+    host.lock().unwrap().idle_adoptions.insert(successor.id);
+    agent_execution::retired(&host, &successor).unwrap();
+    let agent = registry.lock().unwrap().agent(accepted.agent.id).unwrap();
+    assert!(!agent.closed, "giving up a reopening keeps the agent");
+    let again = chat::Session {
+        id: TerminalId::new(),
+        ..successor.clone()
+    };
+    registry
+        .lock()
+        .unwrap()
+        .succeed(again.id, successor.id, None, |_| false)
+        .unwrap();
+    assert!(agent_execution::adopt_resumed(&host, &again).unwrap());
+
+    // Once given work, ending it ends the agent's process and the agent.
+    host.lock().unwrap().idle_adoptions.insert(again.id);
+    agent_execution::given_work(&host, again.id);
+    agent_execution::retired(&host, &again).unwrap();
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
     );
 }

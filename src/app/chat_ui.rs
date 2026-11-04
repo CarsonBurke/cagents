@@ -5434,15 +5434,26 @@ fn retire_conversation(
 /// Closes a conversation the reader closed, like [`retire_conversation`],
 /// and also retires the agent still bound to it after a daemon stop. Giving
 /// up a failed start must not do that, so only an explicit Close comes here.
+///
+/// A reopened conversation that was given no work yet leaves its agent
+/// stopped when its process closes, as a reopening its card gave up would; so
+/// a live conversation's agent is retired by its session once it has closed.
 fn close_conversation(
     handle: Option<Arc<ClientHandle>>,
     session: Option<chat::Session>,
 ) -> Result<(), String> {
+    let live = handle.is_some();
     end_conversation(
         handle,
-        session,
+        session.clone(),
         super::channel_ui::close_sessions_retiring_agents,
-    )
+    )?;
+    match session {
+        Some(session) if live => {
+            super::channel_ui::close_sessions_retiring_agents(vec![CardKind::Chat(session)])
+        }
+        _ => Ok(()),
+    }
 }
 
 fn end_conversation(

@@ -654,6 +654,7 @@ fn dispatch(
         // still requires its explicitly selected account to be registered.
         selected_account(&accepted.agent.spec).map_err(before)?;
     }
+    given_work(host, session.id);
     // Once command submission begins an absent acknowledgement is ambiguous.
     // Only the adapter's exact correlated result may declare success.
     handle
@@ -798,6 +799,14 @@ pub(super) fn announce(host: &SharedHost, registry: &SharedRegistry) {
 }
 
 pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), String> {
+    if host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .idle_adoptions
+        .remove(&session.id)
+    {
+        return stopped(host, session);
+    }
     // Normal interactive sessions still work without the optional registry.
     let Ok(registry) = registry(host) else {
         return Ok(());
@@ -827,6 +836,15 @@ pub(super) fn stopped(host: &SharedHost, session: &chat::Session) -> Result<(), 
         announce(host, &registry);
     }
     Ok(())
+}
+
+/// The conversation `chat` is being given work, so it no longer only reopens
+/// its agent's conversation: ending it from now on retires that agent.
+pub(in crate::host) fn given_work(host: &SharedHost, chat: TerminalId) {
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .idle_adoptions
+        .remove(&chat);
 }
 
 /// Bind the agent of a resumed conversation to `successor`, the process that

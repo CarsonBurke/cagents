@@ -2717,10 +2717,19 @@ fn process_inner(
                 .chats
                 .get(&id)
                 .map(|record| record.session.clone());
-            if let Some(started) = started
-                && let Err(error) = super::agent_execution::adopt_resumed(host, &started)
-            {
-                tracing::warn!(chat=%id, %error, "The resumed conversation did not take over its agent");
+            if let Some(started) = started {
+                match super::agent_execution::adopt_resumed(host, &started) {
+                    Ok(true) => {
+                        host.lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .idle_adoptions
+                            .insert(id);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(chat=%id, %error, "The resumed conversation did not take over its agent");
+                    }
+                }
             }
             Ok(response)
         }
@@ -2851,6 +2860,9 @@ fn process_inner(
                         ServerResponse::ChatFileChangePatches { chat_id, page }
                     }
                 });
+            }
+            if command.gives_work() {
+                super::agent_execution::given_work(host, chat_id);
             }
             handle.command(command).map_err(unavailable)?;
             Ok(ServerResponse::Accepted)
