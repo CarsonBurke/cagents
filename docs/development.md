@@ -128,6 +128,8 @@ scripts/run-development                 # with the embedded browser
 | `--debug` | Opt into local raw stderr tracing/panic output and Rust backtraces (`CAGENTS_LOCAL_DEBUG=1`, `cagents=debug,cagentsd=debug,warn`); an explicit `RUST_LOG` or `RUST_BACKTRACE` takes precedence |
 | `--fresh-daemon` | Stop the existing development daemon, its sessions and background subagents after all three builds succeed, before launching |
 | `--log-file PATH` | Write UI tracing and panic output to `PATH` (relative to the calling directory); build diagnostics stay in the terminal |
+| `--instance NAME` | Run an isolated instance in a headless niri-harness session; see [Parallel instances](#parallel-instances) |
+| `--stop-instance NAME` | Stop that instance's daemon, its jobs and its harness session; keep its storage |
 | `-- ARGS...` | Pass remaining arguments to the UI |
 
 ```sh
@@ -159,7 +161,42 @@ How the runner works:
   `$XDG_RUNTIME_DIR/cagents-development/` daemon, so it runs beside an installed
   production instance.
 - Browserless and integrated development sessions share that state; do not run
-  them at the same time.
+  them at the same time. Use [parallel instances](#parallel-instances) instead.
+
+### Parallel instances
+
+Several people or agents can each validate a change in the native app at once
+by giving every run its own instance:
+
+```sh
+scripts/run-development --browserless --instance pr2064
+niri-harness --session cagents-pr2064 observe
+scripts/run-development --instance pr2064 --fresh-daemon   # rebuild and replace it
+scripts/run-development --stop-instance pr2064
+```
+
+An instance name is 1–24 ASCII letters, digits or hyphens. The runner builds
+the matched set as usual, then starts the UI in a headless
+`niri-harness` session named
+`cagents-NAME` and returns once its window maps. Drive and capture it with
+`niri-harness --session cagents-NAME ...`.
+
+| Shared by default | Per instance |
+| --- | --- |
+| Storage `~/.local/share/cagents-development`, config, state | `cagents-development-NAME` under each XDG root, selected by `CAGENTS_DEVELOPMENT_INSTANCE` |
+| Daemon under `$XDG_RUNTIME_DIR/cagents-development/` | The harness session's private runtime directory |
+| Application ID and activation on the session bus | The harness session's private D-Bus |
+
+`CAGENTS_DEVELOPMENT_INSTANCE` only affects development builds; production
+ignores it. The runner sets it for `--instance` and clears it otherwise, so an
+inherited value never selects an instance. Provider accounts and tools keep
+the caller's `HOME`, so an instance's agents use the same provider sign-ins.
+
+Stopping a harness session deletes its runtime directory, so stop an instance
+with `--stop-instance`, which stops its daemon first. `niri-harness stop` alone
+leaves that daemon running without a socket. An instance's storage remains
+for its next launch; delete `~/.local/share/cagents-development-NAME` and its
+config and state siblings to discard it.
 
 The browserless UI keeps saved browser descriptors and opens their URLs through
 the system browser instead of compiling Servo.
