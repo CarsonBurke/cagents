@@ -1,5 +1,6 @@
 //! Deliberately restricted reader for the published protocol-77 source schema.
 //! Never use this client for ordinary connections or provider attachment.
+use super::legacy_session::LegacySession;
 use crate::{
     chat::Session,
     model::HostSessionProof,
@@ -8,6 +9,7 @@ use crate::{
 use serde::{
     Deserialize, Serialize,
     de::{self, EnumAccess, SeqAccess, VariantAccess, Visitor},
+    ser::SerializeStructVariant,
 };
 use std::{
     fmt,
@@ -46,10 +48,16 @@ impl Serialize for Request<'_> {
             .serialize(serializer),
             Self::ListTerminals => ClientRequest::List.serialize(serializer),
             Self::ListChats => ClientRequest::ChatList.serialize(serializer),
-            Self::Resolve(source) => ClientRequest::ResolveUpgradeChat {
-                source: (*source).clone(),
+            Self::Resolve(source) => {
+                let mut value = serializer.serialize_struct_variant(
+                    "ClientRequest",
+                    38,
+                    "ResolveUpgradeChat",
+                    1,
+                )?;
+                value.serialize_field("source", &LegacySession::from((*source).clone()))?;
+                value.end()
             }
-            .serialize(serializer),
         }
     }
 }
@@ -118,6 +126,7 @@ enum Response {
 // Field order and types below are the complete protocol-77 TerminalDescriptor
 // layout from 28ae28639. It contains no terminal or native-chat snapshot.
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 pub(super) struct Terminal {
     _screen_lost_after_crash: bool,
     pub(super) session: crate::model::TerminalSession,
@@ -159,11 +168,11 @@ struct Connected {
 }
 #[derive(Deserialize)]
 struct Listed {
-    sessions: Vec<Session>,
+    sessions: Vec<LegacySession>,
 }
 #[derive(Deserialize)]
 struct Resolved {
-    session: Session,
+    session: LegacySession,
 }
 struct EmptyResume;
 impl<'de> Deserialize<'de> for EmptyResume {
@@ -206,11 +215,13 @@ impl<'de> Deserialize<'de> for Response {
                     }
                     13 => {
                         let value: Listed = payload.newtype_variant()?;
-                        Ok(Response::Listed(value.sessions))
+                        Ok(Response::Listed(
+                            value.sessions.into_iter().map(Session::from).collect(),
+                        ))
                     }
                     18 => {
                         let value: Resolved = payload.newtype_variant()?;
-                        Ok(Response::Resolved(value.session))
+                        Ok(Response::Resolved(value.session.into()))
                     }
                     _ => Err(de::Error::custom(
                         "source response is outside the read-only compatibility contract",
@@ -369,11 +380,68 @@ mod tests {
     }
 
     fn frame(response: ServerResponse) -> Vec<u8> {
-        postcard::to_allocvec(&ServerEnvelope {
+        #[derive(Serialize)]
+        struct FrozenEnvelope {
+            version: u16,
+            request_id: Option<u64>,
+            proof: HostSessionProof,
+            message: FrozenMessage,
+        }
+        #[derive(Serialize)]
+        enum FrozenMessage {
+            Response { response: FrozenResponse },
+        }
+        struct FrozenResponse(ServerResponse);
+        impl Serialize for FrozenResponse {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                // The envelope version alone cannot freeze today's nested
+                // descriptors. Encode the historical chat and terminal fields.
+                match &self.0 {
+                    ServerResponse::Listed { terminals } => {
+                        let mut value = serializer.serialize_struct_variant(
+                            "ServerResponse",
+                            1,
+                            "Listed",
+                            1,
+                        )?;
+                        let terminals: Vec<_> =
+                            terminals.iter().cloned().map(Terminal::from).collect();
+                        value.serialize_field("terminals", &terminals)?;
+                        value.end()
+                    }
+                    ServerResponse::ChatListed { sessions } => {
+                        let mut value = serializer.serialize_struct_variant(
+                            "ServerResponse",
+                            13,
+                            "ChatListed",
+                            1,
+                        )?;
+                        let sessions: Vec<_> =
+                            sessions.iter().cloned().map(LegacySession::from).collect();
+                        value.serialize_field("sessions", &sessions)?;
+                        value.end()
+                    }
+                    ServerResponse::UpgradeChatResolved { session } => {
+                        let mut value = serializer.serialize_struct_variant(
+                            "ServerResponse",
+                            18,
+                            "UpgradeChatResolved",
+                            1,
+                        )?;
+                        value.serialize_field("session", &LegacySession::from(session.clone()))?;
+                        value.end()
+                    }
+                    response => response.serialize(serializer),
+                }
+            }
+        }
+        postcard::to_allocvec(&FrozenEnvelope {
             version: VERSION,
             request_id: Some(1),
             proof: proof(),
-            message: ServerMessage::Response { response },
+            message: FrozenMessage::Response {
+                response: FrozenResponse(response),
+            },
         })
         .unwrap()
     }

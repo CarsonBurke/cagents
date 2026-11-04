@@ -1,20 +1,85 @@
 //! Read-only inspection of the stable 99/100/101/current inventory subset.
 //! The frozen protocol-77 reader remains separate from this matched connection.
+use super::legacy_session::LegacySession;
 use crate::{
     chat::Session,
     model::HostSessionProof,
-    terminal::ipc::{
-        self, ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse,
-    },
+    terminal::ipc::{self, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse},
 };
+use serde::{Deserialize, Serialize, ser::SerializeStructVariant};
 use std::{
     io::{self, Read, Write},
+    marker::PhantomData,
     os::{fd::AsRawFd, unix::net::UnixStream},
     path::Path,
     time::{Duration, Instant},
 };
 
 const MAX_FRAME: usize = 4 * 1024 * 1024;
+
+#[derive(Serialize)]
+struct RequestEnvelope<'a> {
+    version: u16,
+    request_id: u64,
+    proof: Option<&'a HostSessionProof>,
+    request: VersionedRequest<'a>,
+}
+
+/// The old Session has no draft-model field. Only these three admitted
+/// requests contain it; no general current request may leak into that codec.
+struct VersionedRequest<'a> {
+    protocol: u16,
+    request: &'a ClientRequest,
+}
+
+impl Serialize for VersionedRequest<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.protocol == ipc::PROTOCOL_VERSION {
+            return self.request.serialize(serializer);
+        }
+        match self.request {
+            ClientRequest::ChatStart {
+                session,
+                source,
+                terminate_source,
+                execution_environment,
+            } => {
+                let mut value =
+                    serializer.serialize_struct_variant("ClientRequest", 20, "ChatStart", 4)?;
+                value.serialize_field("session", &LegacySession::from(session.clone()))?;
+                value.serialize_field("source", source)?;
+                value.serialize_field("terminate_source", terminate_source)?;
+                value.serialize_field("execution_environment", execution_environment)?;
+                value.end()
+            }
+            ClientRequest::ChatAttach { session } => {
+                let mut value =
+                    serializer.serialize_struct_variant("ClientRequest", 22, "ChatAttach", 1)?;
+                value.serialize_field("session", &LegacySession::from(session.clone()))?;
+                value.end()
+            }
+            ClientRequest::ResolveUpgradeChat { source } => {
+                let mut value = serializer.serialize_struct_variant(
+                    "ClientRequest",
+                    38,
+                    "ResolveUpgradeChat",
+                    1,
+                )?;
+                value.serialize_field("source", &LegacySession::from(source.clone()))?;
+                value.end()
+            }
+            ClientRequest::Connect { .. }
+            | ClientRequest::List
+            | ClientRequest::ChatList
+            | ClientRequest::ChatDetach { .. }
+            | ClientRequest::ChatVisibility { .. }
+            | ClientRequest::ChatRead { .. } => self.request.serialize(serializer),
+            _ => Err(serde::ser::Error::custom(
+                "request is outside the source inspection codec",
+            )),
+        }
+    }
+}
 
 pub(in crate::host) struct Client {
     stream: UnixStream,
@@ -121,6 +186,9 @@ impl Client {
             | ClientRequest::ChatRead { chat_id, .. } => Some(*chat_id),
             _ => None,
         };
+        if bootstrap_chat.is_some() && !supports_history_protocol(self.protocol) {
+            return Err("Source protocol has no qualified snapshot inspection API".into());
+        }
         let request_id = self.next;
         self.next += 1;
         let mut stream = DeadlineStream {
@@ -129,11 +197,14 @@ impl Client {
         };
         ipc::write_frame(
             &mut stream,
-            &ClientEnvelope {
+            &RequestEnvelope {
                 version: self.protocol,
                 request_id,
-                proof: authenticated.then(|| self.proof.clone()),
-                request,
+                proof: authenticated.then_some(&self.proof),
+                request: VersionedRequest {
+                    protocol: self.protocol,
+                    request: &request,
+                },
             },
         )
         .map_err(|_| "Cannot send source inspection")?;
@@ -141,13 +212,7 @@ impl Client {
         // Activity can arrive first, including during Detach. Drain only that
         // exact chat's qualified events under the same absolute deadline.
         for _ in 0..256 {
-            let envelope = if bootstrap_chat.is_some() {
-                let payload = read_payload_with_limit(&mut stream, ipc::MAX_FRAME_BYTES)?;
-                postcard::from_bytes::<ServerEnvelope>(&payload)
-                    .map_err(|_| "Unsupported legacy retained-owner response")?
-            } else {
-                read_response(&mut stream)?
-            };
+            let envelope = read_response(&mut stream, self.protocol, bootstrap_chat.is_some())?;
             if envelope.version != self.protocol || envelope.proof != self.proof {
                 return Err("Source inspection ownership or protocol changed".into());
             }
@@ -287,9 +352,7 @@ impl Client {
     /// descriptor or presented as evidence of an old provider's execution.
     /// The host's normal owner/managed-work fences remain. No resident data is evicted.
     pub(super) fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
-        if ![119, ipc::PROTOCOL_VERSION].contains(&self.protocol)
-            || !source.is_saved_claude_history()
-        {
+        if !supports_history_protocol(self.protocol) || !source.is_saved_claude_history() {
             return Err("Saved history has no qualified read-only inspection API".into());
         }
         let mut requested = source.clone();
@@ -380,12 +443,18 @@ impl Client {
 // and inventory DTOs. Version 100 appends capacity operations; 101 requires
 // atomic managed-pane adoption without changing these DTOs. This restricted
 // Inventory uses the frozen restricted decoder. The separate retained/history
-// methods admit full snapshots only for the explicitly qualified119/current pair.
+// methods admit full snapshots only for qualified119/127/128/current layouts.
 // Versions 102 (Copy sidecars), 103 (retained Claude continuity) and 104 (the
 // appended Work board request) preserve this subset, including the existing
-// continuity enum discriminants.
+// continuity enum discriminants. Protocol127 was the previous matched version;
+// installed128 adds only StartupState request/response variants. Their Session
+// layout is still frozen;129 adds draft_model and uses the current Session.
 pub(super) fn supports_protocol(protocol: u16) -> bool {
-    [99, 100, 101, 102, 103, 119, ipc::PROTOCOL_VERSION].contains(&protocol)
+    [99, 100, 101, 102, 103, 119, 127, 128, ipc::PROTOCOL_VERSION].contains(&protocol)
+}
+
+fn supports_history_protocol(protocol: u16) -> bool {
+    [119, 127, 128, ipc::PROTOCOL_VERSION].contains(&protocol)
 }
 
 fn read_payload_with_limit(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>, String> {
@@ -404,110 +473,250 @@ fn read_payload_with_limit(reader: &mut impl Read, limit: usize) -> Result<Vec<u
     Ok(payload)
 }
 
-fn read_response(reader: &mut impl Read) -> Result<ServerEnvelope, String> {
-    let payload = read_payload_with_limit(reader, MAX_FRAME)?;
-    let (envelope, remaining) = postcard::take_from_bytes::<InspectionEnvelope>(&payload)
-        .map_err(|_| "Unsupported source response")?;
+fn read_response(
+    reader: &mut impl Read,
+    protocol: u16,
+    bootstrap: bool,
+) -> Result<ServerEnvelope, String> {
+    if !supports_protocol(protocol) || bootstrap && !supports_history_protocol(protocol) {
+        return Err("Source protocol has no qualified response inspection API".into());
+    }
+    let limit = if bootstrap {
+        ipc::MAX_FRAME_BYTES
+    } else {
+        MAX_FRAME
+    };
+    let payload = read_payload_with_limit(reader, limit)?;
+    // Choose the layout from the authenticated connection's protocol, never
+    // by trying an old and new decoder until one happens to accept a frame.
+    match (protocol == ipc::PROTOCOL_VERSION, bootstrap) {
+        (true, false) => decode_response::<Session, false>(&payload),
+        (true, true) => decode_response::<Session, true>(&payload),
+        (false, false) => decode_response::<LegacySession, false>(&payload),
+        (false, true) => decode_response::<LegacySession, true>(&payload),
+    }
+}
+
+fn decode_response<S, const BOOTSTRAP: bool>(payload: &[u8]) -> Result<ServerEnvelope, String>
+where
+    S: serde::de::DeserializeOwned + Into<Session>,
+{
+    let (envelope, remaining) =
+        postcard::take_from_bytes::<InspectionEnvelope<InspectionMessage<S, BOOTSTRAP>>>(payload)
+            .map_err(|_| "Unsupported source response")?;
     if !remaining.is_empty() {
         return Err("Source response has an unknown layout".into());
     }
-    let InspectionMessage::Response { response } = envelope.message;
     Ok(ServerEnvelope {
         version: envelope.version,
         request_id: envelope.request_id,
         proof: envelope.proof,
-        message: ServerMessage::Response {
-            response: response.0,
-        },
+        message: envelope.message.0,
     })
 }
 
-// Postcard encodes a one-field Response struct variant as its tag followed by
-// that field. Accept only that message and the four frozen inventory replies.
-#[derive(serde::Deserialize)]
-struct InspectionEnvelope {
+#[derive(Deserialize)]
+struct InspectionEnvelope<M> {
     version: u16,
     request_id: Option<u64>,
     proof: HostSessionProof,
-    message: InspectionMessage,
+    message: M,
 }
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum InspectionMessage {
-    Response { response: InspectionResponse },
-}
-struct InspectionResponse(ServerResponse);
-impl<'de> serde::Deserialize<'de> for InspectionResponse {
+
+/// Inventory never consumes native snapshots. Only the qualified history
+/// attachment path may read them and drain its four exact-chat event types.
+struct InspectionMessage<S, const BOOTSTRAP: bool>(ServerMessage, PhantomData<S>);
+impl<'de, S, const BOOTSTRAP: bool> Deserialize<'de> for InspectionMessage<S, BOOTSTRAP>
+where
+    S: Deserialize<'de> + Into<Session>,
+{
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = InspectionResponse;
+        struct Visitor<S, const BOOTSTRAP: bool>(PhantomData<S>);
+        impl<'de, S, const BOOTSTRAP: bool> serde::de::Visitor<'de> for Visitor<S, BOOTSTRAP>
+        where
+            S: Deserialize<'de> + Into<Session>,
+        {
+            type Value = InspectionMessage<S, BOOTSTRAP>;
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a qualified source inventory response")
+                f.write_str("a qualified source inspection message")
             }
             fn visit_enum<A: serde::de::EnumAccess<'de>>(
                 self,
                 data: A,
             ) -> Result<Self::Value, A::Error> {
                 use serde::de::VariantAccess;
+                #[derive(Deserialize)]
+                struct Changed {
+                    chat_id: crate::model::TerminalId,
+                }
+                #[derive(Deserialize)]
+                struct Observed {
+                    chat_id: crate::model::TerminalId,
+                    epoch: u64,
+                }
+                #[derive(Deserialize)]
+                struct Activity {
+                    chat_id: crate::model::TerminalId,
+                    state: crate::agent::ActivityState,
+                    generation: u64,
+                }
+                #[derive(Deserialize)]
+                struct AccountUsage {
+                    chat_id: crate::model::TerminalId,
+                    report: crate::account::LiveReport,
+                    observed_at: u64,
+                }
                 let (tag, variant) = data.variant::<u32>()?;
-                #[derive(serde::Deserialize)]
+                let message = match tag {
+                    0 => {
+                        let response: InspectionResponse<S, BOOTSTRAP> =
+                            variant.newtype_variant()?;
+                        ServerMessage::Response {
+                            response: response.0,
+                        }
+                    }
+                    7 if BOOTSTRAP => {
+                        let value: Changed = variant.newtype_variant()?;
+                        ServerMessage::ChatChanged {
+                            chat_id: value.chat_id,
+                        }
+                    }
+                    8 if BOOTSTRAP => {
+                        let value: Observed = variant.newtype_variant()?;
+                        ServerMessage::ChatObserved {
+                            chat_id: value.chat_id,
+                            epoch: value.epoch,
+                        }
+                    }
+                    10 if BOOTSTRAP => {
+                        let value: Activity = variant.newtype_variant()?;
+                        ServerMessage::ChatActivity {
+                            chat_id: value.chat_id,
+                            state: value.state,
+                            generation: value.generation,
+                        }
+                    }
+                    13 if BOOTSTRAP => {
+                        let value: AccountUsage = variant.newtype_variant()?;
+                        ServerMessage::ChatAccountUsage {
+                            chat_id: value.chat_id,
+                            report: value.report,
+                            observed_at: value.observed_at,
+                        }
+                    }
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "message is outside the read-only inspection contract",
+                        ));
+                    }
+                };
+                Ok(InspectionMessage(message, PhantomData))
+            }
+        }
+        deserializer.deserialize_enum(
+            "InspectionMessage",
+            &[],
+            Visitor::<S, BOOTSTRAP>(PhantomData),
+        )
+    }
+}
+
+struct InspectionResponse<S, const BOOTSTRAP: bool>(ServerResponse, PhantomData<S>);
+impl<'de, S, const BOOTSTRAP: bool> Deserialize<'de> for InspectionResponse<S, BOOTSTRAP>
+where
+    S: Deserialize<'de> + Into<Session>,
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor<S, const BOOTSTRAP: bool>(PhantomData<S>);
+        impl<'de, S, const BOOTSTRAP: bool> serde::de::Visitor<'de> for Visitor<S, BOOTSTRAP>
+        where
+            S: Deserialize<'de> + Into<Session>,
+        {
+            type Value = InspectionResponse<S, BOOTSTRAP>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a qualified source inspection response")
+            }
+            fn visit_enum<A: serde::de::EnumAccess<'de>>(
+                self,
+                data: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::VariantAccess;
+                #[derive(Deserialize)]
                 struct Connected {
                     proof: HostSessionProof,
                     resumed: Vec<crate::terminal_ipc::TerminalDescriptor>,
                 }
-                #[derive(serde::Deserialize)]
+                #[derive(Deserialize)]
                 struct Listed {
                     terminals: Vec<crate::terminal_ipc::TerminalDescriptor>,
                 }
-                #[derive(serde::Deserialize)]
-                struct ChatListed {
-                    sessions: Vec<Session>,
+                #[derive(Deserialize)]
+                struct ChatListed<S> {
+                    sessions: Vec<S>,
                 }
-                #[derive(serde::Deserialize)]
-                struct Resolved {
-                    session: Session,
+                #[derive(Deserialize)]
+                struct Resolved<S> {
+                    session: S,
                 }
-                #[derive(serde::Deserialize)]
-                struct Attached {
-                    session: Session,
+                #[derive(Deserialize)]
+                struct Attached<S> {
+                    session: S,
+                    // Source119 and current share this snapshot layout. It
+                    // contains no Session/Launch; the attachment beside it does.
                     snapshot: crate::chat::Snapshot,
                 }
+                #[derive(Deserialize)]
+                struct Snapshot {
+                    chat_id: crate::model::TerminalId,
+                    snapshot: Option<crate::chat::Snapshot>,
+                }
+                let (tag, variant) = data.variant::<u32>()?;
                 let response = match tag {
-                    4 => {
-                        let _: () = variant.newtype_variant()?;
-                        ServerResponse::Detached
-                    }
-                    11 => {
-                        let value: Attached = variant.newtype_variant()?;
-                        ServerResponse::ChatAttached {
-                            session: value.session,
-                            snapshot: value.snapshot,
-                        }
-                    }
-                    0 => {
+                    0 if !BOOTSTRAP => {
                         let value: Connected = variant.newtype_variant()?;
                         ServerResponse::Connected {
                             proof: value.proof,
                             resumed: value.resumed,
                         }
                     }
-                    1 => {
+                    1 if !BOOTSTRAP => {
                         let value: Listed = variant.newtype_variant()?;
                         ServerResponse::Listed {
                             terminals: value.terminals,
                         }
                     }
-                    13 => {
-                        let value: ChatListed = variant.newtype_variant()?;
+                    13 if !BOOTSTRAP => {
+                        let value: ChatListed<S> = variant.newtype_variant()?;
                         ServerResponse::ChatListed {
-                            sessions: value.sessions,
+                            sessions: value.sessions.into_iter().map(Into::into).collect(),
                         }
                     }
-                    18 => {
-                        let value: Resolved = variant.newtype_variant()?;
+                    18 if !BOOTSTRAP => {
+                        let value: Resolved<S> = variant.newtype_variant()?;
                         ServerResponse::UpgradeChatResolved {
-                            session: value.session,
+                            session: value.session.into(),
+                        }
+                    }
+                    4 if BOOTSTRAP => {
+                        variant.unit_variant()?;
+                        ServerResponse::Detached
+                    }
+                    5 if BOOTSTRAP => {
+                        variant.unit_variant()?;
+                        ServerResponse::Accepted
+                    }
+                    11 if BOOTSTRAP => {
+                        let value: Attached<S> = variant.newtype_variant()?;
+                        ServerResponse::ChatAttached {
+                            session: value.session.into(),
+                            snapshot: value.snapshot,
+                        }
+                    }
+                    12 if BOOTSTRAP => {
+                        let value: Snapshot = variant.newtype_variant()?;
+                        ServerResponse::ChatSnapshot {
+                            chat_id: value.chat_id,
+                            snapshot: value.snapshot,
                         }
                     }
                     _ => {
@@ -516,10 +725,14 @@ impl<'de> serde::Deserialize<'de> for InspectionResponse {
                         ));
                     }
                 };
-                Ok(InspectionResponse(response))
+                Ok(InspectionResponse(response, PhantomData))
             }
         }
-        deserializer.deserialize_enum("InspectionResponse", &[], Visitor)
+        deserializer.deserialize_enum(
+            "InspectionResponse",
+            &[],
+            Visitor::<S, BOOTSTRAP>(PhantomData),
+        )
     }
 }
 
@@ -554,9 +767,201 @@ impl Write for DeadlineStream<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_ipc::ClientEnvelope;
+
+    fn legacy_protocols() -> std::collections::BTreeSet<u16> {
+        [99, 100, 101, 102, 103, 119, 127, 128].into()
+    }
 
     fn source_protocols() -> std::collections::BTreeSet<u16> {
-        [99, 100, 101, 102, 103, 119, ipc::PROTOCOL_VERSION].into()
+        let mut protocols = legacy_protocols();
+        protocols.insert(ipc::PROTOCOL_VERSION);
+        protocols
+    }
+
+    fn append<T: Serialize>(bytes: &mut Vec<u8>, value: &T) {
+        bytes.extend(postcard::to_allocvec(value).unwrap());
+    }
+
+    // Frozen top-level field sequence from qualified source119
+    // 3fcce2a7bf7dcca4cb307de544613aedb0388b61. The source audit separately
+    // verified the transitive DTO declarations against127/128. Do not replace
+    // this sequence with current Snapshot serialization in old-peer fixtures.
+    fn frozen_snapshot119(snapshot: &crate::chat::Snapshot) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        macro_rules! fields {
+            ($($field:ident),* $(,)?) => { $(append(&mut bytes, &snapshot.$field);)* };
+        }
+        fields!(
+            sampled_at,
+            generation,
+            turn_generation,
+            finished_at,
+            items,
+            text_copy_sources,
+            requests,
+            capabilities,
+            models,
+            selected_model,
+            reasoning,
+            fast_mode,
+            permission_mode,
+            permissions,
+            permission_denials,
+            commands,
+            skills,
+            usage,
+            busy,
+            detail,
+            session_id,
+            native_continuity,
+            title,
+            error,
+            read_only_reason,
+            exited,
+            has_earlier,
+            has_later,
+            composer,
+            prompt_suggestion,
+            open_url,
+            waiting,
+            plan,
+            subagents,
+            ready,
+            queued_messages,
+            queue_removals,
+            history_loading,
+            interrupt_mode,
+            branch_points,
+            forked,
+            file_changes,
+        );
+        bytes
+    }
+
+    // The peer encodes the old field sequence independently of the production
+    // decoder. Never serialize a current Session just with an older version.
+    fn source_frame(envelope: &ServerEnvelope) -> Vec<u8> {
+        if envelope.version == ipc::PROTOCOL_VERSION {
+            let mut frame = Vec::new();
+            ipc::write_frame(&mut frame, envelope).unwrap();
+            return frame;
+        }
+        let mut payload = Vec::new();
+        append(&mut payload, &envelope.version);
+        append(&mut payload, &envelope.request_id);
+        append(&mut payload, &envelope.proof);
+        match &envelope.message {
+            ServerMessage::Response { response } => {
+                append(&mut payload, &0u32);
+                match response {
+                    ServerResponse::Connected { proof, resumed } => {
+                        append(&mut payload, &0u32);
+                        append(&mut payload, proof);
+                        append(&mut payload, resumed);
+                    }
+                    ServerResponse::Listed { terminals } => {
+                        append(&mut payload, &1u32);
+                        append(&mut payload, terminals);
+                    }
+                    ServerResponse::Detached => append(&mut payload, &4u32),
+                    ServerResponse::Accepted => append(&mut payload, &5u32),
+                    ServerResponse::ChatAttached { session, snapshot } => {
+                        append(&mut payload, &11u32);
+                        append(&mut payload, &LegacySession::from(session.clone()));
+                        payload.extend(frozen_snapshot119(snapshot));
+                    }
+                    ServerResponse::ChatSnapshot { chat_id, snapshot } => {
+                        append(&mut payload, &12u32);
+                        append(&mut payload, chat_id);
+                        append(&mut payload, &snapshot.as_ref().map(|_| ()));
+                        if let Some(snapshot) = snapshot {
+                            payload.extend(frozen_snapshot119(snapshot));
+                        }
+                    }
+                    ServerResponse::ChatListed { sessions } => {
+                        append(&mut payload, &13u32);
+                        let sessions: Vec<_> =
+                            sessions.iter().cloned().map(LegacySession::from).collect();
+                        append(&mut payload, &sessions);
+                    }
+                    ServerResponse::UpgradeChatResolved { session } => {
+                        append(&mut payload, &18u32);
+                        append(&mut payload, &LegacySession::from(session.clone()));
+                    }
+                    response => panic!("unqualified fixture response: {response:?}"),
+                }
+            }
+            message @ (ServerMessage::ChatChanged { .. }
+            | ServerMessage::ChatObserved { .. }
+            | ServerMessage::ChatActivity { .. }
+            | ServerMessage::ChatAccountUsage { .. }) => append(&mut payload, message),
+            message => panic!("unqualified fixture message: {message:?}"),
+        }
+        let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+        frame.extend(payload);
+        frame
+    }
+
+    fn write_source_frame(writer: &mut impl Write, envelope: &ServerEnvelope) -> io::Result<()> {
+        writer.write_all(&source_frame(envelope))
+    }
+
+    fn take<T: serde::de::DeserializeOwned>(payload: &mut &[u8]) -> T {
+        let (value, remaining) = postcard::take_from_bytes(payload).unwrap();
+        *payload = remaining;
+        value
+    }
+
+    fn read_legacy_request(reader: &mut impl Read) -> ClientEnvelope {
+        let payload = read_payload_with_limit(reader, ipc::MAX_CLIENT_FRAME_BYTES).unwrap();
+        let mut remaining = payload.as_slice();
+        let version = take(&mut remaining);
+        let request_id = take(&mut remaining);
+        let proof = take(&mut remaining);
+        let tag: u32 = take(&mut remaining);
+        let request = match tag {
+            0 => ClientRequest::Connect {
+                expected_host: take(&mut remaining),
+                resume: take(&mut remaining),
+            },
+            1 => ClientRequest::List,
+            20 => ClientRequest::ChatStart {
+                session: take::<LegacySession>(&mut remaining).into(),
+                source: take(&mut remaining),
+                terminate_source: take(&mut remaining),
+                execution_environment: take(&mut remaining),
+            },
+            22 => ClientRequest::ChatAttach {
+                session: take::<LegacySession>(&mut remaining).into(),
+            },
+            23 => ClientRequest::ChatDetach {
+                chat_id: take(&mut remaining),
+            },
+            25 => ClientRequest::ChatVisibility {
+                chat_id: take(&mut remaining),
+                visible: take(&mut remaining),
+            },
+            26 => ClientRequest::ChatRead {
+                chat_id: take(&mut remaining),
+                after_generation: take(&mut remaining),
+            },
+            29 => ClientRequest::ChatList,
+            38 => ClientRequest::ResolveUpgradeChat {
+                source: take::<LegacySession>(&mut remaining).into(),
+            },
+            _ => panic!("unqualified source request tag {tag}"),
+        };
+        assert!(
+            remaining.is_empty(),
+            "a current Session field leaked into a legacy request"
+        );
+        ClientEnvelope {
+            version,
+            request_id,
+            proof,
+            request,
+        }
     }
 
     fn source_frame_version(frame: &[u8], protocol: u16) -> Vec<u8> {
@@ -729,7 +1134,7 @@ mod tests {
                 message: ServerMessage::Response { response },
             };
             let mut bytes = Vec::new();
-            ipc::write_frame(&mut bytes, &envelope).unwrap();
+            write_source_frame(&mut bytes, &envelope).unwrap();
             let frozen: &[u8] = match name {
                 "CONNECTED" => {
                     include_bytes!("../../../tests/fixtures/upgrade-inspection-v100/connected.bin")
@@ -746,21 +1151,40 @@ mod tests {
                 _ => unreachable!(),
             };
             assert_eq!(bytes.as_slice(), frozen);
-            assert_eq!(read_response(&mut &frozen[..]).unwrap(), envelope);
+            assert_eq!(
+                read_response(&mut &frozen[..], 100, false).unwrap(),
+                envelope
+            );
             for protocol in source_protocols() {
                 let historical = source_frame_version(frozen, protocol);
                 let mut expected = envelope.clone();
                 expected.version = protocol;
                 let mut current = Vec::new();
-                ipc::write_frame(&mut current, &expected).unwrap();
-                assert_eq!(current, historical);
-                assert_eq!(read_response(&mut historical.as_slice()).unwrap(), expected);
+                write_source_frame(&mut current, &expected).unwrap();
+                if protocol == ipc::PROTOCOL_VERSION
+                    && matches!(
+                        expected.message,
+                        ServerMessage::Response {
+                            response: ServerResponse::ChatListed { .. }
+                                | ServerResponse::UpgradeChatResolved { .. }
+                        }
+                    )
+                {
+                    assert_ne!(current, historical);
+                    assert!(read_response(&mut historical.as_slice(), protocol, false).is_err());
+                } else {
+                    assert_eq!(current, historical);
+                }
+                assert_eq!(
+                    read_response(&mut current.as_slice(), protocol, false).unwrap(),
+                    expected
+                );
             }
         }
     }
 
     #[test]
-    fn frozen_inventory_subset_accepts_99_through_104_only() {
+    fn frozen_inventory_subset_accepts_qualified_legacy_and_current_versions() {
         assert!(!supports_protocol(98));
         assert!(!supports_protocol(ipc::PROTOCOL_VERSION + 1));
         assert_eq!(postcard::to_allocvec(&ClientRequest::List).unwrap(), [1]);
@@ -787,11 +1211,12 @@ mod tests {
         for protocol in source_protocols() {
             assert!(supports_protocol(protocol));
             // Frozen postcard envelope with request 7, proof s/b/i and an empty
-            // ChatListed response. The only version-specific byte is first.
-            let payload = [protocol as u8, 1, 7, 1, b's', 1, b'b', 1, b'i', 0, 13, 0];
+            // ChatListed response. Only the encoded version scalar changes.
+            let mut payload = postcard::to_allocvec(&protocol).unwrap();
+            payload.extend([1, 7, 1, b's', 1, b'b', 1, b'i', 0, 13, 0]);
             let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
             frame.extend(payload);
-            let envelope = read_response(&mut frame.as_slice()).unwrap();
+            let envelope = read_response(&mut frame.as_slice(), protocol, false).unwrap();
             assert_eq!(envelope.version, protocol);
             assert_eq!(envelope.request_id, Some(7));
             assert_eq!(
@@ -828,9 +1253,210 @@ mod tests {
                     message: ServerMessage::Response { response },
                 };
                 let mut frame = Vec::new();
-                ipc::write_frame(&mut frame, &envelope).unwrap();
-                assert_eq!(read_response(&mut frame.as_slice()).unwrap(), envelope);
+                write_source_frame(&mut frame, &envelope).unwrap();
+                assert_eq!(
+                    read_response(&mut frame.as_slice(), protocol, false).unwrap(),
+                    envelope
+                );
             }
+        }
+    }
+
+    #[test]
+    fn session_requests_use_the_selected_sources_frozen_or_current_layout() {
+        for protocol in source_protocols() {
+            let mut session = populated_inventory().0;
+            session.launch.draft_model = Some(crate::chat::DraftModel {
+                model: "current-only-model".into(),
+                reasoning: Some("high".into()),
+            });
+            let mut requests = vec![ClientRequest::ResolveUpgradeChat {
+                source: session.clone(),
+            }];
+            if supports_history_protocol(protocol) {
+                requests.push(ClientRequest::ChatAttach {
+                    session: session.clone(),
+                });
+            }
+            if protocol == 119 {
+                requests.push(ClientRequest::ChatStart {
+                    session: session.clone(),
+                    source: None,
+                    terminate_source: false,
+                    execution_environment: Default::default(),
+                });
+            }
+            for request in requests {
+                let mut bytes = Vec::new();
+                ipc::write_frame(
+                    &mut bytes,
+                    &RequestEnvelope {
+                        version: protocol,
+                        request_id: 7,
+                        proof: Some(&proof()),
+                        request: VersionedRequest {
+                            protocol,
+                            request: &request,
+                        },
+                    },
+                )
+                .unwrap();
+                let decoded = if protocol == ipc::PROTOCOL_VERSION {
+                    ipc::read_frame::<ClientEnvelope>(&mut bytes.as_slice())
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    read_legacy_request(&mut bytes.as_slice())
+                };
+                assert_eq!(decoded.version, protocol);
+                assert_eq!(decoded.request_id, 7);
+                assert_eq!(decoded.proof, Some(proof()));
+                let mut expected = request;
+                if protocol != ipc::PROTOCOL_VERSION {
+                    match &mut expected {
+                        ClientRequest::ResolveUpgradeChat { source }
+                        | ClientRequest::ChatAttach { session: source }
+                        | ClientRequest::ChatStart {
+                            session: source, ..
+                        } => source.launch.draft_model = None,
+                        _ => unreachable!(),
+                    }
+                }
+                assert_eq!(decoded.request, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn source_session_decoders_never_fall_back_to_a_different_protocol_layout() {
+        let mut session = populated_inventory().0;
+        session.launch.draft_model = Some(crate::chat::DraftModel {
+            model: "current-only-model".into(),
+            reasoning: Some("high".into()),
+        });
+        for response in [
+            ServerResponse::ChatListed {
+                sessions: vec![session.clone()],
+            },
+            ServerResponse::UpgradeChatResolved {
+                session: session.clone(),
+            },
+        ] {
+            let envelope = ServerEnvelope {
+                version: ipc::PROTOCOL_VERSION,
+                request_id: Some(7),
+                proof: proof(),
+                message: ServerMessage::Response { response },
+            };
+            let current = source_frame(&envelope);
+            assert_eq!(
+                read_response(&mut current.as_slice(), ipc::PROTOCOL_VERSION, false).unwrap(),
+                envelope
+            );
+            for protocol in [119, 127, 128] {
+                let mut mislabeled = envelope.clone();
+                mislabeled.version = protocol;
+                let mut bytes = Vec::new();
+                // Deliberately bypass the legacy adapter to model a packet
+                // that contains the new Session under an old protocol label.
+                ipc::write_frame(&mut bytes, &mislabeled).unwrap();
+                assert!(read_response(&mut bytes.as_slice(), protocol, false).is_err());
+            }
+        }
+        for protocol in [119, 127, 128] {
+            let attached = ServerEnvelope {
+                version: protocol,
+                request_id: Some(7),
+                proof: proof(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session: session.clone(),
+                        snapshot: crate::chat::Snapshot::default(),
+                    },
+                },
+            };
+            let mut bytes = Vec::new();
+            ipc::write_frame(&mut bytes, &attached).unwrap();
+            assert!(read_response(&mut bytes.as_slice(), protocol, true).is_err());
+        }
+    }
+
+    #[test]
+    fn source_snapshot_layout_and_decoder_scope_remain_qualified() {
+        let source = populated_inventory().0;
+        let snapshot = crate::chat::Snapshot {
+            sampled_at: Some(71),
+            generation: 257,
+            turn_generation: 13,
+            session_id: source.launch.session_id.clone(),
+            ready: true,
+            selected_model: Some("fixture-model".into()),
+            reasoning: Some("high".into()),
+            native_continuity: source.native_continuity.clone(),
+            items: vec![std::sync::Arc::new(crate::chat::Item {
+                id: "snapshot119".into(),
+                role: crate::chat::Role::Assistant,
+                content: crate::chat::ItemContent::Text {
+                    text: "Retained history 🦀".into(),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                started_at: Some(123),
+                at: Some(456),
+            })],
+            ..Default::default()
+        };
+        assert_eq!(
+            postcard::to_allocvec(&snapshot).unwrap(),
+            frozen_snapshot119(&snapshot)
+        );
+        for protocol in [119, 127, 128, ipc::PROTOCOL_VERSION] {
+            for response in [
+                ServerResponse::Detached,
+                ServerResponse::Accepted,
+                ServerResponse::ChatAttached {
+                    session: source.clone(),
+                    snapshot: snapshot.clone(),
+                },
+                ServerResponse::ChatSnapshot {
+                    chat_id: source.id,
+                    snapshot: Some(snapshot.clone()),
+                },
+            ] {
+                let envelope = ServerEnvelope {
+                    version: protocol,
+                    request_id: Some(7),
+                    proof: proof(),
+                    message: ServerMessage::Response { response },
+                };
+                let bytes = source_frame(&envelope);
+                assert!(read_response(&mut bytes.as_slice(), protocol, false).is_err());
+                assert_eq!(
+                    read_response(&mut bytes.as_slice(), protocol, true).unwrap(),
+                    envelope
+                );
+                let mut trailing = bytes[4..].to_vec();
+                trailing.push(0);
+                let mut frame = (trailing.len() as u32).to_be_bytes().to_vec();
+                frame.extend(trailing);
+                assert!(read_response(&mut frame.as_slice(), protocol, true).is_err());
+            }
+            let inventory = ServerEnvelope {
+                version: protocol,
+                request_id: Some(7),
+                proof: proof(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::ChatListed {
+                        sessions: vec![source.clone()],
+                    },
+                },
+            };
+            assert!(
+                read_response(&mut source_frame(&inventory).as_slice(), protocol, true).is_err()
+            );
+        }
+        for protocol in [99, 100, 101, 102, 103] {
+            assert!(read_response(&mut [].as_slice(), protocol, true).is_err());
         }
     }
 
@@ -847,7 +1473,7 @@ mod tests {
         let expected = source.clone();
         let worker = std::thread::spawn(move || {
             for attach in [true, false] {
-                let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
+                let request = read_legacy_request(&mut peer);
                 assert_eq!(request.version, 119);
                 assert_eq!(request.proof.as_ref(), Some(&proof()));
                 if attach {
@@ -870,7 +1496,7 @@ mod tests {
                         epoch: 3,
                     },
                 ] {
-                    ipc::write_frame(
+                    write_source_frame(
                         &mut peer,
                         &ServerEnvelope {
                             version: 119,
@@ -908,7 +1534,7 @@ mod tests {
                 } else {
                     ServerResponse::Detached
                 };
-                ipc::write_frame(
+                write_source_frame(
                     &mut peer,
                     &ServerEnvelope {
                         version: 119,
@@ -952,17 +1578,24 @@ mod tests {
 
     #[test]
     fn legacy_history_preview_only_attaches_reads_and_detaches_without_execution_or_eviction() {
-        let (stream, mut peer) = UnixStream::pair().unwrap();
-        let source = super::super::tests::session();
-        let mut requested = source.clone();
-        requested.proof = Some(proof());
-        let expected = requested.clone();
-        let worker = std::thread::spawn(move || {
-            for step in 0..4 {
-                let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
-                assert_eq!(request.version, 119);
-                assert_eq!(request.proof, Some(proof()));
-                let response = match (step, request.request) {
+        for protocol in [119, 127, 128, ipc::PROTOCOL_VERSION] {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let source = super::super::tests::session();
+            let mut requested = source.clone();
+            requested.proof = Some(proof());
+            let expected = requested.clone();
+            let worker = std::thread::spawn(move || {
+                for step in 0..4 {
+                    let request = if protocol == ipc::PROTOCOL_VERSION {
+                        ipc::read_frame::<ClientEnvelope>(&mut peer)
+                            .unwrap()
+                            .unwrap()
+                    } else {
+                        read_legacy_request(&mut peer)
+                    };
+                    assert_eq!(request.version, protocol);
+                    assert_eq!(request.proof, Some(proof()));
+                    let response = match (step, request.request) {
                     (0, ClientRequest::ChatAttach { session }) if session == expected => ServerResponse::ChatAttached {
                         session,
                         snapshot: crate::chat::Snapshot {
@@ -983,42 +1616,43 @@ mod tests {
                     (3, ClientRequest::ChatDetach { chat_id }) if chat_id == expected.id => ServerResponse::Detached,
                     other => panic!("Unexpected history request (no Start, Close or Release permitted): {other:?}"),
                 };
-                // Only exact target-chat events may interleave with the reply.
-                ipc::write_frame(
-                    &mut peer,
-                    &ServerEnvelope {
-                        version: 119,
-                        request_id: None,
-                        proof: proof(),
-                        message: ServerMessage::ChatChanged {
-                            chat_id: expected.id,
+                    // Only exact target-chat events may interleave with the reply.
+                    write_source_frame(
+                        &mut peer,
+                        &ServerEnvelope {
+                            version: protocol,
+                            request_id: None,
+                            proof: proof(),
+                            message: ServerMessage::ChatChanged {
+                                chat_id: expected.id,
+                            },
                         },
-                    },
-                )
-                .unwrap();
-                ipc::write_frame(
-                    &mut peer,
-                    &ServerEnvelope {
-                        version: 119,
-                        request_id: Some(request.request_id),
-                        proof: proof(),
-                        message: ServerMessage::Response { response },
-                    },
-                )
-                .unwrap();
-            }
-        });
-        let mut client = Client {
-            stream,
-            proof: proof(),
-            next: 1,
-            protocol: 119,
-            deadline: Instant::now() + Duration::from_secs(5),
-        };
-        client.inspect_saved_history(&source).unwrap();
-        assert_ne!(source, requested, "original saved proof remains unchanged");
-        drop(client);
-        worker.join().unwrap();
+                    )
+                    .unwrap();
+                    write_source_frame(
+                        &mut peer,
+                        &ServerEnvelope {
+                            version: protocol,
+                            request_id: Some(request.request_id),
+                            proof: proof(),
+                            message: ServerMessage::Response { response },
+                        },
+                    )
+                    .unwrap();
+                }
+            });
+            let mut client = Client {
+                stream,
+                proof: proof(),
+                next: 1,
+                protocol,
+                deadline: Instant::now() + Duration::from_secs(5),
+            };
+            client.inspect_saved_history(&source).unwrap();
+            assert_ne!(source, requested, "original saved proof remains unchanged");
+            drop(client);
+            worker.join().unwrap();
+        }
     }
 
     #[test]
@@ -1038,12 +1672,19 @@ mod tests {
             let mut frame = (body.len() as u32).to_be_bytes().to_vec();
             frame.extend(body);
             assert!(
-                read_response(&mut frame.as_slice()).is_err(),
+                read_response(&mut frame.as_slice(), 100, false).is_err(),
                 "mutation {mutation}"
             );
         }
-        assert!(read_response(&mut ((MAX_FRAME as u32 + 1).to_be_bytes()).as_slice()).is_err());
-        assert!(read_response(&mut [0, 0].as_slice()).is_err());
+        assert!(
+            read_response(
+                &mut ((MAX_FRAME as u32 + 1).to_be_bytes()).as_slice(),
+                100,
+                false
+            )
+            .is_err()
+        );
+        assert!(read_response(&mut [0, 0].as_slice(), 100, false).is_err());
     }
 
     #[test]

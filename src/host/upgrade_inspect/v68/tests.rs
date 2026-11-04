@@ -273,7 +273,7 @@ fn authentic_68_bytes_pin_populated_read_only_requests_and_responses() {
     let owner = proof();
     let session = source(&owner);
     assert_eq!(
-        postcard::to_allocvec(&session).unwrap(),
+        postcard::to_allocvec(&LegacySession::from(session.clone())).unwrap(),
         frozen_session(&owner)
     );
     assert_eq!(
@@ -320,6 +320,30 @@ fn authentic_68_bytes_pin_populated_read_only_requests_and_responses() {
     let value: Envelope = postcard::from_bytes(&response(&owner, 7, 1, &terminals)).unwrap();
     assert!(
         matches!(value.message, Message::Response { response: Response::Terminals(t) } if t.len() == 1 && t[0].session == terminal(&owner).session && t[0].upgrade_sources == terminal(&owner).upgrade_sources)
+    );
+}
+
+#[test]
+fn draft_selection_does_not_change_the_legacy_wire_contract() {
+    let owner = proof();
+    let mut session = source(&owner);
+    session.launch.draft_model = Some(crate::chat::DraftModel {
+        model: "new-draft-model".into(),
+        reasoning: Some("high".into()),
+    });
+    assert_eq!(
+        postcard::to_allocvec(&LegacySession::from(session.clone())).unwrap(),
+        frozen_session(&owner)
+    );
+    assert_eq!(
+        postcard::to_allocvec(&RequestEnvelope {
+            version: VERSION,
+            request_id: 7,
+            proof: Some(&owner),
+            request: Request::Resolve(&session),
+        })
+        .unwrap(),
+        expected_request(&owner, 7, 38)
     );
 }
 
