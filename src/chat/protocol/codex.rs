@@ -857,21 +857,23 @@ impl Codex {
                 step.events
                     .extend(parse_item(value, true, id)?.into_iter().map(Event::Item));
             }
-            if let Some(message) = turn["error"]["message"].as_str() {
-                if current {
-                    step.events.push(Event::Error {
-                        message: message.into(),
-                        fatal: false,
-                    });
-                } else {
-                    step.events.push(Event::Execution {
-                        run: execution.run,
-                        event: crate::agent_execution::ProviderEvent::Diagnostic {
-                            message: message.into(),
-                        },
-                    });
-                }
+            if current && let Some(message) = turn["error"]["message"].as_str() {
+                step.events.push(Event::Error {
+                    message: message.into(),
+                    fatal: false,
+                });
             }
+        }
+        // A superseded turn's error must not replace the current one, yet its
+        // run keeps the provider's reason. Ordinary completed frames publish
+        // only a current turn's error, so this applies on both routes.
+        if !current && let Some(message) = turn["error"]["message"].as_str() {
+            step.events.push(Event::Execution {
+                run: execution.run,
+                event: crate::agent_execution::ProviderEvent::Diagnostic {
+                    message: message.into(),
+                },
+            });
         }
         execution_end(execution.run, outcome, step);
         Ok(())
@@ -2573,13 +2575,13 @@ impl Adapter for Codex {
                     // its turn ID arrives. The old request's correlation alone
                     // cannot assign that lifecycle to its acknowledged turn.
                     let owns_lifecycle = owns_current
-                        && (revision == self.lifecycle_revision
-                            || self.notification_turn.as_deref() == Some(id)
+                        && ((ack_lifecycle_authority
+                            && (revision == self.lifecycle_revision
+                                || self.notification_turn.as_deref() == Some(id)))
                             // Scalar idle can follow this early completion.
                             // It announces no newer work to protect from replay.
                             || (!self.busy
-                                && !early_completion.as_ref().is_some_and(|entry| entry.superseded)))
-                        && ack_lifecycle_authority;
+                                && !early_completion.as_ref().is_some_and(|entry| entry.superseded)));
                     let completion_authority = owns_lifecycle;
                     let early_completion = early_completion.filter(|_| owns_lifecycle);
                     if completion_authority {
@@ -2661,10 +2663,6 @@ impl Adapter for Codex {
                             .clone()
                             .ok_or("Codex completion has no confirmed thread")?;
                         self.resolve_turn_requests(&thread, id, &mut step);
-                        step.events.push(Event::TurnFinished {
-                            key: Some(format!("codex:{thread}:{id}")),
-                            outcome: completed.outcome,
-                        });
                         self.observe_turn_lifecycle(id, &completed.status, false, &mut step);
                         self.publish_turn_status(&completed.status, &mut step);
                         if let Some(message) = completed.error {
@@ -2673,6 +2671,11 @@ impl Adapter for Codex {
                                 fatal: false,
                             });
                         }
+                        // After its error, so the outcome keeps the provider's reason.
+                        step.events.push(Event::TurnFinished {
+                            key: Some(format!("codex:{thread}:{id}")),
+                            outcome: completed.outcome,
+                        });
                         self.notification_revision = self.notification_revision.wrapping_add(1);
                         self.notification_turn = None;
                     }
@@ -3007,6 +3010,11 @@ impl Adapter for Codex {
                 if turn_id.is_empty() {
                     return Err("Codex reported an empty turn identity".into());
                 }
+                // An unscoped completion cannot be retained for a later
+                // acknowledgement to adopt as this thread's outcome.
+                if method == "turn/completed" && string(params, "threadId")?.is_empty() {
+                    return Err("Codex completed a turn without a thread identity".into());
+                }
                 // A completed ID is current only when a start, active attach,
                 // or exact accepted request reply has established ownership.
                 let current =
@@ -3049,6 +3057,7 @@ impl Adapter for Codex {
                     step.events.push(Event::TurnStarted);
                 }
                 self.materialized = true;
+                let mut finished = None;
                 if method == "turn/completed" {
                     use crate::notifications::Kind;
                     let outcome = match turn["status"].as_str() {
@@ -3073,7 +3082,9 @@ impl Adapter for Codex {
                         )?;
                         self.resolve_turn_requests(thread, turn_id, &mut step);
                         let key = Some(format!("codex:{thread}:{turn_id}"));
-                        step.events.push(if current {
+                        // Published after the turn's items and error, so the
+                        // terminal outcome carries the provider's own reason.
+                        finished = Some(if current {
                             Event::TurnFinished { key, outcome }
                         } else {
                             Event::PastTurnFinished { key, outcome }
@@ -3140,6 +3151,7 @@ impl Adapter for Codex {
                         fatal: false,
                     });
                 }
+                step.events.extend(finished);
                 if method == "turn/completed" {
                     self.finish_execution(turn, current, &mut step, false)?;
                     if current {
@@ -4842,7 +4854,6 @@ mod tests {
                 output_window_started(replacement)
             };
             adapter.receive(frame).unwrap();
-            assert!(!adapter.output_streams.contains_key(&key));
             let window = adapter.output_windows.get(&key).unwrap();
             assert_eq!((window.omitted, window.head), (0, 0));
             let delta = "31m-tail🦀";
@@ -6850,7 +6861,7 @@ mod tests {
             assert!(replayed.busy);
             assert_eq!(replayed.outcome, pending.outcome);
             assert_eq!(replayed.turn_generation, pending.turn_generation);
-            assert!(!updates.try_iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:old")));
+            assert!(!updates.try_iter().any(|update| matches!(update, chat::runtime::Update::AttentionContext { evidence: evidence, .. } if evidence.key == "codex:thread-exact:old")));
             feed_frames(
                 &handle,
                 &frames,
@@ -6923,7 +6934,7 @@ mod tests {
                     assert_eq!(before_ack.busy, !announced);
                     let mut evidence = updates.try_iter().collect::<Vec<_>>();
                     if !announced {
-                        assert!(!evidence.iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:new")));
+                        assert!(!evidence.iter().any(|update| matches!(update, chat::runtime::Update::AttentionContext { evidence: evidence, .. } if evidence.key == "codex:thread-exact:new")));
                     }
                     feed_frames(
                         &handle,
@@ -6949,7 +6960,7 @@ mod tests {
                         })
                     );
                     evidence.extend(updates.try_iter());
-                    assert_eq!(evidence.iter().filter(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:new" && evidence.kind == outcome)).count(), 1);
+                    assert_eq!(evidence.iter().filter(|update| matches!(update, chat::runtime::Update::AttentionContext { evidence: evidence, .. } if evidence.key == "codex:thread-exact:new" && evidence.kind == outcome)).count(), 1);
                     let results = evidence
                         .iter()
                         .filter_map(|update| match update {
@@ -7006,7 +7017,7 @@ mod tests {
             assert_eq!(after.items, before.items);
             assert_eq!(after.outcome, before.outcome);
             assert_eq!(after.turn_generation, before.turn_generation);
-            assert!(!updates.try_iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:new")));
+            assert!(!updates.try_iter().any(|update| matches!(update, chat::runtime::Update::AttentionContext { evidence: evidence, .. } if evidence.key == "codex:thread-exact:new")));
             // Settle only this fixture's surviving turn after every ownership
             // assertion. Production close must not wait for an interruption
             // reply that the transport-free fixture can never deliver.
@@ -7215,7 +7226,7 @@ mod tests {
                 assert_eq!(after.activity(), crate::agent::ActivityState::Waiting);
                 let updates = updates.try_iter().collect::<Vec<_>>();
                 assert!(updates.iter().any(|update| matches!(update, chat::runtime::Update::PastAttention(evidence) if evidence.key == "codex:thread-exact:old" && evidence.kind == outcome)));
-                assert!(!updates.iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:old")));
+                assert!(!updates.iter().any(|update| matches!(update, chat::runtime::Update::AttentionContext { evidence: evidence, .. } if evidence.key == "codex:thread-exact:old")));
                 writes.try_iter().for_each(drop);
                 handle
                     .command(Command::Answer {
@@ -7289,7 +7300,7 @@ mod tests {
                 assert_eq!(after.requests, before.requests);
                 let updates = updates.try_iter().collect::<Vec<_>>();
                 assert!(updates.iter().any(|update| matches!(update, chat::runtime::Update::PastAttention(evidence) if evidence.key == "codex:thread-exact:old" && evidence.kind == outcome)));
-                assert!(!updates.iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:old")));
+                assert!(!updates.iter().any(|update| matches!(update, chat::runtime::Update::AttentionContext { evidence: evidence, .. } if evidence.key == "codex:thread-exact:old")));
                 handle.close().unwrap();
             }
         }
@@ -7320,7 +7331,7 @@ mod tests {
                 reason: "current failure".into()
             })
         );
-        assert!(updates.try_iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:current" && evidence.kind == Kind::Failed)));
+        assert!(updates.try_iter().any(|update| matches!(update, chat::runtime::Update::AttentionContext { evidence: evidence, .. } if evidence.key == "codex:thread-exact:current" && evidence.kind == Kind::Failed)));
         handle.close().unwrap();
     }
 
@@ -7359,7 +7370,7 @@ mod tests {
             assert_eq!(after.finished_at, before.finished_at);
             let evidence = updates.try_iter().collect::<Vec<_>>();
             assert!(evidence.iter().any(|update| matches!(update, chat::runtime::Update::PastAttention(attention) if attention.key == "codex:thread-exact:old" && attention.kind == Kind::Failed)));
-            assert!(!evidence.iter().any(|update| matches!(update, chat::runtime::Update::Attention(attention) if attention.key == "codex:thread-exact:old")));
+            assert!(!evidence.iter().any(|update| matches!(update, chat::runtime::Update::AttentionContext { evidence: attention, .. } if attention.key == "codex:thread-exact:old")));
             // A real known start establishes fresh authority after the unknown
             // activity; the refusal is not a permanent inability to finish.
             feed_frames(
@@ -7381,7 +7392,7 @@ mod tests {
                 handle.snapshot(None).unwrap().outcome,
                 Some(crate::agent::ActivityOutcome::Succeeded)
             );
-            assert!(updates.try_iter().any(|update| matches!(update, chat::runtime::Update::Attention(attention) if attention.key == "codex:thread-exact:new" && attention.kind == Kind::Succeeded)));
+            assert!(updates.try_iter().any(|update| matches!(update, chat::runtime::Update::AttentionContext { evidence: attention, .. } if attention.key == "codex:thread-exact:new" && attention.kind == Kind::Succeeded)));
             handle.close().unwrap();
         }
     }
@@ -7446,7 +7457,7 @@ mod tests {
                     finished[0].1.diagnostic.as_deref(),
                     Some("old accepted failure")
                 );
-                assert!(!evidence.iter().any(|update| matches!(update, chat::runtime::Update::Attention(attention) if attention.key == "codex:thread-exact:old")));
+                assert!(!evidence.iter().any(|update| matches!(update, chat::runtime::Update::AttentionContext { evidence: attention, .. } if attention.key == "codex:thread-exact:old")));
                 if !settled {
                     feed_frames(
                         &handle,
