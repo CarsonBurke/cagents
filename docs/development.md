@@ -250,7 +250,9 @@ jobs. With several slots each build gets an equal
 share of the CPUs as `CARGO_BUILD_JOBS`, which also caps a larger value; `-j`
 still wins. For `test`, `bench` and `run` only the build holds a slot, and the
 tests or program run after it is released, so do not wrap the gate in another
-lock. The development runner gates each of its builds itself.
+lock. Rustdoc compiles doctests while they run, so `cargo test --doc` keeps
+its slot throughout; a plain `cargo test` compiles its doctests after the
+slot is released. The development runner gates each of its builds itself.
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock /var/tmp/cagents-cargo.lock` takes exactly one

@@ -41,14 +41,16 @@ case $1 in
 esac
 [ "$#" -gt 0 ] || fail 'missing Cargo subcommand'
 
-cpus=$(nproc)
+# The machine's CPUs, not this process's share: nproc follows affinity and
+# OMP_NUM_THREADS, and a narrow caller would otherwise think it was alone.
+cpus=$(getconf _NPROCESSORS_ONLN)
 memory_kib=$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\) kB$/\1/p' /proc/meminfo)
 [ -n "$memory_kib" ] || fail 'cannot read MemTotal from /proc/meminfo'
 # A cagents build peaked at 6.5 GiB of anonymous memory with 12 jobs.
 slot_kib=$((8 * 1024 * 1024))
 if [ -n "${CAGENTS_BUILD_SLOTS:-}" ]; then
     slots=$CAGENTS_BUILD_SLOTS
-    case $slots in ''|*[!0-9]*|0) fail 'CAGENTS_BUILD_SLOTS must be a positive integer' ;; esac
+    case $slots in ''|*[!0-9]*|0*) fail 'CAGENTS_BUILD_SLOTS must be a positive integer' ;; esac
 else
     slots=$(((memory_kib - 8 * 1024 * 1024) / slot_kib))
     [ "$slots" -le $((cpus / 8)) ] || slots=$((cpus / 8))
@@ -61,7 +63,7 @@ if [ "$slots" -gt 1 ]; then
     share=$((cpus / slots))
     [ "$share" -ge 2 ] || share=2
     case ${CARGO_BUILD_JOBS:-} in
-        ''|*[!0-9]*) CARGO_BUILD_JOBS=$share ;;
+        ''|*[!0-9]*|0*) CARGO_BUILD_JOBS=$share ;;
         *) [ "$CARGO_BUILD_JOBS" -le "$share" ] || CARGO_BUILD_JOBS=$share ;;
     esac
     export CARGO_BUILD_JOBS
@@ -70,7 +72,8 @@ fi
 lock=${CAGENTS_BUILD_LOCK:-/var/tmp/cagents-cargo.lock}
 
 available_kib() {
-    sed -n 's/^MemAvailable:[[:space:]]*\([0-9]*\) kB$/\1/p' /proc/meminfo
+    available=$(sed -n 's/^MemAvailable:[[:space:]]*\([0-9]*\) kB$/\1/p' /proc/meminfo)
+    printf '%s' "${available:-0}"
 }
 
 announce() {
@@ -99,15 +102,18 @@ others_idle() {
 }
 
 # Holds a slot on descriptor 9 until release. One waiter at a time picks a
-# slot, so waiters are admitted roughly in arrival order.
+# slot, so waiters are admitted roughly in arrival order. The highest slot is
+# tried first: slot 0 is also taken by plain `flock` callers, who block on it
+# and would otherwise win it ahead of a polling gate.
 acquire() {
     announced=false
     waited_since=$(date +%s)
     exec 8>>"$lock.queue"
     flock -n 8 || { announce; flock 8; }
     while :; do
-        index=0
-        while [ "$index" -lt "$slots" ]; do
+        index=$slots
+        while [ "$index" -gt 0 ]; do
+            index=$((index - 1))
             exec 9>>"$(slot_path "$index")"
             if flock -n 9; then
                 # Start beside other builds only when the memory a build needs
@@ -123,7 +129,6 @@ acquire() {
                 flock -u 9
             fi
             exec 9>&-
-            index=$((index + 1))
         done
         announce
         sleep 0.5
@@ -134,14 +139,63 @@ release() {
     exec 9>&-
 }
 
-# Whether this process inherited an open slot lock, as under
+# Runs a shell function while this shell holds the slot. Descriptors 8 and 9
+# stay here, so a lingering child such as a compiler cache server cannot keep
+# the slot; a signal to the gate reaches the command, and the slot is released
+# only once it has exited.
+held() {
+    (
+        export CAGENTS_BUILD_SLOT_HELD=1
+        "$@"
+    ) 0<&0 8>&- 9>&- &
+    child=$!
+    trap 'kill -s TERM "$child" 2>/dev/null' INT TERM HUP
+    status=0
+    wait "$child" || status=$?
+    while kill -0 "$child" 2>/dev/null; do
+        status=0
+        wait "$child" || status=$?
+    done
+    trap - INT TERM HUP
+    return "$status"
+}
+
+run_cargo() {
+    exec cargo "$@"
+}
+
+# The build half of `test`, `bench` or `run`. Arguments after `--` belong to
+# the tests or program, not Cargo.
+build_phase() {
+    ended=false
+    for argument do
+        shift
+        [ "$argument" != -- ] || ended=true
+        [ "$ended" = true ] || set -- "$@" "$argument"
+    done
+    if [ "$subcommand" = run ]; then
+        exec cargo build "$@"
+    fi
+    exec cargo "$subcommand" --no-run "$@"
+}
+
+# Whether this process inherited a slot lock that is held, as under
 # `flock /var/tmp/cagents-cargo.lock scripts/run-development`. Its holder is an
 # ancestor, so waiting for another slot could wait on itself.
 inherits_slot() {
     held=$(readlink -f "$lock")
     for descriptor in /proc/$$/fd/*; do
-        case $(readlink "$descriptor") in
-            "$held"|"$held".[0-9]|"$held".[0-9][0-9]) return 0 ;;
+        path=$(readlink "$descriptor") || continue
+        case $path in
+            "$held"|"$held".[0-9]|"$held".[0-9][0-9])
+                exec 7>>"$path"
+                if flock -n 7; then
+                    exec 7>&-
+                else
+                    exec 7>&-
+                    return 0
+                fi
+                ;;
         esac
     done
     return 1
@@ -155,35 +209,26 @@ fi
 
 subcommand=$1
 shift
+
+# Cargo cannot build doctests without running them, so a doctest command
+# keeps its slot throughout.
+runs_separately=false
 case $subcommand in
-    test|bench|run)
-        if [ "$subcommand" = run ]; then build=build; else build=--no-run; fi
-        acquire
-        # Descriptors 8 and 9 stay with this shell: a lingering child such as a
-        # compiler cache server must not keep the slot.
-        status=0
-        (
-            # Arguments after `--` belong to the tests or program, not Cargo.
-            ended=false
-            for argument do
-                shift
-                [ "$argument" != -- ] || ended=true
-                [ "$ended" = true ] || set -- "$@" "$argument"
-            done
-            if [ "$build" = build ]; then
-                exec env CAGENTS_BUILD_SLOT_HELD=1 cargo build "$@"
-            fi
-            exec env CAGENTS_BUILD_SLOT_HELD=1 cargo "$subcommand" --no-run "$@"
-        ) 8>&- 9>&- || status=$?
-        release
-        [ "$status" -eq 0 ] || exit "$status"
-        exec cargo "$subcommand" "$@"
-        ;;
-    *)
-        acquire
-        status=0
-        CAGENTS_BUILD_SLOT_HELD=1 cargo "$subcommand" "$@" 8>&- 9>&- || status=$?
-        release
-        exit "$status"
-        ;;
+    test|bench|run) runs_separately=true ;;
 esac
+for argument do
+    [ "$argument" != -- ] || break
+    [ "$argument" != --doc ] || runs_separately=false
+done
+
+acquire
+status=0
+if [ "$runs_separately" = true ]; then
+    held build_phase "$@" || status=$?
+    release
+    [ "$status" -eq 0 ] || exit "$status"
+    exec cargo "$subcommand" "$@"
+fi
+held run_cargo "$subcommand" "$@" || status=$?
+release
+exit "$status"
