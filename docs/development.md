@@ -74,9 +74,9 @@ that isolation. Build a matched browserless release as three feature-disjoint
 targets:
 
 ```sh
-cargo build --locked --release --no-default-features --bin cagents
-cargo build --locked --release --no-default-features --features host --bin cagentsd
-cargo build --locked --release --no-default-features --features ui --bin cagents-ui
+scripts/cargo-gate build --locked --release --no-default-features --bin cagents
+scripts/cargo-gate build --locked --release --no-default-features --features host --bin cagentsd
+scripts/cargo-gate build --locked --release --no-default-features --features ui --bin cagents-ui
 ```
 
 `cagents`, `cagents-ui`, and `cagentsd` are a matched set and must stay
@@ -252,7 +252,8 @@ still wins. For `test`, `bench` and `run` only the build holds a slot, and the
 tests or program run after it is released, so do not wrap the gate in another
 lock. Rustdoc compiles doctests while they run, so `cargo test --doc` keeps
 its slot throughout; a plain `cargo test` compiles its doctests after the
-slot is released. The development runner gates each of its builds itself.
+slot is released. The development runner builds its matched set through the
+gate itself.
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock /var/tmp/cagents-cargo.lock` takes exactly one
@@ -323,7 +324,7 @@ identifying `libsqlite3-sys` as the affected package in a browserless UI check:
 ```sh
 # Explicit maintenance operation: only after evidence identifies this package.
 cargo clean --package libsqlite3-sys
-CARGO_BUILD_JOBS=2 cargo check --locked --no-default-features --features ui --bin cagents-ui
+CARGO_BUILD_JOBS=2 scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
 ```
 
 Use `name@version` if the package name is ambiguous. Preserve the clean output,
@@ -341,7 +342,7 @@ available, though Cargo may rebuild dependents of the selected package.
 CARGO_BUILD_JOBS=1 scripts/run-development --browserless
 
 # Opt into more compilation jobs when system RAM is available.
-cargo check --locked -j 4 --no-default-features --features ui --bin cagents-ui
+scripts/cargo-gate check --locked -j 4 --no-default-features --features ui --bin cagents-ui
 ```
 
 Compilation jobs and test threads are separate controls: `-j` does not
@@ -436,11 +437,11 @@ fixture layouts need more room; a short base alone is not proof.
     export TMPDIR
     printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
     CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
-        python3 scripts/build-ceditor-product cagentsd --locked \
+        scripts/cargo-gate exec python3 scripts/build-ceditor-product cagentsd --locked \
             --no-default-features --features host --bin cagentsd
     ) || exit
     export CAGENTS_TEST_RETAINED_ACTOR_HELPER
-    cargo test --locked --no-default-features --features host --all-targets
+    scripts/cargo-gate test --locked --no-default-features --features host --all-targets
 )
 ```
 
@@ -454,9 +455,9 @@ root to make a failed preparation pass.
 Prefer the narrow target that covers the changed contract, for example:
 
 ```sh
-cargo test --locked --no-default-features --features host --lib terminal::
-cargo test --locked --no-default-features --features host --test terminal_load_contract
-cargo test --locked --no-default-features --features ui --test session_restore_contract
+scripts/cargo-gate test --locked --no-default-features --features host --lib terminal::
+scripts/cargo-gate test --locked --no-default-features --features host --test terminal_load_contract
+scripts/cargo-gate test --locked --no-default-features --features ui --test session_restore_contract
 ```
 
 The four named-tree reconciliation contracts share their cases between the root
@@ -464,7 +465,7 @@ UI target and a focused workspace package. For edits confined to vendored
 iced-core tree reconciliation, run the focused package first:
 
 ```sh
-cargo test --locked -p cagents-iced-contracts
+scripts/cargo-gate test --locked -p cagents-iced-contracts
 ```
 
 The package uses the UI's exact iced-core Git revision; the root Cargo patch
@@ -475,7 +476,7 @@ uninhabited renderer. Retain validation through the UI's concrete renderer when
 changing the tree contract or UI integration:
 
 ```sh
-cargo test --locked --no-default-features --features ui --test iced_tree_reconciliation
+scripts/cargo-gate test --locked --no-default-features --features ui --test iced_tree_reconciliation
 ```
 
 Explicitly selecting a target with required features absent, including through a
@@ -488,7 +489,7 @@ library-suite run does not also create and mutate that filesystem fixture.
 mutations or pathspec handling, include its explicit target:
 
 ```sh
-cargo test --locked --no-default-features --features host --test repository_scale_contract
+scripts/cargo-gate test --locked --no-default-features --features host --test repository_scale_contract
 ```
 
 The fixture retains its disk-backed private namespace, subprocess deadline and
@@ -522,7 +523,7 @@ workloads are described in [Performance](performance.md).
 Repeatable upgrade-policy checks:
 
 ```sh
-cargo test --locked --no-default-features --test installer_lifecycle_contract
+scripts/cargo-gate test --locked --no-default-features --test installer_lifecycle_contract
 scripts/smoke-package-upgrades
 ```
 

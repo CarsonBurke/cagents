@@ -127,6 +127,10 @@ acquire() {
     exec 8>>"$lock.queue"
     flock -n 8 || { announce; flock 8; }
     waiter=
+    # A queued request outliving this gate would take slot 0 for a moment.
+    trap 'withdraw; exit 130' INT
+    trap 'withdraw; exit 143' TERM
+    trap 'withdraw; exit 129' HUP
     while :; do
         if [ -z "$waiter" ]; then
             exec 6>>"$lock"
@@ -142,12 +146,20 @@ acquire() {
             exec 9>&6 6>&-
             if [ "$(available_kib)" -ge "$slot_kib" ] || others_idle 0; then
                 index=0
+                trap - INT TERM HUP
                 admitted
                 return
             fi
             flock -u 9
             exec 9>&-
             sleep 0.5
+            continue
+        fi
+        # Queue again if the request itself was killed.
+        if waiter_gone; then
+            wait "$waiter" || :
+            waiter=
+            exec 6>&-
             continue
         fi
         index=$slots
@@ -158,7 +170,8 @@ acquire() {
                 # Start beside other builds only when the memory a build needs
                 # is free now; a lone build always starts.
                 if [ "$(available_kib)" -ge "$slot_kib" ] || others_idle "$index"; then
-                    stop_waiter
+                    withdraw
+                    trap - INT TERM HUP
                     admitted
                     return
                 fi
@@ -173,11 +186,19 @@ acquire() {
 
 # Withdraws the queued request for slot 0. Closing the last descriptor on it
 # also gives the slot back if the request was granted meanwhile.
-stop_waiter() {
-    kill "$waiter" 2>/dev/null || :
-    wait "$waiter" || :
+withdraw() {
+    if [ -n "$waiter" ]; then
+        kill "$waiter" 2>/dev/null || :
+        wait "$waiter" || :
+    fi
     exec 6>&-
     waiter=
+}
+
+# Whether the queued request has exited; an unreaped one is a zombie.
+waiter_gone() {
+    state=$(sed -n 's/^[0-9]* (.*) \(.\) .*/\1/p' /proc/"$waiter"/stat 2>/dev/null) || return 0
+    [ -z "$state" ] || [ "$state" = Z ]
 }
 
 admitted() {
@@ -247,9 +268,12 @@ inside_gate() {
     case ${CAGENTS_BUILD_SLOT_HELD:-} in
         ''|*[!0-9]*) return 1 ;;
     esac
-    holder=$(tr '\0' ' ' 2>/dev/null </proc/"$CAGENTS_BUILD_SLOT_HELD"/cmdline) || return 1
-    case $holder in
-        *cargo-gate*) return 0 ;;
+    # The gate runs as `sh PATH/cargo-gate ...`; its script is the second
+    # argument.
+    script=$(tr '\0' '\n' 2>/dev/null </proc/"$CAGENTS_BUILD_SLOT_HELD"/cmdline | sed -n 2p) ||
+        return 1
+    case $script in
+        cargo-gate|*/cargo-gate|*/cagents-cargo-gate) return 0 ;;
     esac
     return 1
 }
@@ -266,8 +290,10 @@ inherits_slot() {
         case $path in
             "$held"|"$held".[0-9]|"$held".[0-9][0-9])
                 inherited=${descriptor##*/}
-                probe=7
-                [ "$inherited" -ne 7 ] || probe=6
+                # Probe on a descriptor this process does not already use.
+                probe=3
+                while [ -e /proc/$$/fd/$probe ]; do probe=$((probe + 1)); done
+                [ "$probe" -le 9 ] || continue
                 eval "exec $probe>>\"\$path\""
                 if flock -n "$probe"; then
                     eval "exec $probe>&-"
