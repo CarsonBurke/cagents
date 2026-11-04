@@ -532,6 +532,7 @@ impl State {
             let Some(state) = self.account_mut(&restored.id) else {
                 continue;
             };
+            state.discovered_absent = !restored.present;
             // A probe that answered first knows better than the load.
             if state.snapshot.is_some() {
                 continue;
@@ -718,6 +719,9 @@ struct AccountState {
     /// its home exists. An absent system account gets no chip, because most
     /// people use one of the two CLIs rather than both.
     present: bool,
+    /// The latest discovery found the CLI or home missing. Live usage from a
+    /// conversation that is still running cannot overrule that finding.
+    discovered_absent: bool,
     identity: Option<Identity>,
     snapshot: Option<UsageSnapshot>,
     schedule: Schedule,
@@ -751,6 +755,7 @@ impl AccountState {
             id: account.id(),
             account,
             present: false,
+            discovered_absent: false,
             identity: None,
             snapshot: None,
             schedule: Schedule::default(),
@@ -2188,8 +2193,10 @@ impl Cagents {
         }
         if observed {
             // A running CLI can still report after discovery found its
-            // executable absent. Keep those figures without undoing discovery.
-            if cli_not_absent {
+            // executable or home absent, and a report may have been buffered
+            // before then. Keep those figures without undoing discovery: only
+            // a fresh discovery restores presence it found missing.
+            if cli_not_absent && !state.discovered_absent {
                 state.present = true;
                 state.failure = None;
             }
@@ -2416,10 +2423,15 @@ impl Cagents {
                 restored,
                 installed,
             } => {
-                if generation != self.account_ui.discovery_generation
-                    || owners != self.account_ui.discovery_owners()
-                {
+                if generation != self.account_ui.discovery_generation {
+                    // A newer discovery is in flight and drains manual intent.
                     return Task::none();
+                }
+                if owners != self.account_ui.discovery_owners() {
+                    // Accounts changed while this ran, so its result may
+                    // describe a removed or replaced row. Ask again rather than
+                    // dropping a Check now still waiting on this discovery.
+                    return self.locate_accounts();
                 }
                 self.account_ui.installed = installed;
                 // Fresh detection owns current presence, independently of an
@@ -2433,6 +2445,7 @@ impl Cagents {
                         state.schedule.invalidate();
                     }
                     state.present = restored.present;
+                    state.discovered_absent = !restored.present;
                     let absent = format!(
                         "{} is not installed",
                         probe::cli_name(state.account.provider)
@@ -9294,6 +9307,95 @@ mod app_tests {
             assert!(state.failure.is_none());
             assert_eq!(state.snapshot.as_ref().unwrap().source, UsageSource::Live);
         }
+    }
+
+    #[test]
+    fn live_usage_cannot_restore_an_account_whose_home_discovery_found_missing() {
+        let mut app = context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 912);
+        let recipe = recipe_on(&app, &id);
+        let now = now_ms();
+        app.account_ui.account_mut(&id).unwrap().present = true;
+        // The CLI remains installed, but this account's home was moved aside.
+        let _ = app.locate_accounts();
+        let restored = app
+            .account_ui
+            .accounts
+            .iter()
+            .filter(|state| !state.account.is_brokered())
+            .map(|state| Restored {
+                id: state.id.clone(),
+                present: state.id != id,
+                entry: None,
+            })
+            .collect();
+        let _ = app.update(Message::AccountUi(Action::Located {
+            generation: app.account_ui.discovery_generation,
+            owners: app.account_ui.discovery_owners(),
+            restored,
+            installed: BTreeMap::from([(Provider::Claude, true)]),
+        }));
+        assert!(!app.account_ui.account(&id).unwrap().present);
+
+        // A conversation still running from that home keeps reporting usage.
+        let _ = app.account_reported(Provider::Claude, &recipe, vec![(claude_report(0.4), now)]);
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(state.snapshot.as_ref().unwrap().source, UsageSource::Live);
+        assert!(!state.present, "live usage does not prove the home exists");
+
+        // Only a fresh discovery that finds the home again restores it.
+        let _ = app.locate_accounts();
+        finish_discovery(&mut app, BTreeMap::from([(Provider::Claude, true)]));
+        assert!(app.account_ui.account(&id).unwrap().present);
+    }
+
+    #[test]
+    fn a_manual_refresh_survives_account_changes_during_its_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.refresh_ui.focused = true;
+        let mut linked = linked_logins(
+            &mut app,
+            root.path(),
+            &["kept@example.test", "removed@example.test"],
+        );
+        let (removed_key, _) = linked.pop().unwrap();
+        let (_, kept) = linked.pop().unwrap();
+        {
+            let state = app.account_ui.account_mut(&kept).unwrap();
+            state.present = true;
+            state.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "history", now_ms()));
+            state.schedule.observe(now_ms());
+        }
+        let _ = app.update(Message::AccountUi(Action::Refresh(kept.clone())));
+        let generation = app.account_ui.discovery_generation;
+        let owners = app.account_ui.discovery_owners();
+        // Another account's removal lands before this discovery answers.
+        let mut changed = app.account_ui.registry.clone();
+        changed.unregister(removed_key);
+        let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Ok(changed))));
+        assert_ne!(owners, app.account_ui.discovery_owners());
+        let _ = app.update(Message::AccountUi(Action::Located {
+            generation,
+            owners,
+            restored: Vec::new(),
+            installed: BTreeMap::from([(Provider::Codex, true)]),
+        }));
+        assert!(
+            app.account_ui.discovery_generation > generation,
+            "the outdated result asks again instead of being dropped"
+        );
+        assert!(app.account_ui.discovery_manual.contains_key(&kept));
+        finish_discovery(&mut app, BTreeMap::from([(Provider::Codex, true)]));
+        assert!(app.account_ui.discovery_manual.is_empty());
+        assert!(
+            app.account_ui
+                .account(&kept)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms()),
+            "the retained Check now still probes the kept account"
+        );
     }
 
     #[test]
