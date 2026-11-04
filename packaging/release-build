@@ -139,6 +139,9 @@ export VERSION
 DEB_ARCH=amd64
 # Use conventional build permissions; the host wrapper's cache remains private.
 umask 022
+# Parallel fixtures hold many sockets and pipes; the inherited soft limit
+# (often 1024) is not a release property, so use the whole hard limit.
+ulimit -n "$(ulimit -Hn)"
 # Test threads follow the job count chosen for this host's memory.
 export RUST_TEST_THREADS=${CARGO_BUILD_JOBS:-2}
 # Tests keep release semantics (optimized, production identity, no debug
