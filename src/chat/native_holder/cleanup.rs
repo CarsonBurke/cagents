@@ -191,6 +191,10 @@ impl Startup {
     }
 }
 
+/// Bounds how long a published receipt may wait for its holder to retire
+/// discovery. A holder that died in that window leaves the record behind.
+const RETIREMENT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn consume(
     terminal: TerminalId,
     holder: &Process,
@@ -215,10 +219,16 @@ fn consume(
     if !matches(&receipt) {
         return Err("Native cleanup receipt belongs to another owner".into());
     }
-    // Publication precedes discovery retirement. Wait for that final step so
-    // acknowledging cleanup also permits immediate same-session replacement.
-    if registry::retirement_pending(&receipt.record).map_err(|error| error.to_string())? {
-        return Ok(false);
+    // Publication precedes discovery retirement by a few file operations.
+    // Wait for that final step so acknowledging cleanup also permits immediate
+    // same-session replacement; a caller racing the release must not fall back
+    // to inspecting a listener the holder has already retired.
+    let deadline = std::time::Instant::now() + RETIREMENT_GRACE;
+    while registry::retirement_pending(&receipt.record).map_err(|error| error.to_string())? {
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     if retain {
         return Ok(true);
