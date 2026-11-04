@@ -1,3 +1,4 @@
+mod automation_removal;
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
 #[cfg(target_os = "linux")]
