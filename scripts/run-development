@@ -234,12 +234,17 @@ fi
 
 # Where Cargo places the dev-runtime executables. They are run directly: a
 # `cargo run` would check the build again outside any build slot.
-products=$(cargo metadata --locked --format-version 1 --no-deps |
-    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/dev-runtime
-[ "$products" != /dev-runtime ] || {
-    printf '%s\n' 'cannot find the Cargo target directory' >&2
-    exit 1
+find_products() {
+    [ -z "${products:-}" ] || return 0
+    target=$(cargo metadata --locked --format-version 1 --no-deps |
+        sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+    [ -n "$target" ] || {
+        printf '%s\n' 'cannot find the Cargo target directory' >&2
+        exit 1
+    }
+    products=$target/dev-runtime
 }
+products=
 
 # Builds the matched set in one build slot, so an up-to-date checkout waits
 # for a slot once rather than three times. Each product is a separate Cargo
@@ -256,12 +261,14 @@ build_products() {
 }
 
 run_cli() {
+    find_products
     "$products/cagents" "$@"
 }
 
 # The CLI this checkout last built, so stopping an instance does not wait for
 # a build when one exists.
 instance_cli() {
+    find_products
     if [ ! -x "$products/cagents" ]; then
         # shellcheck disable=SC2086 # empty when the default features apply
         "$root/scripts/cargo-gate" build --locked --profile dev-runtime $default_features \
@@ -347,6 +354,7 @@ if [ "$stop_instance" = true ]; then
 fi
 
 build_products
+find_products
 
 # Keep the current development session alive if any part of the matched build
 # fails. Only stop its daemon once the replacement set is ready to launch.
