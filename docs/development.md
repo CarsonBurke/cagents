@@ -259,6 +259,12 @@ command still run under `flock /var/tmp/cagents-cargo.lock` takes exactly one
 slot. A gated command started under such a lock runs at once in the slot its
 caller holds. Set `CAGENTS_BUILD_SLOTS` to override the count.
 
+To gate a script that runs several Cargo commands, replace
+`flock /var/tmp/cagents-cargo.lock COMMAND` with
+`scripts/cargo-gate exec COMMAND`. It holds one slot until the command exits,
+and gated commands inside it run in that slot. Gating each Cargo command
+instead keeps test runs out of the slot.
+
 The feature lanes coexist in one build directory: a no-op check of one lane
 stays a no-op after building the others. With a per-checkout build directory,
 such as `build-dir = "/var/tmp/cargo-build{workspace-root}/target"` in

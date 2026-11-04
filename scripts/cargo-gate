@@ -16,10 +16,16 @@ fail() {
 usage() {
     cat <<'EOF'
 Usage: scripts/cargo-gate [cargo] SUBCOMMAND [ARGS...]
+       scripts/cargo-gate exec COMMAND [ARGS...]
 
 Runs `cargo SUBCOMMAND ARGS...` once a build slot is free. For `test`,
 `bench` and `run`, only the build (`--no-run`, or `build`) holds the slot; the
 tests or program run afterwards without it.
+
+`exec` runs any command, such as a script of several Cargo builds, in one
+slot held until it exits: a drop-in for `flock /var/tmp/cagents-cargo.lock
+COMMAND`. Gated commands inside it run in that slot without waiting. Prefer
+gating each Cargo command, so tests run outside the slot.
 
 Environment:
   CAGENTS_BUILD_SLOTS    Concurrent builds; default: one per 8 GiB of RAM
@@ -40,6 +46,13 @@ case $1 in
     cargo) shift ;;
 esac
 [ "$#" -gt 0 ] || fail 'missing Cargo subcommand'
+if [ "$1" = exec ]; then
+    shift
+    [ "$#" -gt 0 ] || fail 'missing command for exec'
+    mode=exec
+else
+    mode=cargo
+fi
 
 # The machine's CPUs, not this process's share: nproc follows affinity and
 # OMP_NUM_THREADS, and a narrow caller would otherwise think it was alone.
@@ -164,6 +177,10 @@ run_cargo() {
     exec cargo "$@"
 }
 
+run_command() {
+    exec "$@"
+}
+
 # The build half of `test`, `bench` or `run`. Arguments after `--` belong to
 # the tests or program, not Cargo.
 build_phase() {
@@ -204,7 +221,17 @@ inherits_slot() {
 # Already inside a slot: a gated command running Cargo again, or a caller
 # that took the lock itself.
 if [ -n "${CAGENTS_BUILD_SLOT_HELD:-}" ] || inherits_slot; then
-    exec cargo "$@"
+    [ "$mode" = exec ] || set -- cargo "$@"
+    export CAGENTS_BUILD_SLOT_HELD=1
+    exec "$@"
+fi
+
+if [ "$mode" = exec ]; then
+    acquire
+    status=0
+    held run_command "$@" || status=$?
+    release
+    exit "$status"
 fi
 
 subcommand=$1
