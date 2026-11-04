@@ -318,6 +318,20 @@ pub(super) fn fixture_source() -> chat::Session {
 }
 impl RemoteActor {
     #[cfg(test)]
+    pub(in crate::chat::runtime) fn fixture_waiting_title(title: String) -> Self {
+        let mut actor = Self::fixture();
+        let remote = Arc::get_mut(&mut actor.0).expect("fixture has no other actor handles");
+        let resident = Arc::get_mut(remote.state.get_mut().unwrap())
+            .expect("fixture owns its resident sample");
+        resident.title = Some(title);
+        resident.activity = crate::agent::ActivityState::Waiting;
+        resident.waiting = true;
+        resident.idle = false;
+        resident.close.activity = crate::agent::ActivityState::Waiting;
+        actor
+    }
+
+    #[cfg(test)]
     pub(in crate::chat::runtime) fn fixture() -> Self {
         use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalId};
         let process = Process::read(std::process::id() as i32).unwrap();

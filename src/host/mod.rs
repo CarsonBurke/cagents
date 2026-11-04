@@ -19,6 +19,7 @@ mod service;
 #[cfg(all(test, target_os = "linux"))]
 mod shutdown_tests;
 mod state;
+mod tray_attention;
 mod work;
 mod worktree_removal;
 
@@ -339,12 +340,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     })?;
     drop(admission);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
-    let tally_host = Arc::downgrade(&host);
-    let _tray = crate::tray::start(move || {
-        let host = tally_host.upgrade()?;
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        Some(state.agent_tally())
-    });
+    let _tray = tray_attention::start(&host, notification_application);
 
     let recovery_only = host
         .lock()

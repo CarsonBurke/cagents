@@ -5,7 +5,7 @@ use crate::{
     notifications::{Preferences, Presence, Snapshot, Target, TestOutcome, Update},
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     sync::{Mutex, Weak},
     thread,
 };
@@ -14,6 +14,11 @@ use std::{
 pub enum Action {
     Snapshot(Snapshot),
     Activated(Target),
+    TrayActivated(crate::instance::TrayActivation),
+    TrayActivationExpired {
+        request: uuid::Uuid,
+        generation: u64,
+    },
     OpenNotice(NoticeActivation),
     HostBound(HostSessionProof),
     LifecycleResolved {
@@ -124,6 +129,13 @@ struct ManagedActivation {
     session: crate::agent_execution::HostedSession,
 }
 
+struct PendingTrayActivation {
+    intent: crate::instance::TrayActivation,
+    backend: Option<(String, String, String)>,
+    bound: bool,
+    owner: Option<crate::model::AgentId>,
+}
+
 #[derive(Default)]
 struct Pending {
     presence: Option<Presence>,
@@ -167,10 +179,14 @@ pub(super) struct State {
     snapshot_backend: Option<(String, String, String)>,
     inbox_activation: Option<(crate::agent_execution::Lineage, uuid::Uuid)>,
     session_activation: Option<TerminalId>,
+    tray_activation: Option<PendingTrayActivation>,
+    tray_requests: VecDeque<uuid::Uuid>,
     activation_generation: u64,
     activation_attempt: Option<(Weak<WorkspaceState>, bool, uuid::Uuid, u64)>,
     #[cfg(test)]
     activation_attempts: usize,
+    #[cfg(test)]
+    tray_source_checks: usize,
 }
 
 impl Default for State {
@@ -197,10 +213,14 @@ impl Default for State {
             snapshot_backend: None,
             inbox_activation: None,
             session_activation: None,
+            tray_activation: None,
+            tray_requests: VecDeque::new(),
             activation_generation: 0,
             activation_attempt: None,
             #[cfg(test)]
             activation_attempts: 0,
+            #[cfg(test)]
+            tray_source_checks: 0,
         }
     }
 }
@@ -646,18 +666,77 @@ impl Cagents {
     }
 
     pub(super) fn update_notifications(&mut self, action: Action) -> Task<Message> {
-        if matches!(&action, Action::Activated(target) if !matches!(target, Target::SessionInbox(_)))
+        if let Action::TrayActivated(intent) = &action {
+            if self.notification_ui.tray_requests.contains(&intent.request) {
+                return Task::none();
+            }
+            if intent.validate().is_err() || intent.window != instance::window_slot() {
+                return Task::none();
+            }
+        }
+        if matches!(&action, Action::TrayActivated(_))
+            || matches!(&action, Action::Activated(target) if !matches!(target, Target::SessionInbox(_)))
         {
             self.notification_ui.inbox_activation = None;
         }
-        if matches!(&action, Action::Activated(_)) {
+        if matches!(&action, Action::Activated(_) | Action::TrayActivated(_)) {
             self.notification_ui.lifecycle_activation = None;
             self.notification_ui.session_activation = None;
+            self.notification_ui.tray_activation = None;
             self.notification_ui.activation_attempt = None;
             self.notification_ui.activation_generation =
                 self.notification_ui.activation_generation.wrapping_add(1);
         }
         match action {
+            Action::TrayActivated(intent) => {
+                let request = intent.request;
+                let session = intent.session;
+                self.notification_ui.tray_requests.push_back(request);
+                if self.notification_ui.tray_requests.len() > 64 {
+                    self.notification_ui.tray_requests.pop_front();
+                }
+                self.notification_ui.tray_activation = Some(PendingTrayActivation {
+                    intent,
+                    backend: lifecycle_backend(),
+                    bound: false,
+                    owner: None,
+                });
+                self.notification_ui.session_activation = Some(session);
+                let generation = self.notification_ui.activation_generation;
+                let focus = self.retry_notification_activation();
+                let expiry = cosmic::task::future(async move {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Message::NotificationUi(Action::TrayActivationExpired {
+                        request,
+                        generation,
+                    })
+                });
+                Task::batch([focus, expiry, self.activate_main_window(None)])
+            }
+            Action::TrayActivationExpired {
+                request,
+                generation,
+            } => {
+                if self
+                    .notification_ui
+                    .tray_activation
+                    .as_ref()
+                    .is_some_and(|pending| pending.intent.request == request)
+                    && generation == self.notification_ui.activation_generation
+                    && self
+                        .notification_ui
+                        .session_activation
+                        .is_some_and(|session| {
+                            self.resolved_activation_agent(session).is_none()
+                                && !self.durable.cards.iter().any(|card| {
+                                    card.existence.is_open() && card_session(card) == Some(session)
+                                })
+                        })
+                {
+                    self.retire_tray_activation();
+                }
+                Task::none()
+            }
             Action::OpenNotice(clicked) => {
                 let current = self.attention_notices().into_iter().any(|notice| {
                     notice.id == clicked.notice && notice.event.target == clicked.target
@@ -998,8 +1077,12 @@ impl Cagents {
 
     pub(super) fn retry_notification_activation(&mut self) -> Task<Message> {
         let Some(session) = self.notification_ui.session_activation else {
+            self.notification_ui.tray_activation = None;
             return Task::none();
         };
+        if !self.tray_namespace_current(session) {
+            return Task::none();
+        }
         let blocked = self.exit.is_some()
             || self.workspace_inputs_blocked()
             || self.focused_repository_is_saving()
@@ -1030,9 +1113,18 @@ impl Cagents {
         {
             self.notification_ui.activation_attempts += 1;
         }
+        if !self.tray_source_current(session) {
+            return Task::none();
+        }
         // A scheduled agent can remain headless in this window. Only this
         // explicit user activation may mount its exact authenticated descriptor.
         let managed = self.resolved_activation_agent(session);
+        if let (Some(pending), Some(managed)) = (&self.notification_ui.tray_activation, &managed)
+            && !pending.intent.source_matches(&managed.session)
+        {
+            self.retire_tray_activation();
+            return Task::none();
+        }
         if managed.is_none()
             && self.workspace_model.agents.iter().any(|agent| {
                 !agent.closed
@@ -1067,6 +1159,24 @@ impl Cagents {
                         .find(|card| card_session(card) == Some(session))
                 })
         };
+        if let (Some(pending), Some(card)) = (&self.notification_ui.tray_activation, existing) {
+            let source = match &card.kind {
+                CardKind::Chat(session) => {
+                    Some(crate::agent_execution::HostedSession::Chat(session.clone()))
+                }
+                CardKind::Terminal(session) => Some(
+                    crate::agent_execution::HostedSession::Terminal(session.clone()),
+                ),
+                _ => None,
+            };
+            if source
+                .as_ref()
+                .is_none_or(|source| !pending.intent.source_matches(source))
+            {
+                self.retire_tray_activation();
+                return Task::none();
+            }
+        }
         if existing.is_some_and(|card| !card.existence.is_open()) {
             self.notification_ui.session_activation = None;
             self.notification_ui.activation_attempt = None;
@@ -1141,6 +1251,122 @@ impl Cagents {
             self.notification_ui.activation_attempt = None;
         }
         Task::batch([adopted, focus])
+    }
+
+    fn retire_tray_activation(&mut self) {
+        self.notification_ui.tray_activation = None;
+        self.notification_ui.session_activation = None;
+        self.notification_ui.activation_attempt = None;
+        self.status = Some(TransientNotice::warning(
+            "The waiting agent changed or is unavailable here. Reopen the tray to choose a current agent.",
+        ));
+    }
+
+    fn tray_namespace_current(&mut self, session: TerminalId) -> bool {
+        let Some(pending) = &self.notification_ui.tray_activation else {
+            return true;
+        };
+        let known_registry = self.workspace_model.identity != crate::workspace_model::NO_REGISTRY;
+        let changed = pending.intent.session != session
+            || pending.backend != lifecycle_backend()
+            || (known_registry && self.workspace_model.identity != pending.intent.registry)
+            || self
+                .notification_ui
+                .host
+                .as_ref()
+                .is_some_and(|host| host != &pending.intent.host)
+            || (pending.bound && (!known_registry || self.notification_ui.host.is_none()));
+        if changed {
+            self.retire_tray_activation();
+            return false;
+        }
+        if !known_registry || self.notification_ui.host.is_none() {
+            return false;
+        }
+        self.notification_ui.tray_activation.as_mut().unwrap().bound = true;
+        true
+    }
+
+    fn tray_source_current(&mut self, session: TerminalId) -> bool {
+        let Some(pending) = &self.notification_ui.tray_activation else {
+            return true;
+        };
+        #[cfg(test)]
+        {
+            self.notification_ui.tray_source_checks += 1;
+        }
+        let owners = self
+            .workspace_model
+            .agents
+            .iter()
+            .filter(|agent| {
+                agent
+                    .session
+                    .as_ref()
+                    .is_some_and(|source| source.id() == session)
+                    || agent
+                        .console
+                        .as_ref()
+                        .is_some_and(|source| source.id == session)
+            })
+            .collect::<Vec<_>>();
+        let live = owners
+            .iter()
+            .copied()
+            .filter(|agent| !agent.closed)
+            .collect::<Vec<_>>();
+        let closed_scope = live.first().is_some_and(|agent| {
+            let index =
+                crate::workspace_model::views::ManagedDisplayIndex::new(&self.workspace_model);
+            let Some(resolved) = index.activation_display(agent, session) else {
+                return false;
+            };
+            let repository = match &resolved.display.scope {
+                crate::agent_execution::Placement::Channel(channel) => {
+                    if self.channel_ui.was_deleted(*channel)
+                        || self.channel_ui.is_deleting(*channel)
+                    {
+                        return true;
+                    }
+                    self.workspace_model
+                        .channel(*channel)
+                        .map(|channel| &channel.repository)
+                }
+                crate::agent_execution::Placement::Worktree { repository, .. } => Some(repository),
+            };
+            repository.is_some_and(|repository| {
+                self.project_ui.closed.contains(repository)
+                    || self.workspace_model.closed_projects.contains(repository)
+            })
+        });
+        if live.len() > 1
+            || closed_scope
+            || (!owners.is_empty() && live.is_empty())
+            || (pending.owner.is_some() && live.first().map(|agent| agent.id) != pending.owner)
+            || live.first().is_some_and(|agent| {
+                let native = agent
+                    .session
+                    .as_ref()
+                    .is_some_and(|source| pending.intent.source_matches(source));
+                let console =
+                    agent.console.as_ref().is_some_and(|source| {
+                        pending.intent.source_matches(
+                            &crate::agent_execution::HostedSession::Terminal(source.clone()),
+                        )
+                    });
+                !native && !console
+            })
+        {
+            self.retire_tray_activation();
+            return false;
+        }
+        let owner = live.first().map(|agent| agent.id);
+        let pending = self.notification_ui.tray_activation.as_mut().unwrap();
+        pending.bound = true;
+        if owner.is_some() {
+            pending.owner = owner;
+        }
+        true
     }
 
     fn notification_attention_updates(
@@ -2270,7 +2496,7 @@ mod tests {
         assert!(app.notification_ui.acknowledged_for_test(id));
     }
 
-    fn scheduled_attention_fixture() -> (Cagents, crate::agent_execution::Agent) {
+    pub(super) fn scheduled_attention_fixture() -> (Cagents, crate::agent_execution::Agent) {
         use crate::agent_execution::{
             Agent, Origin, Placement, Spec, Surface, Target as AgentTarget,
         };
@@ -3776,3 +4002,6 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = Action> +
 
 #[cfg(test)]
 mod journal_tests;
+
+#[cfg(test)]
+mod tray_tests;

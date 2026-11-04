@@ -1410,11 +1410,83 @@ impl ApplicationLease {
 }
 
 /// A later `cagents ui` invocation asking the running window to come forward.
+/// Private tray intent, distinct from a saved conversation link. Fingerprints
+/// describe the existing logical process, never an actor capability.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TrayActivation {
+    pub request: uuid::Uuid,
+    pub registry: uuid::Uuid,
+    pub host: crate::model::HostSessionProof,
+    pub window: String,
+    pub session: crate::model::TerminalId,
+    pub sources: Vec<[u8; 32]>,
+}
+
+impl TrayActivation {
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        validate_window_slot(&self.window)?;
+        if self.request.is_nil()
+            || self.registry.is_nil()
+            || self.session.as_uuid().is_nil()
+            || !self.host.is_complete()
+            || !(1..=2).contains(&self.sources.len())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid tray intent",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn source_matches(&self, source: &crate::agent_execution::HostedSession) -> bool {
+        source.id() == self.session
+            && tray_source_fingerprint(source)
+                .is_ok_and(|fingerprint| self.sources.contains(&fingerprint))
+    }
+}
+
+/// Hash exactly HostedSession::same_process fields, excluding mutable thread,
+/// transcript and presentation metadata. The wire never contains launch env.
+pub(crate) fn tray_source_fingerprint(
+    source: &crate::agent_execution::HostedSession,
+) -> io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    if !source.has_complete_proof() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Tray source has no live proof",
+        ));
+    }
+    let bytes = match source {
+        crate::agent_execution::HostedSession::Chat(session) => serde_json::to_vec(&(
+            "chat",
+            session.id,
+            &session.proof,
+            session.launch.provider,
+            &session.launch.recipe,
+        )),
+        crate::agent_execution::HostedSession::Terminal(session) => serde_json::to_vec(&(
+            "terminal",
+            session.id,
+            &session.launch,
+            session.continuity.live_proof(),
+        )),
+    }
+    .map_err(io::Error::other)?;
+    let mut hash = Sha256::new();
+    hash.update(b"cagents-private-tray-process-v1\0");
+    hash.update(bytes);
+    Ok(hash.finalize().into())
+}
+
 #[cfg(feature = "ui")]
 #[derive(Debug, Clone)]
 pub struct UiActivation {
     pub token: Option<String>,
     pub session: Option<crate::model::TerminalId>,
+    pub(crate) tray: Option<TrayActivation>,
     pub update: Option<UiUpdateRequest>,
 }
 
@@ -1567,6 +1639,61 @@ pub fn activate_window_session(
     token: Option<&str>,
 ) -> io::Result<bool> {
     activate_window_session_in(&runtime_directory()?, slot, session, token)
+}
+
+pub(crate) fn activate_window_tray(intent: &TrayActivation) -> io::Result<bool> {
+    activate_window_tray_in(&runtime_directory()?, intent)
+}
+
+fn activate_window_tray_in(runtime: &Path, intent: &TrayActivation) -> io::Result<bool> {
+    intent.validate()?;
+    require_owned_runtime_directory(runtime)?;
+    let line = format!(
+        "tray-attention {}\n",
+        serde_json::to_string(intent).map_err(io::Error::other)?
+    );
+    if line.len() > MAX_ACTIVATION_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Tray intent is too large",
+        ));
+    }
+    let mut stream = match UnixStream::connect(runtime.join(slot_socket_name(&intent.window))) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+    stream.set_read_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+    stream.write_all(line.as_bytes())?;
+    Ok(read_capped_line(&stream)? == "ok")
+}
+
+/// Actual private socket/decoder/event handoff for App regression parents.
+#[cfg(all(test, feature = "ui"))]
+pub(crate) fn fixture_activation_event(intent: &TrayActivation, generic: bool) -> UiActivation {
+    let runtime = tempfile::tempdir().unwrap();
+    let (sender, receiver) = async_channel::bounded(1);
+    let listener =
+        UiActivationListener::bind_named(runtime.path(), slot_socket_name(&intent.window), sender)
+            .unwrap();
+    let admitted = if generic {
+        activate_window_session_in(runtime.path(), &intent.window, intent.session, None)
+    } else {
+        activate_window_tray_in(runtime.path(), intent)
+    };
+    // The production ACK follows send_blocking; it proves the event is queued.
+    let event = receiver.try_recv();
+    drop(listener);
+    assert!(admitted.unwrap());
+    event.unwrap()
 }
 
 fn activate_window_session_in(
@@ -1842,6 +1969,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                     .send_blocking(UiActivation {
                         token,
                         session: None,
+                        tray: None,
                         update: None,
                     })
                     .is_err()
@@ -1856,6 +1984,22 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                     .send_blocking(UiActivation {
                         token,
                         session: Some(session),
+                        tray: None,
+                        update: None,
+                    })
+                    .is_err()
+                {
+                    let _ = writeln!(&stream, "error: window is no longer accepting activations");
+                    break;
+                }
+                let _ = writeln!(&stream, "ok");
+            }
+            Ok(ActivationRequest::Tray(intent)) => {
+                if events
+                    .send_blocking(UiActivation {
+                        token: None,
+                        session: None,
+                        tray: Some(intent),
                         update: None,
                     })
                     .is_err()
@@ -1871,6 +2015,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                     .send_blocking(UiActivation {
                         token: None,
                         session: None,
+                        tray: None,
                         update: Some(UiUpdateRequest { action, response }),
                     })
                     .is_err()
@@ -1893,6 +2038,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
 enum ActivationRequest {
     Activate(Option<String>),
     Session(crate::model::TerminalId, Option<String>),
+    Tray(TrayActivation),
     Shutdown,
     Update(UiUpdateAction),
 }
@@ -1923,6 +2069,11 @@ fn read_capped_line(stream: &UnixStream) -> io::Result<String> {
 
 #[cfg(feature = "ui")]
 fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
+    if let Some(json) = line.strip_prefix("tray-attention ") {
+        let intent: TrayActivation = serde_json::from_str(json).map_err(io::Error::other)?;
+        intent.validate()?;
+        return Ok(ActivationRequest::Tray(intent));
+    }
     match line.split_once(' ') {
         None if line == "activate" => Ok(ActivationRequest::Activate(None)),
         None if line == "shutdown" => Ok(ActivationRequest::Shutdown),
@@ -2920,6 +3071,51 @@ mod tests {
         ));
         assert!(parse_activation_request("open").is_err());
         assert!(parse_activation_request("activate ").is_err());
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn tray_activation_codec_requires_private_provenance_and_keeps_generic_session_kind() {
+        let intent = TrayActivation {
+            request: uuid::Uuid::new_v4(),
+            registry: uuid::Uuid::new_v4(),
+            host: crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("tray-codec-host"),
+                boot_id: crate::model::BootId::new("tray-codec-boot"),
+                host_incarnation: crate::model::HostIncarnation::new("tray-codec-incarnation"),
+            },
+            window: PRIMARY_WINDOW.into(),
+            session: crate::model::TerminalId::new(),
+            sources: vec![[4; 32]],
+        };
+        let encoded = serde_json::to_value(&intent).unwrap();
+        let request = format!("tray-attention {encoded}");
+        assert!(
+            matches!(parse_activation_request(&request).unwrap(), ActivationRequest::Tray(current) if current == intent)
+        );
+        assert!(
+            matches!(parse_activation_request(&format!("session {}", intent.session)).unwrap(), ActivationRequest::Session(current, None) if current == intent.session)
+        );
+        for mutation in 0..7 {
+            let mut invalid = encoded.clone();
+            match mutation {
+                0 => invalid["request"] = serde_json::json!(uuid::Uuid::nil()),
+                1 => invalid["registry"] = serde_json::json!(uuid::Uuid::nil()),
+                2 => invalid["session"] = serde_json::json!(uuid::Uuid::nil()),
+                3 => invalid["window"] = serde_json::json!("../invalid"),
+                4 => invalid["host"]["host_incarnation"] = serde_json::json!(""),
+                5 => invalid["sources"] = serde_json::json!([]),
+                6 => invalid["unexpected_saved_link"] = serde_json::json!(true),
+                _ => unreachable!(),
+            }
+            assert!(
+                parse_activation_request(&format!("tray-attention {invalid}")).is_err(),
+                "invalid tray envelope {mutation} must be refused"
+            );
+        }
+        let mut excessive = intent;
+        excessive.sources = vec![[4; 32]; 3];
+        assert!(excessive.validate().is_err());
     }
 
     #[cfg(feature = "ui")]

@@ -85,6 +85,10 @@ pub(crate) struct TerminalRecord {
 }
 
 impl TerminalRecord {
+    pub(super) fn is_running(&self) -> bool {
+        self.running
+    }
+
     pub(super) fn execution_launch(&self) -> &crate::model::LaunchRecipe {
         self.execution_recipe
             .as_ref()
@@ -313,6 +317,7 @@ pub(crate) struct HostState {
     notification_watchers: BTreeMap<ClientId, crate::notifications::Presence>,
     notification_activation:
         BTreeMap<crate::notifications::Destination, crate::notifications::Target>,
+    tray_activation: BTreeMap<crate::notifications::Destination, crate::instance::TrayActivation>,
     subscriptions: Subscriptions,
     pub(super) shutting_down: bool,
     shutdown_requested: bool,
@@ -444,6 +449,7 @@ impl HostState {
             notification_closed: BTreeSet::new(),
             notification_watchers: BTreeMap::new(),
             notification_activation: BTreeMap::new(),
+            tray_activation: BTreeMap::new(),
             subscriptions: Subscriptions::default(),
             shutting_down: false,
             shutdown_requested: false,
@@ -581,6 +587,73 @@ impl HostState {
         )
     }
 
+    /// Select only a Cagents window which reports this exact session. The
+    /// Session socket acknowledgement, rather than its presence, admits focus.
+    pub(super) fn tray_destination(
+        &self,
+        session: TerminalId,
+    ) -> crate::notifications::Destination {
+        use crate::notifications::{Application, Destination};
+        self.notification_watchers
+            .values()
+            .filter(|presence| {
+                presence.application == Application::Cagents && presence.sessions.contains(&session)
+            })
+            .max_by_key(|presence| {
+                (
+                    presence.focused == Some(session),
+                    presence.window == crate::instance::PRIMARY_WINDOW,
+                )
+            })
+            .map_or_else(
+                || Destination {
+                    application: Application::Cagents,
+                    window: crate::instance::PRIMARY_WINDOW.to_owned(),
+                },
+                crate::notifications::Presence::destination,
+            )
+    }
+
+    pub(super) fn queue_tray_session(
+        &mut self,
+        destination: crate::notifications::Destination,
+        intent: crate::instance::TrayActivation,
+    ) -> Result<(), String> {
+        if destination.application != crate::notifications::Application::Cagents {
+            return Err("Waiting-agent navigation requires a Cagents window".into());
+        }
+        destination.validate()?;
+        intent.validate().map_err(|error| error.to_string())?;
+        if intent.window != destination.window {
+            return Err("Waiting-agent destination changed".into());
+        }
+        if self.tray_activation.len() >= 32 && !self.tray_activation.contains_key(&destination) {
+            return Err("The window navigation queue is full; try again shortly".into());
+        }
+        // A newer explicit tray choice supersedes a cold desktop-alert click
+        // for this window; a later generic watch must not replay the old one.
+        self.notification_activation.remove(&destination);
+        self.tray_activation.insert(destination, intent);
+        Ok(())
+    }
+
+    pub(super) fn pending_tray_session(
+        &self,
+        destination: &crate::notifications::Destination,
+    ) -> Option<&crate::instance::TrayActivation> {
+        self.tray_activation.get(destination)
+    }
+
+    pub(super) fn acknowledge_tray_session(
+        &mut self,
+        destination: &crate::notifications::Destination,
+        intent: &crate::instance::TrayActivation,
+    ) {
+        if self.tray_activation.get(destination) == Some(intent) {
+            self.tray_activation.remove(destination);
+        }
+    }
+
     pub(super) fn watch_notifications(
         &mut self,
         client: ClientId,
@@ -659,6 +732,7 @@ impl HostState {
             });
         if let Some((&client, presence)) = owner {
             let destination = presence.destination();
+            self.tray_activation.remove(&destination);
             if let Some(delivery) = self.clients.get(&client) {
                 let _ = delivery.push(ServerEnvelope {
                     version: PROTOCOL_VERSION,
@@ -675,6 +749,7 @@ impl HostState {
                 .unwrap_or(crate::instance::PRIMARY_WINDOW)
                 .to_owned(),
         });
+        self.tray_activation.remove(&destination);
         if self.notification_activation.len() < 32
             || self.notification_activation.contains_key(&destination)
         {
