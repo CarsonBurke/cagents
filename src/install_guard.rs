@@ -558,9 +558,9 @@ fn selectable_root(prefix: &Path, version_root: &Path) -> io::Result<std::path::
     Ok(target)
 }
 
-/// Atomically replaces `current` with `link`, provided it still holds
-/// `expected`. The exchange keeps the replaced link, so an independent change
-/// is put back exactly as found rather than overwritten.
+/// Exchanges `current` with `link`, retaining the link replaced at that instant.
+/// An unexpected link is restored before refusing. Supported writers hold the
+/// caller's launch fence; manual filesystem writes outside it are not serialized.
 fn exchange_current(prefix: &Path, link: &Path, expected: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let current = prefix.join("current");
@@ -603,7 +603,7 @@ fn exchange_current(prefix: &Path, link: &Path, expected: &Path) -> io::Result<(
             let _ = std::fs::remove_file(&next);
         }
         return Err(io::Error::other(match restored {
-            Ok(()) => "current installation changed independently; it was left as found".into(),
+            Ok(()) => "current installation changed independently; the link observed during selection was restored".into(),
             Err(error) => format!(
                 "current installation changed independently, and restoring it failed ({error}); its replaced link is kept at {}",
                 next.display()
@@ -1157,8 +1157,8 @@ mod tests {
             std::fs::read_link(&current).unwrap(),
             Path::new("versions/new")
         );
-        // The exchange itself is the comparison: whatever an independent
-        // writer published is put back, never replaced by this selection.
+        // A link changed before the exchange is restored. Supported writers
+        // cannot race the exchange while the caller holds the launch fence.
         let error = exchange_current(
             prefix,
             Path::new("versions/old"),
