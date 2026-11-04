@@ -49,6 +49,9 @@ while (($#)); do
 done
 ((STAGE_ONLY == 0 || ${#UPGRADE_ARGS[@]} == 0)) || fail '--yes and --interrupt apply to the upgrade, not --stage-only'
 
+# install.sh refuses hosted agent sessions; say so before spending a build.
+[[ ${CAGENTS_AGENT_AUTHORITY+x} != x ]] || fail 'run this from your own terminal; hosted sessions cannot change the installation'
+
 cd "$ROOT_DIR"
 # Only HEAD is built; refuse rather than silently leave tracked edits out.
 [[ -z $(git status --porcelain --untracked-files=no) ]] || fail 'commit or discard tracked changes first'
