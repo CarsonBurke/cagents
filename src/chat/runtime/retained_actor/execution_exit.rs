@@ -39,7 +39,7 @@ pub(super) fn identity_absent(expected: &Process) -> Result<bool, String> {
 /// that happens to reuse it); both refuse. Descendants that left the group on
 /// purpose are tool work, not writers of the provider's conversation, which
 /// only the provider process itself records.
-pub(super) fn abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
+pub(crate) fn abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
     abandoned_in(std::path::Path::new("/proc"), holder, root)
 }
 

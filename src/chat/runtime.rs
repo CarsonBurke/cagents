@@ -29,6 +29,8 @@ mod handle;
 pub use handle::Handle;
 #[cfg(test)]
 pub(crate) use handle::RetainedInputOutcome;
+/// Process evidence only, without the reader lease: no retirement authority.
+pub(crate) use retained_actor::execution_exit::abandoned as retained_actor_abandoned;
 pub(crate) use retained_actor::transport::{
     ActorIdentity, RetirementInspection, VerifiedRetirement,
 };
