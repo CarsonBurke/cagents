@@ -84,7 +84,7 @@ impl Store {
             .write(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(self.root.process_path().join(LOCK))
+            .open(self.root.process_path().map_err(storage_error)?.join(LOCK))
             .map_err(storage_error)?;
         validate_private(&file)?;
         crate::instance::owned_file_lock(file, libc::LOCK_EX).map_err(storage_error)
@@ -170,7 +170,9 @@ impl Store {
         }
         // Lost metadata must never silently reset numbers/device or turn
         // existing bytes into new, unrelated image identities.
-        for entry in std::fs::read_dir(self.root.process_path()).map_err(storage_error)? {
+        for entry in std::fs::read_dir(self.root.process_path().map_err(storage_error)?)
+            .map_err(storage_error)?
+        {
             let name = entry.map_err(storage_error)?.file_name();
             if is_staging_temporary(&name) {
                 self.remove_private_temporary(&name)?;
@@ -387,7 +389,7 @@ impl Store {
     #[cfg(any(feature = "ui", all(test, feature = "host")))]
     fn remove_orphans(&self, registry: &Registry) -> Result<(), String> {
         let mut unrecognized = false;
-        for (count, entry) in std::fs::read_dir(self.root.process_path())
+        for (count, entry) in std::fs::read_dir(self.root.process_path().map_err(storage_error)?)
             .map_err(storage_error)?
             .enumerate()
         {

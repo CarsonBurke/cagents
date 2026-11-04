@@ -20,7 +20,8 @@ fn fresh_host_launch_keeps_prepared_identity_and_rejects_foreign_provider_frames
             fs::create_dir_all(root.join(path)).unwrap();
         }
         let test = thread::current().name().unwrap().to_owned();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--exact", &test, "--nocapture"])
             .env_clear()
             .env(MODE, "1")
@@ -39,14 +40,19 @@ fn fresh_host_launch_keeps_prepared_identity_and_rejects_foreign_provider_frames
             .env(
                 "PATH",
                 format!("{}:/usr/bin:/bin", root.join("bin").display()),
-            )
-            .output()
-            .unwrap();
+            );
+        let output =
+            crate::host::fixture_process::run_fixture(&mut command, root, Duration::from_secs(90))
+                .unwrap();
         assert!(
             output.status.success(),
             "stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
         );
         return;
     }
@@ -83,33 +89,13 @@ fn fresh_host_launch_keeps_prepared_identity_and_rejects_foreign_provider_frames
     // This is the real HOST entry, including its first protocol::create call.
     start_execution(&host, 0, source, context).unwrap();
     let handle = host.lock().unwrap().chats[&id].handle.clone();
+    // Captures only the returned, live authenticated actor. The startup Close
+    // guard remains armed until the parent holds both original descriptors.
+    let _cleanup = crate::host::fixture_process::ActorGuard::created(handle.clone(), proof.clone())
+        .expect("original actor custody must be acknowledged before fixture input");
     let identity = handle
         .actor_identity()
         .expect("actual retained helper required");
-    struct Cleanup {
-        handle: Handle,
-        record: crate::daemon::holder_registry::Record,
-    }
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            if self.handle.close().is_ok() && self.handle.finish_retained_close().is_ok() {
-                return;
-            }
-            // Failed fixtures kill only their own exact process incarnations;
-            // this is teardown, not evidence of semantic retirement.
-            for process in [&self.record.root, &self.record.holder] {
-                if process.is_current() {
-                    unsafe {
-                        libc::kill(process.pid, libc::SIGKILL);
-                    }
-                }
-            }
-        }
-    }
-    let _cleanup = Cleanup {
-        handle: handle.clone(),
-        record: identity.record.clone(),
-    };
     wait(
         || handle.attachment_snapshot().ready,
         "provider did not initialize",

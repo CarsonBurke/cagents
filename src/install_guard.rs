@@ -82,11 +82,13 @@ pub(crate) fn record_deferred(stage: Option<(&Path, &Path)>) -> io::Result<()> {
     file.write_all(DEFERRED_RECEIPT)
 }
 
+#[cfg(target_os = "linux")]
 struct ResultPipe {
     reader: File,
     writer: File,
 }
 
+#[cfg(target_os = "linux")]
 impl ResultPipe {
     fn new() -> io::Result<Self> {
         let mut fds = [-1; 2];
@@ -191,6 +193,7 @@ impl Drop for Signals {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn run(
     prefix: &Path,
     installer: &Path,
@@ -323,6 +326,22 @@ struct StagedOwner {
     daemon_compatible: bool,
     #[serde(default)]
     candidate_protocol: u16,
+}
+
+/// Refuse before opening the installer, changing signal handlers, or acquiring
+/// a window guard. The Linux transaction cannot be approximated by a pipe
+/// without atomic descriptor flags or by numeric process ownership.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn run(
+    _prefix: &Path,
+    _installer: &Path,
+    _arguments: &[OsString],
+    _stage_only: bool,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Coordinated installation requires Linux window and process ownership",
+    ))
 }
 
 fn compatible_owner() -> io::Result<bool> {
@@ -777,6 +796,21 @@ fn running_owner_bin(prefix: &Path, executable: &Path) -> io::Result<std::path::
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn unsupported_installation_refuses_before_path_or_window_preparation() {
+        for stage_only in [false, true] {
+            let error = run(
+                Path::new("relative-prefix-must-not-be-opened"),
+                Path::new("missing-installer-must-not-be-opened"),
+                &[],
+                stage_only,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        }
+    }
+
     use super::*;
 
     #[cfg(target_os = "linux")]

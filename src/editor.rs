@@ -479,7 +479,7 @@ fn load_regular_file(
     root: &Root,
     worktree: &Path,
     relative_path: &Path,
-    metadata: fs::Metadata,
+    metadata: fs_safety::EntryMetadata,
     tone: PdfTone,
 ) -> Result<FileContent, FileIoError> {
     if !metadata.is_file() {

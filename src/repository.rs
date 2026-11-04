@@ -2835,7 +2835,7 @@ fn untracked_line_count(
         return None;
     }
     let mut file = fs_safety::open_beneath(root, relative).ok()?;
-    let opened = fs_safety::metadata_of(&file).ok()?;
+    let opened = fs_safety::EntryMetadata::from(&fs_safety::metadata_of(&file).ok()?);
     if !opened.is_file() || opened.len() > MAX_DIFF_SIDE_BYTES || opened.len() >= *remaining {
         return None;
     }
@@ -2869,7 +2869,7 @@ fn untracked_line_count(
     }
     // Reject concurrent writes and replacement/unlink races rather than attach
     // counts from a different object to this path in the snapshot.
-    let identity = |metadata: &fs::Metadata| {
+    let identity = |metadata: &fs_safety::EntryMetadata| {
         (
             metadata.dev(),
             metadata.ino(),
@@ -2880,7 +2880,7 @@ fn untracked_line_count(
             metadata.ctime_nsec(),
         )
     };
-    let after = fs_safety::metadata_of(&file).ok()?;
+    let after = fs_safety::EntryMetadata::from(&fs_safety::metadata_of(&file).ok()?);
     let named = fs_safety::metadata_beneath(root, relative).ok()?;
     if identity(&opened) != identity(&after)
         || identity(&after) != identity(&named)
@@ -6421,8 +6421,10 @@ impl GitFileLock {
         Ok((metadata.dev(), metadata.ino()))
     }
 
-    fn version(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
-        use std::os::unix::fs::MetadataExt;
+    fn version(
+        metadata: impl Into<fs_safety::EntryMetadata>,
+    ) -> (u64, u64, u64, i64, i64, i64, i64) {
+        let metadata = metadata.into();
         (
             metadata.dev(),
             metadata.ino(),

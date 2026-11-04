@@ -5521,6 +5521,8 @@ pub(crate) mod tests {
 
     const CHILD_HELPER_ENV: &str = "CAGENTS_LSP_CHILD_HELPER";
     const CHILD_HELPER_TEST: &str = "lsp::tests::child_helper_sleeps_until_terminated";
+    const CHILD_RELEASE_ENV: &str = "CAGENTS_LSP_CHILD_RELEASE";
+    const CHILD_FINISHED_ENV: &str = "CAGENTS_LSP_CHILD_FINISHED";
 
     /// Holds the path the grandchild helper publishes its pid to, so its
     /// presence is proof the helper body ran.
@@ -10103,7 +10105,29 @@ pub(crate) mod tests {
         if std::env::var_os(CHILD_HELPER_ENV).is_none() {
             return;
         }
-        std::thread::sleep(Duration::from_secs(120));
+        let Some(release) = std::env::var_os(CHILD_RELEASE_ENV) else {
+            std::thread::sleep(Duration::from_secs(120));
+            return;
+        };
+        let release = PathBuf::from(release);
+        let finished = PathBuf::from(
+            std::env::var_os(CHILD_FINISHED_ENV).expect("private cooperative fixture completion"),
+        );
+        let ready = finished.with_extension("ready");
+        let staged = finished.with_extension("ready-staged");
+        std::fs::write(&staged, std::process::id().to_string())
+            .expect("publish cooperative grandchild readiness");
+        std::fs::rename(staged, ready).expect("finish cooperative grandchild readiness");
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while !release.is_file() {
+            if std::time::Instant::now() >= deadline {
+                std::fs::write(&finished, b"deadline").expect("publish fixture deadline");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // This acknowledges the helper body, not kernel exit or orphan reap.
+        std::fs::write(finished, b"released").expect("acknowledge cooperative release");
     }
 
     /// Helper body executed only when this test binary is re-invoked as a
@@ -10145,7 +10169,11 @@ pub(crate) mod tests {
         Sleeps,
         /// [`child_helper_leaves_a_grandchild_behind`], publishing the
         /// grandchild's pid to this path.
-        LeavesAGrandchild(&'a Path),
+        LeavesAGrandchild {
+            published: &'a Path,
+            release: &'a Path,
+            finished: &'a Path,
+        },
     }
 
     /// `reaper` decides whether Tokio may kill the child when the handle is
@@ -10163,6 +10191,8 @@ pub(crate) mod tests {
             // termination sequence, not about protocol plumbing.
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .env_remove(CHILD_RELEASE_ENV)
+            .env_remove(CHILD_FINISHED_ENV)
             .kill_on_drop(reaper)
             .process_group(0);
         match helper {
@@ -10170,8 +10200,15 @@ pub(crate) mod tests {
             Helper::Sleeps => {
                 command.env(CHILD_HELPER_ENV, "1");
             }
-            Helper::LeavesAGrandchild(published) => {
-                command.env(GRANDCHILD_ENV, published);
+            Helper::LeavesAGrandchild {
+                published,
+                release,
+                finished,
+            } => {
+                command
+                    .env(GRANDCHILD_ENV, published)
+                    .env(CHILD_RELEASE_ENV, release)
+                    .env(CHILD_FINISHED_ENV, finished);
             }
         }
         let child = command.spawn().expect("spawn the test executable");
@@ -10568,6 +10605,53 @@ pub(crate) mod tests {
         }
     }
 
+    /// A failed production oracle may leave an orphan behind. Its private gate
+    /// permits cooperative cleanup without using the leader's already-reaped
+    /// numeric group. Completion acknowledges cooperation only, never a reap.
+    #[cfg(target_os = "linux")]
+    struct DetachedChildRelease {
+        directory: Option<tempfile::TempDir>,
+        release: PathBuf,
+        finished: PathBuf,
+        production_stopped: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DetachedChildRelease {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("private detached-child fixture");
+            Self {
+                release: directory.path().join("release"),
+                finished: directory.path().join("finished"),
+                directory: Some(directory),
+                production_stopped: false,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for DetachedChildRelease {
+        fn drop(&mut self) {
+            let requested = std::fs::write(&self.release, b"release").is_ok();
+            if self.production_stopped {
+                return;
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while requested && std::time::Instant::now() < deadline {
+                if std::fs::read(&self.finished).is_ok_and(|bytes| bytes.as_slice() == b"released")
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Keep the release available if a late helper has not acknowledged
+            // it within this bounded cleanup wait. No signal or reap is implied.
+            if let Some(directory) = self.directory.take() {
+                let _ = directory.keep();
+            }
+        }
+    }
+
     /// A leader that exits promptly is the common case — `rust-analyzer` quits
     /// on `exit` — and its group is exactly what must still be ended: nothing
     /// else can reach the children it left behind.
@@ -10575,15 +10659,29 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     fn a_prompt_exit_still_ends_the_server_process_group() {
         block_on(async {
-            let directory = tempfile::tempdir().expect("tempdir");
-            let path = directory.path().join("grandchild-pid");
+            let mut cleanup = DetachedChildRelease::new();
+            let path = cleanup
+                .directory
+                .as_ref()
+                .unwrap()
+                .path()
+                .join("grandchild-pid");
             let child = spawn_test_child(
                 &["--exact", GRANDCHILD_TEST, "--test-threads=1"],
-                Helper::LeavesAGrandchild(&path),
+                Helper::LeavesAGrandchild {
+                    published: &path,
+                    release: &cleanup.release,
+                    finished: &cleanup.finished,
+                },
                 true,
             );
             let group = child.process_group;
             let grandchild = published_pid(&path).await;
+            assert_eq!(
+                published_pid(&cleanup.finished.with_extension("ready")).await,
+                grandchild,
+                "the actual grandchild must enter its private cleanup gate"
+            );
             assert_ne!(
                 grandchild, group,
                 "the grandchild is a process of its own, in the leader's group"
@@ -10604,16 +10702,15 @@ pub(crate) mod tests {
                 "the helper exits on its own, so no signal is needed to end it"
             );
             let gone = wait_until_not_running(grandchild).await;
-            if !gone {
-                // Only reached when the group was never ended, in which case
-                // it still holds this process and its id is therefore still
-                // reserved: this is the signal `stop` owed it.
-                signal_process_group(group, SIGKILL);
-            }
             assert!(
                 gone,
                 "a server's descendants must go with the process group it led"
             );
+            assert!(
+                !cleanup.finished.exists(),
+                "production teardown must stop the grandchild before cooperative cleanup or its deadline"
+            );
+            cleanup.production_stopped = true;
         });
     }
 

@@ -844,7 +844,72 @@ fn a_complete_rename_can_be_staged_unstaged_and_discarded() {
 #[cfg(unix)]
 #[test]
 fn a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        os::unix::fs::{OpenOptionsExt, PermissionsExt},
+        time::Instant,
+    };
+
+    struct PipeHolder {
+        started: PathBuf,
+        release: PathBuf,
+        finished: PathBuf,
+        workers: Vec<(&'static str, thread::JoinHandle<()>)>,
+    }
+
+    impl PipeHolder {
+        fn settle(&mut self) -> Vec<String> {
+            let mut errors = Vec::new();
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&self.release)
+            {
+                Ok(_) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        && fs::symlink_metadata(&self.release)
+                            .is_ok_and(|metadata| metadata.is_file()) => {}
+                Err(error) => errors.push(format!("release detached pipe holder: {error}")),
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while (self.started.is_file() && !self.finished.is_file())
+                || self.workers.iter().any(|(_, worker)| !worker.is_finished())
+            {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            if self.started.is_file() && !self.finished.is_file() {
+                errors.push("detached holder did not acknowledge closing its pipes".into());
+            }
+            let mut pending = Vec::new();
+            for (name, worker) in self.workers.drain(..) {
+                if worker.is_finished() {
+                    if worker.join().is_err() {
+                        errors.push(format!("{name} worker panicked"));
+                    }
+                } else {
+                    errors.push(format!("{name} worker did not settle within cleanup bound"));
+                    pending.push((name, worker));
+                }
+            }
+            self.workers = pending;
+            errors
+        }
+    }
+
+    impl Drop for PipeHolder {
+        fn drop(&mut self) {
+            // A panic must release the cooperative holder before Fixture drops
+            // its directory. Never wait indefinitely for an owned test thread.
+            for error in self.settle() {
+                eprintln!("pipe-holder fixture cleanup unconfirmed: {error}");
+            }
+        }
+    }
 
     let Some(fixture) = Fixture::new() else {
         return;
@@ -853,17 +918,42 @@ fn a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock() {
     fixture.git_in_work(&["add", "-A"]);
     fixture.commit("initial");
 
-    let holder = fixture.root.path().join("holder.pid");
+    let mut holder = PipeHolder {
+        started: fixture.root.path().join("holder.started"),
+        release: fixture.root.path().join("holder.release"),
+        finished: fixture.root.path().join("holder.finished"),
+        workers: Vec::new(),
+    };
+    let quoted_root = format!(
+        "'{}'",
+        fixture
+            .root
+            .path()
+            .to_str()
+            .expect("UTF-8 fixture path")
+            .replace('\'', "'\\''")
+    );
     let hooks = fixture.work().join(".git/hooks");
     fs::create_dir_all(&hooks).expect("hooks directory");
     let hook = hooks.join("pre-commit");
     fs::write(
         &hook,
         format!(
-            "#!/bin/sh\n\
-             setsid sh -c 'printf %s \"$$\" > \"{}\"; exec sleep 300' &\n\
-             exit 0\n",
-            holder.display()
+            r#"#!/bin/sh
+setsid sh -c '
+    root=$1
+    : > "$root/holder.started" || exit 1
+    remaining=1200
+    while [ -d "$root" ] && [ ! -f "$root/holder.release" ] && [ "$remaining" -gt 0 ]; do
+        sleep 0.1 || exit 1
+        remaining=$((remaining - 1))
+    done
+    exec >/dev/null 2>&1
+    : > "$root/holder.finished"
+' holder {} &
+exit 0
+"#,
+            quoted_root
         ),
     )
     .expect("write hook");
@@ -886,7 +976,7 @@ fn a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock() {
     let locks = Arc::new(MutationLocks::new());
     let common = fixture.work().join(".git");
     let (report, results) = mpsc::channel();
-    {
+    let commit_worker = {
         let locks = Arc::clone(&locks);
         let common = common.clone();
         thread::spawn(move || {
@@ -895,37 +985,43 @@ fn a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock() {
                 .execute(&command, &CancellationToken::new());
             drop(guard);
             let _ = report.send(outcome.err().map(|failure| failure.kind));
-        });
-    }
+        })
+    };
+    holder.workers.push(("commit", commit_worker));
     let kind = results
         .recv_timeout(Duration::from_secs(60))
         .expect("the commit never returned while a hook's child held its pipes");
     assert_eq!(kind, Some(ProcessFailureKind::TimedOut));
     assert!(
-        holder.is_file(),
+        holder.started.is_file(),
         "the hook never launched its detached child, so the hazard was not exercised"
+    );
+    assert!(
+        !holder.release.exists() && !holder.finished.exists(),
+        "the detached holder stopped holding its pipes before the timeout result"
     );
 
     let (acquired, acquisitions) = mpsc::channel();
-    thread::spawn(move || {
+    let lock_worker = thread::spawn(move || {
         let _guard = locks.lock(&common);
         let _ = acquired.send(());
     });
+    holder.workers.push(("mutation lock", lock_worker));
     acquisitions
         .recv_timeout(Duration::from_secs(10))
         .expect("the mutation lock was still held after the command returned");
 
-    // The sleeper is in its own session precisely so that nothing this service
-    // signals can reach it, which leaves the cleanup to the test.
-    if let Ok(text) = fs::read_to_string(&holder)
-        && let Ok(group) = text.trim().parse::<u32>()
-    {
-        let _ = Command::new("kill")
-            .arg("-9")
-            .arg("--")
-            .arg(format!("-{group}"))
-            .output();
-    }
+    assert!(
+        !holder.release.exists() && !holder.finished.exists(),
+        "the detached holder stopped holding its pipes before lock acquisition"
+    );
+
+    // The holder's loop outlives the 60s hang guard unless released, and also
+    // ends if its private directory disappears. Its finite loop bounds a crash
+    // that prevents Drop from releasing it. The acknowledgement follows closing
+    // stdout/stderr; it is a cooperative gate receipt, not a child-reaping proof.
+    let errors = holder.settle();
+    assert!(errors.is_empty(), "pipe-holder fixture cleanup: {errors:?}");
 }
 
 /// A discard request is built from a snapshot and then sits in front of the

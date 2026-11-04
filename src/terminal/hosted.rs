@@ -3160,8 +3160,63 @@ mod tests {
         if !systemd_user_manager_available() {
             return;
         }
+        struct ScopeRelease {
+            directory: Option<tempfile::TempDir>,
+            release: PathBuf,
+            finished: PathBuf,
+            attempted: bool,
+            acknowledged: bool,
+        }
+
+        impl ScopeRelease {
+            fn release(&mut self) -> bool {
+                self.attempted = true;
+                if std::fs::write(&self.release, b"release").is_err() {
+                    return false;
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    if std::fs::read(&self.finished)
+                        .is_ok_and(|bytes| bytes.as_slice() == b"released")
+                    {
+                        self.acknowledged = true;
+                        return true;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                false
+            }
+        }
+
+        impl Drop for ScopeRelease {
+            fn drop(&mut self) {
+                if !self.attempted {
+                    self.release();
+                }
+                if !self.acknowledged
+                    && let Some(directory) = self.directory.take()
+                {
+                    // A late orphan must still find the request. An ACK only
+                    // confirms cooperation/closed stdio, never exit or reap.
+                    let _ = directory.keep();
+                }
+            }
+        }
+
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("scope-evidence");
+        let observe = directory.path().join("observe-after-launcher-exit");
+        let release = directory.path().join("release");
+        let holder_evidence = directory.path().join("holder-cgroup");
+        let finished = directory.path().join("finished");
+        // Install cleanup before the launcher can create its detached holder.
+        let mut cleanup = ScopeRelease {
+            directory: Some(directory),
+            release: release.clone(),
+            finished: finished.clone(),
+            attempted: false,
+            acknowledged: false,
+        };
         // Regular files avoid waiting for the background holder to close a pipe.
         let mut stdout = tempfile::tempfile().unwrap();
         let mut stderr = tempfile::tempfile().unwrap();
@@ -3196,9 +3251,38 @@ mod tests {
         // manager-side variable expansion or replacement by manager state.
         command
             .env("CAGENTS_SCOPE_TEST", "caller-value")
-            .args(["-c", "cat /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
+            .args([
+                "-c",
+                r#"cat /proc/self/cgroup > "$1"
+printf '%s\n%s\n' "$2" "$CAGENTS_SCOPE_TEST" >> "$1"
+(
+    exec </dev/null >/dev/null 2>&1
+    remaining=3000
+    while [ ! -f "$3" ] && [ ! -f "$4" ] && [ "$remaining" -gt 0 ]; do
+        remaining=$((remaining - 1))
+        sleep 0.01
+    done
+    if [ -f "$3" ] && [ ! -f "$4" ]; then
+        cat /proc/self/cgroup > "$5.staged" && mv "$5.staged" "$5"
+    fi
+    while [ ! -f "$4" ] && [ "$remaining" -gt 0 ]; do
+        remaining=$((remaining - 1))
+        sleep 0.01
+    done
+    if [ -f "$4" ]; then
+        printf released > "$6"
+    else
+        printf deadline > "$6"
+    fi
+) &"#,
+                "fixture",
+            ])
             .arg(&output)
-            .arg("$HOME");
+            .arg("$HOME")
+            .arg(&observe)
+            .arg(&release)
+            .arg(&holder_evidence)
+            .arg(&finished);
         command
             .stdout(stdout.try_clone().unwrap())
             .stderr(stderr.try_clone().unwrap());
@@ -3212,11 +3296,21 @@ mod tests {
         let evidence = std::fs::read_to_string(output).unwrap();
         // A detached holder must survive a daemon handoff. Scope launchers
         // return when the main process exits and leave its children in place.
-        let holder_pid: i32 = evidence.lines().nth(3).unwrap().parse().unwrap();
-        let holder_cgroup = std::fs::read_to_string(format!("/proc/{holder_pid}/cgroup"));
-        // SAFETY: this PID belongs to the fixture's own background sleep.
-        unsafe { libc::kill(holder_pid, libc::SIGTERM) };
-        let holder_cgroup = holder_cgroup.unwrap();
+        // Only the orphan can answer this probe, issued after launcher return.
+        std::fs::write(&observe, b"observe").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let holder_cgroup = loop {
+            if let Ok(cgroup) = std::fs::read_to_string(&holder_evidence)
+                && !cgroup.is_empty()
+            {
+                break cgroup;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "scope orphan did not answer the probe"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
         let caller = std::fs::read_to_string("/proc/self/cgroup").unwrap();
         let mut lines = evidence.lines();
         let scope = lines.next().unwrap();
@@ -3228,6 +3322,14 @@ mod tests {
         assert_eq!(lines.next(), Some("$HOME"));
         assert_eq!(lines.next(), Some("caller-value"));
         assert_eq!(holder_cgroup.trim(), scope);
+        assert!(
+            !finished.exists(),
+            "the scope orphan must survive the launcher until cooperative cleanup"
+        );
+        assert!(
+            cleanup.release(),
+            "scope orphan did not acknowledge release after closing inherited stdio"
+        );
     }
 
     #[test]
