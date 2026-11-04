@@ -1,0 +1,189 @@
+#!/bin/sh
+# Run a Cargo command in one of a few shared build slots.
+#
+# Checkouts on one host share its memory, not a build directory: each worktree
+# has its own. One global lock idles most of the CPU while a single slow crate
+# compiles, and while tests run. This admits a few builds at once, sized by
+# memory, and runs tests and programs after their build has left its slot.
+set -eu
+
+program=cargo-gate
+fail() {
+    printf '%s: %s\n' "$program" "$*" >&2
+    exit 2
+}
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/cargo-gate [cargo] SUBCOMMAND [ARGS...]
+
+Runs `cargo SUBCOMMAND ARGS...` once a build slot is free. For `test`,
+`bench` and `run`, only the build (`--no-run`, or `build`) holds the slot; the
+tests or program run afterwards without it.
+
+Environment:
+  CAGENTS_BUILD_SLOTS    Concurrent builds; default: one per 8 GiB of RAM
+                         after an 8 GiB reserve, at most one per 8 CPUs
+  CAGENTS_BUILD_LOCK     First slot's lock file; the others add .1, .2, ...
+                         (default /var/tmp/cagents-cargo.lock)
+  CARGO_BUILD_JOBS       With several slots, set or capped to CPUs divided by
+                         slots, at least 2
+
+Slot 0 is the plain lock file, so a command still run under
+`flock /var/tmp/cagents-cargo.lock` occupies exactly one slot.
+EOF
+}
+
+[ "$#" -gt 0 ] || { usage >&2; exit 2; }
+case $1 in
+    -h|--help) usage; exit 0 ;;
+    cargo) shift ;;
+esac
+[ "$#" -gt 0 ] || fail 'missing Cargo subcommand'
+
+cpus=$(nproc)
+memory_kib=$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\) kB$/\1/p' /proc/meminfo)
+[ -n "$memory_kib" ] || fail 'cannot read MemTotal from /proc/meminfo'
+# A cagents build peaked at 6.5 GiB of anonymous memory with 12 jobs.
+slot_kib=$((8 * 1024 * 1024))
+if [ -n "${CAGENTS_BUILD_SLOTS:-}" ]; then
+    slots=$CAGENTS_BUILD_SLOTS
+    case $slots in ''|*[!0-9]*|0) fail 'CAGENTS_BUILD_SLOTS must be a positive integer' ;; esac
+else
+    slots=$(((memory_kib - 8 * 1024 * 1024) / slot_kib))
+    [ "$slots" -le $((cpus / 8)) ] || slots=$((cpus / 8))
+    [ "$slots" -ge 1 ] || slots=1
+fi
+# With several slots, each build gets an equal share of the CPUs, replacing the
+# repository's two-job default and capping a larger CARGO_BUILD_JOBS. A lone
+# slot keeps Cargo's configured jobs. `-j` on the command still wins.
+if [ "$slots" -gt 1 ]; then
+    share=$((cpus / slots))
+    [ "$share" -ge 2 ] || share=2
+    case ${CARGO_BUILD_JOBS:-} in
+        ''|*[!0-9]*) CARGO_BUILD_JOBS=$share ;;
+        *) [ "$CARGO_BUILD_JOBS" -le "$share" ] || CARGO_BUILD_JOBS=$share ;;
+    esac
+    export CARGO_BUILD_JOBS
+fi
+
+lock=${CAGENTS_BUILD_LOCK:-/var/tmp/cagents-cargo.lock}
+
+available_kib() {
+    sed -n 's/^MemAvailable:[[:space:]]*\([0-9]*\) kB$/\1/p' /proc/meminfo
+}
+
+announce() {
+    if [ "$announced" = false ]; then
+        printf '%s: waiting for one of %s build slots\n' "$program" "$slots" >&2
+        announced=true
+    fi
+}
+
+slot_path() {
+    if [ "$1" -eq 0 ]; then printf '%s' "$lock"; else printf '%s.%s' "$lock" "$1"; fi
+}
+
+# Whether every slot other than $1 is free. Only gated waiters take the
+# extra slots, and they hold the queue lock while choosing one.
+others_idle() {
+    other=0
+    while [ "$other" -lt "$slots" ]; do
+        if [ "$other" -ne "$1" ]; then
+            exec 7>>"$(slot_path "$other")"
+            flock -n 7 || { exec 7>&-; return 1; }
+            exec 7>&-
+        fi
+        other=$((other + 1))
+    done
+}
+
+# Holds a slot on descriptor 9 until release. One waiter at a time picks a
+# slot, so waiters are admitted roughly in arrival order.
+acquire() {
+    announced=false
+    waited_since=$(date +%s)
+    exec 8>>"$lock.queue"
+    flock -n 8 || { announce; flock 8; }
+    while :; do
+        index=0
+        while [ "$index" -lt "$slots" ]; do
+            exec 9>>"$(slot_path "$index")"
+            if flock -n 9; then
+                # Start beside other builds only when the memory a build needs
+                # is free now; a lone build always starts.
+                if [ "$(available_kib)" -ge "$slot_kib" ] || others_idle "$index"; then
+                    exec 8>&-
+                    waited=$(($(date +%s) - waited_since))
+                    if [ "$waited" -gt 0 ]; then
+                        printf '%s: admitted to slot %s after %ss\n' "$program" "$index" "$waited" >&2
+                    fi
+                    return
+                fi
+                flock -u 9
+            fi
+            exec 9>&-
+            index=$((index + 1))
+        done
+        announce
+        sleep 0.5
+    done
+}
+
+release() {
+    exec 9>&-
+}
+
+# Whether this process inherited an open slot lock, as under
+# `flock /var/tmp/cagents-cargo.lock scripts/run-development`. Its holder is an
+# ancestor, so waiting for another slot could wait on itself.
+inherits_slot() {
+    held=$(readlink -f "$lock")
+    for descriptor in /proc/$$/fd/*; do
+        case $(readlink "$descriptor") in
+            "$held"|"$held".[0-9]|"$held".[0-9][0-9]) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Already inside a slot: a gated command running Cargo again, or a caller
+# that took the lock itself.
+if [ -n "${CAGENTS_BUILD_SLOT_HELD:-}" ] || inherits_slot; then
+    exec cargo "$@"
+fi
+
+subcommand=$1
+shift
+case $subcommand in
+    test|bench|run)
+        if [ "$subcommand" = run ]; then build=build; else build=--no-run; fi
+        acquire
+        # Descriptors 8 and 9 stay with this shell: a lingering child such as a
+        # compiler cache server must not keep the slot.
+        status=0
+        (
+            # Arguments after `--` belong to the tests or program, not Cargo.
+            ended=false
+            for argument do
+                shift
+                [ "$argument" != -- ] || ended=true
+                [ "$ended" = true ] || set -- "$@" "$argument"
+            done
+            if [ "$build" = build ]; then
+                exec env CAGENTS_BUILD_SLOT_HELD=1 cargo build "$@"
+            fi
+            exec env CAGENTS_BUILD_SLOT_HELD=1 cargo "$subcommand" --no-run "$@"
+        ) 8>&- 9>&- || status=$?
+        release
+        [ "$status" -eq 0 ] || exit "$status"
+        exec cargo "$subcommand" "$@"
+        ;;
+    *)
+        acquire
+        status=0
+        CAGENTS_BUILD_SLOT_HELD=1 cargo "$subcommand" "$@" 8>&- 9>&- || status=$?
+        release
+        exit "$status"
+        ;;
+esac

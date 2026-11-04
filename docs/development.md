@@ -233,6 +233,39 @@ implementation alone does not establish native hotpatch acceptance.
 
 ## Build and test resource usage
 
+### Sharing a host between several checkouts
+
+When several agents build on one host, run Cargo through the build gate
+rather than a single global lock:
+
+```sh
+scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
+scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+```
+
+The gate admits a few builds at once: one per 8 GiB of RAM after an 8 GiB
+reserve, at most one per 8 CPUs. A build starts beside others only while
+8 GiB is actually available; one `cagents` build peaked at 6.5 GiB with 12
+jobs. With several slots each build gets an equal
+share of the CPUs as `CARGO_BUILD_JOBS`, which also caps a larger value; `-j`
+still wins. For `test`, `bench` and `run` only the build holds a slot, and the
+tests or program run after it is released, so do not wrap the gate in another
+lock. The development runner gates each of its builds itself.
+
+The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
+command still run under `flock /var/tmp/cagents-cargo.lock` takes exactly one
+slot. A gated command started under such a lock runs at once in the slot its
+caller holds. Set `CAGENTS_BUILD_SLOTS` to override the count.
+
+The feature lanes coexist in one build directory: a no-op check of one lane
+stays a no-op after building the others. With a per-checkout build directory,
+such as `build-dir = "/var/tmp/cargo-build{workspace-root}/target"` in
+`~/.cargo/config.toml`, the cost per worktree is the first build of each lane. On a 24-thread, 60 GiB host
+a cold check took 35 s for the CLI, 53 s for the host, 62 s for the UI and
+126 s for the integrated UI; the single `cagents` crate is most of each.
+
+### Compilation jobs and shared build directories
+
 Repository-local Cargo configuration (`.cargo/config.toml`) defaults to **two
 concurrent compilation jobs**, including `cargo test` and every build in the
 runner. Cargo otherwise uses the logical CPU count, which can create

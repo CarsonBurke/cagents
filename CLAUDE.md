@@ -38,7 +38,7 @@ You are a senior app developer tasked with creating a great Agent Development En
   `integrated-browser` select implementation graphs; never reunify `ui` and
   `host` in one Cargo invocation just to shorten a command.
 - Before finishing a feature or dependency change, run every affected isolated boundary. UI-only builds must not resolve Ghostty; host-only builds must not resolve libcosmic, Servo, WebRender, or SpiderMonkey.
-- Do not run independent cold Cargo builds concurrently. They contend for the shared build directory and memory; use lower `CARGO_BUILD_JOBS` when the host is already under memory pressure.
+- Do not run independent cold Cargo builds concurrently by hand. When several checkouts share a host, run Cargo through `scripts/cargo-gate`, which admits as many builds as memory allows and runs tests after the build releases its slot. Do not hold a build lock while tests or the app run.
 
 ## Run the application through the development runner
 
