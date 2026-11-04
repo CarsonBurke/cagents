@@ -228,12 +228,8 @@ fn inspect(request: Request) -> Result<(), String> {
                 } else {
                     reader.resolve(source)
                 };
-                if missing
-                    && source.is_saved_claude_history()
-                    && !result
-                        .as_ref()
-                        .is_ok_and(|resolved| resolved.native_continuity.retains_provider())
-                    && reader.inspect_saved_history(source).is_ok()
+                if cold_history_reader(source, missing, &result, request.proof.as_ref())
+                    .is_some_and(|history| reader.inspect_saved_history(&history).is_ok())
                 {
                     cold_history.push(source.clone());
                 }
@@ -344,6 +340,37 @@ fn terminal_requires_migration(
             .live_proof()
             .is_some_and(|proof| proof.is_complete() && &proof.boot_id != current_boot),
     }
+}
+
+/// The read-only history a saved pane reopens as, when no provider survives
+/// to carry: saved Claude history the source no longer hosts, or the reader of
+/// a provider lost with an earlier boot. The destination window accepts exactly
+/// these as settled, so the source must prove each one readable first.
+fn cold_history_reader(
+    source: &Session,
+    missing: bool,
+    resolution: &Result<Session, String>,
+    live: Option<&HostSessionProof>,
+) -> Option<Session> {
+    match resolution {
+        Ok(resolved) if crate::chat::is_lost_holder_history(source, resolved) => {
+            return Some(resolved.clone());
+        }
+        Ok(resolved) if resolved.native_continuity.retains_provider() => return None,
+        _ => {}
+    }
+    if !missing {
+        return None;
+    }
+    if source.is_saved_claude_history() {
+        return Some(source.clone());
+    }
+    // A later pass of the same update does not resolve again. The reader its
+    // first pass resolved stays resident under this same exact descriptor.
+    resolution
+        .is_err()
+        .then(|| source.lost_holder_history(live?))
+        .flatten()
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), String> {
@@ -480,6 +507,62 @@ mod tests {
             terminal_requires_migration(&source, &BootId::new("current")),
             "incomplete proof cannot classify obsolete execution"
         );
+    }
+
+    #[test]
+    fn a_provider_lost_with_an_earlier_boot_settles_only_as_its_exact_reader() {
+        let live = HostSessionProof {
+            host_session_id: HostSessionId::new("current"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("current"),
+        };
+        let mut lost = session();
+        lost.native_continuity = NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        lost.proof.as_mut().unwrap().boot_id = BootId::new("previous");
+        let reader = lost.lost_holder_history(&live).unwrap();
+        let resolved = Ok(reader.clone());
+        let live = Some(&live);
+        assert_eq!(
+            cold_history_reader(&lost, true, &resolved, live),
+            Some(reader.clone())
+        );
+        let preview_only = Err("Saved owner changed after preview".to_owned());
+        assert_eq!(
+            cold_history_reader(&lost, true, &preview_only, live),
+            Some(reader.clone()),
+            "the window-closing pass inspects the reader its first pass resolved"
+        );
+        assert_eq!(cold_history_reader(&lost, true, &preview_only, None), None);
+        assert_eq!(cold_history_reader(&lost, false, &preview_only, live), None);
+
+        let mut altered = reader.clone();
+        altered.launch.session_id = Some("22222222-2222-4222-8222-222222222222".into());
+        assert_eq!(cold_history_reader(&lost, true, &Ok(altered), live), None);
+        let mut same_boot = lost.clone();
+        same_boot.proof.as_mut().unwrap().boot_id = BootId::new("boot");
+        assert_eq!(
+            cold_history_reader(&same_boot, true, &preview_only, live),
+            None
+        );
+        let mut unnamed = lost.clone();
+        unnamed.launch.session_id = None;
+        assert_eq!(
+            cold_history_reader(&unnamed, true, &preview_only, live),
+            None
+        );
+
+        let saved = session();
+        assert_eq!(
+            cold_history_reader(&saved, true, &preview_only, live),
+            Some(saved.clone())
+        );
+        assert_eq!(
+            cold_history_reader(&saved, false, &preview_only, live),
+            None
+        );
+        let mut retained = saved.clone();
+        retained.native_continuity = NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        assert_eq!(cold_history_reader(&saved, true, &Ok(retained), live), None);
     }
 
     #[test]
