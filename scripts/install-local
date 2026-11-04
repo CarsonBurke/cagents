@@ -65,10 +65,15 @@ build() {
     mkdir -p -- "$output"
     (
         cd "$checkout"
+        # rustup selects rust-toolchain.toml; mise supplies the pinned Zig.
         export PATH=$HOME/.cargo/bin:$PATH
         export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-$(nproc)}
+        local tools=()
+        if command -v mise >/dev/null; then
+            tools=(mise exec --)
+        fi
         VERSION=$VERSION CAGENTS_CARGO_PROFILE=local CAGENTS_DIST_DIR=$output \
-            scripts/package-linux.sh --variant full --archive-only
+            "${tools[@]}" scripts/package-linux.sh --variant full --archive-only
     )
 }
 
@@ -92,6 +97,10 @@ if [[ ! -d \$checkout ]]; then
     git -C "\$repository" worktree add --detach "\$checkout" "\$commit"
 fi
 git -C "\$checkout" checkout --quiet --force --detach "\$commit"
+# This checkout only ever holds commits pushed by this script.
+if command -v mise >/dev/null; then
+    mise trust --quiet "\$checkout/mise.toml"
+fi
 build "\$checkout" "\$output"
 EOF
     rm -rf -- "$OUTPUT"
