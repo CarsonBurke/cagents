@@ -902,6 +902,8 @@ pub enum Action {
         expected: Registered,
     },
     SignInWithCode(AccountId),
+    /// The code alternative rendered by one failed browser sign-in row.
+    UseCodeForBlockedLogin(uuid::Uuid),
     /// The CLI and browser callback were checked off the interface thread.
     LoginReady {
         owner: u64,
@@ -995,6 +997,7 @@ impl Action {
                 | Self::UseReportedLogin { .. }
                 | Self::SignIn(_)
                 | Self::SignInWithCode(_)
+                | Self::UseCodeForBlockedLogin(_)
                 | Self::Add { .. }
                 | Self::LinkStart(_)
                 | Self::LinkCommit
@@ -2526,6 +2529,16 @@ impl Cagents {
                     }
                 }
                 Task::none()
+            }
+            Action::UseCodeForBlockedLogin(key) => {
+                if !self.account_ui.logins.iter().any(|login| {
+                    login.key == key
+                        && login.provider == Provider::Codex
+                        && login.phase == LoginPhase::CallbackBlocked
+                }) {
+                    return Task::none();
+                }
+                self.add_account(Provider::Codex, true)
             }
             Action::Add { provider, device } => self.add_account(provider, device),
             Action::LinkStart(provider) => {
