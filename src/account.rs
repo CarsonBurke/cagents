@@ -194,7 +194,7 @@ pub(crate) fn validate_linked_home_operand(value: &str) -> Result<(), String> {
     }
     if value.contains('\0') || !(Path::new(value).is_absolute() || value.starts_with("~/")) {
         return Err(
-            "Use an absolute account home on the selected device, or a quoted '~/path'".into(),
+            "Use an absolute account home on the selected device, or one starting with ~/".into(),
         );
     }
     Ok(())
