@@ -1691,9 +1691,9 @@ impl Cagents {
                 // was never shared, so nothing else closed it.
                 if newly_local {
                     self.status = Some(TransientNotice::warning(if view.retired.contains(&id) {
-                        "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it."
+                        "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it.".to_string()
                     } else {
-                        "A pane is not in the shared workspace, so it is kept only in this window with its unsaved edits."
+                        self.kept_here_notice(id, "Its unsaved edits stay here.")
                     }));
                 }
                 continue;
@@ -1708,7 +1708,7 @@ impl Cagents {
             if !self.shared_views.retained.contains(&id) {
                 tracing::warn!(card = %id, scope = ?view.scope, "keeping a pane the shared view has neither listed nor retired");
                 self.status = Some(TransientNotice::warning(
-                    "A pane is not in the shared workspace, so it is kept only in this window.",
+                    self.kept_here_notice(id, "It keeps working here."),
                 ));
             }
             self.retain_local_pane(id);
@@ -2021,10 +2021,23 @@ impl Cagents {
     /// Whether a pane missing from its shared view should close here. Only a
     /// recorded removal says someone closed it. The automatic panes below have
     /// no actor and no work; a view that gained content simply replaces them.
+    fn kept_here_notice(&self, id: CardId, consequence: &str) -> String {
+        let title = self
+            .card_state(id)
+            .map(|card| card.title.as_str())
+            .filter(|title| !title.is_empty())
+            .unwrap_or("This pane");
+        format!("\u{201c}{title}\u{201d} is open only in this window, so your other windows can't see it. {consequence}")
+    }
+
     fn absence_closes_pane(&self, id: CardId, view: &View) -> bool {
         self.pane_retired(id, view)
             || self.chat_is_unused_default(id)
             || self.shared_views.defaults.contains_key(&id)
+            // A terminal waits for its creation to be accepted before starting,
+            // so a refused one has no process to lose and would only sit on
+            // Loading forever.
+            || self.durable.pending_terminal_creations.contains(&id)
             || !self
                 .card_state(id)
                 .is_some_and(|card| card.existence.is_open())
@@ -4317,6 +4330,35 @@ mod tests {
             matches!(app.cards.get(&pane.id), Some(CardRuntime::Failed(reason))
             if reason.contains("Open the saved URL in your system browser"))
         );
+    }
+
+    #[test]
+    fn a_refused_terminal_creation_closes_instead_of_loading_forever() {
+        let (mut app, a, _, first) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(a);
+        let mut view = View::empty(a);
+        view.panes.push(first.clone());
+        app.workspace_model.views = vec![view.clone()];
+        drop(app.project_shared_view(&view, &HashSet::from([first.id])));
+        app.shared_views
+            .baseline
+            .insert(Scope::Channel(a), vec![first.clone()]);
+        app.shared_views.pending.clear();
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(session, Some((0, 0))));
+        let id = app.workspace.focused().unwrap();
+        assert!(app.durable.pending_terminal_creations.contains(&id));
+
+        app.refuse_shared_view_edit(&Scope::Channel(a), id.as_uuid());
+        for _ in 0..2 {
+            drop(app.reconcile_shared_views());
+        }
+
+        assert!(!app.card_state(id).unwrap().existence.is_open());
+        assert!(!app.shared_views.retained.contains(&id));
+        assert!(!app.durable.local_only_cards.contains(&id));
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -485,6 +485,15 @@ fn an_acknowledged_insert_the_view_does_not_list_keeps_the_running_card_until_re
             &handle
         ));
     }
+    let notice = world
+        .app
+        .status
+        .as_ref()
+        .map(|notice| notice.message.as_str());
+    assert!(
+        notice.is_some_and(|text| text.contains("is open only in this window")),
+        "the reader is told where the pane now lives: {notice:?}"
+    );
     // A recorded removal is what closes it, and it does.
     let mut removed = world.app.workspace_model.clone();
     removed.sequence += 1;

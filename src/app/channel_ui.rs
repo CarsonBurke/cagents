@@ -903,7 +903,7 @@ impl Cagents {
         }
         if retained_scope.is_some() {
             self.status = Some(TransientNotice::warning(
-                "A channel was deleted in another client. Your unsaved work is retained in its worktree.",
+                "A channel was deleted in another client. Your unsaved work and running conversations stay in its worktree.",
             ));
         }
         let select = if was_active {
