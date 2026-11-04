@@ -132,14 +132,13 @@ else
         [[ $REMOTE_REPOSITORY != "$REPOSITORY" ]] || fail 'the repository must be under $HOME to locate it on the build host'
         REMOTE_OUTPUT=/var/tmp/cagents-install-local/$VERSION
         git push --quiet --force "ssh://$BUILD_HOST/~/$REMOTE_REPOSITORY" "$COMMIT:$BUILD_REF"
-        # The host's login shell may not be POSIX, so bash reads this script
-        # from stdin; keep the build from consuming the rest of it.
-        # shellcheck disable=SC2029
-        ssh "$BUILD_HOST" bash -s -- \
-            "$REMOTE_REPOSITORY" "$COMMIT" "$VERSION" "$REMOTE_OUTPUT" "${CARGO_BUILD_JOBS:-}" <<EOF
+        # The host's login shell may not be POSIX and re-parses ssh arguments,
+        # dropping empty ones. Bash reads this script from stdin instead, with
+        # every value quoted for bash; the build must not consume the rest.
+        ssh "$BUILD_HOST" bash -s <<EOF
 set -euo pipefail
 $(declare -f build_commit)
-build_commit "\$HOME/\$1" "\$2" "\$3" "\$4" "\$5" </dev/null
+build_commit "\$HOME"/$(printf '%q ' "$REMOTE_REPOSITORY" "$COMMIT" "$VERSION" "$REMOTE_OUTPUT" "${CARGO_BUILD_JOBS:-}")</dev/null
 EOF
         rm -rf -- "$OUTPUT"
         mkdir -p -- "$OUTPUT"
