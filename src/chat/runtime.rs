@@ -3206,7 +3206,7 @@ impl Actor {
         let mut frame_error = None;
         for mut event in step.events {
             if let Event::Error { message, .. } | Event::HistoryError(message) = &mut event {
-                *message = super::protocol::preview(message.as_bytes(), 1024);
+                *message = super::protocol::bounded_message(message, 1024);
             }
             if let Event::Execution { run, event } = event {
                 if let crate::agent_execution::ProviderEvent::Started { key } = event {
@@ -3352,7 +3352,7 @@ impl Actor {
                     self.execution.observe(
                         run,
                         &Event::Error {
-                            message: super::protocol::preview(message.as_bytes(), 1024),
+                            message: super::protocol::bounded_message(&message, 1024),
                             fatal: false,
                         },
                     );
@@ -5077,7 +5077,7 @@ mod tests {
         assert!(updates.iter().any(|update|matches!(update,Update::PastAttention(evidence) if evidence.key=="old-result" && evidence.kind==crate::notifications::Kind::Cancelled)));
         assert!(
             !updates.iter().any(
-                |update| matches!(update,Update::Attention(evidence) if evidence.key=="old-result")
+                |update| matches!(update,Update::AttentionContext { evidence, .. } if evidence.key=="old-result")
             ),
             "old evidence must not enter current-session attention coalescing or sample current rich context"
         );

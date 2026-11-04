@@ -999,7 +999,7 @@ while IFS= read -r frame; do
       case "$frame" in
         *'"subtype":"interrupt"'*)
           printf 'interrupt\n' >> "$HOME/../interrupts"
-          printf '{"type":"result","uuid":"interrupted-result","is_error":false}\n'
+          printf '{"type":"result","subtype":"success","uuid":"interrupted-result","is_error":false}\n'
           ;;
       esac
       id=${frame#*'"request_id":"'}
@@ -3043,7 +3043,7 @@ while IFS= read -r frame; do
             printf 'received\n' > "$HOME/../idle-interrupt"
           else
             current=$id
-            printf '{"type":"result","uuid":"next-result","is_error":false}\n'
+            printf '{"type":"result","subtype":"success","uuid":"next-result","is_error":false}\n'
             printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$old"
             # Observing this request proves the reader consumed the preceding
             # result and stale ACK; a filesystem marker alone would not.
@@ -3064,7 +3064,7 @@ while IFS= read -r frame; do
       n=$((n + 1))
       if [ "$n" -eq 1 ]; then
         printf '{"type":"control_request","request_id":"background-first","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"first","input":{"command":"true"}}}\n'
-        printf '{"type":"result","uuid":"first-result","is_error":false}\n'
+        printf '{"type":"result","subtype":"success","uuid":"first-result","is_error":false}\n'
       else
         printf 'started\n' > "$HOME/../next-prompt"
       fi
@@ -3074,7 +3074,7 @@ done
 "#;
     let script = if request_after_result {
         let request = "        printf '{\"type\":\"control_request\",\"request_id\":\"background-first\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\",\"tool_use_id\":\"first\",\"input\":{\"command\":\"true\"}}}\\n'\n";
-        let result = "        printf '{\"type\":\"result\",\"uuid\":\"first-result\",\"is_error\":false}\\n'\n";
+        let result = "        printf '{\"type\":\"result\",\"subtype\":\"success\",\"uuid\":\"first-result\",\"is_error\":false}\\n'\n";
         let original = format!("{request}{result}");
         assert!(
             script.contains(&original),
@@ -3102,7 +3102,9 @@ done
         .clone();
     // The native provider controls can interrupt background work between
     // managed turns. The owner API correctly refuses general idle interrupts.
-    handle.command(Command::Interrupt).unwrap();
+    // The fixture withholds this acknowledgement until the next run, so keep
+    // it deferred rather than waiting for it here.
+    let _idle_interrupt = handle.enqueue_command(Command::Interrupt).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !root.join("idle-interrupt").exists() {
         assert!(
@@ -3148,17 +3150,24 @@ done
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    process(
-        &host,
-        owner.clone(),
-        Operation::Control {
-            agent,
-            command: Control::Interrupt {
-                including_subagents: false,
-            },
-        },
-    )
-    .unwrap();
+    // An interrupt waits for its own acknowledgement, which this fixture
+    // withholds until the barrier decision is answered below.
+    let interrupting = {
+        let host = host.clone();
+        let owner = owner.clone();
+        std::thread::spawn(move || {
+            process(
+                &host,
+                owner,
+                Operation::Control {
+                    agent,
+                    command: Control::Interrupt {
+                        including_subagents: false,
+                    },
+                },
+            )
+        })
+    };
     let barrier = pending_requests(&host, agent);
     assert_eq!(barrier[0].id, "ack-barrier");
     let (_, waiting) = status(&host, &owner, agent).unwrap();
@@ -3176,6 +3185,13 @@ done
         },
     )
     .unwrap();
+    // The provider refuses the late interrupt because the run already
+    // settled; the caller hears that answer rather than timing out.
+    let interrupted = format!("{:?}", interrupting.join().unwrap());
+    assert!(
+        !interrupted.contains("did not answer"),
+        "the interrupt must receive its own acknowledgement: {interrupted}"
+    );
     assert_eq!(settled(&host, followup.run.id).state, State::Succeeded);
     assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
     let record = registry(&host)

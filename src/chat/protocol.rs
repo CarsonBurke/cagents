@@ -528,6 +528,25 @@ mod launch_tests {
 }
 
 /// A byte-bounded, terminal-safe preview of untrusted protocol text.
+/// Bounds a readable multi-line message. Unlike [`preview`], line breaks and
+/// tabs stay intact so provider diagnostics keep their shape; other controls
+/// are escaped so they cannot drive a terminal or hide text.
+pub(crate) fn bounded_message(text: &str, limit: usize) -> String {
+    let mut result = String::new();
+    for ch in text.chars() {
+        let escaped: String = if ch.is_control() && !matches!(ch, '\n' | '\t') {
+            ch.escape_default().collect()
+        } else {
+            ch.to_string()
+        };
+        if result.len() + escaped.len() > limit {
+            break;
+        }
+        result.push_str(&escaped);
+    }
+    result
+}
+
 pub(crate) fn preview(bytes: &[u8], limit: usize) -> String {
     let text = String::from_utf8_lossy(bytes);
     let mut result = String::new();

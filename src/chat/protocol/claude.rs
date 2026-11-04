@@ -2872,9 +2872,7 @@ impl Adapter for Claude {
                     ));
                     let outcome = if interruption == Some(true) {
                         Kind::Cancelled
-                    } else if frame["is_error"].as_bool() == Some(true)
-                        || frame["subtype"] != "success"
-                    {
+                    } else if failed_result(&frame) {
                         Kind::Failed
                     } else {
                         Kind::Succeeded
@@ -2957,12 +2955,14 @@ impl Adapter for Claude {
                     }
                 }
                 step.events.push(Event::Usage(self.usage.clone()));
-                if frame["is_error"].as_bool() == Some(true) || frame["subtype"] != "success" {
+                if failed_result(&frame) {
                     let errors = provider_error_text(&frame["errors"]);
                     let message = if !errors.is_empty() {
                         errors
                     } else if !string(&frame, "result").is_empty() {
                         string(&frame, "result").into()
+                    } else if string(&frame, "subtype").is_empty() {
+                        "Claude ended the turn without reporting success".into()
                     } else {
                         format!("Claude result: {}", string(&frame, "subtype"))
                     };
@@ -3087,7 +3087,7 @@ impl Adapter for Claude {
         }
         for event in &mut step.events {
             if let Event::Error { message, .. } | Event::HistoryError(message) = event {
-                *message = super::preview(message.as_bytes(), 1024);
+                *message = super::bounded_message(message, 1024);
             }
         }
         self.remember_failure_receipt(receipt);
@@ -4158,6 +4158,13 @@ fn image_content(block: &Value) -> ItemContent {
         description: "Claude image attachment".into(),
     }
 }
+/// Only an unflagged `success` result proves a successful turn. Claude names
+/// failures with subtypes such as `error_max_turns`; a result without any
+/// subtype proves nothing and settles as failed.
+fn failed_result(frame: &Value) -> bool {
+    frame["is_error"].as_bool() == Some(true) || frame["subtype"] != "success"
+}
+
 fn content_text(value: &Value) -> String {
     if let Some(s) = value.as_str() {
         s.into()
@@ -4542,13 +4549,21 @@ impl Claude {
             }
             "ping" => {}
             "error" => {
-                let message = event["error"]["message"]
-                    .as_str()
-                    .or_else(|| event["error"].as_str())
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| {
-                        "Claude reported a stream error without a readable message".into()
-                    });
+                let original = content_text(&event["error"]);
+                let message = if !parent.is_empty() && !original.is_empty() {
+                    // Transient child detail is cleared by terminal task
+                    // notifications. Keep explicit API failures in that child's
+                    // transcript as well, with the same exact original cause.
+                    original
+                } else {
+                    event["error"]["message"]
+                        .as_str()
+                        .or_else(|| event["error"].as_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            "Claude reported a stream error without a readable message".into()
+                        })
+                };
                 if !parent.is_empty() {
                     step.events.push(Event::Item(child_failure_item(
                         frame,
@@ -6180,8 +6195,8 @@ mod tests {
         for index in 0..300 {
             let id = format!("tool-{index}");
             for frame in [
-                json!({"type":"assistant","message":{"id":format!("message-{index}"),"role":"assistant","content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":"true"}}]}}),
-                json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"done","is_error":false}]}}),
+                json!({"type":"assistant","uuid":format!("assistant-{index}"),"message":{"id":format!("message-{index}"),"role":"assistant","content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":"true"}}]}}),
+                json!({"type":"user","uuid":format!("result-{index}"),"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"done","is_error":false}]}}),
             ] {
                 let step = adapter.receive(frame).unwrap();
                 assert!(
@@ -8056,7 +8071,7 @@ mod tests {
                 .receive(approval("background-1", "Bash", json!({"command":"true"})))
                 .unwrap();
             adapter
-                .receive(json!({"type":"result","is_error":false}))
+                .receive(json!({"type":"result","subtype":"success","is_error":false}))
                 .unwrap();
             assert!(adapter.busy, "the decision outlives the turn");
             assert!(
@@ -8135,7 +8150,7 @@ mod tests {
                         .unwrap();
                 }
                 adapter
-                    .receive(json!({"type":"result","is_error":false}))
+                    .receive(json!({"type":"result","subtype":"success","is_error":false}))
                     .unwrap();
                 if request_after_result {
                     assert!(!adapter.busy, "main result precedes the late decision");
@@ -8170,7 +8185,7 @@ mod tests {
                     .unwrap();
                 let current = adapter.command(Command::Interrupt).unwrap();
                 let current_id = current.writes[0]["request_id"].as_str().unwrap();
-                let result = json!({"type":"result","uuid":"next-result","is_error":false});
+                let result = json!({"type":"result","subtype":"success","uuid":"next-result","is_error":false});
                 let mut events = Vec::new();
                 if after_result {
                     events.extend(adapter.receive(result.clone()).unwrap().events);
@@ -12011,7 +12026,7 @@ mod tests {
             let interrupt = adapter.command(Command::Interrupt).unwrap();
             let id = interrupt.writes[0]["request_id"].as_str().unwrap();
             adapter
-                .receive(json!({"type":"result","uuid":"old-a","is_error":false}))
+                .receive(json!({"type":"result","subtype":"success","uuid":"old-a","is_error":false}))
                 .unwrap();
             adapter
                 .send_prompt("Review B migration".into(), Vec::new(), PromptMode::Send)
@@ -12098,7 +12113,7 @@ mod tests {
                     "message":{"role":"user","content":[{"type":"text","text":"Repair `config_file.rs`"}]}}),
                 json!({"type":"assistant","uuid":"notification-topic-answer","session_id":"44444444-4444-4444-8444-444444444444",
                     "message":{"role":"assistant","content":[{"type":"text","text":"The configuration is ready to review."}]}}),
-                json!({"type":"result","uuid":"notification-topic-result","session_id":"44444444-4444-4444-8444-444444444444","is_error":false}),
+                json!({"type":"result","subtype":"success","uuid":"notification-topic-result","session_id":"44444444-4444-4444-8444-444444444444","is_error":false}),
             ],
             false,
         );
@@ -12188,7 +12203,15 @@ mod tests {
             } else {
                 crate::notifications::Kind::Succeeded
             };
-            assert!(acknowledged.events.iter().any(|event| matches!(event, Event::TurnFinished { key, outcome } if key.as_deref() == Some("claude:first") && *outcome == expected)));
+            // The following turn has started, so the old outcome is past
+            // evidence: it notifies without settling the current turn.
+            assert!(acknowledged.events.iter().any(|event| matches!(event, Event::PastTurnFinished { key, outcome } if key.as_deref() == Some("claude:first") && *outcome == expected)));
+            assert!(
+                !acknowledged
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::TurnFinished { .. }))
+            );
             let second = adapter
                 .receive(
                     json!({"type":"result","subtype":"success","uuid":"second","is_error":false}),
