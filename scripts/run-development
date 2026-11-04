@@ -20,7 +20,7 @@ while [ "$#" -gt 0 ]; do
         --hot) hot=true; browserless=true ;;
         --hot-integrated) hot=true; browserless=false ;;
         --instance|--stop-instance)
-            [ "$1" = --stop-instance ] && stop_instance=true
+            if [ "$1" = --stop-instance ]; then stop_instance=true; else stop_instance=false; fi
             if [ "$#" -lt 2 ] || [ -z "$2" ]; then
                 printf '%s\n' "$1 requires a name" >&2
                 exit 2
@@ -234,6 +234,18 @@ run_cli() {
     fi
 }
 
+# The CLI this checkout last built, so stopping an instance neither waits for
+# nor changes a build. Falls back to building it.
+instance_cli() {
+    target=$(cargo metadata --locked --format-version 1 --no-deps 2>/dev/null |
+        sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+    if [ -n "$target" ] && [ -x "$target/dev-runtime/cagents" ]; then
+        "$target/dev-runtime/cagents" "$@"
+    else
+        run_cli "$@"
+    fi
+}
+
 # The instance's daemon lives in the harness session's private runtime
 # directory, which stopping the session deletes, so stop the daemon first.
 stop_instance_session() {
@@ -246,7 +258,7 @@ stop_instance_session() {
         eval "$harness_env"
         socket=$XDG_RUNTIME_DIR/cagents-development-$instance/cagentsd.sock
         if [ -e "$socket" ]; then
-            if ! output=$(run_cli daemon stop-for-rebuild --including-subagents 2>&1); then
+            if ! output=$(instance_cli daemon stop-for-rebuild --including-subagents 2>&1); then
                 printf '%s\n' "$output" >&2
                 exit 1
             fi
@@ -261,35 +273,40 @@ stop_instance_session() {
             done
         fi
     )
-    niri-harness --session "$harness_session" stop >/dev/null 2>&1
+    # The harness reports a runtime it could not remove; the sweep below
+    # removes it, so only a failure that leaves it behind is worth showing.
+    harness_output=$(niri-harness --session "$harness_session" stop 2>&1 >/dev/null) || :
     sweep_instance_runtime "$runtime"
+    if [ -n "$harness_output" ] && [ -e "$runtime" ]; then
+        printf '%s\n' "$harness_output" >&2
+    fi
 }
 
 # Bus-activated services such as the document portal and gvfs can outlive the
-# harness session, keeping FUSE mounts in its runtime directory, which the
-# harness then leaves behind. Only processes started with that private
-# directory carry it in their environment.
+# harness session, and their FUSE mounts keep the harness from removing its
+# runtime directory. Only processes started with that private directory carry
+# it in their environment. A killed FUSE server can leave its mount behind
+# until the kernel notices, so detach any that remain before removing it.
 sweep_instance_runtime() {
     case $1 in
         "${XDG_RUNTIME_DIR:?}"/nh-?*) ;;
         *) return 0 ;;
     esac
-    [ -d "$1" ] || return 0
     for environment in /proc/[0-9]*/environ; do
         if tr '\0' '\n' 2>/dev/null <"$environment" | grep -qxF "XDG_RUNTIME_DIR=$1"; then
             process=${environment#/proc/}
             kill "${process%/environ}" 2>/dev/null || :
         fi
     done
-    remaining=40
-    while awk -v runtime="$1" '$5 == runtime || index($5, runtime "/") == 1 { found = 1 } END { exit !found }' /proc/self/mountinfo; do
-        if [ "$remaining" -eq 0 ]; then
-            printf '%s\n' "instance $instance runtime retained at $1: a filesystem is still mounted there" >&2
-            return 0
-        fi
-        remaining=$((remaining - 1))
-        sleep 0.05
+    [ -d "$1" ] || return 0
+    awk -v runtime="$1" 'index($5, runtime "/") == 1 && $(NF - 2) ~ /^fuse/ { print $5 }' \
+        /proc/self/mountinfo | while IFS= read -r mount; do
+        fusermount3 -u -z "$mount" 2>/dev/null || fusermount -u -z "$mount" 2>/dev/null || :
     done
+    if awk -v runtime="$1" '$5 == runtime || index($5, runtime "/") == 1 { found = 1 } END { exit !found }' /proc/self/mountinfo; then
+        printf '%s\n' "instance $instance runtime retained at $1: a filesystem is still mounted there" >&2
+        return 0
+    fi
     rm -rf -- "$1"
 }
 
