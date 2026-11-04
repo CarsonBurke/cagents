@@ -2512,11 +2512,12 @@ fn process_inner(
             let retirement = if source.launch.provider == Provider::Claude {
                 retained_resume::inspect_resume_retirement(host, &source).map_err(unavailable)?
             } else {
-                None
+                retained_resume::ResumeRetirement::Unclassified
             };
             // A present owner must be restored, not replaced. Missing evidence
-            // is never proof of a completed close.
-            if retirement.is_none() && has_native_owner(&source)? {
+            // is never proof of a completed close; a runtime record left by a
+            // proved retired or abandoned actor is not a present owner.
+            if !retirement.is_classified() && has_native_owner(&source)? {
                 return Ok(ServerResponse::ChatResumePrepared { session: source });
             }
             // A kernel boot change proves every process from the saved boot
@@ -2528,7 +2529,7 @@ fn process_inner(
             let closed = if previous_boot {
                 true
             } else if source.launch.provider == Provider::Claude {
-                retained_resume::prepare_resume_verified(host, &source, retirement)
+                retained_resume::prepare_resume_verified(host, &source, retirement.verified())
                     .map_err(unavailable)?
             } else {
                 chat::native_holder::closed_source(&source, &proof)

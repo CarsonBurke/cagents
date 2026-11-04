@@ -1466,6 +1466,10 @@ for line in sys.stdin:
         send({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':{}}})
     elif frame.get('type')=='user':
         with (root/'prompts').open('a') as log: log.write('prompt\n')
+        if (root/'leave-survivor').exists():
+            import subprocess
+            survivor=subprocess.Popen(['/bin/sleep','120'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL)
+            (root/'survivor-pid').write_text(str(survivor.pid))
         received=frame['uuid']
         send({'type':'user','uuid':received,'session_id':session,'parent_tool_use_id':None,'message':frame['message']})
         send({'type':'command_lifecycle','command_uuid':received,'state':'started','session_id':session,'uuid':'lifecycle-'+received})
@@ -3759,4 +3763,231 @@ fn unattached_claude_cleanup_refuses_unsupported_protocol_before_reservation() {
     assert!(state.chat_spawning.is_empty());
     assert!(state.chats.is_empty());
     assert!(state.native_closing.is_empty());
+}
+
+/// A same-boot actor that died without writing retirement grants disk resume
+/// only once its helper, its provider and every process left in either's
+/// process group or session are gone. A survivor in the provider's group
+/// refuses, and its exit then allows exactly one proved successor.
+#[test]
+fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
+    let _helper_executable = retained_helper_executable();
+    const MODE: &str = "CAGENTS_ABANDONED_CLAUDE_RESUME_TEST";
+    if std::env::var_os(MODE).is_none() {
+        for mode in ["abandoned", "survivor"] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let root = directory.path();
+            for path in [
+                "home/.claude",
+                "run",
+                "data",
+                "config",
+                "cache",
+                "bin",
+                "project",
+            ] {
+                fs::create_dir_all(root.join(path)).unwrap();
+            }
+            let test = thread::current().name().unwrap().to_owned();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env_clear()
+                .env(
+                    "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+                    retained_helper_executable(),
+                )
+                .env(MODE, mode)
+                .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+                .env("CAGENTS_HOLDER_ROOT", root)
+                .env("HOME", root.join("home"))
+                .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+                .env("XDG_RUNTIME_DIR", root.join("run"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_CACHE_HOME", root.join("cache"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", root.join("bin").display()),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "abandoned resume mode={mode} failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
+    let survivor = std::env::var(MODE).unwrap() == "survivor";
+    install_provider(&root.join("bin/claude"));
+    if survivor {
+        fs::write(root.join("leave-survivor"), "").unwrap();
+    }
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let proof = |incarnation| HostSessionProof {
+        host_session_id: HostSessionId::new("abandoned-resume-fixture"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new(incarnation),
+    };
+    let first = proof("first");
+    let lease = crate::daemon::HostLease::acquire(&paths, &first).unwrap();
+    let registry_path = root.join("registry.sqlite3");
+    let mut state = HostState::new(first.clone());
+    state.enable_holder_recovery();
+    state.install_model(super::super::model::Registry::at(&registry_path).unwrap());
+    let host = Arc::new(HostLock::new(state));
+    let launch = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        root.join("project"),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let id = launch.id;
+    start_execution(
+        &host,
+        0,
+        launch,
+        Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap()),
+    )
+    .unwrap();
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    let identity = handle.actor_identity().unwrap();
+    struct Cleanup(crate::daemon::holder_registry::Record, std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for process in [&self.0.root, &self.0.holder] {
+                if process.is_current() {
+                    unsafe {
+                        libc::kill(process.pid, libc::SIGKILL);
+                    }
+                }
+            }
+            if let Ok(pid) = fs::read_to_string(self.1.join("survivor-pid")) {
+                unsafe {
+                    libc::kill(pid.trim().parse().unwrap(), libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let _cleanup = Cleanup(identity.record.clone(), root.clone());
+    wait_until(
+        || handle.attachment_snapshot().ready,
+        "actor never initialized",
+    );
+    handle
+        .command(chat::Command::Prompt {
+            text: "One explicit turn before the actor is abandoned".into(),
+            attachments: Vec::new(),
+            mode: chat::PromptMode::Send,
+        })
+        .unwrap();
+    wait_until(
+        || root.join("provider-done").exists() && handle.confirmed_session_id().is_some(),
+        "fixture provider never confirmed its completed conversation",
+    );
+    let mut confirmed = None;
+    wait_until(
+        || {
+            let (response, _, _) =
+                super::super::client::process_request(&host, 17, ClientRequest::ChatList).unwrap();
+            let ServerResponse::ChatListed { sessions } = response else {
+                panic!("public metadata did not return chat inventory");
+            };
+            confirmed = sessions.into_iter().find(|session| {
+                session.id == id
+                    && session.launch.session_id.is_some()
+                    && session.launch.session_id == handle.confirmed_session_id()
+            });
+            confirmed.is_some()
+        },
+        "public inventory never published its provider-confirmed descriptor",
+    );
+    let confirmed = confirmed.unwrap();
+    // The daemon and the actor die together without any retirement: nothing
+    // writes a receipt, as when a crash takes both down.
+    drop(handle);
+    drop(host);
+    drop(lease);
+    for process in [&identity.record.root, &identity.record.holder] {
+        unsafe {
+            libc::kill(process.pid, libc::SIGKILL);
+        }
+    }
+    wait_until(
+        || !identity.record.holder.is_current() && !identity.record.root.is_current(),
+        "the killed actor never exited",
+    );
+    let next = proof("successor");
+    let _lease = crate::daemon::HostLease::acquire(&paths, &next).unwrap();
+    let mut state = HostState::new(next.clone());
+    state.enable_holder_recovery();
+    state.install_model(super::super::model::Registry::at(&registry_path).unwrap());
+    let successor = Arc::new(HostLock::new(state));
+    let registry = super::super::agent_execution::registry(&successor).unwrap();
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .native_actor_retirement(identity.instance)
+            .unwrap()
+            .is_none(),
+        "the fixture must exercise an actor with no retirement at all"
+    );
+    let prepare = || {
+        process_inner(
+            &successor,
+            17,
+            ClientRequest::ChatPrepareResume {
+                source: confirmed.clone(),
+            },
+        )
+    };
+    if survivor {
+        let pid: i32 = fs::read_to_string(root.join("survivor-pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let refused = prepare()
+            .err()
+            .expect("a process left in the provider's group may still write the conversation");
+        assert!(
+            refused.message.contains("without verified retirement"),
+            "{}",
+            refused.message
+        );
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        wait_until(
+            || !Path::new(&format!("/proc/{pid}")).exists(),
+            "the survivor never exited",
+        );
+    }
+    let ServerResponse::ChatResumePrepared { session } = prepare().unwrap() else {
+        panic!("a proved abandoned actor must prepare its exact saved conversation");
+    };
+    assert_ne!(session.id, confirmed.id);
+    assert_eq!(session.launch, confirmed.launch);
+    assert_eq!(session.proof, None);
+    assert_eq!(
+        session.native_continuity,
+        chat::NativeContinuity::ReconnectOnly
+    );
+    assert!(
+        successor.lock().unwrap().chats.is_empty(),
+        "resume preparation must not launch a provider"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "nothing the abandoned actor held is resubmitted"
+    );
 }

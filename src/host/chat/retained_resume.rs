@@ -154,18 +154,110 @@ fn current_admission(
     Ok(())
 }
 
+/// The successor would select the exact physical account home the old actor
+/// captured, so its provider reads the same on-disk conversation.
+fn same_account_home(source: &Session, captured: &LaunchAccountScope) -> Result<(), String> {
+    captured.revalidate()?;
+    let launch = super::prepare_native_process_launch(
+        &source.launch,
+        Some(crate::model::agent_recovery::fresh_native_environment(
+            Provider::Claude,
+            false,
+        )),
+        &Default::default(),
+        None,
+    )
+    .map_err(|e| e.message)?;
+    let selected =
+        LaunchAccountScope::resolve(Provider::Claude, &launch.recipe.working_directory, |name| {
+            launch
+                .recipe
+                .environment
+                .get(name)
+                .map(std::ffi::OsString::from)
+        })?;
+    if !same_scope(captured, &selected) {
+        return Err("Claude disk resume would select a different physical account home".into());
+    }
+    Ok(())
+}
+
+/// An actor that ended without retirement grants disk resume only when no
+/// writer of it can survive: its exact helper and provider are gone in this
+/// boot with nothing left in their process group or session, it was never
+/// cleanup intent, it had no paired CLI terminal, and it ran this pane's exact
+/// launch under the account home the successor would select. Whatever it had
+/// not acknowledged is lost with it and is never resubmitted; the successor
+/// starts on the saved conversation with no input.
+fn abandoned(
+    ownership: &NativeActorOwnership,
+    source: &Session,
+    proof: &HostSessionProof,
+) -> Result<(), String> {
+    let issued = ownership.source();
+    if ownership.is_pending()
+        || issued.id != source.id
+        || ownership.owner().terminal != source.id
+        || issued.launch.provider != Provider::Claude
+        || issued.launch.recipe != source.launch.recipe
+        || issued
+            .launch
+            .session_id
+            .as_ref()
+            .is_some_and(|id| Some(id) != source.launch.session_id.as_ref())
+        || issued.terminal.is_some()
+        || source.terminal.is_some()
+    {
+        return Err(
+            "The saved Claude actor ended without retirement and its ownership does not match this pane exactly".into(),
+        );
+    }
+    if !Handle::inspect_abandoned_actor(ownership.owner(), proof)? {
+        return Err("The saved Claude actor ended without retirement and part of it may still be running; no replacement was prepared".into());
+    }
+    let captured = ownership.scope().map_err(|_| {
+        "The ended Claude actor has no captured physical account identity".to_owned()
+    })?;
+    same_account_home(source, captured)
+}
+
+/// How the pane's same-boot actors ended, as far as one census scan proves.
+pub(super) enum ResumeRetirement {
+    /// Nothing classified: not a retained pane, another boot, or an actor
+    /// still running. Generic owner discovery decides.
+    Unclassified,
+    /// The single verified retirement, carried through the later checks
+    /// rather than reopening its files.
+    Verified(crate::chat::runtime::VerifiedRetirement),
+    /// An actor that ended without retirement and left no surviving group
+    /// or session. Its stale runtime record is not a live owner; the full
+    /// ownership check still runs before any successor is prepared.
+    Abandoned,
+}
+
+impl ResumeRetirement {
+    pub(super) fn is_classified(&self) -> bool {
+        !matches!(self, Self::Unclassified)
+    }
+    pub(super) fn verified(self) -> Option<crate::chat::runtime::VerifiedRetirement> {
+        match self {
+            Self::Verified(verified) => Some(verified),
+            Self::Unclassified | Self::Abandoned => None,
+        }
+    }
+}
+
 /// Classify this exact durable pane before generic discovery can mistake an
-/// exited, unreaped helper for a live owner. Carry the single verified read
-/// through the later account/registry checks rather than reopening its files.
+/// exited, unreaped helper for a live owner.
 pub(super) fn inspect_resume_retirement(
     host: &SharedHost,
     source: &Session,
-) -> Result<Option<crate::chat::runtime::VerifiedRetirement>, String> {
+) -> Result<ResumeRetirement, String> {
     if !matches!(
         source.native_continuity,
         crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
     ) {
-        return Ok(None);
+        return Ok(ResumeRetirement::Unclassified);
     }
     let proof = host
         .lock()
@@ -179,12 +271,13 @@ pub(super) fn inspect_resume_retirement(
         .as_ref()
         .is_some_and(|saved| saved.boot_id != proof.boot_id)
     {
-        return Ok(None);
+        return Ok(ResumeRetirement::Unclassified);
     }
     let registry = super::super::agent_execution::registry(host)?;
     let mut after = None;
     let mut verified = None;
     let mut running = false;
+    let mut abandoned = false;
     loop {
         let page = registry
             .lock()
@@ -195,7 +288,12 @@ pub(super) fn inspect_resume_retirement(
             // actor cannot hide a current owner of the same pane allocation.
             // Scan every row first so Running never swallows an unproved exit,
             // receipt error, pending owner or ambiguous verified history.
-            return Ok(if running { None } else { verified });
+            return Ok(match (running, verified) {
+                (true, _) => ResumeRetirement::Unclassified,
+                (false, Some(verified)) => ResumeRetirement::Verified(verified),
+                (false, None) if abandoned => ResumeRetirement::Abandoned,
+                (false, None) => ResumeRetirement::Unclassified,
+            });
         }
         for ownership in page {
             after = Some(ownership.actor());
@@ -218,7 +316,16 @@ pub(super) fn inspect_resume_retirement(
             match Handle::inspect_retained_retirement(ownership.owner(), &proof)? {
                 crate::chat::runtime::RetirementInspection::Running => running = true,
                 crate::chat::runtime::RetirementInspection::ExitedUnproved => {
-                    return Err("The saved Claude actor exited without verified retirement".into());
+                    // Disk resume decides separately whether this exit left
+                    // no surviving writer; it is never retirement evidence.
+                    if ownership.is_pending()
+                        || !Handle::inspect_abandoned_actor(ownership.owner(), &proof)?
+                    {
+                        return Err(
+                            "The saved Claude actor exited without verified retirement".into()
+                        );
+                    }
+                    abandoned = true;
                 }
                 crate::chat::runtime::RetirementInspection::Verified(receipt) => {
                     let retirement = registry
@@ -321,6 +428,8 @@ pub(super) fn prepare_resume_verified(
                 // launch admission's responsibility, not an inferred absence.
                 if super::same_conversation(&ownership.source().launch, &source.launch)
                     && retirement.is_none()
+                    && (ownership.is_pending()
+                        || !Handle::inspect_abandoned_actor(ownership.owner(), &proof)?)
                 {
                     return Err(
                         "Another registered Claude owner has no completed retirement".into(),
@@ -328,8 +437,14 @@ pub(super) fn prepare_resume_verified(
                 }
                 continue;
             }
-            let retirement =
-                retirement.ok_or("The saved Claude actor has no committed retirement")?;
+            let Some(retirement) = retirement else {
+                abandoned(&ownership, source, &proof)?;
+                if matched {
+                    return Err("The saved Claude pane matches more than one ended actor".into());
+                }
+                matched = true;
+                continue;
+            };
             let archived = if ownership.is_pending() || retirement.is_pending() {
                 Some(
                     registry
@@ -357,9 +472,20 @@ pub(super) fn prepare_resume_verified(
                     );
                 }
                 crate::chat::runtime::RetirementInspection::ExitedUnproved => {
-                    return Err(
-                        "The saved Claude actor has no authenticated final retirement proof".into(),
-                    );
+                    if retirement.is_pending() {
+                        return Err(
+                            "The saved Claude actor has no authenticated final retirement proof"
+                                .into(),
+                        );
+                    }
+                    abandoned(&ownership, source, &proof)?;
+                    if matched {
+                        return Err(
+                            "The saved Claude pane matches more than one ended actor".into()
+                        );
+                    }
+                    matched = true;
+                    continue;
                 }
             };
             if unconfirmed_retired_startup(&ownership, &retirement, &verified)? {
@@ -381,33 +507,7 @@ pub(super) fn prepare_resume_verified(
                 return Err("The saved Claude pane matches more than one retired actor".into());
             }
             let captured = evidence.scope.map_err(str::to_owned)?;
-            captured.revalidate()?;
-            let launch = super::prepare_native_process_launch(
-                &source.launch,
-                Some(crate::model::agent_recovery::fresh_native_environment(
-                    Provider::Claude,
-                    false,
-                )),
-                &Default::default(),
-                None,
-            )
-            .map_err(|e| e.message)?;
-            let selected = LaunchAccountScope::resolve(
-                Provider::Claude,
-                &launch.recipe.working_directory,
-                |name| {
-                    launch
-                        .recipe
-                        .environment
-                        .get(name)
-                        .map(std::ffi::OsString::from)
-                },
-            )?;
-            if !same_scope(captured, &selected) {
-                return Err(
-                    "Claude disk resume would select a different physical account home".into(),
-                );
-            }
+            same_account_home(source, captured)?;
             match (&evidence.source.terminal, evidence.paired_holder) {
                 (None, None) => {}
                 (Some(terminal), Some(pair))

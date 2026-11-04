@@ -166,6 +166,12 @@ impl Handle {
     ) -> Result<super::RetirementInspection, String> {
         RemoteActor::inspect_retained_retirement(record, proof)
     }
+    pub(crate) fn inspect_abandoned_actor(
+        record: &crate::daemon::holder_registry::Record,
+        proof: &crate::model::HostSessionProof,
+    ) -> Result<bool, String> {
+        RemoteActor::inspect_abandoned(record, proof)
+    }
     pub(crate) fn retired_actor_receipt(
         record: &crate::daemon::holder_registry::Record,
         proof: &crate::model::HostSessionProof,
