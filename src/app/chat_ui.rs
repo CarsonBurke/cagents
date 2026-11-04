@@ -8046,10 +8046,26 @@ impl Cagents {
         self.chat_ui.phases.remove(&target.card);
         if !source_matches || !context_matches {
             self.release_draft_start_capture(target.card);
-            if source_matches && let Some(runtime) = self.chat_card_runtime_mut(target) {
-                runtime.error = Some("The workspace changed while saving. Nothing was started; your draft is retained, so send it again when ready.".into());
-            }
-            return self.restore_failed_draft_start_focus(target, &source);
+            // Another window's launch options wait for this save's answer. The
+            // composer adopts them now, or the next Send refuses a stale source.
+            let adopted = self.adopt_stored_draft_session(target.card);
+            let Some(runtime) = self.chat_card_runtime_mut(target) else {
+                return adopted;
+            };
+            runtime.error = Some(if source_matches {
+                "The workspace changed while saving. Nothing was started; your draft is retained, so send it again when ready.".into()
+            } else {
+                "This draft changed in another window while saving. Nothing was started; your draft is retained, so review it and send again.".into()
+            });
+            // The same draft keeps the keyboard; another conversation's reader
+            // in this card owns its own.
+            let shown = runtime.session.clone();
+            let focus = if shown.id == source.id {
+                self.restore_failed_draft_start_focus(target, &shown)
+            } else {
+                Task::none()
+            };
+            return Task::batch([adopted, focus]);
         }
         if creation_revoked {
             self.release_draft_start_capture(target.card);

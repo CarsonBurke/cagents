@@ -439,6 +439,7 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
         "scope",
         "runtime-replaced",
         "source-replaced",
+        "identity-replaced",
         "replacement-both",
     ] {
         let (mut app, _directory, card, target) = fixture();
@@ -506,9 +507,15 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
                 };
                 source.launch.recipe.arguments.push("changed source".into());
             }
+            "identity-replaced" => {
+                let CardKind::Chat(source) = &mut app.card_state_mut(card).unwrap().kind else {
+                    unreachable!()
+                };
+                source.id = TerminalId::new();
+            }
             "replacement-both" => {
                 let mut replacement = source.clone();
-                replacement.launch.recipe.arguments.push("new owner".into());
+                replacement.id = TerminalId::new();
                 app.card_state_mut(card).unwrap().kind = CardKind::Chat(replacement.clone());
                 match app.cards.get_mut(&card).unwrap() {
                     CardRuntime::Chat(runtime) => runtime.session = replacement,
@@ -524,13 +531,22 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
             }
             _ => {}
         }
-        let retained_source = runtime(&app, card).session.clone();
+        // The same draft with another window's options is still this composer's
+        // draft: it adopts them and keeps the keyboard. A different conversation
+        // in the card is not, so its reader keeps both.
+        let retained_source = match (context, &app.card_state(card).unwrap().kind) {
+            ("source-replaced", CardKind::Chat(source)) => source.clone(),
+            _ => runtime(&app, card).session.clone(),
+        };
         let recovery = app.draft_start_checkpointed(target, attempt, result);
         let chosen = (context == "other-control").then(sidebar::search_focus_id);
         let task = chosen.as_ref().map_or_else(Task::none, |id| {
             iced::widget::operation::focus(id.clone()).map(cosmic::Action::App)
         });
-        let expected = if matches!(context, "current" | "registry" | "writer" | "scope") {
+        let expected = if matches!(
+            context,
+            "current" | "registry" | "writer" | "scope" | "source-replaced"
+        ) {
             Some(card_control_id(card, "chat-composer"))
         } else {
             chosen
@@ -689,6 +705,62 @@ fn changed_draft_or_source_and_stale_checkpoint_cannot_authorize_first_start() {
             );
         }
     }
+}
+
+#[test]
+fn options_another_window_chose_during_the_first_save_leave_the_draft_sendable() {
+    let (mut app, _directory, card, target) = fixture();
+    let task = app.start_chat_draft(target);
+    let (target, attempt, result) = checkpoint(task);
+    assert!(result.is_ok());
+    // The shared projection installs the peer's recipe on the card; the draft
+    // keeps its launch while its first save is in flight.
+    let CardKind::Chat(chosen) = &mut app.card_state_mut(card).unwrap().kind else {
+        unreachable!()
+    };
+    chosen
+        .launch
+        .recipe
+        .arguments
+        .push("chosen in another window".into());
+    let chosen = chosen.clone();
+    drop(app.adopt_shared_draft_session(card, &chosen));
+    assert_ne!(runtime(&app, card).session, chosen);
+
+    drop(app.draft_start_checkpointed(target, attempt, result));
+    no_starter(&app, card);
+    assert_eq!(runtime(&app, card).session, chosen);
+    assert_eq!(
+        runtime(&app, card).composer.text(),
+        "First prompt remains local"
+    );
+    assert!(
+        runtime(&app, card)
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("changed in another window")),
+        "a Send that started nothing must say why"
+    );
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(stored(&app, card), chosen);
+
+    // Send works again, and starts on the options the other window chose.
+    let retry = app.start_chat_draft(target);
+    let (target, attempt, result) = checkpoint(retry);
+    assert!(result.is_ok());
+    drop(app.draft_start_checkpointed(target, attempt, result));
+    let attempted = app
+        .chat_ui
+        .attempt(card)
+        .expect("retry starts")
+        .session
+        .clone();
+    assert_eq!(attempted.launch.recipe, chosen.launch.recipe);
+    assert_ne!(attempted.id, chosen.id);
 }
 
 #[test]
