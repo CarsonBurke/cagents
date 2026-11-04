@@ -6458,6 +6458,7 @@ impl Cagents {
                     ));
                     return Task::none();
                 };
+                session.launch.draft_model = self.chat_model_for_duplicate(source_id, session);
                 session.id = TerminalId::new();
                 session.launch.recipe = recipe;
                 session.launch.session_id = None;

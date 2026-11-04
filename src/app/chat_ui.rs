@@ -5607,6 +5607,43 @@ impl Cagents {
         draft_snapshot(provider, models, model, reasoning)
     }
 
+    fn remembered_draft_model(&self, provider: Provider) -> Option<chat::DraftModel> {
+        self.chat_ui
+            .last_models
+            .get(&provider)
+            .map(|(model, reasoning)| chat::DraftModel {
+                model: model.clone(),
+                reasoning: reasoning.clone(),
+            })
+    }
+
+    /// A draft clone keeps its shared choice. A running conversation may have
+    /// changed models since its first send, so its clone uses the current one.
+    pub(super) fn chat_model_for_duplicate(
+        &self,
+        card: CardId,
+        session: &chat::Session,
+    ) -> Option<chat::DraftModel> {
+        if session.is_unstarted() {
+            return session.launch.draft_model.clone();
+        }
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
+        };
+        if let Some(runtime) = runtime.filter(|runtime| runtime.session.id == session.id) {
+            return runtime
+                .snapshot
+                .selected_model
+                .clone()
+                .map(|model| chat::DraftModel {
+                    model,
+                    reasoning: runtime.snapshot.reasoning.clone(),
+                });
+        }
+        self.remembered_draft_model(session.launch.provider)
+    }
+
     /// Stops offering `model` to new drafts of `provider`, as a conversation
     /// of that provider would not take it.
     fn forget_chat_model(&mut self, provider: Provider, model: &str) {
@@ -6440,14 +6477,7 @@ impl Cagents {
                 return Task::none();
             }
         };
-        session.launch.draft_model =
-            self.chat_ui
-                .last_models
-                .get(&provider)
-                .map(|(model, reasoning)| chat::DraftModel {
-                    model: model.clone(),
-                    reasoning: reasoning.clone(),
-                });
+        session.launch.draft_model = self.remembered_draft_model(provider);
         let scope = if self.durable.active_channel.is_none()
             && self.active_workspace.as_deref() != Some(working_directory.as_path())
         {
@@ -6467,10 +6497,13 @@ impl Cagents {
     /// restored chat draft can move to the new card before its first snapshot.
     pub(super) fn insert_chat_card(
         &mut self,
-        session: chat::Session,
+        mut session: chat::Session,
         beside: Option<CardId>,
         draft_from: Option<CardId>,
     ) -> Task<Message> {
+        if session.is_unstarted() && session.launch.draft_model.is_none() {
+            session.launch.draft_model = self.remembered_draft_model(session.launch.provider);
+        }
         self.insert_chat_card_with_lifetime(session, beside, false, draft_from)
     }
 
@@ -22654,8 +22687,57 @@ mod tests {
     }
 
     #[test]
-    fn draft_model_choice_survives_returned_first_message_and_changed_preference()
-    {
+    fn draft_model_choice_on_a_clone_uses_the_running_model_or_the_drafts_shared_choice() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let original_choice = Some(chat::DraftModel {
+            model: "first-model".into(),
+            reasoning: Some("low".into()),
+        });
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.session.launch.draft_model = original_choice.clone();
+        }
+        if let Some(CardKind::Chat(session)) = app.card_state_mut(card).map(|state| &mut state.kind)
+        {
+            session.launch.draft_model = original_choice;
+        }
+        show_chat_snapshot_for_test(
+            &mut app,
+            card,
+            Snapshot {
+                generation: 1,
+                session_id: Some(KNOWN_THREAD.into()),
+                selected_model: Some("current-model".into()),
+                reasoning: Some("high".into()),
+                ready: true,
+                ..Snapshot::default()
+            },
+        );
+        let current = Some(chat::DraftModel {
+            model: "current-model".into(),
+            reasoning: Some("high".into()),
+        });
+        drop(app.duplicate_pane(app.card_state(card).unwrap().clone()));
+        let copy = app.workspace.focused().unwrap();
+        assert_eq!(draft_model_for_test(&app, copy), current);
+        assert_eq!(chat_runtime(&app, copy).session.launch.draft_model, current);
+
+        // Duplicating a default draft must not pick another conversation's
+        // last chosen model, either.
+        let target = chat_runtime(&app, copy).target;
+        drop(app.choose_draft_model(target, Provider::Codex, None));
+        app.remember_chat_model(Provider::Codex, Some("window-model".into()), None);
+        drop(app.duplicate_pane(app.card_state(copy).unwrap().clone()));
+        let default_copy = app.workspace.focused().unwrap();
+        assert_eq!(draft_model_for_test(&app, default_copy), None);
+        assert_eq!(
+            chat_runtime(&app, default_copy).session.launch.draft_model,
+            None
+        );
+    }
+
+    #[test]
+    fn draft_model_choice_survives_returned_first_message_and_changed_preference() {
         for refused in [false, true] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             drop(app.observe_listed_models(
