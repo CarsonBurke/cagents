@@ -3638,17 +3638,24 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
         Some(confirmed),
         "resume must use the actual canonical retirement descriptor"
     );
-    assert!(
-        process_inner(
-            &successor,
-            17,
-            ClientRequest::ChatPrepareResume {
-                source: requested.clone()
-            }
-        )
-        .is_err(),
-        "an actually saved unnamed alias cannot acquire a fabricated confirmed identity"
+    // The saved unnamed card resumes exactly the conversation its retirement
+    // records as confirmed, through the same account checks.
+    let unnamed = process_inner(
+        &successor,
+        17,
+        ClientRequest::ChatPrepareResume {
+            source: requested.clone(),
+        },
     );
+    if mode == "removed-home" || mode == "replaced-home" {
+        assert!(unnamed.is_err());
+    } else {
+        let ServerResponse::ChatResumePrepared { session } = unnamed.unwrap() else {
+            panic!("an unnamed card whose actor retired resumes what it confirmed");
+        };
+        assert!(chat::is_retained_resume_successor(&requested, &session));
+        assert_eq!(session.launch.session_id.as_deref(), Some(confirmed));
+    }
     let mut wrong_recipe = canonical.clone();
     wrong_recipe
         .launch
