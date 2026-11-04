@@ -1,9 +1,15 @@
 #![cfg(all(feature = "host", target_os = "linux"))]
 
 //! A real private daemon establishes and reuses an offline fixture provider.
-//! Management uses an explicitly declared synthetic User RPC connection. The
-//! invoking process and daemon retain inherited HOME and delegation unchanged;
-//! only the child's XDG directories, provider homes and PATH are fixture-owned.
+//! A genuinely nondelegated User environment is required before any guardian
+//! or daemon starts. RPCs use the captured inherited authority; HOME and
+//! delegation remain unchanged. Only the child's XDG directories, provider
+//! homes and PATH are fixture-owned. This exercises the User protocol fixture,
+//! not production CLI admission, because no CLI command is invoked.
+#[path = "support/precheck_receipt_guardian.rs"]
+#[allow(dead_code)]
+mod guardian;
+
 use cagents::{
     agent::Provider,
     agent_execution::{Authority, HostedSession, Run, Spec, State, Surface, Target},
@@ -41,12 +47,17 @@ fn require(condition: bool, message: impl Into<String>) -> Result<(), String> {
 /// A disconnected or wedged RPC cannot extend the fixture's operation budget.
 struct FixtureUser {
     client: ControlClient,
+    authority: Authority,
     finished: Option<mpsc::Sender<()>>,
     watchdog: Option<thread::JoinHandle<()>>,
 }
 
 impl FixtureUser {
-    fn connected(client: ControlClient, budget: Duration) -> Result<Self, String> {
+    fn connected(
+        client: ControlClient,
+        authority: Authority,
+        budget: Duration,
+    ) -> Result<Self, String> {
         let hangup = client.hangup().map_err(|error| error.to_string())?;
         let (finished, receiver) = mpsc::channel();
         let watchdog = thread::Builder::new()
@@ -57,16 +68,21 @@ impl FixtureUser {
                 }
             })
             .map_err(|error| error.to_string())?;
-        Ok(Self {
+        let mut user = Self {
             client,
+            authority,
             finished: Some(finished),
             watchdog: Some(watchdog),
-        })
+        };
+        user.client
+            .authenticate(user.authority.clone())
+            .map_err(|error| error.to_string())?;
+        Ok(user)
     }
 
     fn automation(&mut self, request: Request) -> Result<Response, String> {
         self.client
-            .automation(Authority::default(), request)
+            .automation(self.authority.clone(), request)
             .map_err(|error| error.to_string())
     }
 }
@@ -87,13 +103,11 @@ struct OriginalDaemon(Child);
 impl OriginalDaemon {
     fn wait_until(&mut self, deadline: Instant) -> Result<(), String> {
         loop {
-            if self
-                .0
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                return Ok(());
+            if let Some(status) = self.0.try_wait().map_err(|error| error.to_string())? {
+                return require(
+                    status.success(),
+                    format!("private daemon cleanup exited unsuccessfully: {status}"),
+                );
             }
             require(Instant::now() < deadline, "private daemon did not exit")?;
             thread::sleep(Duration::from_millis(10));
@@ -123,7 +137,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn start() -> Result<Self, String> {
+    fn start(custody: &guardian::Custody, authority: Authority) -> Result<Self, String> {
         // An absent private binary must never fall through to a real provider.
         for path in ["/usr/bin/claude", "/bin/claude"] {
             require(
@@ -131,10 +145,13 @@ impl Fixture {
                 format!("fixture requires no provider at {path}"),
             )?;
         }
-        let root = tempfile::Builder::new()
-            .prefix("cagents-establishment-")
-            .tempdir_in("/var/tmp")
+        let mut root = tempfile::Builder::new()
+            .prefix("e-")
+            .tempdir_in(custody.root())
             .map_err(|error| error.to_string())?;
+        // The existing guardian retains this namespace through family
+        // settlement and removes it only after its positive ECHILD receipt.
+        root.disable_cleanup(true);
         let root_path = root
             .path()
             .canonicalize()
@@ -163,7 +180,7 @@ impl Fixture {
         ] {
             command.env(name, root.path().join(leaf));
         }
-        // No env_clear, HOME override, or authority read/copy/removal.
+        // No env_clear, HOME override, or authority environment mutation.
         let mut daemon = OriginalDaemon(
             command
                 .env(
@@ -182,6 +199,11 @@ impl Fixture {
                 .spawn()
                 .map_err(|error| error.to_string())?,
         );
+        // Transfer exact original-child custody before readiness or any
+        // request can start a detached retained provider helper.
+        custody
+            .register(&daemon.0, root.path())
+            .map_err(|error| error.to_string())?;
         let socket = root
             .path()
             .join("runtime")
@@ -206,12 +228,7 @@ impl Fixture {
             )?;
             thread::sleep(Duration::from_millis(10));
         };
-        let mut user = FixtureUser::connected(client, Duration::from_secs(40))?;
-        // This separate synthetic User caller is declared before any request;
-        // it is never a retry of the invoking session's delegated CLI.
-        user.client
-            .authenticate(Authority::default())
-            .map_err(|error| error.to_string())?;
+        let user = FixtureUser::connected(client, authority, Duration::from_secs(40))?;
         let proof = user.client.proof().clone();
         require(
             proof.is_complete(),
@@ -532,15 +549,13 @@ impl Fixture {
     }
 
     fn cleanup(&mut self) -> Result<(), String> {
-        let mut client = ControlClient::connect(&self.socket).map_err(|error| error.to_string())?;
+        let client = ControlClient::connect(&self.socket).map_err(|error| error.to_string())?;
         require(
             client.proof() == &self.proof,
             "cleanup connected to a different daemon",
         )?;
-        client
-            .authenticate(Authority::default())
-            .map_err(|error| error.to_string())?;
-        let mut user = FixtureUser::connected(client, Duration::from_secs(25))?;
+        let mut user =
+            FixtureUser::connected(client, self.user.authority.clone(), Duration::from_secs(25))?;
         if let Some(id) = self.automation {
             let Response::Automation(mut automation) = user.automation(Request::Show { id })?
             else {
@@ -713,29 +728,42 @@ fn successful_run<'a>(detail: &'a RunDetail, expected: &str) -> Result<&'a Run, 
     Ok(run)
 }
 
+fn unexpected_fixture_actor(stage: &str, _root: &std::path::Path) {
+    panic!("establishment fixture has no actor stage: {stage}");
+}
+
 #[test]
 fn failed_first_reuse_start_releases_and_new_firings_establish_then_reuse_one_provider() {
-    let inherited_home = std::env::var_os("HOME");
-    let delegated = Authority::from_environment() != Authority::default();
-    let mut fixture = Fixture::start().expect("private establishment fixture could not start");
-    let result = fixture.exercise();
-    let cleanup = fixture.cleanup();
-    // Collect observations and retire exact owned work before any assertion.
-    if result.is_err() || cleanup.is_err() {
-        fixture.root.disable_cleanup(true);
-        eprintln!(
-            "Private establishment evidence retained at {}",
-            fixture.root.path().display()
-        );
-    }
-    assert_eq!(std::env::var_os("HOME"), inherited_home);
+    let authority = Authority::from_environment();
     assert_eq!(
-        Authority::from_environment() != Authority::default(),
-        delegated
+        authority,
+        Authority::default(),
+        "this private-daemon protocol fixture requires an actual ordinary User environment; delegated execution is refused before any guardian or daemon starts"
     );
-    assert!(
-        result.is_ok(),
-        "establishment contract: {result:?}; cleanup: {cleanup:?}"
+    guardian::isolated(
+        "failed_first_reuse_start_releases_and_new_firings_establish_then_reuse_one_provider",
+        unexpected_fixture_actor,
+        |custody| {
+            let inherited_home = std::env::var_os("HOME");
+            let mut fixture = Fixture::start(custody, authority.clone())
+                .expect("private establishment fixture could not start");
+            let result = fixture.exercise();
+            let cleanup = fixture.cleanup();
+            // Collect observations and retire exact owned work before any assertion.
+            if result.is_err() || cleanup.is_err() {
+                fixture.root.disable_cleanup(true);
+                eprintln!(
+                    "Private establishment evidence retained at {}",
+                    fixture.root.path().display()
+                );
+            }
+            assert_eq!(std::env::var_os("HOME"), inherited_home);
+            assert_eq!(Authority::from_environment(), authority);
+            assert!(
+                result.is_ok(),
+                "establishment contract: {result:?}; cleanup: {cleanup:?}"
+            );
+            assert!(cleanup.is_ok(), "private ownership cleanup: {cleanup:?}");
+        },
     );
-    assert!(cleanup.is_ok(), "private ownership cleanup: {cleanup:?}");
 }
