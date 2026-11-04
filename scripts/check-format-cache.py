@@ -23,7 +23,8 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE_ROOTS = ("src", "tests", "crates")
-CACHE = ROOT / "target" / ".check-format-cache"
+# The checker runs from ROOT, which also anchors relative Cargo target paths.
+CACHE = ROOT / (os.environ.get("CARGO_TARGET_DIR") or "target") / ".check-format-cache"
 CONFIG_NAMES = ("rustfmt.toml", ".rustfmt.toml")
 MAX_FILES = 20_000
 MAX_BYTES = 128 * 1024 * 1024
