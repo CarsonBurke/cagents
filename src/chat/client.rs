@@ -3995,6 +3995,70 @@ mod tests {
     /// A daemon that did upgrade itself can still map the saved descriptor onto
     /// the conversation it restarted under, and that attachment wins over
     /// starting a second provider on the same conversation.
+    /// A pane saved showing an agent's chat, paired with the agent's
+    /// console, rejoins the running actor after the app or the daemon
+    /// restarts. It never starts the provider again beside the agent.
+    #[test]
+    fn an_agent_chat_saved_with_its_console_restores_by_attaching() {
+        let live = host_proof("live");
+        let mut saved = omp_card(Some(CONVERSATION), Some(live.clone()));
+        saved.terminal = Some(crate::model::TerminalSession {
+            id: saved.id,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            launch: crate::model::LaunchRecipe {
+                unset_environment: Default::default(),
+                program: "cagents".into(),
+                arguments: vec![
+                    "agent".into(),
+                    "console".into(),
+                    crate::model::AgentId::new().to_string(),
+                ],
+                working_directory: "/".into(),
+                environment: BTreeMap::new(),
+            },
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::Live {
+                host_session_id: live.host_session_id.clone(),
+                boot_id: live.boot_id.clone(),
+                host_incarnation: live.host_incarnation.clone(),
+            },
+        });
+        // The same daemon still runs it.
+        let (mut client, _peer) = UnixStream::pair().unwrap();
+        let outcome = restore(
+            &mut client,
+            &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+            &mut 2,
+            &live,
+            saved.clone(),
+            &mut None,
+            false,
+        );
+        assert!(
+            matches!(&outcome, Ok(ClientRequest::ChatAttach { session }) if *session == saved),
+            "{outcome:?}"
+        );
+        // A restarted daemon proves the agent's actor is the saved one.
+        let mut before = saved.clone();
+        before.proof = Some(host_proof("before-the-restart"));
+        let (outcome, _) = negotiate(
+            &live,
+            before,
+            ServerMessage::Response {
+                response: ServerResponse::UpgradeChatResolved {
+                    session: saved.clone(),
+                },
+            },
+        );
+        assert!(
+            matches!(&outcome, Ok(ClientRequest::ChatAttach { session }) if *session == saved),
+            "{outcome:?}"
+        );
+    }
+
     #[test]
     fn a_proven_upgrade_lineage_attaches_instead_of_starting_a_second_provider() {
         let live = host_proof("live");
