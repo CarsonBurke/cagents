@@ -1,19 +1,67 @@
 //! Lazy, cancellable inspection of immutable commits from the history list.
 use super::*;
-use crate::repository::{DiffEntry, Oid};
+use crate::repository::{DiffEntry, Oid, RepositoryError};
 use crate::sidebar::CommitChanges;
+
+#[derive(Debug, Clone)]
+pub enum ReadFailure {
+    Limited {
+        matches: Vec<CommitSummary>,
+        notice: String,
+    },
+    Failed(String),
+}
+
+impl From<RepositoryError> for ReadFailure {
+    fn from(error: RepositoryError) -> Self {
+        match error {
+            RepositoryError::HistorySearchLimit { matches, .. } => Self::Limited {
+                notice: "Search reached its limit; more matches may exist. \
+                         Refine the query to search further."
+                    .into(),
+                matches,
+            },
+            error => Self::Failed(error.to_string()),
+        }
+    }
+}
+
+impl From<String> for ReadFailure {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<&str> for ReadFailure {
+    fn from(error: &str) -> Self {
+        Self::Failed(error.to_owned())
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct State {
     generation: u64,
     page_generation: u64,
+    page_cancellation: Option<CancellationToken>,
     cancellation: Option<CancellationToken>,
 }
 
 impl State {
     pub(super) fn next_page_request(&mut self) -> u64 {
-        self.page_generation = self.page_generation.wrapping_add(1);
+        self.cancel_pages();
+        self.page_cancellation = Some(CancellationToken::default());
         self.page_generation
+    }
+
+    pub(super) fn cancel_pages(&mut self) {
+        self.page_generation = self.page_generation.wrapping_add(1);
+        if let Some(cancellation) = self.page_cancellation.take() {
+            cancellation.cancel();
+        }
+    }
+
+    pub(super) fn page_cancellation(&self) -> CancellationToken {
+        self.page_cancellation.clone().unwrap_or_default()
     }
 
     pub(super) fn accepts_page(&self, generation: u64) -> bool {
@@ -31,6 +79,7 @@ impl State {
 impl Drop for State {
     fn drop(&mut self) {
         self.cancel();
+        self.cancel_pages();
     }
 }
 
@@ -201,6 +250,44 @@ mod tests {
     }
 
     #[test]
+    fn history_search_without_head_does_not_start_an_unfinishable_page() {
+        let (mut app, key, _, _) = fixture();
+        let mut source = SourceControlModel::loading(key.clone());
+        source.unborn = true;
+        app.sidebar_model.source_control = Some(source);
+        let generation = app.history_ui.page_generation;
+        drop(app.update(Message::Sidebar(SidebarAction::SearchHistory {
+            key,
+            query: "Author".into(),
+        })));
+        let source = app.sidebar_model.source_control.as_ref().unwrap();
+        assert!(!source.history_loading);
+        assert!(!source.history_requested());
+        assert!(source.history_query.is_empty());
+        assert_eq!(app.history_ui.page_generation, generation);
+    }
+
+    #[test]
+    fn history_paging_without_head_keeps_the_page_idle() {
+        for unborn in [false, true] {
+            let (mut app, key, _, _) = fixture();
+            let mut source = SourceControlModel::loading(key.clone());
+            source.unborn = unborn;
+            app.sidebar_model.source_control = Some(source);
+            let generation = app.history_ui.page_generation;
+            drop(app.update(Message::Sidebar(SidebarAction::LoadMoreHistory {
+                key,
+                page: 0,
+            })));
+            let source = app.sidebar_model.source_control.as_ref().unwrap();
+            assert!(!source.history_loading);
+            assert!(!source.history_requested());
+            assert_eq!(source.next_history_page, 0);
+            assert_eq!(app.history_ui.page_generation, generation);
+        }
+    }
+
+    #[test]
     fn switching_commits_cancels_the_old_read_and_rejects_its_completion() {
         let (mut app, key, first, second) = fixture();
         drop(app.open_history_commit(key.clone(), first.clone()));
@@ -258,6 +345,25 @@ mod tests {
     }
 
     #[test]
+    fn superseded_history_searches_and_rebindings_cancel_the_old_worker() {
+        let mut state = State::default();
+        let old = state.next_page_request();
+        let cancelled = state.page_cancellation();
+        let current = state.next_page_request();
+        assert!(cancelled.is_cancelled());
+        assert!(!state.accepts_page(old));
+        assert!(state.accepts_page(current));
+        let active = state.page_cancellation();
+        state.cancel_pages();
+        assert!(active.is_cancelled());
+        assert!(!state.accepts_page(current));
+        state.next_page_request();
+        let final_token = state.page_cancellation();
+        drop(state);
+        assert!(final_token.is_cancelled());
+    }
+
+    #[test]
     fn an_abandoned_history_error_cannot_replace_a_new_page_request() {
         let (mut app, key, head, _) = fixture();
         let old = app.history_ui.next_page_request();
@@ -275,6 +381,199 @@ mod tests {
         let source = app.sidebar_model.source_control.as_ref().unwrap();
         assert!(source.history_loading);
         assert!(source.history_error.is_none());
+    }
+
+    fn history_summary(oid: Oid) -> CommitSummary {
+        let identity = CommitIdentity {
+            name: "Author".into(),
+            email: "author@example.invalid".into(),
+            timestamp: 0,
+            offset_minutes: 0,
+        };
+        CommitSummary {
+            oid,
+            parents: vec![],
+            author: identity.clone(),
+            committer: identity,
+            subject: "Known matching commit".into(),
+            body: String::new(),
+        }
+    }
+
+    fn begin_history_query(app: &mut Cagents, key: &ActiveWorktreeKey, query: &str) -> u64 {
+        drop(
+            app.update(Message::Sidebar(SidebarAction::HistoryQueryChanged {
+                key: key.clone(),
+                query: query.into(),
+            })),
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::SearchHistory {
+            key: key.clone(),
+            query: query.into(),
+        })));
+        app.history_ui.page_generation
+    }
+
+    fn limited(commits: Vec<CommitSummary>) -> ReadFailure {
+        RepositoryError::HistorySearchLimit {
+            matches: commits,
+            failure: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn superseded_history_success_and_limit_cannot_replace_the_current_query() {
+        let (mut app, key, head, current) = fixture();
+        app.sidebar_model.source_control.as_mut().unwrap().head_oid = Some(head.to_string().into());
+        let first = begin_history_query(&mut app, &key, "A");
+        let abandoned = app.history_ui.page_cancellation();
+        let second = begin_history_query(&mut app, &key, "B");
+        assert!(abandoned.is_cancelled());
+        assert_ne!(first, second);
+        let cancelled =
+            ReadFailure::from(RepositoryError::Process(crate::process::process_failure(
+                &crate::process::CommandSpec::new("git"),
+                crate::process::ProcessFailureKind::Cancelled,
+                "superseded history request",
+                false,
+            )));
+        assert!(matches!(&cancelled, ReadFailure::Failed(_)));
+        for result in [
+            Ok(vec![history_summary(head.clone())]),
+            Err(limited(vec![history_summary(head.clone())])),
+            Err(cancelled),
+        ] {
+            drop(app.update(Message::SourceControlHistory {
+                generation: first,
+                key: key.clone(),
+                page: 0,
+                head: head.clone(),
+                result,
+            }));
+            let source = app.sidebar_model.source_control.as_ref().unwrap();
+            assert_eq!(source.history_query, "B");
+            assert!(source.history_loading);
+            assert!(source.history.is_empty());
+            assert!(source.history_limit.is_none());
+            assert!(source.history_error.is_none());
+        }
+        drop(app.update(Message::SourceControlHistory {
+            generation: second,
+            key,
+            page: 0,
+            head,
+            result: Ok(vec![history_summary(current.clone())]),
+        }));
+        let source = app.sidebar_model.source_control.as_ref().unwrap();
+        assert_eq!(source.history_query, "B");
+        assert_eq!(source.history.len(), 1);
+        assert_eq!(source.history[0].oid, current);
+        assert!(source.history_complete);
+        assert!(source.history_limit.is_none());
+    }
+
+    #[test]
+    fn limited_history_keeps_known_rows_inspectable_and_refuses_replay_or_more() {
+        let (mut app, key, head, found) = fixture();
+        app.sidebar_model.source_control.as_mut().unwrap().head_oid = Some(head.to_string().into());
+        let generation = begin_history_query(&mut app, &key, found.as_str());
+        let token = app.history_ui.page_cancellation();
+        let payload = limited(vec![history_summary(found.clone())]);
+        drop(app.update(Message::SourceControlHistory {
+            generation,
+            key: key.clone(),
+            page: 0,
+            head: head.clone(),
+            result: Err(payload.clone()),
+        }));
+        let source = app.sidebar_model.source_control.as_ref().unwrap();
+        let notice = source.history_limit.clone();
+        assert!(notice.as_ref().unwrap().contains("more matches may exist"));
+        assert!(source.history_loaded);
+        assert!(!source.history_loading);
+        assert!(!source.history_complete);
+        assert_eq!(source.next_history_page, 0);
+        assert_eq!(source.history.len(), 1);
+        assert_eq!(source.history[0].oid, found);
+        drop(app.update(Message::Sidebar(SidebarAction::LoadMoreHistory {
+            key: key.clone(),
+            page: 0,
+        })));
+        assert_eq!(app.history_ui.page_generation, generation);
+        assert!(!token.is_cancelled());
+        for result in [Err(payload), Ok(vec![history_summary(found.clone())])] {
+            drop(app.update(Message::SourceControlHistory {
+                generation,
+                key: key.clone(),
+                page: 0,
+                head: head.clone(),
+                result,
+            }));
+        }
+        let source = app.sidebar_model.source_control.as_ref().unwrap();
+        assert_eq!(source.history.len(), 1);
+        assert_eq!(source.history_limit, notice);
+        // This is the ordinary action reached by the existing selectable row.
+        // Its returned Git future is unpolled; the selected retained target
+        // and detail ownership must still be installed by the real reducer.
+        drop(app.update(Message::Sidebar(SidebarAction::OpenCommit {
+            key: key.clone(),
+            oid: found.clone(),
+        })));
+        assert_eq!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .commit_changes
+                .as_ref()
+                .unwrap()
+                .commit
+                .oid,
+            found
+        );
+        let next = begin_history_query(&mut app, &key, "refined");
+        assert_ne!(next, generation);
+        assert!(token.is_cancelled());
+        let source = app.sidebar_model.source_control.as_ref().unwrap();
+        assert!(source.history_limit.is_none());
+        assert!(source.history_loading);
+        assert!(source.history.is_empty());
+        assert!(source.commit_changes.is_none());
+    }
+
+    #[test]
+    fn limited_history_completion_keeps_binding_head_page_and_loading_fences() {
+        for wrong in ["binding", "head", "page", "loading"] {
+            let (mut app, key, head, found) = fixture();
+            app.sidebar_model.source_control.as_mut().unwrap().head_oid =
+                Some(head.to_string().into());
+            let generation = begin_history_query(&mut app, &key, "current");
+            if wrong == "loading" {
+                app.sidebar_model
+                    .source_control
+                    .as_mut()
+                    .unwrap()
+                    .history_loading = false;
+            }
+            let mut reply_key = key.clone();
+            if wrong == "binding" {
+                reply_key.canonical_path = "/another-worktree".into();
+            }
+            drop(app.update(Message::SourceControlHistory {
+                generation,
+                key: reply_key,
+                page: u32::from(wrong == "page"),
+                head: if wrong == "head" { found.clone() } else { head },
+                result: Err(limited(vec![history_summary(found)])),
+            }));
+            let source = app.sidebar_model.source_control.as_ref().unwrap();
+            assert!(source.history.is_empty(), "{wrong}");
+            assert!(source.history_limit.is_none(), "{wrong}");
+            assert!(source.history_error.is_none(), "{wrong}");
+            assert_eq!(source.history_loading, wrong != "loading", "{wrong}");
+        }
     }
 
     #[test]
