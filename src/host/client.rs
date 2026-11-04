@@ -417,6 +417,7 @@ fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(),
     if matches!(
         request,
         ClientRequest::BuildInfo
+            | ClientRequest::StartupState
             | ClientRequest::List
             | ClientRequest::Attach { .. }
             | ClientRequest::Detach { .. }
@@ -489,7 +490,8 @@ fn ensure_startup_recovery_request(
     };
     let inspection = matches!(
         request,
-        ClientRequest::List
+        ClientRequest::StartupState
+            | ClientRequest::List
             | ClientRequest::ChatList
             | ClientRequest::Attach { .. }
             | ClientRequest::Detach { .. }
@@ -894,6 +896,15 @@ pub(super) fn process_request(
             ServerResponse::BuildInfo {
                 version: crate::VERSION.into(),
             },
+            Vec::new(),
+            false,
+        )),
+        ClientRequest::StartupState => Ok((
+            ServerResponse::StartupState(
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .startup_state(),
+            ),
             Vec::new(),
             false,
         )),

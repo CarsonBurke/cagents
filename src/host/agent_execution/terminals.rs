@@ -31,6 +31,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::Connect { .. }
         | R::Authenticate { .. }
         | R::BuildInfo
+        | R::StartupState
         | R::List
         | R::WatchTerminals
         | R::WatchWorkspaceModel
