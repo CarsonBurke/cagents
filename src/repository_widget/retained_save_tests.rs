@@ -118,6 +118,67 @@ async fn loaded(path: &Path) -> (RepositoryRuntime, CardId, crate::operation_rec
     (runtime, card, custody)
 }
 
+#[tokio::test]
+async fn initial_load_completes_after_a_stale_first_read() {
+    if isolated_test(
+        "repository_widget::retained_save_tests::initial_load_completes_after_a_stale_first_read",
+    ) {
+        return;
+    }
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let checkout = Checkout::new();
+    let path = checkout.path().join("file.txt");
+    std::fs::write(&path, "baseline").unwrap();
+    let card = CardId::new();
+    let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+        project: ProjectId::new(),
+        repository: checkout.path().to_owned(),
+        worktree: checkout.path().to_owned(),
+        selected_file: None,
+    });
+    let initial = runtime.update(RepositoryAction::OpenFile {
+        card,
+        path: "file.txt".into(),
+    });
+    let watch = runtime.document_watch.as_ref().unwrap().clone();
+    let forced_stale = Arc::new(AtomicBool::new(false));
+    let forced = forced_stale.clone();
+    // Preserve the actual worker/read result. Force only its captured watch
+    // revision, independently of native callback timing on the test host.
+    let initial = initial.map(move |mut action| {
+        if let RepositoryAction::FileLoadedAt { result, .. } = &mut action {
+            assert!(!forced.swap(true, Ordering::SeqCst));
+            let read = result.as_mut().expect("the actual initial read succeeded");
+            assert!(matches!(
+                read.clone().into_parts().1,
+                Ok(LoadedFile {
+                    content: FileContent::Editable { text, .. },
+                    ..
+                }) if text == "baseline"
+            ));
+            read.watch_revision = Some(watch.revision().wrapping_sub(1));
+        }
+        action
+    });
+    finish(&mut runtime, initial).await;
+    assert!(forced_stale.load(Ordering::SeqCst));
+    assert_eq!(
+        runtime.editor_text().as_deref(),
+        Some("baseline"),
+        "forced stale initial completion; path={path:?}; loading={}; reading={}; \
+         reload_pending={}; attested={}",
+        matches!(runtime.document, DocumentState::Loading { .. }),
+        runtime.document_reading,
+        runtime.document_reload_pending,
+        runtime.original_read_attested
+    );
+    assert!(runtime.original_read_attested);
+    assert!(!runtime.document_reading);
+}
+
 fn insert(runtime: &mut RepositoryRuntime, card: CardId, character: char) {
     drop(runtime.update(RepositoryAction::EditorAction {
         card,
