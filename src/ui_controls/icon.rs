@@ -247,7 +247,11 @@ pub fn provider_icon(provider: crate::agent::Provider) -> Handle {
     static CODEX: LazyLock<Handle> = LazyLock::new(|| {
         icon::from_svg_bytes(include_bytes!("../icons/codex.svg").as_slice()).symbolic(true)
     });
+    static ANTIGRAVITY: LazyLock<Handle> = LazyLock::new(|| {
+        icon::from_svg_bytes(include_bytes!("../icons/antigravity.svg").as_slice()).symbolic(false)
+    });
     match provider {
+        Provider::Antigravity => ANTIGRAVITY.clone(),
         Provider::Omp => OMP.clone(),
         Provider::Claude => CLAUDE.clone(),
         Provider::Codex => CODEX.clone(),

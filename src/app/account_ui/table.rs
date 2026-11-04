@@ -964,6 +964,10 @@ fn status(account: &AccountState) -> (&'static str, fn(&cosmic::Theme) -> iced::
         UsageStatus::Warning => ("Near limit", design::warning_color),
         UsageStatus::Limited => ("Limited", design::destructive_color),
         UsageStatus::NeedsLogin => ("Signed out", design::warning_color),
+        // It answered as a login, and only has no limits to report.
+        UsageStatus::Unavailable if account.identity.is_some() => {
+            ("Signed in", design::muted_color)
+        }
         UsageStatus::Unavailable => ("Unavailable", design::muted_color),
     }
 }

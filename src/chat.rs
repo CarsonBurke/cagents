@@ -492,7 +492,8 @@ impl AttachmentRules {
                 max_file_bytes: None,
             },
             // OMP sends images inline and names any other file in the prompt.
-            Provider::Omp => Self {
+            // Text alone over its stream-json input.
+            Provider::Omp | Provider::Antigravity => Self {
                 images_only: false,
                 max_count: None,
                 max_image_bytes: 16 * MIB,
@@ -2076,6 +2077,16 @@ impl Model {
         })
     }
 
+    /// One line of `agy models`: an ID and a label, tab-separated.
+    pub fn from_antigravity(line: &str) -> Option<Self> {
+        let (id, label) = line.split_once('\t')?;
+        Some(Self {
+            id: id.trim().into(),
+            label: label.trim().into(),
+            reasoning: Vec::new(),
+        })
+    }
+
     /// One entry of the Codex app server's `model/list` page.
     ///
     /// An entry that does not describe its efforts, or does not name itself
@@ -3214,6 +3225,7 @@ pub(crate) fn fresh_session(
                 recipe.arguments.extend(["--permission-mode".into(), mode]);
             }
         }
+        Provider::Antigravity => {}
     }
     Ok(Session {
         native_continuity: Default::default(),

@@ -9,6 +9,7 @@ fn provider_marker(provider: Provider) -> (&'static str, &'static str) {
     match provider {
         Provider::Claude => ("provider-error:claude", "Claude"),
         Provider::Codex => ("provider-error:codex", "Codex"),
+        Provider::Antigravity => ("provider-error:antigravity", "Antigravity"),
         Provider::Omp => ("provider-error:omp", "Oh My Pi"),
     }
 }
@@ -155,6 +156,7 @@ impl<'a> Failure<'a> {
         let name = match provider {
             Provider::Claude => "Claude",
             Provider::Codex => "Codex",
+            Provider::Antigravity => "Antigravity",
             Provider::Omp => "Oh My Pi",
         };
         let reset = (kind == FailureKind::AccountLimit)

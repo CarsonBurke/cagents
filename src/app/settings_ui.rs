@@ -154,6 +154,10 @@ fn default_account_choice<'a>(
             "Claude",
             "Automatic uses a signed-in plan and switches when its allowance runs out. Choosing an account pins new conversations and terminals; project choices take precedence.",
         ),
+        crate::agent::Provider::Antigravity => (
+            "Antigravity",
+            "Antigravity CLI uses the one sign-in on this computer.",
+        ),
         _ => (
             "ChatGPT (Codex)",
             "Automatic uses a signed-in plan and switches when its allowance runs out. Choosing an account pins new conversations and terminals; project choices take precedence.",

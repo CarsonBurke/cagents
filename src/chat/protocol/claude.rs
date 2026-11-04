@@ -528,6 +528,7 @@ impl Claude {
         wire.remove("_cagents_permissions");
         wire.remove("_cagents_permission_update");
         Ok(Step {
+            interrupt_process: false,
             suppress_current_notification: false,
             notification_preview: None,
             writes: vec![json!({"type":"control_request","request_id":id,"request":request})],
@@ -915,6 +916,7 @@ impl Claude {
             return Err("Claude permission response must be smaller than 30 MiB".into());
         }
         let mut step = Step {
+            interrupt_process: false,
             suppress_current_notification: false,
             notification_preview: None,
             writes: vec![
@@ -985,6 +987,7 @@ impl Claude {
                 string(request, "subtype")
             );
             return Ok(Step {
+                interrupt_process: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: vec![
@@ -5484,6 +5487,7 @@ impl Claude {
             return Err("Claude elicitation response must be smaller than 30 MiB".into());
         }
         let mut step = Step {
+            interrupt_process: false,
             suppress_current_notification: false,
             notification_preview: None,
             writes: vec![

@@ -338,7 +338,9 @@ impl Drop for TestAdmission {
 pub(super) fn message_key(provider: crate::agent::Provider, item_id: &str) -> Option<&str> {
     let (message, index) = match provider {
         crate::agent::Provider::Codex => item_id.rsplit_once("/input/")?,
-        crate::agent::Provider::Claude | crate::agent::Provider::Omp => item_id.rsplit_once(':')?,
+        crate::agent::Provider::Claude
+        | crate::agent::Provider::Antigravity
+        | crate::agent::Provider::Omp => item_id.rsplit_once(':')?,
     };
     if message.is_empty()
         || index.is_empty()

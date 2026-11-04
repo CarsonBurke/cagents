@@ -28,7 +28,7 @@ pub(crate) fn exact_session(
     match process.provider {
         Provider::Claude => claude::exact_session(&process.launch, process.pid)
             .map_err(|_| "Claude could not report an unambiguous live session through `claude agents --json`.".into()),
-        Provider::Codex | Provider::Omp => Ok(None),
+        Provider::Codex | Provider::Antigravity | Provider::Omp => Ok(None),
     }
 }
 
@@ -111,7 +111,10 @@ impl Observer {
     ) -> Result<Observation, ObserveError> {
         let provider = process.provider;
         let recipe = &process.launch;
-        if provider == Provider::Omp || !recipe.working_directory.is_absolute() {
+        // Neither Omp nor Antigravity publishes a census of its live conversations.
+        if matches!(provider, Provider::Omp | Provider::Antigravity)
+            || !recipe.working_directory.is_absolute()
+        {
             return Err(ObserveError::Unavailable);
         }
         // A Codex CLI that keeps its own threads says what they are doing in
@@ -178,7 +181,7 @@ impl Observer {
             entry.census = match provider {
                 Provider::Claude => claude::census(recipe).map(Inventory::Claude),
                 Provider::Codex => codex::census(&key).map(Inventory::Codex),
-                Provider::Omp => unreachable!(),
+                Provider::Antigravity | Provider::Omp => unreachable!(),
             }
             .ok();
             // Failure is cached too, replacing (not retaining) previous Working.
@@ -280,7 +283,7 @@ fn key(provider: Provider, recipe: &LaunchRecipe) -> ProbeResult<Key> {
     let variable = match provider {
         Provider::Claude => "CLAUDE_CONFIG_DIR",
         Provider::Codex => "CODEX_HOME",
-        Provider::Omp => return Err(()),
+        Provider::Antigravity | Provider::Omp => return Err(()),
     };
     let home = if let Some(value) = recipe.environment.get(variable) {
         absolute(recipe, value)?

@@ -127,7 +127,7 @@ impl Reservation {
                 validate_proof(terminal_proof.or(source.proof.as_ref()), state.proof())?;
                 return Ok(None);
             }
-            if record.returning_terminal || record.handle.owns_work() {
+            if record.returning_terminal || record.handle.blocks_replacement() {
                 return Err(error(
                     "Chat already owns work or a pending handoff; attach to its existing view",
                 ));
@@ -150,7 +150,7 @@ impl Reservation {
         if state.chats.values().any(|record| {
             let mut launch = record.session.launch.clone();
             launch.session_id = record.handle.session_id();
-            record.handle.owns_work() && same_conversation(&launch, &source.launch)
+            record.handle.blocks_replacement() && same_conversation(&launch, &source.launch)
         }) {
             return Err(error(
                 "This exact conversation already owns work; attach to its existing chat",

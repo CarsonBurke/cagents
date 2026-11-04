@@ -305,6 +305,7 @@ fn select(
             Some(std::path::Path::new(home).join(match provider {
                 crate::agent::Provider::Claude => ".claude",
                 crate::agent::Provider::Codex => ".codex",
+                crate::agent::Provider::Antigravity => ".gemini/antigravity-cli",
                 crate::agent::Provider::Omp => return None,
             }))
         })?;

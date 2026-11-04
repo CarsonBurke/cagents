@@ -12,7 +12,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{net::UnixStream, process::CommandExt},
     },
-    process::{Child, Command as Process, Stdio},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as Process, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -206,6 +206,8 @@ struct Inner {
     completed: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
+    /// The failure is the provider's own observed exit, not lost track of work.
+    provider_exited: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
@@ -426,6 +428,7 @@ impl LocalHandle {
         let completed = Arc::new(AtomicBool::new(false));
         let draining = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
+        let provider_exited = Arc::new(AtomicBool::new(false));
         let store = Arc::new(Mutex::new(store));
         let confirmed_session = Arc::new(Mutex::new(None));
         let preserve_native = Arc::new(AtomicBool::new(false));
@@ -445,6 +448,7 @@ impl LocalHandle {
             completed: completed.clone(),
             draining: draining.clone(),
             failure: failure.clone(),
+            provider_exited: provider_exited.clone(),
             worker: Mutex::new(None),
             store: store.clone(),
             notify: notify.clone(),
@@ -472,6 +476,9 @@ impl LocalHandle {
             .spawn(move || {
                 let _owned_socket = owned_socket;
                 let mut actor = Actor {
+                    process_spec: spec.clone(),
+                    provider_exited,
+                    provider_process: provider_process.clone(),
                     launch_context: spec.execution.clone(),
                     launch_account_scope,
                     working_directory: spec.working_directory.clone(),
@@ -1244,6 +1251,11 @@ impl LocalHandle {
                     .unwrap_or_else(|p| p.into_inner())
                     .is_some())
     }
+    /// Whether an explicit start may replace this actor: its provider was seen
+    /// to exit and the whole process group has been cleaned up.
+    pub(crate) fn provider_exit_settled(&self) -> bool {
+        self.is_completed() && self.0.provider_exited.load(Ordering::Acquire)
+    }
     /// What the conversation is doing, read without loading its transcript.
     pub(crate) fn activity(&self) -> crate::agent::ActivityState {
         self.0
@@ -1874,6 +1886,9 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     Ok(())
 }
 struct Actor {
+    process_spec: ProcessSpec,
+    provider_exited: Arc<AtomicBool>,
+    provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
     launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
@@ -2023,34 +2038,48 @@ impl Actor {
         }
         Ok(())
     }
-    fn run(&mut self, initial: Step) -> Result<(), String> {
-        let mut stdin = self
+    fn provider_pipes(&mut self) -> Result<(ChildStdin, ChildStdout, ChildStderr), String> {
+        let child = &mut self
             .child
             .as_mut()
             .ok_or("Provider process unavailable")?
-            .child
-            .stdin
-            .take()
-            .ok_or("Provider stdin unavailable")?;
-        let mut stdout = self
-            .child
-            .as_mut()
-            .ok_or("Provider process unavailable")?
-            .child
-            .stdout
-            .take()
-            .ok_or("Provider stdout unavailable")?;
-        let mut stderr = self
-            .child
-            .as_mut()
-            .ok_or("Provider process unavailable")?
-            .child
-            .stderr
-            .take()
-            .ok_or("Provider stderr unavailable")?;
+            .child;
+        let stdin = child.stdin.take().ok_or("Provider stdin unavailable")?;
+        let stdout = child.stdout.take().ok_or("Provider stdout unavailable")?;
+        let stderr = child.stderr.take().ok_or("Provider stderr unavailable")?;
         nonblocking(&stdin)?;
         nonblocking(&stdout)?;
         nonblocking(&stderr)?;
+        Ok((stdin, stdout, stderr))
+    }
+    /// Replaces an exited provider with the same launch under new arguments.
+    /// The old group is gone before the new process can touch the conversation.
+    fn relaunch(
+        &mut self,
+        arguments: Vec<String>,
+    ) -> Result<(ChildStdin, ChildStdout, ChildStderr), String> {
+        if let Some(mut previous) = self.child.take() {
+            previous.terminate().map_err(|error| error.to_string())?;
+        }
+        self.process_spec.arguments = arguments;
+        let child = spawn_provider(&self.process_spec, &self.stop)?
+            .ok_or("Provider process unavailable")?;
+        *self
+            .provider_process
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(
+            crate::daemon::holder_registry::Process::read(child.child.id() as i32)
+                .map_err(|error| error.to_string())?,
+        );
+        self.child = Some(child);
+        self.stderr.clear();
+        self.first_frame = false;
+        self.started = Instant::now();
+        self.write_started = None;
+        self.provider_pipes()
+    }
+    fn run(&mut self, initial: Step) -> Result<(), String> {
+        let (mut stdin, mut stdout, mut stderr) = self.provider_pipes()?;
         self.step(initial)?;
         let mut stdout_eof = false;
         let mut stderr_eof = false;
@@ -2142,6 +2171,18 @@ impl Actor {
                     .observe_exit_within(PROTOCOL_EXIT_GRACE)
                     .map_err(|error| error.to_string())?
                 {
+                    self.provider_exited.store(true, Ordering::Release);
+                    if closing.is_none()
+                        && let Some((arguments, step)) = self.adapter.relaunch_after_exit()
+                    {
+                        self.step(step)?;
+                        (stdin, stdout, stderr) = self.relaunch(arguments)?;
+                        self.provider_exited.store(false, Ordering::Release);
+                        stdout_eof = false;
+                        stderr_eof = false;
+                        partial_started = None;
+                        continue;
+                    }
                     if status.success() {
                         return Ok(());
                     }
@@ -2684,6 +2725,13 @@ impl Actor {
             && let Some(context) = &self.launch_context
         {
             context.verify_directory(&self.working_directory)?;
+        }
+        if step.interrupt_process
+            && let Some(child) = &self.child
+        {
+            // SAFETY: the actor reaps this child, so its numeric group is still
+            // reserved. An already-exited child has no turn left to stop.
+            unsafe { libc::kill(-(child.child.id() as i32), libc::SIGINT) };
         }
         for value in step.writes {
             let mut frame = BoundedFrame(Vec::new());
@@ -4322,6 +4370,7 @@ mod tests {
             ) -> Result<Step, String> {
                 self.run = Some(run);
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![serde_json::json!({"final":true})],
@@ -4340,6 +4389,7 @@ mod tests {
                 assert_eq!(frame, serde_json::json!({"final":true}));
                 let run = self.run.take().unwrap();
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -6073,6 +6123,7 @@ mod tests {
     impl Adapter for Echo {
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step {
+                interrupt_process: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: vec![json!({"text": "hello"})],
@@ -6084,6 +6135,7 @@ mod tests {
                 return Err("fixture only supports refresh".into());
             }
             Ok(Step {
+                interrupt_process: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: vec![json!({"text": " world"})],
@@ -6092,6 +6144,7 @@ mod tests {
         }
         fn receive(&mut self, frame: Value) -> Result<Step, String> {
             Ok(Step {
+                interrupt_process: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: Vec::new(),
@@ -6718,6 +6771,7 @@ mod tests {
         impl Adapter for Reporter {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({})],
@@ -6729,6 +6783,7 @@ mod tests {
             }
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -6794,6 +6849,7 @@ mod tests {
         impl Adapter for WholeTurn {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({})],
@@ -6806,6 +6862,7 @@ mod tests {
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 let execution = |event| Event::Execution { run: self.0, event };
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -6967,6 +7024,7 @@ mod tests {
         fn command(&mut self, command: Command) -> Result<Step, String> {
             if command == Command::Interrupt {
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({"interrupt": true})],
@@ -7527,6 +7585,33 @@ mod tests {
             descendant.reaped = true;
             assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
         }
+    }
+
+    #[test]
+    fn a_provider_seen_to_exit_can_be_replaced_while_staying_protected() {
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "read -r init; exec 1>&-; exit 137".into()],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_completed() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(handle.failure().is_some());
+        assert!(handle.owns_work());
+        assert!(!handle.blocks_replacement());
     }
 
     #[test]

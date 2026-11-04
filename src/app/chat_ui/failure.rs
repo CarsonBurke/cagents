@@ -71,7 +71,7 @@ fn provider_item_text(provider: Provider, item: &chat::Item) -> Option<&str> {
         } if match provider {
             Provider::Claude => matches!(name.as_str(), "Agent" | "Task"),
             Provider::Codex => matches!(name.as_str(), "spawnAgent" | "spawn_agent"),
-            Provider::Omp => false,
+            Provider::Antigravity | Provider::Omp => false,
         } =>
         {
             Some(output)
@@ -1070,7 +1070,9 @@ mod tests {
     fn part(provider: Provider, message: &str, index: usize) -> String {
         match provider {
             Provider::Codex => format!("{message}/input/{index}"),
-            Provider::Claude | Provider::Omp => format!("{message}:{index}"),
+            Provider::Claude | Provider::Antigravity | Provider::Omp => {
+                format!("{message}:{index}")
+            }
         }
     }
 

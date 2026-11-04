@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 mod claude;
 #[cfg(feature = "host")]
 pub(crate) use claude::transcript as claude_transcript;
+mod antigravity;
 mod codex;
 mod omp;
 
@@ -26,6 +27,7 @@ pub enum Provider {
     Omp,
     Claude,
     Codex,
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +75,12 @@ struct ProviderAdapter {
     >,
 }
 
-const ADAPTERS: [ProviderAdapter; 3] = [omp::ADAPTER, claude::ADAPTER, codex::ADAPTER];
+const ADAPTERS: [ProviderAdapter; 4] = [
+    omp::ADAPTER,
+    claude::ADAPTER,
+    codex::ADAPTER,
+    antigravity::ADAPTER,
+];
 
 impl Provider {
     fn adapter(self) -> &'static ProviderAdapter {
@@ -82,7 +89,7 @@ impl Provider {
 
     /// Every provider in declaration order, for menus and for recognizing the
     /// placeholder titles a card carries before its conversation names itself.
-    pub const ALL: [Self; 3] = [Self::Omp, Self::Claude, Self::Codex];
+    pub const ALL: [Self; 4] = [Self::Omp, Self::Claude, Self::Codex, Self::Antigravity];
 
     pub fn executable(self) -> &'static str {
         self.adapter().executable
@@ -119,6 +126,27 @@ impl Provider {
         };
         // Shared servers, tool commands and account management do not own the
         // foreground conversation: a terminal signing in is not an agent.
+        if provider == Self::Antigravity
+            && arguments.first().is_some_and(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "agent"
+                        | "agents"
+                        | "changelog"
+                        | "help"
+                        | "install"
+                        | "mcp"
+                        | "mic-serve"
+                        | "models"
+                        | "plugin"
+                        | "plugins"
+                        | "remote-control"
+                        | "update"
+                )
+            })
+        {
+            return None;
+        }
         if arguments.first().is_some_and(|arg| {
             matches!(
                 arg.as_str(),
@@ -287,7 +315,8 @@ impl Provider {
             Self::Codex => codex_title_without_status(title).trim(),
             // Claude exposes names through its PID-scoped inventory. Arbitrary
             // OSC titles are not an alternative to that authoritative source.
-            Self::Claude => return None,
+            // Its title shows status and project, never a conversation's name.
+            Self::Claude | Self::Antigravity => return None,
         };
         let directory = cwd.file_name().and_then(|name| name.to_str());
         // Codex's default title ends in the project name, separated from the
@@ -308,6 +337,7 @@ impl Provider {
             || [
                 "codex",
                 "omp",
+                "agy",
                 "Ready",
                 "Working",
                 "Idle",

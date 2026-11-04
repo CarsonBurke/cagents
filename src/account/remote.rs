@@ -394,6 +394,9 @@ fn login_recipe(
         arguments: match account.provider {
             Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
             Provider::Codex => vec!["login".into(), "--device-auth".into()],
+            Provider::Antigravity => {
+                return Err("Open a terminal on this device and run agy to sign in".into());
+            }
             Provider::Omp => return Err("Omp manages its own sign-in".into()),
         },
         working_directory: std::env::var_os("HOME")
