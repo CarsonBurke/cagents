@@ -548,7 +548,7 @@ pub fn model_for_card(
         CardKind::Settings => "Settings",
         CardKind::Accounts => "Accounts",
         CardKind::Automations => "Automations",
-        CardKind::Work => "Work",
+        CardKind::Work => "Work board",
     };
     let mut sections = Vec::with_capacity(4);
     let mut actions = Vec::new();

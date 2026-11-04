@@ -1573,6 +1573,12 @@ fn card_accessible_name(type_label: &str, title: &str, caption: &str, focused: b
 /// legible falls back to its card kind rather than blanking the header.
 fn normalize_restored_titles(state: &mut WorkspaceState) {
     for card in &mut state.cards {
+        // The Work board has one name, including in a snapshot saved before it
+        // had this one.
+        if matches!(card.kind, CardKind::Work) {
+            card.title = card_kind_labels(Some(&card.kind)).type_label.to_owned();
+            continue;
+        }
         card.title = normalize_card_name(&card.title)
             .unwrap_or_else(|| card_kind_labels(Some(&card.kind)).type_label.to_owned());
     }
@@ -1659,7 +1665,7 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
             unavailable: "Automations unavailable",
         },
         Some(CardKind::Work) => CardLabels {
-            type_label: "Work",
+            type_label: "Work board",
             icon: Icon::Board,
             starting: "Loading the Work board…",
             unavailable: "Work board unavailable",
@@ -4676,6 +4682,7 @@ pub enum Message {
     WorkUi(crate::work_ui::Action),
     ChannelWork(crate::channel_work_ui::Action),
     ChannelWorkNavigation(channel_work::Navigation),
+    ChannelWorkEntryPointerPress,
     ChannelWorkPoll,
     ChannelWorkEscape,
     AutomationApproval(automation_approval::Action),
@@ -17680,6 +17687,10 @@ impl Application for Cagents {
             Message::WorkUi(action) => self.update_work_ui(action),
             Message::ChannelWork(action) => self.update_channel_work(action),
             Message::ChannelWorkNavigation(navigation) => self.channel_navigation(navigation),
+            Message::ChannelWorkEntryPointerPress => {
+                self.note_channel_work_entry_pointer_press();
+                Task::none()
+            }
             Message::ChannelWorkEscape => self.escape_channel_work(),
             Message::ChannelWorkPoll => self.channel_work.view.refresh().map_or_else(Task::none, |effect| self.channel_work_effect(effect)),
             Message::GitUi(action) => self.update_git(action),
@@ -31349,6 +31360,25 @@ mod tests {
         // Nothing legible survived, so the card is named for its kind rather
         // than losing its header, its accessible name and the window title.
         assert_eq!(state.cards[2].title, "Repository");
+    }
+
+    #[test]
+    fn a_work_board_saved_under_its_old_title_restores_under_its_name() {
+        let mut state = WorkspaceState {
+            cards: vec![CardState {
+                id: CardId::new(),
+                generation: 0,
+                title: "Work".into(),
+                width_fraction: 1.0,
+                existence: Existence::Open,
+                exposure: Exposure::Visible,
+                residency: Residency::Hot,
+                kind: CardKind::Work,
+            }],
+            ..WorkspaceState::default()
+        };
+        normalize_restored_titles(&mut state);
+        assert_eq!(state.cards[0].title, "Work board");
     }
 
     #[test]

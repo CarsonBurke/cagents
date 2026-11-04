@@ -1626,9 +1626,10 @@ fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
 }
 
-const CHANNEL_WORK_ENTRY_NAME: &str = "Open channel work";
 /// What the header keeps clear of tabs for the entry and the gap beside it.
 pub(super) const CHANNEL_WORK_ENTRY_RESERVED_WIDTH: f32 = 82.0;
+pub(super) const CHANNEL_WORK_ENTRY_ICON_ONLY_RESERVED_WIDTH: f32 =
+    2.0 * space::S + design::ROW_ICON_SIZE as f32 + space::XXS;
 
 fn command<'a>(
     icon: impl Into<widget::icon::Handle>,
@@ -2620,7 +2621,19 @@ impl Cagents {
         .into()
     }
 
-    fn workspace_header_width(&self) -> f32 {
+    pub(super) fn workspace_header_width(&self) -> f32 {
+        let work = if !self.channel_work_entry_is_mounted() {
+            0.0
+        } else if self.channel_work_entry_is_icon_only() {
+            CHANNEL_WORK_ENTRY_ICON_ONLY_RESERVED_WIDTH
+        } else {
+            CHANNEL_WORK_ENTRY_RESERVED_WIDTH
+        };
+        self.workspace_header_width_with(work)
+    }
+
+    /// The header's room for everything but the tabs, given what `work` needs.
+    pub(super) fn workspace_header_width_with(&self, work: f32) -> f32 {
         let navigator = if should_show_card_navigator(self.workspace.cards().len()) {
             design::PANE_NAVIGATOR_RESERVED_WIDTH
         } else {
@@ -2660,11 +2673,6 @@ impl Cagents {
         } else {
             0.0
         };
-        let work = if self.channel_work_entry_navigation().is_some() {
-            CHANNEL_WORK_ENTRY_RESERVED_WIDTH
-        } else {
-            0.0
-        };
         let width = navigator + controls + update + notice + attention + work + 16.0;
         if self.workspace.viewport_width() > 0.0 {
             width.min(self.workspace.viewport_width())
@@ -2674,8 +2682,12 @@ impl Cagents {
     }
 
     fn tab_strip_geometry(&self) -> (f32, f32) {
+        self.tab_strip_geometry_with(self.workspace_header_width())
+    }
+
+    fn tab_strip_geometry_with(&self, header_width: f32) -> (f32, f32) {
         let available = (self.workspace.viewport_width()
-            - self.workspace_header_width()
+            - header_width
             - design::PRIMARY_CONTROL_SIZE
             - space::XXS)
             .max(0.0);
@@ -2819,31 +2831,57 @@ impl Cagents {
         .into()
     }
 
+    /// `workflow_header` holds nothing while the overlay covers that end of
+    /// the bar, so the entry is not there to reserve room for.
+    pub(super) fn channel_work_entry_is_mounted(&self) -> bool {
+        !self.context_inspector_is_overlay() && self.channel_work_entry_navigation().is_some()
+    }
+
+    /// The entry drops its label once its label would turn the tabs compact.
+    /// Deciding from the labelled width keeps the answer from depending on
+    /// itself; opening Work does not change it, so the entry keeps its form.
+    pub(super) fn channel_work_entry_is_icon_only(&self) -> bool {
+        let header = self.workspace_header_width_with(CHANNEL_WORK_ENTRY_RESERVED_WIDTH);
+        self.tab_strip_geometry_with(header).1 < design::TAB_MIN_WIDTH
+    }
+
     /// The one way into a channel's work from the main header, and back out.
     fn channel_work_entry(&self) -> Option<Element<'_, Message>> {
         let navigation = self.channel_work_entry_navigation()?;
         let open = self.channel_work_is_main();
+        let title = self
+            .workspace_model
+            .channel(navigation.home.channel)
+            .filter(|channel| channel.ordinal == navigation.home.creation_ordinal)
+            .map_or("", |channel| channel.title.as_str());
+        let name = if title.is_empty() {
+            Cow::Borrowed("Channel work")
+        } else {
+            Cow::Owned(format!("Channel work for {title}"))
+        };
         Some(crate::ui_controls::owned(
             navigation,
-            crate::ui_controls::toggle_view_tab(
-                crate::ui_controls::ViewTab {
+            crate::ui_controls::toggle_view_tab(crate::ui_controls::ToggleViewTab {
+                tab: crate::ui_controls::ViewTab {
                     label: "Work".into(),
-                    description: CHANNEL_WORK_ENTRY_NAME.into(),
+                    description: name,
                     count: None,
                     selected: open,
                     id: Some(channel_work::channel_work_entry_id(navigation.generation)),
                     on_press: (!self.modal_is_open())
                         .then_some(Message::ChannelWorkNavigation(navigation)),
                 },
-                widget::icon(Icon::PullRequest.handle())
+                icon: widget::icon(Icon::PullRequest.handle())
                     .size(design::ROW_ICON_SIZE)
                     .into(),
-                if open {
-                    "Close channel work"
+                hint: if open {
+                    "Close channel work".into()
                 } else {
-                    CHANNEL_WORK_ENTRY_NAME
+                    "Channel work".into()
                 },
-            ),
+                icon_only: self.channel_work_entry_is_icon_only(),
+                on_pointer_press: Message::ChannelWorkEntryPointerPress,
+            }),
         ))
     }
 

@@ -69,7 +69,7 @@ fn tab_row<'a, Message: Clone + 'a>(
 ) -> Element<'a, Message> {
     let row = widget::row::with_children(
         tabs.into_iter()
-            .map(|tab| tab_button(tab, compact, None, returns, None))
+            .map(|tab| tab_button(tab, compact, None, returns))
             .collect::<Vec<_>>(),
     )
     .spacing(space::XS)
@@ -84,18 +84,47 @@ pub fn view_tab<'a, Message: Clone + 'a>(
     compact: bool,
     leading: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    tab_button(tab, compact, leading, false, None)
+    tab_button(tab, compact, leading, false)
 }
 
 /// A lone view tab that both opens and leaves its view, so pressing it while
-/// selected is an intent. Its name stays put as it toggles; `hint` is the
-/// tooltip, and says what a press would do now.
+/// selected is an intent.
+pub struct ToggleViewTab<'a, Message> {
+    /// `description` is the accessible name, which stays put as it toggles;
+    /// the state is carried by `selected`.
+    pub tab: ViewTab<'a, Message>,
+    pub icon: Element<'a, Message>,
+    /// The tooltip, which says what a press would do now.
+    pub hint: Cow<'a, str>,
+    /// Draws only the icon, for a bar that has run out of room for the label.
+    pub icon_only: bool,
+    /// Raised when a pointer starts a press, ahead of the press message, so
+    /// the caller can tell a pointer from the keyboard.
+    pub on_pointer_press: Message,
+}
+
+/// See [`ToggleViewTab`]. Without a press message it is plainly inert: no hover
+/// fill and no tooltip to suggest that it would respond behind a modal.
 pub fn toggle_view_tab<'a, Message: Clone + 'a>(
-    tab: ViewTab<'a, Message>,
-    leading: Element<'a, Message>,
-    hint: impl Into<Cow<'a, str>>,
+    toggle: ToggleViewTab<'a, Message>,
 ) -> Element<'a, Message> {
-    tab_button(tab, false, Some(leading), true, Some(hint.into()))
+    let ToggleViewTab {
+        tab,
+        icon,
+        hint,
+        icon_only,
+        on_pointer_press,
+    } = toggle;
+    let enabled = tab.on_press.is_some();
+    let (button, _) = tab_control(tab, false, Some(icon), true, !icon_only);
+    if enabled {
+        tooltip(
+            crate::interaction::hover(button.on_press_down(on_pointer_press)),
+            hint,
+        )
+    } else {
+        button.into()
+    }
 }
 
 /// A view tab; `returns` keeps a selected tab's press message.
@@ -104,8 +133,19 @@ fn tab_button<'a, Message: Clone + 'a>(
     compact: bool,
     leading: Option<Element<'a, Message>>,
     returns: bool,
-    hint: Option<Cow<'a, str>>,
 ) -> Element<'a, Message> {
+    let (button, name) = tab_control(tab, compact, leading, returns, true);
+    tooltip(crate::interaction::hover(button), name)
+}
+
+/// The bare tab and its accessible name.
+fn tab_control<'a, Message: Clone + 'a>(
+    tab: ViewTab<'a, Message>,
+    compact: bool,
+    leading: Option<Element<'a, Message>>,
+    returns: bool,
+    show_label: bool,
+) -> (widget::button::Button<'a, Message>, Cow<'a, str>) {
     let ViewTab {
         label,
         description,
@@ -120,12 +160,14 @@ fn tab_button<'a, Message: Clone + 'a>(
     if let Some(leading) = leading {
         content = content.push(leading);
     }
-    let label = if compact {
-        design::caption(label)
-    } else {
-        design::body(label)
-    };
-    content = content.push(label.wrapping(iced::widget::text::Wrapping::None));
+    if show_label {
+        let label = if compact {
+            design::caption(label)
+        } else {
+            design::body(label)
+        };
+        content = content.push(label.wrapping(iced::widget::text::Wrapping::None));
+    }
     // The count is drawn, so it is spoken too.
     let name: Cow<'a, str> = match &count {
         Some((count, _)) => format!("{description}: {count}").into(),
@@ -142,13 +184,20 @@ fn tab_button<'a, Message: Clone + 'a>(
         .class(view_tab_style(selected))
         .name(name.clone())
         .selected(selected)
-        .padding([0.0, if compact { space::S } else { space::M }])
+        .padding([
+            0.0,
+            if compact || !show_label {
+                space::S
+            } else {
+                space::M
+            },
+        ])
         .height(view_tab_height(compact))
         .on_press_maybe(if selected && !returns { None } else { on_press });
     if let Some(id) = id {
         button = button.id(id);
     }
-    tooltip(crate::interaction::hover(button), hint.unwrap_or(name))
+    (button, name)
 }
 
 pub fn view_tab_height(compact: bool) -> f32 {
@@ -173,6 +222,18 @@ fn view_tab_style(selected: bool) -> cosmic::theme::Button {
             } else {
                 design::muted_color(theme)
             }),
+            // A selected tab already wears the focus fill, so a pressable one
+            // shows focus the way other buttons do: a ring outside the control.
+            outline_width: if selected && focused {
+                design::BORDER_WIDTH
+            } else {
+                0.0
+            },
+            outline_color: if selected && focused {
+                design::accent_color(theme)
+            } else {
+                iced::Color::TRANSPARENT
+            },
             ..design::button_style()
         }
     };
@@ -199,6 +260,65 @@ fn view_tab_style(selected: bool) -> cosmic::theme::Button {
 mod tests {
     use super::*;
     use crate::ui_controls::{accessibility_probe::headless_renderer, activity_spinner};
+
+    fn toggle(on_press: Option<()>, icon_only: bool) -> Element<'static, ()> {
+        toggle_view_tab(ToggleViewTab {
+            tab: ViewTab {
+                label: "Work".into(),
+                description: "Channel work".into(),
+                count: None,
+                selected: true,
+                id: None,
+                on_press,
+            },
+            icon: widget::Space::new().width(16).height(16).into(),
+            hint: "Close".into(),
+            icon_only,
+            on_pointer_press: (),
+        })
+    }
+
+    #[test]
+    fn an_inert_toggle_is_a_bare_button_without_hover_or_tooltip() {
+        use cosmic::iced::advanced::widget::Tree;
+        let bare: Element<'_, ()> = widget::button::custom(widget::Space::new()).into();
+        let bare = Tree::new(bare.as_widget()).tag;
+        assert_eq!(Tree::new(toggle(None, false).as_widget()).tag, bare);
+        assert_ne!(Tree::new(toggle(Some(()), false).as_widget()).tag, bare);
+    }
+
+    #[test]
+    fn icon_only_toggle_is_narrower_and_keeps_its_name() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{layout, widget::Tree};
+        let renderer = headless_renderer();
+        let width = |mut tab: Element<'static, ()>| {
+            let mut tree = Tree::new(tab.as_widget());
+            tab.as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(400.0, 80.0)),
+                )
+                .size()
+                .width
+        };
+        let icon_only = width(toggle(Some(()), true));
+        assert!(icon_only < width(toggle(Some(()), false)));
+        assert_eq!(icon_only, 2.0 * space::S + 16.0);
+    }
+
+    #[test]
+    fn only_a_selected_tab_draws_the_focus_ring_over_its_fill() {
+        let theme = cosmic::Theme::default();
+        let active = |selected: bool, focused: bool| match view_tab_style(selected) {
+            cosmic::theme::Button::Custom { active, .. } => active(focused, &theme),
+            _ => unreachable!(),
+        };
+        assert_eq!(active(true, true).outline_width, design::BORDER_WIDTH);
+        assert_eq!(active(true, false).outline_width, 0.0);
+        assert_eq!(active(false, true).outline_width, 0.0);
+    }
 
     #[test]
     fn compact_status_tabs_select_only_an_inactive_view() {
