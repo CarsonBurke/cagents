@@ -12026,7 +12026,9 @@ mod tests {
             let interrupt = adapter.command(Command::Interrupt).unwrap();
             let id = interrupt.writes[0]["request_id"].as_str().unwrap();
             adapter
-                .receive(json!({"type":"result","subtype":"success","uuid":"old-a","is_error":false}))
+                .receive(
+                    json!({"type":"result","subtype":"success","uuid":"old-a","is_error":false}),
+                )
                 .unwrap();
             adapter
                 .send_prompt("Review B migration".into(), Vec::new(), PromptMode::Send)

@@ -2092,8 +2092,8 @@ mod tests {
         // Closing a holder whose control stream broke falls back to its
         // identity, which only the daemon lease owner may release.
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
-        let _lease = crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap())
-            .unwrap();
+        let _lease =
+            crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
         let mut holder = spawn(spec, source).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let diagnostic = loop {
