@@ -651,7 +651,12 @@ fi
 CANDIDATE_COORDINATOR=$DOWNLOAD_DIR/cagents-install-coordinator
 tar -xOzf "$ARCHIVE_PATH" -- "$TOP_LEVEL/bin/cagents" > "$CANDIDATE_COORDINATOR" \
     || fail 'could not extract the verified update coordinator'
-chmod 0700 "$CANDIDATE_COORDINATOR"
+# Source-pane preflight runs the matched host beside the selected coordinator.
+# A fresh install (or an old CLI without the guard) uses this extracted pair.
+CANDIDATE_INSPECTOR=$DOWNLOAD_DIR/cagentsd
+tar -xOzf "$ARCHIVE_PATH" -- "$TOP_LEVEL/bin/cagentsd" > "$CANDIDATE_INSPECTOR" \
+    || fail 'could not extract the verified source inspector'
+chmod 0700 "$CANDIDATE_COORDINATOR" "$CANDIDATE_INSPECTOR"
 supports_install_guard() {
     [ -x "$1" ] \
         && "$1" coordinate-install --help >/dev/null 2>&1 \
