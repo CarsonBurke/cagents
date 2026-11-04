@@ -1970,8 +1970,17 @@ mod tests {
         wait_for(&monitor, project.id, "atomic file replacement", |change| {
             change.worktrees.contains(&worktree.id)
         });
+        // Retain the old inode so the filesystem cannot immediately reuse its
+        // identity for the replacement this test expects us to re-register.
+        let original_directory = std::fs::File::open(&source).unwrap();
+        let original_identity = original_directory.metadata().unwrap();
         std::fs::remove_dir_all(&source).unwrap();
         std::fs::create_dir(&source).unwrap();
+        let replacement_identity = std::fs::metadata(&source).unwrap();
+        assert_ne!(
+            (original_identity.dev(), original_identity.ino()),
+            (replacement_identity.dev(), replacement_identity.ino())
+        );
         std::fs::write(&file, "third").unwrap();
         wait_for(
             &monitor,
@@ -1979,8 +1988,8 @@ mod tests {
             "directory removal/recreation",
             |change| change.membership,
         );
-        // The path set is unchanged and the inode can be reused. Rearm after
-        // retirement instead of trusting a stale registration for that path.
+        // The replacement holds a distinct inode. The separate unchanged-identity
+        // contract covers retirement even when the inode is reused.
         monitor.0.configure(vec![Arc::new(project.clone())]);
         // Configure completion must be acknowledged even when paths compare
         // equal, so edits cannot race the re-registration barrier.
@@ -1988,15 +1997,27 @@ mod tests {
             &monitor,
             project.id,
             "re-registration acknowledgement",
-            |change| change.coverage == Some(true) && change.worktrees.contains(&worktree.id),
+            |change| {
+                change.coverage == Some(true)
+                    && change.error.is_none()
+                    && change.worktrees.contains(&worktree.id)
+            },
         );
         std::fs::write(&file, "fourth").unwrap();
         wait_for(
             &monitor,
             project.id,
-            "edit after re-registration",
-            |change| change.worktrees.contains(&worktree.id),
+            "ordinary edit after re-registration",
+            |change| {
+                change.worktrees.contains(&worktree.id)
+                    && change.error.is_none()
+                    && change.coverage.is_none()
+                    && !change.topology
+                    && !change.membership
+                    && !change.references
+            },
         );
+        drop(original_directory);
     }
 }
 

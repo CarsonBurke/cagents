@@ -472,7 +472,13 @@ impl Cagents {
                 self.sidebar_state.reveal_project(project_id);
                 let scope = self.open_channel_with_default(id);
                 self.persist();
-                scope
+                Task::batch([
+                    scope,
+                    sidebar::reveal(sidebar::selection_row_focus_id(
+                        sidebar::SelectionRow::Channel(id),
+                    ))
+                    .map(cosmic::Action::App),
+                ])
             }
             // A channel being deleted is not somewhere to go; its row offers
             // nothing, and this refuses anything that raced it.

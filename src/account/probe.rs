@@ -141,18 +141,7 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
     };
     let probed = tokio::time::timeout(TIMEOUT, probe_cli(&account, &program)).await;
     let outcome = match probed {
-        Ok(Ok(Probed {
-            identity,
-            snapshot,
-            models,
-        })) => Outcome::Answered {
-            catalog: (!models.is_empty()).then(|| Catalog {
-                models,
-                observed_at: snapshot.observed_at,
-            }),
-            identity,
-            snapshot,
-        },
+        Ok(Ok(probed)) => probed.into_outcome(),
         Ok(Err(message)) => Outcome::Failed(message),
         Err(_) => Outcome::Failed(format!(
             "{} did not answer within {} seconds",
@@ -264,18 +253,51 @@ fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
 struct Probed {
     identity: Option<Identity>,
     snapshot: UsageSnapshot,
-    /// Empty when the CLI listed none.
-    models: Vec<Model>,
+    /// A model response has its own observation, independent of quota.
+    catalog: Option<Catalog>,
 }
 
 impl Probed {
-    fn state(status: UsageStatus, detail: &str, observed_at: u64, models: Vec<Model>) -> Self {
+    fn state(
+        status: UsageStatus,
+        detail: &str,
+        observed_at: u64,
+        catalog: Option<Catalog>,
+    ) -> Self {
         Self {
             identity: None,
             snapshot: UsageSnapshot::state(status, detail, observed_at),
-            models,
+            catalog,
         }
     }
+
+    fn into_outcome(self) -> Outcome {
+        Outcome::Answered {
+            identity: self.identity,
+            snapshot: self.snapshot,
+            catalog: self.catalog,
+        }
+    }
+}
+
+/// The local observation of one matched answer, before unrelated awaits.
+/// This is neither request-start nor the provider's internal sampling time.
+struct Observed<T> {
+    value: T,
+    observed_at: u64,
+}
+
+fn observed_catalog(models: Vec<Model>, observed_at: u64) -> Option<Catalog> {
+    (!models.is_empty()).then_some(Catalog {
+        models,
+        observed_at,
+    })
+}
+
+// Keep the original result, including its observations, through actual cleanup.
+async fn after_close<T>(result: T, close: impl std::future::Future<Output = ()>) -> T {
+    close.await;
+    result
 }
 
 pub fn cli_name(provider: Provider) -> &'static str {
@@ -671,15 +693,25 @@ fn spawn_failure(error: &io::Error) -> String {
 }
 
 /// Runs a CLI that prints one JSON document and exits.
-async fn run_json(command: Command) -> Result<Value, String> {
+async fn run_json(command: Command) -> Result<Observed<Value>, String> {
     let mut group = Group::spawn(command).await?;
     let mut output = Vec::new();
     // The output is dropped once read, so a CLI that writes past the limit
     // meets a closed pipe rather than blocking until the timeout.
     let read = group.stdout()?.read_to_end(&mut output).await;
-    group.finish().await;
-    read.map_err(|_| "The CLI's output could not be read".to_owned())?;
-    serde_json::from_slice(&output).map_err(|_| "The CLI printed something unexpected".to_owned())
+    let result = read
+        .map_err(|_| "The CLI's output could not be read".to_owned())
+        .and_then(|_| observed_json(&output, now_ms));
+    after_close(result, group.finish()).await
+}
+
+fn observed_json(bytes: &[u8], now: impl FnOnce() -> u64) -> Result<Observed<Value>, String> {
+    let value = serde_json::from_slice(bytes)
+        .map_err(|_| "The CLI printed something unexpected".to_owned())?;
+    Ok(Observed {
+        value,
+        observed_at: now(),
+    })
 }
 
 /// Signs `account` out through its own CLI - `claude auth logout`, `codex
@@ -753,27 +785,46 @@ async fn probe_claude(account: &Account, program: &Path) -> Result<Probed, Strin
         "",
         "--disable-slash-commands",
     ]);
-    let (status, usage) = tokio::join!(run_json(status), claude_usage(usage));
-    let observed_at = now_ms();
-    let (models, usage) = match usage {
-        Ok(ClaudeSession { models, usage }) => (models, Ok(usage)),
-        Err(message) => (Vec::new(), Err(message)),
+    join_claude(run_json(status), claude_usage(usage)).await
+}
+
+async fn join_claude(
+    status: impl std::future::Future<Output = Result<Observed<Value>, String>>,
+    usage: impl std::future::Future<Output = Result<ClaudeSession, String>>,
+) -> Result<Probed, String> {
+    let (status, usage) = tokio::join!(status, usage);
+    finish_claude_probe(status, usage)
+}
+
+fn finish_claude_probe(
+    status: Result<Observed<Value>, String>,
+    usage: Result<ClaudeSession, String>,
+) -> Result<Probed, String> {
+    let (catalog, usage) = match usage {
+        Ok(ClaudeSession { catalog, usage }) => (catalog, Ok(usage)),
+        Err(message) => (None, Err(message)),
     };
-    let identity = match status.as_ref().map(super::claude::parse_auth_status) {
-        Ok(Err(state)) => {
-            return Ok(Probed::state(
-                state,
-                "Signed out of Claude Code",
-                observed_at,
-                models,
-            ));
-        }
-        Ok(Ok(identity)) => Some(identity),
+    let identity = match status {
+        Ok(status) => match super::claude::parse_auth_status(&status.value) {
+            Err(state) => {
+                return Ok(Probed::state(
+                    state,
+                    "Signed out of Claude Code",
+                    status.observed_at,
+                    catalog,
+                ));
+            }
+            Ok(identity) => Some(identity),
+        },
         Err(_) => None,
     };
-    let snapshot = match usage {
-        Ok(Ok(response)) => super::claude::parse_usage(&response, observed_at),
-        Ok(Err(message)) => match super::claude::error_status(&message) {
+    // An auth failure still takes precedence above. Otherwise a missing usage
+    // answer remains the original failure, even when identity was available.
+    let usage = usage?;
+    let observed_at = usage.observed_at;
+    let snapshot = match usage.value {
+        Ok(response) => super::claude::parse_usage(&response, observed_at),
+        Err(message) => match super::claude::error_status(&message) {
             Some(UsageStatus::NeedsLogin) => UsageSnapshot::state(
                 UsageStatus::NeedsLogin,
                 "Signed out of Claude Code",
@@ -788,31 +839,27 @@ async fn probe_claude(account: &Account, program: &Path) -> Result<Probed, Strin
             // backoff while the figures already on screen stay.
             None => return Err("Claude Code could not read usage just now".into()),
         },
-        // The session never answered: a failure to back off from, even when
-        // the identity came back, since the limits are what is shown.
-        Err(message) => return Err(message),
     };
     Ok(Probed {
         identity,
         snapshot,
-        models,
+        catalog,
     })
 }
 
 /// What the usage session answered.
 struct ClaudeSession {
     /// The models `initialize` listed.
-    models: Vec<Model>,
+    catalog: Option<Catalog>,
     /// The `get_usage` control response's inner `response`, or the error
     /// message Claude answered either request with.
-    usage: Result<Value, String>,
+    usage: Observed<Result<Value, String>>,
 }
 
 async fn claude_usage(command: Command) -> Result<ClaudeSession, String> {
     let mut session = Session::spawn(command).await?;
     let result = claude_exchange(&mut session).await;
-    session.close().await;
-    result
+    after_close(result, session.close()).await
 }
 
 async fn claude_exchange(session: &mut Session) -> Result<ClaudeSession, String> {
@@ -822,23 +869,30 @@ async fn claude_exchange(session: &mut Session) -> Result<ClaudeSession, String>
         .send(&json!({"type": "control_request", "request_id": INITIALIZE,
             "request": {"subtype": "initialize"}}))
         .await?;
-    let initialized = match claude_response(session, INITIALIZE).await? {
-        Ok(initialized) => initialized,
-        Err(message) => {
-            return Ok(ClaudeSession {
-                models: Vec::new(),
-                usage: Err(message),
-            });
-        }
-    };
-    let models = models(initialized["models"].as_array(), Model::from_claude);
+    let initialized = claude_response(session, INITIALIZE).await?;
+    let catalog = claude_catalog(&initialized);
+    if initialized.value.is_err() {
+        return Ok(ClaudeSession {
+            catalog,
+            usage: initialized,
+        });
+    }
     session
         .send(&json!({"type": "control_request", "request_id": USAGE,
             "request": {"subtype": "get_usage", "skip_behaviors": true}}))
         .await?;
     Ok(ClaudeSession {
-        models,
+        catalog,
         usage: claude_response(session, USAGE).await?,
+    })
+}
+
+fn claude_catalog(initialized: &Observed<Result<Value, String>>) -> Option<Catalog> {
+    initialized.value.as_ref().ok().and_then(|value| {
+        observed_catalog(
+            models(value["models"].as_array(), Model::from_claude),
+            initialized.observed_at,
+        )
     })
 }
 
@@ -862,13 +916,24 @@ fn models(entries: Option<&Vec<Value>>, parse: fn(&Value) -> Option<Model>) -> V
 async fn claude_response(
     session: &mut Session,
     request_id: &str,
-) -> Result<Result<Value, String>, String> {
+) -> Result<Observed<Result<Value, String>>, String> {
     loop {
         let frame = session.next().await?;
-        if let Some(answer) = match_control_response(&frame, request_id) {
+        if let Some(answer) = observed_control_response(&frame, request_id, now_ms) {
             return Ok(answer);
         }
     }
+}
+
+fn observed_control_response(
+    frame: &Value,
+    request_id: &str,
+    now: impl FnOnce() -> u64,
+) -> Option<Observed<Result<Value, String>>> {
+    match_control_response(frame, request_id).map(|value| Observed {
+        value,
+        observed_at: now(),
+    })
 }
 
 /// The answer `frame` carries for `request_id`, if it is that control
@@ -897,18 +962,24 @@ async fn probe_codex(account: &Account, program: &Path) -> Result<Probed, String
     command.arg("app-server");
     let mut session = Session::spawn(command).await?;
     let result = codex_exchange(&mut session).await;
-    session.close().await;
+    finish_codex_probe(after_close(result, session.close()).await)
+}
+
+fn finish_codex_probe(result: Result<CodexSession, String>) -> Result<Probed, String> {
     let CodexSession {
         account: account_read,
         limits: limits_read,
         models,
     } = result?;
-    let models = models
-        .ok()
-        .map(|result| self::models(result["data"].as_array(), Model::from_codex))
-        .unwrap_or_default();
-    let observed_at = now_ms();
-    let identity = match account_read {
+    let catalog = models.and_then(|answer| {
+        answer.value.ok().and_then(|result| {
+            observed_catalog(
+                self::models(result["data"].as_array(), Model::from_codex),
+                answer.observed_at,
+            )
+        })
+    });
+    let identity = match account_read.value {
         Ok(result) => match super::codex::parse_account(&result) {
             Ok(identity) => Some(identity),
             Err(state) => {
@@ -916,12 +987,18 @@ async fn probe_codex(account: &Account, program: &Path) -> Result<Probed, String
                     UsageStatus::NeedsLogin => "Signed out of Codex",
                     _ => "Codex is not signed in to a ChatGPT plan",
                 };
-                return Ok(Probed::state(state, detail, observed_at, models));
+                return Ok(Probed::state(
+                    state,
+                    detail,
+                    account_read.observed_at,
+                    catalog,
+                ));
             }
         },
         Err(_) => None,
     };
-    let snapshot = match limits_read {
+    let observed_at = limits_read.observed_at;
+    let snapshot = match limits_read.value {
         Ok(result) => super::codex::parse_rate_limits(&result, observed_at),
         Err(error) => match super::codex::error_status(&error) {
             Some(UsageStatus::NeedsLogin) => UsageSnapshot::state(
@@ -940,7 +1017,7 @@ async fn probe_codex(account: &Account, program: &Path) -> Result<Probed, String
     Ok(Probed {
         identity,
         snapshot,
-        models,
+        catalog,
     })
 }
 
@@ -948,12 +1025,12 @@ type RpcResult = Result<Value, Value>;
 
 /// What the app server answered.
 struct CodexSession {
-    account: RpcResult,
-    limits: RpcResult,
+    account: Observed<RpcResult>,
+    limits: Observed<RpcResult>,
     /// The first page of `model/list`, which lists every model Codex offers
     /// in one page of this size. A version without it answers an error, and
     /// one that did not answer within [`MODELS_GRACE`] reads as one.
-    models: RpcResult,
+    models: Option<Observed<RpcResult>>,
 }
 
 async fn codex_exchange(session: &mut Session) -> Result<CodexSession, String> {
@@ -977,34 +1054,30 @@ async fn codex_exchange(session: &mut Session) -> Result<CodexSession, String> {
         .await?;
     let mut answers = CodexAnswers::default();
     while answers.account.is_none() || answers.limits.is_none() {
-        answers.take(session.next().await?);
+        answers.take(session.next().await?, now_ms);
     }
     // The usage is what the probe is for, so the listing is only waited for
     // a little longer, and a probe that has its answer never fails for it.
     let _ = tokio::time::timeout(MODELS_GRACE, async {
         while answers.models.is_none() {
-            answers.take(session.next().await?);
+            answers.take(session.next().await?, now_ms);
         }
         Ok::<(), String>(())
     })
     .await;
-    Ok(CodexSession {
-        account: answers.account.unwrap(),
-        limits: answers.limits.unwrap(),
-        models: answers.models.unwrap_or(Err(Value::Null)),
-    })
+    Ok(answers.finish())
 }
 
 #[derive(Default)]
 struct CodexAnswers {
-    account: Option<RpcResult>,
-    limits: Option<RpcResult>,
-    models: Option<RpcResult>,
+    account: Option<Observed<RpcResult>>,
+    limits: Option<Observed<RpcResult>>,
+    models: Option<Observed<RpcResult>>,
 }
 
 impl CodexAnswers {
     /// Keeps `frame` if it answers one of the requests.
-    fn take(&mut self, frame: Value) {
+    fn take(&mut self, frame: Value, now: impl FnOnce() -> u64) {
         if frame.get("method").is_some() {
             return;
         }
@@ -1014,7 +1087,18 @@ impl CodexAnswers {
             Some(4) => &mut self.models,
             _ => return,
         };
-        *slot = Some(rpc_result(frame));
+        *slot = Some(Observed {
+            value: rpc_result(frame),
+            observed_at: now(),
+        });
+    }
+
+    fn finish(self) -> CodexSession {
+        CodexSession {
+            account: self.account.unwrap(),
+            limits: self.limits.unwrap(),
+            models: self.models,
+        }
     }
 }
 
@@ -1056,9 +1140,10 @@ mod tests {
         const CHILD: &str = "CAGENTS_ACCOUNT_ENV_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
+            // Preserve the caller's scope; override only these fixture inputs.
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child.args(["--exact", "account::probe::tests::selected_home_probes_remove_inherited_credentials_but_system_keeps_them", "--nocapture"])
-                .env_clear().env(CHILD, "1").env("HOME", directory.path()).env("PATH", "/usr/bin:/bin");
+                .env(CHILD, "1").env("HOME", directory.path()).env("PATH", "/usr/bin:/bin");
             for provider in Account::PROVIDERS {
                 for name in super::super::credential_overrides(provider) {
                     child.env(name, "fixture-only");
@@ -1173,6 +1258,283 @@ mod tests {
         );
     }
 
+    fn claude_reply(request: &str, response: Value) -> Value {
+        json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": request, "response": response}})
+    }
+
+    fn assert_pending<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.poll(&mut context).is_pending());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_matched_usage_keeps_observation_through_auth_and_close() {
+        for signed_in in [true, false] {
+            let clock = std::cell::Cell::new(5);
+            let initialized = observed_control_response(
+                &claude_reply("initialize", json!({"models": [{"value": "opus"}]})),
+                "initialize",
+                || clock.get(),
+            )
+            .unwrap();
+            let catalog = claude_catalog(&initialized);
+            clock.set(10);
+            let usage = observed_control_response(
+                &claude_reply(
+                    "usage",
+                    serde_json::from_str(include_str!(
+                        "../../fixtures/accounts/claude-get-usage.json"
+                    ))
+                    .unwrap(),
+                ),
+                "usage",
+                || clock.get(),
+            )
+            .unwrap();
+            let (auth_ready, auth_wait) = tokio::sync::oneshot::channel::<()>();
+            let (close_ready, close_wait) = tokio::sync::oneshot::channel::<()>();
+            let auth_clock = &clock;
+            let status = async move {
+                auth_wait.await.unwrap();
+                observed_json(
+                    &serde_json::to_vec(&json!({"loggedIn": signed_in,
+                        "email": "user@example.com", "subscriptionType": "max"}))
+                    .unwrap(),
+                    || auth_clock.get(),
+                )
+            };
+            let usage = after_close(Ok(ClaudeSession { catalog, usage }), async {
+                close_wait.await.unwrap();
+            });
+            let mut completion = Box::pin(join_claude(status, usage));
+            assert_pending(completion.as_mut());
+            clock.set(30);
+            auth_ready.send(()).unwrap();
+            assert_pending(completion.as_mut());
+            clock.set(40);
+            close_ready.send(()).unwrap();
+            let Outcome::Answered {
+                identity,
+                snapshot,
+                catalog,
+            } = completion.await.unwrap().into_outcome()
+            else {
+                panic!("the matched collector must produce its ordinary answer");
+            };
+            assert_eq!(catalog.unwrap().observed_at, 5);
+            assert_eq!(snapshot.observed_at, if signed_in { 10 } else { 30 });
+            if signed_in {
+                assert_eq!(identity.unwrap().email.as_deref(), Some("user@example.com"));
+                assert_eq!(snapshot.plan.as_deref(), Some("max"));
+                assert!(!snapshot.windows.is_empty());
+                assert_ne!(snapshot.status, UsageStatus::NeedsLogin);
+            } else {
+                assert!(identity.is_none());
+                assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
+                assert!(snapshot.windows.is_empty());
+            }
+        }
+
+        // A matched protocol rejection has its own observation even when the
+        // separate auth process failed, and a transient error remains Failed.
+        for (message, expected) in [
+            ("Not logged in", Some(UsageStatus::NeedsLogin)),
+            ("service overloaded", None),
+        ] {
+            let usage = observed_control_response(
+                &json!({"type":"control_response", "response": {
+                    "subtype":"error", "request_id":"usage", "error":message}}),
+                "usage",
+                || 12,
+            )
+            .unwrap();
+            let result = finish_claude_probe(
+                Err("auth transport failed".into()),
+                Ok(ClaudeSession {
+                    catalog: None,
+                    usage,
+                }),
+            );
+            if let Some(expected) = expected {
+                let probed = result.unwrap();
+                assert_eq!(probed.snapshot.status, expected);
+                assert_eq!(probed.snapshot.observed_at, 12);
+                assert!(probed.identity.is_none());
+            } else {
+                assert_eq!(
+                    result.err().as_deref(),
+                    Some("Claude Code could not read usage just now")
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_collector_keeps_independent_quota_and_catalog_times_through_close() {
+        for models_first in [false, true] {
+            for signed_in in [false, true] {
+                let clock = std::cell::Cell::new(3);
+                let mut answers = CodexAnswers::default();
+                let listing = json!({"id":4,"result":{"data":[{"model":"gpt-5"}]}});
+                if models_first {
+                    answers.take(listing.clone(), || clock.get());
+                }
+                clock.set(10);
+                answers.take(
+                    serde_json::from_str(include_str!(
+                        "../../fixtures/accounts/codex-rate-limits-read.json"
+                    ))
+                    .unwrap(),
+                    || clock.get(),
+                );
+                clock.set(15);
+                let account = if signed_in {
+                    serde_json::from_str(include_str!(
+                        "../../fixtures/accounts/codex-account-read.json"
+                    ))
+                    .unwrap()
+                } else {
+                    json!({"id":2,"result":{"account":null,"requiresOpenaiAuth":true}})
+                };
+                answers.take(account, || clock.get());
+                let (models_ready, models_wait) = tokio::sync::oneshot::channel::<()>();
+                let (close_ready, close_wait) = tokio::sync::oneshot::channel::<()>();
+                let models_clock = &clock;
+                let collected = async move {
+                    models_wait.await.unwrap();
+                    if !models_first {
+                        answers.take(listing, || models_clock.get());
+                    }
+                    Ok(answers.finish())
+                };
+                let mut completion = Box::pin(async {
+                    finish_codex_probe(
+                        after_close(collected.await, async {
+                            close_wait.await.unwrap();
+                        })
+                        .await,
+                    )
+                });
+                assert_pending(completion.as_mut());
+                clock.set(20);
+                models_ready.send(()).unwrap();
+                assert_pending(completion.as_mut());
+                clock.set(40);
+                close_ready.send(()).unwrap();
+                let Outcome::Answered {
+                    identity,
+                    snapshot,
+                    catalog,
+                } = completion.await.unwrap().into_outcome()
+                else {
+                    panic!("the matched collector must answer");
+                };
+                assert_eq!(
+                    catalog.unwrap().observed_at,
+                    if models_first { 3 } else { 20 }
+                );
+                assert_eq!(snapshot.observed_at, if signed_in { 10 } else { 15 });
+                if signed_in {
+                    assert_eq!(identity.unwrap().plan.as_deref(), Some("prolite"));
+                    assert_eq!(snapshot.ordinary_usage_allowed, Some(true));
+                    assert!(!snapshot.windows.is_empty());
+                } else {
+                    assert!(identity.is_none());
+                    assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
+                }
+            }
+        }
+        for classified in [false, true] {
+            let mut answers = CodexAnswers::default();
+            answers.take(
+                serde_json::from_str(include_str!(
+                    "../../fixtures/accounts/codex-account-read.json"
+                ))
+                .unwrap(),
+                || 5,
+            );
+            let error = if classified {
+                serde_json::from_str(include_str!(
+                    "../../fixtures/accounts/codex-rate-limits-401.json"
+                ))
+                .unwrap()
+            } else {
+                json!({"id":3,"error":{"code":-1,"message":"service overloaded"}})
+            };
+            answers.take(error, || 11);
+            // Neither a missing nor an error model response creates a catalog.
+            if classified {
+                answers.take(json!({"id":4,"error":{"code":-1}}), || 14);
+            }
+            let result = finish_codex_probe(Ok(answers.finish()));
+            if classified {
+                let probed = result.unwrap();
+                assert_eq!(probed.snapshot.status, UsageStatus::NeedsLogin);
+                assert_eq!(probed.snapshot.observed_at, 11);
+                assert!(probed.catalog.is_none());
+                assert!(probed.identity.is_some());
+            } else {
+                assert_eq!(
+                    result.err().as_deref(),
+                    Some("Codex could not read usage just now")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unmatched_and_duplicate_frames_keep_value_and_observation_together() {
+        let calls = std::cell::Cell::new(0);
+        let now = || {
+            calls.set(calls.get() + 1);
+            calls.get()
+        };
+        assert!(
+            observed_control_response(&claude_reply("other", json!({})), "usage", now).is_none()
+        );
+        let mut answers = CodexAnswers::default();
+        answers.take(json!({"id":99,"result":{}}), now);
+        answers.take(json!({"id":3,"method":"notification","result":{}}), now);
+        assert_eq!(calls.get(), 0, "unmatched frames are not observations");
+        let first = observed_control_response(
+            &claude_reply("usage", json!({"value":"first"})),
+            "usage",
+            now,
+        )
+        .unwrap();
+        assert_eq!(first.value.unwrap()["value"], "first");
+        assert_eq!(first.observed_at, 1);
+        answers.take(json!({"id":3,"result":{"value":"old"}}), now);
+        answers.take(json!({"id":3,"result":{"value":"current"}}), now);
+        let limits = answers.limits.as_ref().unwrap();
+        assert_eq!(limits.value.as_ref().unwrap()["value"], "current");
+        assert_eq!(
+            limits.observed_at, 3,
+            "preserve existing same-id overwrite policy"
+        );
+        let initialized = observed_control_response(
+            &json!({"type":"control_response","response":{
+            "subtype":"error","request_id":"initialize","error":"Not logged in"}}),
+            "initialize",
+            now,
+        )
+        .unwrap();
+        assert!(claude_catalog(&initialized).is_none());
+        let probed = finish_claude_probe(
+            Err("auth failed".into()),
+            Ok(ClaudeSession {
+                catalog: None,
+                usage: initialized,
+            }),
+        )
+        .unwrap();
+        assert_eq!(probed.snapshot.status, UsageStatus::NeedsLogin);
+        assert_eq!(probed.snapshot.observed_at, 4);
+        assert!(probed.catalog.is_none());
+        assert_eq!(calls.get(), 4);
+    }
+
     /// A fake CLI stands in for the provider's: the probe has to speak the
     /// protocol, read only the answer it asked for, and leave nothing running.
     #[tokio::test]
@@ -1201,8 +1563,9 @@ sleep 30
         let Probed {
             identity,
             snapshot,
-            models,
+            catalog,
         } = probe_claude(&account, &script).await.unwrap();
+        let models = catalog.unwrap().models;
         assert_eq!(identity.unwrap().email.as_deref(), Some("user@example.com"));
         assert_eq!(models.len(), 1, "initialize listed one model");
         assert_eq!(snapshot.windows.len(), 1);
@@ -1262,10 +1625,11 @@ cat >/dev/null
         let Probed {
             identity,
             snapshot,
-            models,
+            catalog,
         } = probe_codex(&Account::system(Provider::Codex), &script)
             .await
             .unwrap();
+        let models = catalog.unwrap().models;
         assert_eq!(identity.unwrap().plan.as_deref(), Some("plus"));
         assert_eq!(models.len(), 1, "a signed-out Codex still lists its models");
         assert_eq!(snapshot.status, UsageStatus::NeedsLogin);

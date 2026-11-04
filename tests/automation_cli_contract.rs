@@ -79,6 +79,10 @@ impl Fixture {
     }
 
     fn with_soft_limit(soft_limit: Option<libc::rlim_t>) -> Self {
+        Self::with_soft_limit_and_branch(soft_limit, "main")
+    }
+
+    fn with_soft_limit_and_branch(soft_limit: Option<libc::rlim_t>, branch: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         for name in [
             "home", "run", "data", "config", "cache", "tmp", "project", "bin",
@@ -86,6 +90,17 @@ impl Fixture {
             fs::create_dir(root.path().join(name)).unwrap();
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        // Own the repository identity even when TMPDIR has enclosing Git
+        // metadata. Plain-folder discovery must not select another checkout.
+        let initialized = Self::command(root.path(), "/usr/bin/git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["init", "--quiet", "--template="])
+            .arg(format!("--initial-branch={branch}"))
+            .arg(root.path().join("project"))
+            .output()
+            .unwrap();
+        assert!(initialized.status.success(), "{initialized:?}");
         let daemon = Self::start_with_soft_limit(root.path(), soft_limit);
         let mut fixture = Self {
             root,
@@ -618,7 +633,7 @@ fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_an
 
 #[test]
 fn automation_cli_lifecycle_audit_pages_durable_receipts_without_running_a_provider() {
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::with_soft_limit_and_branch(None, "lifecycle-fixture");
     let project = fixture.root.path().join("project");
     // This case owns lifecycle receipts, not discovery of a plain folder.
     // Bind its project explicitly even when TMPDIR is inside another checkout.

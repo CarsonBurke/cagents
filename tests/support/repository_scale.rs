@@ -2,86 +2,64 @@
 use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
 use std::{
     fs,
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
-    sync::Mutex,
     time::{Duration, Instant},
 };
 
-/// Bound stream summaries within the parent's 1 MiB cap. ProcessFailure keeps
-/// only a 64 KiB prefix, so also retain the latest tiny records independently.
-/// Never log argv, stdin payloads or environment values here.
-pub(super) fn diagnostic(message: std::fmt::Arguments<'_>) {
-    static REMAINING: Mutex<usize> = Mutex::new(256 * 1024);
-    let record = format!("{message}\n");
-    assert!(record.len() <= 4096, "oversized scale diagnostic record");
-    let journal = if record.starts_with("PATHSPEC_PHASE_") {
-        Some("phase-progress")
-    } else if record.starts_with("PATHSPEC_GIT_") {
-        Some("git-progress")
-    } else {
-        None
-    };
-    if let Some(name) = journal {
-        let directory = PathBuf::from(
-            std::env::var_os("CAGENTS_LARGE_PATHSPEC_ROOT")
-                .expect("owning private contract namespace"),
-        );
-        // Publish atomically before entering the operation. A timeout during
-        // this write leaves the previous complete record, never a partial one.
-        let mut temporary = tempfile::NamedTempFile::new_in(&directory).unwrap();
-        temporary.write_all(record.as_bytes()).unwrap();
-        temporary.flush().unwrap();
-        temporary.persist(directory.join(name)).unwrap();
-    }
-    let mut remaining = REMAINING.lock().unwrap_or_else(|p| p.into_inner());
-    if *remaining == 0 {
-        return;
-    }
-    let mut stderr = std::io::stderr().lock();
-    if record.len() >= *remaining {
-        *remaining = 0;
-        stderr
-            .write_all(b"PATHSPEC_DIAGNOSTICS_TRUNCATED\n")
-            .unwrap();
-    } else {
-        *remaining -= record.len();
-        stderr.write_all(record.as_bytes()).unwrap();
-    }
-    stderr.flush().unwrap();
+// The scale contract's 26 fixed phase pairs total at most 4,114 bytes with
+// maximal u128 elapsed digits and "panicking" results. Its executor documents
+// the combined diagnostic bound against the 64 KiB failure capture limit.
+pub(super) struct Phase {
+    name: &'static str,
+    started: Instant,
 }
 
-/// An unfinished BEGIN remains in the private journal if the deadline wins.
-pub(super) fn phase<T>(name: &str, items: usize, operation: impl FnOnce() -> T) -> T {
-    let started = Instant::now();
-    diagnostic(format_args!(
-        "PATHSPEC_PHASE_BEGIN phase={name} items={items} elapsed_ms=0"
-    ));
-    let result = operation();
-    diagnostic(format_args!(
-        "PATHSPEC_PHASE_END phase={name} items={items} elapsed_ms={}",
-        started.elapsed().as_millis()
-    ));
-    result
+pub(super) fn phase(name: &'static str) -> Phase {
+    eprintln!("pathspec phase={name} begin elapsed_ms=0");
+    Phase {
+        name,
+        started: Instant::now(),
+    }
 }
 
-fn report_latest_progress(directory: &Path) {
-    for name in ["phase-progress", "git-progress"] {
-        let record = (|| -> std::io::Result<String> {
-            let mut record = String::new();
-            fs::File::open(directory.join(name))?
-                .take(4097)
-                .read_to_string(&mut record)?;
-            Ok(record)
-        })();
-        match record {
-            Ok(record) if record.len() <= 4096 => {
-                eprintln!("Latest scale {name} (diagnostic only, not custody proof):\n{record}");
+impl Drop for Phase {
+    fn drop(&mut self) {
+        eprintln!(
+            "pathspec phase={} end elapsed_ms={} result={}",
+            self.name,
+            self.started.elapsed().as_millis(),
+            if std::thread::panicking() {
+                "panicking"
+            } else {
+                "finished"
             }
-            Ok(_) => eprintln!("Latest scale {name}: oversized record refused"),
-            Err(error) => eprintln!("Latest scale {name}: unavailable ({:?})", error.kind()),
-        }
+        );
     }
+}
+
+pub(super) fn fixture_git_environment(mut command: CommandSpec) -> CommandSpec {
+    // Fixture environment hardening, not a demonstrated timeout fix: this
+    // contract exercises pathspecs rather than automatic repository maintenance.
+    const CONFIG: [(&str, &str); 6] = [
+        ("core.fsmonitor", "false"),
+        ("core.hooksPath", "/dev/null"),
+        ("commit.gpgsign", "false"),
+        ("init.templateDir", ""),
+        ("gc.auto", "0"),
+        ("maintenance.auto", "false"),
+    ];
+    command = command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", CONFIG.len().to_string());
+    for (index, (key, value)) in CONFIG.into_iter().enumerate() {
+        command = command
+            .env(format!("GIT_CONFIG_KEY_{index}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+    }
+    command
 }
 
 /// Runs `contract` as the only test of a private libtest subprocess,
@@ -108,6 +86,7 @@ pub(super) fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Pa
         .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
         .unwrap_or(name);
     if std::env::var("CAGENTS_LARGE_PATHSPEC_CONTRACT").as_deref() == Ok(name) {
+        let entry = phase("child entry");
         // SAFETY: prctl takes no pointers here. Adopting orphans is
         // confined to this dedicated single-test subprocess.
         assert_eq!(
@@ -122,8 +101,12 @@ pub(super) fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Pa
         )
         .join("repository");
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        drop(entry);
+        let running = phase("contract");
         contract(&root);
+        drop(running);
         eprintln!("Contract passed; settling its process family");
+        let settlement = phase("settlement");
         // The kernel reparents an orphan to this subreaper as its
         // parent exits, so while any descendant lives this process
         // still has a child of its own; ECHILD is settlement.
@@ -139,6 +122,7 @@ pub(super) fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Pa
                 _ => panic!("settling the contract's process family: {error}"),
             }
         }
+        drop(settlement);
         return;
     }
 
@@ -182,21 +166,9 @@ pub(super) fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Pa
             command = command.env_remove(key);
         }
     }
-    command = command
+    let command = fixture_git_environment(command)
         .env("CAGENTS_LARGE_PATHSPEC_CONTRACT", name)
-        .env("CAGENTS_LARGE_PATHSPEC_ROOT", &directory.0)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_COUNT", "4")
-        .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
-        .env("GIT_CONFIG_VALUE_0", "false")
-        .env("GIT_CONFIG_KEY_1", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_1", "/dev/null")
-        .env("GIT_CONFIG_KEY_2", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_2", "false")
-        .env("GIT_CONFIG_KEY_3", "init.templateDir")
-        .env("GIT_CONFIG_VALUE_3", "");
+        .env("CAGENTS_LARGE_PATHSPEC_ROOT", &directory.0);
     let (success, stdout, stderr, status) =
         match SystemProcessExecutor.execute(&command, &CancellationToken::new()) {
             Ok(output) => (
@@ -224,11 +196,6 @@ pub(super) fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Pa
     }
     let stdout = String::from_utf8_lossy(&stdout);
     let stderr = String::from_utf8_lossy(&stderr);
-    if !success {
-        // Print outside ProcessFailure's prefix so a late phase remains visible
-        // even when the captured child stderr excerpt omitted it.
-        report_latest_progress(&directory.0);
-    }
     assert!(success, "{status}\n{stdout}\n{stderr}");
     assert!(
         stdout
