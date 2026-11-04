@@ -31,7 +31,7 @@ while (($#)); do
                 'Requires Linux x86_64, unprivileged user namespaces, bubblewrap, Bash,' \
                 'Git, curl, GNU tar/coreutils, flock, network access, and ample disk space.' \
                 'CAGENTS_RELEASE_CACHE selects a private, marked cache (default:' \
-                '~/.cache/cagents-release/ubuntu-22.04-amd64). CARGO_BUILD_JOBS defaults to 2.' \
+                '~/.cache/cagents-release/ubuntu-22.04-amd64). CARGO_BUILD_JOBS defaults to every CPU.' \
                 'No root, Docker, host toolchain, credentials, or publication is used.'
             exit 0
             ;;
@@ -46,7 +46,7 @@ CALLER_GID=$(id -g)
 for command in bwrap git curl tar sha256sum flock realpath stat mktemp install; do
     command -v "$command" >/dev/null || fail "required command not found: $command"
 done
-JOBS=${CARGO_BUILD_JOBS:-2}
+JOBS=${CARGO_BUILD_JOBS:-$(nproc)}
 [[ $JOBS =~ ^[1-9][0-9]*$ ]] || fail 'CARGO_BUILD_JOBS must be a positive integer'
 if [[ -z $REF ]]; then
     version=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' "$ROOT_DIR/Cargo.toml")

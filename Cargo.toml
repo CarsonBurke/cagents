@@ -310,6 +310,12 @@ lto = false
 codegen-units = 256
 incremental = true
 
+# The release lane's tests: release semantics, so production identity and no
+# debug assertions, compiled at the `local` speed. Shipped binaries still use
+# `release`.
+[profile.release-test]
+inherits = "local"
+
 [profile.dev.package."*"]
 debug = 0
 
