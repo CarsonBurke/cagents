@@ -137,6 +137,7 @@ impl EntryIdentity {
 
 const ROW_HEIGHT: f32 = 40.0;
 const ROW_SPACING: f32 = space::XXS;
+const REASSIGN_BUTTON: &str = "palette.recording.reassign";
 
 fn palette_query(query: &str) -> (Option<char>, &str) {
     let query = query.trim();
@@ -529,6 +530,12 @@ impl Cagents {
                 self.palette.filtering_key = false;
                 self.palette.reassign = None;
                 self.palette.recording_error = None;
+                return Some(Task::none());
+            }
+            // A pending Reassign is reached with the keyboard: Tab and
+            // Shift+Tab move focus to it rather than being recorded, which
+            // would withdraw the offer the user is navigating to.
+            if self.palette.reassign.is_some() && is_tab_press(event).is_some() {
                 return Some(Task::none());
             }
             if let keyboard::Event::KeyPressed {
@@ -1016,6 +1023,7 @@ impl Cagents {
                         "Reassign from {}",
                         SettingsField::SHORTCUTS[*owner].label()
                     ))
+                    .id(widget::Id::new(REASSIGN_BUTTON))
                     .on_press(Message::Palette(Action::Reassign))
                     .into(),
                 );
@@ -3186,6 +3194,91 @@ mod settings_recorder_tests {
         );
         assert!(app.settings_pending.is_empty());
         assert!(app.settings_invalid.is_empty());
+    }
+
+    #[test]
+    fn keyboard_reaches_and_activates_a_pending_reassign() {
+        use iced::{
+            Size,
+            advanced::{clipboard, widget::operation},
+            mouse,
+            runtime::user_interface::{Cache, UserInterface},
+        };
+
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let field = SettingsField::ShortcutToggleProjects;
+        let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
+        drop(app.update_palette(Action::Record(field)));
+        drop(app.record_shortcut(field, chord.clone()));
+        assert!(app.palette.reassign.is_some());
+
+        let press = |key: keyboard::key::Named, code, modifiers| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modified_key: keyboard::Key::Named(key),
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        };
+        for modifiers in [keyboard::Modifiers::empty(), keyboard::Modifiers::SHIFT] {
+            let tab = press(
+                keyboard::key::Named::Tab,
+                keyboard::key::Code::Tab,
+                modifiers,
+            );
+            assert!(app.palette_key_event(&tab).is_some());
+            assert!(
+                app.palette.reassign.is_some(),
+                "Tab moves toward Reassign instead of being recorded"
+            );
+            assert_eq!(app.palette.recording, Some(field));
+        }
+
+        let enter = press(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            keyboard::Modifiers::empty(),
+        );
+        let mut messages = Vec::new();
+        {
+            let surface = app.palette_surface().expect("recording surface");
+            let mut renderer = super::super::tests::headless_renderer();
+            let mut ui = UserInterface::build(
+                surface,
+                Size::new(600.0, 300.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            ui.operate(
+                &renderer,
+                &mut operation::focusable::focus::<()>(widget::Id::new(REASSIGN_BUTTON)),
+            );
+            ui.update(
+                &[iced::Event::Keyboard(enter.clone())],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+        }
+        assert!(
+            matches!(messages.as_slice(), [Message::Palette(Action::Reassign)]),
+            "Enter on the focused Reassign button requests the reassignment"
+        );
+        assert!(app.palette_key_event(&enter).is_some());
+        assert!(app.palette.reassign.is_some(), "Enter is not recorded");
+        for message in messages {
+            drop(app.update(message));
+        }
+        assert!(app.palette.recording.is_none());
+        assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
+        assert!(
+            app.settings
+                .keyboard_shortcuts
+                .toggle_projects
+                .contains(&chord)
+        );
     }
 
     #[test]
