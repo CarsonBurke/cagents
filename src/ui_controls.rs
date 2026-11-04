@@ -33,4 +33,4 @@ pub use placeholder::{Placeholder, placeholder};
 pub use popover::{popover, popover_item};
 pub use responsive::responsive;
 pub use shrinkable::shrinkable;
-pub use tabs::{ViewTab, nested_view_tabs, view_tab, view_tab_height, view_tabs};
+pub use tabs::{ViewTab, nested_view_tabs, toggle_view_tab, view_tab, view_tab_height, view_tabs};

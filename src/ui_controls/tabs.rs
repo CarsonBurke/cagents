@@ -69,7 +69,7 @@ fn tab_row<'a, Message: Clone + 'a>(
 ) -> Element<'a, Message> {
     let row = widget::row::with_children(
         tabs.into_iter()
-            .map(|tab| tab_button(tab, compact, None, returns))
+            .map(|tab| tab_button(tab, compact, None, returns, None))
             .collect::<Vec<_>>(),
     )
     .spacing(space::XS)
@@ -84,7 +84,18 @@ pub fn view_tab<'a, Message: Clone + 'a>(
     compact: bool,
     leading: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    tab_button(tab, compact, leading, false)
+    tab_button(tab, compact, leading, false, None)
+}
+
+/// A lone view tab that both opens and leaves its view, so pressing it while
+/// selected is an intent. Its name stays put as it toggles; `hint` is the
+/// tooltip, and says what a press would do now.
+pub fn toggle_view_tab<'a, Message: Clone + 'a>(
+    tab: ViewTab<'a, Message>,
+    leading: Element<'a, Message>,
+    hint: impl Into<Cow<'a, str>>,
+) -> Element<'a, Message> {
+    tab_button(tab, false, Some(leading), true, Some(hint.into()))
 }
 
 /// A view tab; `returns` keeps a selected tab's press message.
@@ -93,6 +104,7 @@ fn tab_button<'a, Message: Clone + 'a>(
     compact: bool,
     leading: Option<Element<'a, Message>>,
     returns: bool,
+    hint: Option<Cow<'a, str>>,
 ) -> Element<'a, Message> {
     let ViewTab {
         label,
@@ -136,7 +148,7 @@ fn tab_button<'a, Message: Clone + 'a>(
     if let Some(id) = id {
         button = button.id(id);
     }
-    tooltip(crate::interaction::hover(button), name)
+    tooltip(crate::interaction::hover(button), hint.unwrap_or(name))
 }
 
 pub fn view_tab_height(compact: bool) -> f32 {

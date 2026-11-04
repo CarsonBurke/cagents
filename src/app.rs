@@ -2783,7 +2783,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::AutomationUi(action) => !action.background() && !action.answers_draft_dialog(),
         Message::WorkUi(action) => !action.background(),
         Message::ChannelWork(action) => !action.background(),
-        Message::OpenChannelWork(_) | Message::ChannelWorkEscape | Message::ChannelWorkNavigation(_) => true,
+        Message::ChannelWorkEscape | Message::ChannelWorkNavigation(_) => true,
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -2915,7 +2915,6 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                 ..
             }
             | Message::ToggleContextInspector
-            | Message::OpenChannelWork(_)
             | Message::ChannelWorkNavigation(_)
             | Message::Repository(RepositoryAction::NewTerminal { .. })
             | Message::Repository(RepositoryAction::MarkdownLink { .. })
@@ -4676,7 +4675,6 @@ pub enum Message {
     AutomationUi(crate::automation_ui::Action),
     WorkUi(crate::work_ui::Action),
     ChannelWork(crate::channel_work_ui::Action),
-    OpenChannelWork(ChannelId),
     ChannelWorkNavigation(channel_work::Navigation),
     ChannelWorkPoll,
     ChannelWorkEscape,
@@ -17681,7 +17679,6 @@ impl Application for Cagents {
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),
             Message::ChannelWork(action) => self.update_channel_work(action),
-            Message::OpenChannelWork(channel) => self.open_channel_work(channel),
             Message::ChannelWorkNavigation(navigation) => self.channel_navigation(navigation),
             Message::ChannelWorkEscape => self.escape_channel_work(),
             Message::ChannelWorkPoll => self.channel_work.view.refresh().map_or_else(Task::none, |effect| self.channel_work_effect(effect)),

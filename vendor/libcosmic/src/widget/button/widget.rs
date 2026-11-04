@@ -707,6 +707,9 @@ impl<'a, Message: 'a + Clone> Widget<Message, crate::Theme, crate::Renderer>
         if self.on_press.is_none() {
             node.set_disabled();
         }
+        if self.selected {
+            node.set_selected(true);
+        }
         // TODO hover
         // if is_hovered {
         //     node.set_hovered();
