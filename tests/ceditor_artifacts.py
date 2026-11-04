@@ -94,7 +94,12 @@ if mode != "missing":
         product.chmod(0o644)
     print(json.dumps(record))
     if mode == "ambiguous":
-        other = dict(record, executable=str(product.with_name("other-ceditor")))
+        # Both choices must be runnable so missing-file rejection cannot hide
+        # an artifact selector that incorrectly accepts the last candidate.
+        other_product = product.with_name("other-ceditor")
+        other_product.write_bytes(product.read_bytes())
+        other_product.chmod(0o755)
+        other = dict(record, executable=str(other_product))
         print(json.dumps(other))
 print(json.dumps({"reason": "build-finished", "success": mode != "failed"}))
 sys.exit(101 if mode == "failed" else 0)
@@ -189,12 +194,29 @@ sys.exit(101 if mode == "failed" else 0)
         self.assertEqual(public_cli.read_text(), "unrelated installed CLI\n")
         self.assertEqual(len(self.cargo_calls()), 6)
 
-    def test_failed_missing_or_ambiguous_artifact_never_launches_or_replaces_installation(self):
+    def test_ambiguous_runnable_artifacts_never_launch_or_replace_installation(self):
         self.assert_success(self.run_script("install-ceditor", "--prefix", str(self.prefix)))
         installed = self.prefix / "bin/ceditor"
         original = installed.resolve()
         releases = sorted((self.prefix / "lib/ceditor/releases").iterdir())
-        for mode in ("failed", "missing", "ambiguous", "relative", "absent", "not-executable"):
+        ambiguity = "Cargo did not report exactly one executable for ceditor (found 2)"
+        self.environment["MOCK_ARTIFACT_MODE"] = "ambiguous"
+        for name, arguments in (("run-ceditor-development", ()),
+                                ("install-ceditor", ("--prefix", str(self.prefix)))):
+            with self.subTest(script=name):
+                result = self.run_script(name, *arguments)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn(ambiguity, result.stderr)
+                self.assertFalse(self.launch.exists())
+                self.assertEqual(installed.resolve(), original)
+                self.assertEqual(sorted((self.prefix / "lib/ceditor/releases").iterdir()), releases)
+
+    def test_failed_missing_or_invalid_artifact_never_launches_or_replaces_installation(self):
+        self.assert_success(self.run_script("install-ceditor", "--prefix", str(self.prefix)))
+        installed = self.prefix / "bin/ceditor"
+        original = installed.resolve()
+        releases = sorted((self.prefix / "lib/ceditor/releases").iterdir())
+        for mode in ("failed", "missing", "relative", "absent", "not-executable"):
             with self.subTest(mode=mode):
                 self.environment["MOCK_ARTIFACT_MODE"] = mode
                 runner = self.run_script("run-ceditor-development")

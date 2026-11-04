@@ -2,6 +2,8 @@
 //! does not decode base64, read a file, or copy a pixel buffer.
 use super::*;
 mod canvas;
+pub(super) mod clipboard;
+pub(in crate::app) use clipboard::{ImageCommand, ImageRef};
 
 // Keep the pixel lease in the decoded buffer itself: cached turns, galleries,
 // detached widget trees and renderer host buffers all clone it. Counting cache
@@ -819,6 +821,16 @@ struct Entry {
     label: String,
     handle: iced::widget::image::Handle,
 }
+impl Entry {
+    /// The entry's literal file path, for Copy image path. Managed snapshot
+    /// paths are non-authority hints and inline data has no path.
+    fn file_path(&self) -> Option<String> {
+        if self.managed {
+            return None;
+        }
+        clipboard::local_file(&self.path).map(|path| path.to_string_lossy().into_owned())
+    }
+}
 pub(in crate::app) struct Gallery {
     entries: Vec<Entry>,
     selected: usize,
@@ -911,7 +923,9 @@ impl Gallery {
         self.reset = self.reset.wrapping_add(1);
     }
     pub(super) fn url(&self) -> Option<Url> {
-        let entry = &self.entries[self.selected];
+        self.entry_url(&self.entries[self.selected])
+    }
+    fn entry_url(&self, entry: &Entry) -> Option<Url> {
         // Managed snapshot paths are non-authority hints. The in-app viewer
         // owns verified pixels; never hand an unverified hint to another app.
         if entry.managed {
@@ -928,8 +942,28 @@ impl Gallery {
             })
         }
     }
+    /// The pixels the viewer shows now; Ctrl+C copies these.
+    pub(in crate::app) fn selected_image(&self) -> ImageRef {
+        ImageRef::Viewer(self.entries[self.selected].handle.id())
+    }
+    /// The viewer entry drawn with `image`, if it is still the one shown. A
+    /// menu left open across navigation must not act on another image.
+    pub(in crate::app) fn resolve(
+        &self,
+        image: iced::advanced::image::Id,
+    ) -> Option<clipboard::Resolved> {
+        let entry =
+            Some(&self.entries[self.selected]).filter(|entry| entry.handle.id() == image)?;
+        Some(clipboard::Resolved {
+            item: None,
+            handle: entry.handle.clone(),
+            path: entry.file_path(),
+            url: self.entry_url(entry),
+        })
+    }
     pub(in crate::app) fn view(&self) -> Element<'_, Message> {
         let entry = &self.entries[self.selected];
+        let image = ImageRef::Viewer(entry.handle.id());
         let navigation = self.entries.len() > 1;
         let toolbar = widget::row::with_children(vec![
             icon(
@@ -946,6 +980,11 @@ impl Gallery {
                 Action::ImageNext(true),
             ),
             iced::widget::Space::new().width(Length::Fill).into(),
+            crate::interaction::tooltip(
+                crate::ui_controls::button::secondary("Copy")
+                    .on_press(action(Action::Image(image, ImageCommand::Copy))),
+                "Copy image (Ctrl+C)",
+            ),
             crate::ui_controls::button::secondary("Fit")
                 .on_press(action(Action::ImageFit))
                 .into(),
@@ -963,14 +1002,25 @@ impl Gallery {
             .min_scale(0.1)
             .max_scale(20.0)
             .into();
-        let canvas = canvas::resettable(self.reset, viewer);
-        dialog_ui::overlay(
+        let canvas = crate::interaction::context_menu(
+            canvas::resettable(self.reset, viewer),
+            clipboard::menu(
+                image,
+                entry.file_path().is_some(),
+                self.entry_url(entry).is_some(),
+            ),
+        );
+        // Escape that an open context menu claims closes only the menu.
+        let dialog = dialog_ui::overlay(
             dialog_ui::surface(
                 widget::column::with_children(vec![
                     toolbar.into(),
                     design::caption(entry.label.as_str()).into(),
                     canvas.into(),
-                    design::caption("Scroll to zoom · Drag to pan · Left / Right to browse").into(),
+                    design::caption(
+                        "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy",
+                    )
+                    .into(),
                 ])
                 .spacing(step::GAP_S)
                 .height(Length::Fill),
@@ -978,7 +1028,17 @@ impl Gallery {
             ),
             Some(action(Action::CloseImage)),
             1.0,
-        )
+        );
+        crate::interaction::unclaimed_key(dialog, |event| {
+            matches!(
+                event,
+                iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                    ..
+                }
+            )
+            .then(|| action(Action::CloseImage))
+        })
     }
 }
 impl Runtime {
@@ -1025,13 +1085,17 @@ impl Runtime {
             .width(Length::Fill)
             .height(280)
             .content_fit(iced::ContentFit::Contain);
+        let image = ImageRef::Transcript(self.target, handle.id());
+        let path = clipboard::has_copyable_path(self, &item.content);
         widget::column::with_children(vec![
-            widget::button::custom(preview)
-                .class(crate::ui_controls::control_style(false, None))
-                .padding(0)
-                .on_press(action(Action::OpenImage(self.target, item.id.clone())))
-                .width(Length::Fill)
-                .into(),
+            crate::interaction::context_menu_lazy(
+                widget::button::custom(preview)
+                    .class(crate::ui_controls::control_style(false, None))
+                    .padding(0)
+                    .on_press(action(Action::OpenImage(self.target, item.id.clone())))
+                    .width(Length::Fill),
+                move || clipboard::menu(image, path, false),
+            ),
             design::caption(format!("{label} · Click to enlarge")).into(),
         ])
         .spacing(step::GAP_XS)

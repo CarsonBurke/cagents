@@ -343,7 +343,8 @@ pub(super) fn message_key(provider: crate::agent::Provider, item_id: &str) -> Op
     if message.is_empty()
         || index.is_empty()
         || !index.bytes().all(|b| b.is_ascii_digit())
-        || index.parse::<usize>().ok()?.to_string() != index
+        || (index.len() > 1 && index.starts_with('0'))
+        || index.parse::<usize>().is_err()
     {
         return None;
     }

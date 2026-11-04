@@ -1,6 +1,8 @@
 use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
+#[cfg(test)]
+mod account_recovery_target_tests;
 pub(super) mod capacity;
 mod native_cleanup;
 mod native_recovery;
@@ -1573,6 +1575,7 @@ fn start_with_execution(
                     source: startup_source.clone(),
                     requested: requested_source.clone(),
                     context,
+                    failed_close: None,
                 },
             );
         }
@@ -1697,7 +1700,22 @@ fn start_with_execution(
             .ok_or_else(|| unavailable("Native startup lost its exact reservation"))?;
         let proof = state.proof().clone();
         drop(state);
-        let response = session_snapshot(&record.session, &record.handle).map_err(unavailable)?;
+        let expected_saved = if remote
+            && source.is_none()
+            && requested_source.terminal.is_none()
+            && !requested_source.native_continuity.retains_provider()
+        {
+            requested_source.launch.session_id.as_deref()
+        } else {
+            None
+        };
+        // A fast named SDK failure may already prevent a snapshot. Install
+        // its exact cleanup owner before observing confirmation or that error.
+        let mut response = if expected_saved.is_some() {
+            None
+        } else {
+            Some(session_snapshot(&record.session, &record.handle).map_err(unavailable)?)
+        };
 
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
@@ -1723,13 +1741,113 @@ fn start_with_execution(
         drop(state);
         drop(retired);
         if remote {
+            installed_handle.wake_retained_outcomes();
+            retained_actor::wake(host, id);
+            if let Some(expected) = expected_saved {
+                let confirmation = confirm_saved_conversation(
+                    &installed_handle,
+                    expected,
+                    Instant::now() + Duration::from_secs(15),
+                    || {
+                        crate::daemon::termination_requested()
+                            || host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down
+                    },
+                )
+                .and_then(|()| {
+                    let session = {
+                        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                        let record = state
+                            .chats
+                            .get(&id)
+                            .ok_or("The resumed conversation disappeared")?;
+                        if !record.handle.same_attachment(&installed_handle) {
+                            return Err("The resumed conversation changed its owner".into());
+                        }
+                        record.session.clone()
+                    };
+                    let current = current_session_snapshot(
+                        host,
+                        session,
+                        installed_handle.clone(),
+                        execution_instance,
+                    )
+                    .map_err(|error| error.message)?;
+                    match &current {
+                        ServerResponse::ChatAttached { snapshot, .. }
+                            if snapshot.ready
+                                && !snapshot.exited
+                                && snapshot.session_id.as_deref() == Some(expected) =>
+                        {
+                            Ok(current)
+                        }
+                        _ => Err(
+                            "The provider stopped before its saved conversation was ready".into(),
+                        ),
+                    }
+                });
+                match confirmation {
+                    Ok(confirmed) => response = Some(confirmed),
+                    Err(message) => {
+                        #[cfg(test)]
+                        retained_admission_tests::pause_failed_confirmation(id);
+                        // A named resume confirms its exact conversation in the
+                        // initialize reply, without a prompt. Keep the ordinary HOST
+                        // record and semantic consumer until normal Close commits all
+                        // attention/loss evidence, retires the helper and revokes its
+                        // authority. A successful attachment must not hide SDK exit.
+                        let target = {
+                            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                            let record = state.chats.get(&id).ok_or_else(|| {
+                                unavailable("The unconfirmed conversation lost its cleanup owner")
+                            })?;
+                            if !record.handle.same_attachment(&installed_handle) {
+                                // A new authenticated proxy for this very same
+                                // installed actor owns cleanup now. Release
+                                // only this obsolete startup reservation; a
+                                // different actor keeps its original evidence.
+                                let same_actor = record.execution_instance == execution_instance
+                                    && record.handle.same_actor(&installed_handle);
+                                drop(state);
+                                if same_actor && let Some(context) = &execution {
+                                    retained_actor::forget_startup(host, &startup_source, context);
+                                }
+                                return Err(unavailable(
+                                    "The unconfirmed conversation changed its owner",
+                                ));
+                            }
+                            let target = CloseTarget::from_record(record);
+                            let pending =
+                                state.native_actor_startups.get_mut(&id).ok_or_else(|| {
+                                    unavailable(
+                                        "The unconfirmed conversation lost its startup reservation",
+                                    )
+                                })?;
+                            pending.failed_close = Some(target.clone());
+                            target
+                        };
+                        // Publication now owns capacity. Do not hold the startup
+                        // reservation while normal Close takes its own exact fence.
+                        drop(admission.take());
+                        if let Err(cleanup) = close_captured(host, target) {
+                            return Err(unavailable(format!(
+                                "{message}. The exact startup cleanup owner is retained: {}. Retry finishes its normal close before another launch.",
+                                cleanup.message
+                            )));
+                        }
+                        if let Some(context) = &execution {
+                            retained_actor::forget_startup(host, &startup_source, context);
+                        }
+                        return Err(unavailable(message));
+                    }
+                }
+            }
             if let Some(context) = &execution {
                 retained_actor::forget_startup(host, &startup_source, context);
             }
-            installed_handle.wake_retained_outcomes();
-            retained_actor::wake(host, id);
         }
-        Ok(response)
+        response.ok_or_else(|| {
+            unavailable("The saved conversation did not publish its confirmed attachment")
+        })
     })();
     drop(admission);
     result
@@ -2172,6 +2290,10 @@ fn recover_account(
             });
             handle
         };
+        // A refused replacement must leave the original actor and history
+        // intact. The temporary source reservation drops on this error;
+        // actual spawn still reauthorizes the account at its own boundary.
+        check_launch_account(&replacement.launch)?;
         // The actor checks this generation after every previously admitted
         // command. A UI snapshot alone cannot prove a timed-out turn is idle.
         crate::account::handoff::preflight(&source, &replacement).map_err(unavailable)?;
@@ -2206,6 +2328,9 @@ fn recover_account(
                 "The original conversation still owns work; reconnect or close it before changing accounts",
             ));
         }
+    }
+    if !automatic {
+        check_launch_account(&replacement.launch)?;
     }
     let id = replacement.id;
     // The checks above prove the candidate replaces the source, so it joins the
@@ -2251,7 +2376,7 @@ fn recover_account(
         .ok_or_else(|| unavailable("The account recovery candidate disappeared"))?
         .handle
         .clone();
-    let confirmation = confirm_account_conversation(
+    let confirmation = confirm_saved_conversation(
         &handle,
         source.launch.session_id.as_deref().unwrap(),
         Instant::now() + Duration::from_secs(15),
@@ -2287,7 +2412,7 @@ fn recover_account(
     response
 }
 
-fn confirm_account_conversation(
+fn confirm_saved_conversation(
     handle: &Handle,
     expected: &str,
     deadline: Instant,
@@ -2296,7 +2421,7 @@ fn confirm_account_conversation(
     loop {
         if cancelled() {
             return Err(
-                "Account recovery was cancelled; the saved conversation is unchanged".into(),
+                "Opening the saved conversation was cancelled; it remains unchanged".into(),
             );
         }
         if let Some(failure) = handle.failure() {
@@ -2366,6 +2491,14 @@ fn process_inner(
                 .clone();
             if !source.has_valid_native_continuity() || source.launch.session_id.is_none() {
                 return Err(error("Saved conversation has invalid continuity evidence"));
+            }
+            if let Some(session) =
+                retained_actor::prepare_failed_start(host, &source).map_err(unavailable)?
+            {
+                return Ok(ServerResponse::ChatResumePrepared { session });
+            }
+            if let Some(session) = capacity::prepare_saved_history(host, &source)? {
+                return Ok(ServerResponse::ChatResumePrepared { session });
             }
             // Classify retained Claude execution before generic discovery:
             // an exited helper may still await its original parent's wait.
@@ -2480,7 +2613,19 @@ fn process_inner(
             let mut sessions = state
                 .chats
                 .values()
-                .filter(|record| record.handle.owns_work() || record.returning_terminal)
+                .filter(|record| {
+                    record.handle.owns_work()
+                        || record.returning_terminal
+                        || state
+                            .native_actor_startups
+                            .get(&record.session.id)
+                            .is_some_and(|pending| {
+                                pending
+                                    .failed_close
+                                    .as_ref()
+                                    .is_some_and(|target| target.matches(record))
+                            })
+                })
                 .map(|record| {
                     let mut session = record.session.clone();
                     session.launch.session_id = record.handle.session_id();
@@ -2525,6 +2670,17 @@ fn process_inner(
         ClientRequest::ChatAttach { session } => {
             if let Some(response) = upgrade_resolution::attach(host, client, &session)? {
                 return Ok(response);
+            }
+            let cleanup = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                validate_proof(session.proof.as_ref(), state.proof())?;
+                state
+                    .chats
+                    .get(&session.id)
+                    .is_some_and(|record| record.handle.is_close_only())
+            };
+            if cleanup {
+                retained_actor::recover_cleanup_attachment(host, &session).map_err(unavailable)?;
             }
             let missing = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -3001,6 +3157,7 @@ impl TerminalViewReservation<'_> {
 /// A close capability captures one hosted attachment, not just its reusable ID.
 /// Execution callers authenticate their model origin before obtaining it; UI
 /// callers must pass the ordinary subscriber admission above.
+#[derive(Clone)]
 pub(super) struct CloseTarget {
     source: Session,
     handle: Handle,
@@ -3222,7 +3379,9 @@ pub(super) fn resolve_upgrade(
             state.native_adoption_failures.get(source).unwrap_or(
                 "The exact upgraded provider is unavailable. Its recovery evidence was retained; reopen this conversation from the provider's saved sessions."
             )))?;
-        if !record.handle.owns_work() {
+        if !record.handle.owns_work()
+            && !(source.is_saved_claude_history() && record.handle.is_read_only_history())
+        {
             return Err(unavailable(
                 "Restored native provider has closed; no writer was restarted",
             ));
@@ -5775,11 +5934,11 @@ done
         .unwrap();
         assert_eq!(handle.session_id().as_deref(), Some("saved-conversation"));
         assert!(
-            confirm_account_conversation(&handle, "saved-conversation", Instant::now(), || false)
+            confirm_saved_conversation(&handle, "saved-conversation", Instant::now(), || false)
                 .is_err()
         );
         handle.command(Command::Interrupt).unwrap();
-        confirm_account_conversation(
+        confirm_saved_conversation(
             &handle,
             "saved-conversation",
             Instant::now() + Duration::from_secs(5),
@@ -5787,11 +5946,11 @@ done
         )
         .unwrap();
         assert!(
-            confirm_account_conversation(&handle, "another-conversation", Instant::now(), || false)
+            confirm_saved_conversation(&handle, "another-conversation", Instant::now(), || false)
                 .is_err()
         );
         assert!(
-            confirm_account_conversation(&handle, "saved-conversation", Instant::now(), || true)
+            confirm_saved_conversation(&handle, "saved-conversation", Instant::now(), || true)
                 .is_err()
         );
         handle.close().unwrap();
