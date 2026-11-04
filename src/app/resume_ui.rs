@@ -776,6 +776,9 @@ impl Cagents {
             self.resume_error("This conversation is open outside this window. Return to its original window before resuming.");
             return Task::none();
         }
+        if let Some(task) = self.defer_retiring_conversation(&entry, false) {
+            return task;
+        }
         let session = &entry.session;
         if session.native_continuity.retains_provider() {
             let generation = self.resume_ui.generation;
@@ -803,6 +806,9 @@ impl Cagents {
         entry: SavedConversation,
         prepared: bool,
     ) -> Task<Message> {
+        if let Some(task) = self.defer_retiring_conversation(&entry, prepared) {
+            return task;
+        }
         let mut session = entry.session;
         if !session.launch.recipe.working_directory.is_dir()
             && !session.launch.needs_read_only_history()
@@ -842,6 +848,63 @@ impl Cagents {
         }
         let discard = replace.map_or_else(Task::none, |card| self.close_card_unasked(card));
         Task::batch([scope, insert, discard])
+    }
+
+    fn defer_retiring_conversation(
+        &mut self,
+        entry: &SavedConversation,
+        prepared: bool,
+    ) -> Option<Task<Message>> {
+        let home @ channel_ui::ClosedCardHome::Pending(_) = self.closed_card_home(entry.card)?
+        else {
+            return None;
+        };
+        let task = self.defer_channel_reopen(
+            home,
+            channel_ui::Reopen::Conversation {
+                entry: entry.clone(),
+                prepared,
+                generation: self.resume_ui.generation,
+                replace: self.resume_ui.replace,
+            },
+        )?;
+        self.resume_ui.loading = true;
+        Some(task)
+    }
+
+    pub(super) fn finish_deferred_conversation(
+        &mut self,
+        entry: SavedConversation,
+        prepared: bool,
+        generation: u64,
+        replace: Option<CardId>,
+        same_home: bool,
+    ) -> Task<Message> {
+        if generation != self.resume_ui.generation {
+            return Task::none();
+        }
+        self.resume_ui.loading = false;
+        if !same_home {
+            self.resume_error(
+                "The channel changed while reopening. Select the conversation again.",
+            );
+            return Task::none();
+        }
+        self.resume_ui.replace = replace;
+        if prepared && self.existing_conversation_card(&entry.session).is_none() {
+            self.insert_resumed_conversation(entry, true)
+        } else {
+            self.resume_saved_conversation(entry)
+        }
+    }
+
+    pub(super) fn fail_deferred_conversation(&mut self, generation: u64, error: &str) -> bool {
+        if generation == self.resume_ui.generation {
+            self.resume_ui.loading = false;
+            self.resume_error(error);
+            return true;
+        }
+        false
     }
 
     /// Enters the place a resumed conversation belongs: the channel it was

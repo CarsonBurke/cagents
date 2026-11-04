@@ -431,60 +431,360 @@ fn reopening_before_retirement_keeps_the_channel() {
     assert_eq!(named.as_deref(), Some(TITLE));
 }
 
-/// Once the registry has been asked to retire the channel, a pane published
-/// into it would arrive after the retirement, so reopening brings the channel
-/// back rather than racing it.
+/// An in-flight close is resolved before reopening publishes a pane. A
+/// successful retirement recreates only after the old identity is gone.
 #[test]
-fn reopening_while_retirement_is_in_flight_revives_the_channel() {
+fn reopening_while_retirement_is_in_flight_waits_then_revives_the_channel() {
     let mut fixture = fixture();
     fixture.close_card();
-    let _published = fixture.send_retirement();
-    assert!(
-        fixture
-            .app
-            .durable
-            .channels
-            .iter()
-            .any(|channel| channel.id == fixture.channel)
-    );
+    let published = fixture.send_retirement();
+    let cards = fixture.app.durable.cards.len();
 
     fixture.reopen_pane();
+    fixture.reopen_pane();
+
+    assert_eq!(fixture.app.durable.channels.len(), 1);
+    assert_eq!(fixture.app.durable.cards.len(), cards);
+    assert_eq!(fixture.app.recently_closed.len(), 1);
+    assert_eq!(
+        fixture.app.channel_ui.reopening[&fixture.channel]
+            .intents
+            .len(),
+        1
+    );
+    assert!(
+        published.try_recv().is_err(),
+        "no pane or replacement channel is published yet"
+    );
+
+    fixture.answer_retirement(true);
 
     let revived = fixture.active_channel().clone();
     assert_ne!(revived.id, fixture.channel);
+    assert_eq!(fixture.app.durable.channels.len(), 1);
     assert_eq!(revived.cards, vec![fixture.resumed().id]);
-
-    // The registry's answer then retires only the old, empty channel.
-    let channel = fixture.channel;
-    fixture
-        .app
-        .workspace_model
-        .views
-        .retain(|view| view.scope != Scope::Channel(channel));
-    drop(fixture.app.retire_peer_channel(channel));
-    assert_eq!(fixture.app.durable.active_channel, Some(revived.id));
-    assert_eq!(fixture.active_channel().cards, revived.cards);
+    assert!(fixture.app.recently_closed.is_empty());
 }
 
-/// A registry that keeps the channel (it holds work, say) changes nothing in
-/// its view, so once the answer is overdue the channel is entered as it is.
+/// Work/history can keep an empty channel. Reopening before that answer must
+/// preserve its exact home, so its existing Work relations stay connected.
 #[test]
-fn a_refused_retirement_reopens_into_the_surviving_channel() {
+fn a_refused_in_flight_retirement_reopens_into_the_original_home() {
+    let mut fixture = fixture();
+    fixture.close_card();
+    let published = fixture.send_retirement();
+
+    fixture.reopen_pane();
+    assert!(published.try_recv().is_err());
+    fixture.answer_retirement(false);
+
+    assert_eq!(fixture.app.durable.channels.len(), 1);
+    assert_eq!(fixture.app.durable.active_channel, Some(fixture.channel));
+    assert_eq!(fixture.app.channel_home().unwrap().0, fixture.home);
+    assert_eq!(fixture.active_channel().cards, vec![fixture.resumed().id]);
+    assert!(fixture.app.channel_ui.revived.is_empty());
+    assert!(
+        !std::iter::from_fn(|| published.try_recv().ok()).any(|edit| matches!(
+            edit,
+            ModelEdit::CreateChannel { .. } | ModelEdit::DeleteChannel { .. }
+        ))
+    );
+}
+
+#[test]
+fn a_resume_picker_selection_waits_for_either_retirement_answer() {
+    for retired in [false, true] {
+        let mut fixture = fixture();
+        let saved = fixture.saved();
+        fixture.close_card();
+        let _published = fixture.send_retirement();
+        fixture.app.resume_ui.open = true;
+
+        drop(fixture.app.resume_saved_conversation(saved));
+        assert!(fixture.app.resume_ui.loading);
+        assert!(fixture.app.resume_ui.open);
+        assert_eq!(fixture.app.recently_closed.len(), 1);
+        fixture.answer_retirement(retired);
+
+        assert!(!fixture.app.resume_ui.loading);
+        assert!(!fixture.app.resume_ui.open);
+        assert_eq!(fixture.app.durable.channels.len(), 1);
+        assert_eq!(fixture.active_channel().id == fixture.channel, !retired);
+        assert_eq!(fixture.active_channel().cards, vec![fixture.resumed().id]);
+    }
+}
+
+#[test]
+fn a_non_chat_reopen_waits_for_either_retirement_answer() {
+    for retired in [false, true] {
+        let mut fixture = fixture();
+        let kind = CardKind::Repository(crate::model::RepositoryView {
+            project: fixture.project,
+            repository: fixture.directory.path().into(),
+            worktree: fixture.directory.path().into(),
+            selected_file: None,
+        });
+        fixture.app.card_state_mut(fixture.card).unwrap().kind = kind.clone();
+        fixture.app.workspace_model.views[0].panes[0].kind = kind;
+        fixture.close_card();
+        let published = fixture.send_retirement();
+        let cards = fixture.app.durable.cards.len();
+
+        fixture.reopen_pane();
+        assert_eq!(fixture.app.durable.cards.len(), cards);
+        assert_eq!(fixture.app.recently_closed.len(), 1);
+        assert!(published.try_recv().is_err());
+        fixture.answer_retirement(retired);
+
+        let channel = fixture.active_channel();
+        assert_eq!(channel.id == fixture.channel, !retired);
+        assert_eq!(fixture.app.durable.channels.len(), 1);
+        assert_eq!(channel.cards.len(), 1);
+        assert_ne!(channel.cards[0], fixture.card);
+        assert!(matches!(
+            fixture.app.card_state(channel.cards[0]).unwrap().kind,
+            CardKind::Repository(_)
+        ));
+        assert!(fixture.app.recently_closed.is_empty());
+    }
+}
+
+#[test]
+fn a_definitively_failed_retirement_keeps_reopen_available_for_retry() {
     let mut fixture = fixture();
     fixture.close_card();
     let _published = fixture.send_retirement();
-    let sent = fixture
-        .app
-        .channel_work
-        .retiring
-        .get_mut(&fixture.channel)
-        .unwrap();
-    sent.1 = std::time::Instant::now() - super::super::channel_work::RETIREMENT_ANSWERED;
+    fixture.reopen_pane();
+    drop(fixture.app.apply_workspace_model_update(
+        super::super::workspace_model_sync::ModelUpdate::RetirementFailed {
+            channel: fixture.channel,
+            error: "The channel changed".into(),
+        },
+    ));
+
+    assert!(!fixture.app.resume_ui.loading);
+    assert_eq!(fixture.app.recently_closed.len(), 1);
+    assert_eq!(fixture.app.durable.channels.len(), 1);
+    fixture.reopen_pane();
+    assert_eq!(fixture.app.channel_home().unwrap().0, fixture.home);
+    assert_eq!(fixture.active_channel().cards, vec![fixture.resumed().id]);
+}
+
+#[test]
+fn cancelling_the_picker_abandons_a_deferred_resume() {
+    let mut fixture = fixture();
+    let saved = fixture.saved();
+    fixture.close_card();
+    let _published = fixture.send_retirement();
+    fixture.app.resume_ui.open = true;
+    drop(fixture.app.resume_saved_conversation(saved));
+    let cards = fixture.app.durable.cards.len();
+    drop(
+        fixture
+            .app
+            .update_resume(super::super::resume_ui::Action::Close),
+    );
+
+    fixture.answer_retirement(false);
+
+    assert_eq!(fixture.app.durable.cards.len(), cards);
+    assert_eq!(fixture.app.recently_closed.len(), 1);
+    assert!(!fixture.app.resume_ui.loading);
+}
+
+#[test]
+fn selecting_the_same_conversation_after_cancelling_replaces_the_pending_intent() {
+    for retired in [false, true] {
+        let mut fixture = fixture();
+        let saved = fixture.saved();
+        fixture.close_card();
+        let _published = fixture.send_retirement();
+        fixture.app.resume_ui.open = true;
+        drop(fixture.app.resume_saved_conversation(saved.clone()));
+        drop(
+            fixture
+                .app
+                .update_resume(super::super::resume_ui::Action::Close),
+        );
+        fixture.app.resume_ui.open = true;
+        drop(fixture.app.resume_saved_conversation(saved));
+        assert!(fixture.app.resume_ui.loading);
+
+        fixture.answer_retirement(retired);
+
+        assert!(!fixture.app.resume_ui.loading);
+        assert!(!fixture.app.resume_ui.open);
+        assert_eq!(fixture.app.durable.channels.len(), 1);
+        assert_eq!(fixture.active_channel().cards, vec![fixture.resumed().id]);
+    }
+}
+
+/// Time alone does not prove a queued retirement was cancelled. Timeout gives
+/// control back without losing the selection or racing a late successful close.
+#[test]
+fn an_unanswered_retirement_fails_reopen_without_guessing_its_outcome() {
+    let mut fixture = fixture();
+    fixture.close_card();
+    let _published = fixture.send_retirement();
+    fixture.reopen_pane();
+    let sent = fixture.app.channel_ui.reopening[&fixture.channel].sent;
+    let cards = fixture.app.durable.cards.len();
+
+    fixture.app.resume_ui.open = true;
+    drop(
+        fixture
+            .app
+            .update(Message::ChannelUi(Action::ReopenTimedOut(
+                fixture.channel,
+                sent,
+            ))),
+    );
+    assert!(!fixture.app.resume_ui.loading);
+    assert_eq!(fixture.app.recently_closed.len(), 1);
+    assert!(fixture.app.channel_ui.reopening.is_empty());
+    assert!(
+        fixture
+            .app
+            .channel_work
+            .retiring
+            .contains_key(&fixture.channel)
+    );
+    assert!(
+        fixture
+            .app
+            .resume_ui
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("try reopening again")
+    );
+
+    fixture.answer_retirement(true);
+    assert_eq!(fixture.app.durable.cards.len(), cards);
+    assert!(fixture.app.durable.channels.is_empty());
+    fixture.reopen_pane();
+    assert_ne!(fixture.active_channel().id, fixture.channel);
+    assert_eq!(fixture.active_channel().cards, vec![fixture.resumed().id]);
+}
+
+#[test]
+fn an_explicit_peer_deletion_during_retirement_is_final() {
+    for picker in [false, true] {
+        let mut fixture = fixture();
+        let saved = fixture.saved();
+        fixture.close_card();
+        let _published = fixture.send_retirement();
+        if picker {
+            drop(fixture.app.resume_saved_conversation(saved));
+        }
+        let sequence = fixture.app.workspace_model.sequence + 1;
+        drop(fixture.app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Edited {
+                sequence,
+                edit: ModelEdit::DeleteChannel {
+                    id: fixture.channel,
+                },
+            },
+        ));
+        let cards = fixture.app.durable.cards.len();
+        fixture.reopen_pane();
+        assert!(fixture.app.durable.channels.is_empty());
+        assert!(fixture.app.channel_ui.emptied.is_empty());
+        if picker {
+            assert_eq!(fixture.resumed().title, TITLE);
+            assert_eq!(fixture.app.durable.active_channel, None);
+            assert_eq!(
+                fixture.app.active_workspace.as_deref(),
+                Some(fixture.directory.path())
+            );
+        } else {
+            assert_eq!(fixture.app.durable.cards.len(), cards);
+        }
+        // A late answer cannot restore privilege revoked by the deletion.
+        fixture.answer_retirement(true);
+        assert!(fixture.app.durable.channels.is_empty());
+    }
+}
+
+#[test]
+fn an_explicit_peer_deletion_overtaken_by_its_snapshot_stays_final() {
+    let mut fixture = fixture();
+    let saved = fixture.saved();
+    fixture.close_card();
+    let _published = fixture.send_retirement();
+    let sequence = fixture.app.workspace_model.sequence + 1;
+    let mut model = fixture.app.workspace_model.clone();
+    model.channels.clear();
+    model.views.clear();
+    model.sequence = sequence + 1;
+    drop(fixture.app.apply_workspace_model_update(
+        super::super::workspace_model_sync::ModelUpdate::Read(model),
+    ));
+    drop(fixture.app.apply_workspace_model_update(
+        super::super::workspace_model_sync::ModelUpdate::Edited {
+            sequence,
+            edit: ModelEdit::DeleteChannel {
+                id: fixture.channel,
+            },
+        },
+    ));
 
     fixture.reopen_pane();
+    assert!(fixture.app.durable.channels.is_empty());
+    drop(fixture.app.resume_saved_conversation(saved));
+    assert!(fixture.app.durable.channels.is_empty());
+    assert_eq!(fixture.app.durable.active_channel, None);
+    assert_eq!(fixture.resumed().title, TITLE);
+}
 
-    assert_eq!(fixture.app.durable.active_channel, Some(fixture.channel));
+#[test]
+fn an_explicit_peer_deletion_severs_a_revival_created_before_its_edge() {
+    let mut fixture = fixture();
+    let saved = fixture.saved();
+    let mut another = saved.clone();
+    another.card = CardId::new();
+    another.session.launch.session_id = Some("5aec1039-41d2-4f85-88e8-8240e123811a".into());
+    fixture.close_card();
+    let mut other_card = fixture.app.card_state(fixture.card).unwrap().clone();
+    other_card.id = another.card;
+    other_card.kind = CardKind::Chat(another.session.clone());
+    fixture.app.recently_closed.push((
+        other_card,
+        Some(WorkspaceDestination::Channel(fixture.channel)),
+    ));
+    let _published = fixture.send_retirement();
+    let sequence = fixture.app.workspace_model.sequence + 1;
+    let mut model = fixture.app.workspace_model.clone();
+    model.channels.clear();
+    model.views.clear();
+    model.sequence = sequence + 1;
+    drop(fixture.app.apply_workspace_model_update(
+        super::super::workspace_model_sync::ModelUpdate::Read(model),
+    ));
+    drop(fixture.app.resume_saved_conversation(saved));
+    let revived = fixture.active_channel().clone();
+    assert_ne!(revived.id, fixture.channel);
+
+    drop(fixture.app.apply_workspace_model_update(
+        super::super::workspace_model_sync::ModelUpdate::Edited {
+            sequence,
+            edit: ModelEdit::DeleteChannel {
+                id: fixture.channel,
+            },
+        },
+    ));
+    drop(fixture.app.resume_saved_conversation(another));
+
     assert_eq!(fixture.app.durable.channels.len(), 1);
+    assert_eq!(fixture.app.durable.channels[0].cards, revived.cards);
+    assert_eq!(fixture.app.durable.active_channel, None);
+    assert!(
+        !fixture
+            .app
+            .channel_ui
+            .revived
+            .contains_key(&fixture.channel)
+    );
 }
 
 /// After a restart forgets which scope a card closed from, the registry's

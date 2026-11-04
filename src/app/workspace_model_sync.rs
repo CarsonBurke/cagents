@@ -63,6 +63,12 @@ pub enum ModelUpdate {
         channel: ChannelId,
         model: WorkspaceModel,
     },
+    /// A definitive refusal of the edit itself, rather than an unknown
+    /// transport outcome that the publisher will retry.
+    RetirementFailed {
+        channel: ChannelId,
+        error: String,
+    },
     /// Optional naming yielded after temporary admission pressure. The next
     /// real wake may retry this exact current candidate; this is not a timer.
     TitleDeferred(ModelEdit),
@@ -250,6 +256,12 @@ fn publish(
                         let _ = updates.send_blocking(ModelUpdate::ViewRefused {
                             scope: scope.clone(),
                             operation: *operation,
+                            error: error.to_string(),
+                        });
+                    }
+                    if let ModelEdit::RetireEmptyChannel { home, .. } = &request {
+                        let _ = updates.send_blocking(ModelUpdate::RetirementFailed {
+                            channel: home.channel,
                             error: error.to_string(),
                         });
                     }
@@ -556,7 +568,10 @@ impl Cagents {
                 task = Task::batch([task, self.retire_peer_channel(channel)]);
             }
             self.channel_work.retiring.remove(&channel);
-            return (task, applied || retired);
+            return (
+                Task::batch([task, self.finish_channel_reopen(channel)]),
+                applied || retired,
+            );
         }
         if let ModelUpdate::Read(model) = &update
             && model.identity == self.workspace_model.identity
@@ -569,6 +584,14 @@ impl Cagents {
 
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::RetirementFailed { channel, error } => {
+                self.channel_work.retiring.remove(&channel);
+                self.fail_channel_reopen(
+                    channel,
+                    &format!("Could not reopen the channel: {error}. Try reopening again."),
+                );
+                Task::none()
+            }
             ModelUpdate::TitleDeferred(edit) => {
                 self.defer_channel_title_suggestion(&edit);
                 Task::none()
@@ -697,6 +720,17 @@ impl Cagents {
                 }
 
                 if sequence <= self.workspace_model.sequence {
+                    if let ModelEdit::DeleteChannel { id } = edit {
+                        // A snapshot can overtake this explicit instruction.
+                        // It must still revoke automatic revival, even when
+                        // absence already removed the local channel.
+                        self.forget_channel_revival(id);
+                        self.workspace_model
+                            .channels
+                            .retain(|channel| channel.id != id);
+                        let retired = self.retire_peer_channel(id);
+                        return Task::batch([retired, self.finish_channel_reopen(id)]);
+                    }
                     return Task::none();
                 }
                 // An explicit delete is an instruction rather than an absence,
@@ -725,6 +759,9 @@ impl Cagents {
                     self.close_shared_project(&repository)
                 });
                 let retired = deleted.map_or_else(Task::none, |id| {
+                    // An explicit deletion is final even if an automatic
+                    // retirement of this identity was already in flight.
+                    self.forget_channel_revival(id);
                     // The registry has authoritatively removed this identity,
                     // even if its creation acknowledgment never reached us.
                     // A failed session close must not make it publishable again.
@@ -735,7 +772,8 @@ impl Cagents {
                     {
                         channel.shared = true;
                     }
-                    self.retire_peer_channel(id)
+                    let retired = self.retire_peer_channel(id);
+                    Task::batch([retired, self.finish_channel_reopen(id)])
                 });
                 Task::batch([removed, retired, self.reconcile_workspace_model()])
             }

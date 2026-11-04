@@ -6,8 +6,7 @@ use crate::{
     model::WorktreeId,
 };
 
-/// Longer than the registry takes to answer a retirement, after which a
-/// channel still present was kept.
+/// Bound a deferred reopen's wait without assuming the retirement was refused.
 pub(super) const RETIREMENT_ANSWERED: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -762,9 +761,6 @@ impl Cagents {
     /// View publication supplies the settled revision. The daemon checks that
     /// exact revision and durable work/history together before retiring a home.
     pub(super) fn retire_settled_empty_channels(&mut self) {
-        self.channel_work
-            .retiring
-            .retain(|_, (_, sent)| sent.elapsed() < RETIREMENT_ANSWERED);
         let candidates = self
             .channel_work
             .retire_candidates
