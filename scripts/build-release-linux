@@ -154,13 +154,24 @@ fi
 # Mount destinations must exist before making the base rootfs read-only.
 mkdir -p "$CACHE/rootfs"/{source,dist,cargo,target}
 
-for directory in cargo target; do
+for directory in cargo target source source.git; do
     [[ ! -L $CACHE/$directory ]] || fail "cache $directory must not be a symlink"
     mkdir -p -- "$CACHE/$directory"
 done
-mkdir "$WORK/source" "$WORK/dist"
-# Fresh source mtimes prevent Cargo reusing newer binaries for an older ref.
-git -C "$ROOT_DIR" archive --format=tar "$SOURCE_COMMIT" | tar -xmf - -C "$WORK/source" --no-same-owner
+mkdir "$WORK/dist"
+# Keep one checkout of the source in the cache. Git rewrites only the files that
+# differ from the previous build, and Cargo sees those files as newer than its
+# artifacts, so it rebuilds exactly what changed, for an older ref too.
+# Unchanged path crates stay fresh. The repository stays outside the tree, so
+# /source has no .git, just as an archive export had none.
+source_git() {
+    git -c core.hooksPath=/dev/null -c core.autocrlf=false \
+        --git-dir="$CACHE/source.git" --work-tree="$CACHE/source" "$@"
+}
+[[ -f $CACHE/source.git/HEAD ]] || git init -q --bare "$CACHE/source.git"
+source_git fetch -q --no-tags --depth=1 "$ROOT_DIR" "$SOURCE_COMMIT"
+source_git checkout -q -f --detach "$SOURCE_COMMIT"
+source_git clean -q -ffdx
 # User lookup must work without importing the host's account database.
 printf 'root:x:0:0:root:/root:/bin/bash\nbuilder:x:%s:%s:Release builder:/home/builder:/bin/bash\n' \
     "$CALLER_UID" "$CALLER_GID" > "$WORK/passwd"
@@ -172,7 +183,7 @@ bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
     --tmpfs /home --dir /home/builder \
     --ro-bind "$WORK/resolv.conf" /etc/resolv.conf \
     --ro-bind "$WORK/passwd" /etc/passwd --ro-bind "$WORK/group" /etc/group \
-    --bind "$WORK/source" /source --bind "$WORK/dist" /dist \
+    --bind "$CACHE/source" /source --bind "$WORK/dist" /dist \
     --bind "$CACHE/cargo" /cargo --bind "$CACHE/target" /target \
     --ro-bind "$WORK/release-build" /release-build \
     --setenv PATH /opt/rust/bin:/opt/zig:/opt/git/bin:/usr/sbin:/usr/bin:/sbin:/bin \
