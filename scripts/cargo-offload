@@ -454,19 +454,6 @@ def real_cargo(environment):
     return environment.get("CAGENTS_BUILD_CARGO") or "cargo"
 
 
-def open_files(environment):
-    """The soft open-file limit the build gets: the caller's, as the gate
-    measured it, or this process's when run without the gate. -1 is
-    unlimited, which the build host reads as its hard limit."""
-    given = environment.get("CAGENTS_BUILD_OPEN_FILES", "").strip()
-    if given == "unlimited":
-        return -1
-    if given.isdigit():
-        return int(given)
-    soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-    return -1 if soft == resource.RLIM_INFINITY else soft
-
-
 # Runs on the build host as `python3 -c REMOTE_AGENT COMMAND ...`. Every
 # command ends with what it started when its standard input closes: the
 # connection to this host dropped or the gate here was cancelled.
@@ -856,21 +843,15 @@ elif command == "run":
     directory, arguments = sys.argv[3], sys.argv[4:]
     request = json.loads(sys.stdin.buffer.readline())
     environment = request["environment"]
-    # The command opens as many files as it could where it was asked for: a
-    # host whose sessions keep the conventional 1024 would otherwise fail a
-    # suite that passes there, and one with more would hide a leak.
-    wanted = request.get("open_files")
-    if wanted is not None:
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if wanted < 0:
-            wanted = hard
-        elif hard != resource.RLIM_INFINITY:
-            wanted = min(wanted, hard)
-        if wanted != soft:
-            try:
-                resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
-            except (OSError, ValueError):
-                pass  # Beyond what the kernel allows; the host's own limit stands.
+    # The command may open as many files as the host allows. An ssh
+    # session's soft limit is the conventional 1024, which fails
+    # descriptor-heavy suites, and nothing gains from a low one.
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft != hard:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        except (OSError, ValueError):
+            pass  # Beyond what the kernel allows; the session's own limit stands.
     if not request.get("core_dumps"):
         # A crashing test or compiler leaves no core: the host's
         # systemd-coredump stores and compresses every one it is given, which
@@ -969,9 +950,32 @@ BOOTSTRAP = ("'import base64, json, sys; code, sys.argv[1:] = "
              "json.loads(base64.b64decode(sys.argv[1])); exec(compile(code, \"cargo-offload\", \"exec\"))'")
 
 
+# ssh binds a build's connection at ControlPath plus a 17-byte suffix while
+# it creates it, and a socket's path holds at most 107 bytes.
+CONTROL_PATH_LIMIT = 107 - len("/m") - 17
+
+
+def owner_alive(name):
+    """Whether the build that made the connection directory `name`, which
+    carries its process ID, is still running. A name without one is from an
+    older gate: then it is judged by age."""
+    pid = name[len("cof-ssh-"):].split("-", 1)[0]
+    if not pid.isdigit() or "-" not in name[len("cof-ssh-"):]:
+        return None
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass  # Someone else's process: running.
+    return True
+
+
 def sweep_connections(directory, age=120):
     """Removes the connection directories of builds that were killed before
-    they could: older than `age` seconds, with no connection listening."""
+    they could, with no connection listening there. A build still waiting
+    for the host has never connected, so its directory goes only once that
+    build has ended."""
     try:
         names = [name for name in os.listdir(directory) if name.startswith("cof-ssh-")]
     except OSError:
@@ -982,13 +986,15 @@ def sweep_connections(directory, age=120):
             status = os.lstat(path)
         except OSError:
             continue
-        if (not os.path.isdir(path) or os.path.islink(path) or status.st_uid != os.getuid()
-                or time.time() - status.st_mtime < age):
+        if not os.path.isdir(path) or os.path.islink(path) or status.st_uid != os.getuid():
+            continue
+        alive = owner_alive(name)
+        if alive or (alive is None and time.time() - status.st_mtime < age):
             continue
         probe = socket.socket(socket.AF_UNIX)
         try:
             probe.connect(os.path.join(path, "m"))
-            continue  # A build's connection is still open.
+            continue  # A connection is still open; it ends when it persists no longer.
         except OSError:
             pass
         finally:
@@ -1117,17 +1123,22 @@ class Offload:
         each: every session costs a login there, which its sshd audits. The
         session is this build's alone, so cancelling it, which ends what it
         started, cuts no other build's."""
-        runtime = self.environment.get("XDG_RUNTIME_DIR") or ""
-        if not os.path.isdir(runtime):
-            runtime = None
-        sweep_connections(runtime or tempfile.gettempdir())
-        try:
-            self.control = tempfile.mkdtemp(prefix="cof-ssh-", dir=runtime)
-        except OSError:
-            return
-        # The socket's path is short: sockets are limited to 108 bytes, and
-        # ssh adds a suffix while it creates one.
-        self.ssh += ["-o", "ControlMaster=auto", "-o", f"ControlPath={self.control}/m",
+        candidates = [self.environment.get("XDG_RUNTIME_DIR") or "", tempfile.gettempdir(), "/tmp"]
+        for directory in dict.fromkeys(candidates):
+            if not os.path.isdir(directory):
+                continue
+            sweep_connections(directory)
+            try:
+                control = tempfile.mkdtemp(prefix=f"cof-ssh-{os.getpid()}-", dir=directory)
+            except OSError:
+                continue
+            if len(control) <= CONTROL_PATH_LIMIT:
+                break
+            os.rmdir(control)
+        else:
+            return  # No directory has a short enough path: each step connects on its own.
+        self.control = control
+        self.ssh += ["-o", "ControlMaster=auto", "-o", f"ControlPath={control}/m",
                      "-o", "ControlPersist=60"]
 
     def close_connection(self):
@@ -1364,7 +1375,6 @@ class Offload:
         )
         try:
             request = {"environment": environment,
-                       "open_files": open_files(self.environment),
                        "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1"}
             if plan.captures:
                 request["directories"] = [arg for value in configs for arg in ("--config", value)]
@@ -1564,9 +1574,17 @@ class Offload:
         sys.stdout.flush()
         sys.stderr.flush()
         # The program replaces this process, and with it the cleanup at the
-        # end of the build.
+        # end of the build. Closing the lease frees the slot; what this
+        # started ends and is reaped first, rather than becoming the
+        # program's children, which it would never wait for.
         self.lease.stdin.close()
         self.close_connection()
+        for child in self.children:
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
         try:
             os.execve(executable, [executable, *self.plan.program], environment)
         except OSError as error:
@@ -1659,9 +1677,14 @@ def say(message):
 
 
 def main(arguments):
+    # The gate passes on where it found builds go, so this cannot decide
+    # otherwise, such as when a slow name lookup ends differently, and exit
+    # FALL_BACK having built nothing. Nothing this starts inherits it.
+    decided = os.environ.pop("CAGENTS_BUILD_OFFLOAD_HOST", "")
     environment = dict(os.environ)
-    host = environment.get("CAGENTS_BUILD_REMOTE", "fw16")
-    here = host in ("", "local") or is_this_host(host)
+    # Only `local` builds here; an empty setting is no setting.
+    host = decided or environment.get("CAGENTS_BUILD_REMOTE") or "fw16"
+    here = not decided and (host == "local" or is_this_host(host))
     if arguments[:1] == ["--host"]:
         # Where builds go: 0, printing the build host, or FALL_BACK when
         # this host builds. Any other status is a failure.

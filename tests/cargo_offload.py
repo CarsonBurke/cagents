@@ -214,35 +214,69 @@ class Resident(unittest.TestCase):
         self.assertEqual(held[999999999], 0)
 
 
+# Sockets bind under these tests' directories, whose paths must stay short
+# however long TMPDIR is.
+SOCKET_ROOT = "/tmp"
+
+
 class SharedConnection(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cof-", dir=SOCKET_ROOT)
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.log = self.root / "ssh.log"
+        tools = self.root / "tools"
+        tools.mkdir()
+        (tools / "ssh").write_text(f'#!/bin/sh\necho "$@" >> {self.log}\n')
+        (tools / "ssh").chmod(0o755)
+        self.runtime = self.root / "runtime"
+        self.runtime.mkdir(mode=0o700)
+        self.environment = {"XDG_RUNTIME_DIR": str(self.runtime),
+                            "PATH": f"{tools}:{os.environ['PATH']}"}
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = self.environment["PATH"]
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+
+    def build(self, environment=None):
+        return offload.Offload("host", offload.parse(["check"]), environment or self.environment)
+
     def test_one_builds_steps_share_a_private_connection_that_ends_with_it(self):
-        with tempfile.TemporaryDirectory() as root:
-            log = Path(root, "ssh.log")
-            tools = Path(root, "tools")
-            tools.mkdir()
-            (tools / "ssh").write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
-            (tools / "ssh").chmod(0o755)
-            runtime = Path(root, "runtime")
-            runtime.mkdir(mode=0o700)
-            environment = {"XDG_RUNTIME_DIR": str(runtime), "PATH": f"{tools}:{os.environ['PATH']}"}
-            build = offload.Offload("host", offload.parse(["check"]), environment)
-            old_path = os.environ["PATH"]
-            os.environ["PATH"] = environment["PATH"]
-            self.addCleanup(os.environ.__setitem__, "PATH", old_path)
-            build.share_connection()
-            command = " ".join(build.remote("exists", "x"))
-            path = command.split("ControlPath=")[1].split()[0]
-            self.assertTrue(path.startswith(str(runtime) + "/"))
-            self.assertLess(len(path), 90)
-            self.assertIn("ControlMaster=auto", command)
-            other = offload.Offload("host", offload.parse(["check"]), environment)
-            other.share_connection()
-            self.assertNotEqual(other.control, build.control)
-            other.close_connection()
-            directory = build.control
-            build.close_connection()
-            self.assertFalse(os.path.exists(directory))
-            self.assertIn(f"ControlPath={path} -o ControlPersist=60 -O exit host", log.read_text())
+        build = self.build()
+        build.share_connection()
+        command = " ".join(build.remote("exists", "x"))
+        path = command.split("ControlPath=")[1].split()[0]
+        self.assertTrue(path.startswith(f"{self.runtime}/cof-ssh-{os.getpid()}-"))
+        self.assertLessEqual(len(path) + 17, 107)
+        self.assertIn("ControlMaster=auto", command)
+        other = self.build()
+        other.share_connection()
+        self.assertNotEqual(other.control, build.control)
+        other.close_connection()
+        directory = build.control
+        build.close_connection()
+        self.assertFalse(os.path.exists(directory))
+        self.assertIn(f"ControlPath={path} -o ControlPersist=60 -O exit host", self.log.read_text())
+
+    def test_a_runtime_directory_too_long_for_a_socket_is_passed_over(self):
+        deep = self.runtime / ("d" * 90)
+        deep.mkdir()
+        build = self.build(self.environment | {"XDG_RUNTIME_DIR": str(deep)})
+        build.share_connection()
+        self.addCleanup(build.close_connection)
+        self.assertIsNotNone(build.control)
+        self.assertFalse(build.control.startswith(str(deep)))
+        self.assertLessEqual(len(build.control), offload.CONTROL_PATH_LIMIT)
+        self.assertEqual(list(deep.iterdir()), [])
+
+    def test_without_a_short_enough_directory_each_step_connects_alone(self):
+        limit = offload.CONTROL_PATH_LIMIT
+        offload.CONTROL_PATH_LIMIT = 1
+        self.addCleanup(setattr, offload, "CONTROL_PATH_LIMIT", limit)
+        build = self.build()
+        build.share_connection()
+        self.assertIsNone(build.control)
+        self.assertNotIn("ControlPath", " ".join(build.remote("exists", "x")))
+        self.assertEqual(list(self.runtime.iterdir()), [])
 
 
 class EnclosingCheckout(unittest.TestCase):
@@ -344,22 +378,34 @@ class Settings(unittest.TestCase):
 
 
 class Sweep(unittest.TestCase):
-    def test_only_old_unused_connection_directories_are_removed(self):
-        with tempfile.TemporaryDirectory() as root:
-            old, fresh, live, other = (Path(root, f"cof-ssh-{name}") for name in ("old", "fresh", "live", "x"))
-            for path in (old, fresh, live):
+    def test_only_unused_directories_of_ended_builds_are_removed(self):
+        ended = subprocess.Popen(["true"])
+        ended.wait()
+        with tempfile.TemporaryDirectory(prefix="cof-", dir=SOCKET_ROOT) as root:
+            names = {
+                # An older gate's names, judged by age.
+                "old": "cof-ssh-old", "fresh": "cof-ssh-fresh",
+                # A build that ended, however recently, and one still
+                # waiting for the host, however long, which never connected.
+                "ended": f"cof-ssh-{ended.pid}-abc", "waiting": f"cof-ssh-{os.getpid()}-abc",
+                # A connection that outlives its ended build for a while.
+                "listening": f"cof-ssh-{ended.pid}-def",
+            }
+            paths = {key: Path(root, name) for key, name in names.items()}
+            for path in paths.values():
                 path.mkdir()
             Path(root, "unrelated").mkdir()
             listener = socket.socket(socket.AF_UNIX)
             self.addCleanup(listener.close)
-            listener.bind(str(live / "m"))
+            listener.bind(str(paths["listening"] / "m"))
             listener.listen()
             ancient = time.time() - 3600
-            for path in (old, live):
-                os.utime(path, (ancient, ancient))
+            for key in ("old", "waiting", "listening"):
+                os.utime(paths[key], (ancient, ancient))
             offload.sweep_connections(root)
             self.assertEqual(sorted(path.name for path in Path(root).iterdir()),
-                             ["cof-ssh-fresh", "cof-ssh-live", "unrelated"])
+                             sorted([names["fresh"], names["waiting"], names["listening"],
+                                     "unrelated"]))
 
 
 class ThisHost(unittest.TestCase):
@@ -369,6 +415,13 @@ class ThisHost(unittest.TestCase):
                               env=os.environ | {"CAGENTS_BUILD_REMOTE": "local"})
         self.assertEqual(here.returncode, offload.FALL_BACK)
         self.assertNotIn(here.returncode, (0, 1))
+
+    @unittest.skipIf(offload.is_this_host("fw16"), "this is the default build host")
+    def test_an_empty_build_host_setting_is_the_default_host(self):
+        script = str(ROOT / "scripts/cargo-offload")
+        default = subprocess.run([script, "--host"], capture_output=True, text=True,
+                                 env=os.environ | {"CAGENTS_BUILD_REMOTE": ""})
+        self.assertEqual((default.returncode, default.stdout), (0, "fw16\n"))
 
 
     def test_this_hosts_names_and_addresses_build_here(self):
@@ -586,6 +639,13 @@ class StandInHost(unittest.TestCase):
         result = self.gate_run("build", env=env)
         self.assertNotIn("Compiling", result.stderr)
 
+    def test_the_program_inherits_none_of_the_builds_processes(self):
+        (self.crate / "src/main.rs").write_text(
+            'fn main() { let id = std::process::id(); print!("[{}]", std::fs::read_to_string('
+            'format!("/proc/{id}/task/{id}/children")).unwrap().trim()); }\n')
+        result = self.gate_run("run", "--quiet", env=self.remote_env())
+        self.assertEqual((result.returncode, result.stdout), (0, "[]"), result.stderr)
+
     def test_a_programs_own_status_is_never_taken_for_building_here(self):
         # 75 is EX_TEMPFAIL, and also how cargo-offload says this host builds.
         (self.crate / "src/main.rs").write_text("fn main() { std::process::exit(75); }\n")
@@ -593,6 +653,24 @@ class StandInHost(unittest.TestCase):
         self.assertEqual(result.returncode, 75, result.stderr)
         self.assertFalse((self.root / "local-build").exists())
         self.assertEqual(list(Path(self.env["XDG_RUNTIME_DIR"]).glob("cof-ssh-*")), [])
+
+    def test_the_build_goes_where_the_gate_found_it_should(self):
+        # cargo-offload would decide afresh that this host builds, as a slow
+        # name lookup can, and exit 75 having built nothing.
+        tools = self.root / "tools"
+        (tools / "cargo-offload").rename(tools / "cargo-offload.real")
+        (tools / "cargo-offload").write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            [ "$1" != --host ] || {{ echo stand-in; exit 0; }}
+            CAGENTS_BUILD_REMOTE=local exec '{tools / "cargo-offload.real"}' "$@"
+        """))
+        (tools / "cargo-offload").chmod(0o755)
+        (self.crate / "src/main.rs").write_text(
+            'fn main() { println!("{:?}", std::env::var("CAGENTS_BUILD_OFFLOAD_HOST").ok()); }\n')
+        result = self.gate_run("run", "--quiet", env=self.remote_env())
+        self.assertEqual((result.returncode, result.stdout), (0, "None\n"), result.stderr)
+        self.assertTrue((self.host_home / ".cache/cagents-offload/crate/slot-0/src/target").is_dir())
+        self.assertFalse((self.root / "local-build").exists())
 
     def test_a_gate_without_its_offload_helper_does_not_build_here(self):
         (self.root / "tools/cargo-offload").unlink()
@@ -813,27 +891,21 @@ class StandInHost(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((slot_tmp / "left-behind").exists())
 
-    def test_the_build_gets_this_shells_open_file_limit(self):
+    def test_the_build_may_open_as_many_files_as_the_host_allows(self):
+        # However low the caller's soft limit, and the stand-in session's
+        # 256, the build gets the hard limit.
         (self.crate / "build.rs").write_text(textwrap.dedent("""
             fn main() {
                 let limits = std::fs::read_to_string("/proc/self/limits").unwrap();
                 let line = limits.lines().find(|l| l.starts_with("Max open files")).unwrap();
-                assert_eq!(line.split_whitespace().nth(3), Some("512"), "{line}");
+                let fields: Vec<_> = line.split_whitespace().collect();
+                assert_eq!(fields[3], fields[4], "{line}");
                 println!("cargo:rerun-if-changed=build.rs");
             }
         """))
-        # Like mise's shim, the interpreter cargo-offload runs under raises
-        # the limit for itself; the build still gets the caller's.
-        wrappers = self.root / "wrappers"
-        wrappers.mkdir()
-        (wrappers / "python3").write_text(
-            f"#!/bin/sh\nulimit -Sn 1024\nexec '{sys.executable}' \"$@\"\n")
-        (wrappers / "python3").chmod(0o755)
-        env = self.remote_env()
-        env["PATH"] = f"{wrappers}:{env['PATH']}"
         hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
         result = subprocess.run(
-            [str(self.gate), "check"], cwd=self.crate, env=env,
+            [str(self.gate), "check"], cwd=self.crate, env=self.remote_env(),
             capture_output=True, text=True, timeout=120,
             preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (512, hard)))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1138,17 +1210,14 @@ class RemoteRun(unittest.TestCase):
             agent.stdin.flush()
             self.assertEqual(agent.wait(timeout=15), 7)
 
-    def test_the_command_gets_the_open_file_limit_it_was_asked_for(self):
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        above = hard + 1 if hard != resource.RLIM_INFINITY else None
-        for wanted, expected in ((64, 64), (above, hard), (-1, hard)):
-            if wanted is None:
-                continue
-            with self.subTest(wanted=wanted), tempfile.TemporaryDirectory() as base:
+    def test_the_command_may_open_as_many_files_as_the_host_allows(self):
+        hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        # An older gate's request still names a limit, which no longer
+        # lowers it.
+        for request in ({"environment": {}}, {"environment": {}, "open_files": 64}):
+            with self.subTest(request=request), tempfile.TemporaryDirectory() as base:
                 Path(base, "src").mkdir()
-                # The connection stays open, as it does while the gate waits.
-                # The agent starts below every requested limit, as an ssh
-                # session's 1024 does, so each request must change it.
+                # The agent starts low, as an ssh session's 1024 does.
                 agent = subprocess.Popen(
                     ["python3", "-c", offload.REMOTE_AGENT, "run", base, ".",
                      "sh", "-c", "ulimit -Sn"],
@@ -1156,13 +1225,13 @@ class RemoteRun(unittest.TestCase):
                     preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (32, hard)))
                 self.addCleanup(agent.stdout.close)
                 self.addCleanup(agent.stdin.close)
-                agent.stdin.write(json.dumps({"environment": {}, "open_files": wanted}).encode()
-                                  + b"\n")
+                # The connection stays open, as it does while the gate waits.
+                agent.stdin.write(json.dumps(request).encode() + b"\n")
                 agent.stdin.flush()
                 self.assertEqual(agent.wait(timeout=15), 0)
                 reported = agent.stdout.read().decode().strip()
-                self.assertEqual(reported, "unlimited" if expected == resource.RLIM_INFINITY
-                                 else str(expected))
+                self.assertEqual(reported, "unlimited" if hard == resource.RLIM_INFINITY
+                                 else str(hard))
 
 
 class Prune(unittest.TestCase):
