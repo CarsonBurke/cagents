@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -167,14 +168,18 @@ case $1 in
         exit 0 ;;
     build)
         printf '%s\\n' "$*" >> "$CARGO_CALLS"
+        sleep "${FAKE_BUILD_SECONDS:-0}"
         for argument do binary=$argument; done
-        mkdir -p "$FAKE_TARGET/dev-runtime" "$FAKE_BUILD/dev-runtime/build/script-1"
+        if [ "$binary" = "${FAKE_FAIL_BINARY:-}" ]; then exit 101; fi
+        mkdir -p "$FAKE_TARGET/dev-runtime" "$FAKE_BUILD/dev-runtime/build/script-1" \\
+            "$FAKE_BUILD/dev-runtime/deps"
+        printf '# env-dep:FAKE_COMPILED=\\n' > "$FAKE_BUILD/dev-runtime/deps/unit.d"
         printf '#!/bin/sh\\nexit 0\\n' > "$FAKE_TARGET/dev-runtime/$binary"
         chmod +x "$FAKE_TARGET/dev-runtime/$binary"
         printf '%s: %s %s\\n' "$FAKE_TARGET/dev-runtime/$binary" "$FAKE_SOURCE" "$FAKE_VENDORED" \\
             > "$FAKE_TARGET/dev-runtime/$binary.d"
-        printf 'cargo:rerun-if-changed=%s\\ncargo::rerun-if-changed=build.rs\\ncargo:rerun-if-env-changed=FAKE_WATCHED\\ncargo:rerun-if-env-changed=AR_x86_64-unknown-linux-gnu\\n' \\
-            "$FAKE_GIT_INDEX" > "$FAKE_BUILD/dev-runtime/build/script-1/output"
+        printf 'cargo:rerun-if-changed=%s\\ncargo:rerun-if-changed=%s\\ncargo::rerun-if-changed=build.rs\\ncargo:rerun-if-env-changed=FAKE_WATCHED\\ncargo:rerun-if-env-changed=AR_x86_64-unknown-linux-gnu\\n' \\
+            "$FAKE_GIT_INDEX" "$FAKE_WATCHED_DIRECTORY" > "$FAKE_BUILD/dev-runtime/build/script-1/output"
         exit 0 ;;
 esac
 exit 83
@@ -189,13 +194,18 @@ exit 83
         self.vendored.parent.mkdir()
         self.vendored.write_text("")
         self.git_index.write_text("")
+        self.watched_asset = self.root / "shared/assets/icons/app.svg"
+        self.watched_asset.parent.mkdir(parents=True)
+        self.watched_asset.write_text("")
         self.ancestor_config = self.root / ".cargo/config.toml"
         self.env.update(
             FAKE_TARGET=str(self.target), FAKE_BUILD=str(self.root / "build"),
             FAKE_SOURCE=str(self.source), FAKE_VENDORED=str(self.vendored),
             FAKE_GIT_INDEX=str(self.git_index),
+            FAKE_WATCHED_DIRECTORY=str(self.root / "shared/assets"),
         )
-        self.env.pop("FAKE_WATCHED", None)
+        for name in ("FAKE_WATCHED", "FAKE_COMPILED", "FAKE_BUILD_SECONDS"):
+            self.env.pop(name, None)
 
     def launch(self, *arguments, **changes):
         environment = self.env.copy()
@@ -234,6 +244,7 @@ exit 83
             ("record removed", lambda: (self.target / "dev-runtime/.run-development-ui").unlink()),
             ("dependency outside the checkout", lambda: self.vendored.write_text("//\n")),
             ("path a build script watches", lambda: self.git_index.write_text("staged")),
+            ("file in a directory a build script watches", lambda: self.watched_asset.write_text("<svg/>")),
             ("dependency list removed", lambda: (self.target / "dev-runtime/cagents.d").unlink()),
             ("Cargo configuration in a parent directory", self.write_ancestor_config),
         ):
@@ -245,6 +256,7 @@ exit 83
             ("toolchain", {"FAKE_RUSTC": "1.94.0"}),
             ("compiler flags", {"RUSTFLAGS": "-Ctarget-cpu=native"}),
             ("variable a build script watches", {"FAKE_WATCHED": "1"}),
+            ("variable read at compile time", {"FAKE_COMPILED": "1"}),
         ):
             with self.subTest(change=name):
                 self.assert_built("--browserless", **changes)
@@ -254,6 +266,52 @@ exit 83
     def write_ancestor_config(self):
         self.ancestor_config.parent.mkdir(exist_ok=True)
         self.ancestor_config.write_text("[build]\n")
+
+    def test_overlapping_launches_record_their_own_start(self):
+        """An edit made while one launch builds is not hidden by a second
+        launch that started later."""
+        self.assert_built("--browserless")
+        self.source.write_text("fn main() { first }\n")
+        slow = dict(self.env, FAKE_BUILD_SECONDS="1")
+        first = subprocess.Popen(
+            [str(self.runner), "--browserless"], cwd=self.root, env=slow,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+        deadline = time.monotonic() + 5
+        while not self.cargo_calls.exists():
+            self.assertLess(time.monotonic(), deadline, "the first launch never built")
+            time.sleep(0.02)
+        self.source.write_text("fn main() { edited }\n")
+        second = subprocess.Popen(
+            [str(self.runner), "--browserless"], cwd=self.root, env=slow,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+        self.assertEqual(first.wait(timeout=10), 0, first.stderr.read())
+        third = subprocess.run(
+            [str(self.runner), "--browserless"], cwd=self.root, env=self.env,
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertNotIn("skipping the build", third.stderr,
+                         "a launch skipped the build after an edit made during one")
+        self.assertEqual(second.wait(timeout=15), 0, second.stderr.read())
+        self.cargo_calls.unlink()
+        self.assert_skipped("--browserless")
+
+    def test_a_failed_build_leaves_no_record(self):
+        self.assert_built("--browserless")
+        self.source.write_text("fn main() { broken }\n")
+        result = subprocess.run(
+            [str(self.runner), "--browserless"], cwd=self.root,
+            env=dict(self.env, FAKE_FAIL_BINARY="cagents-ui"),
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 101, result.stderr)
+        self.cargo_calls.unlink()
+        self.assert_built("--browserless")
+        leftovers = [path.name for path in (self.target / "dev-runtime").iterdir()
+                     if path.name.startswith(".run-development-started")]
+        self.assertEqual(leftovers, [])
 
     def test_the_other_lane_rebuilds_and_invalidates_this_one(self):
         self.assert_built("--browserless")

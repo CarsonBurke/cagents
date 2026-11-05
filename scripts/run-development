@@ -260,11 +260,16 @@ build_dir=
 # the daemon compile libcosmic.
 build_products() {
     # shellcheck disable=SC2016 # expanded by the inner shell
-    "$root/scripts/cargo-gate" exec sh -ec '
+    "$root/scripts/cargo-gate" exec "$@" sh -ec '
         cargo build --locked --profile dev-runtime $1 --features development --bin cagents
         cargo build --locked --profile dev-runtime $1 --features development,host --bin cagentsd
         cargo build --locked --profile dev-runtime $1 --features "development,$2" --bin cagents-ui
-    ' build-products "$default_features" "$ui_feature"
+        if [ -n "$3" ]; then
+            for executable in cagents cagentsd cagents-ui; do
+                stat -c "%n %i %s %.9Y" "$4/$executable"
+            done >"$3"
+        fi
+    ' build-products "$default_features" "$ui_feature" "${built:-}" "$products"
 }
 
 # A launch with nothing to build skips the build gate, whose queue can be long
@@ -280,8 +285,12 @@ build_identity() {
     printf 'zig %s %s\n' "$zig_executable" "$zig_version"
     env | grep -E '^(RUST|CARGO_|CC=|CXX=|AR=|CFLAGS=|CXXFLAGS=|LDFLAGS=|PKG_CONFIG)' |
         grep -v -e '^CARGO_BUILD_JOBS=' -e '^CARGO_HOME=' | LC_ALL=C sort
-    # Variables a build script asked Cargo to watch.
-    watched=$(build_script_watches env-changed)
+    # Variables a build script asked Cargo to watch, and those read at
+    # compile time through env! or option_env!.
+    watched=$({
+        build_script_watches env-changed
+        sed -n 's/^# env-dep:\([^=]*\).*/\1/p' "$build_dir"/dev-runtime/deps/*.d 2>/dev/null
+    } | LC_ALL=C sort -u)
     env | awk -v watched="$watched" '
         BEGIN { count = split(watched, names, "\n"); for (i = 1; i <= count; i++) seen[names[i]] }
         { name = $0; sub(/=.*/, "", name) }
@@ -292,9 +301,8 @@ build_identity() {
 # variable names, or changed for paths. Outputs of earlier builds count too,
 # which only makes the check stricter.
 build_script_watches() {
-    for output in "$build_dir"/dev-runtime/build/*/output; do
-        [ ! -f "$output" ] || sed -n "s/^cargo::\{0,1\}rerun-if-$1=//p" "$output"
-    done | LC_ALL=C sort -u
+    sed -n "s/^cargo::\{0,1\}rerun-if-$1=//p" "$build_dir"/dev-runtime/build/*/output 2>/dev/null |
+        LC_ALL=C sort -u
 }
 # Files the build read outside the checkout scan: the executables' dependency
 # lists from Cargo, absolute paths the build scripts watch (such as Git
@@ -343,29 +351,41 @@ products_current() {
         case $input in
         'optional '*)
             input=${input#optional }
-            [ ! -e "$input" ] || [ ! "$input" -nt "$record" ] || return 1
+            [ -e "$input" ] || continue
             ;;
-        *) [ -e "$input" ] && [ ! "$input" -nt "$record" ] || return 1 ;;
+        *) [ -e "$input" ] || return 1 ;;
         esac
+        # Cargo watches a directory's whole tree.
+        if [ -d "$input" ]; then
+            [ -z "$(find "$input" -newer "$record" -print -quit)" ] || return 1
+        else
+            [ ! "$input" -nt "$record" ] || return 1
+        fi
     done
 }
-# The record's time is when the build started, so a file saved during the
-# build counts as changed at the next launch.
+# The record's time is when this launch's build started, so a file saved
+# during the build counts as changed at the next launch. Launches from one
+# checkout build one at a time under a checkout lock, which Cargo's build
+# directory lock would impose anyway, and each notes the executables it built
+# before releasing it, so a record never describes another launch's build.
 build_and_record() {
+    built=
     locate_products || { build_products; return; }
     record=$(build_record)
-    started=$record.started
     mkdir -p -- "$products"
-    rm -f -- "$record" "$started"
-    : >"$started"
-    build_products
-    build_identity >"$started.new" && built_executables >>"$started.new" || {
-        rm -f -- "$started" "$started.new"
-        return 0
+    started=$(mktemp "$products/.run-development-started.XXXXXX")
+    built=$started.built
+    rm -f -- "$record"
+    build_products flock -- "$products/.run-development.lock" || {
+        status=$?
+        rm -f -- "$started" "$built"
+        return "$status"
     }
-    touch -r "$started" "$started.new"
-    mv -f -- "$started.new" "$record"
-    rm -f -- "$started"
+    if build_identity >"$started.new" && cat -- "$built" >>"$started.new"; then
+        touch -r "$started" "$started.new"
+        mv -f -- "$started.new" "$record"
+    fi
+    rm -f -- "$started" "$started.new" "$built"
 }
 
 run_cli() {
