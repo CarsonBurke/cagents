@@ -1241,6 +1241,61 @@ fn stopping_a_starting_agent_from_its_chat_withdraws_its_prompt() {
 }
 
 #[test]
+fn a_deferred_stop_of_a_starting_agent_reports_success() {
+    if isolated("a_deferred_stop_of_a_starting_agent_reports_success").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    hold_provider_initialization(&root);
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    await_undelivered(&host, &accepted);
+    let HostedSession::Chat(session) = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatAttach {
+            session: session.clone(),
+        },
+    )
+    .unwrap();
+    // The client defers Interrupt and waits on its reply; a stop the agent
+    // layer settles itself must still answer that wait with success.
+    let reply = super::super::chat::enqueue_deferred(
+        &host,
+        17,
+        ClientRequest::ChatCommand {
+            chat_id: session.id,
+            command: Command::Interrupt,
+        },
+    )
+    .unwrap();
+    let crate::chat::runtime::CommandReply::Local(reply) = reply else {
+        panic!("a withdrawn stop has no retained acknowledgement");
+    };
+    assert_eq!(reply.recv_timeout(Duration::from_secs(5)), Ok(Ok(())));
+    assert_withdrawn(&host, accepted.run.id);
+    std::fs::write(root.join("initialize-release"), "").unwrap();
+    let gate = agent_gate(&host, accepted.agent.id);
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    while gate.lock().unwrap().is_some() {
+        assert!(Instant::now() < hang_guard, "dispatch never settled");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!root.join("prompts").exists());
+}
+
+#[test]
 fn interrupting_a_run_whose_provider_is_starting_withdraws_its_prompt() {
     if isolated("interrupting_a_run_whose_provider_is_starting_withdraws_its_prompt").is_some() {
         return;

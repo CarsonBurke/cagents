@@ -2462,7 +2462,7 @@ pub(super) fn enqueue_deferred(
     request: ClientRequest,
 ) -> Result<chat::runtime::CommandReply, ProtocolError> {
     let mut pending = None;
-    super::agent_execution::try_interactive(host, client, request, |request| {
+    let response = super::agent_execution::try_interactive(host, client, request, |request| {
         let ClientRequest::ChatCommand { chat_id, command } = request else {
             return Err(error("Expected a provider control command"));
         };
@@ -2476,7 +2476,17 @@ pub(super) fn enqueue_deferred(
         pending = Some(handle.enqueue_command(command).map_err(unavailable)?);
         Ok(ServerResponse::Accepted)
     })?;
-    pending.ok_or_else(|| error("Provider control was not admitted"))
+    match (pending, response) {
+        (Some(reply), _) => Ok(reply),
+        // The agent layer settled the command without the provider, as when
+        // a stop withdraws a prompt its starting provider never received.
+        (None, ServerResponse::Accepted) => {
+            let (settled, reply) = crossbeam_channel::bounded(1);
+            let _ = settled.send(Ok(()));
+            Ok(reply.into())
+        }
+        (None, _) => Err(error("Provider control was not admitted")),
+    }
 }
 
 pub(super) fn process(
