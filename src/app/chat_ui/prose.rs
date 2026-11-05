@@ -70,11 +70,15 @@ pub(super) struct Highlight(Arc<Runs>);
 
 #[derive(Debug, Default)]
 struct Runs {
-    /// Whether the block is highlighted at all: a highlighted line without
-    /// tokens draws nothing but its ending, where a plain one draws its text.
+    /// Whether the block is highlighted at all: an empty highlighted line
+    /// draws nothing but its ending, where a plain one draws an empty span.
     highlighted: bool,
     runs: Box<[Run]>,
     styles: Box<[Style]>,
+    /// The whole block drawn, once something draws it whole. A block short
+    /// enough to be one paragraph is drawn whole every time its row is built,
+    /// and a paragraph shapes again whenever its spans are new ones.
+    all: std::sync::OnceLock<Arc<[Span<'static, markdown::Uri>]>>,
 }
 
 /// Runs draw the same where they end at the same bytes in the same styles,
@@ -122,12 +126,29 @@ impl Highlight {
     }
 
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of_val(&*self.0.runs) + std::mem::size_of_val(&*self.0.styles)
+        std::mem::size_of_val(&*self.0.runs)
+            + std::mem::size_of_val(&*self.0.styles)
+            + self.0.all.get().map_or(0, |all| {
+                all.iter()
+                    .map(|span| std::mem::size_of_val(span) + span.text.len())
+                    .sum()
+            })
     }
 
-    /// The spans that draw all of `text`, the block this highlights.
+    /// The spans that draw all of `text`, the block this highlights; the
+    /// same ones each time for a block short enough to be [one
+    /// paragraph](CodeBlock::PARAGRAPH).
     pub(super) fn all(&self, text: &str) -> Arc<[Span<'static, markdown::Uri>]> {
-        self.spans(text, 0..text.len())
+        if text.len() > CodeBlock::PARAGRAPH {
+            return self.spans(text, 0..text.len());
+        }
+        let all = self.0.all.get_or_init(|| self.spans(text, 0..text.len()));
+        debug_assert_eq!(
+            all.iter().map(|span| span.text.len()).sum::<usize>(),
+            text.len(),
+            "a highlight draws the one block it was made for"
+        );
+        all.clone()
     }
 
     /// The spans that draw `range` of `text`, the block this highlights:
@@ -143,6 +164,7 @@ impl Highlight {
             highlighted,
             runs,
             styles,
+            ..
         } = &*self.0;
         let mut spans = Vec::new();
         let mut run = runs.partition_point(|run| (run.end as usize) <= range.start);
@@ -230,6 +252,7 @@ impl Writer {
             highlighted: true,
             runs: self.runs.into(),
             styles: self.styles.into(),
+            all: Default::default(),
         }))
     }
 }
@@ -259,6 +282,10 @@ impl CodeBlock {
     /// The font a block's paragraph is set in. Its spans name their own only
     /// where highlighting or [`monospace`] chose one, relative to this.
     pub(super) const FONT: iced::Font = iced::Font::MONOSPACE;
+
+    /// The most bytes of a block drawn as one paragraph; a longer one is drawn
+    /// a row per line.
+    pub(super) const PARAGRAPH: usize = 2048;
 
     /// A block that will not change.
     pub(super) fn new(
@@ -330,7 +357,9 @@ impl CodeBlock {
             return;
         };
         let Some(highlighter) = &mut tail.highlighter else {
-            // A plain block is the same in both palettes, whatever its text.
+            // A plain block has no runs in either palette, but what it drew
+            // whole was its old text.
+            self.palettes = Default::default();
             return;
         };
         let mut palettes =
@@ -376,7 +405,14 @@ impl CodeBlock {
         theme: crate::settings::EditorSyntaxTheme,
     ) -> [Arc<[Span<'static, markdown::Uri>]>; 2] {
         let block = Self::new(language, code, theme);
-        [false, true].map(|dark| block.highlight(dark).all(code))
+        let light = block.highlight(false).all(code);
+        // A plain block is the same in both palettes.
+        let dark = if block.highlight(true).0.highlighted {
+            block.highlight(true).all(code)
+        } else {
+            light.clone()
+        };
+        [light, dark]
     }
 }
 
@@ -1118,7 +1154,7 @@ pub(super) fn code_text(
     flow_cache: Option<flow_layout::Cache>,
     reader_source: Option<reader_source::Source>,
 ) -> Element<'static, Message> {
-    if text.len() <= 2048 {
+    if text.len() <= CodeBlock::PARAGRAPH {
         let spans = highlight
             .map(|highlight| highlight.all(&text))
             .filter(|spans| !spans.is_empty())
@@ -2995,6 +3031,40 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// A paragraph shapes again whenever its spans are new ones, so a short
+    /// block draws whole from the same spans each time its row is built, and
+    /// from new ones once its text grows.
+    #[test]
+    fn a_block_draws_whole_from_the_same_spans_until_it_grows() {
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        for language in [Some("rust"), None] {
+            let code = "let a = 1;\n";
+            let mut block = CodeBlock::open(language, code, theme);
+            for dark in [false, true] {
+                let first = block.highlight(dark).all(code);
+                assert!(
+                    Arc::ptr_eq(&first, &block.highlight(dark).all(code)),
+                    "{language:?} dark: {dark}"
+                );
+                assert!(
+                    Arc::ptr_eq(&first, &block.highlight(dark).clone().all(code)),
+                    "{language:?} dark: {dark}, shared"
+                );
+            }
+            let grown = "let a = 1;\nlet b = 2;\n";
+            assert!(block.extend(language, grown));
+            for dark in [false, true] {
+                let drawn = block
+                    .highlight(dark)
+                    .all(grown)
+                    .iter()
+                    .map(|span| span.text.as_ref())
+                    .collect::<String>();
+                assert_eq!(drawn, grown, "{language:?} dark: {dark}");
             }
         }
     }
