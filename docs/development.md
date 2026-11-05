@@ -12,8 +12,8 @@
 The README's [Run from source](../README.md#run-from-source) section is the
 quick start; this page is the full reference. Repository tooling is shell
 (POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust. Python 3
-is also required by the ceditor development/installation scripts, experimental
-hot runner, and the full Servo dependency graph.
+is also required by the Cargo gate, ceditor development/installation scripts,
+experimental hot runner, and the full Servo dependency graph.
 
 ## Prerequisites
 
@@ -46,19 +46,19 @@ Start with the boundary that owns your change:
 
 ```sh
 # Control CLI: no UI, Ghostty, SQLite, or Servo graph.
-cargo check --locked --no-default-features --bin cagents
+scripts/cargo-gate check --locked --no-default-features --bin cagents
 
 # Terminal daemon: Ghostty/PTY host, no UI or Servo graph.
-cargo check --locked --no-default-features --features host --bin cagentsd
+scripts/cargo-gate check --locked --no-default-features --features host --bin cagentsd
 
 # Browserless UI client: libcosmic, no Ghostty or Servo graph.
-cargo check --locked --no-default-features --features ui --bin cagents-ui
+scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
 
 # Integrated UI client: libcosmic and Servo, no Ghostty graph.
-cargo check --locked --features integrated-browser --bin cagents-ui
+scripts/cargo-gate check --locked --features integrated-browser --bin cagents-ui
 
 # Standalone editor: separate package using the browserless UI graph.
-cargo check --locked --package ceditor --bin ceditor
+scripts/cargo-gate check --locked --package ceditor --bin ceditor
 ```
 
 Changes to ceditor or shared UI, editor, or notification public contracts also
@@ -74,9 +74,9 @@ that isolation. Build a matched browserless release as three feature-disjoint
 targets:
 
 ```sh
-cargo build --locked --release --no-default-features --bin cagents
-cargo build --locked --release --no-default-features --features host --bin cagentsd
-cargo build --locked --release --no-default-features --features ui --bin cagents-ui
+scripts/cargo-gate build --locked --release --no-default-features --bin cagents
+scripts/cargo-gate build --locked --release --no-default-features --features host --bin cagentsd
+scripts/cargo-gate build --locked --release --no-default-features --features ui --bin cagents-ui
 ```
 
 `cagents`, `cagents-ui`, and `cagentsd` are a matched set and must stay
@@ -233,13 +233,63 @@ implementation alone does not establish native hotpatch acceptance.
 
 ## Build and test resource usage
 
+### Sharing a host between several checkouts
+
+When several agents build on one host, run Cargo through the build gate
+rather than a single global lock:
+
+```sh
+scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
+scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+```
+
+The gate admits a few builds at once: one per 8 GiB of RAM after an 8 GiB
+reserve, at most one per 8 CPUs. A build starts beside others only while
+8 GiB is actually available; one `cagents` build peaked at 6.5 GiB with 12
+jobs. With several slots each build gets an equal
+share of the CPUs as `CARGO_BUILD_JOBS`, which also caps a larger value; `-j`
+still wins. For `test`, `bench` and `run` only the build holds a slot, and the
+tests or program run after it is released, so do not wrap the gate in another
+lock. Rustdoc compiles doctests while they run, so `cargo test --doc` keeps
+its slot throughout; a plain `cargo test` compiles its doctests after the
+slot is released. The development runner builds its matched set through the
+gate itself.
+
+The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
+command still run under `flock /var/tmp/cagents-cargo.lock` takes exactly one
+slot. A gated command started under such a lock runs at once in the slot its
+caller holds. Set `CAGENTS_BUILD_SLOTS` to override the count.
+
+To gate a script that runs several Cargo commands, replace
+`flock /var/tmp/cagents-cargo.lock COMMAND` with
+`scripts/cargo-gate exec COMMAND`. It holds one slot until the command exits,
+and gated commands inside it run in that slot. Gating each Cargo command
+instead keeps test runs out of the slot.
+
+Cancelling a held command keeps its slot until the command and its descendants
+have exited. The Linux Python 3 supervisor sends TERM, allows the command one
+shared two-second grace period, then kills and reaps remaining descendants,
+including children that created a separate session. Successful commands may leave background cache
+services running without holding a slot. The regression contract uses private
+locks and owned fixture processes only: `python3 tests/cargo_gate.py -v`.
+
+The feature lanes coexist in one build directory: a no-op check of one lane
+stays a no-op after building the others. With a per-checkout build directory,
+such as `build-dir = "/var/tmp/cargo-build{workspace-root}/target"` in
+`~/.cargo/config.toml`, the cost per worktree is the first build of each lane. On a 24-thread, 60 GiB host
+a cold check took 35 s for the CLI, 53 s for the host, 62 s for the UI and
+126 s for the integrated UI; the single `cagents` crate is most of each.
+
+### Compilation jobs and shared build directories
+
 Repository-local Cargo configuration (`.cargo/config.toml`) defaults to **two
 concurrent compilation jobs**, including `cargo test` and every build in the
 runner. Cargo otherwise uses the logical CPU count, which can create
 substantial RAM pressure on high-core-count or shared machines. Override it
 with standard Cargo controls: `CARGO_BUILD_JOBS` also applies to the runner,
-and `-j` takes precedence for a single invocation. Run the isolated feature
-lanes sequentially, not as concurrent cold builds.
+and `-j` takes precedence for a single invocation; with several build slots,
+`scripts/cargo-gate` sets or caps `CARGO_BUILD_JOBS` to a share of the CPUs.
+Run the isolated feature lanes one after another, each through the gate.
 
 Worktrees can share Cargo's target and build directories. Cargo makes path
 packages relocatable and compares source timestamps, so an older checkout can
@@ -281,7 +331,7 @@ identifying `libsqlite3-sys` as the affected package in a browserless UI check:
 ```sh
 # Explicit maintenance operation: only after evidence identifies this package.
 cargo clean --package libsqlite3-sys
-CARGO_BUILD_JOBS=2 cargo check --locked --no-default-features --features ui --bin cagents-ui
+CARGO_BUILD_JOBS=2 scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
 ```
 
 Use `name@version` if the package name is ambiguous. Preserve the clean output,
@@ -299,7 +349,7 @@ available, though Cargo may rebuild dependents of the selected package.
 CARGO_BUILD_JOBS=1 scripts/run-development --browserless
 
 # Opt into more compilation jobs when system RAM is available.
-cargo check --locked -j 4 --no-default-features --features ui --bin cagents-ui
+scripts/cargo-gate check --locked -j 4 --no-default-features --features ui --bin cagents-ui
 ```
 
 Compilation jobs and test threads are separate controls: `-j` does not
@@ -364,9 +414,9 @@ its lane. Cover the boundaries a change touches; prepare the HOST prerequisites
 below before running that lane:
 
 ```sh
-cargo test --locked --no-default-features --all-targets
-cargo test --locked --no-default-features --features host --all-targets
-cargo test --locked --no-default-features --features ui --all-targets
+scripts/cargo-gate test --locked --no-default-features --all-targets
+scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+scripts/cargo-gate test --locked --no-default-features --features ui --all-targets
 ```
 
 HOST fixtures that exec retained actors require
@@ -394,11 +444,11 @@ fixture layouts need more room; a short base alone is not proof.
     export TMPDIR
     printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
     CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
-        python3 scripts/build-ceditor-product cagentsd --locked \
+        scripts/cargo-gate exec python3 scripts/build-ceditor-product cagentsd --locked \
             --no-default-features --features host --bin cagentsd
     ) || exit
     export CAGENTS_TEST_RETAINED_ACTOR_HELPER
-    cargo test --locked --no-default-features --features host --all-targets
+    scripts/cargo-gate test --locked --no-default-features --features host --all-targets
 )
 ```
 
@@ -412,9 +462,9 @@ root to make a failed preparation pass.
 Prefer the narrow target that covers the changed contract, for example:
 
 ```sh
-cargo test --locked --no-default-features --features host --lib terminal::
-cargo test --locked --no-default-features --features host --test terminal_load_contract
-cargo test --locked --no-default-features --features ui --test session_restore_contract
+scripts/cargo-gate test --locked --no-default-features --features host --lib terminal::
+scripts/cargo-gate test --locked --no-default-features --features host --test terminal_load_contract
+scripts/cargo-gate test --locked --no-default-features --features ui --test session_restore_contract
 ```
 
 The four named-tree reconciliation contracts share their cases between the root
@@ -422,8 +472,12 @@ UI target and a focused workspace package. For edits confined to vendored
 iced-core tree reconciliation, run the focused package first:
 
 ```sh
-cargo test --locked -p cagents-iced-contracts
+scripts/cargo-gate test --locked -p cagents-iced-contracts
 ```
+
+The same package checks that a rebuilt named widget keeps the native
+accessibility ID it already published, so an assistive-technology action
+queued before the rebuild still reaches it.
 
 The package uses the UI's exact iced-core Git revision; the root Cargo patch
 resolves both targets to `vendor/iced-core`, with the production `a11y` Id
@@ -433,7 +487,7 @@ uninhabited renderer. Retain validation through the UI's concrete renderer when
 changing the tree contract or UI integration:
 
 ```sh
-cargo test --locked --no-default-features --features ui --test iced_tree_reconciliation
+scripts/cargo-gate test --locked --no-default-features --features ui --test iced_tree_reconciliation
 ```
 
 Explicitly selecting a target with required features absent, including through a
@@ -446,7 +500,7 @@ library-suite run does not also create and mutate that filesystem fixture.
 mutations or pathspec handling, include its explicit target:
 
 ```sh
-cargo test --locked --no-default-features --features host --test repository_scale_contract
+scripts/cargo-gate test --locked --no-default-features --features host --test repository_scale_contract
 ```
 
 The fixture retains its disk-backed private namespace, subprocess deadline and
@@ -480,7 +534,7 @@ workloads are described in [Performance](performance.md).
 Repeatable upgrade-policy checks:
 
 ```sh
-cargo test --locked --no-default-features --test installer_lifecycle_contract
+scripts/cargo-gate test --locked --no-default-features --test installer_lifecycle_contract
 scripts/smoke-package-upgrades
 ```
 
@@ -529,7 +583,7 @@ Published releases still come from `scripts/build-release-linux`; see
 | `required command not found: zig` | Install Zig 0.15.2 and put it on `PATH` (`mise install` reads `mise.toml`). |
 | The UI talks to an old daemon after you changed daemon, host, or IPC code | Relaunch with `--fresh-daemon`. |
 | `development daemon did not stop within 5 seconds` | Look for a lingering development daemon with `pgrep -a cagentsd`, let it exit (or stop that process), then retry `--fresh-daemon`. The socket is `$XDG_RUNTIME_DIR/cagents-development/cagentsd.sock`. |
-| Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and avoid concurrent cold builds; see [resource usage](#build-and-test-resource-usage). |
+| Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and build through `scripts/cargo-gate` rather than starting builds side by side; see [resource usage](#build-and-test-resource-usage). |
 | A UI problem needs logs | Add `--debug --log-file /tmp/cagents-ui.log` and read the file after reproducing. |
 | New links do not open in browserless mode | Install `xdg-utils`, or use a desktop with a working portal. |
 
