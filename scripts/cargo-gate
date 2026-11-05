@@ -21,7 +21,14 @@ usage() {
 Usage: scripts/cargo-gate [cargo] SUBCOMMAND [ARGS...]
        scripts/cargo-gate exec COMMAND [ARGS...]
 
-Runs `cargo SUBCOMMAND ARGS...` once a build slot is free. For `test`,
+`build`, `check`, `clippy`, `test` and `doc` run on the build host in
+CAGENTS_BUILD_REMOTE with scripts/cargo-offload: in one of its build slots,
+with this checkout's sources, streaming their output; `build` copies the
+executables it made back into this checkout's target directory. When that
+host is unreachable, low on disk, or the command names paths on this host,
+the command runs here instead, after one line saying why.
+
+Otherwise, runs `cargo SUBCOMMAND ARGS...` once a build slot is free. For `test`,
 `bench` and `run`, only the build (`--no-run`, or `build`) holds the slot; the
 tests or program run afterwards without it.
 
@@ -36,6 +43,13 @@ holding build directories runs low, scripts/build-disk-guard first reclaims
 removed worktrees' build directories, and refuses the build below a floor.
 
 Environment:
+  CAGENTS_BUILD_REMOTE   Host that runs `build`, `check`, `clippy`, `test` and
+                         `doc` (default fw16); `local` builds here
+  CAGENTS_BUILD_REMOTE_SLOTS, CAGENTS_BUILD_REMOTE_JOBS,
+  CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB
+                         Builds at once on that host (default 3), Cargo jobs
+                         for each (6), and the free space below which it
+                         builds nothing (40 GiB)
   CAGENTS_BUILD_SEED=0   Do not seed a new build directory
   CAGENTS_BUILD_FREE_FLOOR_GIB
                          Free space below which builds are refused; default
@@ -67,7 +81,10 @@ Environment:
                          4 and 8
 
 Slot 0 is the plain lock file, so a command still run under
-`flock /var/tmp/cagents-cargo.lock` occupies exactly one slot.
+`flock --close /var/tmp/cagents-cargo.lock` occupies exactly one slot. Without
+--close, a daemon the command leaves behind keeps the slot until it exits. With
+it, gated commands under that flock run in its slot, and killing the flock frees
+the slot even if its command keeps running.
 EOF
 }
 
@@ -238,7 +255,13 @@ fits() {
                             claim="$holder:$claimed"
                             case $since in
                                 ''|*[!0-9]*) ;;
-                                *) [ -n "$newest" ] && [ "$since" -le "$newest" ] || newest=$since ;;
+                                *)
+                                    # Discard pre-reboot dates before choosing
+                                    # the newest, so they cannot hide a fresh start.
+                                    if [ "$since" -le "$(uptime_seconds)" ]; then
+                                        [ -n "$newest" ] && [ "$since" -le "$newest" ] || newest=$since
+                                    fi
+                                    ;;
                             esac
                         fi
                         ;;
@@ -314,7 +337,10 @@ acquire() {
         check_admission
         if [ -z "$waiter" ]; then
             exec 6>>"$lock"
-            flock 6 &
+            # Neither the queue nor the caller's streams: if this gate is killed,
+            # the request must not keep everyone queued behind a slot another
+            # gated build could skip, or a caller reading its output waiting.
+            flock 6 8>&- </dev/null >/dev/null 2>&1 &
             waiter=$!
         fi
         # The shared descriptor locks only once the queued request is granted:
@@ -552,9 +578,44 @@ inherits_slot() {
     return 1
 }
 
-# Already inside a slot: a gated command running Cargo again, or a caller
-# that took the lock itself.
-if inside_gate || inherits_slot; then
+# Whether `path` is one of this gate's slots, given the resolved first slot.
+is_slot() {
+    case $1 in
+        "$held") return 0 ;;
+        "$held".*)
+            number=${1#"$held".}
+            case $number in ''|*[!0-9]*|0*|??????????*) return 1 ;; esac
+            [ "$number" -lt "$slots" ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+# Whether a `flock` command started this one, as under
+# `flock --close /var/tmp/cagents-cargo.lock scripts/run-development`, and holds
+# a slot it did not pass down. Among ancestors, only a running `flock` counts: it
+# holds the slot for exactly as long as its command runs. Any other ancestor
+# holding a slot may be a leftover, and everything it starts would skip admission.
+# (A process that itself inherited the slot is inherits_slot's case.)
+started_by_flock() {
+    held=$(readlink -f "$lock")
+    ancestor=$PPID
+    while [ "$ancestor" -gt 1 ]; do
+        { read -r name </proc/"$ancestor"/comm; } 2>/dev/null || return 1
+        if [ "$name" = flock ]; then
+            for descriptor in /proc/"$ancestor"/fd/*; do
+                path=$(readlink "$descriptor" 2>/dev/null) || continue
+                is_slot "$path" || continue
+                if grep -q '^lock:.*FLOCK' /proc/"$ancestor"/fdinfo/"${descriptor##*/}" 2>/dev/null; then
+                    return 0
+                fi
+            done
+        fi
+        ancestor=$(sed -n 's/^PPid:[[:space:]]*//p' /proc/"$ancestor"/status 2>/dev/null) || return 1
+        [ -n "$ancestor" ] || return 1
+    done
+    return 1
+}
+if inside_gate || inherits_slot || started_by_flock; then
     [ "$mode" = exec ] || set -- cargo "$@"
     exec "$@"
 fi
@@ -563,6 +624,19 @@ admission_deadline=
 if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
     admission_deadline=$(python3 "$(dirname "$0")/cargo-gate-command.py" \
         --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
+fi
+
+# Builds run on the build host when it can take them, without a slot here;
+# scripts/cargo-offload says when one builds here instead, and why. Its wait
+# for a slot there spends the admission budget; the build there does not.
+offload=$(dirname "$0")/cargo-offload
+if [ "$mode" = cargo ] && [ -x "$offload" ]; then
+    deadline=$admission_deadline
+    admission_deadline=
+    status=0
+    supervised '' env CAGENTS_BUILD_ADMISSION_DEADLINE="$deadline" "$offload" "$@" || status=$?
+    admission_deadline=$deadline
+    [ "$status" -eq 75 ] || exit "$status"
 fi
 
 # A new worktree's build directory starts from the main checkout's compiled

@@ -468,6 +468,34 @@ mod tests {
         }
     }
 
+    /// `src/lib.rs:12` in a chat opens the file with its caret on line 12.
+    #[tokio::test]
+    async fn chat_file_position_links_open_at_their_line() {
+        use super::super::chat_ui::{Action, Target};
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().to_path_buf();
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        let text: String = (1..=40).map(|line| format!("line {line}\n")).collect();
+        std::fs::write(worktree.join("src/lib.rs"), text).unwrap();
+        let mut app = app();
+        drop(app.new_native_chat(crate::agent::Provider::Codex, Some(worktree.clone())));
+        let source = app.workspace.focused().unwrap();
+        let target: Target = match app.cards.get(&source).unwrap() {
+            CardRuntime::Chat(runtime) => runtime.target,
+            _ => panic!("draft chat"),
+        };
+        let click =
+            Action::OpenDocumentFrom(target, Some(worktree.join(".chat")), "src/lib.rs:12".into());
+        let task = app.handle_chat_ui(click);
+        settle(&mut app, task).await;
+        let file = runtime(&app, app.workspace.focused().unwrap());
+        assert_eq!(
+            file.descriptor.worktree.join(file.selected_path().unwrap()),
+            worktree.join("src/lib.rs")
+        );
+        assert_eq!(file.cursor_position().map(|at| at.line), Some(11));
+    }
+
     #[tokio::test]
     async fn unknown_child_directory_refuses_relative_links_without_reading_parent_files() {
         let directory = tempfile::tempdir().unwrap();

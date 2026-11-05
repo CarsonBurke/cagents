@@ -242,9 +242,17 @@ impl DndDestinationRectangles {
         self.rectangles.append(other);
     }
 
-    /// Returns the list of DnD destination rectangles.
+    /// Returns DnD destination rectangles in their original registration order.
     /// This consumes the [`DndDestinationRectangles`].
-    pub fn into_rectangles(mut self) -> Vec<DndDestinationRectangle> {
+    ///
+    /// Internal wrappers may translate, clip, scale or append this list without
+    /// changing target priority. Native registration reverses it only once.
+    pub fn into_rectangles(self) -> Vec<DndDestinationRectangle> {
+        self.rectangles
+    }
+
+    /// Returns the final native list with the last registered target first.
+    pub fn into_native_rectangles(mut self) -> Vec<DndDestinationRectangle> {
         self.rectangles.reverse();
         self.rectangles
     }
