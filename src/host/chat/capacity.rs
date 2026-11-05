@@ -153,7 +153,7 @@ impl Reservation {
             record.handle.owns_work() && same_conversation(&launch, &source.launch)
         }) {
             return Err(error(
-                "This exact conversation already owns work; attach to its existing chat",
+                "This conversation is already running. If no window shows it, `cagents sessions` says how to put it in a channel.",
             ));
         }
         if state
