@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn setup_progress_survives_reopen_without_executing_or_recreating_the_worktree() {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let path = root.path().join("state.sqlite");
         let request = request(root.path());
         let first = intent(&request);
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn stale_callbacks_cannot_overwrite_resumed_run_or_add_intent_to_unsettled_rows() {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let store = StateStore::open(
             root.path().join("state.sqlite"),
             crate::model::BootId::new("setup-intent"),
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn malformed_settled_journals_are_not_rewritten() {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let store = StateStore::open(
             root.path().join("state.sqlite"),
             crate::model::BootId::new("setup-intent"),

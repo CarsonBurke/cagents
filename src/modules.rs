@@ -11,6 +11,8 @@ pub const VERSION: &str = env!("CAGENTS_VERSION");
 mod names;
 pub(crate) mod native_chat_capacity;
 pub mod search_match;
+#[cfg(test)]
+pub(crate) mod test_fixture;
 
 pub mod account;
 pub mod agent;
