@@ -380,13 +380,18 @@ class StandInHost(unittest.TestCase):
         self.assertIn("building here: broken could not lease a build slot (status 1)\n", result.stderr)
         self.assertFalse((self.root / "runtime/cagents-offload/broken.unreachable").exists())
 
-    def test_tests_build_here_under_a_stray_git_marker_and_other_commands_do_not(self):
+    def test_tests_stop_under_a_stray_git_marker_and_other_commands_do_not(self):
         env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "marked"}
         result = self.gate_run("test", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("building here: /stray/.git on marked would put the tests inside a Git checkout\n",
+        self.assertEqual(result.returncode, 78, result.stderr)
+        self.assertIn("cargo-gate: /stray/.git on marked puts the tests inside a Git checkout;",
                       result.stderr)
-        self.assertTrue((self.root / "local-build").exists())
+        self.assertNotIn("building here", result.stderr)
+        self.assertFalse((self.root / "local-build").exists())
+        # The slot is free again.
+        slot = self.host_home / ".cache/cagents-offload/crate/slot-0/lock"
+        with open(slot, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         result = self.gate_run("check", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("building here", result.stderr)

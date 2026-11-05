@@ -444,9 +444,10 @@ there; its build settings, such as `jobs` and `build-dir`, describe this host
 and are not. Each slot's commands get a private `TMPDIR` on the host's disk,
 `/var/tmp/cof-<uid>/<repository>-<N>`, short enough for the Unix sockets
 tests bind under it and emptied before the next command there. While a
-`.git` sits in any of its ancestors on the host, `test` builds here, saying
-which marker, since fixtures that check Git ancestry fail under one; other
-commands still run there. Cargo's registry and Git caches and the toolchain on the
+`.git` sits in any of its ancestors on the host, `test` stops with status 78
+and names it, since fixtures that check Git ancestry fail under one and
+building here instead would hide the leak; remove the marker, or set
+`CAGENTS_BUILD_REMOTE=local`. Other commands still run there. Cargo's registry and Git caches and the toolchain on the
 host are shared with anything else built there; Cargo locks its caches itself.
 
 ### Compilation jobs and shared build directories

@@ -28,6 +28,8 @@ import threading
 import time
 
 FALL_BACK = 75
+# A command the build host cannot run faithfully, which building here would hide.
+REFUSED = 78
 program = "cargo-gate"
 
 # Subcommands, and their aliases, whose results are their output, their exit
@@ -581,13 +583,16 @@ class Offload:
         marker = words[3] if len(words) > 3 else None
         if marker and subcommand == "test":
             # Tests that check Git ancestry would fail there for a reason
-            # that is not theirs; the slot is released before building here.
+            # that is not theirs. Building here instead would hide the leak
+            # behind a much slower build, so this stops and names it.
             lease.stdin.close()
             try:
                 lease.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 lease.kill()
-            return self.fall_back(f"{marker} on {self.host} would put the tests inside a Git checkout")
+            say(f"{marker} on {self.host} puts the tests inside a Git checkout; something "
+                "left it there. Remove it, or set CAGENTS_BUILD_REMOTE=local to test here.")
+            return REFUSED
         try:
             return self.build(subcommand, slot, top, workspace, cwd, metadata)
         finally:
