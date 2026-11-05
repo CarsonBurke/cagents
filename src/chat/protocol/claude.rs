@@ -13312,7 +13312,7 @@ mod tests {
                 .events
                 .iter()
                 .filter_map(|event| match event {
-                    Event::Subagent { id, status, .. } if id == tool => Some(*status),
+                    Event::Subagent { id, status, .. } if id == tool => *status,
                     _ => None,
                 })
                 .collect();
