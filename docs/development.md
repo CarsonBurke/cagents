@@ -12,8 +12,8 @@
 The README's [Run from source](../README.md#run-from-source) section is the
 quick start; this page is the full reference. Repository tooling is shell
 (POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust. Python 3
-is also required by the ceditor development/installation scripts, experimental
-hot runner, and the full Servo dependency graph.
+is also required by the Cargo gate, ceditor development/installation scripts,
+experimental hot runner, and the full Servo dependency graph.
 
 ## Prerequisites
 
@@ -128,6 +128,8 @@ scripts/run-development                 # with the embedded browser
 | `--debug` | Opt into local raw stderr tracing/panic output and Rust backtraces (`CAGENTS_LOCAL_DEBUG=1`, `cagents=debug,cagentsd=debug,warn`); an explicit `RUST_LOG` or `RUST_BACKTRACE` takes precedence |
 | `--fresh-daemon` | Stop the existing development daemon, its sessions and background subagents after all three builds succeed, before launching |
 | `--log-file PATH` | Write UI tracing and panic output to `PATH` (relative to the calling directory); build diagnostics stay in the terminal |
+| `--instance NAME` | Run an isolated instance in a headless niri-harness session; see [Parallel instances](#parallel-instances) |
+| `--stop-instance NAME` | Stop that instance's daemon, its jobs and its harness session; keep its storage |
 | `-- ARGS...` | Pass remaining arguments to the UI |
 
 ```sh
@@ -146,10 +148,15 @@ automatically. The runner prints this impact before signaling the daemon.
 
 How the runner works:
 
-- It builds the three sibling executables with separate feature sets and runs
-  the selected UI through Cargo, so configured target directories and target
-  triples are honored. UI-only compilation never builds Ghostty; daemon-only
-  compilation never builds libcosmic or Servo.
+- It builds the three sibling executables with separate feature sets in one
+  slot of the [build gate](#sharing-a-host-between-several-checkouts), then
+  runs them from the target directory Cargo reports, so configured target
+  directories are honored.
+  UI-only compilation never builds Ghostty; daemon-only compilation never
+  builds libcosmic or Servo.
+- A launch with nothing to build skips the gate and starts at once, printing
+  `The matched set is already built for this checkout; skipping the build.`
+  See [Up-to-date launches](#up-to-date-launches).
 - The normal runner enables `integrated-browser` only for the UI; the matched
   CLI and daemon keep the same full-product identity without resolving Servo.
 - It uses the `dev-runtime` profile, which keeps UI dependencies optimized for
@@ -159,7 +166,90 @@ How the runner works:
   `$XDG_RUNTIME_DIR/cagents-development/` daemon, so it runs beside an installed
   production instance.
 - Browserless and integrated development sessions share that state; do not run
-  them at the same time.
+  them at the same time. Use [parallel instances](#parallel-instances) instead.
+
+### Up-to-date launches
+
+Waiting for a build slot only to learn that nothing needs building can take
+minutes on a busy host, so the runner decides first whether the matched set is
+already current. After each successful build it writes a record,
+`.run-development-ui` or `.run-development-integrated-browser`, beside the
+executables in `target/dev-runtime/`. The next launch skips the gate only if
+all of these still hold:
+
+- The lane, `rustc -vV`, the checked-out commit and the Zig toolchain match the
+  record.
+- The build environment matches: `RUST*`, `CARGO_*` (except `CARGO_BUILD_JOBS`
+  and `CARGO_HOME`), the C toolchain and `pkg-config` variables, and every
+  variable a build script asked Cargo to watch.
+- All three executables are the files that build produced.
+- No file changed after the build started: anything in the checkout outside
+  `target/`, `.git/`, `website/`, `dist/` and nested worktrees; any file in
+  the executables' Cargo dependency lists; any absolute path a build script
+  watches, such as the shared repository's Git index; and any Cargo
+  configuration file Cargo would load for the checkout.
+
+Otherwise the launch builds through the gate as before, and Cargo makes the
+real decision. The check never runs Cargo's build, so nothing compiles outside
+a slot. Launching the other lane rebuilds the UI and invalidates this lane's
+record. Delete the record to force the next launch through the gate.
+
+### Parallel instances
+
+Several people or agents can each validate a change in the native app at once
+by giving every run its own instance:
+
+```sh
+scripts/run-development --browserless --instance pr2064
+niri-harness --session cagents-pr2064 observe
+scripts/run-development --instance pr2064 --fresh-daemon   # rebuild and replace it
+scripts/run-development --stop-instance pr2064
+```
+
+An instance name is 1–24 ASCII letters, digits or hyphens. The runner builds
+the matched set as usual, then starts the UI in a headless
+`niri-harness` session named
+`cagents-NAME` and returns once its window maps. Drive and capture it with
+`niri-harness --session cagents-NAME ...`.
+
+| Shared by default | Per instance |
+| --- | --- |
+| Storage `~/.local/share/cagents-development`, config, state | `cagents-development-NAME` under each XDG root, selected by `CAGENTS_DEVELOPMENT_INSTANCE` |
+| Daemon under `$XDG_RUNTIME_DIR/cagents-development/` | The harness session's private runtime directory |
+| Application ID and activation on the session bus | The harness session's private D-Bus |
+
+`CAGENTS_DEVELOPMENT_INSTANCE` only affects development builds; production
+ignores it. The runner sets it for `--instance` and clears it otherwise, so an
+inherited value never selects an instance. Provider accounts and tools keep
+the caller's `HOME`, so an instance's agents use the same provider sign-ins.
+
+The runner starts the session without the caller's `WAYLAND_DISPLAY`,
+`WAYLAND_SOCKET`, `NIRI_SOCKET`, `DISPLAY` and `XAUTHORITY`, and stops an
+instance's daemon through `niri-harness exec`, so nothing it runs for an
+instance can reach the caller's desktop. Agents should also set
+`CAGENTS_DEVELOPMENT_NESTED_ONLY=1`: the runner then refuses to start a UI
+without `--instance` unless it runs inside a session through
+`niri-harness --session NAME exec -- scripts/run-development ...`, so a failed
+nested session cannot put a UI on the user's desktop. It requires a session's
+private `nh-*` runtime directory and no `DISPLAY` or `WAYLAND_SOCKET`, which is
+what `niri-harness exec` provides.
+
+Stopping a harness session deletes its runtime directory, so stop an instance
+with `--stop-instance`, which stops its daemon first. `niri-harness stop` alone
+leaves that daemon running without a socket. An instance's storage remains
+for its next launch; delete `~/.local/share/cagents-development-NAME` and its
+config and state siblings to discard it.
+
+Instances started from one checkout run that checkout's executables, so start
+them all in the same lane: all `--browserless` or all integrated. The two lanes
+write their UI to the same path, and launching the other lane rebuilds it under
+the running instances. Run the other lane from a second checkout.
+
+An idle instance takes about 0.4 GiB: the UI, its daemon, a headless niri
+compositor and the session's portals. Memory rarely limits how many run at
+once; building them does. Each checkout compiles its own matched set through
+`scripts/cargo-gate`. Once a checkout is built, its later launches skip the
+gate and start in seconds; see [Up-to-date launches](#up-to-date-launches).
 
 The browserless UI keeps saved browser descriptors and opens their URLs through
 the system browser instead of compiling Servo.
@@ -253,7 +343,8 @@ tests or program run after it is released, so do not wrap the gate in another
 lock. Rustdoc compiles doctests while they run, so `cargo test --doc` keeps
 its slot throughout; a plain `cargo test` compiles its doctests after the
 slot is released. The development runner builds its matched set through the
-gate itself.
+gate itself, and skips the gate when the set is
+[already current](#up-to-date-launches).
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock /var/tmp/cagents-cargo.lock` takes exactly one
@@ -265,6 +356,13 @@ To gate a script that runs several Cargo commands, replace
 `scripts/cargo-gate exec COMMAND`. It holds one slot until the command exits,
 and gated commands inside it run in that slot. Gating each Cargo command
 instead keeps test runs out of the slot.
+
+Cancelling a held command keeps its slot until the command and its descendants
+have exited. The Linux Python 3 supervisor sends TERM, allows the command one
+shared two-second grace period, then kills and reaps remaining descendants,
+including children that created a separate session. Successful commands may leave background cache
+services running without holding a slot. The regression contract uses private
+locks and owned fixture processes only: `python3 tests/cargo_gate.py -v`.
 
 The feature lanes coexist in one build directory: a no-op check of one lane
 stays a no-op after building the others. With a per-checkout build directory,
@@ -460,6 +558,45 @@ scripts/cargo-gate test --locked --no-default-features --features host --test te
 scripts/cargo-gate test --locked --no-default-features --features ui --test session_restore_contract
 ```
 
+The selected IPC source contract can be checked without compiling Rust:
+
+```sh
+scripts/check-protocol-contract
+python3 -I -B tests/protocol_contract.py -v
+scripts/check-protocol-contract --base-ref origin/main
+```
+
+It covers `ClientRequest`, `ServerMessage` and `ServerResponse` in
+`src/terminal/ipc.rs`, `Provider` in `src/agent.rs`, and `Run`, `Summary` and
+`Reply` in `src/agent_execution.rs`. Ordered fields, variants, types, relevant
+attributes and discriminants are recorded as Rust tokens; comments, formatting,
+runtime methods and standard nonserialization derives do not change the record.
+This partial contract covers the parallel protocol-number collisions reported
+in #2119. It is a source guard, not a serializer schema or a wire fingerprint.
+
+When a covered declaration changes, choose a fresh `PROTOCOL_VERSION`, then run
+`scripts/check-protocol-contract --record`. Commit the new
+`tests/fixtures/protocol-contract/<version>.json` alongside the source change.
+Keep old snapshots unchanged. Two branches choosing the same new version add
+the same snapshot path: different contracts cause a Git add/add conflict. After
+combining the source changes, choose another unused version and regenerate its
+snapshot rather than keeping one branch's stale snapshot.
+
+Script CI supplies the PR base or previous main revision from the GitHub event,
+fetching that exact object if the checkout is shallow. The guard refuses changed
+or deleted base snapshots and unbumped selected declarations relative to that
+base, including its first adoption before snapshots existed. A missing base
+fails explicitly. A local check without `--base-ref` confirms the current
+snapshot only; it does not establish historical immutability.
+
+The guard selects by declaration name; it does not resolve modules, imported
+types or aliases, expand macros, evaluate enclosing-module `cfg` or numeric
+expressions, or inspect custom serializers, dependency changes
+and semantic compatibility rules. Changes outside these seven declarations
+still need protocol review and, where applicable, a version bump. Two divergent
+branches cannot detect one another before comparison or merge. The historical
+upgrade inspector's supported-version policy remains a separate decision.
+
 The four named-tree reconciliation contracts share their cases between the root
 UI target and a focused workspace package. For edits confined to vendored
 iced-core tree reconciliation, run the focused package first:
@@ -467,6 +604,10 @@ iced-core tree reconciliation, run the focused package first:
 ```sh
 scripts/cargo-gate test --locked -p cagents-iced-contracts
 ```
+
+The same package checks that a rebuilt named widget keeps the native
+accessibility ID it already published, so an assistive-technology action
+queued before the rebuild still reaches it.
 
 The package uses the UI's exact iced-core Git revision; the root Cargo patch
 resolves both targets to `vendor/iced-core`, with the production `a11y` Id

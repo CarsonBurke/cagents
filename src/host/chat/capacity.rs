@@ -761,10 +761,20 @@ mod tests {
         let (directory, mut source, _) = closed_history(host);
         std::fs::create_dir(&source.launch.recipe.working_directory).unwrap();
         let program = directory.path().join("completed-provider");
-        // A real pipe transport consumes initialization and exits normally.
+        // A real pipe transport acknowledges initialization and exits normally.
         // Its transcript comes from the real Claude history adapter, not a
         // hand-built Store or a history reader relabeled as a writer.
-        std::fs::write(&program, "#!/bin/sh\nread -r initialization\nexit 0\n").unwrap();
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+read -r initialization
+id=${initialization#*\"request_id\":\"}
+id=${id%%\"*}
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+exit 0
+"#,
+        )
+        .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         source.launch.recipe.program = program.to_string_lossy().into_owned();
         // Enter through the real daemon start path: ordinary UI writers also

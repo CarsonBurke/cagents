@@ -48,7 +48,7 @@ You are a senior app developer tasked with creating a great Agent Development En
 - The runner uses the `dev-runtime` profile so UI dependencies remain optimized. Keep ordinary `dev` checks unoptimized; do not restore a wildcard `opt-level` under `[profile.dev.package."*"]`.
 - Add `--debug --log-file /tmp/cagents-ui.log` when diagnosing UI behavior.
 - Add `--fresh-daemon` after changing daemon, terminal-host, IPC/protocol, or process-lifecycle code. It uses the daemon lock and a Linux pidfd rather than the wire protocol, so it remains safe across protocol changes; this terminates terminals hosted by that daemon.
-- Do not run browserless and integrated development sessions concurrently; they share development state.
+- Do not run two development sessions without `--instance` at the same time; they share development state. Give each concurrent native run its own `--instance NAME`.
 
 ## Preserve cross-feature behavior
 
