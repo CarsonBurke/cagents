@@ -662,12 +662,13 @@ fn losing_a_race_with_no_session_change_still_warns() {
 }
 
 /// A window that attached to a chat another window is running.
-fn working_chat(peer: &mut Peer) {
-    attached_with_update_pending(peer);
+fn working_chat(peer: &mut Peer) -> uuid::Uuid {
+    let (operation, _) = attached_with_update_pending(peer);
     let CardRuntime::Chat(runtime) = peer.app.cards.get_mut(&peer.card).unwrap() else {
         panic!("expected a chat runtime");
     };
     Arc::make_mut(&mut runtime.snapshot).busy = true;
+    operation
 }
 
 fn card_open(peer: &Peer) -> bool {
@@ -737,7 +738,11 @@ fn a_close_with_nothing_working_does_not_ask() {
 #[test]
 fn the_question_ends_when_the_other_window_replaces_the_conversation() {
     let mut peer = peer();
-    working_chat(&mut peer);
+    let operation = working_chat(&mut peer);
+    let kind = peer.app.card_state(peer.card).unwrap().kind.clone();
+    drop(project(&mut peer.app, peer.channel, peer.card, kind));
+    peer.app
+        .acknowledge_view_edit(Scope::Channel(peer.channel), Some(operation));
     drop(peer.app.update(Message::CloseCard(peer.card)));
     assert!(peer.app.chat_close_dialog_visible());
 
@@ -750,5 +755,9 @@ fn the_question_ends_when_the_other_window_replaces_the_conversation() {
     ));
 
     assert!(!peer.app.chat_close_dialog_visible());
+
+    // An answer already on its way cannot close what replaced the conversation.
+    drop(peer.app.update(Message::ConfirmChatClose));
     assert!(!peer.app.chat_close_asked(peer.card));
+    assert!(card_open(&peer));
 }

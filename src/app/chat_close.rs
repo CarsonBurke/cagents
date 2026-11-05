@@ -29,10 +29,11 @@ impl Cagents {
             return Some(Task::none());
         }
         if self.chat_close_dialog_visible() {
-            self.queued_card_closes.push_back(terminal_close::QueuedCardClose {
-                card,
-                unasked: false,
-            });
+            self.queued_card_closes
+                .push_back(terminal_close::QueuedCardClose {
+                    card,
+                    unasked: false,
+                });
             return Some(Task::none());
         }
         self.ask_before_chat_close(card)

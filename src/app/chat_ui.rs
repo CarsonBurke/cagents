@@ -7710,7 +7710,15 @@ impl Cagents {
         let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| &state.kind) else {
             return None;
         };
-        if session.is_unstarted() || self.chat_close_owned(card) {
+        // A return already under way has given the conversation up; closing
+        // only says not to keep its terminal.
+        if session.is_unstarted()
+            || self.chat_close_owned(card)
+            || matches!(
+                self.chat_ui.phases.get(&card),
+                Some(Phase::Returning { .. })
+            )
+        {
             return None;
         }
         let working = match self.cards.get(&card) {
