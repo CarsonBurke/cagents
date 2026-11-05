@@ -1559,6 +1559,18 @@ impl RemoteActor {
     /// Send an input's first exchange. A failed call may never have reached
     /// the helper, so it schedules the fence's retransmission.
     fn dispatch_input(&self, identity: &InputIdentity, payload: Value) {
+        // A deferred input's caller waits from its first exchange, so its
+        // retransmission window starts here rather than at admission.
+        if let Some(uncertain) = self
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+            .filter(|uncertain| &uncertain.identity == identity)
+        {
+            uncertain.acknowledgement_deadline = Instant::now() + ACKNOWLEDGEMENT_WAIT;
+        }
         match self.call::<InputReceipt>("input", json!([identity, payload])) {
             Ok(receipt) => self.apply_receipts(&[receipt]),
             Err(_) => {
