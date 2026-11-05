@@ -11,8 +11,9 @@
 
 The README's [Run from source](../README.md#run-from-source) section is the
 quick start; this page is the full reference. Repository tooling is shell
-(POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust; Python
-is only a native build prerequisite of the full Servo dependency graph.
+(POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust. Python 3
+is also required by the Cargo gate, ceditor development/installation scripts,
+experimental hot runner, and the full Servo dependency graph.
 
 ## Prerequisites
 
@@ -45,17 +46,26 @@ Start with the boundary that owns your change:
 
 ```sh
 # Control CLI: no UI, Ghostty, SQLite, or Servo graph.
-cargo check --locked --no-default-features --bin cagents
+scripts/cargo-gate check --locked --no-default-features --bin cagents
 
 # Terminal daemon: Ghostty/PTY host, no UI or Servo graph.
-cargo check --locked --no-default-features --features host --bin cagentsd
+scripts/cargo-gate check --locked --no-default-features --features host --bin cagentsd
 
 # Browserless UI client: libcosmic, no Ghostty or Servo graph.
-cargo check --locked --no-default-features --features ui --bin cagents-ui
+scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
 
 # Integrated UI client: libcosmic and Servo, no Ghostty graph.
-cargo check --locked --features integrated-browser --bin cagents-ui
+scripts/cargo-gate check --locked --features integrated-browser --bin cagents-ui
+
+# Standalone editor: separate package using the browserless UI graph.
+scripts/cargo-gate check --locked --package ceditor --bin ceditor
 ```
+
+Changes to ceditor or shared UI, editor, or notification public contracts also
+require the standalone editor check above. The workspace's
+`default-members = ["."]` selects only cagents: root UI checks and root
+`--all-targets` tests do not compile the downstream ceditor binary. Run the
+ceditor check separately from the CLI, host, and UI checks.
 
 The default `full` feature selects production identity only; `ui`, `host`, and
 `integrated-browser` select implementation graphs. Cargo features are
@@ -64,9 +74,9 @@ that isolation. Build a matched browserless release as three feature-disjoint
 targets:
 
 ```sh
-cargo build --locked --release --no-default-features --bin cagents
-cargo build --locked --release --no-default-features --features host --bin cagentsd
-cargo build --locked --release --no-default-features --features ui --bin cagents-ui
+scripts/cargo-gate build --locked --release --no-default-features --bin cagents
+scripts/cargo-gate build --locked --release --no-default-features --features host --bin cagentsd
+scripts/cargo-gate build --locked --release --no-default-features --features ui --bin cagents-ui
 ```
 
 `cagents`, `cagents-ui`, and `cagentsd` are a matched set and must stay
@@ -118,6 +128,8 @@ scripts/run-development                 # with the embedded browser
 | `--debug` | Opt into local raw stderr tracing/panic output and Rust backtraces (`CAGENTS_LOCAL_DEBUG=1`, `cagents=debug,cagentsd=debug,warn`); an explicit `RUST_LOG` or `RUST_BACKTRACE` takes precedence |
 | `--fresh-daemon` | Stop the existing development daemon, its sessions and background subagents after all three builds succeed, before launching |
 | `--log-file PATH` | Write UI tracing and panic output to `PATH` (relative to the calling directory); build diagnostics stay in the terminal |
+| `--instance NAME` | Run an isolated instance in a headless niri-harness session; see [Parallel instances](#parallel-instances) |
+| `--stop-instance NAME` | Stop that instance's daemon, its jobs and its harness session; keep its storage |
 | `-- ARGS...` | Pass remaining arguments to the UI |
 
 ```sh
@@ -136,10 +148,15 @@ automatically. The runner prints this impact before signaling the daemon.
 
 How the runner works:
 
-- It builds the three sibling executables with separate feature sets and runs
-  the selected UI through Cargo, so configured target directories and target
-  triples are honored. UI-only compilation never builds Ghostty; daemon-only
-  compilation never builds libcosmic or Servo.
+- It builds the three sibling executables with separate feature sets in one
+  slot of the [build gate](#sharing-a-host-between-several-checkouts), then
+  runs them from the target directory Cargo reports, so configured target
+  directories are honored.
+  UI-only compilation never builds Ghostty; daemon-only compilation never
+  builds libcosmic or Servo.
+- A launch with nothing to build skips the gate and starts at once, printing
+  `The matched set is already built for this checkout; skipping the build.`
+  See [Up-to-date launches](#up-to-date-launches).
 - The normal runner enables `integrated-browser` only for the UI; the matched
   CLI and daemon keep the same full-product identity without resolving Servo.
 - It uses the `dev-runtime` profile, which keeps UI dependencies optimized for
@@ -149,7 +166,90 @@ How the runner works:
   `$XDG_RUNTIME_DIR/cagents-development/` daemon, so it runs beside an installed
   production instance.
 - Browserless and integrated development sessions share that state; do not run
-  them at the same time.
+  them at the same time. Use [parallel instances](#parallel-instances) instead.
+
+### Up-to-date launches
+
+Waiting for a build slot only to learn that nothing needs building can take
+minutes on a busy host, so the runner decides first whether the matched set is
+already current. After each successful build it writes a record,
+`.run-development-ui` or `.run-development-integrated-browser`, beside the
+executables in `target/dev-runtime/`. The next launch skips the gate only if
+all of these still hold:
+
+- The lane, `rustc -vV`, the checked-out commit and the Zig toolchain match the
+  record.
+- The build environment matches: `RUST*`, `CARGO_*` (except `CARGO_BUILD_JOBS`
+  and `CARGO_HOME`), the C toolchain and `pkg-config` variables, and every
+  variable a build script asked Cargo to watch.
+- All three executables are the files that build produced.
+- No file changed after the build started: anything in the checkout outside
+  `target/`, `.git/`, `website/`, `dist/` and nested worktrees; any file in
+  the executables' Cargo dependency lists; any absolute path a build script
+  watches, such as the shared repository's Git index; and any Cargo
+  configuration file Cargo would load for the checkout.
+
+Otherwise the launch builds through the gate as before, and Cargo makes the
+real decision. The check never runs Cargo's build, so nothing compiles outside
+a slot. Launching the other lane rebuilds the UI and invalidates this lane's
+record. Delete the record to force the next launch through the gate.
+
+### Parallel instances
+
+Several people or agents can each validate a change in the native app at once
+by giving every run its own instance:
+
+```sh
+scripts/run-development --browserless --instance pr2064
+niri-harness --session cagents-pr2064 observe
+scripts/run-development --instance pr2064 --fresh-daemon   # rebuild and replace it
+scripts/run-development --stop-instance pr2064
+```
+
+An instance name is 1–24 ASCII letters, digits or hyphens. The runner builds
+the matched set as usual, then starts the UI in a headless
+`niri-harness` session named
+`cagents-NAME` and returns once its window maps. Drive and capture it with
+`niri-harness --session cagents-NAME ...`.
+
+| Shared by default | Per instance |
+| --- | --- |
+| Storage `~/.local/share/cagents-development`, config, state | `cagents-development-NAME` under each XDG root, selected by `CAGENTS_DEVELOPMENT_INSTANCE` |
+| Daemon under `$XDG_RUNTIME_DIR/cagents-development/` | The harness session's private runtime directory |
+| Application ID and activation on the session bus | The harness session's private D-Bus |
+
+`CAGENTS_DEVELOPMENT_INSTANCE` only affects development builds; production
+ignores it. The runner sets it for `--instance` and clears it otherwise, so an
+inherited value never selects an instance. Provider accounts and tools keep
+the caller's `HOME`, so an instance's agents use the same provider sign-ins.
+
+The runner starts the session without the caller's `WAYLAND_DISPLAY`,
+`WAYLAND_SOCKET`, `NIRI_SOCKET`, `DISPLAY` and `XAUTHORITY`, and stops an
+instance's daemon through `niri-harness exec`, so nothing it runs for an
+instance can reach the caller's desktop. Agents should also set
+`CAGENTS_DEVELOPMENT_NESTED_ONLY=1`: the runner then refuses to start a UI
+without `--instance` unless it runs inside a session through
+`niri-harness --session NAME exec -- scripts/run-development ...`, so a failed
+nested session cannot put a UI on the user's desktop. It requires a session's
+private `nh-*` runtime directory and no `DISPLAY` or `WAYLAND_SOCKET`, which is
+what `niri-harness exec` provides.
+
+Stopping a harness session deletes its runtime directory, so stop an instance
+with `--stop-instance`, which stops its daemon first. `niri-harness stop` alone
+leaves that daemon running without a socket. An instance's storage remains
+for its next launch; delete `~/.local/share/cagents-development-NAME` and its
+config and state siblings to discard it.
+
+Instances started from one checkout run that checkout's executables, so start
+them all in the same lane: all `--browserless` or all integrated. The two lanes
+write their UI to the same path, and launching the other lane rebuilds it under
+the running instances. Run the other lane from a second checkout.
+
+An idle instance takes about 0.4 GiB: the UI, its daemon, a headless niri
+compositor and the session's portals. Memory rarely limits how many run at
+once; building them does. Each checkout compiles its own matched set through
+`scripts/cargo-gate`. Once a checkout is built, its later launches skip the
+gate and start in seconds; see [Up-to-date launches](#up-to-date-launches).
 
 The browserless UI keeps saved browser descriptors and opens their URLs through
 the system browser instead of compiling Servo.
@@ -223,13 +323,64 @@ implementation alone does not establish native hotpatch acceptance.
 
 ## Build and test resource usage
 
+### Sharing a host between several checkouts
+
+When several agents build on one host, run Cargo through the build gate
+rather than a single global lock:
+
+```sh
+scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
+scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+```
+
+The gate admits a few builds at once: one per 8 GiB of RAM after an 8 GiB
+reserve, at most one per 8 CPUs. A build starts beside others only while
+8 GiB is actually available; one `cagents` build peaked at 6.5 GiB with 12
+jobs. With several slots each build gets an equal
+share of the CPUs as `CARGO_BUILD_JOBS`, which also caps a larger value; `-j`
+still wins. For `test`, `bench` and `run` only the build holds a slot, and the
+tests or program run after it is released, so do not wrap the gate in another
+lock. Rustdoc compiles doctests while they run, so `cargo test --doc` keeps
+its slot throughout; a plain `cargo test` compiles its doctests after the
+slot is released. The development runner builds its matched set through the
+gate itself, and skips the gate when the set is
+[already current](#up-to-date-launches).
+
+The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
+command still run under `flock /var/tmp/cagents-cargo.lock` takes exactly one
+slot. A gated command started under such a lock runs at once in the slot its
+caller holds. Set `CAGENTS_BUILD_SLOTS` to override the count.
+
+To gate a script that runs several Cargo commands, replace
+`flock /var/tmp/cagents-cargo.lock COMMAND` with
+`scripts/cargo-gate exec COMMAND`. It holds one slot until the command exits,
+and gated commands inside it run in that slot. Gating each Cargo command
+instead keeps test runs out of the slot.
+
+Cancelling a held command keeps its slot until the command and its descendants
+have exited. The Linux Python 3 supervisor sends TERM, allows the command one
+shared two-second grace period, then kills and reaps remaining descendants,
+including children that created a separate session. Successful commands may leave background cache
+services running without holding a slot. The regression contract uses private
+locks and owned fixture processes only: `python3 tests/cargo_gate.py -v`.
+
+The feature lanes coexist in one build directory: a no-op check of one lane
+stays a no-op after building the others. With a per-checkout build directory,
+such as `build-dir = "/var/tmp/cargo-build{workspace-root}/target"` in
+`~/.cargo/config.toml`, the cost per worktree is the first build of each lane. On a 24-thread, 60 GiB host
+a cold check took 35 s for the CLI, 53 s for the host, 62 s for the UI and
+126 s for the integrated UI; the single `cagents` crate is most of each.
+
+### Compilation jobs and shared build directories
+
 Repository-local Cargo configuration (`.cargo/config.toml`) defaults to **two
 concurrent compilation jobs**, including `cargo test` and every build in the
 runner. Cargo otherwise uses the logical CPU count, which can create
 substantial RAM pressure on high-core-count or shared machines. Override it
 with standard Cargo controls: `CARGO_BUILD_JOBS` also applies to the runner,
-and `-j` takes precedence for a single invocation. Run the isolated feature
-lanes sequentially, not as concurrent cold builds.
+and `-j` takes precedence for a single invocation; with several build slots,
+`scripts/cargo-gate` sets or caps `CARGO_BUILD_JOBS` to a share of the CPUs.
+Run the isolated feature lanes one after another, each through the gate.
 
 Worktrees can share Cargo's target and build directories. Cargo makes path
 packages relocatable and compares source timestamps, so an older checkout can
@@ -271,7 +422,7 @@ identifying `libsqlite3-sys` as the affected package in a browserless UI check:
 ```sh
 # Explicit maintenance operation: only after evidence identifies this package.
 cargo clean --package libsqlite3-sys
-CARGO_BUILD_JOBS=2 cargo check --locked --no-default-features --features ui --bin cagents-ui
+CARGO_BUILD_JOBS=2 scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
 ```
 
 Use `name@version` if the package name is ambiguous. Preserve the clean output,
@@ -289,7 +440,7 @@ available, though Cargo may rebuild dependents of the selected package.
 CARGO_BUILD_JOBS=1 scripts/run-development --browserless
 
 # Opt into more compilation jobs when system RAM is available.
-cargo check --locked -j 4 --no-default-features --features ui --bin cagents-ui
+scripts/cargo-gate check --locked -j 4 --no-default-features --features ui --bin cagents-ui
 ```
 
 Compilation jobs and test threads are separate controls: `-j` does not
@@ -319,24 +470,29 @@ not being changed.
 
 Optional systemd user scopes receive numeric PIDs in the OS user manager's PID
 namespace. Before submitting one, the daemon connects to the fixed
-`/run/user/UID/systemd/private` peer and requires its kernel credentials, exact
-peer pidfd and active PID namespace to match this caller. The proof retains the
-connection, pidfd and namespace descriptor through the existing user-bus
-request. It does not infer the manager's identity from a bus broker, a nonzero
-peer PID, a hardcoded namespace inode or a numeric `/proc/PID` lookup.
+`/run/user/UID/systemd/private` peer and requires its kernel credentials and
+exact peer pidfd to match this caller. The pidfd's procfs fdinfo must then name
+exactly one PID namespace, ours, read from a procfs whose own view is our
+namespace. The manager holds `CAP_WAKE_ALARM`, so ptrace-gated routes such as
+`PIDFD_GET_PID_NAMESPACE` or `/proc/PID/ns` are denied to the daemon and cannot
+serve as proof. The proof retains the connection and pidfd through the existing
+user-bus request. It does not infer the manager's identity from a bus broker, a
+nonzero peer PID, a hardcoded namespace inode or a numeric `/proc/PID` lookup.
 
 This relies on the existing trusted OS manager and its well-known user-bus
 service routing; it does not protect against a hostile same-user replacement
 of those OS services. The request's routing and launch authority are unchanged.
-If the peer, namespace ioctl or required access cannot be proved, no scope
-request is attempted and ordinary launch is retained without claiming separate
-OOM isolation. An actual request or membership failure in a proved context
+Both namespace reports are read with `openat2` beneath one `/proc` descriptor
+verified as procfs, without crossing mounts or magic links. If the peer or its
+namespace cannot be proved, no scope request is attempted, ordinary launch is
+retained without claiming separate OOM isolation, and the refusal's reason is
+returned to the caller. An actual request or membership failure in a proved context
 still reports failure. Scope-dependent tests report unqualified isolation when
 that same proof is unavailable, and keep their strict membership assertions
 when it is available. Kernel-peer regressions use private Unix sockets without
 submitting requests to the OS manager.
 
-See the [kernel pidfd namespace API](https://github.com/torvalds/linux/blob/master/include/uapi/linux/pidfd.h)
+See the [kernel pidfd fdinfo format](https://github.com/torvalds/linux/blob/master/fs/pidfs.c)
 and [systemd's numeric scope PID handling](https://github.com/systemd/systemd/blob/main/src/core/dbus-scope.c).
 
 ## Testing
@@ -345,29 +501,113 @@ A bare `cargo test` runs only the shared CLI lane: under the default `full`
 feature, the `ui` and `host` unit tests are compiled out. Cargo skips integration
 targets whose required features are absent, rather than compiling and linking
 empty harnesses. The host-only terminal workload example is also skipped outside
-its lane. Cover the boundaries a change touches:
+its lane. Cover the boundaries a change touches; prepare the HOST prerequisites
+below before running that lane:
 
 ```sh
-cargo test --locked --no-default-features --all-targets
-cargo test --locked --no-default-features --features host --all-targets
-cargo test --locked --no-default-features --features ui --all-targets
+scripts/cargo-gate test --locked --no-default-features --all-targets
+scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+scripts/cargo-gate test --locked --no-default-features --features ui --all-targets
 ```
+
+HOST fixtures that exec retained actors require
+`CAGENTS_TEST_RETAINED_ACTOR_HELPER` to name a `cagentsd` built from the same
+checkout and source state as the tests. Build it immediately before testing,
+keeping sources, Cargo environment, target, configuration and any explicit
+profile overrides fixed. Ordinary build and test profile defaults differ as
+expected.
+The existing artifact helper reads Cargo's exact executable path, including
+configured target directories/triples. A matching version alone does not prove
+that two dirty source trees match.
+
+Use a fresh private temporary directory with a short, physical absolute path
+outside Git ancestry: neither it nor any ancestor may contain a `.git` file,
+directory or symlink. For this Linux example, verify that `XDG_RUNTIME_DIR`
+meets those conditions before creating the root. The **final** nested Unix
+socket path must be shorter than 108 bytes, including fixture suffixes. For
+example, `/.tmpXXXXXX/tmp/cagents-codex-<36-byte UUID>/control.sock` adds 79
+bytes, so that layout requires a temporary base of at most 28 bytes. Longer
+fixture layouts need more room; a short base alone is not proof.
+
+```sh
+(
+    TMPDIR=$(mktemp -d "${XDG_RUNTIME_DIR:?}/tXXXXXX") || exit
+    export TMPDIR
+    printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
+    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
+        scripts/cargo-gate exec python3 scripts/build-ceditor-product cagentsd --locked \
+            --no-default-features --features host --bin cagentsd
+    ) || exit
+    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
+    scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+)
+```
+
+A helper build failure prevents the test command. Use the same preparation for
+narrow HOST targets that need retained actors. Keep the temporary root and any
+separately retained fixture evidence until their original children have settled;
+this recipe deliberately installs no automatic deletion trap. Do not change
+socket limits, remove enclosing Git markers or silently select another runtime
+root to make a failed preparation pass.
 
 Prefer the narrow target that covers the changed contract, for example:
 
 ```sh
-cargo test --locked --no-default-features --features host --lib terminal::
-cargo test --locked --no-default-features --features host --test terminal_load_contract
-cargo test --locked --no-default-features --features ui --test session_restore_contract
+scripts/cargo-gate test --locked --no-default-features --features host --lib terminal::
+scripts/cargo-gate test --locked --no-default-features --features host --test terminal_load_contract
+scripts/cargo-gate test --locked --no-default-features --features ui --test session_restore_contract
 ```
+
+The selected IPC source contract can be checked without compiling Rust:
+
+```sh
+scripts/check-protocol-contract
+python3 -I -B tests/protocol_contract.py -v
+scripts/check-protocol-contract --base-ref origin/main
+```
+
+It covers `ClientRequest`, `ServerMessage` and `ServerResponse` in
+`src/terminal/ipc.rs`, `Provider` in `src/agent.rs`, and `Run`, `Summary` and
+`Reply` in `src/agent_execution.rs`. Ordered fields, variants, types, relevant
+attributes and discriminants are recorded as Rust tokens; comments, formatting,
+runtime methods and standard nonserialization derives do not change the record.
+This partial contract covers the parallel protocol-number collisions reported
+in #2119. It is a source guard, not a serializer schema or a wire fingerprint.
+
+When a covered declaration changes, choose a fresh `PROTOCOL_VERSION`, then run
+`scripts/check-protocol-contract --record`. Commit the new
+`tests/fixtures/protocol-contract/<version>.json` alongside the source change.
+Keep old snapshots unchanged. Two branches choosing the same new version add
+the same snapshot path: different contracts cause a Git add/add conflict. After
+combining the source changes, choose another unused version and regenerate its
+snapshot rather than keeping one branch's stale snapshot.
+
+Script CI supplies the PR base or previous main revision from the GitHub event,
+fetching that exact object if the checkout is shallow. The guard refuses changed
+or deleted base snapshots and unbumped selected declarations relative to that
+base, including its first adoption before snapshots existed. A missing base
+fails explicitly. A local check without `--base-ref` confirms the current
+snapshot only; it does not establish historical immutability.
+
+The guard selects by declaration name; it does not resolve modules, imported
+types or aliases, expand macros, evaluate enclosing-module `cfg` or numeric
+expressions, or inspect custom serializers, dependency changes
+and semantic compatibility rules. Changes outside these seven declarations
+still need protocol review and, where applicable, a version bump. Two divergent
+branches cannot detect one another before comparison or merge. The historical
+upgrade inspector's supported-version policy remains a separate decision.
 
 The four named-tree reconciliation contracts share their cases between the root
 UI target and a focused workspace package. For edits confined to vendored
 iced-core tree reconciliation, run the focused package first:
 
 ```sh
-cargo test --locked -p cagents-iced-contracts
+scripts/cargo-gate test --locked -p cagents-iced-contracts
 ```
+
+The same package checks that a rebuilt named widget keeps the native
+accessibility ID it already published, so an assistive-technology action
+queued before the rebuild still reaches it.
 
 The package uses the UI's exact iced-core Git revision; the root Cargo patch
 resolves both targets to `vendor/iced-core`, with the production `a11y` Id
@@ -377,7 +617,7 @@ uninhabited renderer. Retain validation through the UI's concrete renderer when
 changing the tree contract or UI integration:
 
 ```sh
-cargo test --locked --no-default-features --features ui --test iced_tree_reconciliation
+scripts/cargo-gate test --locked --no-default-features --features ui --test iced_tree_reconciliation
 ```
 
 Explicitly selecting a target with required features absent, including through a
@@ -390,13 +630,31 @@ library-suite run does not also create and mutate that filesystem fixture.
 mutations or pathspec handling, include its explicit target:
 
 ```sh
-cargo test --locked --no-default-features --features host --test repository_scale_contract
+scripts/cargo-gate test --locked --no-default-features --features host --test repository_scale_contract
 ```
 
 The fixture retains its disk-backed private namespace, subprocess deadline and
 process-family cleanup checks. Its test count and workload are unchanged.
 
-Run `cargo fmt --check` after Rust edits. For UI changes, launch the real UI with
+Run `scripts/check-format` after Rust edits. It runs `cargo fmt --check` for
+Cargo roots and directly checks `src/modules.rs` and nested Rust-source
+`include!` fragments, which rustfmt does not discover through macro expansion.
+Both stages report their diagnostics and any failure makes the command fail;
+the check never rewrites source or formats vendored packages. When adding a
+Rust-source `include!`, update the explicit list in the script. Its lightweight
+regression is `python3 tests/check_format.py` (mocked command routing and bounded
+real-rustfmt fixtures, with no Cargo/application build). Set
+`CHECK_FORMAT_CARGO_FIXTURE=1` for the additional dependency-free temporary Cargo
+fixture; this still runs only `cargo fmt`, with no application build.
+
+The explicit-source stage can reuse a successful check only when its source,
+configuration, environment and formatter inputs match. Each invocation reads
+formatter binaries and libraries once, then reopens them and checks their full
+file identity before reusing those digests for its second snapshot. No tool
+digest or file-metadata shortcut is retained between invocations. Unverifiable
+inputs run the ordinary formatter instead.
+
+For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
 changes, verify both the browserless and integrated lanes. Performance
 workloads are described in [Performance](performance.md).
@@ -406,7 +664,7 @@ workloads are described in [Performance](performance.md).
 Repeatable upgrade-policy checks:
 
 ```sh
-cargo test --locked --no-default-features --test installer_lifecycle_contract
+scripts/cargo-gate test --locked --no-default-features --test installer_lifecycle_contract
 scripts/smoke-package-upgrades
 ```
 
@@ -417,6 +675,37 @@ packages using the generated maintainer-script contract, checks
 mixed-generation interruption, and preserves unrelated files and fixture user
 data. It does not signal the host daemon or install anything on the host.
 
+## Installing your checkout
+
+`scripts/install-local` replaces your installed cagents with the committed
+`HEAD`:
+
+```sh
+scripts/install-local --build-host fw16
+```
+
+It builds the three matched executables with the `local` Cargo profile,
+versioned `<version>+local.<short sha>`. That profile keeps release identity
+and optimization but skips link-time optimization and single-unit code
+generation. Each build is incremental, so after the first one only changed
+code is recompiled. The script stages the archive with
+`install.sh --stage-only` and runs `cagents daemon upgrade`, which shows each
+affected session and asks before replacing anything. `--stage-only` stops
+after staging so you can finish from the application's update notice instead.
+
+The build runs in the repository's `.worktrees/.install-local`, a detached
+checkout the script owns, so its target directory stays warm and edits in your
+other checkouts never reach the binaries. With `--build-host`, `HEAD` is pushed
+to `refs/cagents/install-local` in the repository at the same path on that host
+and built there. The archive is copied back, and the script refuses it if it
+needs a newer glibc than this machine has. Uncommitted tracked changes are
+refused so that the version names its exact source. If that version is already
+current, the build is skipped. After staging, older `+local` builds are removed,
+except the two most recent and any that a running process still uses.
+
+Published releases still come from `scripts/build-release-linux`; see
+[Releasing](releasing.md).
+
 ## Troubleshooting
 
 | Symptom | What to do |
@@ -424,7 +713,7 @@ data. It does not signal the host daemon or install anything on the host.
 | `required command not found: zig` | Install Zig 0.15.2 and put it on `PATH` (`mise install` reads `mise.toml`). |
 | The UI talks to an old daemon after you changed daemon, host, or IPC code | Relaunch with `--fresh-daemon`. |
 | `development daemon did not stop within 5 seconds` | Look for a lingering development daemon with `pgrep -a cagentsd`, let it exit (or stop that process), then retry `--fresh-daemon`. The socket is `$XDG_RUNTIME_DIR/cagents-development/cagentsd.sock`. |
-| Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and avoid concurrent cold builds; see [resource usage](#build-and-test-resource-usage). |
+| Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and build through `scripts/cargo-gate` rather than starting builds side by side; see [resource usage](#build-and-test-resource-usage). |
 | A UI problem needs logs | Add `--debug --log-file /tmp/cagents-ui.log` and read the file after reproducing. |
 | New links do not open in browserless mode | Install `xdg-utils`, or use a desktop with a working portal. |
 
@@ -448,8 +737,9 @@ source visible alongside an error. Rendering is debounced, uses at most two
 workers, and retains at most 24 diagrams / 32 MiB of pixels per document.
 
 The development runner uses an isolated application and settings identity.
-The editor runner and installer honor `CARGO_BUILD_TARGET` when locating the
-built executable.
+The editor runner and installer require Python 3 to read executable paths from
+Cargo's build output. This honors configured targets and output directories,
+including `build.target` in Cargo configuration and `CARGO_BUILD_TARGET`.
 
 Desktop alerts are sent through the notification portal under the daemon's
 application ID. When the portal accepts that ID, the daemon owns it on the session

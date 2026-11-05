@@ -178,6 +178,47 @@ fn brokered_digest(service: &str, key: &str) -> String {
         .collect()
 }
 
+/// Validate an existing-home operand without interpreting it on this device.
+/// CLI callers retain the original spelling; native fields may trim it first.
+pub(crate) fn validate_linked_home_operand(value: &str) -> Result<(), String> {
+    // The destination's established linker trims text-field input. Refuse an
+    // ambiguous CLI operand rather than silently selecting a different home.
+    if value.trim() != value {
+        return Err("Use an account home without leading or trailing whitespace".into());
+    }
+    if value
+        .strip_prefix("~/")
+        .is_some_and(|relative| Path::new(relative).is_absolute())
+    {
+        return Err("Use one slash after ~ so the account home stays relative to the selected device's home".into());
+    }
+    if value.contains('\0') || !(Path::new(value).is_absolute() || value.starts_with("~/")) {
+        return Err(
+            "Use an absolute account home on the selected device, or one starting with ~/".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Expand only on the device that owns the account registry. An absolute
+/// remainder after ~/ would replace HOME during Path::join, so reject it first.
+#[cfg(any(feature = "ui", feature = "host", test))]
+pub(crate) fn expand_linked_home(
+    value: &str,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    validate_linked_home_operand(value)?;
+    let path = if let Some(relative) = value.strip_prefix("~/") {
+        PathBuf::from(home.ok_or("HOME is unavailable")?).join(relative)
+    } else {
+        PathBuf::from(value)
+    };
+    if !path.is_absolute() {
+        return Err("Use an absolute account home on the selected device".into());
+    }
+    Ok(path)
+}
+
 /// The environment variable a provider's CLI reads its home from.
 pub fn home_variable(provider: Provider) -> Option<&'static str> {
     match provider {
@@ -1072,6 +1113,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linked_home_expansion_keeps_destination_home_and_refuses_absolute_remainders() {
+        use std::ffi::OsStr;
+        let destination = OsStr::new("/selected-device/home");
+        // The defect selected /other/account instead of the chosen device HOME.
+        assert_eq!(
+            Path::new(destination).join("/other/account"),
+            Path::new("/other/account")
+        );
+        for value in [
+            "~//other/account",
+            "~///other/account",
+            "relative/account",
+            "",
+            "~/bad\0home",
+        ] {
+            assert!(
+                expand_linked_home(value, Some(destination)).is_err(),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            expand_linked_home("~/account homes/work", Some(destination)).unwrap(),
+            Path::new("/selected-device/home/account homes/work")
+        );
+        assert_eq!(
+            expand_linked_home("/explicit/other home", None).unwrap(),
+            Path::new("/explicit/other home")
+        );
+        assert_eq!(
+            expand_linked_home("~/", Some(destination)).unwrap(),
+            Path::new("/selected-device/home")
+        );
+        assert!(expand_linked_home("~/account", None).is_err());
+        assert!(expand_linked_home("~/account", Some(OsStr::new("relative/home"))).is_err());
+        // Neither UI normalization nor CLI validation may rebind the operand.
+        assert_eq!(
+            expand_linked_home("  ~/account homes/work  ".trim(), Some(destination)).unwrap(),
+            Path::new("/selected-device/home/account homes/work")
+        );
+        assert!(validate_linked_home_operand("  ~/account homes/work  ").is_err());
+        assert!(validate_linked_home_operand("~/account homes/work").is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let home = OsStr::from_bytes(b"/selected-device/\xff");
+            assert_eq!(
+                expand_linked_home("~/account", Some(home)).unwrap(),
+                Path::new(home).join("account")
+            );
+        }
+    }
+
+    #[test]
     fn managed_identity_requires_exact_provider_and_canonical_uuid_path() {
         let root = Path::new("/installation/accounts");
         let key = uuid::Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap();
@@ -1359,6 +1453,7 @@ mod tests {
         const CHILD: &str = "CAGENTS_TEST_DETACH_SELECTIONS";
         if std::env::var_os(CHILD).is_none() {
             let key = uuid::Uuid::new_v4();
+            // Preserve the caller's scope; override only these fixture inputs.
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1366,7 +1461,6 @@ mod tests {
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env_clear()
                 .env(CHILD, "1")
                 .env("HOME", "/home/a")
                 .env("CODEX_HOME", format!("/data/accounts/codex/{key}"))

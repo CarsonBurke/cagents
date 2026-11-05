@@ -22,7 +22,11 @@ impl Runtime {
     }
     pub(super) fn active_auth_notice(&self, anchor: &Option<String>, message: &str) -> bool {
         self.auth_error().is_some()
-            && anchor.as_deref() == self.turns.last().map(|turn| turn.key.as_str())
+            && failure::same_prompt(
+                self.session.launch.provider,
+                anchor.as_deref(),
+                self.notice_anchor(&self.snapshot, &self.turns),
+            )
             && chat::requires_sign_in(self.session.launch.provider, message)
     }
     fn recovery_available(&self) -> bool {

@@ -88,9 +88,10 @@ mod tests {
         assert!(find.background_results);
         assert_eq!(find.schedule_refresh(latest), None);
         assert!(!find.begin_refresh(pending, latest));
-        assert!(find
-            .schedule_refresh(SearchContent::of(&output_snapshot(4)))
-            .is_some());
+        assert!(
+            find.schedule_refresh(SearchContent::of(&output_snapshot(4)))
+                .is_some()
+        );
     }
 
     #[test]
@@ -113,7 +114,10 @@ mod tests {
         let pending = find.schedule_refresh(SearchContent::of(&snapshot)).unwrap();
         assert!(find.begin_refresh(pending, SearchContent::of(&snapshot)));
         snapshot.scroll.total += 1;
-        assert!(find.schedule_refresh(SearchContent::of(&snapshot)).is_some());
+        assert!(
+            find.schedule_refresh(SearchContent::of(&snapshot))
+                .is_some()
+        );
     }
 
     #[test]
@@ -238,12 +242,24 @@ mod tests {
                 TerminalId::new(),
             )),
         );
-        app.terminal_find.insert(card, Find { open: true, ..Find::default() });
-        drop(app.update(Message::KeyEvent { event: escape_event(), captured: true }));
+        app.terminal_find.insert(
+            card,
+            Find {
+                open: true,
+                ..Find::default()
+            },
+        );
+        drop(app.update(Message::KeyEvent {
+            event: escape_event(),
+            captured: true,
+        }));
         assert!(app.terminal_find[&card].open);
         // With no focused field answering the key, Escape on the terminal
         // surface still closes its open find bar.
-        drop(app.update(Message::KeyEvent { event: escape_event(), captured: false }));
+        drop(app.update(Message::KeyEvent {
+            event: escape_event(),
+            captured: false,
+        }));
         assert!(!app.terminal_find[&card].open);
     }
 
@@ -251,12 +267,21 @@ mod tests {
     fn focused_terminal_find_closes_on_its_first_escape_before_native_blur() {
         use cosmic::iced::{
             Event, Rectangle,
-            advanced::{Layout, Shell, clipboard, layout, widget::{Tree, operation}},
+            advanced::{
+                Layout, Shell, clipboard, layout,
+                widget::{Tree, operation},
+            },
             mouse,
         };
         let mut app = super::super::tests::context_inspector_test_app(false);
         let card = CardId::new();
-        app.terminal_find.insert(card, Find { open: true, ..Find::default() });
+        app.terminal_find.insert(
+            card,
+            Find {
+                open: true,
+                ..Find::default()
+            },
+        );
         let renderer = super::super::tests::headless_renderer();
         let mut element = app.terminal_find_view(card).unwrap();
         let mut tree = Tree::new(&element);
@@ -289,10 +314,11 @@ mod tests {
             message,
             Message::TerminalFind(Action::Close(target)) if *target == card
         )));
-        assert!(!published.iter().any(|message| matches!(
-            message,
-            Message::TerminalFind(Action::Focus(_, false))
-        )));
+        assert!(
+            !published
+                .iter()
+                .any(|message| matches!(message, Message::TerminalFind(Action::Focus(_, false))))
+        );
     }
 
     #[test]
@@ -762,7 +788,9 @@ impl Cagents {
         let previous = find.matches.get(find.selected).copied();
         let background = std::mem::take(&mut find.background_results);
         let selected = background
-            .then(|| previous.and_then(|previous| matches.iter().position(|item| *item == previous)))
+            .then(|| {
+                previous.and_then(|previous| matches.iter().position(|item| *item == previous))
+            })
             .flatten()
             .unwrap_or_else(|| {
                 if background {

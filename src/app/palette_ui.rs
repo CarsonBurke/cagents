@@ -920,6 +920,77 @@ impl Cagents {
         )
     }
 
+    /// Reopens this exact closed pane, including after its channel's retirement
+    /// settles. A later close must never change the intent being replayed.
+    pub(super) fn reopen_closed_pane(&mut self, id: CardId) -> Task<Message> {
+        let Some(index) = self
+            .recently_closed
+            .iter()
+            .position(|(card, _)| card.id == id)
+        else {
+            return Task::none();
+        };
+        let scope = self.active_workspace_destination();
+        let (card, saved_scope) = self.recently_closed[index].clone();
+        if let CardKind::Chat(session) = &card.kind
+            && session.launch.session_id.is_some()
+        {
+            let task = self.resume_saved_conversation(crate::persistence::SavedConversation {
+                card: card.id,
+                title: card.title.clone(),
+                session: session.clone(),
+                open: false,
+                updated_at_unix_ms: crate::chat::now_ms().unwrap_or(0) as i64,
+            });
+            return task;
+        }
+        if let Some(home @ channel_ui::ClosedCardHome::Pending(_)) = self.closed_card_home(card.id)
+        {
+            return self
+                .defer_channel_reopen(home, channel_ui::Reopen::Pane(card.id))
+                .unwrap_or_else(Task::none);
+        }
+        if card.kind.is_utility() {
+            self.recently_closed.remove(index);
+            return self.open_utility_card(card.kind);
+        }
+        // Close retires the old card's filing. The matching saved
+        // destination identifies the workspace being reopened in;
+        // channel membership is restored separately on insertion, into
+        // the channel entered here.
+        let mut previous = (None, None);
+        let (owner, scope, revived) = match saved_scope {
+            Some(WorkspaceDestination::Worktree(_) | WorkspaceDestination::Folder(_)) => {
+                (self.active_workspace.clone(), Task::none(), None)
+            }
+            Some(WorkspaceDestination::Channel(id)) => {
+                previous = (self.durable.active_channel, self.active_workspace.clone());
+                let home = self.closed_channel_home(id);
+                let revived = match home {
+                    Some(channel_ui::ClosedCardHome::Retired(retired)) => Some(retired),
+                    _ => None,
+                };
+                match home.and_then(|home| self.enter_closed_card_home(home)) {
+                    Some(entered) => (None, entered, revived),
+                    // Closed in the strip on screen, which takes it back.
+                    None if saved_scope == scope => (None, Task::none(), None),
+                    // Its channel could not be brought back, and the
+                    // pane belongs nowhere else.
+                    None => return Task::none(),
+                }
+            }
+            None => (None, Task::none(), None),
+        };
+        self.recently_closed.remove(index);
+        let reopened = self.duplicate_pane_in_scope(card, owner);
+        // A pane that cannot be cloned, or that opens outside the
+        // window, leaves a revived channel with nothing in it.
+        let abandoned = revived.map_or_else(Task::none, |retired| {
+            self.abandon_empty_revival(retired, previous)
+        });
+        Task::batch([scope, reopened, abandoned])
+    }
+
     pub(super) fn run_workspace_command(
         &mut self,
         command: Command,
@@ -1002,42 +1073,16 @@ impl Cagents {
             }
             Command::ReopenPane => {
                 let scope = self.active_workspace_destination();
-                let Some(index) = self
-                    .recently_closed
-                    .iter()
-                    .rposition(|(_, saved_scope)| *saved_scope == scope)
-                else {
+                // The latest pane closed here, or in a channel that retired
+                // when it closed, which reopening brings back.
+                let Some(index) = self.recently_closed.iter().rposition(|(_, saved_scope)| {
+                    *saved_scope == scope
+                        || matches!(saved_scope, Some(WorkspaceDestination::Channel(id))
+                            if self.closed_channel_reopens_from(*id, scope))
+                }) else {
                     return Task::none();
                 };
-                let (card, saved_scope) = self.recently_closed[index].clone();
-                if let CardKind::Chat(session) = &card.kind
-                    && session.launch.session_id.is_some()
-                {
-                    let task =
-                        self.resume_saved_conversation(crate::persistence::SavedConversation {
-                            card: card.id,
-                            title: card.title.clone(),
-                            session: session.clone(),
-                            open: false,
-                            updated_at_unix_ms: crate::chat::now_ms().unwrap_or(0) as i64,
-                        });
-                    return task;
-                }
-                self.recently_closed.remove(index);
-                if card.kind.is_utility() {
-                    self.open_utility_card(card.kind)
-                } else {
-                    // Close retires the old card's filing. The matching saved
-                    // destination identifies the workspace being reopened in;
-                    // channel membership is restored separately on insertion.
-                    let owner = match saved_scope {
-                        Some(
-                            WorkspaceDestination::Worktree(_) | WorkspaceDestination::Folder(_),
-                        ) => self.active_workspace.clone(),
-                        Some(WorkspaceDestination::Channel(_)) | None => None,
-                    };
-                    self.duplicate_pane_in_scope(card, owner)
-                }
+                self.reopen_closed_pane(self.recently_closed[index].0.id)
             }
             Command::FocusPane1
             | Command::FocusPane2
@@ -1821,22 +1866,38 @@ mod tests {
                 matches!(entry.2, Message::Palette(Action::FocusPane(id)) if id == target)
             }).unwrap();
             let held = Message::Palette(Action::Run(MessageBox(Box::new(selected))));
-            let before = (app.active_workspace.clone(), app.durable.active_channel,
-                app.workspace.order().collect::<Vec<_>>(), app.workspace.focused(),
-                app.settings.palette_recents.clone());
+            let before = (
+                app.active_workspace.clone(),
+                app.durable.active_channel,
+                app.workspace.order().collect::<Vec<_>>(),
+                app.workspace.focused(),
+                app.settings.palette_recents.clone(),
+            );
             let (response, _) = std::sync::mpsc::sync_channel(1);
             drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
-                action: instance::UiUpdateAction::Prepare, response,
+                action: instance::UiUpdateAction::Prepare,
+                response,
             })));
-            assert!(app.update_prepared, "real Prepare admitted the palette-open window");
+            assert!(
+                app.update_prepared,
+                "real Prepare admitted the palette-open window"
+            );
             drop(app.update(held.clone()));
-            assert_eq!((app.active_workspace.clone(), app.durable.active_channel,
-                app.workspace.order().collect::<Vec<_>>(), app.workspace.focused(),
-                app.settings.palette_recents.clone()), before);
+            assert_eq!(
+                (
+                    app.active_workspace.clone(),
+                    app.durable.active_channel,
+                    app.workspace.order().collect::<Vec<_>>(),
+                    app.workspace.focused(),
+                    app.settings.palette_recents.clone()
+                ),
+                before
+            );
             assert_eq!(app.palette.query.as_deref(), Some("@held pane"));
             let (response, receiver) = std::sync::mpsc::sync_channel(1);
             drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
-                action: instance::UiUpdateAction::Cancel, response,
+                action: instance::UiUpdateAction::Cancel,
+                response,
             })));
             assert_eq!(receiver.try_recv().unwrap(), "ok");
             drop(app.update(held));
@@ -1922,7 +1983,8 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards.insert(0, other);
         assert_eq!(app.card_state(id).unwrap().id, id);
         assert_eq!(app.card_state_mut(id).unwrap().id, id);
-    }    #[test]
+    }
+    #[test]
     fn move_picker_ranks_destinations_and_keeps_category_prefixes_literal() {
         let mut app = settings_focus_fixture();
         let card = app.workspace.focused().unwrap();

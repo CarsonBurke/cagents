@@ -82,11 +82,13 @@ impl Cagents {
                     .iter()
                     .find(|candidate| candidate.repository == project)
                 {
-                    Some(project) => self.update(Message::Sidebar(SidebarAction::OpenPullRequest {
-                        project_id: project.id,
-                        number,
-                        url,
-                    })),
+                    Some(project) => {
+                        self.update(Message::Sidebar(SidebarAction::OpenPullRequest {
+                            project_id: project.id,
+                            number,
+                            url,
+                        }))
+                    }
                     None => self.open_clicked_link(url),
                 }
             }
@@ -99,6 +101,7 @@ impl Cagents {
                 self.handle_chat_ui(chat_ui::Action::OpenSession(session.to_string()))
             }
             Effect::Copy(text) => {
+                chat_ui::invalidate_copy_intent();
                 self.status = Some(TransientNotice::success(format!("Copied {text}")));
                 iced::clipboard::write(text).map(cosmic::Action::App)
             }
@@ -180,8 +183,8 @@ fn watch(
     // Never start a daemon merely to watch it; the window starts one as soon
     // as it needs one, and this reconnects then.
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let mut client = crate::control::ControlClient::connect(&socket)
-        .map_err(|error| error.to_string())?;
+    let mut client =
+        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
     *hangup.lock().unwrap_or_else(|p| p.into_inner()) =
         Some(client.hangup().map_err(|error| error.to_string())?);
     // The pane closed while this connected.

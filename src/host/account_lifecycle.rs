@@ -130,7 +130,10 @@ impl Home {
 
 /// Walk the actual directory parent chain through descriptors. Lexical
 /// aliases can change when a reserved home/provider parent is renamed.
-pub(super) fn physical_ancestors(path: &Path, pin: Option<&File>) -> Result<BTreeSet<(u64, u64)>, String> {
+pub(super) fn physical_ancestors(
+    path: &Path,
+    pin: Option<&File>,
+) -> Result<BTreeSet<(u64, u64)>, String> {
     let mut cursor = if let Some(pin) = pin {
         pin.try_clone().map_err(|error| error.to_string())?
     } else {

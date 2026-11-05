@@ -107,7 +107,11 @@ pub(super) enum Outcome {
     Failed(String),
 }
 
-pub(super) fn poll(target: &Target, memory: &mut Memory, cancellation: &CancellationToken) -> Outcome {
+pub(super) fn poll(
+    target: &Target,
+    memory: &mut Memory,
+    cancellation: &CancellationToken,
+) -> Outcome {
     match read(target, memory, cancellation) {
         Ok(Some(snapshot)) => Outcome::Synced(snapshot),
         Ok(None) => Outcome::NotGitHub,
@@ -165,16 +169,22 @@ fn read(
     };
     let (authored, open) = std::thread::scope(|scope| {
         let open = scope.spawn(|| {
-            gh.list_authored(&request(PullRequestStateFilter::Open, OPEN, true), cancellation)
+            gh.list_authored(
+                &request(PullRequestStateFilter::Open, OPEN, true),
+                cancellation,
+            )
         });
-        let authored =
-            gh.list_authored(&request(PullRequestStateFilter::All, AUTHORED, false), cancellation);
+        let authored = gh.list_authored(
+            &request(PullRequestStateFilter::All, AUTHORED, false),
+            cancellation,
+        );
         (
             authored,
-            open.join()
-                .unwrap_or_else(|_| Err(crate::github::GitHubError::Inspection(
+            open.join().unwrap_or_else(|_| {
+                Err(crate::github::GitHubError::Inspection(
                     "the open pull request listing panicked".into(),
-                ))),
+                ))
+            }),
         )
     });
     let authored = authored.map_err(|error| error.to_string())?;
@@ -192,10 +202,7 @@ fn read(
         .others
         .retain(|branch, _| target.checked_out.iter().any(|(_, name, _)| name == branch));
     for (worktree, branch, oid) in &target.checked_out {
-        if snapshot
-            .for_branch(branch, Some(oid))
-            .is_some()
-        {
+        if snapshot.for_branch(branch, Some(oid)).is_some() {
             memory.others.remove(branch);
             continue;
         }
@@ -212,7 +219,8 @@ fn read(
             Some((_, _, found)) => found.clone(),
             None if looked_up < OTHERS_PER_POLL => {
                 looked_up += 1;
-                let Some(head) = crate::github::worktree_head_repository(worktree, branch, cancellation)
+                let Some(head) =
+                    crate::github::worktree_head_repository(worktree, branch, cancellation)
                 else {
                     memory
                         .others
@@ -220,7 +228,8 @@ fn read(
                     continue;
                 };
                 // A lookup that fails is retried next poll; the cards stand.
-                let Ok(found) = gh.resolve_branch_head(&repository, &head, branch, oid, cancellation)
+                let Ok(found) =
+                    gh.resolve_branch_head(&repository, &head, branch, oid, cancellation)
                 else {
                     continue;
                 };
@@ -291,7 +300,13 @@ mod tests {
     use super::*;
     use crate::github::RemoteValue;
 
-    fn pull_request(number: u64, branch: &str, oid: &str, state: &str, updated: &str) -> PullRequest {
+    fn pull_request(
+        number: u64,
+        branch: &str,
+        oid: &str,
+        state: &str,
+        updated: &str,
+    ) -> PullRequest {
         serde_json::from_value(serde_json::json!({
             "number": number,
             "title": format!("PR {number}"),

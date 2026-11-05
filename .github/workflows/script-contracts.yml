@@ -1,0 +1,251 @@
+name: Script contracts
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: script-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTUP_TOOLCHAIN: 1.93.0
+  RUSTUP_AUTO_INSTALL: "0"
+  PYTHONDONTWRITEBYTECODE: "1"
+  CARGO_NET_OFFLINE: "true"
+  EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  contracts:
+    name: Script contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Install the pinned formatter
+        run: |
+          rustup toolchain install 1.93.0 --profile minimal --component rustfmt
+          format_toolchain_bin=$(dirname "$(rustup which --toolchain 1.93.0 cargo)")
+          printf '%s\n' "$format_toolchain_bin" >> "$GITHUB_PATH"
+
+      - name: Verify source and required tools
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          git rev-parse HEAD 'HEAD^{tree}'
+          sha256sum scripts/run-development tests/run-development-zig.py \
+            scripts/check-format scripts/check-format-cache.py tests/check_format.py mise.toml
+          for format_tool in git cargo rustc rustfmt rustup sh python3; do
+            command -v "$format_tool"
+          done
+          python3 - <<'PY'
+          import sys
+          import tomllib
+          assert sys.version_info >= (3, 11), "Python 3.11+ is required for TOML contract coverage"
+          print(sys.version)
+          PY
+          case "$(cargo --version)" in
+            "cargo 1.93.0 "*) ;;
+            *) printf '%s\n' 'Cargo must use the pinned Rust 1.93.0 toolchain' >&2; exit 1 ;;
+          esac
+          case "$(rustc --version)" in
+            "rustc 1.93.0 "*) ;;
+            *) printf '%s\n' 'Rust must use the pinned 1.93.0 toolchain' >&2; exit 1 ;;
+          esac
+          cargo --version
+          rustfmt --version
+
+      - name: Check Cargo gate source and contracts
+        run: |
+          python3 -I -B - <<'PY'
+          from pathlib import Path
+          import stat
+          import subprocess
+          import sys
+
+          def present(path):
+              current = Path()
+              for index, part in enumerate(path.parts):
+                  current /= part
+                  try:
+                      mode = current.lstat().st_mode
+                  except FileNotFoundError:
+                      return False
+                  expected = stat.S_ISREG if index == len(path.parts) - 1 else stat.S_ISDIR
+                  if not expected(mode):
+                      print(f"Invalid contract path: {current} must be a regular file or real directory, never a symlink", file=sys.stderr)
+                      raise SystemExit(2)
+              return True
+
+          gate = Path("scripts/cargo-gate")
+          source = Path("scripts/cargo-gate-command.py")
+          fixture = Path("tests/cargo_gate.py")
+          gate_present = present(gate)
+          source_present = present(source)
+          fixture_present = present(fixture)
+          if source_present != fixture_present:
+              print(f"Incomplete contract pair: {source} and {fixture} must both exist", file=sys.stderr)
+              raise SystemExit(2)
+          if source_present and not gate_present:
+              print(f"Incomplete Cargo gate: {gate} is required by {source} and {fixture}", file=sys.stderr)
+              raise SystemExit(2)
+          runner = Path("scripts/run-development")
+          if not gate_present and present(runner) and b"scripts/cargo-gate" in runner.read_bytes():
+              print(f"Incomplete Cargo gate: {runner} references missing {gate}", file=sys.stderr)
+              raise SystemExit(2)
+          if gate_present and not source_present and b"cargo-gate-command.py" in gate.read_bytes():
+              print(f"Incomplete Cargo gate: {gate} references missing {source} and {fixture}", file=sys.stderr)
+              raise SystemExit(2)
+          if gate_present:
+              print("Checking: Cargo gate source", flush=True)
+              paths = [str(gate)]
+              if source_present:
+                  paths.extend((str(source), str(fixture)))
+              for command in (["sha256sum", *paths], ["sh", "-n", str(gate)]):
+                  result = subprocess.run(command)
+                  if result.returncode:
+                      raise SystemExit(result.returncode)
+          else:
+              print("Not applicable: Cargo gate (source absent at this head)", flush=True)
+          if not source_present:
+              print("Not applicable: held-command cancellation (source and fixture both absent at this head)", flush=True)
+          else:
+              print("Checking: held-command cancellation", flush=True)
+              result = subprocess.run([sys.executable, "-I", "-B", str(fixture), "-v"])
+              if result.returncode:
+                  raise SystemExit(result.returncode)
+          PY
+
+      - name: Check selected IPC source contract
+        env:
+          PROTOCOL_CONTRACT_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python3 -I -B - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import stat
+          import subprocess
+          import sys
+
+          def present(path, directory=False):
+              current = Path()
+              for index, part in enumerate(path.parts):
+                  current /= part
+                  try:
+                      mode = current.lstat().st_mode
+                  except FileNotFoundError:
+                      return False
+                  expected = stat.S_ISDIR if directory or index < len(path.parts) - 1 else stat.S_ISREG
+                  if not expected(mode):
+                      print(f"Invalid contract path: {current} must be a regular file or real directory, never a symlink", file=sys.stderr)
+                      raise SystemExit(2)
+              return True
+
+          paths = [Path(path) for path in (
+              "scripts/check-protocol-contract",
+              "scripts/protocol_contract_source.py",
+              "tests/protocol_contract.py",
+          )]
+          exists = [present(path) for path in paths]
+          ledger_present = present(Path("tests/fixtures/protocol-contract"), directory=True)
+          if not any(exists) and not ledger_present:
+              print("Not applicable: selected IPC source contract (guard and fixtures absent at this head)", flush=True)
+              raise SystemExit(0)
+          if not all(exists) or not ledger_present:
+              print("Incomplete protocol contract: checker, source lexer, tests and snapshot directory must all exist", file=sys.stderr)
+              raise SystemExit(2)
+          base = os.environ.get("PROTOCOL_CONTRACT_BASE_SHA", "")
+          if not re.fullmatch(r"[0-9a-f]{40}", base) or base == "0" * 40:
+              print("A trusted event comparison base is required for the protocol contract", file=sys.stderr)
+              raise SystemExit(2)
+          if subprocess.run(["git", "cat-file", "-e", f"{base}^{{commit}}"], stderr=subprocess.DEVNULL).returncode:
+              result = subprocess.run(["git", "fetch", "--no-tags", "--depth=1", "origin", base])
+              if result.returncode:
+                  raise SystemExit(result.returncode)
+          for command in (
+              ["sha256sum", *(str(path) for path in paths)],
+              [sys.executable, "-I", "-B", str(paths[2]), "-v"],
+              [sys.executable, "-I", "-B", str(paths[0]), "--base-ref", base],
+          ):
+              result = subprocess.run(command)
+              if result.returncode:
+                  raise SystemExit(result.returncode)
+          PY
+
+      - name: Check Zig discovery contracts
+        run: python3 tests/run-development-zig.py -v
+
+      - name: Check installer coordinator extraction contracts
+        run: python3 tests/installer_coordinator.py -v
+
+      - name: Check validation checkout and process custody contracts
+        run: |
+          python3 -I -B - <<'PY'
+          from pathlib import Path
+          import stat
+          import subprocess
+          import sys
+
+          def present(path):
+              current = Path()
+              for index, part in enumerate(path.parts):
+                  current /= part
+                  try:
+                      mode = current.lstat().st_mode
+                  except FileNotFoundError:
+                      return False
+                  expected = stat.S_ISREG if index == len(path.parts) - 1 else stat.S_ISDIR
+                  if not expected(mode):
+                      print(f"Invalid contract path: {current} must be a regular file or real directory, never a symlink", file=sys.stderr)
+                      raise SystemExit(2)
+              return True
+
+          for name, source, fixture in (
+              ("validation checkout", "scripts/prepare-validation-checkout", "tests/prepare_validation_checkout.py"),
+              ("process custody", "scripts/qualification/process_custody.py", "tests/qualification/test_process_custody.py"),
+          ):
+              source_present = present(Path(source))
+              fixture_present = present(Path(fixture))
+              if not source_present and not fixture_present:
+                  print(f"Not applicable: {name} (source and fixture both absent at this head)", flush=True)
+                  continue
+              if not source_present or not fixture_present:
+                  print(f"Incomplete contract pair: {source} and {fixture} must both exist", file=sys.stderr)
+                  raise SystemExit(2)
+              print(f"Checking: {name}", flush=True)
+              result = subprocess.run([sys.executable, "-I", "-B", fixture, "-v"])
+              if result.returncode:
+                  raise SystemExit(result.returncode)
+          PY
+
+      - name: Check all formatter contracts
+        env:
+          CHECK_FORMAT_CARGO_FIXTURE: "1"
+        run: python3 tests/check_format.py -v
+
+      - name: Check shell syntax
+        run: |
+          sh -n scripts/run-development
+          sh -n scripts/check-format
+
+      - name: Check repository formatting
+        run: scripts/check-format
+
+      - name: Verify the source remains unchanged
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
