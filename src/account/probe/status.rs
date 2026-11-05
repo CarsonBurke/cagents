@@ -3,6 +3,7 @@
 //! It never requests quota, models, a provider turn, login or logout.
 
 use std::{
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -10,7 +11,7 @@ use std::{
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use super::{OUTPUT_LIMIT, Session, TIMEOUT, codex_response, command};
+use super::{OUTPUT_LIMIT, Session, TIMEOUT, codex_response, command_with_path};
 use crate::{
     account::{Account, Identity},
     agent::Provider,
@@ -34,9 +35,12 @@ pub(crate) enum LoginStatus {
 /// Only an exact sealed subject/program pair may enter the recovery spawn
 /// path. The spawn hook independently revalidates the permit and command at
 /// the actual process-creation boundary, including executable-busy retries.
+/// `search_path` is the owned snapshot used to select `program`; it is never
+/// refreshed between the managed and System status requests.
 pub(crate) async fn run(
     account: Account,
     program: PathBuf,
+    search_path: Option<OsString>,
     permit: RecoveryStatusPermit,
 ) -> Result<LoginStatus, String> {
     if !program.is_absolute()
@@ -50,8 +54,8 @@ pub(crate) async fn run(
     let _operation = permit.clone();
     tokio::time::timeout(TIMEOUT, async move {
         match account.provider {
-            Provider::Claude => claude(account, program, permit).await,
-            Provider::Codex => codex(account, program, permit).await,
+            Provider::Claude => claude(account, program, search_path, permit).await,
+            Provider::Codex => codex(account, program, search_path, permit).await,
             Provider::Omp => Err("This provider manages its own account homes".into()),
         }
     })
@@ -65,9 +69,10 @@ pub(crate) async fn run(
 async fn claude(
     account: Account,
     program: PathBuf,
+    search_path: Option<OsString>,
     permit: RecoveryStatusPermit,
 ) -> Result<LoginStatus, String> {
-    let mut command = status_command(&account, &program)?;
+    let mut command = status_command_with_path(&account, &program, search_path.as_deref())?;
     command.args(["auth", "status", "--json"]);
     let mut group = Process::spawn(command, permit).await?;
     // The extra byte distinguishes an oversized document from a valid JSON
@@ -99,9 +104,10 @@ async fn claude(
 async fn codex(
     account: Account,
     program: PathBuf,
+    search_path: Option<OsString>,
     permit: RecoveryStatusPermit,
 ) -> Result<LoginStatus, String> {
-    let mut command = status_command(&account, &program)?;
+    let mut command = status_command_with_path(&account, &program, search_path.as_deref())?;
     command.arg("app-server").stdin(Stdio::piped());
     let mut group = Process::spawn(command, permit).await?;
     let stdin = group.stdin.take();
@@ -170,8 +176,21 @@ fn status_output_within_limit(session: &mut StatusSession) -> Result<(), String>
     Ok(())
 }
 
+#[cfg(test)]
 fn status_command(account: &Account, program: &Path) -> Result<tokio::process::Command, String> {
-    let mut command = command(account, program);
+    // Process ownership fixtures supply an absolute fake program and never
+    // resolve a provider or ask the shell for PATH.
+    status_command_with_path(account, program, None)
+}
+
+fn status_command_with_path(
+    account: &Account,
+    program: &Path,
+    search_path: Option<&OsStr>,
+) -> Result<tokio::process::Command, String> {
+    // This is the same snapshot used to select program, not a later shell
+    // refresh that could pair an old CLI with a different Node installation.
+    let mut command = command_with_path(account, program, search_path);
     let variable = crate::account::home_variable(account.provider)
         .ok_or_else(|| "This provider has no account status home".to_owned())?;
     let home = account

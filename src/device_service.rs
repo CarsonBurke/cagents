@@ -1693,6 +1693,9 @@ mod request_tests;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountSnapshot {
     pub registry: crate::account::registry::Registry,
+    /// Read-only managed-home hints, never a confirmed account identity.
+    #[serde(default)]
+    pub(crate) preserved: crate::account::recovery::Discovery,
     pub homes: Option<crate::account::home::Homes>,
     pub system_homes: std::collections::BTreeMap<crate::agent::Provider, PathBuf>,
     pub entries: std::collections::BTreeMap<String, crate::account::cache::Entry>,
@@ -1740,6 +1743,7 @@ fn accounts() -> Result<Reply, String> {
         .collect();
     let snapshot = AccountSnapshot {
         cache_keys,
+        preserved: crate::account::recovery::Discovery::read(homes.as_ref(), &registry),
         registry,
         homes,
         system_homes: crate::account::Account::PROVIDERS
@@ -1929,6 +1933,32 @@ mod wire_tests {
         assert_eq!(&decoded, value);
         let json = serde_json::to_value(value).unwrap();
         assert_eq!(serde_json::from_value::<T>(json).unwrap(), *value);
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn account_snapshot_discovery_is_additive_json_metadata() {
+        let legacy = serde_json::json!({
+            "registry": crate::account::registry::Registry::default(),
+            "homes": null, "system_homes": {}, "entries": {},
+            "catalogs": {}, "installed": {}
+        });
+        let snapshot: AccountSnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(snapshot.preserved.candidates.is_empty());
+        assert!(snapshot.preserved.problem.is_none());
+        let candidate = crate::account::recovery::Candidate {
+            provider: Provider::Claude,
+            key: uuid::Uuid::from_u128(2118),
+        };
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        value["preserved"] = serde_json::to_value(crate::account::recovery::Discovery {
+            candidates: vec![candidate.clone()],
+            problem: None,
+        })
+        .unwrap();
+        roundtrip(&Reply::Accounts(value.clone()));
+        let decoded: AccountSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.preserved.candidates, vec![candidate]);
     }
 
     #[test]

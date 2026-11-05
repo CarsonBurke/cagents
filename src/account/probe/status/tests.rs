@@ -383,6 +383,87 @@ fn provider_identity_rejects_control_characters_inside_the_address() {
     }
 }
 
+#[test]
+fn prepared_status_commands_keep_the_selected_executable_and_path_for_both_subjects() {
+    use std::{ffi::OsStr, path::Path};
+
+    use crate::{account::AccountHome, agent::Provider};
+
+    let selected = std::ffi::OsString::from(
+        "/cagents-fixture/selected-runtime/bin:/cagents-fixture/selected-cli/bin",
+    );
+    let refreshed =
+        std::ffi::OsString::from("/cagents-fixture/new-runtime/bin:/cagents-fixture/new-cli/bin");
+    for provider in [Provider::Claude, Provider::Codex] {
+        let program = Path::new("/cagents-fixture/selected-cli/bin").join(provider.executable());
+        let home = Path::new("/cagents-fixture/reserved-home");
+        for account in [
+            crate::account::Account::managed(provider, uuid::Uuid::from_u128(7), home.into()),
+            crate::account::Account {
+                provider,
+                home: AccountHome::SystemAt { path: home.into() },
+            },
+        ] {
+            let command =
+                super::status_command_with_path(&account, &program, Some(&selected)).unwrap();
+            let newer =
+                super::status_command_with_path(&account, &program, Some(&refreshed)).unwrap();
+            let path = |command: &tokio::process::Command| {
+                command
+                    .as_std()
+                    .get_envs()
+                    .find(|(name, _)| *name == OsStr::new("PATH"))
+                    .and_then(|(_, value)| value)
+                    .map(OsStr::to_owned)
+            };
+            assert_eq!(command.as_std().get_program(), program.as_os_str());
+            assert_eq!(path(&command), Some(selected.clone()));
+            assert_eq!(path(&newer), Some(refreshed.clone()));
+            let variable = crate::account::home_variable(provider).unwrap();
+            assert_eq!(
+                command
+                    .as_std()
+                    .get_envs()
+                    .find(|(name, _)| *name == OsStr::new(variable))
+                    .and_then(|(_, value)| value),
+                Some(home.as_os_str()),
+                "the captured System home must stay explicit too"
+            );
+        }
+    }
+}
+
+#[test]
+fn status_path_preserves_absence_empty_and_non_unicode_snapshots() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStringExt, path::Path};
+
+    let account = crate::account::Account::managed(
+        crate::agent::Provider::Codex,
+        uuid::Uuid::from_u128(8),
+        "/cagents-fixture/reserved-home".into(),
+    );
+    for selected in [
+        None,
+        Some(std::ffi::OsString::new()),
+        Some(std::ffi::OsString::from_vec(
+            b"/cagents-fixture/runtime-\xff/bin".to_vec(),
+        )),
+    ] {
+        let command = super::status_command_with_path(
+            &account,
+            Path::new("/cagents-fixture/selected-cli/bin/codex"),
+            selected.as_deref(),
+        )
+        .unwrap();
+        let actual = command
+            .as_std()
+            .get_envs()
+            .find(|(name, _)| *name == OsStr::new("PATH"))
+            .map(|(_, value)| value);
+        assert_eq!(actual, selected.as_deref().map(Some));
+    }
+}
+
 struct FakeRun {
     outcome: Result<LoginStatus, String>,
     record: String,
@@ -421,7 +502,8 @@ async fn fake_status(provider: crate::agent::Provider, body: &str) -> FakeRun {
     let permit = recovery
         .status_permit(account.clone(), program.clone())
         .unwrap();
-    let outcome = super::run(account, program, permit).await;
+    let search_path = Some(directory.path().join("private-cli-bin").into_os_string());
+    let outcome = super::run(account, program, search_path, permit).await;
     let record = fs::read_to_string(record).unwrap_or_default();
     // Keep the actual host and master recovery alive until the complete
     // status path, including owned process-group cleanup, has returned.

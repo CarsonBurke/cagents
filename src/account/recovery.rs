@@ -23,6 +23,29 @@ pub(crate) struct Candidate {
     pub key: Uuid,
 }
 
+/// A metadata-only snapshot supplied by the selected device. An error keeps
+/// the last successful hints visible; it never confirms a login or absence.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct Discovery {
+    pub candidates: Vec<Candidate>,
+    pub problem: Option<String>,
+}
+
+impl Discovery {
+    pub(crate) fn read(homes: Option<&Homes>, registry: &Registry) -> Self {
+        match homes.map(|homes| discover(homes, registry)).transpose() {
+            Ok(candidates) => Self {
+                candidates: candidates.unwrap_or_default(),
+                problem: None,
+            },
+            Err(error) => Self {
+                candidates: Vec::new(),
+                problem: Some(error.to_string()),
+            },
+        }
+    }
+}
+
 /// Only `Missing` proves absence. An empty discovery result, a represented
 /// home, or a failed inspection must not become an "account removed" notice.
 #[derive(Clone, Debug, PartialEq, Eq)]

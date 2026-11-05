@@ -25,6 +25,26 @@ struct RestorePlan {
     retained: Option<Account>,
 }
 
+impl Store {
+    /// UI preference edits apply to the latest supported registry, preserving
+    /// unrelated edits. An operation launched against a registry that has
+    /// since been reset must not republish its old choices into that reset.
+    pub(crate) fn update_after_revision(
+        &self,
+        minimum_revision: u64,
+        change: impl FnOnce(&mut Registry),
+    ) -> io::Result<Registry> {
+        self.update_checked(|registry| {
+            if registry.revision() < minimum_revision {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    "The account registry was reset while this change was pending. Reload Accounts and try again."));
+            }
+            change(registry);
+            Ok(())
+        }).map(|(registry, ())| registry)
+    }
+}
+
 fn supported_registry(registry: &Registry) -> io::Result<()> {
     if registry.is_newer() {
         return Err(io::Error::new(

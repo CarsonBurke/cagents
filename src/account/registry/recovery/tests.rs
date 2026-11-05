@@ -96,6 +96,59 @@ fn error_kind<T>(result: io::Result<T>) -> io::ErrorKind {
 }
 
 #[test]
+fn an_old_preference_closure_cannot_republish_choices_into_a_reset_registry() {
+    let fixture = Fixture::new();
+    let store = crate::account::registry::Store::at(fixture.directory.path().join("registry"));
+    let system = Account::system(Provider::Claude);
+    let old = store
+        .update(|registry| registry.set_label(&system, Some("Before reset".into())))
+        .unwrap()
+        .0;
+    assert!(old.revision() > 0);
+    fs::remove_file(fixture.directory.path().join("registry/accounts.toml")).unwrap();
+    let mut called = false;
+    assert!(
+        store
+            .update_after_revision(old.revision(), |_| called = true)
+            .is_err()
+    );
+    assert!(!called);
+    assert_eq!(store.load().unwrap(), Registry::default());
+    assert!(
+        !fixture
+            .directory
+            .path()
+            .join("registry/accounts.toml")
+            .exists()
+    );
+}
+
+#[test]
+fn preference_revision_floor_preserves_newer_unrelated_changes_under_the_same_lease() {
+    let fixture = Fixture::new();
+    let store = crate::account::registry::Store::at(fixture.directory.path().join("registry"));
+    let claude = Account::system(Provider::Claude);
+    let codex = Account::system(Provider::Codex);
+    let first = store
+        .update(|registry| registry.set_label(&claude, Some("Original".into())))
+        .unwrap()
+        .0;
+    let concurrent = store
+        .update(|registry| registry.set_label(&codex, Some("Concurrent".into())))
+        .unwrap()
+        .0;
+    let current = store
+        .update_after_revision(first.revision(), |registry| {
+            registry.set_label(&claude, Some("Chosen".into()))
+        })
+        .unwrap();
+    assert_eq!(current.label(&claude), Some("Chosen"));
+    assert_eq!(current.label(&codex), Some("Concurrent"));
+    assert_eq!(current.revision(), concurrent.revision() + 1);
+    assert_eq!(store.load().unwrap(), current);
+}
+
+#[test]
 fn planning_refuses_newer_registries_and_unverified_identities_without_changes() {
     let fixture = Fixture::new();
     let confirmed = identity("restored@example.invalid");

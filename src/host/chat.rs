@@ -381,6 +381,7 @@ fn check_launch_account(launch: &chat::Launch) -> Result<(), ProtocolError> {
                 if matches!(
                     failure,
                     crate::account::registry::LaunchAccountError::Removed { .. }
+                        | crate::account::registry::LaunchAccountError::RegistrationMissing { .. }
                 ) {
                     ProtocolErrorCode::AccountRemoved
                 } else {

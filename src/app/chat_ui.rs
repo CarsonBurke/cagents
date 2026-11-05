@@ -5947,6 +5947,21 @@ impl Cagents {
         })
     }
 
+    fn preserved_resume_action(&self, card: CardId) -> Option<Message> {
+        if self.chat_start_pending(card) {
+            return None;
+        }
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => {
+                Some(Message::ChatUi(Action::Reconnect(runtime.target)))
+            }
+            // Startup can refuse the account before it creates a reader.
+            // The normal retry path reopens the unchanged durable session.
+            Some(CardRuntime::Failed(_)) => Some(Message::RetryCard(card)),
+            _ => None,
+        }
+    }
+
     pub(super) fn account_recovery_controls(&self, card: CardId) -> Option<Element<'_, Message>> {
         if !self.chat_ui.removed_accounts.contains(&card) {
             return None;
@@ -5964,10 +5979,46 @@ impl Cagents {
             .filter(|choice| !choice.selected)
             .collect::<Vec<_>>();
         let pending = self.chat_start_pending(card);
-        let mut content: Vec<Element<'_, Message>> = vec![design::caption(if pending {
-            "Checking the saved conversation on the selected account…"
-        } else { "Continue this saved conversation on another account. Its identity stays unchanged until the provider confirms it." }).into()];
-        if choices.is_empty() && !pending {
+        let preserved = self.preserved_chat_account(source.launch.provider, &source.launch.recipe);
+        let mut content: Vec<Element<'_, Message>> = Vec::new();
+        if let Some((candidate, restored, status)) = &preserved {
+            if *restored {
+                content.push(design::caption("The original account is available. Resume this saved conversation with its history and draft unchanged.").into());
+                content.push(
+                    crate::ui_controls::button::primary("Resume saved conversation")
+                        .on_press_maybe(self.preserved_resume_action(card))
+                        .into(),
+                );
+            } else if matches!(
+                status,
+                Some(account_ui::PreservedStatus::Pending | account_ui::PreservedStatus::Checking)
+            ) {
+                content.push(design::caption("Restoring the original account… Its saved conversation and draft stay here.").into());
+            } else {
+                let enabled = self.preserved_restore_enabled(candidate);
+                content.push(design::caption(if enabled {
+                    "The original account folder is still here. Restore its registration after confirming its sign-in, then resume this saved conversation."
+                } else {
+                    "Restore is unavailable right now. Open Accounts to check this account's registration and recovery status."
+                }).into());
+                content.push(
+                    crate::ui_controls::button::primary("Restore account")
+                        .on_press_maybe((enabled && !pending).then(|| {
+                            Message::AccountUi(account_ui::Action::RestorePreserved(
+                                candidate.clone(),
+                            ))
+                        }))
+                        .into(),
+                );
+            }
+        } else {
+            content.push(design::caption(if pending {
+                "Checking the saved conversation on the selected account…"
+            } else { "Continue this saved conversation on another account. Its identity stays unchanged until the provider confirms it." }).into());
+        }
+        if preserved.is_some() && !choices.is_empty() {
+            content.push(design::caption("Or continue using another account:").into());
+        } else if preserved.is_none() && choices.is_empty() && !pending {
             content.push(
                 design::caption("Add or sign in to another account in Accounts to continue.")
                     .into(),

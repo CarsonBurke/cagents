@@ -1,7 +1,7 @@
 //! Orphan registration uses the ordinary daemon lifecycle frontdoor, while
 //! retaining the original key and refusing unconfirmed provider identities.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 use crate::{
     account::{
@@ -27,6 +27,8 @@ pub(crate) fn restore_reserved(
         .build()
         .map_err(|_| "Account restoration could not start its provider status task".to_owned())?;
     // Resolve the ordinary provider executable before minting a status permit.
+    // Keep this owned PATH for both children, even if another discovery
+    // refreshes the shell path while the first status request is running.
     // This is the application's explicit restore operation; test entrypoints
     // below take an absolute private executable and never search PATH.
     let search = runtime.block_on(probe::search_path());
@@ -35,23 +37,24 @@ pub(crate) fn restore_reserved(
             "The provider CLI is not installed on this device; the preserved account was kept",
         )?;
     let recovery = AccountRecovery::new(reservation, homes, candidate)?;
-    runtime.block_on(restore_with_program(recovery, program))
+    runtime.block_on(restore_with_program(recovery, program, search))
 }
 
 async fn restore_with_program(
     recovery: AccountRecovery,
     program: PathBuf,
+    search_path: Option<OsString>,
 ) -> Result<Settled, String> {
     let account = recovery.account();
     let permit = recovery.status_permit(account.clone(), program.clone())?;
-    let identity = match status::run(account, program.clone(), permit).await? {
+    let identity = match status::run(account, program.clone(), search_path.clone(), permit).await? {
         LoginStatus::SignedIn(identity) => identity,
         LoginStatus::SignedOut => return Err("The provider did not confirm a login in this preserved home. Its files were kept and no account was restored.".into()),
     };
     let system = match recovery.system() {
         Some(account) => {
             let permit = recovery.status_permit(account.clone(), program.clone())?;
-            match status::run(account, program, permit).await? {
+            match status::run(account, program, search_path, permit).await? {
                 LoginStatus::SignedIn(identity) => Some(identity),
                 LoginStatus::SignedOut => None,
             }

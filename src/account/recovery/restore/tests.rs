@@ -17,6 +17,7 @@ struct Fixture {
     homes: Homes,
     candidate: Candidate,
     program: PathBuf,
+    path_record: PathBuf,
     ready: PathBuf,
     release: PathBuf,
 }
@@ -45,6 +46,7 @@ impl Fixture {
             fs::create_dir(&system).unwrap();
         }
         let program = directory.path().join("fake-provider");
+        let path_record = directory.path().join("status-path-record");
         let ready = directory.path().join("status-ready");
         let release = directory.path().join("status-release");
         let pause = if wait {
@@ -57,7 +59,8 @@ impl Fixture {
             String::new()
         };
         let script = format!(
-            "#!/bin/sh\nset -eu\n[ \"$#\" = 3 ] && [ \"$1\" = auth ] && [ \"$2\" = status ] && [ \"$3\" = --json ] || exit 21\nif [ \"${{CLAUDE_CONFIG_DIR-}}\" = {} ]; then\n{pause}{candidate_status}\nelif [ \"${{CLAUDE_CONFIG_DIR-}}\" = {} ]; then\n{}\nelse\nexit 22\nfi\n",
+            "#!/bin/sh\nset -eu\n[ \"$#\" = 3 ] && [ \"$1\" = auth ] && [ \"$2\" = status ] && [ \"$3\" = --json ] || exit 21\nprintf '%s\\n' \"${{PATH-unset}}\" >> {}\nif [ \"${{CLAUDE_CONFIG_DIR-}}\" = {} ]; then\n{pause}{candidate_status}\nelif [ \"${{CLAUDE_CONFIG_DIR-}}\" = {} ]; then\n{}\nelse\nexit 22\nfi\n",
+            quote(&path_record),
             quote(&home),
             quote(&system),
             system_status.unwrap_or("exit 23")
@@ -72,6 +75,7 @@ impl Fixture {
             homes,
             candidate,
             program,
+            path_record,
             ready,
             release,
         }
@@ -79,6 +83,15 @@ impl Fixture {
 
     fn home(&self) -> PathBuf {
         self.homes.path(self.candidate.provider, self.candidate.key)
+    }
+
+    fn search_path(&self) -> Option<OsString> {
+        Some(
+            self._directory
+                .path()
+                .join("private-cli-bin")
+                .into_os_string(),
+        )
     }
 
     fn recovery(&self) -> AccountRecovery {
@@ -109,9 +122,13 @@ const SIGNED_OUT: &str = "printf '%s\\n' '{\"loggedIn\":false}'; exit 1";
 async fn a_confirmed_surviving_home_is_registered_with_its_original_key_and_files() {
     let fixture = Fixture::new(SIGNED_IN, Some(SIGNED_OUT), false);
     let inode = fs::metadata(fixture.home()).unwrap().ino();
-    let settled = restore_with_program(fixture.recovery(), fixture.program.clone())
-        .await
-        .unwrap();
+    let settled = restore_with_program(
+        fixture.recovery(),
+        fixture.program.clone(),
+        fixture.search_path(),
+    )
+    .await
+    .unwrap();
     let Settled::Registered {
         registry,
         identity: Some(identity),
@@ -139,11 +156,13 @@ async fn a_confirmed_surviving_home_is_registered_with_its_original_key_and_file
 #[tokio::test]
 async fn a_duplicate_system_login_keeps_the_restored_key_as_an_archived_registration() {
     let fixture = Fixture::new(SIGNED_IN, Some(SIGNED_IN), false);
-    let Settled::Registered { registry, .. } =
-        restore_with_program(fixture.recovery(), fixture.program.clone())
-            .await
-            .unwrap()
-    else {
+    let Settled::Registered { registry, .. } = restore_with_program(
+        fixture.recovery(),
+        fixture.program.clone(),
+        fixture.search_path(),
+    )
+    .await
+    .unwrap() else {
         panic!("not restored")
     };
     assert!(registry.find(fixture.candidate.key).is_some());
@@ -180,9 +199,13 @@ async fn no_login_or_an_unverified_system_answer_never_publishes_a_registry_row(
         let fixture = Fixture::new(candidate, system, false);
         let before = fixture.store.load().unwrap();
         assert!(
-            restore_with_program(fixture.recovery(), fixture.program.clone())
-                .await
-                .is_err()
+            restore_with_program(
+                fixture.recovery(),
+                fixture.program.clone(),
+                fixture.search_path(),
+            )
+            .await
+            .is_err()
         );
         assert_eq!(fixture.store.load().unwrap(), before);
         assert!(fixture.store.load().unwrap().pending().is_empty());
@@ -209,6 +232,7 @@ async fn provider_io_holds_no_storage_lease_and_checked_commit_preserves_unrelat
     let running = tokio::spawn(restore_with_program(
         fixture.recovery(),
         fixture.program.clone(),
+        fixture.search_path(),
     ));
     wait_for(&fixture.ready).await;
     assert!(fixture.homes.try_lifecycle_lock().is_ok());
@@ -231,6 +255,7 @@ async fn relevant_registry_change_during_status_refuses_commit_without_overwriti
     let running = tokio::spawn(restore_with_program(
         fixture.recovery(),
         fixture.program.clone(),
+        fixture.search_path(),
     ));
     wait_for(&fixture.ready).await;
     let (concurrent, ()) = fixture
@@ -243,5 +268,25 @@ async fn relevant_registry_change_during_status_refuses_commit_without_overwriti
     assert_eq!(
         fs::read(fixture.home().join("history.fixture")).unwrap(),
         b"unchanged original conversation\n"
+    );
+}
+
+#[tokio::test]
+async fn managed_and_system_status_share_the_exact_selected_path_snapshot() {
+    let fixture = Fixture::new(SIGNED_IN, Some(SIGNED_OUT), false);
+    let selected = fixture.search_path().unwrap();
+    let settled = restore_with_program(
+        fixture.recovery(),
+        fixture.program.clone(),
+        Some(selected.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(settled, Settled::Registered { .. }));
+    let recorded = fs::read_to_string(&fixture.path_record).unwrap();
+    assert_eq!(
+        recorded.lines().collect::<Vec<_>>(),
+        vec![selected.to_str().unwrap(), selected.to_str().unwrap()],
+        "both provider children must receive the snapshot used for executable selection"
     );
 }
