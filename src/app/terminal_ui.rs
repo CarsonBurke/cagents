@@ -851,6 +851,8 @@ impl Cagents {
     pub(super) fn terminal_find_view(&self, card: CardId) -> Option<Element<'_, Message>> {
         let find = self.terminal_find.get(&card).filter(|find| find.open)?;
         let message = |action| Message::TerminalFind(action);
+        // A foreground surface owns Enter even if a click refocuses find.
+        let can_step = !self.workspace_inputs_blocked();
         let input = crate::interaction::focused_key(
             crate::ui_controls::field::search("Find in terminal scrollback", &find.query)
                 .id(input_id(card))
@@ -867,7 +869,7 @@ impl Cagents {
                     key: keyboard::Key::Named(keyboard::key::Named::Enter),
                     modifiers,
                     ..
-                } => Some(Message::TerminalFind(Action::Next(card, modifiers.shift()))),
+                } if can_step => Some(Message::TerminalFind(Action::Next(card, modifiers.shift()))),
                 _ => None,
             },
         );
