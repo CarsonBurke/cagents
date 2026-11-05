@@ -22799,9 +22799,14 @@ mod tests {
         }
         std::fs::write(account.join("config.toml"), user_policy).unwrap();
         // An account directory linked into the cwd hierarchy must not be
-        // mistaken for an independent project override.
+        // mistaken for an independent project override. HOME sits just above
+        // it, so the walk still crosses the account but ends in this fixture
+        // instead of reading the real account of a temp root inside a home.
         recipe.working_directory = home.path().join("elsewhere");
-        recipe.unset_environment.insert("HOME".into());
+        recipe.environment.insert(
+            "HOME".into(),
+            home.path().parent().unwrap().to_string_lossy().into_owned(),
+        );
         assert_eq!(
             draft_permission_mode(&recipe, Provider::Codex).as_deref(),
             Some("yolo")
@@ -30184,6 +30189,9 @@ mod tests {
                 .cache
                 .get("tool")
                 .map(|cached| cached.revision);
+            // The previous iteration's shaping slot is released on the
+            // retirement worker; a dispatch that overtakes it is only deferred.
+            preparation::retirement_barrier();
             let reply = executor.block_on(async {
                 let task = app.handle_chat_action(action);
                 let mut outputs =
