@@ -236,19 +236,22 @@ impl Cagents {
         };
         // Another window can publish the same session update first, as when two
         // windows attached to one conversation both learn its provider session.
-        // Nothing was lost, so there is nothing to tell anyone about.
-        let already_applied = matches!(&change, Change::Update { pane, .. } if {
+        // Only a session update qualifies: a refused name or width edit can be lost.
+        let session_already_applied = matches!(&change, Change::Update { before, pane } if {
+            let same_source = |a: &Pane, b: &Pane| {
+                a.kind == b.kind
+                    && a.pending_terminal_start == b.pending_terminal_start
+                    && a.scope == b.scope
+            };
             let mut owners = self
                 .workspace_model
                 .views
                 .iter()
                 .flat_map(|view| &view.panes)
                 .filter(|current| current.id == pane.id);
-            owners.next().is_some_and(|current| {
-                current.kind == pane.kind
-                    && current.pending_terminal_start == pane.pending_terminal_start
-                    && current.scope == pane.scope
-            }) && owners.next().is_none()
+            !same_source(before, pane)
+                && owners.next().is_some_and(|current| same_source(current, pane))
+                && owners.next().is_none()
         });
         let mut retry = None;
         if let Change::Update { before, pane } = &change
@@ -309,7 +312,20 @@ impl Cagents {
                 }
             }
         }
-        if !already_applied {
+        // Nothing was lost once any name or width it carried is on its way again
+        // or already there, so there is nothing to tell anyone about.
+        let already_applied = session_already_applied
+            && (retry.is_some()
+                || matches!(&change, Change::Update { pane, .. }
+                    if self
+                        .workspace_model
+                        .views
+                        .iter()
+                        .flat_map(|view| &view.panes)
+                        .any(|current| current == pane)));
+        if already_applied {
+            tracing::debug!(?scope, %operation, %error, "pane session update lost to an identical one");
+        } else {
             tracing::warn!(?scope, %operation, %error, "refused source-sensitive pane intent; host applied no fields");
         }
         self.shared_views.pending.remove(index);
@@ -3058,6 +3074,67 @@ mod tests {
                     .message
                     .contains("incoming session update could not be verified")
             }));
+        }
+    }
+
+    /// Another window made the same session update, but this one also renamed
+    /// the pane. Quiet is only right while the name is still on its way.
+    #[test]
+    fn losing_a_session_update_race_stays_quiet_only_if_its_rename_survives() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for can_retry in [true, false] {
+            let (mut app, source, _, before) = channel_move_fixture();
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            let operation = uuid::Uuid::new_v4();
+            let mut desired = before.clone();
+            desired.title = "Renamed here".into();
+            desired.scope = Some("/same-new-source".into());
+            let change = Change::Update {
+                before: before.clone(),
+                pane: desired.clone(),
+            };
+            app.shared_views
+                .pending
+                .push((operation, Scope::Channel(source), change.clone()));
+            if can_retry {
+                app.publish_model_edit(ModelEdit::ChangeView {
+                    scope: Scope::Channel(source),
+                    expected_revision: 17,
+                    operation,
+                    change: change.clone(),
+                });
+                rx.try_recv().unwrap();
+            }
+            let mut model = app.workspace_model.clone();
+            model.views[0].panes[0].scope = desired.scope.clone();
+            model.sequence += 1;
+            drop(
+                app.apply_workspace_model_update(ModelUpdate::ViewConflicted {
+                    scope: Scope::Channel(source),
+                    operation,
+                    change,
+                    model,
+                    error: "The pane source changed".into(),
+                }),
+            );
+
+            let warned = app
+                .notices
+                .recent()
+                .any(|entry| entry.notice.message.contains("session update was refused"));
+            assert_eq!(warned, !can_retry);
+            if can_retry {
+                let ModelEdit::ChangeView { change, .. } = rx.try_recv().unwrap() else {
+                    panic!("presentation retry");
+                };
+                let Change::Update { pane, .. } = change else {
+                    panic!("update");
+                };
+                assert_eq!(pane.title, desired.title);
+            } else {
+                assert!(rx.try_recv().is_err());
+            }
         }
     }
 
