@@ -188,18 +188,18 @@ run_cli() {
 # single --bins invocation would reunify the UI and host graphs and make the UI
 # compile Ghostty while making the daemon compile libcosmic.
 if [ "$browserless" = true ]; then
-    cargo build --locked --profile dev-runtime --no-default-features \
+    "$root/scripts/cargo-gate" build --locked --profile dev-runtime --no-default-features \
         --features development --bin cagents
-    cargo build --locked --profile dev-runtime --no-default-features \
+    "$root/scripts/cargo-gate" build --locked --profile dev-runtime --no-default-features \
         --features development,host --bin cagentsd
-    cargo build --locked --profile dev-runtime --no-default-features \
+    "$root/scripts/cargo-gate" build --locked --profile dev-runtime --no-default-features \
         --features development,ui --bin cagents-ui
 else
-    cargo build --locked --profile dev-runtime \
+    "$root/scripts/cargo-gate" build --locked --profile dev-runtime \
         --features development --bin cagents
-    cargo build --locked --profile dev-runtime \
+    "$root/scripts/cargo-gate" build --locked --profile dev-runtime \
         --features development,host --bin cagentsd
-    cargo build --locked --profile dev-runtime \
+    "$root/scripts/cargo-gate" build --locked --profile dev-runtime \
         --features development,integrated-browser --bin cagents-ui
 fi
 
