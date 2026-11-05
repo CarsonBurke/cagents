@@ -2505,7 +2505,7 @@ mod tests {
                 &renderer,
                 &mut operation::scrollable::scroll_to::<()>(
                     id,
-                    widget::scrollable::AbsoluteOffset {
+                    cosmic::iced::widget::scrollable::AbsoluteOffset {
                         x: Some(offset.x),
                         y: Some(offset.y),
                     },
@@ -2518,7 +2518,7 @@ mod tests {
             &renderer,
             &mut operation::scrollable::scroll_to::<()>(
                 foreground.clone(),
-                widget::scrollable::AbsoluteOffset {
+                cosmic::iced::widget::scrollable::AbsoluteOffset {
                     x: Some(21.0),
                     y: Some(32.0),
                 },
@@ -2530,7 +2530,7 @@ mod tests {
             &renderer,
             &mut operation::scrollable::scroll_to::<()>(
                 strip.clone(),
-                widget::scrollable::AbsoluteOffset {
+                cosmic::iced::widget::scrollable::AbsoluteOffset {
                     x: Some(999.0),
                     y: Some(999.0),
                 },
