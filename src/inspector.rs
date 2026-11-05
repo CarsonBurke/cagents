@@ -244,7 +244,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
         let (background_tree, foreground_tree) = tree.children.split_at_mut(1);
         // The background is painted, so whatever it raises has to be painted
         // too: dropping its overlay drew a card's dropdown as a closed button
-        // with no menu. It stays inert, because this layer withholds events and
+        // with no menu. It stays inert, because this layer withholds input and
         // operations from the background and an overlay that took them would
         // hand a frozen subtree the clicks aimed at the modal. The foreground's
         // overlay is grouped last so it composites above it.
@@ -299,8 +299,8 @@ impl<'a, Message: 'a> From<ModalOverlay<'a, Message>> for Element<'a, Message> {
 
 /// An overlay that is drawn but never operated.
 ///
-/// [`ModalOverlay`] paints its background while withholding every event and
-/// operation from it. This wrapper extends that same split to the overlays the
+/// [`ModalOverlay`] keeps background rendering live while withholding input
+/// and widget operations. This wrapper also shields the overlays the
 /// background raises, so a control that was already open keeps its painted
 /// shape without stealing input from the modal in front of it.
 struct Inert<'a, Message> {
