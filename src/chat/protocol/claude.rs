@@ -13761,9 +13761,11 @@ mod tests {
             // No recording shows this order or what the task reports here.
             let mut adapter = working();
             adapter
-                .receive(json!({"type":"assistant","uuid":"a1","message":{"id":"m1","content":[
+                .receive(
+                    json!({"type":"assistant","uuid":"a1","message":{"id":"m1","content":[
                     {"type":"tool_use","id":"t1","name":"Bash",
-                     "input":{"command":"sleep 99","run_in_background":true}}]}}))
+                     "input":{"command":"sleep 99","run_in_background":true}}]}}),
+                )
                 .unwrap();
             adapter
                 .receive(json!({"type":"user","uuid":"u1","message":{"content":[
@@ -13782,7 +13784,10 @@ mod tests {
             assert!(step.events.iter().any(|event| matches!(
                 event,
                 Event::Item(Item {
-                    content: ItemContent::Command { status: ToolStatus::Running, .. },
+                    content: ItemContent::Command {
+                        status: ToolStatus::Running,
+                        ..
+                    },
                     ..
                 })
             )));
@@ -13792,8 +13797,10 @@ mod tests {
         fn a_foreground_command_is_not_offered_as_a_background_one() {
             let mut adapter = working();
             adapter
-                .receive(json!({"type":"assistant","uuid":"a1","message":{"id":"m1","content":[
-                    {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 99"}}]}}))
+                .receive(
+                    json!({"type":"assistant","uuid":"a1","message":{"id":"m1","content":[
+                    {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 99"}}]}}),
+                )
                 .unwrap();
             adapter
                 .receive(json!({"type":"system","subtype":"task_started","uuid":"s1",
