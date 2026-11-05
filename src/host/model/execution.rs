@@ -1423,10 +1423,62 @@ impl Registry {
         source: &HostedSession,
         now_ms: u64,
     ) -> Result<bool, String> {
+        self.retire_agent_process_checked(source, now_ms, None)
+    }
+
+    /// A previous-boot cleanup must not cancel work accepted by the
+    /// scheduler's independent WAL connection after the caller's inspection.
+    pub(crate) fn retire_completed_automation_process(
+        &mut self,
+        agent: &Agent,
+        run: &Run,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        if agent.closed
+            || !matches!(agent.origin, Origin::Automation { .. })
+            || run.agent != agent.id
+            || !run.state.is_terminal()
+            || run.state == State::Interrupted
+        {
+            return Err("Only an exact completed automation run can be retired".into());
+        }
+        let source = agent
+            .session
+            .as_ref()
+            .ok_or("The saved provider is unavailable")?;
+        self.retire_agent_process_checked(source, now_ms, Some((agent, run)))
+    }
+
+    fn retire_agent_process_checked(
+        &mut self,
+        source: &HostedSession,
+        now_ms: u64,
+        completed: Option<(&Agent, &Run)>,
+    ) -> Result<bool, String> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        if let Some((agent, run)) = completed {
+            let current = read_agent(&tx, agent.id)?;
+            let latest: Run = decode(
+                &tx.query_row(
+                    "SELECT record FROM agent_runs WHERE agent=?1 ORDER BY rowid DESC LIMIT 1",
+                    [agent.id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|error| error.to_string())?,
+            )?;
+            let occupied: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_launches WHERE agent=?1)
+                 OR EXISTS(SELECT 1 FROM agent_policies WHERE agent=?1 AND interactive=1)
+                 OR EXISTS(SELECT 1 FROM agent_runs WHERE agent=?1 AND state IN ('accepted','running','waiting'))",
+                [agent.id.to_string()], |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            if current != *agent || latest != *run || occupied {
+                return Err("The automation agent changed before historical retirement; its work was preserved".into());
+            }
+        }
         let authority: Option<String> = tx
             .query_row(
                 "SELECT source FROM agent_authorities WHERE session_id = ?1",

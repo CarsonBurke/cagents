@@ -333,18 +333,26 @@ scripts/cargo-gate check --locked --no-default-features --features ui --bin cage
 scripts/cargo-gate test --locked --no-default-features --features host --all-targets
 ```
 
-The gate admits a few builds at once: one per 8 GiB of RAM after an 8 GiB
-reserve, at most one per 8 CPUs. A build starts beside others only while
-8 GiB is actually available; one `cagents` build peaked at 6.5 GiB with 12
-jobs. With several slots each build gets an equal
-share of the CPUs as `CARGO_BUILD_JOBS`, which also caps a larger value; `-j`
-still wins. For `test`, `bench` and `run` only the build holds a slot, and the
-tests or program run after it is released, so do not wrap the gate in another
-lock. Rustdoc compiles doctests while they run, so `cargo test --doc` keeps
-its slot throughout; a plain `cargo test` compiles its doctests after the
-slot is released. The development runner builds its matched set through the
-gate itself, and skips the gate when the set is
-[already current](#up-to-date-launches).
+The gate admits several builds at once, up to one per 4 GiB of RAM after an 8
+GiB reserve and at most one per 4 CPUs. Builds spend most of their time in a
+few crates that compile or link on one CPU, so each busies about 1.4 CPUs on
+average, and memory decides how many fit. Each build has an expected peak: 3
+GiB for anything in the CLI lane, 4 GiB for other checks, 7 GiB for a host
+build or test build, 9 GiB for a UI one and 8 GiB for an `exec` script such as
+the development runner; a slot held by a plain `flock` counts as 9 GiB.
+`CAGENTS_BUILD_COST_GIB` overrides it. A build starts beside others only when
+the memory available, less what the running builds are expected to take beyond
+what they already hold, covers its own; a lone build always starts. Each build
+gets a share of the CPUs among the builds running once it starts, between 4 and
+8 (the jobs the costs were measured with) and at most half the CPUs, as
+`CARGO_BUILD_JOBS`, which also caps a larger value; `-j` still wins. For
+`test`, `bench` and `run` only the build holds a slot, and the tests or program
+run after it is released, so do not wrap the gate in another lock. Rustdoc
+compiles doctests while they run, so `cargo test --doc` keeps its slot
+throughout; a plain `cargo test` compiles its doctests after the slot is
+released. The development runner builds its matched set through the gate
+itself, and skips the gate when the set is [already
+current](#up-to-date-launches).
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock /var/tmp/cagents-cargo.lock` takes exactly one
@@ -399,7 +407,24 @@ checkout path, and the crates that depend on them. Incremental caches are not
 copied. Seeding does nothing on a file system without reflinks, when the main
 checkout has no build, for a directory that has been built in, or with
 `CAGENTS_BUILD_SEED=0`; run `scripts/seed-build-dir` by hand to seed a
-directory a plain `cargo` would create.
+directory a plain `cargo` would create. Seeded directories carry Cargo's
+`CACHEDIR.TAG`, so `prune-cargo-build-dirs` reclaims them after their worktree
+is removed.
+
+The gate's helpers run from the gate's own directory. Install a changed gate
+for every checkout with `scripts/install-cargo-gate`, never by copying
+`scripts/cargo-gate` alone: it stages the gate with its helpers, checks that
+the staged gate runs a command, renames them into `/var/tmp`, and checks the
+result.
+
+Build directories share one disk. When the file system holding them has less
+than twice a floor free (5% of its size, at most 64 GiB), `scripts/cargo-gate`
+runs `scripts/build-disk-guard`, which reclaims removed worktrees' build
+directories at once with `prune-cargo-build-dirs`, at most every ten minutes
+across the host; idle live worktrees' are left to the pruner's own schedule.
+Below the floor it refuses the build and says why. Remove worktrees you no
+longer need; their build directories follow. Set `CAGENTS_BUILD_FREE_FLOOR_GIB`
+to change the floor, or `0` to disable the guard.
 
 The build script that stamps `--version` reruns only when the stamp could
 change, because each rerun recompiles `cagents`. It watches this checkout's
@@ -587,6 +612,38 @@ scripts/cargo-gate test --locked --no-default-features --features host --lib ter
 scripts/cargo-gate test --locked --no-default-features --features host --test terminal_load_contract
 scripts/cargo-gate test --locked --no-default-features --features ui --test session_restore_contract
 ```
+
+For focused root library tests, compile one isolated test harness and run the
+Cargo-reported executable directly, after its build admission has ended:
+
+```sh
+scripts/test-lib cli search_match::tests::overlapping_occurrences_keep_the_best_boundary_rank
+scripts/test-lib host --prefix terminal:: --test-threads 1
+scripts/test-lib ui --profile dev-runtime --prefix app::chat_ui::
+```
+
+Use actual full test names, or repeat `--prefix MODULE::` for literal module
+groups. Prefixes expand to ordinary full names and overlapping selections run
+once. The command rejects missing names, duplicate exact names, empty groups,
+ambiguous artifacts and ignored-only selections. An explicitly named ignored
+test is refused; ignored tests within a prefix are visibly skipped. Use the
+existing explicit opt-in workflow for ignored cases, after satisfying their
+fixture and authority requirements.
+
+The helper fixes `--locked --no-default-features --package cagents --lib` and
+selects only the requested CLI, HOST or UI boundary. It preserves the caller's
+Cargo environment, stdin, test exit status and cancellation. It submits one
+test-compilation command through `scripts/cargo-gate`, then performs discovery
+and exact execution without Cargo. Set the usual `CARGO_BUILD_JOBS`,
+`CARGO_TARGET_DIR` and `CAGENTS_BUILD_LOCK` as needed. The gate's existing build
+directory seeding policy also applies; `CAGENTS_BUILD_SEED=0` disables it. Keep
+source and target unchanged until the command finishes; a detected executable
+replacement is refused.
+
+Run the helper outside `cargo-gate exec`, a parent `flock`, or a coordinator's
+held build lease. It refuses inherited admission because a child cannot release
+its parent's lock. The ordinary `cargo-gate test` commands above remain useful
+for integration targets, broader suites and explicit ignored-test workflows.
 
 The selected IPC source contract can be checked without compiling Rust:
 

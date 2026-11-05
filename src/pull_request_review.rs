@@ -191,6 +191,8 @@ pub enum Action {
     LoadList,
     LoadMore,
     BrowserQuery(String),
+    BrowserSearch(String),
+    BrowserFocused,
     BrowserFilterIndex(usize),
     ListLoaded {
         generation: u64,
@@ -302,6 +304,63 @@ pub enum ListState {
     Loading,
     Ready(Vec<Arc<PullRequest>>),
     Failed(String),
+}
+
+/// Open pull requests GitHub matched for one browser query. Kept apart from
+/// the open list, so a search adds rows without discarding loaded depth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositorySearch {
+    query: String,
+    rows: Vec<Arc<PullRequest>>,
+    cursor: Option<String>,
+}
+
+/// One stream of browser requests: the open list, or the repository search.
+/// Each has its own cancellation and error, so neither interrupts the other.
+#[derive(Debug, Default)]
+struct BrowserRequest {
+    /// The browser generation the in-flight answer carries.
+    generation: u64,
+    cancellation: CancellationToken,
+    loading: bool,
+    appending: bool,
+    error: Option<String>,
+    last_refresh: Option<Instant>,
+    /// What the in-flight request searches for; empty for the open list.
+    query: String,
+}
+
+impl BrowserRequest {
+    /// Starts a request as `generation`, abandoning any still in flight.
+    fn start(&mut self, generation: u64, append: bool, query: String) -> CancellationToken {
+        self.cancellation.cancel();
+        self.cancellation = CancellationToken::new();
+        self.generation = generation;
+        self.loading = true;
+        self.appending = append;
+        self.error = None;
+        self.last_refresh = Some(Instant::now());
+        self.query = query;
+        self.cancellation.clone()
+    }
+
+    /// Abandons the request in flight; its answer will be ignored.
+    fn cancel(&mut self) {
+        self.cancellation.cancel();
+        self.loading = false;
+    }
+
+    /// Whether `generation` answers the request in flight.
+    fn answers(&self, generation: u64) -> bool {
+        self.loading && self.generation == generation
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        !self.loading
+            && self
+                .last_refresh
+                .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(30))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -417,12 +476,13 @@ pub struct State {
     /// Set by shells that list through this state rather than their own.
     source: Option<ReviewSource>,
     list: ListState,
-    list_generation: u64,
-    list_cancellation: CancellationToken,
+    /// Advances whenever a browser request starts: answers carry it, and row
+    /// actions are fenced by it.
+    browser_generation: u64,
     list_cursor: Option<String>,
-    list_loading: bool,
-    list_appending: bool,
-    list_error: Option<String>,
+    list_request: BrowserRequest,
+    search: Option<RepositorySearch>,
+    search_request: BrowserRequest,
     browser_query: String,
     browser_keys: BTreeMap<u64, (String, String)>,
     browser_viewport: (f32, f32),
@@ -473,7 +533,8 @@ impl std::fmt::Debug for State {
 impl Drop for State {
     fn drop(&mut self) {
         self.cancellation.cancel();
-        self.list_cancellation.cancel();
+        self.list_request.cancel();
+        self.search_request.cancel();
     }
 }
 
@@ -617,12 +678,11 @@ impl State {
             git,
             source: None,
             list: ListState::Idle,
-            list_generation: 0,
-            list_cancellation: CancellationToken::new(),
+            browser_generation: 0,
             list_cursor: None,
-            list_loading: false,
-            list_appending: false,
-            list_error: None,
+            list_request: BrowserRequest::default(),
+            search: None,
+            search_request: BrowserRequest::default(),
             browser_query: String::new(),
             browser_keys: BTreeMap::new(),
             browser_viewport: (0.0, 480.0),
@@ -664,12 +724,12 @@ impl State {
         }
         self.source = source;
         self.requests.reset();
-        self.list_cancellation.cancel();
-        self.list_generation = self.list_generation.wrapping_add(1);
+        std::mem::take(&mut self.list_request).cancel();
+        std::mem::take(&mut self.search_request).cancel();
+        self.browser_generation = self.browser_generation.wrapping_add(1);
         self.list = ListState::Idle;
         self.list_cursor = None;
-        self.list_loading = false;
-        self.list_error = None;
+        self.search = None;
         self.browser_query.clear();
         self.browser_keys.clear();
         self.browser_viewport.0 = 0.0;
@@ -683,6 +743,11 @@ impl State {
 
     pub fn source(&self) -> Option<&ReviewSource> {
         self.source.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn browser_is_refreshing(&self) -> bool {
+        self.list_request.loading
     }
 
     pub fn list(&self) -> &ListState {
@@ -724,17 +789,33 @@ impl State {
     /// Resolves a listed number to a target when this state owns the list.
     pub fn listed_target(&self, number: u64) -> Option<ReviewTarget> {
         let source = self.source.as_ref()?;
-        let ListState::Ready(pull_requests) = &self.list else {
-            return None;
-        };
-        let pull_request = pull_requests
-            .iter()
-            .find(|pull_request| pull_request.number == number)?;
+        let pull_request = self.listed_pull_request(number)?;
         Some(ReviewTarget {
             repository: source.repository.clone(),
             worktree: source.worktree.clone(),
             pull_request: Arc::clone(pull_request),
         })
+    }
+
+    /// A pull request the browser holds, from the open list or the current
+    /// repository search.
+    fn listed_pull_request(&self, number: u64) -> Option<&Arc<PullRequest>> {
+        let open = match &self.list {
+            ListState::Ready(rows) => rows.as_slice(),
+            _ => &[],
+        };
+        let searched = self.current_search().map_or(&[][..], |search| &search.rows);
+        open.iter()
+            .chain(searched)
+            .find(|pull_request| pull_request.number == number)
+    }
+
+    /// Search results for the query now in the browser, if they have loaded.
+    fn current_search(&self) -> Option<&RepositorySearch> {
+        let query = self.browser_query.trim();
+        self.search
+            .as_ref()
+            .filter(|search| !query.is_empty() && search.query == query)
     }
 
     /// Takes the effects accumulated since the last drain, oldest first.
@@ -806,7 +887,7 @@ impl State {
                 ActionTask::none()
             }
             Action::BrowserFenced { generation, action } => {
-                if generation != self.list_generation {
+                if generation != self.browser_generation {
                     return ActionTask::none();
                 }
                 self.update(*action)
@@ -823,15 +904,71 @@ impl State {
             }
             Action::Discussion(action) => self.update_discussion(action),
             Action::SetSource(source) => self.set_source(source),
+            Action::BrowserFocused => {
+                if self.target.is_none()
+                    && self.source.as_ref().is_some_and(|source| {
+                        crate::github::polling::ready(&source.repository.host, false)
+                    })
+                {
+                    let open = if self.list_request.loading {
+                        ActionTask::none()
+                    } else {
+                        self.load_open_list(false)
+                    };
+                    let search = if self.search_request.loading {
+                        ActionTask::none()
+                    } else {
+                        self.load_search(false)
+                    };
+                    ActionTask::batch([open, search])
+                } else {
+                    ActionTask::none()
+                }
+            }
             Action::LoadList => self.load_list(),
-            Action::LoadMore => self.load_list_page(true),
+            Action::LoadMore => {
+                if self.browser_query.trim().is_empty() {
+                    self.load_open_list(true)
+                } else {
+                    self.load_search(true)
+                }
+            }
             Action::BrowserQuery(query) => {
-                self.browser_query = query;
+                let changed = query.trim() != self.browser_query.trim();
+                self.browser_query = query.clone();
+                if !changed {
+                    return ActionTask::none();
+                }
                 self.browser_viewport.0 = 0.0;
-                iced::widget::operation::scroll_to(
-                    widget::Id::new("pr.browser"),
-                    iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
-                )
+                // A search for older text is obsolete, and so is its error.
+                // The open list it filters locally is unaffected.
+                self.search_request.cancel();
+                self.search_request.error = None;
+                ActionTask::batch([
+                    iced::widget::operation::scroll_to(
+                        widget::Id::new("pr.browser"),
+                        iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
+                    ),
+                    ActionTask::perform(
+                        async move {
+                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            Action::BrowserSearch(query)
+                        },
+                        |action| action,
+                    ),
+                ])
+            }
+            Action::BrowserSearch(query) => {
+                if self.browser_query != query {
+                    ActionTask::none()
+                } else if !query.trim().is_empty() {
+                    self.load_search(false)
+                } else if !(matches!(self.list, ListState::Ready(_)) || self.list_request.loading) {
+                    self.load_open_list(false)
+                } else {
+                    // Clearing a search returns to the open list it kept.
+                    ActionTask::none()
+                }
             }
             Action::BrowserViewport { offset, height } => {
                 self.browser_viewport = (offset, height);
@@ -848,53 +985,13 @@ impl State {
                 )
             }
             Action::ListLoaded { generation, result } => {
-                if generation != self.list_generation {
-                    return ActionTask::none();
-                }
-                self.list_loading = false;
-                match result {
-                    Ok(page) => {
-                        self.list_cursor = page.next_cursor;
-                        let mut rows = if self.list_appending {
-                            match std::mem::replace(&mut self.list, ListState::Idle) {
-                                ListState::Ready(rows) => rows,
-                                _ => Vec::new(),
-                            }
-                        } else {
-                            Vec::new()
-                        };
-                        let mut known: BTreeSet<_> = rows.iter().map(|row| row.number).collect();
-                        rows.extend(
-                            page.pull_requests
-                                .into_iter()
-                                .filter(|row| known.insert(row.number))
-                                .map(Arc::new),
-                        );
-                        self.browser_keys = rows
-                            .iter()
-                            .map(|row| {
-                                (
-                                    row.number,
-                                    (
-                                        row.title.to_lowercase(),
-                                        row.author.as_ref().map_or_else(String::new, |author| {
-                                            author.login.to_lowercase()
-                                        }),
-                                    ),
-                                )
-                            })
-                            .collect();
-                        self.list = ListState::Ready(rows);
-                        self.list_error = None;
-                    }
-                    Err(message) if matches!(self.list, ListState::Ready(_)) => {
-                        self.list_error = Some(message)
-                    }
-                    Err(message) => self.list = ListState::Failed(message),
-                }
-                // A partial page cannot establish which PR refs are obsolete.
-                if self.list_cursor.is_none() && self.list_error.is_none() {
-                    self.prune_fetched_refs()
+                if self.list_request.answers(generation) {
+                    self.list_request.loading = false;
+                    self.open_list_loaded(result)
+                } else if self.search_request.answers(generation) {
+                    self.search_request.loading = false;
+                    self.search_loaded(result);
+                    ActionTask::none()
                 } else {
                     ActionTask::none()
                 }
@@ -911,7 +1008,7 @@ impl State {
                 match result {
                     Ok(target) => self.open(target),
                     Err(message) => {
-                        self.list_error = Some(message);
+                        self.list_request.error = Some(message);
                         ActionTask::none()
                     }
                 }
@@ -928,6 +1025,9 @@ impl State {
                 self.refreshing = false;
                 match result {
                     Ok(loaded) => {
+                        if let Some(target) = &self.target {
+                            crate::github::polling::succeeded(&target.repository.host);
+                        }
                         self.adopt(&loaded);
                         return self.load_discussion();
                     }
@@ -943,7 +1043,29 @@ impl State {
             }
             Action::Refresh => self.refresh(),
             Action::RefreshIfDue(now) => {
+                if self.target.is_none()
+                    && self.source.as_ref().is_some_and(|source| {
+                        crate::github::polling::ready(&source.repository.host, false)
+                    })
+                {
+                    // Both lists refresh, so a row that closed leaves the
+                    // local matches as well as the search results.
+                    let open = if self.list_request.due(now) {
+                        self.load_open_list(false)
+                    } else {
+                        ActionTask::none()
+                    };
+                    let search = if self.search_request.due(now) {
+                        self.load_search(false)
+                    } else {
+                        ActionTask::none()
+                    };
+                    return ActionTask::batch([open, search]);
+                }
                 if !self.refreshing
+                    && self.target.as_ref().is_some_and(|target| {
+                        crate::github::polling::ready(&target.repository.host, false)
+                    })
                     && self.last_refresh.is_some_and(|last| {
                         now.saturating_duration_since(last) >= Duration::from_secs(30)
                     })
@@ -1101,8 +1223,9 @@ impl State {
         }
     }
 
+    /// Reloads the open list and, while there is a query, its search.
     fn load_list(&mut self) -> ActionTask {
-        self.load_list_page(false)
+        ActionTask::batch([self.load_open_list(false), self.load_search(false)])
     }
 
     fn open_number(&mut self, number: u64) -> ActionTask {
@@ -1148,42 +1271,166 @@ impl State {
         ActionTask::batch([closed, load])
     }
 
-    fn load_list_page(&mut self, append: bool) -> ActionTask {
-        if append && (self.list_loading || self.list_cursor.is_none()) {
+    /// Requests the open list, keeping the depth already loaded unless
+    /// `append` asks for the next page.
+    fn load_open_list(&mut self, append: bool) -> ActionTask {
+        if append && (self.list_request.loading || self.list_cursor.is_none()) {
             return ActionTask::none();
         }
         let Some(source) = self.source.clone() else {
             return ActionTask::none();
         };
-        self.list_cancellation.cancel();
-        self.list_cancellation = CancellationToken::new();
-        let cancellation = self.list_cancellation.clone();
-        self.list_generation = self.list_generation.wrapping_add(1);
-        let generation = self.list_generation;
-        let cursor = if append {
-            self.list_cursor.clone()
-        } else {
-            None
-        };
-        self.list_loading = true;
-        self.list_appending = append;
-        self.list_error = None;
-        if !matches!(self.list, ListState::Ready(_)) {
-            self.list = ListState::Loading;
+        if let Some(message) = browser_paused(&source) {
+            if !matches!(self.list, ListState::Ready(_)) {
+                self.list = ListState::Failed(message.clone());
+            }
+            self.list_request.error = Some(message);
+            return ActionTask::none();
         }
-        let api = Arc::clone(&self.api);
-        ActionTask::perform(
-            async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    api.pull_request_page(&source.repository, cursor.as_deref(), &cancellation)
-                        .map_err(|error| error.to_string())
-                })
-                .await
-                .unwrap_or_else(|error| Err(format!("pull request list task failed: {error}")));
-                Action::ListLoaded { generation, result }
-            },
-            |action| action,
+        let loaded = match &self.list {
+            ListState::Ready(rows) => rows.len(),
+            _ => {
+                self.list = ListState::Loading;
+                0
+            }
+        };
+        let cursor = append.then(|| self.list_cursor.clone()).flatten();
+        let generation = self.next_browser_generation();
+        let cancellation = self.list_request.start(generation, append, String::new());
+        fetch_browser_pages(
+            Arc::clone(&self.api),
+            source,
+            String::new(),
+            cursor,
+            page_limit(append, loaded),
+            cancellation,
+            generation,
         )
+    }
+
+    /// Searches the repository for the browser's query, keeping the depth
+    /// already loaded for it unless `append` asks for the next page.
+    fn load_search(&mut self, append: bool) -> ActionTask {
+        let query = self.browser_query.trim().to_owned();
+        if query.is_empty() {
+            return ActionTask::none();
+        }
+        let (loaded, next) = self.current_search().map_or((0, None), |search| {
+            (search.rows.len(), search.cursor.clone())
+        });
+        if append && (self.search_request.loading || next.is_none()) {
+            return ActionTask::none();
+        }
+        let Some(source) = self.source.clone() else {
+            return ActionTask::none();
+        };
+        if let Some(message) = browser_paused(&source) {
+            self.search_request.error = Some(message);
+            return ActionTask::none();
+        }
+        let cursor = if append { next } else { None };
+        let generation = self.next_browser_generation();
+        let cancellation = self.search_request.start(generation, append, query.clone());
+        fetch_browser_pages(
+            Arc::clone(&self.api),
+            source,
+            query,
+            cursor,
+            page_limit(append, loaded),
+            cancellation,
+            generation,
+        )
+    }
+
+    fn next_browser_generation(&mut self) -> u64 {
+        self.browser_generation = self.browser_generation.wrapping_add(1);
+        self.browser_generation
+    }
+
+    fn open_list_loaded(&mut self, result: Result<PullRequestPage, String>) -> ActionTask {
+        let page = match result {
+            Ok(page) => page,
+            Err(message) => {
+                if matches!(self.list, ListState::Ready(_)) {
+                    self.list_request.error = Some(message);
+                } else {
+                    self.list = ListState::Failed(message);
+                }
+                return ActionTask::none();
+            }
+        };
+        if let Some(source) = &self.source {
+            crate::github::polling::succeeded(&source.repository.host);
+        }
+        self.list_cursor = page.next_cursor;
+        let mut rows = if self.list_request.appending {
+            match std::mem::replace(&mut self.list, ListState::Idle) {
+                ListState::Ready(rows) => rows,
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let mut known: BTreeSet<_> = rows.iter().map(|row| row.number).collect();
+        rows.extend(
+            page.pull_requests
+                .into_iter()
+                .filter(|row| known.insert(row.number))
+                .map(Arc::new),
+        );
+        self.browser_keys = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.number,
+                    (
+                        row.title.to_lowercase(),
+                        row.author
+                            .as_ref()
+                            .map_or_else(String::new, |author| author.login.to_lowercase()),
+                    ),
+                )
+            })
+            .collect();
+        self.list = ListState::Ready(rows);
+        self.list_request.error = None;
+        // A partial page cannot establish which PR refs are obsolete.
+        if self.list_cursor.is_none() {
+            self.prune_fetched_refs()
+        } else {
+            ActionTask::none()
+        }
+    }
+
+    fn search_loaded(&mut self, result: Result<PullRequestPage, String>) {
+        let query = std::mem::take(&mut self.search_request.query);
+        let page = match result {
+            Ok(page) => page,
+            Err(message) => {
+                self.search_request.error = Some(message);
+                return;
+            }
+        };
+        if let Some(source) = &self.source {
+            crate::github::polling::succeeded(&source.repository.host);
+        }
+        let mut rows = match self.search.take() {
+            Some(search) if self.search_request.appending && search.query == query => search.rows,
+            _ => Vec::new(),
+        };
+        let mut known: BTreeSet<_> = rows.iter().map(|row| row.number).collect();
+        rows.extend(
+            page.pull_requests
+                .into_iter()
+                .filter(|row| known.insert(row.number))
+                .map(Arc::new),
+        );
+        self.search = Some(RepositorySearch {
+            query,
+            rows,
+            cursor: page.next_cursor,
+        });
+        self.search_request.error = None;
     }
 
     /// Drops fetched ranges for pull requests the list no longer shows as
@@ -1203,7 +1450,7 @@ impl State {
             self.git.clone(),
             source.worktree.clone(),
             retain,
-            self.list_cancellation.clone(),
+            self.list_request.cancellation.clone(),
         )
         .discard()
     }
@@ -1300,7 +1547,12 @@ impl State {
     }
 
     fn refresh(&mut self) -> ActionTask {
-        if self.target.is_none() {
+        let Some(target) = &self.target else {
+            return ActionTask::none();
+        };
+        if !crate::github::polling::ready(&target.repository.host, true) {
+            self.notice = crate::github::polling::rate_limit(&target.repository.host)
+                .map(|limit| limit.to_string());
             return ActionTask::none();
         }
         match self.load {
@@ -2248,6 +2500,71 @@ impl State {
         self.unavailable_reason = reason;
     }
 
+    /// How far the repository search for the current query has got. Loaded
+    /// rows that match locally are shown throughout.
+    fn browser_query_status(&self) -> &'static str {
+        if self.browser_query.trim().is_empty() {
+            ""
+        } else if self.current_search().is_some() {
+            " · repository searched"
+        } else if self.search_request.loading {
+            " · searching repository…"
+        } else if self.search_request.error.is_some() {
+            " · repository search unavailable"
+        } else {
+            " · searching repository…"
+        }
+    }
+
+    /// The browser's rows for its query and filter: loaded open pull requests
+    /// matching the text, plus the repository search's results for it.
+    fn browser_matches(&self) -> Vec<&Arc<PullRequest>> {
+        let query = self.browser_query.trim().to_lowercase();
+        let author_query = query.trim_start_matches('@');
+        let number_query = query.trim_start_matches('#');
+        let open = match &self.list {
+            ListState::Ready(rows) => rows.as_slice(),
+            _ => &[],
+        };
+        let filtered = |pr: &PullRequest| {
+            self.browser_filter
+                .matches(pr, self.requests.requested().get(&pr.number))
+        };
+        let mut matches: Vec<&Arc<PullRequest>> = open
+            .iter()
+            .filter(|pr| {
+                filtered(pr)
+                    && (query.is_empty()
+                        || pr.number.to_string() == number_query
+                        || match self.browser_keys.get(&pr.number) {
+                            Some((title, author)) => {
+                                title.contains(&query) || author.contains(author_query)
+                            }
+                            None => {
+                                pr.title.to_lowercase().contains(&query)
+                                    || pr.author.as_ref().is_some_and(|author| {
+                                        author.login.to_lowercase().contains(author_query)
+                                    })
+                            }
+                        })
+            })
+            .collect();
+        // GitHub matches whole words and exact logins, so loaded rows matching
+        // partial text stay beside its results. Its rows already match the
+        // text; only the browser filter applies to them.
+        if let Some(search) = self.current_search() {
+            let mut known: BTreeSet<u64> = matches.iter().map(|pr| pr.number).collect();
+            matches.extend(
+                search
+                    .rows
+                    .iter()
+                    .filter(|pr| filtered(pr) && known.insert(pr.number)),
+            );
+            matches.sort_by_key(|pr| std::cmp::Reverse(pr.number));
+        }
+        matches
+    }
+
     pub fn browser<'a>(&'a self, modal_open: bool) -> Element<'a, Action> {
         if self.source.is_none() {
             return widget::container(
@@ -2262,12 +2579,14 @@ impl State {
             .into();
         }
         let query = self.browser_query.trim().to_lowercase();
+        let search = self.current_search();
         let mut browser_count = 0;
+        let mut has_matching_rows = false;
         let mut rows: Vec<Element<'a, Action>> = match &self.list {
-            ListState::Idle | ListState::Loading => {
+            ListState::Idle | ListState::Loading if search.is_none() => {
                 vec![design::caption("Loading pull requests…").into()]
             }
-            ListState::Failed(message) => vec![
+            ListState::Failed(message) if search.is_none() => vec![
                 widget::container(
                     widget::column::with_children(vec![
                         design::caption(format!("Couldn’t list pull requests. {message}"))
@@ -2282,39 +2601,10 @@ impl State {
                 .padding(Padding::from([space::S, space::M]))
                 .into(),
             ],
-            ListState::Ready(pull_requests) if pull_requests.is_empty() => vec![
-                widget::container(design::caption("No open pull requests."))
-                    .padding(Padding::from([space::S, space::M]))
-                    .into(),
-            ],
-            ListState::Ready(pull_requests) => {
-                let matches: Vec<_> = pull_requests
-                    .iter()
-                    .filter(|pr| {
-                        self.browser_filter
-                            .matches(pr, self.requests.requested().get(&pr.number))
-                            && (query.is_empty()
-                                || self.browser_keys.get(&pr.number).map_or_else(
-                                    || pr.title.to_lowercase().contains(&query),
-                                    |(title, _)| title.contains(&query),
-                                )
-                                || pr.number.to_string() == query.trim_start_matches('#')
-                                || pr.author.as_ref().is_some_and(|author| {
-                                    self.browser_keys.get(&pr.number).map_or_else(
-                                        || {
-                                            author
-                                                .login
-                                                .to_lowercase()
-                                                .contains(query.trim_start_matches('@'))
-                                        },
-                                        |(_, author)| {
-                                            author.contains(query.trim_start_matches('@'))
-                                        },
-                                    )
-                                }))
-                    })
-                    .collect();
+            _ => {
+                let matches = self.browser_matches();
                 browser_count = matches.len();
+                has_matching_rows = !matches.is_empty();
                 let window = browser_row_window(
                     matches.len(),
                     self.browser_viewport.0,
@@ -2337,7 +2627,7 @@ impl State {
                     .height(design::PULL_REQUEST_BROWSER_ROW_HEIGHT)
                     .into();
                     row.map(|action| Action::BrowserFenced {
-                        generation: self.list_generation,
+                        generation: self.browser_generation,
                         action: Box::new(action),
                     })
                 }));
@@ -2360,7 +2650,7 @@ impl State {
         ) {
             for request in self.requests.requested().values() {
                 let entry = &request.entry;
-                let listed = matches!(&self.list, ListState::Ready(prs) if prs.iter().any(|pr| pr.number == entry.number));
+                let listed = self.listed_pull_request(entry.number).is_some();
                 if listed
                     || (self.browser_filter == BrowserFilter::ReRequested
                         && request.history
@@ -2371,7 +2661,9 @@ impl State {
                 {
                     continue;
                 }
-                rows.push(
+                has_matching_rows = true;
+                rows.push(crate::ui_controls::owned(
+                    entry.number,
                     button::custom(widget::column::with_children(vec![
                         design::body(entry.title.as_str()).into(),
                         design::caption(format!(
@@ -2387,17 +2679,35 @@ impl State {
                     .width(Length::Fill)
                     .padding([space::XS, space::S])
                     .on_press_maybe((!modal_open).then_some(Action::BrowserFenced {
-                        generation: self.list_generation,
+                        generation: self.browser_generation,
                         action: Box::new(Action::OpenNumber(entry.number)),
-                    }))
-                    .into(),
-                );
+                    })),
+                ));
             }
         }
-        let count = match &self.list {
-            ListState::Ready(pull_requests) if !pull_requests.is_empty() => browser_count,
-            _ => 0,
-        };
+        if (matches!(self.list, ListState::Ready(_)) || search.is_some()) && !has_matching_rows {
+            let message = if !query.is_empty() && search.is_none() {
+                if self.search_request.error.is_some() && !self.search_request.loading {
+                    "Couldn’t search the repository."
+                } else {
+                    "Searching the repository…"
+                }
+            } else if query.is_empty()
+                && self.browser_filter == BrowserFilter::All
+                && matches!(&self.list, ListState::Ready(prs) if prs.is_empty())
+            {
+                "No open pull requests."
+            } else {
+                "No matching open pull requests."
+            };
+            rows.clear();
+            rows.push(
+                widget::container(design::caption(message))
+                    .padding(Padding::from([space::S, space::M]))
+                    .into(),
+            );
+        }
+        let count = browser_count;
         let list: Element<'a, Action> = widget::scrollable(
             widget::container(widget::column::with_children(rows))
                 .padding(design::with_vertical_rail(Padding::from([
@@ -2416,12 +2726,9 @@ impl State {
         .height(Length::Fill)
         .into();
         let controls = widget::column::with_children(vec![
-            crate::ui_controls::field::search(
-                "Search loaded PRs by title, # or @author",
-                &self.browser_query,
-            )
-            .on_input(Action::BrowserQuery)
-            .into(),
+            crate::ui_controls::field::search("Search title, #123, @author", &self.browser_query)
+                .on_input(Action::BrowserQuery)
+                .into(),
             widget::row::with_children(vec![
                 crate::ui_controls::field::select(
                     &BrowserFilter::ALL,
@@ -2430,18 +2737,24 @@ impl State {
                 )
                 .into(),
                 icon_button(Icon::Refresh, "Refresh pull requests")
-                    .on_press_maybe((!modal_open && !self.list_loading).then_some(Action::LoadList))
+                    .on_press_maybe(
+                        (!modal_open && !self.list_request.loading).then_some(Action::LoadList),
+                    )
                     .into(),
             ])
             .spacing(space::S)
             .into(),
-            design::caption(format!(
-                "{count} matching · {} loaded",
-                match &self.list {
-                    ListState::Ready(rows) => rows.len(),
-                    _ => 0,
-                }
-            ))
+            design::caption(if query.is_empty() {
+                format!(
+                    "{count} matching · {} loaded",
+                    match &self.list {
+                        ListState::Ready(rows) => rows.len(),
+                        _ => 0,
+                    }
+                )
+            } else {
+                format!("{count} matching{}", self.browser_query_status())
+            })
             .into(),
             widget::container(widget::column::with_children(
                 self.requests
@@ -2461,26 +2774,107 @@ impl State {
             column = column.push(
                 crate::ui_controls::button::secondary(format!("Open #{number}")).on_press_maybe(
                     (!modal_open).then_some(Action::BrowserFenced {
-                        generation: self.list_generation,
+                        generation: self.browser_generation,
                         action: Box::new(Action::OpenNumber(number)),
                     }),
                 ),
             );
         }
         let mut column = column.push(list);
-        if let Some(error) = &self.list_error {
-            column =
-                column.push(design::caption(error).wrapping(iced::widget::text::Wrapping::Word));
-        }
-        if self.list_cursor.is_some() {
+        let search_error =
+            self.search_request.error.as_ref().filter(|error| {
+                !query.is_empty() && self.list_request.error.as_ref() != Some(*error)
+            });
+        for error in self.list_request.error.iter().chain(search_error) {
             column = column.push(
-                crate::ui_controls::button::secondary("Load more pull requests").on_press_maybe(
-                    (!modal_open && !self.list_loading).then_some(Action::LoadMore),
-                ),
+                widget::container(
+                    design::caption(error).wrapping(iced::widget::text::Wrapping::Word),
+                )
+                .padding(Padding::from([space::XS, space::M])),
+            );
+        }
+        let (more, loading) = if query.is_empty() {
+            (self.list_cursor.is_some(), self.list_request.loading)
+        } else {
+            (
+                search.is_some_and(|search| search.cursor.is_some()),
+                self.search_request.loading,
+            )
+        };
+        if more {
+            column = column.push(
+                crate::ui_controls::button::secondary("Load more pull requests")
+                    .on_press_maybe((!modal_open && !loading).then_some(Action::LoadMore)),
             );
         }
         column.height(Length::Fill).width(Length::Fill).into()
     }
+}
+
+/// Why the browser may not ask GitHub now, if the host's budget forbids it.
+fn browser_paused(source: &ReviewSource) -> Option<String> {
+    (!crate::github::polling::ready(&source.repository.host, true)).then(|| {
+        crate::github::polling::rate_limit(&source.repository.host)
+            .map(|limit| limit.to_string())
+            .unwrap_or_else(|| "GitHub refresh is paused. Try again shortly.".into())
+    })
+}
+
+/// How many pages a request fetches: one more when appending, otherwise
+/// enough to keep the depth already loaded.
+fn page_limit(append: bool, loaded: usize) -> usize {
+    if append {
+        1
+    } else {
+        loaded.div_ceil(50).max(1)
+    }
+}
+
+/// Fetches up to `page_limit` pages of the open list, or of the repository
+/// search for a non-empty `query`, answering as `generation`.
+fn fetch_browser_pages(
+    api: Arc<dyn GitHubReviewApi>,
+    source: ReviewSource,
+    query: String,
+    cursor: Option<String>,
+    page_limit: usize,
+    cancellation: CancellationToken,
+    generation: u64,
+) -> ActionTask {
+    ActionTask::perform(
+        async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let mut cursor = cursor;
+                let mut rows = Vec::new();
+                for _ in 0..page_limit {
+                    let page = if query.is_empty() {
+                        api.pull_request_page(&source.repository, cursor.as_deref(), &cancellation)
+                    } else {
+                        api.search_pull_requests(
+                            &source.repository,
+                            &query,
+                            cursor.as_deref(),
+                            &cancellation,
+                        )
+                    }
+                    .map_err(|error| error.to_string())?;
+                    rows.extend(page.pull_requests);
+                    cursor = page.next_cursor;
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+                Ok(PullRequestPage {
+                    pull_requests: rows,
+                    next_cursor: cursor,
+                })
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("pull request list task failed: {error}")));
+            Action::ListLoaded { generation, result }
+        },
+        |action| action,
+    )
 }
 
 /// One pull request in the browser: state glyph, title, and number, author
@@ -2550,17 +2944,22 @@ pub fn browser_row<'a>(
     ])
     .spacing(space::S)
     .align_y(Alignment::Center);
-    crate::interaction::hover(
-        button::custom(content)
-            .class(sidebar_button_style(selected))
-            .name(format!(
-                "Review pull request #{} {}",
-                pull_request.number, pull_request.title
-            ))
-            .selected(selected)
-            .padding([space::XS, space::S])
-            .width(Length::Fill)
-            .on_press_maybe((!modal_open).then_some(Action::Select(pull_request.number))),
+    // Rows are positional: a refresh that inserts or removes a pull request
+    // above a held row must not move its press or focus to another number.
+    crate::ui_controls::owned(
+        pull_request.number,
+        crate::interaction::hover(
+            button::custom(content)
+                .class(sidebar_button_style(selected))
+                .name(format!(
+                    "Review pull request #{} {}",
+                    pull_request.number, pull_request.title
+                ))
+                .selected(selected)
+                .padding([space::XS, space::S])
+                .width(Length::Fill)
+                .on_press_maybe((!modal_open).then_some(Action::Select(pull_request.number))),
+        ),
     )
 }
 
@@ -2914,6 +3313,8 @@ pub(crate) struct ScriptedApi {
     pub viewed_outcome: std::sync::Mutex<ReviewMutationOutcome<()>>,
     pub conversation: std::sync::Mutex<crate::github::PullRequestConversation>,
     pub submitted: std::sync::Mutex<Vec<crate::github::SubmitReviewRequest>>,
+    pub search_pages: std::sync::Mutex<std::collections::VecDeque<PullRequestPage>>,
+    pub searches: std::sync::Mutex<Vec<(String, Option<String>)>>,
 }
 
 #[cfg(test)]
@@ -2924,12 +3325,33 @@ impl ScriptedApi {
             viewed_outcome: std::sync::Mutex::new(ReviewMutationOutcome::Applied(())),
             conversation: std::sync::Mutex::new(Default::default()),
             submitted: std::sync::Mutex::new(Vec::new()),
+            search_pages: Default::default(),
+            searches: Default::default(),
         }
     }
 }
 
 #[cfg(test)]
 impl GitHubReviewApi for ScriptedApi {
+    fn search_pull_requests(
+        &self,
+        _repository: &GitHubRepoKey,
+        query: &str,
+        cursor: Option<&str>,
+        _: &CancellationToken,
+    ) -> Result<PullRequestPage, crate::github::GitHubError> {
+        self.searches
+            .lock()
+            .unwrap()
+            .push((query.to_owned(), cursor.map(str::to_owned)));
+        Ok(self
+            .search_pages
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted search page"))
+    }
+
     fn pull_request(
         &self,
         _key: &PullRequestKey,
@@ -3359,6 +3781,445 @@ pub(crate) mod tests {
         }));
     }
 
+    pub(crate) fn ready_due_browser(state: &mut State) {
+        drop(state.update(Action::ListLoaded {
+            generation: state.list_request.generation,
+            result: Ok(PullRequestPage {
+                pull_requests: Vec::new(),
+                next_cursor: None,
+            }),
+        }));
+        state.list_request.last_refresh = Some(Instant::now() - Duration::from_secs(31));
+    }
+
+    #[test]
+    fn multi_page_search_refresh_retains_loaded_depth_query_and_viewport() {
+        use cosmic::iced::futures::StreamExt;
+        let (mut state, api) = state();
+        state.source = Some(ReviewSource {
+            repository: target(1).repository,
+            worktree: "/repo".into(),
+        });
+        state.browser_query = "needle".into();
+        state.list = ListState::Ready(vec![Arc::new(pull_request(500))]);
+        state.search = Some(RepositorySearch {
+            query: "needle".into(),
+            rows: (1..=100)
+                .map(|number| Arc::new(pull_request(number)))
+                .collect(),
+            cursor: Some("page-3".into()),
+        });
+        state.list_request.last_refresh = Some(Instant::now());
+        state.search_request.last_refresh = Some(Instant::now() - Duration::from_secs(31));
+        state.browser_viewport.0 = 800.0;
+        api.search_pages.lock().unwrap().extend([
+            PullRequestPage {
+                pull_requests: (2..=51).map(pull_request).collect(),
+                next_cursor: Some("page-2".into()),
+            },
+            PullRequestPage {
+                pull_requests: (52..=101).map(pull_request).collect(),
+                next_cursor: Some("page-3".into()),
+            },
+        ]);
+        let task = state.update(Action::RefreshIfDue(Instant::now()));
+        let reply = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(action @ Action::ListLoaded { .. }) =
+                        action
+                    {
+                        return action;
+                    }
+                }
+                panic!("list request produced no result");
+            });
+        drop(state.update(reply));
+        assert_eq!(
+            *api.searches.lock().unwrap(),
+            vec![
+                ("needle".into(), None),
+                ("needle".into(), Some("page-2".into()))
+            ]
+        );
+        let search = state.search.as_ref().expect("loaded search");
+        assert_eq!(search.rows.len(), 100);
+        assert!(state.listed_target(1).is_none());
+        assert!(state.listed_target(101).is_some());
+        assert!(
+            matches!(&state.list, ListState::Ready(rows) if rows.len() == 1 && rows[0].number == 500),
+            "a search refresh leaves the open list alone"
+        );
+        assert_eq!(state.browser_query, "needle");
+        assert_eq!(state.browser_viewport.0, 800.0);
+    }
+
+    #[test]
+    fn visible_browser_refreshes_on_cadence_and_drops_closed_rows() {
+        let (mut state, _) = state();
+        drop(state.set_source(Some(ReviewSource {
+            repository: target(1).repository,
+            worktree: "/repo".into(),
+        })));
+        drop(state.update(Action::ListLoaded {
+            generation: state.list_request.generation,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![pull_request(1)],
+                next_cursor: None,
+            }),
+        }));
+        let before = state.browser_generation;
+        drop(state.update(Action::RefreshIfDue(Instant::now())));
+        assert_eq!(state.browser_generation, before);
+        let due = state.list_request.last_refresh.unwrap() + Duration::from_secs(31);
+        drop(state.update(Action::RefreshIfDue(due)));
+        assert!(state.list_request.loading);
+        assert!(state.listed_target(1).is_some());
+        drop(state.update(Action::ListLoaded {
+            generation: state.list_request.generation,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![pull_request(2)],
+                next_cursor: None,
+            }),
+        }));
+        assert!(state.listed_target(1).is_none());
+        assert!(state.listed_target(2).is_some());
+    }
+
+    #[test]
+    fn selected_review_refresh_obeys_shared_server_and_transient_backoff() {
+        for (host, error, manual_allowed) in [
+            (
+                "review-server-limit.invalid",
+                crate::github::GitHubError::RateLimited {
+                    limit: crate::github::polling::RateLimit {
+                        retry_at: crate::github::polling::now() + 120,
+                    },
+                },
+                false,
+            ),
+            (
+                "review-transient-backoff.invalid",
+                crate::github::GitHubError::Inspection("offline".into()),
+                true,
+            ),
+        ] {
+            let (mut state, _) = state();
+            let mut selected = target(1);
+            selected.repository = GitHubRepoKey::new(host, None, "o", "r").unwrap();
+            state.target = Some(selected);
+            state.load = LoadState::Ready;
+            state.last_refresh = Some(Instant::now() - Duration::from_secs(31));
+            let before = state.load_generation;
+            crate::github::polling::failed(host, &error);
+
+            drop(state.update(Action::RefreshIfDue(Instant::now())));
+            assert_eq!(state.load_generation, before, "{host}");
+            assert!(!state.refreshing, "{host}");
+            assert_eq!(state.load, LoadState::Ready);
+
+            drop(state.update(Action::Refresh));
+            assert_eq!(
+                state.load_generation,
+                before + u64::from(manual_allowed),
+                "{host}"
+            );
+            assert_eq!(state.refreshing, manual_allowed, "{host}");
+            assert_eq!(state.load, LoadState::Ready);
+            assert!(state.target.is_some());
+            if !manual_allowed {
+                assert!(state.notice.as_deref().unwrap().contains("Retrying at"));
+            }
+
+            // A successful in-flight load clears transient failures, while a
+            // server deadline learned by another poller remains authoritative.
+            finish_load(&mut state, loaded(vec![], vec![]));
+            assert_eq!(crate::github::polling::ready(host, false), manual_allowed);
+            assert!(!state.refreshing);
+        }
+    }
+
+    #[test]
+    fn blocked_repository_search_keeps_rows_and_reports_its_pending_query() {
+        let (mut state, _) = state();
+        let repository =
+            GitHubRepoKey::new("browser-server-limit.invalid", None, "o", "r").unwrap();
+        state.source = Some(ReviewSource {
+            repository: repository.clone(),
+            worktree: "/repo".into(),
+        });
+        state.list = ListState::Ready(vec![Arc::new(pull_request(1))]);
+        let before = state.browser_generation;
+        crate::github::polling::failed(
+            &repository.host,
+            &crate::github::GitHubError::RateLimited {
+                limit: crate::github::polling::RateLimit {
+                    retry_at: crate::github::polling::now() + 120,
+                },
+            },
+        );
+
+        drop(state.update(Action::BrowserQuery("needle".into())));
+        drop(state.update(Action::BrowserSearch("needle".into())));
+        assert_eq!(state.browser_generation, before);
+        assert!(!state.search_request.loading);
+        assert!(
+            matches!(&state.list, ListState::Ready(rows) if rows.len() == 1 && rows[0].number == 1)
+        );
+        assert!(state.search.is_none());
+        assert_eq!(
+            state.browser_query_status(),
+            " · repository search unavailable"
+        );
+        assert!(
+            state
+                .search_request
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Retrying at")
+        );
+        assert!(
+            state.list_request.error.is_none(),
+            "the open list was not asked for anything"
+        );
+
+        // The same budget must give an unopened browser a truthful error,
+        // rather than a spinner for a request it did not start.
+        let (mut unopened, _) = self::state();
+        drop(unopened.set_source(state.source.clone()));
+        assert!(!unopened.list_request.loading);
+        assert!(
+            matches!(&unopened.list, ListState::Failed(message) if message.contains("Retrying at"))
+        );
+    }
+
+    #[test]
+    fn repository_search_ignores_obsolete_query_and_old_page() {
+        let (mut state, _) = state();
+        drop(state.set_source(Some(ReviewSource {
+            repository: target(1).repository,
+            worktree: "/repo".into(),
+        })));
+        let open = state.list_request.generation;
+        drop(state.update(Action::BrowserQuery("old query".into())));
+        drop(state.update(Action::BrowserSearch("old query".into())));
+        let old_search = state.search_request.generation;
+        assert!(
+            state.list_request.answers(open),
+            "a search never interrupts the open list's first load"
+        );
+        drop(state.update(Action::BrowserQuery("needle".into())));
+        assert!(
+            !state.search_request.loading,
+            "a changed query cancels the old search"
+        );
+        drop(state.update(Action::BrowserSearch("old query".into())));
+        assert!(
+            !state.search_request.loading,
+            "an obsolete debounce starts nothing"
+        );
+        drop(state.update(Action::ListLoaded {
+            generation: old_search,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![pull_request(1)],
+                next_cursor: None,
+            }),
+        }));
+        assert!(state.listed_target(1).is_none());
+        assert!(state.search.is_none());
+        drop(state.update(Action::BrowserSearch("needle".into())));
+        assert!(state.search_request.loading);
+        drop(state.update(Action::ListLoaded {
+            generation: state.search_request.generation,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![pull_request(2)],
+                next_cursor: None,
+            }),
+        }));
+        assert_eq!(state.search.as_ref().unwrap().query, "needle");
+        assert!(state.listed_target(2).is_some());
+        assert_eq!(state.list, ListState::Loading, "the open list is still due");
+        drop(state.update(Action::ListLoaded {
+            generation: open,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![pull_request(3)],
+                next_cursor: None,
+            }),
+        }));
+        assert!(state.listed_target(3).is_some());
+    }
+
+    #[test]
+    fn a_failed_search_typed_during_the_first_load_leaves_the_list_loading_truthfully() {
+        let (mut state, _) = state();
+        drop(state.set_source(Some(ReviewSource {
+            repository: target(1).repository,
+            worktree: "/repo".into(),
+        })));
+        let open = state.list_request.generation;
+        drop(state.update(Action::BrowserQuery("needle".into())));
+        drop(state.update(Action::BrowserSearch("needle".into())));
+        drop(state.update(Action::ListLoaded {
+            generation: state.search_request.generation,
+            result: Err("offline".into()),
+        }));
+        assert!(
+            state.list_request.answers(open),
+            "the open list is still in flight"
+        );
+        assert!(state.list_request.error.is_none());
+        assert_eq!(
+            state.browser_query_status(),
+            " · repository search unavailable"
+        );
+        drop(state.update(Action::ListLoaded {
+            generation: open,
+            result: Err("offline".into()),
+        }));
+        assert_eq!(state.list, ListState::Failed("offline".into()));
+        // A new query forgets the old search's error.
+        drop(state.update(Action::BrowserQuery("other".into())));
+        assert!(state.search_request.error.is_none());
+        assert_eq!(state.browser_query_status(), " · searching repository…");
+    }
+
+    #[test]
+    fn cadence_refreshes_open_list_behind_an_active_search() {
+        let (mut state, _) = state();
+        drop(state.set_source(Some(ReviewSource {
+            repository: target(1).repository,
+            worktree: "/repo".into(),
+        })));
+        let titled = |number, title: &str| {
+            let mut pull_request = pull_request(number);
+            pull_request.title = title.into();
+            pull_request
+        };
+        drop(state.update(Action::ListLoaded {
+            generation: state.list_request.generation,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![titled(2, "Flux sensor"), titled(1, "Flux capacitor")],
+                next_cursor: None,
+            }),
+        }));
+        drop(state.update(Action::BrowserQuery("flux".into())));
+        drop(state.update(Action::BrowserSearch("flux".into())));
+        drop(state.update(Action::ListLoaded {
+            generation: state.search_request.generation,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![titled(2, "Flux sensor"), titled(1, "Flux capacitor")],
+                next_cursor: None,
+            }),
+        }));
+        let due = Instant::now() + Duration::from_secs(31);
+        drop(state.update(Action::RefreshIfDue(due)));
+        assert!(state.list_request.loading, "the open list refreshes too");
+        assert!(state.search_request.loading);
+        // #1 closed: neither list may keep showing it.
+        let still_open = || PullRequestPage {
+            pull_requests: vec![titled(2, "Flux sensor")],
+            next_cursor: None,
+        };
+        drop(state.update(Action::ListLoaded {
+            generation: state.list_request.generation,
+            result: Ok(still_open()),
+        }));
+        drop(state.update(Action::ListLoaded {
+            generation: state.search_request.generation,
+            result: Ok(still_open()),
+        }));
+        let visible: Vec<_> = state.browser_matches().iter().map(|pr| pr.number).collect();
+        assert_eq!(visible, vec![2]);
+    }
+
+    #[test]
+    fn repository_search_adds_to_local_matches_and_clearing_keeps_loaded_depth() {
+        let (mut state, _) = state();
+        drop(state.set_source(Some(ReviewSource {
+            repository: target(1).repository,
+            worktree: "/repo".into(),
+        })));
+        let titled = |number, title: &str| {
+            let mut pull_request = pull_request(number);
+            pull_request.title = title.into();
+            pull_request
+        };
+        drop(
+            state.update(Action::ListLoaded {
+                generation: state.list_request.generation,
+                result: Ok(PullRequestPage {
+                    pull_requests: (51..=150)
+                        .rev()
+                        .map(|number| titled(number, "Routine change"))
+                        .chain([titled(50, "Calibrate capacitor")])
+                        .collect(),
+                    next_cursor: Some("page-3".into()),
+                }),
+            }),
+        );
+        // GitHub matches whole words, so a partial word finds nothing remotely;
+        // the loaded match must not disappear when that answer arrives.
+        let visible = |state: &State| {
+            state
+                .browser_matches()
+                .iter()
+                .map(|pr| pr.number)
+                .collect::<Vec<_>>()
+        };
+        drop(state.update(Action::BrowserQuery("capac".into())));
+        assert_eq!(
+            visible(&state),
+            vec![50],
+            "loaded matches show while typing"
+        );
+        drop(state.update(Action::BrowserSearch("capac".into())));
+        assert_eq!(state.search_request.query, "capac");
+        drop(state.update(Action::ListLoaded {
+            generation: state.search_request.generation,
+            result: Ok(PullRequestPage {
+                pull_requests: Vec::new(),
+                next_cursor: None,
+            }),
+        }));
+        assert_eq!(visible(&state), vec![50]);
+        assert_eq!(state.browser_query_status(), " · repository searched");
+        // A server match whose title lacks the literal text is still shown.
+        drop(state.update(Action::BrowserQuery("calibrate".into())));
+        drop(state.update(Action::BrowserSearch("calibrate".into())));
+        drop(state.update(Action::ListLoaded {
+            generation: state.search_request.generation,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![titled(7, "Calibrating sensors")],
+                next_cursor: None,
+            }),
+        }));
+        assert_eq!(
+            visible(&state),
+            vec![50, 7],
+            "newest first, as in the open list"
+        );
+        assert!(state.listed_target(7).is_some());
+        // Clearing returns to the open list at its depth, without a reload.
+        let generation = state.browser_generation;
+        drop(state.update(Action::BrowserQuery(String::new())));
+        drop(state.update(Action::BrowserSearch(String::new())));
+        assert_eq!(state.browser_generation, generation);
+        assert!(!state.list_request.loading);
+        assert!(matches!(&state.list, ListState::Ready(rows) if rows.len() == 101));
+        assert_eq!(state.list_cursor.as_deref(), Some("page-3"));
+        assert_eq!(visible(&state).len(), 101);
+        assert!(state.listed_target(7).is_none());
+        // Whitespace does not restart a search or move the viewport.
+        state.browser_viewport.0 = 300.0;
+        drop(state.update(Action::BrowserQuery("  ".into())));
+        assert_eq!(state.browser_viewport.0, 300.0);
+    }
+
     #[test]
     fn browser_pages_are_lazy_deduplicated_and_retryable() {
         let (mut state, _) = state();
@@ -3367,18 +4228,21 @@ pub(crate) mod tests {
             worktree: "/repo".into(),
         })));
         drop(state.update(Action::ListLoaded {
-            generation: state.list_generation,
+            generation: state.list_request.generation,
             result: Ok(PullRequestPage {
                 pull_requests: vec![pull_request(1)],
                 next_cursor: Some("page-2".into()),
             }),
         }));
-        assert!(!state.list_loading);
+        assert!(!state.list_request.loading);
         assert!(state.listed_target(1).is_some());
         drop(state.update(Action::LoadMore));
-        let page_generation = state.list_generation;
+        let page_generation = state.browser_generation;
         drop(state.update(Action::LoadMore));
-        assert_eq!(state.list_generation, page_generation, "one page at a time");
+        assert_eq!(
+            state.browser_generation, page_generation,
+            "one page at a time"
+        );
         drop(state.update(Action::ListLoaded {
             generation: page_generation,
             result: Err("offline".into()),
@@ -3390,7 +4254,7 @@ pub(crate) mod tests {
         assert_eq!(state.list_cursor.as_deref(), Some("page-2"));
         drop(state.update(Action::LoadMore));
         drop(state.update(Action::ListLoaded {
-            generation: state.list_generation,
+            generation: state.list_request.generation,
             result: Ok(PullRequestPage {
                 pull_requests: vec![pull_request(1), pull_request(2)],
                 next_cursor: None,
@@ -3403,10 +4267,10 @@ pub(crate) mod tests {
             rows.iter().map(|row| row.number).collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert!(state.list_error.is_none());
-        let completed = state.list_generation;
+        assert!(state.list_request.error.is_none());
+        let completed = state.browser_generation;
         drop(state.update(Action::LoadMore));
-        assert_eq!(state.list_generation, completed);
+        assert_eq!(state.browser_generation, completed);
     }
 
     #[test]
@@ -3416,7 +4280,7 @@ pub(crate) mod tests {
             repository: target(1).repository,
             worktree: "/repo".into(),
         })));
-        let previous_list = state.list_generation;
+        let previous_list = state.list_request.generation;
         drop(state.set_source(None));
         drop(state.update(Action::ListLoaded {
             generation: previous_list,
@@ -3922,6 +4786,57 @@ pub(crate) mod tests {
         ));
     }
 
+    /// A refresh that inserts a pull request above a held row shifts every
+    /// row down one position. The press must stay with the pull request it
+    /// started on rather than selecting whichever number now occupies it.
+    #[test]
+    fn refresh_cannot_move_a_held_row_press_to_another_pull_request() {
+        use crate::ui_controls::accessibility_probe::headless_renderer;
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Point, Size, mouse};
+
+        let mut renderer = headless_renderer();
+        let mut cache = Cache::new();
+        let mut frame = |numbers: &[u64], event: mouse::Event| {
+            let pull_requests = numbers
+                .iter()
+                .copied()
+                .map(pull_request)
+                .collect::<Vec<_>>();
+            let rows = pull_requests
+                .iter()
+                .map(|pull_request| browser_row(pull_request, None, false, false))
+                .collect::<Vec<_>>();
+            let mut ui = UserInterface::build(
+                widget::column::with_children(rows).width(Length::Fixed(320.0)),
+                Size::new(320.0, 400.0),
+                std::mem::replace(&mut cache, Cache::new()),
+                &mut renderer,
+            );
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[Event::Mouse(event)],
+                mouse::Cursor::Available(Point::new(160.0, 10.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            cache = ui.into_cache();
+            messages
+        };
+        let press = mouse::Event::ButtonPressed(mouse::Button::Left);
+        let release = mouse::Event::ButtonReleased(mouse::Button::Left);
+
+        assert!(frame(&[7, 9], press).is_empty());
+        assert!(frame(&[8, 7, 9], release).is_empty());
+        assert!(frame(&[8, 7, 9], press).is_empty());
+        assert!(matches!(
+            frame(&[8, 7, 9], release).as_slice(),
+            [Action::Select(8)]
+        ));
+    }
+
     #[test]
     fn the_own_list_resolves_numbers_to_targets() {
         let (mut state, _) = state();
@@ -3931,7 +4846,7 @@ pub(crate) mod tests {
         })));
         assert_eq!(state.list, ListState::Loading);
         drop(state.update(Action::ListLoaded {
-            generation: state.list_generation,
+            generation: state.list_request.generation,
             result: Ok(PullRequestPage {
                 pull_requests: vec![pull_request(7)],
                 next_cursor: None,
