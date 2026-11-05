@@ -518,8 +518,14 @@ impl Cagents {
         restore.chain(command)
     }
 
+    /// Whether the next key press is a shortcut being recorded or a key to
+    /// filter the palette by, rather than anything the shell acts on.
+    pub(super) fn palette_records_keys(&self) -> bool {
+        self.palette.recording.is_some() || self.palette.filtering_key
+    }
+
     pub(super) fn palette_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
-        if self.palette.recording.is_some() || self.palette.filtering_key {
+        if self.palette_records_keys() {
             // Recording is globally visible, but a real dialog owns its
             // key before the recording or settings draft can change.
             if self.modal_is_open() {
@@ -534,9 +540,13 @@ impl Cagents {
             }
             // A pending Reassign is reached with the keyboard: Tab and
             // Shift+Tab move focus to it rather than being recorded, which
-            // would withdraw the offer the user is navigating to.
+            // would withdraw the offer the user is navigating to. It is the
+            // recorder's only control, so either direction lands on it.
             if self.palette.reassign.is_some() && is_tab_press(event).is_some() {
-                return Some(Task::none());
+                return Some(
+                    iced::widget::operation::focus(widget::Id::new(REASSIGN_BUTTON))
+                        .map(cosmic::Action::App),
+                );
             }
             if let keyboard::Event::KeyPressed {
                 key,
@@ -3200,15 +3210,21 @@ mod settings_recorder_tests {
     fn keyboard_reaches_and_activates_a_pending_reassign() {
         use iced::{
             Size,
-            advanced::{clipboard, widget::operation},
+            advanced::{clipboard, widget::operation::Outcome},
+            futures::StreamExt,
             mouse,
             runtime::user_interface::{Cache, UserInterface},
         };
 
         let mut app = super::super::tests::context_inspector_test_app(false);
+        app.core.set_keyboard_nav(true);
         let field = SettingsField::ShortcutToggleProjects;
         let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
-        drop(app.update_palette(Action::Record(field)));
+        drop(app.update(Message::Palette(Action::Record(field))));
+        assert!(
+            !app.core.keyboard_nav(),
+            "the shell's own Tab traversal would move focus out of the recorder"
+        );
         drop(app.record_shortcut(field, chord.clone()));
         assert!(app.palette.reassign.is_some());
 
@@ -3221,27 +3237,33 @@ mod settings_recorder_tests {
             text: None,
             repeat: false,
         };
+        let enter = press(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            keyboard::Modifiers::empty(),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut messages = Vec::new();
         for modifiers in [keyboard::Modifiers::empty(), keyboard::Modifiers::SHIFT] {
             let tab = press(
                 keyboard::key::Named::Tab,
                 keyboard::key::Code::Tab,
                 modifiers,
             );
-            assert!(app.palette_key_event(&tab).is_some());
+            let task = app.palette_key_event(&tab).expect("the recorder owns Tab");
             assert!(
                 app.palette.reassign.is_some(),
                 "Tab moves toward Reassign instead of being recorded"
             );
             assert_eq!(app.palette.recording, Some(field));
-        }
 
-        let enter = press(
-            keyboard::key::Named::Enter,
-            keyboard::key::Code::Enter,
-            keyboard::Modifiers::empty(),
-        );
-        let mut messages = Vec::new();
-        {
+            // Nothing is focused until the Tab's own task runs on the
+            // recorder; Enter then reaches Reassign only if that task put
+            // focus there.
+            messages.clear();
             let surface = app.palette_surface().expect("recording surface");
             let mut renderer = super::super::tests::headless_renderer();
             let mut ui = UserInterface::build(
@@ -3250,10 +3272,18 @@ mod settings_recorder_tests {
                 Cache::default(),
                 &mut renderer,
             );
-            ui.operate(
-                &renderer,
-                &mut operation::focusable::focus::<()>(widget::Id::new(REASSIGN_BUTTON)),
-            );
+            let mut stream = iced::runtime::task::into_stream(task).expect("a focus task");
+            while let Some(action) = runtime.block_on(stream.next()) {
+                if let iced::runtime::Action::Widget(operation) = action {
+                    let mut next = Some(operation);
+                    while let Some(mut operation) = next.take() {
+                        ui.operate(&renderer, operation.as_mut());
+                        if let Outcome::Chain(chained) = operation.finish() {
+                            next = Some(chained);
+                        }
+                    }
+                }
+            }
             ui.update(
                 &[iced::Event::Keyboard(enter.clone())],
                 mouse::Cursor::Unavailable,
@@ -3261,17 +3291,22 @@ mod settings_recorder_tests {
                 &mut clipboard::Null,
                 &mut messages,
             );
+            assert!(
+                matches!(messages.as_slice(), [Message::Palette(Action::Reassign)]),
+                "Tab with {modifiers:?} then Enter requests the reassignment: {}",
+                messages.len()
+            );
         }
-        assert!(
-            matches!(messages.as_slice(), [Message::Palette(Action::Reassign)]),
-            "Enter on the focused Reassign button requests the reassignment"
-        );
         assert!(app.palette_key_event(&enter).is_some());
         assert!(app.palette.reassign.is_some(), "Enter is not recorded");
         for message in messages {
             drop(app.update(message));
         }
         assert!(app.palette.recording.is_none());
+        assert!(
+            app.core.keyboard_nav(),
+            "traversal returns once recording ends"
+        );
         assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
         assert!(
             app.settings
