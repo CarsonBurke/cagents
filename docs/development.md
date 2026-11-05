@@ -580,13 +580,18 @@ cold. Before its first gated build, `scripts/cargo-gate` runs
 `scripts/seed-build-dir`, which copies the main checkout's compiled
 dependencies into the new build directory with btrfs reflinks. The copy takes
 under a minute and shares file data with the main checkout's until either side
-rewrites a file, so it costs only file system metadata. Cargo then rebuilds
-what differs: this checkout's own and vendored crates, which depend on the
-checkout path, and the crates that depend on them. Incremental caches are not
-copied. Seeding does nothing on a file system without reflinks, when the main
-checkout has no build, for a directory that has been built in, or with
+rewrites a file, so it costs only file system metadata. Seeding leaves out the
+fingerprints of this checkout's own and vendored crates, the packages with no
+`source` in `Cargo.lock`, so Cargo always rebuilds them and the crates that
+depend on them. Cargo would otherwise judge them by source times alone, and a
+copied fingerprint can be newer than this checkout's different sources.
+Incremental caches are not copied. Seeding does nothing on a file system
+without reflinks, when the main checkout has no build or this checkout has no
+`Cargo.lock`, for a directory that has been built in, or with
 `CAGENTS_BUILD_SEED=0`; run `scripts/seed-build-dir` by hand to seed a
-directory a plain `cargo` would create. Seeded directories carry Cargo's
+directory a plain `cargo` would create. After copying a target by hand, run
+`scripts/seed-build-dir --forget-local TARGET` from the checkout that will build
+there, before its first build; it fails when `TARGET` holds no build. Seeded directories carry Cargo's
 `CACHEDIR.TAG`, so `prune-cargo-build-dirs` reclaims them after their worktree
 is removed.
 

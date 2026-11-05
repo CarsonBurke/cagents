@@ -10,9 +10,16 @@
 #
 # Seeding copies the main checkout's compiled dependencies with reflinks, which
 # share the data on disk until either copy is rewritten. Cargo then reuses
-# whatever still matches and rebuilds the rest, including this checkout's own
-# crates. Build scripts that recorded their output directory are relocated by
-# Cargo itself. Incremental caches are not copied.
+# whatever still matches and rebuilds the rest. Build scripts that recorded
+# their output directory are relocated by Cargo itself. Incremental caches are
+# not copied.
+#
+# Cargo decides a path package is fresh by comparing its sources' times with
+# its fingerprint's, and names the fingerprint by the path within the workspace.
+# A copied fingerprint can so be newer than different sources in this checkout,
+# and Cargo would call main's build of them fresh. Registry and Git packages
+# are identified by version and commit instead. So the fingerprints of this
+# checkout's path packages are never kept, whatever the sources' times.
 #
 # This is an optimization: when anything is unsuitable, it leaves the build
 # directory alone and Cargo builds as it would have.
@@ -26,15 +33,61 @@ note() {
 usage() {
     cat <<'EOF'
 Usage: scripts/seed-build-dir [--from BUILD_DIR] [--to BUILD_DIR]
+       scripts/seed-build-dir --forget-local BUILD_DIR
 
 Copies the compiled dependencies of BUILD_DIR (default: the main checkout's
 Cargo build directory) into an empty build directory (default: this
 checkout's), using reflinks. Does nothing when the destination already has a
-build, the source is missing or the same, or the file system cannot reflink.
+build, the source is missing or the same, this checkout has no Cargo.lock, or
+the file system cannot reflink.
+
+--forget-local makes Cargo rebuild this checkout's own and vendored crates in
+a Cargo target or build directory copied by hand, as every copy must before it
+is built in: otherwise Cargo can call the original's build of them fresh and
+run it. Run it from the checkout that will build there.
 
 Environment:
   CAGENTS_BUILD_SEED=0   Never seed
 EOF
+}
+
+# The lock file of the workspace holding the working directory, as Cargo finds it.
+lock_file() {
+    root=$(cargo metadata --format-version 1 --no-deps 2>/dev/null |
+        sed -n 's/.*"workspace_root":"\([^"]*\)".*/\1/p')
+    [ -n "$root" ] && [ -f "$root/Cargo.lock" ] || return 1
+    printf '%s\n' "$root/Cargo.lock"
+}
+
+# The path packages of lock file $1, the ones with no `source`, as alternatives
+# of a regular expression. Fails when there are none: every workspace has one,
+# so that lock file was not understood.
+local_packages() {
+    packages=$(awk '
+        function finish() { if (name != "" && !sourced) print name }
+        { sub(/\r$/, "") }
+        /^\[/ { finish(); name = ""; sourced = 0 }
+        /^name = / { name = $3; gsub(/"/, "", name) }
+        /^source = / { sourced = 1 }
+        END { finish() }
+    ' "$1")
+    [ -n "$packages" ] || return 1
+    printf '%s\n' "$packages" | paste -s -d '|' -
+}
+
+# Removes the fingerprints of the packages matching $1 from build directory $2,
+# in every profile however deep: Cargo adds a directory for a target triple.
+# Without a fingerprint Cargo rebuilds a package, and then whatever depends on
+# it. Fails when the directory holds no fingerprints.
+forget_local() {
+    fingerprints=$(find "$2/" \( -name deps -o -name build -o -name incremental -o -name examples \) \
+        -prune -o -type d -name .fingerprint -print)
+    [ -n "$fingerprints" ] || return 1
+    printf '%s\n' "$fingerprints" | while IFS= read -r directory; do
+        # Each is named <package>-<hash>; a package can begin with another's name.
+        find "$directory" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
+            -regex ".*/($1)-[0-9a-f]+" -exec rm -rf -- {} +
+    done
 }
 
 from=
@@ -43,6 +96,13 @@ while [ "$#" -gt 0 ]; do
     case $1 in
         --from) [ "$#" -gt 1 ] || { usage >&2; exit 2; }; from=$2; shift ;;
         --to) [ "$#" -gt 1 ] || { usage >&2; exit 2; }; to=$2; shift ;;
+        --forget-local)
+            [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+            lock=$(lock_file) || { note "no Cargo.lock for a workspace at $(pwd -P)"; exit 1; }
+            packages=$(local_packages "$lock") || { note "$lock names no crate of this checkout"; exit 1; }
+            forget_local "$packages" "$2" || { note "no build to forget in $2"; exit 1; }
+            exit 0
+            ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -96,6 +156,10 @@ fi
 # An unbuilt source has nothing to copy, and a built one is not the empty
 # destination.
 built "$from" || exit 0
+if ! lock=$(lock_file) || ! packages=$(local_packages "$lock"); then
+    note "not seeding $to: no Cargo.lock names this checkout's own crates"
+    exit 0
+fi
 
 mkdir -p -- "$to"
 tag "$to"
@@ -173,6 +237,7 @@ for fingerprints in "$from"/*/.fingerprint; do
     profiles="$profiles $profile"
 done
 
+forget_local "$packages" "$stage"
 for profile in $profiles; do
     # Replaces only a missing or empty profile directory, so a build that
     # started meanwhile keeps its own.

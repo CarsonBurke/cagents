@@ -97,7 +97,7 @@ STUBS = {
         # The gate asks where the build directory is before it takes a slot.
         if [ "$1" = metadata ]; then
             printf '%s\\n' "$*" >> "$STUB_LOG/cargo-metadata"
-            printf '{"target_directory":"/stub"}\\n'
+            printf '{"target_directory":"/stub","workspace_root":"%s"}\\n' "$PWD"
             exit 0
         fi
         printf '%s\\n' "$*" >> "$STUB_LOG/cargo"
@@ -210,6 +210,7 @@ class Evidence(unittest.TestCase):
     def checkout(self, name: str = "after") -> Path:
         path = self.root / name
         (path / "scripts").mkdir(parents=True)
+        (path / "Cargo.lock").write_text('[[package]]\nname = "cagents"\nversion = "0.1.0"\n')
         write_executable(
             path / "scripts" / "run-development",
             """
@@ -393,6 +394,28 @@ class Evidence(unittest.TestCase):
         (self.logs / "runner-other-features").touch()
         (self.logs / "harness-waits").touch()
         self.assert_fails_promptly("build did not compile that")
+
+    def test_a_seed_target_keeps_no_fingerprint_of_the_checkouts_own_crates(self) -> None:
+        probe = self.root / "reflink-probe"
+        probe.touch()
+        if subprocess.run(["cp", "--reflink=always", probe, f"{probe}-copy"],
+                          capture_output=True).returncode != 0:
+            self.skipTest("this file system cannot reflink")
+        self.built("before")
+        seed = self.task / "target-before"
+        fingerprints = seed / "debug/.fingerprint"
+        (fingerprints / "cagents-0a1b").mkdir(parents=True)
+        (fingerprints / "zstd-sys-2c3d").mkdir()
+        after = self.checkout("after")
+        (after / "Cargo.lock").write_text(
+            '[[package]]\nname = "cagents"\nversion = "0.1.0"\n\n'
+            '[[package]]\nname = "zstd-sys"\nversion = "2.0.0"\n'
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+        )
+        self.run_tool("build", "after", str(after), "--seed-target", str(seed))
+        copied = self.task / "target-after/debug/.fingerprint"
+        self.assertEqual(sorted(path.name for path in copied.iterdir()), ["zstd-sys-2c3d"])
+        self.assertTrue((fingerprints / "cagents-0a1b").is_dir())
 
     def test_a_failed_seed_copy_cannot_pass_as_the_seeds_build(self) -> None:
         if os.geteuid() == 0:
