@@ -14,7 +14,7 @@ pub enum AccountCommand {
         /// Provider whose existing home is registered: claude or codex.
         #[arg(value_parser = link::parse_provider)]
         provider: crate::agent::Provider,
-        /// Absolute home on the selected device, or quoted '~/path'.
+        /// Absolute home on the selected device, or one starting with ~/ (quote it).
         #[arg(value_parser = link::parse_home)]
         home: String,
     },

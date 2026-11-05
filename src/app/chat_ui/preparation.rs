@@ -5,7 +5,8 @@ use std::sync::atomic::AtomicUsize;
 const SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const QUEUED_BYTES: usize = 72 * 1024 * 1024;
 const QUEUED_ITEMS: usize = 128;
-static RESERVED: AtomicUsize = AtomicUsize::new(0);
+// Bytes leased across the application, bounded by QUEUED_BYTES.
+application_atomic!(fn reserved() -> AtomicUsize);
 static ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
 fn next_attempt() -> u64 {
@@ -87,14 +88,30 @@ struct Canonical {
     blocks: HashMap<u64, prose::CodeBlock>,
 }
 
-#[derive(Default)]
-pub(super) struct Lease(AtomicUsize);
+/// Bytes charged to the application's budget. The budget is captured on the
+/// UI thread at creation, since a lease may drop on the reclaimer.
+pub(super) struct Lease {
+    bytes: AtomicUsize,
+    reserved: &'static AtomicUsize,
+}
+impl Default for Lease {
+    fn default() -> Self {
+        Self {
+            bytes: AtomicUsize::new(0),
+            reserved: reserved(),
+        }
+    }
+}
 impl Lease {
+    fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
     fn resize(&self, bytes: usize) -> bool {
-        let old = self.0.load(Ordering::Relaxed);
+        let old = self.bytes();
         if bytes > old {
             let extra = bytes - old;
-            if RESERVED
+            if self
+                .reserved
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
                     total
                         .checked_add(extra)
@@ -105,19 +122,19 @@ impl Lease {
                 return false;
             }
         } else {
-            RESERVED.fetch_sub(old - bytes, Ordering::Relaxed);
+            self.reserved.fetch_sub(old - bytes, Ordering::Relaxed);
             if bytes < old {
                 notify_available();
             }
         }
-        self.0.store(bytes, Ordering::Relaxed);
+        self.bytes.store(bytes, Ordering::Relaxed);
         true
     }
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        let bytes = self.0.load(Ordering::Relaxed);
-        RESERVED.fetch_sub(bytes, Ordering::Relaxed);
+        let bytes = self.bytes();
+        self.reserved.fetch_sub(bytes, Ordering::Relaxed);
         if bytes != 0 {
             notify_available();
         }
@@ -184,7 +201,7 @@ impl MetadataRetirement {
             .saturating_add(64);
         if !owned
             .lease
-            .resize(owned.lease.0.load(Ordering::Relaxed).saturating_add(bytes))
+            .resize(owned.lease.bytes().saturating_add(bytes))
         {
             return false;
         }
@@ -699,16 +716,16 @@ impl State {
     pub(super) fn queued_bytes(&self) -> usize {
         self.entries
             .values()
-            .map(|entry| entry.shared.lease.0.load(Ordering::Relaxed))
+            .map(|entry| entry.shared.lease.bytes())
             .chain(
                 self.local
                     .iter()
-                    .map(|(_, entry)| entry.shared.lease.0.load(Ordering::Relaxed)),
+                    .map(|(_, entry)| entry.shared.lease.bytes()),
             )
             .sum()
     }
     pub(super) fn global_queued_bytes() -> usize {
-        RESERVED.load(Ordering::Relaxed)
+        reserved().load(Ordering::Relaxed)
     }
     pub(super) fn error(&self) -> Option<&str> {
         self.errors
@@ -2869,7 +2886,7 @@ mod tests {
             let previous = runtime.cache[&id].item.as_ref().unwrap().clone();
             let pressure = Lease::default();
             let spare = if large_id { 4096 } else { 0 };
-            assert!(pressure.resize(QUEUED_BYTES - RESERVED.load(Ordering::Relaxed) - spare));
+            assert!(pressure.resize(QUEUED_BYTES - reserved().load(Ordering::Relaxed) - spare));
             let mut snapshot = (*handle.snapshot()).clone();
             snapshot.generation += 1;
             Arc::make_mut(&mut snapshot.items[0]).at = Some(1_700_000_000_000);
@@ -4077,10 +4094,7 @@ mod tests {
             .upgrade()
             .expect("queued output retains source lease after eviction");
         assert!(owner.cancelled.load(Ordering::Relaxed));
-        assert_eq!(
-            owner.lease.0.load(Ordering::Relaxed),
-            "a retained body".len()
-        );
+        assert_eq!(owner.lease.bytes(), "a retained body".len());
         drop(owner);
         assert!(state.accept(target, "message", run, output).is_none());
         let retired = iced::futures::executor::block_on(permits.clone().acquire_owned()).unwrap();
