@@ -6283,7 +6283,9 @@ impl Cagents {
                 if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
                     && self.worktree_view_scope(&directory).is_some()
                 {
-                    self.shared_views.deferred_default = Some(directory.clone());
+                    self.shared_views.deferred_default = self
+                        .default_pane_scope(&directory)
+                        .map(|scope| (scope, directory.clone()));
                     return Task::none();
                 }
                 self.shared_views.creating_default =
@@ -6301,6 +6303,27 @@ impl Cagents {
     }
 
     pub(super) fn ensure_default_pane(&mut self) -> Task<Message> {
+        self.ensure_default_pane_after_loading(true)
+    }
+
+    /// A channel created by this window is known to be empty. Opening an
+    /// existing channel instead waits for its shared panes before offering an
+    /// automatic composer that could receive typing intended for those panes.
+    pub(super) fn ensure_new_channel_default_pane(&mut self) -> Task<Message> {
+        self.ensure_default_pane_after_loading(false)
+    }
+
+    pub(super) fn default_pane_scope(
+        &self,
+        directory: &std::path::Path,
+    ) -> Option<crate::workspace_model::views::Scope> {
+        self.durable
+            .active_channel
+            .map(crate::workspace_model::views::Scope::Channel)
+            .or_else(|| self.worktree_view_scope(directory))
+    }
+
+    fn ensure_default_pane_after_loading(&mut self, wait_for_shared: bool) -> Task<Message> {
         let Some(directory) = self.active_workspace.clone() else {
             return Task::none();
         };
@@ -6310,6 +6333,14 @@ impl Cagents {
                     && matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_))
             })
         }) {
+            return Task::none();
+        }
+        if wait_for_shared
+            && let Some(scope) = self.default_pane_scope(&directory)
+            && (self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+                || !self.shared_views.scope_initialized(&scope))
+        {
+            self.shared_views.deferred_default = Some((scope, directory));
             return Task::none();
         }
         let pane = if self.durable.active_channel.is_some() {
