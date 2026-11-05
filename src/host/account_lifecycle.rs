@@ -4,6 +4,8 @@
 //! This foundation issues no deletion permit. Managed removal refuses and
 //! pending/failed homes remain intact. Historical namespace enrollment and
 //! complete actor/reader retirement census belong to that separate cut.
+pub(crate) mod recovery;
+
 use super::state::SharedHost;
 use crate::{
     account::{

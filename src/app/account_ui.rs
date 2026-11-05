@@ -46,7 +46,9 @@ use crate::account::{
 };
 use crate::agent::Provider;
 
+mod recovery;
 mod table;
+pub(super) use recovery::Status as PreservedStatus;
 
 fn remote_lifecycle<T: serde::de::DeserializeOwned>(
     operation: account::remote::Operation,
@@ -99,6 +101,13 @@ pub(super) struct State {
     /// has to match when the current metadata read completes.
     discovery_manual: BTreeMap<AccountId, u64>,
     registry: Registry,
+    recovery: recovery::Queue,
+    registry_callbacks: recovery::RegistryCallbacks,
+    registry_requests: BTreeMap<RegistryRequest, uuid::Uuid>,
+    registry_reset_floor: Option<u64>,
+    recovery_problem: Option<String>,
+    recovery_cli_pending: bool,
+    last_registry_scan: Option<Registry>,
     store: Option<Store>,
     homes: Option<Homes>,
     remote_system_homes: BTreeMap<Provider, PathBuf>,
@@ -242,6 +251,13 @@ impl State {
             discovery_generation: 0,
             discovery_manual: BTreeMap::new(),
             registry,
+            recovery: recovery::Queue::default(),
+            registry_callbacks: recovery::RegistryCallbacks::default(),
+            registry_requests: BTreeMap::new(),
+            registry_reset_floor: None,
+            recovery_problem: None,
+            recovery_cli_pending: false,
+            last_registry_scan: None,
             store,
             homes,
             remote_system_homes: BTreeMap::new(),
@@ -343,6 +359,34 @@ impl State {
             self.registry = registry;
             self.sync_accounts();
         }
+    }
+
+    fn registry_write(&self) -> RegistryWrite {
+        RegistryWrite {
+            state: self.recovery.owner(),
+            registry: self.registry_callbacks.capture_owner(),
+            request: None,
+        }
+    }
+
+    fn registry_write_for(&mut self, operation: RegistryRequest) -> RegistryWrite {
+        let request = uuid::Uuid::new_v4();
+        self.registry_requests.insert(operation.clone(), request);
+        RegistryWrite {
+            request: Some((operation, request)),
+            ..self.registry_write()
+        }
+    }
+
+    fn finish_registry_write(&mut self, callback: &RegistryWrite) -> bool {
+        let Some((operation, request)) = &callback.request else {
+            return true;
+        };
+        if self.registry_requests.get(operation) != Some(request) {
+            return false;
+        }
+        self.registry_requests.remove(operation);
+        true
     }
 
     /// What the reader calls `account`: the name they gave it, else the
@@ -867,12 +911,29 @@ pub use crate::account::remote::Settled;
 pub struct Loaded {
     generation: u64,
     registry: Result<Registry, String>,
+    preserved: account::recovery::Discovery,
     restored: Vec<Restored>,
     catalogs: BTreeMap<Provider, Catalog>,
     installed: BTreeMap<Provider, bool>,
     /// Whether presence was judged on the interface's own `PATH` because the
     /// shell had not yet said what a terminal would search.
     provisional: bool,
+}
+
+/// A lifecycle callback may retire only its own latch after a checked reset.
+/// Data from another app/device state never belongs to this window.
+#[derive(Debug, Clone)]
+pub struct RegistryWrite {
+    state: uuid::Uuid,
+    registry: uuid::Uuid,
+    request: Option<(RegistryRequest, uuid::Uuid)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum RegistryRequest {
+    Link,
+    Login(uuid::Uuid),
+    Remove(AccountId),
 }
 
 /// What the startup load found for one account.
@@ -885,6 +946,15 @@ pub struct Restored {
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    RegistryRead(recovery::ReadToken, Box<Action>),
+    RegistryWrite(RegistryWrite, Box<Action>),
+    RegistryScanned {
+        registry: Result<Registry, String>,
+        preserved: account::recovery::Discovery,
+    },
+    RestorePreserved(account::recovery::Candidate),
+    PreservedRestored(recovery::Request, Result<Settled, String>),
+    PreservedDetails(account::recovery::Candidate),
     RemoteHomeReady(Provider, Result<crate::account::remote::Created, String>),
     RemoteLoaded(u64, Result<crate::device_service::AccountSnapshot, String>),
     RemoteLogin(AccountId, u64, Result<LaunchRecipe, String>),
@@ -1017,7 +1087,9 @@ impl Action {
     pub(super) fn blocked_while_modal(&self) -> bool {
         matches!(
             self,
-            Self::Refresh(_)
+            Self::RestorePreserved(_)
+                | Self::PreservedDetails(_)
+                | Self::Refresh(_)
                 | Self::Install(_)
                 | Self::Popover(Some(_))
                 | Self::ShowAccount(_)
@@ -1702,6 +1774,10 @@ impl Cagents {
     pub(super) fn load_accounts(&mut self) -> Task<Message> {
         self.account_ui.discovery_generation = self.account_ui.discovery_generation.wrapping_add(1);
         let generation = self.account_ui.discovery_generation;
+        let callback = self
+            .account_ui
+            .registry_callbacks
+            .issue_read_at(self.account_ui.registry.revision());
         if crate::device::is_remote() {
             return cosmic::task::future(async move {
                 let result =
@@ -1718,7 +1794,10 @@ impl Cagents {
                     .await
                     .map_err(|error| error.to_string())
                     .and_then(|result| result);
-                Message::AccountUi(Action::RemoteLoaded(generation, result))
+                Message::AccountUi(Action::RegistryRead(
+                    callback,
+                    Box::new(Action::RemoteLoaded(generation, result)),
+                ))
             });
         }
         let store = self.account_ui.store.clone();
@@ -1739,6 +1818,13 @@ impl Cagents {
                     .as_ref()
                     .map(|registry| registry.accounts(homes.as_ref()))
                     .unwrap_or_else(|_| Account::system_accounts().into());
+                let preserved = registry
+                    .as_ref()
+                    .map(|registry| account::recovery::Discovery::read(homes.as_ref(), registry))
+                    .unwrap_or_else(|error| account::recovery::Discovery {
+                        candidates: Vec::new(),
+                        problem: Some(error.clone()),
+                    });
                 let now = now_ms();
                 let installed = provider_installations(search_path.as_deref());
                 let restored = restore(&accounts, cache.as_ref(), now, &installed);
@@ -1749,8 +1835,21 @@ impl Cagents {
                 // Not while the registry cannot be read, or its accounts' homes
                 // cannot be found, which would take every added account for
                 // one since removed.
-                if let (Some(cache), Ok(_), Some(_)) = (&cache, &registry, &homes) {
-                    let keep = accounts.iter().filter_map(Account::cache_key).collect();
+                if let (Some(cache), Ok(_), Some(homes)) = (&cache, &registry, &homes)
+                    && preserved.problem.is_none()
+                {
+                    let keep = accounts
+                        .iter()
+                        .cloned()
+                        .chain(preserved.candidates.iter().map(|candidate| {
+                            Account::managed(
+                                candidate.provider,
+                                candidate.key,
+                                homes.path(candidate.provider, candidate.key),
+                            )
+                        }))
+                        .filter_map(|account| account.cache_key())
+                        .collect();
                     if let Err(error) = cache.prune(&keep, now) {
                         tracing::debug!(%error, "the account usage cache could not be pruned");
                     }
@@ -1758,6 +1857,7 @@ impl Cagents {
                 Loaded {
                     generation,
                     registry,
+                    preserved,
                     restored,
                     catalogs,
                     installed,
@@ -1768,12 +1868,19 @@ impl Cagents {
             .unwrap_or_else(|_| Loaded {
                 generation,
                 registry: Err("The accounts could not be read".into()),
+                preserved: account::recovery::Discovery {
+                    candidates: Vec::new(),
+                    problem: Some("The preserved accounts could not be inspected".into()),
+                },
                 restored: Vec::new(),
                 catalogs: BTreeMap::new(),
                 installed: BTreeMap::new(),
                 provisional,
             });
-            Message::AccountUi(Action::Loaded(loaded))
+            Message::AccountUi(Action::RegistryRead(
+                callback,
+                Box::new(Action::Loaded(loaded)),
+            ))
         });
         match self.start_omp_read() {
             Some(read) => Task::batch([load, read]),
@@ -1825,6 +1932,10 @@ impl Cagents {
 
     /// Reads the registry again, for what another window changed.
     pub(super) fn reload_registry(&mut self) -> Task<Message> {
+        let callback = self
+            .account_ui
+            .registry_callbacks
+            .issue_read_at(self.account_ui.registry.revision());
         if crate::device::is_remote() {
             self.account_ui.discovery_generation =
                 self.account_ui.discovery_generation.wrapping_add(1);
@@ -1844,18 +1955,42 @@ impl Cagents {
                     .await
                     .map_err(|error| error.to_string())
                     .and_then(|result| result);
-                Message::AccountUi(Action::RemoteLoaded(generation, result))
+                Message::AccountUi(Action::RegistryRead(
+                    callback,
+                    Box::new(Action::RemoteLoaded(generation, result)),
+                ))
             });
         }
         let Some(store) = self.account_ui.store.clone() else {
             return Task::none();
         };
+        let homes = self.account_ui.homes.clone();
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || store.load())
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result.map_err(|error| error.to_string()));
-            Message::AccountUi(Action::RegistryLoaded(result))
+            let result = tokio::task::spawn_blocking(move || {
+                let registry = store.load().map_err(|error| error.to_string())?;
+                let preserved = account::recovery::Discovery::read(homes.as_ref(), &registry);
+                Ok::<_, String>((registry, preserved))
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            let (registry, preserved) = match result {
+                Ok((registry, preserved)) => (Ok(registry), preserved),
+                Err(error) => (
+                    Err(error.clone()),
+                    account::recovery::Discovery {
+                        candidates: Vec::new(),
+                        problem: Some(error),
+                    },
+                ),
+            };
+            Message::AccountUi(Action::RegistryRead(
+                callback,
+                Box::new(Action::RegistryScanned {
+                    registry,
+                    preserved,
+                }),
+            ))
         })
     }
 
@@ -1865,6 +2000,8 @@ impl Cagents {
         &mut self,
         change: impl FnOnce(&mut Registry) + Send + 'static,
     ) -> Task<Message> {
+        let callback = self.account_ui.registry_write();
+        let minimum_revision = self.account_ui.registry.revision();
         if crate::device::is_remote() {
             let expected_revision = self.account_ui.registry.revision();
             let mut registry = self.account_ui.registry.clone();
@@ -1888,7 +2025,10 @@ impl Cagents {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
-                Message::AccountUi(Action::Saved(result))
+                Message::AccountUi(Action::RegistryWrite(
+                    callback,
+                    Box::new(Action::Saved(result)),
+                ))
             });
         }
         let Some(store) = self.account_ui.store.clone() else {
@@ -1900,15 +2040,16 @@ impl Cagents {
             return Task::none();
         };
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || store.update(change))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| {
-                    result
-                        .map(|(registry, ())| registry)
-                        .map_err(|error| error.to_string())
-                });
-            Message::AccountUi(Action::Saved(result))
+            let result = tokio::task::spawn_blocking(move || {
+                store.update_after_revision(minimum_revision, change)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            Message::AccountUi(Action::RegistryWrite(
+                callback,
+                Box::new(Action::Saved(result)),
+            ))
         })
     }
 
@@ -2013,7 +2154,9 @@ impl Cagents {
         // A fresh discovery already answered this question without starting
         // the CLI. Do not repeatedly prepare missing-CLI probes or spend a
         // manual attempt; explicit Refresh rediscovers before reaching here.
-        if self.account_ui.installed.get(&provider) == Some(&false) {
+        if self.account_ui.installed.get(&provider) == Some(&false)
+            || self.account_ui.recovery.suppresses(provider)
+        {
             return None;
         }
         let busy = self.account_ui.provider_busy(provider, id, now);
@@ -2282,6 +2425,95 @@ impl Cagents {
 
     pub(super) fn update_account_ui(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::RegistryRead(callback, action) => {
+                if !self.account_ui.registry_callbacks.accept_read(callback) {
+                    return Task::none();
+                }
+                let observed = match action.as_ref() {
+                    Action::Loaded(loaded) => loaded.registry.as_ref().ok(),
+                    Action::RegistryLoaded(Ok(registry))
+                    | Action::RegistryScanned {
+                        registry: Ok(registry),
+                        ..
+                    } => Some(registry),
+                    Action::RemoteLoaded(generation, Ok(snapshot))
+                        if *generation == self.account_ui.discovery_generation =>
+                    {
+                        Some(&snapshot.registry)
+                    }
+                    _ => None,
+                }
+                .map(Registry::revision);
+                if let Some(observed) = observed {
+                    let current = self.account_ui.registry.revision();
+                    let floor = callback.minimum_revision();
+                    if observed < floor && floor >= current {
+                        // This read began after the window knew this persisted
+                        // revision. An older read is not proof of a reset.
+                        self.account_ui.registry_reset_floor = Some(floor);
+                    } else if observed >= current {
+                        self.account_ui.registry_reset_floor = None;
+                    }
+                }
+                self.update_account_ui(*action)
+            }
+            Action::RegistryWrite(callback, action) => {
+                if callback.state != self.account_ui.recovery.owner() {
+                    return Task::none();
+                }
+                if !self.account_ui.finish_registry_write(&callback) {
+                    // A replacement owns this row's latch now. Even cleanup
+                    // from the old operation must leave that replacement alone.
+                    return Task::none();
+                }
+                if !self
+                    .account_ui
+                    .registry_callbacks
+                    .accept_owner(callback.registry)
+                {
+                    // Retire only the exact operation's existing latch. Other
+                    // async work keeps its normal completion path and owner.
+                    match *action {
+                        Action::LinkReady { .. } => self.account_ui.table.linking = false,
+                        Action::Removed { ref id, .. } => {
+                            self.account_ui.removing.remove(id);
+                        }
+                        Action::LoginVerified { key, .. }
+                        | Action::LoginSettled { key, .. }
+                        | Action::LoginCallbackBlocked(key) => {
+                            if let Some(login) = self
+                                .account_ui
+                                .logins
+                                .iter_mut()
+                                .find(|login| login.key == key)
+                            {
+                                login.phase = LoginPhase::Waiting;
+                                login.next_check = now_ms() + LOGIN_RETRY;
+                            }
+                        }
+                        _ => {}
+                    }
+                    return self.reload_registry();
+                }
+                self.update_account_ui(*action)
+            }
+            Action::RegistryScanned {
+                registry,
+                preserved,
+            } => {
+                let recovery = match &registry {
+                    Ok(registry) => self.install_preserved_discovery(preserved, registry.clone()),
+                    Err(error) => {
+                        self.account_ui.recovery_problem = Some(error.clone());
+                        Task::none()
+                    }
+                };
+                let loaded = self.update_account_ui(Action::RegistryLoaded(registry));
+                Task::batch([loaded, recovery])
+            }
+            Action::RestorePreserved(candidate) => self.restore_preserved(candidate),
+            Action::PreservedRestored(request, result) => self.preserved_restored(request, result),
+            Action::PreservedDetails(candidate) => self.toggle_preserved_details(candidate),
             Action::RemoteHomeReady(provider, result) => match result {
                 Ok(created) => {
                     let task = self.begin_account_login(
@@ -2334,6 +2566,7 @@ impl Cagents {
                 self.update_account_ui(Action::Loaded(Loaded {
                     generation,
                     registry: Ok(snapshot.registry),
+                    preserved: snapshot.preserved,
                     restored,
                     installed: snapshot.installed,
                     catalogs: snapshot.catalogs,
@@ -2376,11 +2609,15 @@ impl Cagents {
                 let current_discovery = loaded.generation == self.account_ui.discovery_generation;
                 if current_discovery {
                     self.account_ui.installed = loaded.installed;
+                    self.account_ui.recovery_cli_pending = loaded.provisional;
                 }
                 let owners_before = self.account_ui.discovery_owners();
                 let mut migration = Task::none();
+                let mut recovery = Task::none();
                 match loaded.registry {
                     Ok(mut registry) => {
+                        recovery =
+                            self.install_preserved_discovery(loaded.preserved, registry.clone());
                         let projects = self
                             .sidebar_model
                             .projects
@@ -2417,7 +2654,7 @@ impl Cagents {
                 } else {
                     Task::none()
                 };
-                Task::batch([follow_up, migration])
+                Task::batch([follow_up, migration, recovery])
             }
             Action::Located {
                 generation,
@@ -2436,6 +2673,7 @@ impl Cagents {
                     return self.locate_accounts();
                 }
                 self.account_ui.installed = installed;
+                self.account_ui.recovery_cli_pending = false;
                 // Fresh detection owns current presence, independently of an
                 // older usage snapshot which remains useful history.
                 let installed = self.account_ui.installed.clone();
@@ -2461,8 +2699,9 @@ impl Cagents {
                     }
                 }
                 self.account_ui.restore(restored);
+                let recovery = self.pump_account_recovery();
                 let manual = std::mem::take(&mut self.account_ui.discovery_manual);
-                if manual.is_empty() {
+                let follow_up = if manual.is_empty() {
                     self.probe_accounts(Trigger::Focus)
                 } else {
                     let now = now_ms();
@@ -2481,7 +2720,8 @@ impl Cagents {
                             .iter()
                             .filter_map(|id| self.probe_account(id, Trigger::Manual, now)),
                     )
-                }
+                };
+                Task::batch([recovery, follow_up])
             }
             Action::Probed { owner, id, outcome } => self.account_probed(id, owner, outcome),
             Action::OmpRead(history) => {
@@ -3046,7 +3286,7 @@ impl Cagents {
             .account(&id)
             .is_some_and(|state| state.owner == owner)
         {
-            return Task::none();
+            return self.pump_account_recovery();
         }
         let provider = self
             .account_ui
@@ -3061,7 +3301,7 @@ impl Cagents {
                 state.schedule.abandon();
                 state.queued = None;
             }
-            return Task::none();
+            return self.pump_account_recovery();
         }
         let now = now_ms();
         self.refresh_login_watch(&id, now);
@@ -3163,7 +3403,8 @@ impl Cagents {
         let remember = learned
             .map(|(key, identity)| self.remember_identity(&id, key, identity))
             .unwrap_or_else(Task::none);
-        Task::batch([remember, self.probe_queued(provider)])
+        let recovery = self.pump_account_recovery();
+        Task::batch([remember, recovery, self.probe_queued(provider)])
     }
 
     /// Records who a registered account's home reported it is.
@@ -3587,6 +3828,7 @@ impl Cagents {
             return Task::none();
         }
         self.account_ui.table.linking = true;
+        let callback = self.account_ui.registry_write_for(RegistryRequest::Link);
         let key = uuid::Uuid::new_v4();
         if crate::device::is_remote() {
             return cosmic::task::future(async move {
@@ -3604,7 +3846,10 @@ impl Cagents {
                     Ok((registry, linked)) => (linked, Ok(registry)),
                     Err(error) => (key, Err(error)),
                 };
-                Message::AccountUi(Action::LinkReady { key, result })
+                Message::AccountUi(Action::RegistryWrite(
+                    callback,
+                    Box::new(Action::LinkReady { key, result }),
+                ))
             });
         }
         let store = self.account_ui.store.clone();
@@ -3654,7 +3899,10 @@ impl Cagents {
                 Ok((registry, linked)) => (linked, Ok(registry)),
                 Err(error) => (key, Err(error)),
             };
-            Message::AccountUi(Action::LinkReady { key, result })
+            Message::AccountUi(Action::RegistryWrite(
+                callback,
+                Box::new(Action::LinkReady { key, result }),
+            ))
         })
     }
 
@@ -3794,16 +4042,19 @@ impl Cagents {
 
     /// Forgets a pending sign-in through the selected daemon. Its home and
     /// any interrupted-removal history remain available for explicit recovery.
-    fn discard_home(&self, key: uuid::Uuid, provider: Provider) -> Task<Message> {
+    fn discard_home(&mut self, key: uuid::Uuid, provider: Provider) -> Task<Message> {
         self.discard_home_via(key, provider, remote_lifecycle::<Settled>)
     }
 
     fn discard_home_via(
-        &self,
+        &mut self,
         key: uuid::Uuid,
         provider: Provider,
         request: impl FnOnce(account::remote::Operation) -> Result<Settled, String> + Send + 'static,
     ) -> Task<Message> {
+        let callback = self
+            .account_ui
+            .registry_write_for(RegistryRequest::Login(key));
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 abandon_home(provider, key, request).map(Settled::Abandoned)
@@ -3811,7 +4062,10 @@ impl Cagents {
             .await
             .map_err(|error| error.to_string())
             .and_then(|result| result);
-            Message::AccountUi(Action::LoginSettled { key, result })
+            Message::AccountUi(Action::RegistryWrite(
+                callback,
+                Box::new(Action::LoginSettled { key, result }),
+            ))
         })
     }
 
@@ -3957,6 +4211,9 @@ impl Cagents {
         }
         login.attempts += 1;
         let account = login.account();
+        let callback = self
+            .account_ui
+            .registry_write_for(RegistryRequest::Login(key));
         cosmic::task::future(async move {
             // The daemon is asked only what the terminal said went wrong. One
             // that cannot answer leaves that unread; the home is still asked.
@@ -3968,7 +4225,12 @@ impl Cagents {
                         .map_err(|error| error.to_string())
                         .and_then(|result| result);
                 match blocked {
-                    Ok(true) => return Message::AccountUi(Action::LoginCallbackBlocked(key)),
+                    Ok(true) => {
+                        return Message::AccountUi(Action::RegistryWrite(
+                            callback,
+                            Box::new(Action::LoginCallbackBlocked(key)),
+                        ));
+                    }
                     Ok(false) => {}
                     Err(error) => unread = Some(error),
                 }
@@ -3995,10 +4257,13 @@ impl Cagents {
             } else {
                 probe::run(account, None, true).await
             };
-            Message::AccountUi(Action::LoginVerified {
-                key,
-                outcome: with_callback_unread(unread, outcome),
-            })
+            Message::AccountUi(Action::RegistryWrite(
+                callback,
+                Box::new(Action::LoginVerified {
+                    key,
+                    outcome: with_callback_unread(unread, outcome),
+                }),
+            ))
         })
     }
 
@@ -4074,6 +4339,9 @@ impl Cagents {
             return self.discard_home(key, provider);
         }
         login.phase = LoginPhase::Settling;
+        let callback = self
+            .account_ui
+            .registry_write_for(RegistryRequest::Login(key));
         if crate::device::is_remote() {
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
@@ -4082,7 +4350,10 @@ impl Cagents {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
-                Message::AccountUi(Action::LoginSettled { key, result })
+                Message::AccountUi(Action::RegistryWrite(
+                    callback,
+                    Box::new(Action::LoginSettled { key, result }),
+                ))
             });
         }
         let managed = registry::Registered {
@@ -4140,7 +4411,10 @@ impl Cagents {
                 }
                 Err(error) => Err(error),
             };
-            Message::AccountUi(Action::LoginSettled { key, result })
+            Message::AccountUi(Action::RegistryWrite(
+                callback,
+                Box::new(Action::LoginSettled { key, result }),
+            ))
         })
     }
 
@@ -4265,6 +4539,9 @@ impl Cagents {
         {
             return Task::none();
         }
+        let callback = self
+            .account_ui
+            .registry_write_for(RegistryRequest::Remove(id.clone()));
         cosmic::task::future(async move {
             let remove_id = id.clone();
             let result = tokio::task::spawn_blocking(move || {
@@ -4277,11 +4554,14 @@ impl Cagents {
                 Ok((registry, error)) => (Some(registry), error),
                 Err(error) => (None, Some(error)),
             };
-            Message::AccountUi(Action::Removed {
-                id,
-                registry,
-                error,
-            })
+            Message::AccountUi(Action::RegistryWrite(
+                callback,
+                Box::new(Action::Removed {
+                    id,
+                    registry,
+                    error,
+                }),
+            ))
         })
     }
 
@@ -5155,7 +5435,53 @@ impl Cagents {
 
     /// The Accounts pane: every account, as a table grouped by provider.
     pub(super) fn accounts_pane(&self) -> Element<'_, Message> {
-        table::view(self).map(pane_message)
+        let table = table::view(self);
+        match self.preserved_accounts_panel() {
+            Some(preserved) => widget::column::with_children([preserved, table])
+                .spacing(space::S)
+                .into(),
+            None => table,
+        }
+        .map(pane_message)
+    }
+
+    /// Interpret only daemon-derived hints and the original recipe's exact
+    /// managed path. Rendering a saved conversation performs no filesystem or
+    /// provider work, and never substitutes another account or launch recipe.
+    pub(super) fn preserved_chat_account(
+        &self,
+        provider: Provider,
+        recipe: &LaunchRecipe,
+    ) -> Option<(account::recovery::Candidate, bool, Option<PreservedStatus>)> {
+        let variable = account::home_variable(provider)?;
+        let path = recipe.environment.get(variable)?;
+        let (selected_provider, key) = self
+            .account_ui
+            .homes
+            .as_ref()?
+            .managed_identity(Path::new(path))?;
+        if selected_provider != provider {
+            return None;
+        }
+        let candidate = account::recovery::Candidate { provider, key };
+        let status = self.account_ui.recovery.status(&candidate).cloned();
+        let restored = self
+            .account_ui
+            .last_registry_scan
+            .as_ref()
+            .is_some_and(|registry| {
+                registry
+                    .find(key)
+                    .is_some_and(|row| row.provider == provider && row.linked_home.is_none())
+            });
+        (restored || status.is_some()).then_some((candidate, restored, status))
+    }
+
+    pub(super) fn preserved_restore_enabled(
+        &self,
+        candidate: &account::recovery::Candidate,
+    ) -> bool {
+        self.account_ui.recovery.can_retry(candidate)
     }
 }
 
@@ -7422,6 +7748,7 @@ mod app_tests {
         let now = now_ms();
         let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
             generation: app.account_ui.discovery_generation,
+            preserved: account::recovery::Discovery::default(),
             registry: Ok(app.account_ui.registry.clone()),
             restored: Vec::new(),
             catalogs: BTreeMap::from([(Provider::Codex, catalog(now - 10_000, "cached"))]),
@@ -7646,6 +7973,7 @@ mod app_tests {
         };
         let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
             generation: app.account_ui.discovery_generation,
+            preserved: account::recovery::Discovery::default(),
             registry: Ok(Registry::default()),
             restored: judged(false),
             catalogs: BTreeMap::new(),
@@ -7700,6 +8028,7 @@ mod app_tests {
         };
         let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
             generation: app.account_ui.discovery_generation,
+            preserved: account::recovery::Discovery::default(),
             registry: Ok(Registry::default()),
             restored: judged(true),
             catalogs: BTreeMap::new(),
@@ -7997,6 +8326,7 @@ mod app_tests {
         let registry: Registry = toml::from_str(&old).unwrap();
         let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
             generation: app.account_ui.discovery_generation,
+            preserved: account::recovery::Discovery::default(),
             registry: Ok(registry),
             restored: Vec::new(),
             catalogs: BTreeMap::new(),
@@ -9099,6 +9429,7 @@ mod app_tests {
         finish_discovery(&mut app, BTreeMap::from([(Provider::Codex, true)]));
         let current = app.account_ui.discovery_generation;
         let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            preserved: account::recovery::Discovery::default(),
             generation: stale_generation,
             registry: Ok(stale_registry),
             restored: Vec::new(),
@@ -9160,6 +9491,7 @@ mod app_tests {
         ))));
         let current_owner = app.account_ui.account(&id).unwrap().owner;
         let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            preserved: account::recovery::Discovery::default(),
             generation: old_generation,
             registry: Ok(old_registry),
             restored: Vec::new(),
@@ -9596,6 +9928,13 @@ mod app_tests {
         assert_eq!(prepared.unset_environment, later.unset_environment);
     }
 
+    fn lifecycle_result(message: &Message) -> &Action {
+        match message {
+            Message::AccountUi(Action::RegistryWrite(_, action)) => action.as_ref(),
+            _ => panic!("lifecycle completion keeps its registry request scope"),
+        }
+    }
+
     async fn lifecycle_message(task: Task<Message>) -> Message {
         use cosmic::iced::futures::StreamExt;
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -9703,7 +10042,7 @@ mod app_tests {
         app.account_ui.popover = Some(linked.id());
         let message = lifecycle_message(task).await;
         assert!(
-            matches!(&message, Message::AccountUi(Action::Removed { id, registry: None, error: Some(reason) }) if *id == managed.id() && reason.contains("files were kept"))
+            matches!(lifecycle_result(&message), Action::Removed { id, registry: None, error: Some(reason) } if *id == managed.id() && reason.contains("files were kept"))
         );
         drop(app.update(message));
         assert_eq!(app.account_ui.registry, original);
@@ -9749,7 +10088,7 @@ mod app_tests {
         });
         let message = lifecycle_message(task).await;
         assert!(
-            matches!(&message, Message::AccountUi(Action::Removed { id, registry: Some(_), error: None }) if *id == linked.id())
+            matches!(lifecycle_result(&message), Action::Removed { id, registry: Some(_), error: None } if *id == linked.id())
         );
         drop(app.update(message));
         assert!(app.account_ui.account(&linked.id()).is_none());
@@ -9843,7 +10182,7 @@ mod app_tests {
         });
         let message = lifecycle_message(task).await;
         assert!(
-            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Err(_) }) if *received == key)
+            matches!(lifecycle_result(&message), Action::LoginSettled { key: received, result: Err(_) } if *received == key)
         );
         drop(app.update(message));
         assert_eq!(store.load().unwrap(), original);
@@ -9860,7 +10199,7 @@ mod app_tests {
         });
         let message = lifecycle_message(task).await;
         assert!(
-            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Err(_) }) if *received == key)
+            matches!(lifecycle_result(&message), Action::LoginSettled { key: received, result: Err(_) } if *received == key)
         );
         drop(app.update(message));
         assert_eq!(store.load().unwrap(), original);
@@ -9872,7 +10211,7 @@ mod app_tests {
         });
         let message = lifecycle_message(task).await;
         assert!(
-            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Err(_) }) if *received == key)
+            matches!(lifecycle_result(&message), Action::LoginSettled { key: received, result: Err(_) } if *received == key)
         );
         drop(app.update(message));
         assert_eq!(store.load().unwrap(), original);
@@ -9893,7 +10232,7 @@ mod app_tests {
         });
         let message = lifecycle_message(task).await;
         assert!(
-            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Ok(Settled::Abandoned(Some(_))) }) if *received == key)
+            matches!(lifecycle_result(&message), Action::LoginSettled { key: received, result: Ok(Settled::Abandoned(Some(_))) } if *received == key)
         );
         drop(app.update(message));
         assert!(app.account_ui.logins.is_empty());

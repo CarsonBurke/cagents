@@ -574,8 +574,10 @@ pub(super) fn process_request(
             ensure_control_open(host)?;
             super::agent_execution::terminals::admit(host, client_id, &request)?;
         }
-        let reservation = super::account_lifecycle::Reservation::for_operation(host, operation)?;
-        let value = crate::account::remote::execute_reserved(operation.clone(), &reservation)
+        let reservation = Arc::new(super::account_lifecycle::Reservation::for_operation(
+            host, operation,
+        )?);
+        let value = crate::account::remote::execute_reserved(operation.clone(), reservation)
             .map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
             })?;

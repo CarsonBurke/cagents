@@ -37,6 +37,8 @@ const VERSION: u32 = 5;
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
 
+pub(crate) mod recovery;
+
 /// One account cagents added, as the registry records it. An account with
 /// `linked_home` belongs to another application or the reader, not cagents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -744,6 +746,7 @@ pub struct Store {
 #[derive(Debug)]
 pub enum LaunchAccountError {
     Removed { provider: Provider, key: Uuid },
+    RegistrationMissing { provider: Provider, key: Uuid },
     Unreadable(io::Error),
 }
 
@@ -753,6 +756,11 @@ impl std::fmt::Display for LaunchAccountError {
             Self::Removed { provider, .. } => write!(
                 formatter,
                 "This {} account was removed. Choose another account before continuing.",
+                provider.label()
+            ),
+            Self::RegistrationMissing { provider, .. } => write!(
+                formatter,
+                "This {} account's registration is missing. Its account folder is still here. Restore the account in Accounts before continuing.",
                 provider.label()
             ),
             Self::Unreadable(error) => {
@@ -875,7 +883,38 @@ impl Store {
         }
         for (provider, key) in selected {
             if !registry.contains_managed_home(homes, provider, key) {
-                return Err(LaunchAccountError::Removed { provider, key });
+                let status = super::recovery::inspect(homes, &registry, provider, key).map_err(
+                    |error| {
+                        LaunchAccountError::Unreadable(io::Error::new(
+                            error.kind(),
+                            format!(
+                                "The saved account home could not be checked safely. Open Accounts to review it before continuing: {error}"
+                            ),
+                        ))
+                    },
+                )?;
+                return Err(match status {
+                    super::recovery::HomeStatus::Missing => {
+                        LaunchAccountError::Removed { provider, key }
+                    }
+                    super::recovery::HomeStatus::Available(_) => {
+                        LaunchAccountError::RegistrationMissing { provider, key }
+                    }
+                    super::recovery::HomeStatus::Ambiguous => {
+                        LaunchAccountError::Unreadable(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "More than one managed account home uses this saved account's key. Open Accounts to review them before continuing.",
+                        ))
+                    }
+                    super::recovery::HomeStatus::Registered
+                    | super::recovery::HomeStatus::Pending
+                    | super::recovery::HomeStatus::Represented => {
+                        LaunchAccountError::Unreadable(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "The saved account home conflicts with an existing account registration. Open Accounts to review it before continuing.",
+                        ))
+                    }
+                });
             }
         }
         Ok(Some(LaunchAccountLease { _lock: lock }))
@@ -1346,6 +1385,111 @@ mod tests {
         assert!(store.register_pending(&homes, account, &[]).is_err());
         assert!(store.load().unwrap().find(key).is_none());
         assert!(!home.exists());
+    }
+
+    #[test]
+    fn lost_registration_reports_preserved_home_and_keeps_original_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (key, home) = homes.create(Provider::Claude, None).unwrap();
+        let history = home.join("history.fixture");
+        fs::write(&history, b"saved synthetic conversation\n").unwrap();
+        store
+            .update(|registry| {
+                let mut registered = managed(Provider::Claude, "fixture@example.invalid");
+                registered.key = key;
+                registry.accounts.push(registered);
+            })
+            .unwrap();
+        let recipe = account_recipe(&home);
+        assert!(
+            store
+                .authorize_launch(&homes, &recipe, None)
+                .unwrap()
+                .is_some()
+        );
+        fs::remove_file(store.path()).unwrap();
+
+        let failure = match store.authorize_launch(&homes, &recipe, None) {
+            Err(failure) => failure,
+            Ok(_) => panic!("a preserved home cannot launch before its registration is restored"),
+        };
+        assert!(matches!(
+            &failure,
+            LaunchAccountError::RegistrationMissing {
+                provider: Provider::Claude,
+                key: selected,
+            } if *selected == key
+        ));
+        assert!(failure.to_string().contains("registration is missing"));
+        assert!(
+            failure
+                .to_string()
+                .contains("Restore the account in Accounts")
+        );
+        assert!(!failure.to_string().contains("was removed"));
+        assert!(home.is_dir());
+        assert_eq!(
+            fs::read(&history).unwrap(),
+            b"saved synthetic conversation\n"
+        );
+        assert!(!store.path().exists(), "diagnosis does not restore a row");
+    }
+
+    #[test]
+    fn missing_unregistered_home_keeps_the_removed_diagnostic() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (key, home) = homes.create(Provider::Claude, None).unwrap();
+        fs::remove_dir(&home).unwrap();
+
+        let failure = match store.authorize_launch(&homes, &account_recipe(&home), None) {
+            Err(failure) => failure,
+            Ok(_) => panic!("a missing managed home cannot launch"),
+        };
+        assert!(matches!(
+            &failure,
+            LaunchAccountError::Removed {
+                provider: Provider::Claude,
+                key: selected,
+            } if *selected == key
+        ));
+        assert!(failure.to_string().contains("was removed"));
+        assert!(!failure.to_string().contains("Restore"));
+        assert!(!home.exists());
+        assert!(!store.path().exists());
+    }
+
+    #[test]
+    fn ambiguous_unregistered_home_refuses_launch_without_claiming_removal() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (key, home) = homes.create(Provider::Claude, None).unwrap();
+        let conflicting = homes.path(Provider::Codex, key);
+        fs::create_dir_all(&conflicting).unwrap();
+
+        let failure = match store.authorize_launch(&homes, &account_recipe(&home), None) {
+            Err(failure) => failure,
+            Ok(_) => panic!("ambiguous managed homes cannot launch"),
+        };
+        assert!(matches!(
+            &failure,
+            LaunchAccountError::Unreadable(error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert!(
+            failure
+                .to_string()
+                .contains("More than one managed account home")
+        );
+        assert!(failure.to_string().contains("Open Accounts"));
+        assert!(!failure.to_string().contains("was removed"));
+        assert!(!failure.to_string().contains("Restore"));
+        assert!(home.is_dir());
+        assert!(conflicting.is_dir());
+        assert!(!store.path().exists());
     }
 
     #[test]

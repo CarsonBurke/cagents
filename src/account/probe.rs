@@ -35,6 +35,9 @@ use super::{
 };
 use crate::{agent::Provider, chat::Model};
 
+#[cfg(feature = "host")]
+pub(crate) mod status;
+
 /// How long a probe may take in total.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 /// How much of a CLI's stdout a probe reads before giving up on it.
@@ -705,8 +708,8 @@ impl Drop for Group {
 }
 
 /// A running CLI speaking JSON lines.
-struct Session {
-    group: Group,
+struct Session<Owner = Group> {
+    group: Owner,
     stdin: Option<ChildStdin>,
     lines: tokio::io::Lines<BufReader<tokio::io::Take<ChildStdout>>>,
 }
@@ -724,6 +727,20 @@ impl Session {
         })
     }
 
+    /// Closes the CLI's input and output, and finishes its group.
+    async fn close(self) {
+        let Self {
+            mut group,
+            stdin,
+            lines,
+        } = self;
+        drop(stdin);
+        drop(lines);
+        group.finish().await;
+    }
+}
+
+impl<Owner> Session<Owner> {
     async fn send(&mut self, frame: &Value) -> Result<(), String> {
         let stdin = self
             .stdin
@@ -756,18 +773,6 @@ impl Session {
                 Err(_) => return Err("The CLI's output could not be read".into()),
             }
         }
-    }
-
-    /// Closes the CLI's input and output, and finishes its group.
-    async fn close(self) {
-        let Self {
-            mut group,
-            stdin,
-            lines,
-        } = self;
-        drop(stdin);
-        drop(lines);
-        group.finish().await;
     }
 }
 
@@ -1209,7 +1214,7 @@ impl CodexAnswers {
     }
 }
 
-async fn codex_response(session: &mut Session, id: i64) -> Result<RpcResult, String> {
+async fn codex_response<Owner>(session: &mut Session<Owner>, id: i64) -> Result<RpcResult, String> {
     loop {
         let frame = session.next().await?;
         if frame["id"].as_i64() == Some(id) && frame.get("method").is_none() {
