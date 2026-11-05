@@ -380,6 +380,51 @@ impl KeyboardShortcuts {
         ]
     }
 
+    /// Replaces one registered action's chords; call the full validator before saving.
+    pub fn set_action(&mut self, index: usize, chords: Vec<String>) {
+        match index {
+            0 => self.new_terminal = chords,
+            1 => self.new_channel = chords,
+            2 => self.clone_pane = chords,
+            3 => self.close_focused_column = chords,
+            4 => self.search_projects = chords,
+            5 => self.find_in_pane = chords,
+            6 => self.previous_column = chords,
+            7 => self.next_column = chords,
+            8 => self.cycle_pane_width = chords,
+            9 => self.previous_workspace = chords,
+            10 => self.next_workspace = chords,
+            11 => self.review_toggle_viewed = chords,
+            12 => self.review_next_file = chords,
+            13 => self.review_previous_file = chords,
+            14 => self.review_next_unviewed = chords,
+            15 => self.review_next_change = chords,
+            16 => self.review_previous_change = chords,
+            17 => self.command_palette = chords,
+            18 => self.new_native_thread = chords,
+            19 => self.chat_permissions = chords,
+            20 => self.chat_model = chords,
+            21 => self.chat_account = chords,
+            22 => self.toggle_inspector = chords,
+            23 => self.open_settings = chords,
+            24 => self.move_pane_left = chords,
+            25 => self.move_pane_right = chords,
+            26 => self.reopen_pane = chords,
+            27 => self.focus_pane_1 = chords,
+            28 => self.focus_pane_2 = chords,
+            29 => self.focus_pane_3 = chords,
+            30 => self.focus_pane_4 = chords,
+            31 => self.focus_pane_5 = chords,
+            32 => self.focus_pane_6 = chords,
+            33 => self.focus_pane_7 = chords,
+            34 => self.focus_pane_8 = chords,
+            35 => self.focus_pane_9 = chords,
+            36 => self.toggle_projects = chords,
+            37 => self.rename_pane = chords,
+            _ => panic!("unknown shortcut action"),
+        }
+    }
+
     fn validate(&self) -> Result<(), SettingsError> {
         self.fault().map_or(Ok(()), |fault| Err(fault.error))
     }
@@ -408,7 +453,7 @@ impl KeyboardShortcuts {
                     Ok(binding) => binding,
                     Err(error) => return fault(error, None),
                 };
-                if let Some(message) = withheld_from_the_card(binding) {
+                if let Some(message) = shortcut_chord_refusal(binding) {
                     return fault(message, None);
                 }
                 if let Some(&(_, owner)) = parsed.iter().find(|(other, _)| *other == binding) {
@@ -469,6 +514,98 @@ pub struct ShortcutFault {
     pub action: usize,
     pub conflicts_with: Option<usize>,
     pub error: SettingsError,
+}
+
+/// A chord handled directly by a native surface rather than the action table.
+#[derive(Debug, Clone, Copy)]
+pub struct FixedShortcut {
+    pub label: &'static str,
+    pub chords: &'static [&'static str],
+    pub scope: &'static str,
+    pub refusal: &'static str,
+    /// Native font zoom also accepts logical keypad keys. Its filter uses the
+    /// same handler instead of the configurable number-row binding policy.
+    pub font_zoom_delta: Option<i8>,
+}
+
+pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
+    FixedShortcut {
+        label: "Cycle recent panes",
+        chords: &["Ctrl+Tab", "Ctrl+Shift+Tab"],
+        scope: "Navigation",
+        refusal: "This chord is reserved for Cycle recent panes",
+        font_zoom_delta: None,
+    },
+    FixedShortcut {
+        label: "Increase font size",
+        chords: &["Ctrl+=", "Ctrl+Plus", "Ctrl+Shift+=", "Ctrl+Shift+Plus"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Increase font size",
+        font_zoom_delta: Some(1),
+    },
+    FixedShortcut {
+        label: "Decrease font size",
+        chords: &["Ctrl+-"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Decrease font size",
+        font_zoom_delta: Some(-1),
+    },
+    FixedShortcut {
+        label: "Reset font size",
+        chords: &["Ctrl+0"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Reset font size",
+        font_zoom_delta: Some(0),
+    },
+    FixedShortcut {
+        label: "Save file",
+        chords: &["Ctrl+S"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Save file",
+        font_zoom_delta: None,
+    },
+    FixedShortcut {
+        label: "Stage / unstage selected lines",
+        chords: &["Ctrl+Shift+S"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Stage / unstage selected lines",
+        font_zoom_delta: None,
+    },
+    FixedShortcut {
+        label: "Copy terminal selection",
+        chords: &["Ctrl+Shift+C"],
+        scope: "Panes",
+        refusal: "This chord is reserved for Copy terminal selection",
+        font_zoom_delta: None,
+    },
+    FixedShortcut {
+        label: "Paste into terminal",
+        chords: &["Ctrl+Shift+V"],
+        scope: "Panes",
+        refusal: "This chord is reserved for Paste into terminal",
+        font_zoom_delta: None,
+    },
+];
+
+/// The same refusal is used by the recorder, typed edits and file validation.
+pub fn shortcut_chord_refusal(binding: ShortcutBinding) -> Option<&'static str> {
+    if let Some(reason) = withheld_from_the_card(binding) {
+        return Some(reason);
+    }
+    FIXED_SHORTCUTS
+        .iter()
+        .find(|fixed| {
+            fixed
+                .chords
+                .iter()
+                .any(|chord| parse_shortcut(chord).is_ok_and(|fixed| fixed == binding))
+        })
+        .map(|fixed| fixed.refusal)
+}
+
+/// Legacy actions that must retain a route back to the workspace.
+pub fn shortcut_required(index: usize) -> bool {
+    !INTRODUCED_SHORTCUT_ACTIONS.contains(&SHORTCUT_ACTIONS[index])
 }
 
 /// Why a chord must not be bound, or `None` when binding it is safe.
@@ -626,6 +763,45 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
         logo,
         key: key.ok_or("keyboard shortcut must contain a key")?,
     })
+}
+
+/// Canonical keys for searching bindings accepted with aliases, whitespace or
+/// reordered modifiers. Display text remains exactly as the user entered it.
+pub fn shortcut_search_keywords(value: &str) -> String {
+    parse_chords(value)
+        .iter()
+        .filter_map(|chord| parse_shortcut(chord).ok())
+        .map(|binding| {
+            let mut parts = Vec::new();
+            if binding.control {
+                parts.push("Ctrl".to_owned());
+            }
+            if binding.alt {
+                parts.push("Alt".to_owned());
+            }
+            if binding.logo {
+                parts.push("Super".to_owned());
+            }
+            if binding.shift {
+                parts.push("Shift".to_owned());
+            }
+            parts.push(match binding.key {
+                ShortcutKey::Character(',') => "Comma".into(),
+                ShortcutKey::Character('+') => "Plus".into(),
+                ShortcutKey::Character(character) => character.to_ascii_uppercase().to_string(),
+                ShortcutKey::ArrowLeft => "Left".into(),
+                ShortcutKey::ArrowRight => "Right".into(),
+                ShortcutKey::ArrowUp => "Up".into(),
+                ShortcutKey::ArrowDown => "Down".into(),
+                ShortcutKey::Tab => "Tab".into(),
+                ShortcutKey::PageUp => "PageUp".into(),
+                ShortcutKey::PageDown => "PageDown".into(),
+                ShortcutKey::Function(number) => format!("F{number}"),
+            });
+            parts.join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Approximate the old line preference at 1 KiB per requested line, rounded
@@ -4256,10 +4432,27 @@ new_thread = "Alt+Shift+G"
         // The gesture only reaches the child as a control character when Ctrl
         // is alone: the shifted and Alt forms send something else, or nothing,
         // and stay bindable.
-        for chord in ["Ctrl+Shift+C", "Ctrl+Alt+D", "Super+Z"] {
+        for chord in ["Ctrl+Shift+X", "Ctrl+Alt+D", "Super+Z"] {
             let mut settings = AppSettings::default();
             settings.keyboard_shortcuts.new_terminal = vec![chord.to_owned()];
             assert!(settings.validate().is_ok(), "{chord} was refused");
+        }
+    }
+
+    #[test]
+    fn native_fixed_chords_refuse_conflicting_actions_by_name() {
+        for (chord, label) in [
+            ("Ctrl+Tab", "Cycle recent panes"),
+            ("Ctrl+=", "Increase font size"),
+            ("Ctrl+Shift+C", "Copy terminal selection"),
+            ("Ctrl+Shift+S", "Stage / unstage selected lines"),
+        ] {
+            let mut settings = AppSettings::default();
+            settings.keyboard_shortcuts.new_terminal = vec![chord.into()];
+            assert!(
+                matches!(settings.validate(), Err(SettingsError::InvalidShortcut(reason)) if reason.contains(label)),
+                "{chord}"
+            );
         }
     }
 

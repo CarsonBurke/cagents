@@ -21,7 +21,14 @@ usage() {
 Usage: scripts/cargo-gate [cargo] SUBCOMMAND [ARGS...]
        scripts/cargo-gate exec COMMAND [ARGS...]
 
-Runs `cargo SUBCOMMAND ARGS...` once a build slot is free. For `test`,
+`build`, `check`, `clippy`, `test` and `doc` run on the build host in
+CAGENTS_BUILD_REMOTE with scripts/cargo-offload: in one of its build slots,
+with this checkout's sources, streaming their output; `build` copies the
+executables it made back into this checkout's target directory. When that
+host is unreachable, low on disk, or the command names paths on this host,
+the command runs here instead, after one line saying why.
+
+Otherwise, runs `cargo SUBCOMMAND ARGS...` once a build slot is free. For `test`,
 `bench` and `run`, only the build (`--no-run`, or `build`) holds the slot; the
 tests or program run afterwards without it.
 
@@ -36,10 +43,21 @@ holding build directories runs low, scripts/build-disk-guard first reclaims
 removed worktrees' build directories, and refuses the build below a floor.
 
 Environment:
+  CAGENTS_BUILD_REMOTE   Host that runs `build`, `check`, `clippy`, `test` and
+                         `doc` (default fw16); `local` builds here
+  CAGENTS_BUILD_REMOTE_SLOTS, CAGENTS_BUILD_REMOTE_JOBS,
+  CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB
+                         Builds at once on that host (default 3), Cargo jobs
+                         for each (6), and the free space below which it
+                         builds nothing (40 GiB)
   CAGENTS_BUILD_SEED=0   Do not seed a new build directory
   CAGENTS_BUILD_FREE_FLOOR_GIB
                          Free space below which builds are refused; default
                          5% of the file system, at most 64; 0 disables
+  CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS
+                         Optional positive integer budget for preflight and
+                         admission waits; expiry exits 124 after cleanup.
+                         Admitted builds are not timed out; default unbounded
   CAGENTS_BUILD_SLOTS    Concurrent builds; default: one per 4 GiB of RAM
                          after an 8 GiB reserve, at most one per 4 CPUs
                          and at most 4
@@ -234,7 +252,13 @@ fits() {
                             claim="$holder:$claimed"
                             case $since in
                                 ''|*[!0-9]*) ;;
-                                *) [ -n "$newest" ] && [ "$since" -le "$newest" ] || newest=$since ;;
+                                *)
+                                    # Discard pre-reboot dates before choosing
+                                    # the newest, so they cannot hide a fresh start.
+                                    if [ "$since" -le "$(uptime_seconds)" ]; then
+                                        [ -n "$newest" ] && [ "$since" -le "$newest" ] || newest=$since
+                                    fi
+                                    ;;
                             esac
                         fi
                         ;;
@@ -294,14 +318,20 @@ acquire() {
     announced=false
     pressure_announced=false
     waited_since=$(date +%s)
-    exec 8>>"$lock.queue"
-    flock -n 8 || { announce; flock 8; }
     waiter=
+    # The supervisor closes 8/9, so keep this shared open description on 6
+    # until the queue wait has completed, then move it to 8 after the owned
+    # waiter has exited.
+    exec 6>>"$lock.queue"
+    flock -n 6 || { announce; supervised '' flock 6 || exit "$?"; }
+    exec 8>&6 6>&-
     # A queued request outliving this gate would take slot 0 for a moment.
     trap 'withdraw; exit 130' INT
     trap 'withdraw; exit 143' TERM
     trap 'withdraw; exit 129' HUP
+    trap 'withdraw; exit 131' QUIT
     while :; do
+        check_admission
         if [ -z "$waiter" ]; then
             exec 6>>"$lock"
             flock 6 &
@@ -316,7 +346,6 @@ acquire() {
             exec 9>&6 6>&-
             if fits 0; then
                 index=0
-                trap - INT TERM HUP
                 admitted
                 return
             fi
@@ -346,7 +375,6 @@ acquire() {
                 fi
                 if [ "$fit" = yes ]; then
                     withdraw
-                    trap - INT TERM HUP
                     admitted
                     return
                 fi
@@ -357,6 +385,19 @@ acquire() {
         announce
         sleep 0.2
     done
+}
+
+check_admission() {
+    [ -n "$admission_deadline" ] || return 0
+    admission_status=0
+    python3 "$(dirname "$0")/cargo-gate-command.py" \
+        --admission-check "$admission_deadline" 6>&- 8>&- 9>&- || admission_status=$?
+    if [ "$admission_status" -ne 0 ]; then
+        withdraw
+        # Exiting closes queue/candidate descriptors, without removing a cost
+        # record belonging to an already admitted build.
+        exit "$admission_status"
+    fi
 }
 
 # Withdraws the queued request for slot 0. Closing the last descriptor on it
@@ -377,6 +418,11 @@ waiter_gone() {
 }
 
 admitted() {
+    # Commit while both the queue and candidate slot are still held. No
+    # admission deadline remains when the build or its nested commands start.
+    check_admission
+    admission_deadline=
+    trap - INT TERM HUP QUIT
     # Prices this build for the builds that start after it, and dates its
     # start in seconds since boot, before the next waiter can look. The date
     # is a line of its own, which gates that only price builds do not read.
@@ -429,8 +475,12 @@ supervised() {
     # POSIX shells may replace async stdin with /dev/null before applying
     # redirections. Save the caller's stdin on the now-free queue descriptor.
     exec 8<&0
+    set -- "$command_state/cancelled" "$@"
+    if [ -z "$slot_marker" ] && [ -n "${admission_deadline:-}" ]; then
+        set -- --admission-until "$admission_deadline" "$@"
+    fi
     CAGENTS_BUILD_SLOT_HELD=$slot_marker python3 "$(dirname "$0")/cargo-gate-command.py" \
-        "$command_state/cancelled" "$@" 0<&8 8>&- 9>&- &
+        "$@" 0<&8 8>&- 9>&- &
     child=$!
     exec 8<&-
     status=0
@@ -527,6 +577,25 @@ inherits_slot() {
 if inside_gate || inherits_slot; then
     [ "$mode" = exec ] || set -- cargo "$@"
     exec "$@"
+fi
+
+admission_deadline=
+if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
+    admission_deadline=$(python3 "$(dirname "$0")/cargo-gate-command.py" \
+        --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
+fi
+
+# Builds run on the build host when it can take them, without a slot here;
+# scripts/cargo-offload says when one builds here instead, and why. Its wait
+# for a slot there spends the admission budget; the build there does not.
+offload=$(dirname "$0")/cargo-offload
+if [ "$mode" = cargo ] && [ -x "$offload" ]; then
+    deadline=$admission_deadline
+    admission_deadline=
+    status=0
+    supervised '' env CAGENTS_BUILD_ADMISSION_DEADLINE="$deadline" "$offload" "$@" || status=$?
+    admission_deadline=$deadline
+    [ "$status" -eq 75 ] || exit "$status"
 fi
 
 # A new worktree's build directory starts from the main checkout's compiled

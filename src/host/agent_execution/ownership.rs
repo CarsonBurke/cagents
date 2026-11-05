@@ -87,7 +87,7 @@ fn interactive_inner(
         return apply(request);
     };
     let gate = agent_gate(host, agent.id);
-    let _dispatch = admission_lock(&gate, nonblocking)?;
+    let mut dispatch = admission_lock(&gate, nonblocking)?;
     if claims {
         let authorized = host
             .lock()
@@ -108,6 +108,17 @@ fn interactive_inner(
         admission_lock(&registry, nonblocking)?
             .claim_agent_interaction(agent.id, None)
             .map_err(unavailable)?;
+        // Stopping a run whose provider is still starting withdraws its prompt;
+        // otherwise its dispatcher would deliver it once the provider is ready.
+        // The provider has no turn yet, so the interrupt stops there.
+        if let ClientRequest::ChatCommand {
+            command: Command::Interrupt,
+            ..
+        } = &request
+            && withdraw_undelivered(host, &mut dispatch, None).map_err(unavailable)?
+        {
+            return Ok(ServerResponse::Accepted);
+        }
     }
     apply(request)
 }
@@ -140,7 +151,7 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
     }
     super::super::client::ensure_control_open(host).map_err(|error| error.message)?;
     let gate = agent_gate(host, expected.agent);
-    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host)?;
     let agent = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -156,6 +167,11 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
         }
         if agent.closed {
             return Ok(Reconciliation::Closed);
+        }
+        // The run was withdrawn while its provider started. Its dispatcher still
+        // owns that startup and wakes the scheduler once it lets go.
+        if dispatch.is_some_and(|claim| claim.run == expected.id) {
+            return Ok(Reconciliation::Busy);
         }
         if registry.pending_agent_launch(agent.id)?.is_some() {
             return Err("Provider startup ownership remains unconfirmed".into());
@@ -317,7 +333,7 @@ pub(in crate::host) fn cancel_agent_run_under_control(
 ) -> Result<(), String> {
     super::super::client::ensure_control_open(host).map_err(|error| error.message)?;
     let gate = agent_gate(host, expected.agent);
-    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host)?;
     let agent = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -333,6 +349,9 @@ pub(in crate::host) fn cancel_agent_run_under_control(
         }
         agent
     };
+    if withdraw_undelivered(host, &mut dispatch, Some(expected.id))? {
+        return Ok(());
+    }
     let Some(HostedSession::Chat(source)) = agent.session else {
         return Err("This accepted run has no provider-confirmed actor to interrupt".into());
     };

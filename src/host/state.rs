@@ -294,7 +294,10 @@ pub(crate) struct HostState {
     pub(super) mailbox_seal: Option<Arc<crate::agent_execution::mailbox::Seal>>,
     /// Operations own their gates, including while waiting to acquire them.
     /// Weak entries let later lookups reclaim gates after every caller leaves.
-    pub(super) execution_gates: BTreeMap<crate::model::AgentId, Weak<Mutex<()>>>,
+    /// Each gate holds the run whose dispatcher released it to wait for the
+    /// provider to become ready, before the prompt was submitted.
+    pub(super) execution_gates:
+        BTreeMap<crate::model::AgentId, Weak<Mutex<Option<super::agent_execution::Undelivered>>>>,
     pub(super) execution_startups: BTreeMap<
         crate::model::AgentId,
         (

@@ -74,11 +74,14 @@ fn origin_body(root: &Path, count: usize) {
     }
     // These are actual issued sessions and actual holder records, not synthetic
     // adoption/cleanup receipts. Parent pins both original epochs before exit.
+    // Publish by rename: the parent polls for the name and must never read a
+    // created but not yet written file.
     fs::write(
-        root.join("origin.json"),
+        root.join("origin.json.tmp"),
         serde_json::to_vec(&originals).unwrap(),
     )
     .unwrap();
+    fs::rename(root.join("origin.json.tmp"), root.join("origin.json")).unwrap();
     wait_for(|| root.join("origin-exit").exists());
     drop(lease);
     // Carry has already completed its real detach. Natural fixture-process

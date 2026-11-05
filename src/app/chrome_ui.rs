@@ -1821,7 +1821,11 @@ impl Cagents {
     /// Gives an open popup sole ownership of Tab, and hands it back to the
     /// shell's traversal once the popup is gone or a dialog has taken over.
     pub(super) fn sync_popup_keyboard_nav(&mut self) {
-        let owned = (self.chrome_ui.popup.is_some() || self.chat_picker_owns_keyboard())
+        // Recording a shortcut owns every key, Tab included: the recorder
+        // moves focus itself, or the key is the chord being recorded.
+        let owned = (self.chrome_ui.popup.is_some()
+            || self.chat_picker_owns_keyboard()
+            || self.palette_records_keys())
             && !self.modal_is_open();
         match (owned, self.chrome_ui.restore_keyboard_nav) {
             (true, None) => {

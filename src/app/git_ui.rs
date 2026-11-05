@@ -24,6 +24,9 @@ struct Entry {
     fallback: Option<String>,
     read_failure: Option<String>,
     read_full_scan: bool,
+    /// A baseline was offered to this window's SessionRuntime. This is not a
+    /// save acknowledgement: retry/quarantine remain owned by the writer.
+    catalog_requested: bool,
     /// When the worktree list was last re-read. Polling is paced from this
     /// rather than from any read, since the edits a partial watch still
     /// reports would otherwise postpone the scan it stands in for.
@@ -200,6 +203,7 @@ impl Cagents {
                 cancellation: None,
                 read_failure: None,
                 read_full_scan: false,
+                catalog_requested: false,
                 pending: git_watch::Change::default(),
                 fallback: failure,
                 last_full_scan: Instant::now(),
@@ -386,6 +390,9 @@ impl Cagents {
                 if self.repository_generations.get(&project) != Some(&generation) {
                     return self.start_git_reads();
                 }
+                if self.session.is_none() {
+                    entry.catalog_requested = false;
+                }
                 match result {
                     Ok((snapshot, plan)) => {
                         if entry.read_full_scan {
@@ -395,6 +402,10 @@ impl Cagents {
                         let removed =
                             records_removed_outside(project, &previous, &snapshot.worktrees);
                         let reconfigure = plan.is_some();
+                        let full_catalog = !entry.catalog_requested
+                            || entry.plan.is_none()
+                            || reconfigure
+                            || entry.read_full_scan;
                         let archived = entry.archived.clone();
                         if let Some(plan) = plan {
                             entry.plan = Some(Arc::new(plan));
@@ -426,11 +437,17 @@ impl Cagents {
                             );
                         }
                         if let Some(session) = &self.session {
-                            session.save_worktrees(removed.into_iter().chain(
-                                snapshot.worktrees.iter().map(|(record, _)| {
-                                    worktree_ui::worktree_state(project, record, Existence::Open)
-                                }),
-                            ));
+                            let records = catalog_changes(
+                                project,
+                                &previous,
+                                &snapshot.worktrees,
+                                removed,
+                                full_catalog,
+                            );
+                            if !records.is_empty() {
+                                session.save_worktrees(records);
+                            }
+                            entry.catalog_requested = true;
                         }
                         if reconfigure {
                             self.refresh_ui.git.configure();
@@ -578,12 +595,12 @@ fn read_local_with_plan(
     snapshot
         .worktrees
         .retain(|(record, _)| !vanished.contains(&record.id));
-    snapshot.heads.retain(|id, _| {
-        snapshot
-            .worktrees
-            .iter()
-            .any(|(record, _)| record.id == *id)
-    });
+    let surviving_ids = snapshot
+        .worktrees
+        .iter()
+        .map(|(record, _)| record.id)
+        .collect::<HashSet<_>>();
+    snapshot.heads.retain(|id, _| surviving_ids.contains(id));
     let plan = (change.membership || change.topology || !vanished.is_empty())
         .then(|| {
             git_watch::Project::read_changed(
@@ -624,14 +641,55 @@ fn records_removed_outside(
     previous: &Snapshot,
     listed: &[(WorktreeRecord, Option<StatusSnapshot>)],
 ) -> Vec<WorktreeState> {
+    let listed_ids = listed
+        .iter()
+        .map(|(record, _)| record.id)
+        .collect::<HashSet<_>>();
     previous
         .worktrees
         .iter()
-        .filter(|(old, _)| !listed.iter().any(|(new, _)| new.id == old.id))
+        .filter(|(old, _)| !listed_ids.contains(&old.id))
         .map(|(record, _)| {
             worktree_ui::worktree_state(project, record, worktree_ui::removed_outside())
         })
         .collect()
+}
+
+/// Only catalog fields belong in this comparison. Status, locks, commit IDs,
+/// and PR authority still flow through the ordinary UI application below.
+/// Structural/first reads always reassert open rows, including tombstone reopen.
+fn catalog_changes(
+    project: ProjectId,
+    previous: &Snapshot,
+    listed: &[(WorktreeRecord, Option<StatusSnapshot>)],
+    mut removed: Vec<WorktreeState>,
+    full: bool,
+) -> Vec<WorktreeState> {
+    let open =
+        |record: &WorktreeRecord| worktree_ui::worktree_state(project, record, Existence::Open);
+    if full {
+        removed.extend(listed.iter().map(|(record, _)| open(record)));
+        return removed;
+    }
+    let previous = previous
+        .worktrees
+        .iter()
+        .map(|(record, _)| (record.id, open(record)))
+        .collect::<HashMap<_, _>>();
+    // The writer keeps the last row for an identity. Compare only that row:
+    // an earlier duplicate must not become the sole delta when the final row
+    // already matches the durable baseline.
+    let first_change = removed.len();
+    let mut seen = HashSet::new();
+    removed.extend(listed.iter().rev().filter_map(|(record, _)| {
+        if !seen.insert(record.id) {
+            return None;
+        }
+        let current = open(record);
+        (previous.get(&record.id) != Some(&current)).then_some(current)
+    }));
+    removed[first_change..].reverse();
+    removed
 }
 
 fn apply_local(project: &mut SidebarProject, snapshot: &Snapshot) {
@@ -786,6 +844,98 @@ mod tests {
             worktrees,
             heads: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn reordered_catalog_membership_preserves_closure_order_and_surviving_heads() {
+        let project = ProjectId::new();
+        let root = PathBuf::from("/fixture/catalog-membership-only");
+        let records = (0..2048)
+            .map(|index| {
+                (
+                    WorktreeRecord {
+                        id: WorktreeId::new(),
+                        path: root.join(format!("worktree-{index}")),
+                        created_at_unix_ms: None,
+                        head_oid: None,
+                        branch: Some(format!("refs/heads/branch-{index}")),
+                        detached: false,
+                        bare: false,
+                        lock: Default::default(),
+                        prunable_reason: None,
+                    },
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let head = GitHubRepoKey::new("github.com", None, "fixture", "project").unwrap();
+        let previous = Snapshot {
+            repository: RepositoryInfo {
+                id: crate::repository::RepositoryId::new(),
+                selected_path: root.clone(),
+                common_dir: root.join(".git"),
+                git_dir: root.join(".git"),
+                worktree_root: Some(root),
+                is_bare: false,
+            },
+            heads: records
+                .iter()
+                .map(|(record, _)| (record.id, head.clone()))
+                .collect(),
+            worktrees: records,
+        };
+        let mut listed = previous
+            .worktrees
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 3 != 0)
+            .map(|(_, record)| record.clone())
+            .rev()
+            .collect::<Vec<_>>();
+        // Identity survives both a reordered listing and changed durable fields.
+        listed[0].0.path = PathBuf::from("/fixture/moved-checkout");
+        listed[0].0.branch = Some("refs/heads/renamed".into());
+        let removed = records_removed_outside(project, &previous, &listed);
+        assert_eq!(
+            removed.iter().map(|record| record.id).collect::<Vec<_>>(),
+            previous
+                .worktrees
+                .iter()
+                .step_by(3)
+                .map(|(record, _)| record.id)
+                .collect::<Vec<_>>()
+        );
+        assert!(removed.iter().all(|record| {
+            record.project_id == project && matches!(record.existence, Existence::Closed { .. })
+        }));
+        let changes = catalog_changes(project, &previous, &listed, removed.clone(), false);
+        assert_eq!(changes[..removed.len()], removed);
+        assert_eq!(changes.len(), removed.len() + 1);
+        assert_eq!(changes.last().unwrap().id, listed[0].0.id);
+        assert_eq!(changes.last().unwrap().branch.as_deref(), Some("renamed"));
+        assert_eq!(changes.last().unwrap().path, listed[0].0.path);
+
+        // No changed worktree or topology means this read performs no Git or
+        // watch discovery. It still prunes stale heads by surviving identity.
+        let expected_heads = listed
+            .iter()
+            .map(|(record, _)| (record.id, head.clone()))
+            .collect::<HashMap<_, _>>();
+        let (updated, plan) = read_local_with_plan(
+            project,
+            Snapshot {
+                worktrees: listed.clone(),
+                ..previous
+            },
+            Default::default(),
+            CancellationToken::default(),
+            None,
+        )
+        .unwrap();
+        assert!(plan.is_none());
+        assert_eq!(updated.worktrees, listed);
+        assert_eq!(updated.heads, expected_heads);
+        assert!(records_removed_outside(project, &updated, &updated.worktrees).is_empty());
     }
 
     #[test]
@@ -991,6 +1141,7 @@ mod tests {
                 cancellation: None,
                 read_failure: None,
                 read_full_scan: false,
+                catalog_requested: false,
                 pending: Default::default(),
                 fallback: None,
                 last_full_scan: Instant::now(),
@@ -1027,6 +1178,7 @@ mod tests {
                 cancellation: None,
                 read_failure: None,
                 read_full_scan: false,
+                catalog_requested: false,
                 pending: Default::default(),
                 fallback: None,
                 last_full_scan: Instant::now(),
@@ -1070,6 +1222,7 @@ mod tests {
                     cancellation: None,
                     read_failure: None,
                     read_full_scan: false,
+                    catalog_requested: false,
                     pending: Default::default(),
                     fallback: Some("watch limit".into()),
                     last_full_scan: Instant::now() - FALLBACK_INTERVAL,
@@ -1121,6 +1274,7 @@ mod tests {
                 cancellation: None,
                 read_failure: None,
                 read_full_scan: false,
+                catalog_requested: false,
                 pending: Default::default(),
                 fallback: Some("directory watch limit reached".into()),
                 last_full_scan: Instant::now() - FALLBACK_INTERVAL,
@@ -1276,6 +1430,7 @@ mod tests {
                 cancellation: None,
                 read_failure: None,
                 read_full_scan: false,
+                catalog_requested: false,
                 pending: Default::default(),
                 fallback: None,
                 last_full_scan: Instant::now(),
@@ -1326,6 +1481,7 @@ mod tests {
                 cancellation: None,
                 read_failure: None,
                 read_full_scan: false,
+                catalog_requested: false,
                 pending: Default::default(),
                 fallback: Some("watch limit".into()),
                 last_full_scan: Instant::now(),
@@ -1352,5 +1508,394 @@ mod tests {
             state.entries[&project].read_failure.is_some(),
             "another project reconfiguring watches cannot settle a failed Git read"
         );
+    }
+
+    fn catalog_app(snapshot: &Snapshot) -> (Cagents, ProjectState) {
+        let project = ProjectState {
+            id: ProjectId::new(),
+            generation: 0,
+            name: "Catalog fixture".into(),
+            repository: snapshot.repository.common_dir.clone(),
+            kind: ProjectKind::Git,
+            existence: Existence::Open,
+        };
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project.id,
+            snapshot.repository.id,
+            project.name.clone(),
+            project.repository.clone(),
+            snapshot
+                .worktrees
+                .iter()
+                .map(|(record, status)| SidebarWorktree::from_repository(record, status.as_ref()))
+                .collect(),
+            Vec::new(),
+        ));
+        app.repository_generations.insert(project.id, 1);
+        app.refresh_ui.git.entries.insert(
+            project.id,
+            Entry {
+                snapshot: snapshot.clone(),
+                generation: 1,
+                plan: None,
+                archived: Vec::new(),
+                remote_started: false,
+                cancellation: None,
+                pending: Default::default(),
+                fallback: None,
+                read_failure: None,
+                read_full_scan: false,
+                catalog_requested: false,
+                last_full_scan: Instant::now(),
+            },
+        );
+        (app, project)
+    }
+
+    fn catalog_plan(project: ProjectId, snapshot: &Snapshot) -> git_watch::Project {
+        git_watch::Project::read_changed(
+            project,
+            snapshot.repository.common_dir.clone(),
+            &snapshot
+                .worktrees
+                .iter()
+                .map(|(record, _)| record.clone())
+                .collect::<Vec<_>>(),
+            &CancellationToken::default(),
+            None,
+            &Default::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn catalog_deltas_preserve_the_final_duplicate_identity_through_the_session_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut snapshot = fixture(&directory.path().join("repo"));
+        let mut winner = snapshot.worktrees[0].clone();
+        winner.0.branch = Some("refs/heads/winner".into());
+        snapshot.worktrees.push(winner);
+        let (mut app, project) = catalog_app(&snapshot);
+        let id = snapshot.worktrees[0].0.id;
+        let (writer, _) = SessionRuntime::open(
+            directory.path().join("window.sqlite3"),
+            crate::model::BootId::new("catalog-duplicate-winner"),
+        )
+        .unwrap();
+        let store = writer.operation_store();
+        writer.save_project(project.clone());
+        app.session = Some(writer);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot.clone(), Some(catalog_plan(project.id, &snapshot)))),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let baseline = store.load_worktree(id).unwrap().unwrap();
+        assert_eq!(baseline.branch.as_deref(), Some("winner"));
+        assert!(baseline.existence.is_open());
+
+        for shadow in ["main", "changed-shadow"] {
+            snapshot.worktrees[0].0.branch = Some(format!("refs/heads/{shadow}"));
+            drop(app.update_git(Action::Read {
+                project: project.id,
+                generation: 1,
+                result: Ok((snapshot.clone(), None)),
+            }));
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(
+                store.load_worktree(id).unwrap().unwrap(),
+                baseline,
+                "an unchanged final row must retain its exact durable generation and fields"
+            );
+        }
+        snapshot.worktrees[1].0.branch = Some("refs/heads/new-winner".into());
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot.clone(), None)),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let changed = store.load_worktree(id).unwrap().unwrap();
+        assert_eq!(changed.branch.as_deref(), Some("new-winner"));
+        assert_eq!(changed.path, baseline.path);
+        assert!(changed.generation > baseline.generation);
+
+        snapshot.worktrees[0].0.branch = Some("refs/heads/another-shadow".into());
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot, None)),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(store.load_worktree(id).unwrap().unwrap(), changed);
+    }
+
+    #[test]
+    fn established_local_reads_skip_equal_catalog_writes_but_keep_ui_and_reassertions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut snapshot = fixture(&directory.path().join("repo"));
+        let (mut app, project) = catalog_app(&snapshot);
+        let id = snapshot.worktrees[0].0.id;
+        let (writer, _) = SessionRuntime::open(
+            directory.path().join("window.sqlite3"),
+            crate::model::BootId::new("catalog-delta"),
+        )
+        .unwrap();
+        let store = writer.operation_store();
+        writer.save_project(project.clone());
+        writer.save_worktrees([worktree_ui::worktree_state(
+            project.id,
+            &snapshot.worktrees[0].0,
+            worktree_ui::removed_outside(),
+        )]);
+        writer.flush(Duration::from_secs(5)).unwrap();
+        let closed = store.load_worktree(id).unwrap().unwrap();
+        assert!(!closed.existence.is_open());
+        app.session = Some(writer);
+        let plan = catalog_plan(project.id, &snapshot);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot.clone(), Some(plan.clone()))),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let opened = store.load_worktree(id).unwrap().unwrap();
+        assert!(
+            opened.existence.is_open(),
+            "first equal Git facts must reopen a tombstone"
+        );
+        assert!(opened.generation > closed.generation);
+        assert!(app.refresh_ui.git.entries[&project.id].catalog_requested);
+        let last_scan = app.refresh_ui.git.entries[&project.id].last_full_scan;
+
+        fs::write(snapshot.worktrees[0].0.path.join("tracked.txt"), "dirty\n").unwrap();
+        let (dirty, next_plan) = read_local_with_plan(
+            project.id,
+            snapshot,
+            git_watch::Change {
+                worktrees: [id].into_iter().collect(),
+                ..Default::default()
+            },
+            CancellationToken::default(),
+            Some(&plan),
+        )
+        .unwrap();
+        assert!(next_plan.is_none());
+        assert!(dirty.worktrees[0].1.as_ref().unwrap().dirty.is_dirty());
+        snapshot = dirty;
+        // Deliver real read facts repeatedly. This tests the handler/catalog
+        // boundary, not physical worker concurrency or native event delivery.
+        for _ in 0..64 {
+            app.refresh_ui
+                .git
+                .entries
+                .get_mut(&project.id)
+                .unwrap()
+                .cancellation = Some(CancellationToken::default());
+            drop(app.update_git(Action::Read {
+                project: project.id,
+                generation: 1,
+                result: Ok((snapshot.clone(), None)),
+            }));
+            let entry = &app.refresh_ui.git.entries[&project.id];
+            assert!(entry.cancellation.is_none());
+            assert_eq!(entry.last_full_scan, last_scan);
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(store.load_worktree(id).unwrap().unwrap(), opened);
+            let row = &app.sidebar_model.project(project.id).unwrap().worktrees[0];
+            assert!(row.dirty.as_ref().unwrap().is_dirty());
+        }
+
+        git(
+            &snapshot.worktrees[0].0.path,
+            &["checkout", "-b", "catalog-branch"],
+        );
+        let (changed, next_plan) = read_local_with_plan(
+            project.id,
+            snapshot,
+            git_watch::Change {
+                worktrees: [id].into_iter().collect(),
+                ..Default::default()
+            },
+            CancellationToken::default(),
+            Some(&plan),
+        )
+        .unwrap();
+        assert!(next_plan.is_none());
+        snapshot = changed;
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot.clone(), None)),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let branched = store.load_worktree(id).unwrap().unwrap();
+        assert_eq!(branched.branch.as_deref(), Some("catalog-branch"));
+        assert!(branched.generation > opened.generation);
+
+        // Equal watch values can represent a replaced directory incarnation.
+        // Adopting a plan must still reassert catalog rows and replace the Arc.
+        let old_plan = app.refresh_ui.git.entries[&project.id]
+            .plan
+            .clone()
+            .unwrap();
+        let same_plan = catalog_plan(project.id, &snapshot);
+        assert_eq!(old_plan.as_ref(), &same_plan);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot, Some(same_plan))),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert!(store.load_worktree(id).unwrap().unwrap().generation > branched.generation);
+        let next = app.refresh_ui.git.entries[&project.id]
+            .plan
+            .as_ref()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&old_plan, next));
+        // Native rearming itself remains covered by the existing watcher test.
+    }
+
+    #[test]
+    fn unchanged_local_reads_leave_owed_catalog_rows_with_the_session_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = fixture(&directory.path().join("repo"));
+        let (mut app, project) = catalog_app(&snapshot);
+        let id = snapshot.worktrees[0].0.id;
+        let (writer, _) = SessionRuntime::open(
+            directory.path().join("window.sqlite3"),
+            crate::model::BootId::new("catalog-held-parent"),
+        )
+        .unwrap();
+        let store = writer.operation_store();
+        app.session = Some(writer);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot.clone(), Some(catalog_plan(project.id, &snapshot)))),
+        }));
+        // A missing parent holds the child in the writer; the window barrier
+        // can settle without falsely implying that this catalog row landed.
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert!(store.load_worktree(id).unwrap().is_none());
+        assert!(app.refresh_ui.git.entries[&project.id].catalog_requested);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot.clone(), None)),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert!(store.load_worktree(id).unwrap().is_none());
+        app.session.as_ref().unwrap().save_project(project.clone());
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let landed = store.load_worktree(id).unwrap().unwrap();
+        assert_eq!(landed.path, snapshot.worktrees[0].0.path);
+        assert!(landed.existence.is_open());
+    }
+
+    #[test]
+    fn a_read_without_a_session_cannot_suppress_the_next_catalog_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = fixture(&directory.path().join("repo"));
+        let (mut app, project) = catalog_app(&snapshot);
+        let id = snapshot.worktrees[0].0.id;
+        let database = directory.path().join("window.sqlite3");
+        let boot = crate::model::BootId::new("catalog-session-presence");
+        let (writer, _) = SessionRuntime::open(&database, boot.clone()).unwrap();
+        writer.save_project(project.clone());
+        app.session = Some(writer);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot.clone(), Some(catalog_plan(project.id, &snapshot)))),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert!(app.refresh_ui.git.entries[&project.id].catalog_requested);
+        let mut prior = app.session.take().unwrap();
+        prior.shutdown();
+        drop(prior);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot.clone(), None)),
+        }));
+        assert!(!app.refresh_ui.git.entries[&project.id].catalog_requested);
+        assert!(app.refresh_ui.git.entries[&project.id].plan.is_some());
+        let (writer, _) = SessionRuntime::open(&database, boot).unwrap();
+        let store = writer.operation_store();
+        writer.save_worktrees([worktree_ui::worktree_state(
+            project.id,
+            &snapshot.worktrees[0].0,
+            worktree_ui::removed_outside(),
+        )]);
+        writer.flush(Duration::from_secs(5)).unwrap();
+        let closed = store.load_worktree(id).unwrap().unwrap();
+        assert!(!closed.existence.is_open());
+        app.session = Some(writer);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot, None)),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let reopened = store.load_worktree(id).unwrap().unwrap();
+        assert!(reopened.existence.is_open());
+        assert!(reopened.generation > closed.generation);
+        // Production bootstrap fixes SessionRuntime before repository loading;
+        // this is a None->Some robustness guard, not general session migration.
     }
 }
