@@ -1303,6 +1303,9 @@ impl Cagents {
     }
 
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
+        // Capture before alias or canonical removal can detach a pane. All
+        // views in this snapshot share one final camera/visibility projection.
+        let viewport = self.workspace.capture_viewport_anchor();
         self.publish_unpublished_local_chats();
         // A watcher snapshot can announce the destination before the explicit
         // transfer response arrives. Rebase before either snapshot projects.
@@ -1456,6 +1459,7 @@ impl Cagents {
                 projected.panes.remove(&scope).unwrap_or_default(),
             );
         }
+        tasks.push(self.finish_shared_viewport_projection(viewport));
         self.shared_views.applying = false;
         // Adopt all canonical descriptors before an ordered migration checkpoint.
         // Held reported titles stay held: publishing them on every view
@@ -1620,8 +1624,10 @@ impl Cagents {
     }
 
     fn project_shared_view(&mut self, view: &View, owned: &HashSet<CardId>) -> Task<Message> {
+        let viewport = self.workspace.capture_viewport_anchor();
         let current = self.local_view_cards(&view.scope);
-        self.project_shared_view_with_cards(view, owned, current)
+        let projection = self.project_shared_view_with_cards(view, owned, current);
+        Task::batch([projection, self.finish_shared_viewport_projection(viewport)])
     }
 
     fn project_shared_view_with_cards(
@@ -1969,7 +1975,7 @@ impl Cagents {
             }
         }
         if active {
-            tasks.push(self.project_shared_strip(&view.panes, &visible));
+            self.project_shared_strip(&view.panes, &visible);
         }
         if !self.shared_views.applying {
             self.persist();
@@ -2115,13 +2121,22 @@ impl Cagents {
         };
         let panes = self.local_view_panes(&scope);
         let visible = self.local_view_cards(&scope);
-        self.project_shared_strip(&panes, &visible)
+        let viewport = self.workspace.capture_viewport_anchor();
+        self.project_shared_strip(&panes, &visible);
+        self.finish_shared_viewport_projection(viewport)
     }
 
-    fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) -> Task<Message> {
-        let anchor = self.workspace.capture_viewport_anchor();
+    fn finish_shared_viewport_projection(
+        &mut self,
+        anchor: crate::workspace::ViewportAnchor,
+    ) -> Task<Message> {
+        let update = self.workspace.restore_viewport_anchor(anchor);
+        let viewport = self.apply_viewport(update, true, false);
+        Task::batch([viewport, self.lifecycle_sweep()])
+    }
+
+    fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) {
         let focus = self.workspace.focused();
-        let mut updates = Vec::new();
         let visible = visible.iter().copied().collect::<HashSet<_>>();
         let removed = self
             .workspace
@@ -2149,9 +2164,7 @@ impl Cagents {
                 state.exposure = Exposure::Offscreen;
             }
             if self.workspace.request_close(id).is_ok() {
-                if let Ok(update) = self.workspace.commit_close(id) {
-                    updates.push(update);
-                }
+                let _ = self.workspace.commit_close(id);
             }
         }
         for (index, pane) in panes.iter().enumerate() {
@@ -2170,13 +2183,11 @@ impl Cagents {
                     }),
                     CardWidth::Fraction(pane.width_fraction),
                 ) {
-                    if let Ok(update) = self.workspace.add_card(
+                    let _ = self.workspace.add_card(
                         card,
                         index.min(self.workspace.cards().len()),
                         false,
-                    ) {
-                        updates.push(update);
-                    }
+                    );
                 }
             } else {
                 // A held reported title is newer than the shared one.
@@ -2196,35 +2207,18 @@ impl Cagents {
                     .card(pane.id)
                     .is_some_and(|card| card.width != CardWidth::Fraction(pane.width_fraction))
                 {
-                    if let Ok(update) = self
+                    let _ = self
                         .workspace
-                        .set_card_width(pane.id, CardWidth::Fraction(pane.width_fraction))
-                    {
-                        updates.push(update);
-                    }
+                        .set_card_width(pane.id, CardWidth::Fraction(pane.width_fraction));
                 }
                 if self.workspace.order().nth(index) != Some(pane.id) {
-                    if let Ok(update) = self.workspace.reorder(pane.id, index) {
-                        updates.push(update);
-                    }
+                    let _ = self.workspace.reorder(pane.id, index);
                 }
             }
         }
         if let Some(focus) = focus.filter(|id| self.workspace.card(*id).is_some()) {
             let _ = self.workspace.focus_without_scrolling(focus);
         }
-        // Inserting before the selected pane changes its strip coordinate.
-        // Keep the content being read under the same editor, without issuing
-        // a new keyboard-focus request or reusing an old scroll coordinate.
-        let anchored = self.workspace.restore_viewport_anchor(anchor);
-        let lifecycle = self.lifecycle_sweep();
-        let mut tasks = updates
-            .into_iter()
-            .map(|update| self.apply_viewport(update, false, false))
-            .collect::<Vec<_>>();
-        tasks.push(self.apply_viewport(anchored, true, false));
-        tasks.push(lifecycle);
-        Task::batch(tasks)
     }
 }
 

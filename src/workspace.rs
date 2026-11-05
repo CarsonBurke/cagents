@@ -606,12 +606,14 @@ impl ViewportUpdate {
 /// The view and any navigation already in flight before a passive strip edit.
 /// This preserves pane identities rather than raw offsets, which can point at
 /// different content after a peer inserts, resizes, or reorders panes.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ViewportAnchor {
     position: Option<ViewportPoint>,
     destination: Option<ViewportPoint>,
     destination_reveals_focus: bool,
     camera: Camera,
+    geometry_revision: u64,
+    visibility: HashMap<CardId, VisibilityClass>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -682,6 +684,7 @@ pub struct Workspace {
     focused: Option<CardId>,
     viewport_width: f32,
     geometry: StripGeometry,
+    geometry_revision: u64,
     layout_transition: Option<LayoutTransition>,
     /// New panes whose slot is still growing. Their contents mount at once at
     /// the final width and are revealed through the slot. This survives
@@ -706,6 +709,7 @@ impl Workspace {
             focused: None,
             viewport_width: 0.0,
             geometry: StripGeometry::build(&[], 0.0, config),
+            geometry_revision: 0,
             layout_transition: None,
             opening: HashSet::new(),
             camera: Camera::new(config.animation_omega)?,
@@ -1240,20 +1244,39 @@ impl Workspace {
             destination_reveals_focus: destination
                 .is_some_and(|point| Some(point.card.id) == self.focused),
             camera: self.camera,
+            geometry_revision: self.geometry_revision,
+            visibility: self.visibility.clone(),
         }
     }
 
     /// Restore a passive projection's view without asking for keyboard focus
     /// or treating the new coordinate as native scroll feedback. The caller
     /// must synchronize the returned final offset with its native scrollable.
-    /// If an anchored pane was removed, retain the close operation's existing
-    /// camera and focus handoff rather than assigning its offset to a neighbour.
+    /// Changed passive geometry is committed as one layout, so an incidental
+    /// close animation cannot move the restored reading pane away afterwards.
+    /// Reading position and navigation destination survive independently; a
+    /// removed anchor keeps the close operation's fallback for that coordinate.
     pub fn restore_viewport_anchor(&mut self, anchor: ViewportAnchor) -> ViewportUpdate {
-        let position = anchor
-            .position
-            .and_then(|point| point.resolve(self.presentation_geometry()));
-        let destination = if anchor.camera.is_animating() {
-            anchor.destination.and_then(|point| {
+        if self.geometry_revision != anchor.geometry_revision {
+            self.layout_transition = None;
+            // The original destination may have been removed. Its close
+            // handoff can precede another insertion/reorder in this batch, so
+            // resolve that fallback focus against the final bounds as well.
+            let mut fallback = self.camera;
+            if let Some(target) = self.focused.and_then(|id| {
+                self.geometry
+                    .focus_offset(id, self.viewport_width, fallback.target())
+            }) {
+                if fallback.is_animating() {
+                    fallback.target = target;
+                } else {
+                    fallback.jump_to(target);
+                }
+            }
+            let position = anchor
+                .position
+                .and_then(|point| point.resolve(&self.geometry));
+            let destination = anchor.destination.and_then(|point| {
                 let target = point.resolve(&self.geometry)?;
                 if anchor.destination_reveals_focus {
                     // A navigation destination reveals its selected pane.
@@ -1264,24 +1287,46 @@ impl Workspace {
                 } else {
                     Some(target)
                 }
-            })
-        } else {
-            position
-        };
-        if let (Some(offset), Some(target)) = (position, destination) {
-            self.camera = Camera {
-                offset,
-                target,
-                ..anchor.camera
+            });
+            self.camera = if anchor.camera.is_animating() {
+                if let Some(target) = destination {
+                    Camera {
+                        offset: position.unwrap_or(fallback.offset()),
+                        target,
+                        ..anchor.camera
+                    }
+                } else {
+                    let mut fallback = Camera {
+                        offset: position.unwrap_or(fallback.offset()),
+                        ..fallback
+                    };
+                    if !fallback.is_animating() {
+                        fallback.jump_to(fallback.offset());
+                    }
+                    fallback
+                }
+            } else if let Some(offset) = position {
+                Camera {
+                    offset,
+                    target: offset,
+                    ..anchor.camera
+                }
+            } else {
+                fallback
             };
-            let maximum = self
-                .presentation_geometry()
-                .max_offset(self.viewport_width)
-                .max(self.geometry.max_offset(self.viewport_width));
-            if offset < 0.0 || target < 0.0 || offset > maximum || target > maximum {
-                self.camera.clamp(maximum);
-            }
+            self.camera
+                .clamp(self.geometry.max_offset(self.viewport_width));
+        } else {
+            // A changed width preference can leave resolved geometry intact
+            // (for example the sole pane filling the viewport). Its incidental
+            // reveal must not retarget a running local camera or layout.
+            self.camera = anchor.camera;
         }
+        // Intermediate add/remove/resize operations update the model's mounted
+        // map, but their native effects must not escape this passive batch.
+        // Diff the final layout against the surfaces visible before the batch.
+        self.visibility = anchor.visibility;
+        self.visibility_bands = None;
         self.refresh_visibility(
             (self.camera.offset() - anchor.camera.offset()).abs() > f32::EPSILON,
         )
@@ -1521,8 +1566,13 @@ impl Workspace {
     }
 
     fn rebuild_geometry(&mut self) {
+        let geometry = StripGeometry::build(&self.cards, self.viewport_width, self.config);
+        if geometry == self.geometry {
+            return;
+        }
         self.layout_transition = None;
-        self.geometry = StripGeometry::build(&self.cards, self.viewport_width, self.config);
+        self.geometry_revision = self.geometry_revision.wrapping_add(1);
+        self.geometry = geometry;
         self.visibility_bands = None;
         self.camera
             .clamp(self.geometry.max_offset(self.viewport_width));
@@ -1872,6 +1922,12 @@ mod tests {
 
         let update = workspace.restore_viewport_anchor(anchor);
         assert!(update.offset_changed);
+        assert!(
+            update
+                .transitions
+                .iter()
+                .all(|change| change.id != original)
+        );
         assert_eq!(workspace.camera().offset(), 300.0);
         assert_eq!(workspace.camera().target(), 300.0);
         assert!(!workspace.camera().is_animating());
@@ -1949,6 +2005,88 @@ mod tests {
         workspace.tick(Duration::from_millis(16));
         control.tick(Duration::from_millis(16));
         assert_eq!(workspace.camera(), control.camera());
+    }
+
+    #[test]
+    fn a_noop_projection_keeps_an_existing_layout_animation() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 4], 400.0);
+        let reading = workspace.order().nth(2).unwrap();
+        workspace.native_scroll(1_100.0, 400.0);
+        workspace
+            .animate_card_width(reading, CardWidth::Fixed(700.0))
+            .unwrap();
+        workspace.tick(Duration::from_millis(32));
+        let mut control = workspace.clone();
+        let anchor = workspace.capture_viewport_anchor();
+        workspace.rename_card(reading, "New title").unwrap();
+
+        assert_eq!(
+            workspace.restore_viewport_anchor(anchor),
+            ViewportUpdate::unchanged()
+        );
+        assert!(workspace.layout_transition.is_some());
+        assert_eq!(workspace.camera(), control.camera());
+        workspace.tick(Duration::from_millis(32));
+        control.tick(Duration::from_millis(32));
+        assert_eq!(workspace.camera(), control.camera());
+        assert_eq!(
+            workspace.presentation_geometry(),
+            control.presentation_geometry()
+        );
+    }
+
+    #[test]
+    fn an_equivalent_width_preference_keeps_a_running_close_layout() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.5); 2], 400.0);
+        let removed = workspace.order().next().unwrap();
+        let remaining = workspace.order().last().unwrap();
+        workspace.request_close(removed).unwrap();
+        workspace.commit_close(removed).unwrap();
+        workspace.tick(Duration::from_millis(32));
+        assert!(workspace.layout_transition.is_some());
+        let mut control = workspace.clone();
+        let anchor = workspace.capture_viewport_anchor();
+        workspace
+            .set_card_width(remaining, CardWidth::Fraction(1.0))
+            .unwrap();
+
+        assert_eq!(
+            workspace.restore_viewport_anchor(anchor),
+            ViewportUpdate::unchanged()
+        );
+        assert!(workspace.layout_transition.is_some());
+        assert_eq!(workspace.camera(), control.camera());
+        workspace.tick(Duration::from_millis(32));
+        control.tick(Duration::from_millis(32));
+        assert_eq!(workspace.camera(), control.camera());
+        assert_eq!(
+            workspace.presentation_geometry(),
+            control.presentation_geometry()
+        );
+    }
+
+    #[test]
+    fn passive_reordering_preserves_the_reading_fraction_in_final_geometry() {
+        for move_reading in [false, true] {
+            let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 4], 400.0);
+            let selected = workspace.focused().unwrap();
+            let reading = workspace.order().nth(2).unwrap();
+            workspace.take_widget_focus_request();
+            workspace.native_scroll(1_100.0, 400.0);
+            let anchor = workspace.capture_viewport_anchor();
+            workspace
+                .reorder(if move_reading { reading } else { selected }, 3)
+                .unwrap();
+
+            workspace.restore_viewport_anchor(anchor);
+            let expected = workspace.geometry().card(reading).unwrap().start + 100.0;
+            assert_eq!(workspace.camera().offset(), expected);
+            assert_eq!(workspace.camera().target(), expected);
+            assert_eq!(workspace.focused(), Some(selected));
+            assert_eq!(workspace.pending_widget_focus, None);
+            workspace.tick(Duration::from_millis(300));
+            assert_eq!(workspace.camera().offset(), expected);
+        }
     }
 
     #[test]
@@ -2045,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_viewport_anchor_preserves_the_existing_close_handoff() {
+    fn removal_resolves_reading_and_navigation_anchors_independently() {
         for remove_destination in [false, true] {
             let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 4], 400.0);
             let first = workspace.order().next().unwrap();
@@ -2053,6 +2191,7 @@ mod tests {
             workspace.focus(destination).unwrap();
             workspace.tick(Duration::from_millis(16));
             workspace.take_widget_focus_request();
+            let before = workspace.camera();
             let anchor = workspace.capture_viewport_anchor();
             let removed = if remove_destination {
                 destination
@@ -2066,10 +2205,109 @@ mod tests {
             let keyboard = workspace.pending_widget_focus;
 
             workspace.restore_viewport_anchor(anchor);
-            assert_eq!(workspace.camera(), camera);
+            if remove_destination {
+                // The reading pane survives: don't discard it just because
+                // the destination was closed. Keep the close's new target.
+                assert_eq!(workspace.camera().offset(), before.offset());
+                assert_eq!(workspace.camera().target(), camera.target());
+                assert_eq!(workspace.camera().velocity(), camera.velocity());
+            } else {
+                // The reading pane was removed, but the navigation survives.
+                assert_eq!(workspace.camera().offset(), camera.offset());
+                assert_eq!(workspace.camera().target(), before.target() - 500.0);
+                assert_eq!(workspace.camera().velocity(), before.velocity());
+            }
             assert_eq!(workspace.focused(), focus);
             assert_eq!(workspace.pending_widget_focus, keyboard);
+            assert!(workspace.layout_transition.is_none());
             workspace.check_invariants().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_removed_destination_keeps_its_close_handoff_after_a_later_insertion() {
+        for moving in [false, true] {
+            let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 2], 400.0);
+            let reading = workspace.order().next().unwrap();
+            let destination = workspace.order().last().unwrap();
+            workspace.focus(destination).unwrap();
+            if moving {
+                workspace.tick(Duration::from_millis(16));
+            }
+            let before = workspace.camera();
+            assert!(before.is_animating());
+            let anchor = workspace.capture_viewport_anchor();
+            workspace.request_close(destination).unwrap();
+            workspace.commit_close(destination).unwrap();
+            let fallback = workspace.camera();
+            assert_eq!(fallback.is_animating(), moving);
+            workspace
+                .add_card(card(CardWidth::Fixed(500.0)), 0, false)
+                .unwrap();
+
+            workspace.restore_viewport_anchor(anchor);
+            assert_eq!(workspace.focused(), Some(reading));
+            assert_eq!(workspace.camera().offset(), 500.0 + before.offset());
+            assert_eq!(workspace.camera().target(), 500.0);
+            assert_eq!(workspace.camera().is_animating(), moving);
+            assert_eq!(workspace.camera().velocity(), fallback.velocity());
+            for _ in 0..600 {
+                if !workspace.camera().is_animating() {
+                    break;
+                }
+                workspace.tick(Duration::from_millis(16));
+            }
+            assert!(!workspace.camera().is_animating());
+            assert_eq!(workspace.camera().offset(), 500.0);
+        }
+    }
+
+    #[test]
+    fn a_removed_reading_pane_keeps_the_settled_close_handoff_after_insertion() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 2], 400.0);
+        let reading = workspace.order().next().unwrap();
+        let next = workspace.order().last().unwrap();
+        let anchor = workspace.capture_viewport_anchor();
+        workspace.request_close(reading).unwrap();
+        workspace.commit_close(reading).unwrap();
+        assert!(!workspace.camera().is_animating());
+        workspace
+            .add_card(card(CardWidth::Fixed(500.0)), 0, false)
+            .unwrap();
+
+        workspace.restore_viewport_anchor(anchor);
+        assert_eq!(workspace.focused(), Some(next));
+        assert_eq!(workspace.camera().offset(), 500.0);
+        assert_eq!(workspace.camera().target(), 500.0);
+        assert!(!workspace.camera().is_animating());
+    }
+
+    #[test]
+    fn a_passive_close_keeps_surviving_reading_and_the_intended_focus_handoff() {
+        for close_selected in [false, true] {
+            let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 4], 500.0);
+            let selected = workspace.focused().unwrap();
+            let neighbour = workspace.order().nth(1).unwrap();
+            let reading = workspace.order().nth(2).unwrap();
+            workspace.take_widget_focus_request();
+            workspace.native_scroll(1_000.0, 500.0);
+            let anchor = workspace.capture_viewport_anchor();
+            let removed = if close_selected { selected } else { neighbour };
+            workspace.request_close(removed).unwrap();
+            workspace.commit_close(removed).unwrap();
+            let focus = workspace.focused();
+            let keyboard = workspace.pending_widget_focus;
+
+            workspace.restore_viewport_anchor(anchor);
+            assert_eq!(workspace.camera().offset(), 500.0);
+            assert_eq!(workspace.camera().target(), 500.0);
+            assert!(!workspace.camera().is_animating());
+            assert_eq!(workspace.focused(), focus);
+            assert_eq!(workspace.pending_widget_focus, keyboard);
+            assert_eq!(workspace.geometry().card(reading).unwrap().start, 500.0);
+            assert_eq!(workspace.presentation_geometry(), workspace.geometry());
+            workspace.tick(Duration::from_millis(300));
+            assert_eq!(workspace.camera().offset(), 500.0);
         }
     }
 

@@ -202,3 +202,197 @@ fn a_peer_insertion_keeps_typing_in_the_retained_visible_composer() {
     );
     assert!(!saved.chat_drafts.contains_key(&incoming));
 }
+
+fn four_shared_drafts(
+    select_reading: bool,
+    fraction: f32,
+) -> (
+    Cagents,
+    ChannelId,
+    ChannelId,
+    [Pane; 4],
+    [chat_ui::Target; 4],
+) {
+    let (mut app, source, destination, _) = fixture();
+    app.active_workspace = Some(PathBuf::from("/repo"));
+    Arc::make_mut(&mut app.durable).active_channel = Some(source);
+    app.workspace.resize_viewport(WIDTH);
+    let panes = std::array::from_fn(|index| {
+        full_width_draft(
+            &mut app,
+            if index % 2 == 0 {
+                Provider::Codex
+            } else {
+                Provider::Claude
+            },
+        )
+    });
+    app.workspace_model.views = vec![
+        View {
+            revision: 1,
+            panes: panes.to_vec(),
+            ..View::empty(source)
+        },
+        View::empty(destination),
+    ];
+    app.shared_views.pending.clear();
+    drop(app.reconcile_shared_views());
+    let selected = panes[if select_reading { 2 } else { 0 }].id;
+    let update = app.workspace.focus(selected).unwrap();
+    drop(app.apply_viewport(update, false, false));
+    let update = app.workspace.tick(Duration::from_secs(1));
+    drop(app.apply_viewport(update, false, false));
+    // A deliberate pan can leave selection elsewhere. Both the selected and
+    // unselected reading cases must retain this local viewport intent.
+    let update = app.workspace.native_scroll(WIDTH * (2.0 + fraction), WIDTH);
+    drop(app.apply_viewport(update, false, false));
+    assert_eq!(app.workspace.focused(), Some(selected));
+    assert_reading_position(&app, panes[2].id, fraction);
+    let targets = std::array::from_fn(|index| match app.cards.get(&panes[index].id).unwrap() {
+        CardRuntime::Chat(runtime) => runtime.target,
+        _ => panic!("the fixture owns four inert draft runtimes"),
+    });
+    (app, source, destination, panes, targets)
+}
+
+fn assert_reading_position(app: &Cagents, reading: CardId, fraction: f32) {
+    let projection = app.workspace.projection(WIDTH);
+    let first_body = projection
+        .mounted
+        .iter()
+        .find(|card| card.start < projection.offset + WIDTH && card.end() > projection.offset)
+        .expect("a surviving conversation occupies the viewport");
+    assert_eq!(
+        first_body.id, reading,
+        "the reading pane must remain at the viewport edge: {projection:?}"
+    );
+    assert_eq!(first_body.visibility, VisibilityClass::Visible);
+    let expected = first_body.start + fraction * first_body.width;
+    assert!(
+        (projection.offset - expected).abs() < 0.001,
+        "the reading fraction must survive passive geometry changes: {projection:?}"
+    );
+    assert!(!app.workspace.camera().is_animating());
+    assert_eq!(
+        app.workspace.camera().offset(),
+        app.workspace.camera().target()
+    );
+}
+
+fn assert_surviving_reading_after_close_interval(
+    app: &mut Cagents,
+    reading: CardId,
+    selected: CardId,
+    fraction: f32,
+) {
+    // Check after the old from_bounds close animation would have settled as
+    // well as the first projected frame. A raw offset can look correct first
+    // and silently show the following conversation once that animation ends.
+    for elapsed in [
+        Duration::ZERO,
+        Duration::from_millis(16),
+        Duration::from_millis(220),
+        Duration::from_secs(1),
+    ] {
+        let update = app.workspace.tick(elapsed);
+        drop(app.apply_viewport(update, false, false));
+        assert_eq!(app.workspace.focused(), Some(selected));
+        assert_reading_position(app, reading, fraction);
+    }
+}
+
+fn assert_draft_identity(app: &Cagents, pane: &Pane, target: chat_ui::Target) {
+    assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+    match app.cards.get(&pane.id).unwrap() {
+        CardRuntime::Chat(runtime) => assert_eq!(runtime.target, target),
+        _ => panic!("a surviving draft keeps its runtime"),
+    }
+}
+
+#[test]
+fn a_peer_transfer_before_the_reading_pane_preserves_the_view_after_layout_settles() {
+    for select_reading in [false, true] {
+        for fraction in [0.0, 0.25] {
+            for destination_first in [false, true] {
+                let (mut app, source, destination, panes, targets) =
+                    four_shared_drafts(select_reading, fraction);
+                let selected = app.workspace.focused().unwrap();
+                let mut views = app.workspace_model.views.clone();
+                views::transfer(
+                    &mut views,
+                    &Scope::Channel(source),
+                    panes[1].id,
+                    &Scope::Channel(destination),
+                    None,
+                )
+                .unwrap();
+                if destination_first {
+                    views.reverse();
+                }
+                app.workspace_model.views = views;
+                app.shared_views.pending.clear();
+                drop(app.reconcile_shared_views());
+
+                assert_eq!(
+                    app.workspace.order().collect::<Vec<_>>(),
+                    [panes[0].id, panes[2].id, panes[3].id]
+                );
+                assert_eq!(
+                    app.local_view_cards(&Scope::Channel(destination)),
+                    [panes[1].id]
+                );
+                assert_surviving_reading_after_close_interval(
+                    &mut app,
+                    panes[2].id,
+                    selected,
+                    fraction,
+                );
+                for (pane, target) in panes.iter().zip(targets) {
+                    assert_draft_identity(&app, pane, target);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_peer_removal_before_the_reading_pane_preserves_the_view_after_layout_settles() {
+    for select_reading in [false, true] {
+        for fraction in [0.0, 0.25] {
+            let (mut app, source, destination, panes, targets) =
+                four_shared_drafts(select_reading, fraction);
+            let selected = app.workspace.focused().unwrap();
+            let source_view = app
+                .workspace_model
+                .views
+                .iter_mut()
+                .find(|view| view.scope == Scope::Channel(source))
+                .unwrap();
+            source_view
+                .apply(&Change::Remove { id: panes[1].id })
+                .unwrap();
+            app.shared_views.pending.clear();
+            drop(app.reconcile_shared_views());
+
+            assert_eq!(
+                app.workspace.order().collect::<Vec<_>>(),
+                [panes[0].id, panes[2].id, panes[3].id]
+            );
+            assert!(
+                app.local_view_cards(&Scope::Channel(destination))
+                    .is_empty()
+            );
+            assert!(!app.card_state(panes[1].id).unwrap().existence.is_open());
+            assert!(!app.cards.contains_key(&panes[1].id));
+            assert_surviving_reading_after_close_interval(
+                &mut app,
+                panes[2].id,
+                selected,
+                fraction,
+            );
+            for index in [0, 2, 3] {
+                assert_draft_identity(&app, &panes[index], targets[index]);
+            }
+        }
+    }
+}
