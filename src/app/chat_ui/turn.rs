@@ -517,6 +517,15 @@ pub(super) fn command_description(content: &ItemContent) -> Option<&str> {
     }
 }
 
+/// A description the closed row keeps beside a command whose first line is
+/// not the whole of it: a heredoc, a script, or a continued line.
+pub(super) fn script_description(content: &ItemContent) -> Option<&str> {
+    let ItemContent::Command { command, .. } = content else {
+        return None;
+    };
+    command_description(content).filter(|_| command.trim().contains('\n'))
+}
+
 /// A command's label without the verb transcripts once stored in it.
 ///
 /// Adapters used to write `Read src/app.rs` and `Search TODO`, which the verb
@@ -1413,6 +1422,18 @@ mod tests {
             command_description(&described),
             Some("Run tests for module 295")
         );
+        // Its first line says what a one-line command does; a script's does not.
+        assert_eq!(script_description(&described), None);
+        let script = run(
+            "Count failures by module",
+            "python3 - <<'EOF'\nprint(1)\nEOF",
+        );
+        assert_eq!(step_label(&script), "python3 - <<'EOF'");
+        assert_eq!(
+            script_description(&script),
+            Some("Count failures by module")
+        );
+        assert_eq!(script_description(&run("", "python3 - <<'EOF'\nEOF")), None);
         // A label that is the command, or no label, adds nothing.
         assert_eq!(command_description(&run("cargo test", "cargo test")), None);
         assert_eq!(command_description(&run("", "cargo test")), None);

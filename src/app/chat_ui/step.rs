@@ -480,6 +480,11 @@ impl Runtime {
             }
         } else {
             preview.push(cached.preview.view());
+            // The first line of a script (`python3 - <<'EOF'`) does not say
+            // what it does, so the provider's account of it is kept in view.
+            if let Some(description) = turn::script_description(&item.content) {
+                preview.push(design::caption(description.to_owned()).into());
+            }
         }
         preview.extend(cached.preview.tail_view());
         line.push(
@@ -496,9 +501,7 @@ impl Runtime {
         } else {
             format!("{verb} {label}")
         };
-        if coordinated.is_none()
-            && let Some(description) = turn::command_description(&item.content)
-        {
+        if let Some(description) = turn::command_description(&item.content) {
             name = format!("{name} · {description}");
         }
         let header = widget::button::custom(

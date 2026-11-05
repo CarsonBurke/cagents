@@ -205,12 +205,13 @@ fn tail_line<'a>(content: &ItemContent, output: &'a str) -> &'a str {
         start += 1;
     }
     // A window that begins mid-line would offer a fragment of a line.
-    let window = match start {
-        0 => output,
-        start => match output[start..].find('\n') {
+    let window = if start == 0 || output[..start].ends_with('\n') {
+        &output[start..]
+    } else {
+        match output[start..].find('\n') {
             Some(newline) => &output[start + newline + 1..],
             None => "",
-        },
+        }
     };
     window
         .lines()
@@ -221,37 +222,83 @@ fn tail_line<'a>(content: &ItemContent, output: &'a str) -> &'a str {
 
 /// Whether a line of output reads as the reason a command failed.
 ///
-/// The test is lexical, as a reader scanning a log would apply it: the line
-/// opens with a severity word (`error[E0308]:`, `FAILED tests/x.py`,
-/// `fatal: not a git repository`), or names one as a field (`app.rs:3: error:
-/// expected`, `thread 'main' panicked at`, `AssertionError: 1 != 2`). Words
-/// that only contain a severity, such as `errors.rs` or `no failures`, do not
-/// count.
+/// The test is lexical, as a reader scanning a log would apply it, and it
+/// looks where tools put the reason rather than anywhere in the line, so a
+/// source excerpt (`12 |     error: Option<String>,`) or an application's
+/// log (`ERROR app: retrying`) printed before the failure does not stand in
+/// for it:
+///
+/// - a severity opens the message, after any `path:line:` location
+///   (`error[E0308]:`, `src/a.ts(3,5): error TS2322:`, `fatal: not a git
+///   repository`, `FAILED tests/x.py::t - AssertionError`);
+/// - a thread panicked (`thread 'main' panicked at src/lib.rs:5:9:`);
+/// - an exception was raised and not caught (`ValueError: bad`,
+///   `java.lang.IllegalStateException: closed`, `TypeError: x is undefined`).
 fn is_diagnostic(line: &str) -> bool {
-    const OPENING: [&str; 7] = [
-        "error",
-        "fatal",
-        "panic",
-        "failed",
-        "failure",
-        "exception",
-        "traceback",
-    ];
     let trimmed = line.trim_start();
-    let lower = trimmed.to_ascii_lowercase();
-    let opens = OPENING.iter().any(|word| {
-        lower.strip_prefix(word).is_some_and(|rest| {
-            rest.chars()
-                .next()
-                .is_none_or(|next| !next.is_ascii_alphanumeric())
-        })
-    });
-    opens
-        || lower.contains("error:")
-        || lower.contains("error[")
-        || lower.contains(" panicked at ")
-        || trimmed.contains("Error: ")
-        || trimmed.contains("Exception: ")
+    opens_with_severity(after_location(trimmed))
+        || trimmed.contains(" panicked at ")
+        || names_exception(line)
+}
+
+/// The message of a compiler-style line, past the location it starts with:
+/// `src/a.rs:3:5: error: …`, `src/a.ts(3,5): error TS2322: …`, or
+/// `src/a.ts:3:5 - error TS2322: …`.
+fn after_location(line: &str) -> &str {
+    let Some((token, rest)) = line.split_once(' ') else {
+        return line;
+    };
+    let located = token
+        .as_bytes()
+        .windows(2)
+        .any(|pair| matches!(pair[0], b':' | b'(') && pair[1].is_ascii_digit());
+    if !located {
+        return line;
+    }
+    if token.ends_with(':') {
+        rest.trim_start()
+    } else {
+        rest.strip_prefix("- ").unwrap_or(line)
+    }
+}
+
+fn opens_with_severity(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let after = |word: &str| lower.strip_prefix(word);
+    if let Some(rest) = after("error") {
+        // `error:` and `error[E0308]:`, or a coded `error TS2322:`.
+        return rest.starts_with([':', '['])
+            || rest.strip_prefix(' ').is_some_and(|code| {
+                let code = code.split(|ch: char| !ch.is_ascii_alphanumeric()).next();
+                code.is_some_and(|code| {
+                    code.starts_with(|ch: char| ch.is_ascii_alphabetic())
+                        && code.ends_with(|ch: char| ch.is_ascii_digit())
+                })
+            });
+    }
+    if let Some(rest) = after("fatal") {
+        return rest.starts_with(':') || rest.starts_with(" error");
+    }
+    if let Some(rest) = after("failed").or_else(|| after("failure")) {
+        return rest.starts_with([':', ' ']);
+    }
+    if let Some(rest) = after("exception") {
+        return rest.starts_with(':') || rest.starts_with(" in thread");
+    }
+    after("panic:").is_some()
+}
+
+/// Whether the line is an uncaught exception as runtimes report it: an
+/// exception's name at the start of the line, then its message.
+fn names_exception(line: &str) -> bool {
+    let name = line.split(':').next().unwrap_or(line);
+    let last = name.rsplit('.').next().unwrap_or(name);
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '$'))
+        && (last.ends_with("Error") || last.ends_with("Exception"))
+        && (name.len() == line.len() || line[name.len()..].starts_with(": "))
 }
 
 impl Preview {
@@ -1416,6 +1463,58 @@ mod tests {
         assert_eq!(tail(&ran(Failed, Some(1), &early)), "last line");
         let multibyte = format!("{}\nerror: late\n", "λ".repeat(super::DIAGNOSTIC_WINDOW));
         assert_eq!(tail(&ran(Failed, Some(1), &multibyte)), "error: late");
+        // A window that starts on a line boundary keeps that line.
+        let aligned = format!(
+            "x\nerror: aligned\n{}\n",
+            "x".repeat(super::DIAGNOSTIC_WINDOW - 16)
+        );
+        assert!(aligned[..aligned.len() - super::DIAGNOSTIC_WINDOW].ends_with('\n'));
+        assert_eq!(tail(&ran(Failed, Some(1), &aligned)), "error: aligned");
+        // Other toolchains put the reason in their own places.
+        for (output, reason) in [
+            (
+                "Traceback (most recent call last):\n  File \"a.py\", line 3, in <module>\n\
+                 \x20   raise ValueError(\"bad\")\nValueError: bad\n",
+                "ValueError: bad",
+            ),
+            (
+                "Exception in thread \"main\" java.lang.IllegalStateException: closed\n\
+                 \tat App.main(App.java:3)\n",
+                "Exception in thread \"main\" java.lang.IllegalStateException: closed",
+            ),
+            (
+                "/app/a.js:2\n  x();\n  ^\n\nTypeError: x is not a function\n    at Object.<anonymous>\n",
+                "TypeError: x is not a function",
+            ),
+            (
+                "> tsc\n\nsrc/a.ts(3,5): error TS2322: Type 'string' is not assignable.\n\
+                 npm error Lifecycle script `build` failed with error:\nnpm error code 2\n",
+                "src/a.ts(3,5): error TS2322: Type 'string' is not assignable.",
+            ),
+            (
+                "src/a.ts:3:5 - error TS2322: Type 'string' is not assignable.\n\n3 x\n\nFound 1 error.\n",
+                "src/a.ts:3:5 - error TS2322: Type 'string' is not assignable.",
+            ),
+            (
+                "a.c:1:10: fatal error: missing.h: No such file or directory\ncompilation terminated.\n",
+                "a.c:1:10: fatal error: missing.h: No such file or directory",
+            ),
+            // Source excerpts and application logs printed before the
+            // failure are not it.
+            (
+                "warning: unused field\n12 |     error: Option<String>,\n   |     ^^^^^\n\
+                 ERROR app: retrying\non_error: cb\n\
+                 thread 'tests::adds' panicked at src/lib.rs:5:9:\n",
+                "thread 'tests::adds' panicked at src/lib.rs:5:9:",
+            ),
+            (
+                "----- Captured log call -----\nERROR root:app.py:10 boom\n\
+                 FAILED tests/test_a.py::test_x - AssertionError: assert 1 == 2\n",
+                "FAILED tests/test_a.py::test_x - AssertionError: assert 1 == 2",
+            ),
+        ] {
+            assert_eq!(tail(&ran(Failed, Some(1), output)), reason, "{output}");
+        }
     }
 
     #[test]
