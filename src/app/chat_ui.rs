@@ -8096,9 +8096,12 @@ impl Cagents {
                 .cloned(),
             _ => None,
         };
+        // A saved reader may stand for an agent, which only the daemon can end.
         if !pending
             && session.proof.is_some()
-            && (session.owns_codex_listener() || session.native_continuity.retains_provider())
+            && (session.owns_codex_listener()
+                || session.native_continuity.retains_provider()
+                || session.is_saved_claude_history())
         {
             let target = self.chat_ui.next_target(card);
             self.chat_ui.phases.insert(
@@ -23550,6 +23553,41 @@ mod tests {
             }
             assert!(!app.chat_start_pending(card));
         }
+    }
+
+    /// A saved reader can stand for a lost agent, so its pane stays until the
+    /// daemon has closed it: a refusal leaves something to retry, not an orphan.
+    #[test]
+    fn a_refused_close_of_a_saved_reader_keeps_its_pane_and_says_why() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("the card holds a chat");
+        };
+        runtime.session.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        runtime.session.terminal = None;
+        let source = app.chat_return_session(card).unwrap();
+        assert!(source.is_saved_claude_history(), "{source:?}");
+        let _ = app.update(Message::CloseCard(card));
+        let Some(Phase::Closing {
+            target,
+            restart: None,
+        }) = app.chat_ui.phases.get(&card)
+        else {
+            panic!("the close waits for the daemon");
+        };
+        let target = *target;
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            target,
+            source,
+            Err("It was not closed".into()),
+        )));
+        assert!(app.workspace.order().any(|id| id == card));
+        assert!(!app.chat_ui.phases.contains_key(&card));
+        assert!(!errors(&app).is_empty(), "the refusal says why");
+        app.notices.entries.clear();
+        close_chat(&mut app, card);
     }
 
     /// A Codex chat and the CLI the daemon still runs for its thread end

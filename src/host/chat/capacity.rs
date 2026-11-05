@@ -1299,6 +1299,30 @@ exit 0
         let host = super::tests::host();
         let (_directory, source, _) = lost_holder_source(&host, &rows, "earlier-boot");
         super::super::close_retained_from_pane(&host, &source).unwrap();
+
+        // An exited reader is in no inventory, so its window sends that same
+        // request while the reader stands: as an agent, then as a plain chat.
+        for managed in [true, false] {
+            let host = super::tests::host();
+            let (directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+            let accepted = managed.then(|| {
+                register_authority(&host, &source);
+                lost_agent(&host, directory.path(), &source)
+            });
+            let (restored, server) = restore_client(&host, source.clone(), 79);
+            let restored = restored.unwrap();
+            assert!(host.lock().unwrap().chats.contains_key(&source.id));
+            let shown = restored.session();
+            super::super::close_retained_from_pane(&host, &shown).unwrap();
+            assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+            if let Some(accepted) = accepted {
+                assert!(!agent_open(&host, accepted.agent.id), "the agent closed");
+                assert!(authority_rows(directory.path(), source.id).is_empty());
+            }
+            assert!(!marker.exists());
+            drop(restored);
+            server.join().unwrap();
+        }
     }
 
     #[test]

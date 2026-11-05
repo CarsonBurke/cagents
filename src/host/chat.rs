@@ -972,6 +972,21 @@ pub(super) fn fence_lost_holder(
 /// agent ends as an agent. A plain retained Claude conversation with no owner
 /// left has nothing to close. Everything else needs its exact close receipt.
 pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> Result<(), String> {
+    // A window's reader is in no inventory, so this is the only request its
+    // pane can send. It runs nothing: end it, then close what it stood for.
+    let reader = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .chats
+            .get(&session.id)
+            .filter(|record| record.handle.is_read_only_history() && !record.handle.owns_work())
+            .map(|record| CloseTarget::capture(&state, record))
+            .transpose()
+            .map_err(|error| error.message)?
+    };
+    if let Some(reader) = reader {
+        close_captured(host, reader).map_err(|error| error.message)?;
+    }
     if super::agent_execution::close_lost_agent_from_pane(host, session)? {
         return Ok(());
     }
