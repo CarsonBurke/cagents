@@ -30,12 +30,22 @@ pub enum Operation {
 
 #[cfg(feature = "host")]
 pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Account>, String> {
-    use super::{Account, home::Homes, registry::Store};
+    use super::{home::Homes, registry::Store};
     let homes = Homes::installation().ok_or("Remote account storage is unavailable")?;
     let registry = Store::installation()
         .ok_or("Remote account registry is unavailable")?
         .try_load()
         .map_err(|error| error.to_string())?;
+    affected_account_in(operation, &homes, &registry)
+}
+
+#[cfg(feature = "host")]
+fn affected_account_in(
+    operation: &Operation,
+    homes: &super::home::Homes,
+    registry: &super::registry::Registry,
+) -> Result<Option<super::Account>, String> {
+    use super::Account;
     match operation {
         Operation::Register { provider, key } | Operation::Abandon { provider, key } => {
             let pending = registry
@@ -428,6 +438,117 @@ mod tests {
         agent::Provider,
     };
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn orphan_registration_keeps_existing_lifecycle_targets_and_refuses_abandoning_unknown_homes() {
+        let directory = tempfile::tempdir().unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let key = uuid::Uuid::from_u128(1);
+        let home = homes.path(Provider::Claude, key);
+        std::fs::create_dir_all(&home).unwrap();
+        let mut registry = super::super::registry::Registry::default();
+        let register = Operation::Register {
+            provider: Provider::Claude,
+            key,
+        };
+        let abandon = Operation::Abandon {
+            provider: Provider::Claude,
+            key,
+        };
+        let expected = Some(Account::managed(Provider::Claude, key, home.clone()));
+        assert_eq!(
+            affected_account_in(&register, &homes, &registry).unwrap(),
+            expected
+        );
+        assert!(affected_account_in(&abandon, &homes, &registry).is_err());
+        registry.begin(Provider::Claude, key, 1);
+        assert_eq!(
+            affected_account_in(&register, &homes, &registry).unwrap(),
+            expected
+        );
+        assert_eq!(
+            affected_account_in(&abandon, &homes, &registry).unwrap(),
+            expected
+        );
+        registry
+            .register(
+                Registered {
+                    provider: Provider::Claude,
+                    key,
+                    linked_home: None,
+                    label: None,
+                    email: Some("registered@example.invalid".into()),
+                    organization: None,
+                    added_at: 2,
+                },
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            affected_account_in(&register, &homes, &registry).unwrap(),
+            None
+        );
+        assert!(affected_account_in(&abandon, &homes, &registry).is_err());
+        assert_eq!(
+            affected_account_in(
+                &Operation::Create {
+                    provider: Provider::Codex,
+                    copy_codex_config: false
+                },
+                &homes,
+                &registry
+            )
+            .unwrap(),
+            Some(Account::system(Provider::Codex))
+        );
+        let linked = directory.path().join("linked-home");
+        let linked_key = uuid::Uuid::from_u128(2);
+        assert_eq!(
+            affected_account_in(
+                &Operation::Link {
+                    provider: Provider::Codex,
+                    key: linked_key,
+                    path: linked.to_str().unwrap().into()
+                },
+                &homes,
+                &registry
+            )
+            .unwrap(),
+            Some(Account::linked(Provider::Codex, linked_key, linked))
+        );
+        assert_eq!(
+            affected_account_in(
+                &Operation::Remove {
+                    id: Account::managed(Provider::Claude, key, home).id()
+                },
+                &homes,
+                &registry
+            )
+            .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn orphan_registration_targets_refuse_newer_ambiguous_and_cross_provider_pending_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let key = uuid::Uuid::from_u128(1);
+        let operation = Operation::Register {
+            provider: Provider::Claude,
+            key,
+        };
+        let mut registry = super::super::registry::Registry::default();
+        assert!(affected_account_in(&operation, &homes, &registry).is_err());
+        std::fs::create_dir_all(homes.path(Provider::Claude, key)).unwrap();
+        let newer = toml::from_str("version = 999\n").unwrap();
+        assert!(affected_account_in(&operation, &homes, &newer).is_err());
+        registry.begin(Provider::Codex, key, 1);
+        assert!(affected_account_in(&operation, &homes, &registry).is_err());
+        registry.abandon(key);
+        std::fs::create_dir_all(homes.path(Provider::Codex, key)).unwrap();
+        assert!(affected_account_in(&operation, &homes, &registry).is_err());
+    }
 
     #[test]
     fn host_lifecycle_never_deletes_managed_or_linked_files_without_a_permit() {
