@@ -538,6 +538,9 @@ pub struct State {
     /// The load whose adoption keeps `notice`: the reload a review write
     /// starts must not erase the write's own outcome.
     notice_survives_load: Option<u64>,
+    /// Why the latest viewed mark failed, for the summary of the operation
+    /// it belonged to.
+    viewed_failure: Option<String>,
     effects: Vec<Effect>,
 }
 
@@ -751,6 +754,7 @@ impl State {
             selected: None,
             notice: None,
             notice_survives_load: None,
+            viewed_failure: None,
             effects: Vec::new(),
         }
     }
@@ -1244,14 +1248,17 @@ impl State {
                         ViewedOutcome::Applied => {
                             file.sync = ViewedSync::Settled;
                         }
+                        // The message may be a local refusal sent before
+                        // GitHub was asked, so the notice names no actor.
                         ViewedOutcome::NotApplied(message) => {
                             file.viewed = !viewed;
                             file.sync = ViewedSync::Settled;
                             self.notice = Some(format!(
-                                "GitHub did not mark {} as {}. {message}",
+                                "Could not mark {} as {}. {message}",
                                 path.display(),
                                 if viewed { "viewed" } else { "not viewed" }
                             ));
+                            self.viewed_failure = Some(message);
                         }
                         ViewedOutcome::Unknown(message) => {
                             file.sync = ViewedSync::Unverified;
@@ -1259,13 +1266,16 @@ impl State {
                                 "Could not confirm the viewed mark on {}; refresh to check. {message}",
                                 path.display()
                             ));
+                            self.viewed_failure = Some(format!(
+                                "Some marks are unconfirmed; refresh to check. {message}"
+                            ));
                         }
                     }
                 }
                 if failures > 0 && total > 1 {
-                    let detail = self.notice.take().unwrap_or_default();
                     self.notice = Some(format!(
-                        "{failures} of {total} files in this batch could not be marked. {detail}"
+                        "{failures} of {total} files could not be marked. {}",
+                        self.viewed_failure.as_deref().unwrap_or_default()
                     ));
                 }
                 self.cache_dirty = true;
@@ -1281,9 +1291,11 @@ impl State {
                     && authority_revision == self.authority_revision
                     && failed > 0
                 {
-                    let detail = self.notice.take().unwrap_or_default();
+                    // One sentence for the whole operation, replacing the
+                    // notices of its batches.
                     self.notice = Some(format!(
-                        "{failed} of {total} files could not be marked. {detail}"
+                        "{failed} of {total} files could not be marked. {}",
+                        self.viewed_failure.take().unwrap_or_default()
                     ));
                 }
                 ActionTask::none()
@@ -1630,6 +1642,7 @@ impl State {
         self.generation = self.generation.wrapping_add(1);
         self.load_generation = 0;
         self.notice_survives_load = None;
+        self.viewed_failure = None;
         self.viewed_after_load.clear();
         self.last_refresh = None;
         self.target = None;
@@ -4288,7 +4301,14 @@ pub(crate) mod tests {
                     .iter()
                     .all(|file| { file.viewed != viewed && file.sync == ViewedSync::Settled })
             );
-            assert!(state.notice.as_ref().unwrap().contains("150 of 200"));
+            let notice = state.notice.as_deref().unwrap();
+            assert!(
+                notice.starts_with(
+                    "150 of 200 files could not be marked. The diff revision changed."
+                ),
+                "one summary, not a stack of batch notices: {notice}"
+            );
+            assert_eq!(notice.matches("could not be marked").count(), 1, "{notice}");
         }
     }
 
@@ -5238,7 +5258,12 @@ pub(crate) mod tests {
         assert_eq!(state.files[0].sync, ViewedSync::Settled);
         assert!(state.files[1].viewed);
         assert_eq!(state.files[1].sync, ViewedSync::Unverified);
-        assert!(state.notice.as_deref().unwrap().contains("b.rs"));
+        assert_eq!(
+            state.notice.as_deref(),
+            Some(
+                "2 of 2 files could not be marked. Some marks are unconfirmed; refresh to check. lost"
+            )
+        );
         // A refresh that reports GitHub's truth reconciles the unverified mark.
         drop(state.update(Action::Refresh));
         drop(state.update(Action::Loaded {
