@@ -1497,8 +1497,14 @@ fn stream(job: &Job) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send
     }))
 }
 async fn run(shared: Arc<Shared>) -> Result<Prepared, String> {
-    let permit = workers()
-        .clone()
+    run_with_permits(shared, workers().clone()).await
+}
+
+async fn run_with_permits(
+    shared: Arc<Shared>,
+    permits: Arc<tokio::sync::Semaphore>,
+) -> Result<Prepared, String> {
+    let permit = permits
         .acquire_owned()
         .await
         .map_err(|_| "Message loading stopped.".to_owned())?;
@@ -1679,6 +1685,29 @@ fn execute(
         _owner: shared,
         _permit: permit,
     })
+}
+
+#[cfg(test)]
+pub(super) fn reply_with_permits_for_test(
+    runtime: &Runtime,
+    id: &str,
+    permits: Arc<tokio::sync::Semaphore>,
+) -> (
+    u64,
+    Pin<Box<dyn std::future::Future<Output = Ready> + Send>>,
+) {
+    let entry = runtime
+        .preparation
+        .entries
+        .get(id)
+        .filter(|entry| entry.running)
+        .expect("admitted actual running transcript input");
+    let run = entry.run;
+    let shared = entry.shared.clone();
+    (
+        run,
+        Box::pin(async move { Ready::new(run_with_permits(shared, permits).await) }),
+    )
 }
 
 #[cfg(test)]

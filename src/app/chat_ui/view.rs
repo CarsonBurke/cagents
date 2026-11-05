@@ -8055,13 +8055,103 @@ mod tests {
     #[test]
     fn native_app_reader_survives_cold_source_placeholder_until_actual_preparation_completes() {
         use iced::advanced::{
-            Layout, layout,
+            Layout, Renderer as _, Shell, layout,
+            renderer::Headless,
             widget::{Operation, Tree, operation},
         };
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Default)]
+        struct Wake(AtomicUsize);
+        impl iced::futures::task::ArcWake for Wake {
+            fn wake_by_ref(wake: &Arc<Self>) {
+                wake.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // This is an offscreen paint oracle, not a native latency measurement.
+        // Anchored exposes the same source to accessibility and draw only once
+        // its reader geometry is ready. Check both semantic body and pixels.
+        fn paint(
+            element: &Element<'_, Message>,
+            tree: &Tree,
+            node: &layout::Node,
+            renderer: &mut cosmic::Renderer,
+        ) -> (bool, Vec<u8>, Vec<iced::Rectangle>) {
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(node),
+                tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let paragraphs = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter(|node| {
+                    node.node()
+                        .value()
+                        .is_some_and(|value| value.contains("Reading paragraph"))
+                })
+                .filter_map(|node| node.node().bounds())
+                .map(|bounds| iced::Rectangle {
+                    x: bounds.x0 as f32,
+                    y: bounds.y0 as f32,
+                    width: (bounds.x1 - bounds.x0) as f32,
+                    height: (bounds.y1 - bounds.y0) as f32,
+                })
+                .collect::<Vec<_>>();
+            let viewport = iced::Rectangle::with_size(iced::Size::new(620.0, 720.0));
+            renderer.reset(viewport);
+            element.as_widget().draw(
+                tree,
+                renderer,
+                &cosmic::Theme::dark(),
+                &iced::advanced::renderer::Style::default(),
+                Layout::new(node),
+                iced::mouse::Cursor::Unavailable,
+                &viewport,
+            );
+            (
+                !paragraphs.is_empty(),
+                renderer.screenshot(iced::Size::new(620, 720), 1.0, iced::Color::BLACK),
+                paragraphs,
+            )
+        }
+        fn paragraph_has_ink(
+            pixels: &[u8],
+            paragraph: iced::Rectangle,
+            viewport: iced::Rectangle,
+        ) -> bool {
+            let Some(visible) = paragraph.intersection(&viewport).and_then(|bounds| {
+                bounds.intersection(&iced::Rectangle::with_size(iced::Size::new(620.0, 720.0)))
+            }) else {
+                return false;
+            };
+            // Ordinary paragraph interiors contain only glyphs and a uniform
+            // background. Exclude edges and the transcript scrollbar; changing
+            // a loading label elsewhere cannot satisfy this body-pixel oracle.
+            let left = (visible.x.ceil() as usize).saturating_add(4);
+            let top = (visible.y.ceil() as usize).saturating_add(2);
+            let right = ((visible.x + visible.width).floor() as usize).saturating_sub(8);
+            let bottom = ((visible.y + visible.height).floor() as usize).saturating_sub(2);
+            if right <= left + 8 || bottom <= top + 8 {
+                return false;
+            }
+            let mut colors = HashMap::<[u8; 3], usize>::new();
+            for y in top..bottom {
+                for x in left..right {
+                    let pixel = &pixels[(y * 620 + x) * 4..][..3];
+                    *colors.entry([pixel[0], pixel[1], pixel[2]]).or_default() += 1;
+                }
+            }
+            let background = colors.values().copied().max().unwrap_or(0);
+            (right - left) * (bottom - top) - background >= 32
+        }
         struct Reader {
             id: widget::Id,
             move_bottom: Option<f32>,
             top: Option<f32>,
+            bounds: iced::Rectangle,
         }
         impl Operation for Reader {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -8070,13 +8160,14 @@ mod tests {
             fn scrollable(
                 &mut self,
                 id: Option<&widget::Id>,
-                _: iced::Rectangle,
+                bounds: iced::Rectangle,
                 _: iced::Rectangle,
                 translation: iced::Vector,
                 state: &mut dyn operation::Scrollable,
             ) {
                 if id == Some(&self.id) {
                     self.top = Some(translation.y);
+                    self.bounds = bounds;
                     if let Some(bottom) = self.move_bottom.take() {
                         state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
                             x: None,
@@ -8129,6 +8220,12 @@ mod tests {
             started_at: None,
         };
         let (mut live, handle) = frame_cost::live_runtime(&[item]);
+        let mut publication = (*handle.snapshot()).clone();
+        publication.generation = 41;
+        publication.finished_at = Some(1_700_000_000_000);
+        handle.replace_snapshot_for_test(publication);
+        live.refresh();
+        live.composer = text_editor::Content::with_text("Keep this unsent draft");
         let mut app = crate::app::tests::context_inspector_test_app(true);
         let mut target = live.target;
         target.card = app.workspace.focused().unwrap();
@@ -8136,19 +8233,23 @@ mod tests {
         app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
         app.cards
             .insert(target.card, CardRuntime::Chat(Box::new(live)));
-        let renderer = crate::app::tests::headless_renderer();
+        let mut renderer = crate::app::tests::headless_renderer();
         let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(620.0, 720.0));
         let scroll = card_control_id(target.card, "chat-transcript");
-        let read = |element: &mut Element<'_, Message>, tree: &mut Tree, node: &layout::Node| {
+        let read = |element: &mut Element<'_, Message>,
+                    tree: &mut Tree,
+                    node: &layout::Node,
+                    renderer: &cosmic::Renderer| {
             let mut reader = Reader {
                 id: scroll.clone(),
                 move_bottom: None,
                 top: None,
+                bounds: iced::Rectangle::default(),
             };
             element
                 .as_widget_mut()
-                .operate(tree, Layout::new(node), &renderer, &mut reader);
-            reader.top.expect("actual native transcript")
+                .operate(tree, Layout::new(node), renderer, &mut reader);
+            (reader.top.expect("actual native transcript"), reader.bounds)
         };
         let expected;
         {
@@ -8161,6 +8262,7 @@ mod tests {
                 id: scroll.clone(),
                 move_bottom: Some(700.0),
                 top: None,
+                bounds: iced::Rectangle::default(),
             };
             element.as_widget_mut().operate(
                 &mut tree,
@@ -8168,7 +8270,7 @@ mod tests {
                 &renderer,
                 &mut movement,
             );
-            expected = read(&mut element, &mut tree, &node);
+            expected = read(&mut element, &mut tree, &node, &renderer).0;
             assert!(expected > 500.0);
             // No subsequent layout: hide immediately after actual navigation.
         }
@@ -8183,34 +8285,140 @@ mod tests {
             .unwrap()
             .set_visible(true)
             .unwrap();
+        assert!(handle.resident_snapshot_with_clock().is_none());
+        assert_eq!(runtime(&app, target).snapshot.generation, 41);
+        assert_eq!(
+            runtime(&app, target).snapshot.finished_at,
+            Some(1_700_000_000_000)
+        );
         let mut tree;
         {
             let mut empty_wait = view(&app, target);
             tree = Tree::new(&empty_wait);
-            empty_wait
+            let node = empty_wait
                 .as_widget_mut()
                 .layout(&mut tree, &renderer, &limits);
+            assert!(
+                !paint(&empty_wait, &tree, &node, &mut renderer).0,
+                "visible metadata is not hydrated transcript readiness"
+            );
         }
+        // Hydration is one explicit publication at the existing generation;
+        // admission and DTO acceptance remain separate independently held gates.
         handle.replace_snapshot_for_test(snapshot);
         app.chat_runtime_mut(target).unwrap().refresh();
         assert!(runtime(&app, target).cache["cold-rich"].placeholder);
         assert!(runtime(&app, target).preparation.contains("cold-rich"));
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let (run, mut reply) = preparation::reply_with_permits_for_test(
+            runtime(&app, target),
+            "cold-rich",
+            permits.clone(),
+        );
+        let wake = Arc::new(Wake::default());
+        let waker = iced::futures::task::waker(wake.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(std::future::Future::poll(reply.as_mut(), &mut context).is_pending());
         {
             let mut placeholder = view(&app, target);
             tree.diff(placeholder.as_widget_mut());
-            placeholder
+            let node = placeholder
                 .as_widget_mut()
                 .layout(&mut tree, &renderer, &limits);
+            assert!(
+                !paint(&placeholder, &tree, &node, &mut renderer).0,
+                "hydrated source cannot paint while its required job lacks admission"
+            );
         }
-        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert!(std::future::Future::poll(reply.as_mut(), &mut context).is_pending());
+        assert_eq!(wake.0.load(Ordering::SeqCst), 0);
+        permits.add_permits(1);
+        assert!(
+            wake.0.load(Ordering::SeqCst) > 0,
+            "admission wakes the actual async preparation without user input"
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ready = executor.block_on(reply);
+        assert!(runtime(&app, target).cache["cold-rich"].placeholder);
+        {
+            let mut held = view(&app, target);
+            tree.diff(held.as_widget_mut());
+            let node = held.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            assert!(
+                !paint(&held, &tree, &node, &mut renderer).0,
+                "worker completion alone is not UI acceptance"
+            );
+        }
+        drop(app.handle_chat_ui(Action::MarkdownPrepared(
+            target,
+            "cold-rich".into(),
+            run,
+            ready,
+        )));
         assert!(!runtime(&app, target).cache["cold-rich"].placeholder);
         let mut ready = view(&app, target);
         tree.diff(ready.as_widget_mut());
-        let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
-        let actual = read(&mut ready, &mut tree, &node);
+        let mut node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut painted = paint(&ready, &tree, &node, &mut renderer);
+        // Native redraw continuation, with no keyboard/mouse event or further
+        // publication. Each extra pass must be requested by the actual widget.
+        for _ in 0..8 {
+            if painted.0 {
+                break;
+            }
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            ready.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Window(iced::window::Event::RedrawRequested(
+                    iced::time::Instant::now(),
+                )),
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut shell,
+                &iced::Rectangle::with_size(iced::Size::new(620.0, 720.0)),
+            );
+            assert!(
+                shell.is_layout_invalid(),
+                "paint continuation must wake itself"
+            );
+            assert_eq!(
+                shell.redraw_request(),
+                iced::window::RedrawRequest::NextFrame
+            );
+            node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            painted = paint(&ready, &tree, &node, &mut renderer);
+        }
+        assert!(
+            painted.0,
+            "accepted required source must reach actual reader paint"
+        );
+        let (actual, viewport) = read(&mut ready, &mut tree, &node, &renderer);
+        assert!(
+            painted
+                .2
+                .iter()
+                .any(|paragraph| paragraph_has_ink(&painted.1, *paragraph, viewport)),
+            "an accessible body paragraph must also contain drawn glyph pixels"
+        );
         assert!(
             (actual - expected).abs() <= 1.0,
             "actual App/native Tree restored {actual} instead of {expected}"
+        );
+        drop(ready);
+        assert_eq!(
+            runtime(&app, target).composer.text(),
+            "Keep this unsent draft"
+        );
+        assert_eq!(runtime(&app, target).snapshot.generation, 41);
+        assert_eq!(
+            runtime(&app, target).snapshot.finished_at,
+            Some(1_700_000_000_000)
         );
     }
 
