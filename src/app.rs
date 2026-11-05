@@ -5349,7 +5349,8 @@ pub struct Cagents {
     automation_close_generation: u64,
     terminal_close: Option<terminal_close::CloseIntent>,
     queued_card_closes: VecDeque<terminal_close::QueuedCardClose>,
-    close_queue_turn: Option<CardId>,
+    /// The ended pane whose terminal the daemon is being asked to release.
+    completed_release: Option<CardId>,
     close_queue_advancing: bool,
     /// The pending removal whose commit has been delivered, so anything still
     /// holding it is one of the closes the commit started.
@@ -13178,8 +13179,7 @@ impl Cagents {
             None => {
                 // Refused after all: the pane stays, and nothing else
                 // will advance the closes queued behind it.
-                self.closed_terminal_cards.remove(&id);
-                self.proven_gone_cards.remove(&id);
+                self.abandon_removal(id);
                 self.next_queued_card_close()
             }
         }
@@ -14414,10 +14414,10 @@ impl Application for Cagents {
             automation_close_generation: 0,
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
-            close_queue_turn: None,
             close_queue_advancing: false,
             close_commit_delivered: None,
             terminal_close_attempts: HashSet::new(),
+            completed_release: None,
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
             proven_gone_cards: HashSet::new(),
@@ -14668,6 +14668,13 @@ impl Application for Cagents {
         // Freeze user input, not lifecycle completions. Dropping a completed
         // save/Git/spawn result would strand that operation if another window vetoed.
         if self.update_prepared && user_message_blocked_during_update(&message) {
+            // Nothing else would ever deliver this removal.
+            if let Message::CommitClose(card) = message {
+                self.abandon_removal(card);
+                self.status = Some(TransientNotice::warning(
+                    "An update is being prepared, so the pane was kept. Close it again if the update doesn't go ahead.",
+                ));
+            }
             return Task::none();
         }
         if self.modal_is_open() {
@@ -29776,10 +29783,10 @@ mod tests {
             automation_close_generation: 0,
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
-            close_queue_turn: None,
             close_queue_advancing: false,
             close_commit_delivered: None,
             terminal_close_attempts: HashSet::new(),
+            completed_release: None,
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
             proven_gone_cards: HashSet::new(),

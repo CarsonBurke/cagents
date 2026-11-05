@@ -8150,6 +8150,17 @@ impl Cagents {
             }
             None => None,
         };
+        // The chat's close ran beside the pane holding the only removal. It
+        // waits for its turn; a replacement isn't a close, and reports.
+        if replacement.is_none()
+            && self
+                .workspace
+                .pending_close()
+                .is_some_and(|pending| pending.unmounting != card)
+        {
+            self.queue_card_close(card, false);
+            return None;
+        }
         self.reserve_chat_removal(card)?;
         self.commit_card_removal(card, replacement)
     }
@@ -23706,6 +23717,82 @@ mod tests {
         app.notices.entries.clear();
         app.status = None;
         close_chat(&mut app, card);
+    }
+
+    /// A chat's close runs beside other closes and only needs the workspace's
+    /// removal at the end, when another pane could be holding it.
+    #[test]
+    fn a_chat_finishing_during_another_removal_waits_its_turn() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let chat = failed_chat(&mut app);
+        let pane = saved_terminal_pane(&mut app);
+        app.workspace.request_close(pane).unwrap();
+        let _ = app.update(Message::CloseCard(chat));
+        let finish = |app: &mut Cagents| {
+            let target = app.chat_ui.phases[&chat].target();
+            let saved = app.chat_return_session(chat).unwrap();
+            let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+                target,
+                saved,
+                Ok(()),
+            )));
+        };
+        finish(&mut app);
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+        assert!(app.card_state(chat).unwrap().existence.is_open());
+        assert!(app.terminal_close_in_progress(chat));
+
+        let _ = app.workspace.cancel_close(pane);
+        let _ = app.update(Message::DismissStatus);
+        finish(&mut app);
+        assert!(!app.card_state(chat).unwrap().existence.is_open());
+    }
+
+    /// A slow chat close takes as long as its daemon takes to answer. Nothing
+    /// about it is a reason to hold up a terminal in another pane.
+    #[test]
+    fn a_chat_closing_does_not_hold_up_another_panes_close() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let chat = failed_chat(&mut app);
+        let pane = saved_terminal_pane(&mut app);
+        let _ = app.update(Message::CloseCard(chat));
+        assert!(app.chat_close_owned(chat));
+        let _ = app.update(Message::CloseCard(pane));
+        assert_eq!(
+            app.terminal_close.as_ref().map(|intent| intent.card),
+            Some(pane)
+        );
+    }
+
+    /// Close during a return has to be remembered then. Queued, it would come
+    /// too late to stop the return starting a terminal in the chat's place.
+    #[test]
+    fn a_chat_closed_during_its_return_beside_another_removal_starts_no_terminal() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let pane = saved_terminal_pane(&mut app);
+        let _ = app.update(Message::ChatUi(Action::Switch(card)));
+        let target = local_return(&app).0;
+        app.workspace.request_close(pane).unwrap();
+        let _ = app.update(Message::CloseCard(card));
+        assert!(matches!(
+            app.chat_ui.phases.get(&card),
+            Some(Phase::Returning {
+                close_requested: true,
+                ..
+            })
+        ));
+        let cards = app.durable.cards.len();
+        let _ = app.update(Message::ChatUi(Action::ReturnedLocally(target, Ok(()))));
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+        let _ = app.workspace.cancel_close(pane);
+        let _ = app.update(Message::DismissStatus);
+        assert!(
+            app.chat_close_owned(card),
+            "its close runs on its turn: {:?}",
+            errors(&app)
+        );
+        assert_eq!(app.durable.cards.len(), cards, "no terminal took its place");
     }
 
     /// The workspace removes one pane at a time, so a second pane that isn't a
