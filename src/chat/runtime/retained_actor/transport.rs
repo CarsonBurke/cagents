@@ -38,6 +38,36 @@ const ARGUMENT: &str = "--cagents-native-actor";
 pub(super) const PROTOCOL: u32 = 2;
 const CAPABILITY: &str = registry::RETAINED_CLAUDE_CAPABILITY;
 const TIMEOUT: Duration = Duration::from_secs(5);
+const PROXY_TICK: Duration = Duration::from_millis(50);
+const QUIET_STATE_INTERVAL: Duration = Duration::from_millis(250);
+
+struct StatePoll {
+    next: Instant,
+}
+impl StatePoll {
+    fn new(now: Instant) -> Self {
+        Self { next: now }
+    }
+
+    fn call_if_due<T, E>(
+        &mut self,
+        now: Instant,
+        force: bool,
+        call: impl FnOnce() -> Result<T, E>,
+    ) -> Option<Result<T, E>> {
+        if !force && now < self.next {
+            return None;
+        }
+        let response = call();
+        // A transient error keeps the existing next-tick retry behavior.
+        self.next = if response.is_ok() {
+            now + QUIET_STATE_INTERVAL
+        } else {
+            now
+        };
+        Some(response)
+    }
+}
 fn payload_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).into()
@@ -130,6 +160,33 @@ pub(crate) struct Resident {
     pub outbox_ack: u64,
     pub outbox_latest: u64,
     changed: u64,
+}
+
+fn fast_state_poll(
+    state: &Resident,
+    visible: bool,
+    local_intent: bool,
+    input_maintenance: bool,
+) -> bool {
+    visible
+        || local_intent
+        || input_maintenance
+        || !state.installed
+        || !state.ready
+        || !state.idle
+        || state.busy
+        || state.waiting
+        || state.working
+        || state.activity != crate::agent::ActivityState::Idle
+        || !state.requests.is_empty()
+        || !state.background_subagents.is_empty()
+        || !state.interrupt_subagents.is_empty()
+        || state.completed
+        || state.close.closing
+        || state.close.completed
+        || state.failure.is_some()
+        || state.continuity_loss.is_some()
+        || state.outbox_ack != state.outbox_latest
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ActorInspection {
@@ -1044,6 +1101,8 @@ impl RemoteActor {
         let worker = thread::Builder::new()
             .name("cagents-actor-proxy".into())
             .spawn(move || {
+                let mut visible = false;
+                let mut state_poll = StatePoll::new(Instant::now());
                 loop {
                     let Some(inner) = weak.upgrade() else {
                         break;
@@ -1058,36 +1117,52 @@ impl RemoteActor {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .take();
-                    if let Some(visible) = desired
-                        && actor.call::<()>("visible", json!([visible])).is_err()
-                    {
-                        actor
-                            .0
-                            .desired_visible
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .get_or_insert(visible);
+                    if let Some(desired) = desired {
+                        visible = desired;
+                        if actor.call::<()>("visible", json!([desired])).is_err() {
+                            actor
+                                .0
+                                .desired_visible
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get_or_insert(desired);
+                        }
                     }
-                    if actor.0.desired_observe.swap(false, Ordering::AcqRel)
-                        && actor.call::<()>("observe", Value::Null).is_err()
-                    {
+                    let observe = actor.0.desired_observe.swap(false, Ordering::AcqRel);
+                    if observe && actor.call::<()>("observe", Value::Null).is_err() {
                         actor.0.desired_observe.store(true, Ordering::Release);
                     }
                     let old = actor.state();
-                    let response = actor.call::<Option<Resident>>("state", json!([old.changed]));
-                    if actor.0.stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if let Err(error) = &response
-                        && actor.endpoint_failed(error)
-                    {
-                        actor.publish_unavailable(error);
-                        break;
-                    }
-                    if let Ok(Some(state)) = response {
-                        if !actor.publish_resident(state) && actor.0.stop.load(Ordering::Acquire) {
+                    let force = fast_state_poll(
+                        &old,
+                        visible,
+                        desired.is_some() || observe,
+                        actor.input_maintenance_pending(&old),
+                    );
+                    // Only hidden, quiescent metadata checks are coalesced.
+                    // Control and receipt maintenance still runs every tick.
+                    if let Some(response) = state_poll.call_if_due(Instant::now(), force, || {
+                        actor.call::<Option<Resident>>("state", json!([old.changed]))
+                    }) {
+                        if actor.0.stop.load(Ordering::Acquire) {
                             break;
                         }
+                        if let Err(error) = &response
+                            && actor.endpoint_failed(error)
+                        {
+                            actor.publish_unavailable(error);
+                            break;
+                        }
+                        if let Ok(Some(state)) = response {
+                            if !actor.publish_resident(state)
+                                && actor.0.stop.load(Ordering::Acquire)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    if actor.0.stop.load(Ordering::Acquire) {
+                        break;
                     }
                     let _ = actor.reconcile_acknowledged_inputs();
                     let identities: Vec<_> = actor
@@ -1107,7 +1182,7 @@ impl RemoteActor {
                     }
                     let _ = actor.flush_input_retirements();
                     drop(actor);
-                    thread::sleep(Duration::from_millis(50));
+                    thread::sleep(PROXY_TICK);
                 }
             })
             .map_err(|error| error.to_string())?;
@@ -1578,6 +1653,24 @@ impl RemoteActor {
             self.0.recovering_inputs.store(false, Ordering::Release);
         }
         Ok(())
+    }
+
+    fn input_maintenance_pending(&self, state: &Resident) -> bool {
+        state.acknowledged_input_count > 0
+            || self.0.recovering_inputs.load(Ordering::Acquire)
+            || self
+                .0
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .any(|pending| pending.reply.is_some())
+            || !self
+                .0
+                .retiring_inputs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
     }
 
     fn flush_input_retirements(&self) -> Result<(), String> {
@@ -3014,7 +3107,15 @@ impl Server {
                     orphans.run();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(20))
+                    wait_for_listener(
+                        &self.listener,
+                        listener_wait_millis(
+                            self.installed,
+                            !self.pending.is_empty(),
+                            orphans.due,
+                            Instant::now(),
+                        ),
+                    )?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error.to_string()),
@@ -3123,6 +3224,36 @@ fn disconnected(control: &UnixStream) -> Result<bool, String> {
     }
     Ok(event.revents & (libc::POLLHUP | libc::POLLERR) != 0)
 }
+fn listener_wait_millis(installed: bool, pending: bool, due: Instant, now: Instant) -> i32 {
+    let mut delay = due.saturating_duration_since(now);
+    if !installed || pending {
+        delay = delay.min(Duration::from_millis(20));
+    }
+    delay
+        .as_millis()
+        .saturating_add(u128::from(delay.as_nanos() % 1_000_000 != 0))
+        .min(i32::MAX as u128) as i32
+}
+
+fn wait_for_listener(listener: &UnixListener, millis: i32) -> Result<bool, String> {
+    let mut event = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: the listener and one initialized pollfd remain live for this call.
+    let result = unsafe { libc::poll(&mut event, 1, millis) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("Retained actor listener wait failed: {error}"));
+        }
+    } else if event.revents & (libc::POLLNVAL | libc::POLLERR | libc::POLLHUP) != 0 {
+        return Err("Retained actor listener became unavailable".into());
+    }
+    Ok(event.revents & libc::POLLIN != 0)
+}
+
 /// This actor is a subreaper, so every orphaned tool descendant of its
 /// provider becomes its child. Reap the exited ones while it serves; the
 /// provider and scope requests spawn through `adopted_orphans`, which reserves
@@ -5879,3 +6010,7 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "transport_deadline_tests.rs"]
 mod deadline_tests;
+
+#[cfg(test)]
+#[path = "idle_poll_tests.rs"]
+mod idle_poll_tests;
