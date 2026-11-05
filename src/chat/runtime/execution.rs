@@ -227,6 +227,7 @@ pub(super) fn exit_reason(
     diagnostic: Option<&str>,
 ) -> String {
     use std::os::unix::process::ExitStatusExt;
+    let clean = status.is_some_and(|status| status.success());
     let status = match status {
         Some(status) if status.signal().is_some() => {
             format!("Provider exited with signal {}", status.signal().unwrap())
@@ -240,13 +241,19 @@ pub(super) fn exit_reason(
         }
         None => "The provider exited before reporting this prompt's final result".into(),
     };
-    // A generic "exited" note adds nothing to the status that already says so.
+    // A note that only says the provider exited adds nothing to the status.
+    // Specific causes, such as an unfinished initialization, are kept.
     let generic = |message: &str| {
-        message.starts_with("Provider exited before")
-            || message.starts_with("The provider exited before")
+        matches!(
+            message,
+            "Provider exited before reporting the turn's final result"
+                | "The provider exited before reporting this prompt's final result"
+        )
     };
     let reason = match diagnostic.filter(|message| !message.is_empty() && !generic(message)) {
         Some(message) if message.starts_with(&status) => message.to_owned(),
+        // The cause already says what was left unfinished.
+        Some(message) if clean => format!("Provider exited with status 0: {message}"),
         Some(message) => format!("{status}: {message}"),
         None => status,
     };
@@ -316,6 +323,25 @@ mod tests {
             assert_eq!(*state, expected);
             assert!(result.diagnostic.as_ref().unwrap().contains(reason));
         }
+    }
+
+    #[test]
+    fn clean_exit_keeps_a_specific_cause_and_drops_a_generic_one() {
+        use std::os::unix::process::ExitStatusExt;
+        let clean = std::process::ExitStatus::from_raw(0);
+        let specific = "Provider exited before completing initialization. \
+                        Last ignored output: wrapper diagnostic";
+        assert_eq!(
+            exit_reason(Some(clean), Some(specific)),
+            format!("Provider exited with status 0: {specific}")
+        );
+        assert_eq!(
+            exit_reason(
+                Some(clean),
+                Some("Provider exited before reporting the turn's final result")
+            ),
+            "Provider exited with status 0 before reporting this prompt's final result"
+        );
     }
 
     #[test]

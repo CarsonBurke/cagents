@@ -3671,7 +3671,8 @@ fn provider_exit_diagnostic(
     {
         "Provider connection closed".into()
     } else {
-        super::protocol::preview(error.as_bytes(), 240)
+        // Room for the cause and the last ignored output it may carry.
+        super::protocol::preview(error.as_bytes(), 512)
     };
     let reason = if status.is_some() {
         execution::exit_reason(status, Some(&detail))
@@ -4603,6 +4604,7 @@ mod tests {
             }
         }
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -4684,6 +4686,7 @@ mod tests {
         }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -4790,6 +4793,7 @@ mod tests {
         let source = directory.join("provider-stderr");
         std::fs::write(&source, &payload).unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -5042,6 +5046,7 @@ mod tests {
         }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -5114,6 +5119,7 @@ mod tests {
         }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -5175,6 +5181,7 @@ mod tests {
         }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -5996,6 +6003,7 @@ mod tests {
         let (_, urgent_incoming) = crossbeam_channel::bounded(1);
         let (wake, _) = UnixStream::pair().unwrap();
         Actor {
+            stdout_noise: None,
             launch_context: None,
             launch_account_scope: None,
             working_directory: "/var/tmp".into(),
@@ -6184,6 +6192,7 @@ mod tests {
         };
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None, messages: None, unset_environment: Default::default(),
             transport: TransportSpec::JsonLines, program: "/bin/sh".into(),
             arguments: vec!["-c".into(),
@@ -9796,6 +9805,7 @@ mod tests {
         }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -9903,6 +9913,7 @@ mod tests {
                 crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let spec = ProcessSpec {
+                stdout_noise: None,
                 execution: None,
                 messages: None,
                 unset_environment: Default::default(),
@@ -9954,6 +9965,7 @@ mod tests {
                 drop(invalid);
             }
             let spec = ProcessSpec {
+                stdout_noise: None,
                 execution: None,
                 messages: None,
                 unset_environment: Default::default(),
@@ -10081,6 +10093,7 @@ mod tests {
     fn bounded_close_does_not_join_a_latched_tls_destructor_on_its_caller() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -10121,6 +10134,7 @@ mod tests {
     fn final_handle_drop_does_not_join_even_after_finished_packet_precedes_tls_cleanup() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -10572,6 +10586,7 @@ mod tests {
             assert!(payload.len() < libc::PIPE_BUF && payload.len() < 8192);
             std::fs::write(&stream, payload).unwrap();
             let spec = ProcessSpec {
+                stdout_noise: None,
                 execution: None, messages: None, unset_environment: Default::default(),
                 transport: TransportSpec::JsonLines, program: "/bin/sh".into(),
                 arguments: vec!["-c".into(),
