@@ -10,6 +10,11 @@ import time
 import unittest
 
 
+CARGO_TAG = (
+    "Signature: 8a477f597d28d172789f06886806bc55\n"
+    "# This file is a cache directory tag created by cargo.\n"
+    "# For information about cache directory tags see https://bford.info/cachedir/\n"
+)
 SEED = Path(__file__).resolve().parents[1] / "scripts/seed-build-dir"
 
 
@@ -251,6 +256,8 @@ class SeedBuildDir(unittest.TestCase):
             self.assertTrue((self.destination / profile / ".fingerprint/zstd-sys-1/lib-zstd").is_file())
             # Incremental caches belong to the checkout's own crates.
             self.assertFalse((self.destination / profile / "incremental").exists())
+        # Cargo tags only directories it creates; the pruner needs the tag.
+        self.assertEqual((self.destination / "CACHEDIR.TAG").read_text(), CARGO_TAG)
         leftovers = [path.name for path in self.destination.iterdir() if path.name.startswith(".seeding")]
         self.assertEqual(leftovers, [])
         # Seeded once, it is a build directory like any other.
@@ -279,10 +286,20 @@ class SeedBuildDir(unittest.TestCase):
 
     def test_a_built_directory_is_left_alone(self):
         (self.destination / "debug/.fingerprint").mkdir(parents=True)
+        (self.destination / ".seed-lock").touch()
         result = self.seed()
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         self.assertFalse((self.destination / "debug/deps").exists())
         self.assertFalse((self.destination / "dev-runtime").exists())
+        # Seeded before seeding tagged directories, it still gets the tag.
+        self.assertEqual((self.destination / "CACHEDIR.TAG").read_text(), CARGO_TAG)
+        # A directory Cargo built itself, such as the main checkout's, is not
+        # made prunable.
+        (self.destination / "CACHEDIR.TAG").unlink()
+        (self.destination / ".seed-lock").unlink()
+        result = self.seed()
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertFalse((self.destination / "CACHEDIR.TAG").exists())
 
     def test_nothing_to_copy_or_opted_out_does_nothing(self):
         for name, run in (
@@ -310,7 +327,9 @@ class SeedBuildDir(unittest.TestCase):
             result = self.seed()
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("cannot reflink", result.stderr)
-            self.assertEqual(sorted(path.name for path in self.destination.iterdir()), [".seed-lock"])
+            # Unbuilt, but tagged: Cargo will not tag a directory it did not create.
+            self.assertEqual(sorted(path.name for path in self.destination.iterdir()),
+                             [".seed-lock", "CACHEDIR.TAG"])
 
 
 if __name__ == "__main__":

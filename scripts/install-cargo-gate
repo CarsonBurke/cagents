@@ -1,0 +1,75 @@
+#!/bin/sh
+# Install this checkout's cargo gate as the host's shared one.
+#
+# Agents in every checkout run the installed gate, so it must never be seen
+# half-updated: the gate runs its helpers from its own directory, and a gate
+# beside an older or missing helper fails every build it admits. This stages
+# the gate with all of its helpers, checks that the staged set admits and runs
+# a command, and only then renames each file into place, helpers before the
+# gate that uses them. It checks the installed set the same way.
+set -eu
+
+program=install-cargo-gate
+fail() {
+    printf '%s: %s\n' "$program" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/install-cargo-gate [DIRECTORY]
+
+Installs scripts/cargo-gate as DIRECTORY/cagents-cargo-gate, with
+cargo-gate-command.py, seed-build-dir and build-disk-guard beside it
+(default DIRECTORY: /var/tmp).
+EOF
+}
+
+case ${1:-} in
+    -h|--help) usage; exit 0 ;;
+esac
+[ "$#" -le 1 ] || { usage >&2; exit 2; }
+destination=${1:-/var/tmp}
+[ -d "$destination" ] || fail "$destination is not a directory"
+source=$(cd "$(dirname "$0")" && pwd -P)
+
+# Installed name, then this checkout's file. The gate goes last.
+files='cargo-gate-command.py:cargo-gate-command.py
+seed-build-dir:seed-build-dir
+build-disk-guard:build-disk-guard
+cagents-cargo-gate:cargo-gate'
+
+stage=$(mktemp -d "$destination/.cagents-cargo-gate.XXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+printf '%s\n' "$files" | while IFS=: read -r installed file; do
+    [ -f "$source/$file" ] || fail "missing scripts/$file"
+    cp -- "$source/$file" "$stage/$installed"
+    chmod 755 -- "$stage/$installed"
+    case $file in
+        *.py) python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$stage/$installed" ;;
+        *) sh -n "$stage/$installed" ;;
+    esac
+done
+
+# Admits and runs a command through the gate at $1, on a private lock so the
+# check neither waits behind real builds nor holds a slot they need. It runs
+# outside any Cargo workspace, so it neither seeds nor checks free space.
+smoke() {
+    lock=$(mktemp -d "$stage/smoke.XXXXXX")
+    output=$( (cd "$lock" && CAGENTS_BUILD_LOCK="$lock/lock" CAGENTS_BUILD_SLOT_HELD= \
+        "$1" exec sh -c 'printf admitted') 2>&1) ||
+        fail "$1 did not run a command: $output"
+    [ "$output" = admitted ] || fail "$1 did not run a command: $output"
+    rm -rf -- "$lock"
+}
+smoke "$stage/cagents-cargo-gate"
+
+printf '%s\n' "$files" | while IFS=: read -r installed file; do
+    mv -f -- "$stage/$installed" "$destination/$installed"
+done
+smoke "$destination/cagents-cargo-gate"
+printf '%s: installed %s/cagents-cargo-gate from %s\n' \
+    "$program" "$destination" "$(git -C "$source" rev-parse --short HEAD 2>/dev/null || printf 'this checkout')"
