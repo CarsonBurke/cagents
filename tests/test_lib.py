@@ -479,6 +479,46 @@ class TestLib(unittest.TestCase):
                     self.assertIn("inherited descriptor holds build admission", result.stderr)
                     self.assertEqual(self.events(), [])
 
+    def test_a_parent_flock_close_is_refused_before_compile(self):
+        result = subprocess.run(
+            ["flock", "--close", str(self.lock), sys.executable, "-I", "-B",
+             str(self.root / "scripts/test-lib"), "cli", "module::one"],
+            cwd=self.root / "caller", env=self.env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("a parent flock holds build admission", result.stderr)
+        self.assertEqual(self.events(), [])
+
+    def under_flock(self, slot, *inner, pass_fds=()):
+        return subprocess.run(
+            ["flock", "--close", str(slot), *inner, sys.executable, "-I", "-B",
+             str(self.root / "scripts/test-lib"), "cli", "module::one"],
+            cwd=self.root / "caller", env=self.env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=10, pass_fds=pass_fds,
+        )
+
+    def test_a_flock_further_up_is_refused_too(self):
+        command = f'{sys.executable} -I -B "{self.root}/scripts/test-lib" cli module::one; exit $?'
+        result = subprocess.run(
+            ["flock", "--close", str(self.lock), "sh", "-c", f"sh -c '{command}'; exit $?"],
+            cwd=self.root / "caller", env=self.env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("a parent flock holds build admission", result.stderr)
+
+    def test_a_flock_on_another_lock_is_not_refused(self):
+        result = self.under_flock(self.root / "unrelated.lock")
+        self.assertNotIn("a parent flock holds build admission", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_flock_with_the_slot_open_but_not_locked_is_not_refused(self):
+        with self.lock.open("a") as opened:
+            result = self.under_flock(self.root / "unrelated.lock", pass_fds=(opened.fileno(),))
+        self.assertNotIn("a parent flock holds build admission", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_unlocked_inherited_descriptor_does_not_falsely_refuse(self):
         with self.lock.open("a") as lock:
             result = self.invoke("cli", "module::one", pass_fds=(lock.fileno(),))
