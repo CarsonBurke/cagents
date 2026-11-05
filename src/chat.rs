@@ -1115,6 +1115,11 @@ pub struct Snapshot {
     #[serde(skip)]
     #[doc(hidden)]
     pub notification_preview: std::sync::Arc<notification::Preview>,
+    /// The latest error reported since the current turn started. A failed
+    /// outcome takes its reason from here, never from an earlier turn's error.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub turn_error: Option<String>,
     /// Daemon wall-clock milliseconds sampled for this publication. Clients
     /// advance this with their monotonic clock instead of comparing timestamps
     /// from two machines. Absent only in older data and synthetic snapshots.

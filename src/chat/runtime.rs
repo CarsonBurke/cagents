@@ -3595,7 +3595,10 @@ fn provider_exit_diagnostic(
         " Sign in again, then restart the session."
     } else if lower.contains("rate limit") || lower.contains("too many requests") {
         " Wait briefly, then restart the session."
-    } else if lower.contains("not found") || lower.contains("no such file or directory") {
+    } else if lower.contains("executable not found")
+        || lower.contains("command not found")
+        || lower.contains("no such file or directory")
+    {
         " Install or configure the provider executable, then restart the session."
     } else if lower.contains("out of memory") || lower.contains("cannot allocate memory") || {
         use std::os::unix::process::ExitStatusExt;
@@ -3603,7 +3606,7 @@ fn provider_exit_diagnostic(
     } {
         " Free memory, then restart the session."
     } else {
-        " Restart session to continue."
+        " Restart the session to continue."
     };
     let detail = if error.to_lowercase().contains("tungstenite")
         || error.to_lowercase().contains("inspect")
@@ -3819,6 +3822,7 @@ fn apply_projected_event(
         }
         Event::ProviderExit(diagnostic) => state.provider_exit = Some(diagnostic),
         Event::TurnStarted => {
+            state.turn_error = None;
             state.provider_exit = None;
             state.prompt_suggestion = None;
             state.turn_generation = state.turn_generation.wrapping_add(1);
@@ -3849,7 +3853,7 @@ fn apply_projected_event(
                 Kind::Cancelled => Some(ActivityOutcome::Cancelled),
                 Kind::Failed => Some(ActivityOutcome::Failed {
                     reason: state
-                        .error
+                        .turn_error
                         .clone()
                         .unwrap_or_else(|| "The provider reported a failed turn".into()),
                 }),
@@ -4268,6 +4272,7 @@ fn apply_projected_event(
         Event::OpenUrl { url, instructions } => state.open_url = Some((url, instructions)),
         Event::Error { message, fatal } => {
             // A later diagnosis does not revise a provider-confirmed result.
+            state.turn_error = Some(message.clone());
             state.error = Some(message);
             if fatal {
                 state.prompt_suggestion = None;

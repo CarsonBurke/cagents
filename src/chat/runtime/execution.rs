@@ -240,7 +240,12 @@ pub(super) fn exit_reason(
         }
         None => "The provider exited before reporting this prompt's final result".into(),
     };
-    let reason = match diagnostic.filter(|message| !message.is_empty()) {
+    // A generic "exited" note adds nothing to the status that already says so.
+    let generic = |message: &str| {
+        message.starts_with("Provider exited before")
+            || message.starts_with("The provider exited before")
+    };
+    let reason = match diagnostic.filter(|message| !message.is_empty() && !generic(message)) {
         Some(message) if message.starts_with(&status) => message.to_owned(),
         Some(message) => format!("{status}: {message}"),
         None => status,
