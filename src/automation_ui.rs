@@ -1455,7 +1455,7 @@ impl State {
                             self.manual_requests.remove(&firing.automation);
                         }
                     }
-                    self.notice = Some(format!("Run requested: {}", state_label(firing.state)));
+                    self.notice = Some("Run requested.".into());
                     self.history.insert(0, firing);
                 }
                 Ok(Response::Removed) => {
@@ -7316,7 +7316,7 @@ mod tests {
             sequence,
             result: std::sync::Arc::new(Ok(Response::Firing(firing))),
         });
-        let message = "Run requested: Queued";
+        let message = "Run requested.";
         assert_eq!(state.notice.as_deref(), Some(message));
         Outline::of(&state, 900.0, 700.0).text(message);
 
