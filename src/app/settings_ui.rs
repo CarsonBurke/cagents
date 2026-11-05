@@ -1457,15 +1457,17 @@ fn shortcut_input<'a>(
             design::body(format!("{label}{required}"))
                 .width(Length::FillPortion(1))
                 .into(),
+            // A cosmic flex row, unlike iced's wrapping row, exposes its
+            // controls to accessibility. It passes its own limits to each
+            // item, so the container loosens them: a chip keeps its label's
+            // width instead of stretching to the column's.
             widget::container(
-                widget::row::with_children(controls)
-                    .spacing(2)
-                    .align_y(Alignment::Center)
-                    .wrap()
-                    .vertical_spacing(2)
-                    .align_x(iced::alignment::Horizontal::Right),
+                widget::flex_row(controls)
+                    .column_spacing(2)
+                    .row_spacing(2)
+                    .align_items(Alignment::Center)
+                    .justify_content(widget::JustifyContent::FlexEnd),
             )
-            .align_x(iced::alignment::Horizontal::Right)
             .width(Length::FillPortion(2))
             .into(),
         ])
@@ -1476,7 +1478,8 @@ fn shortcut_input<'a>(
         design::caption(source).width(64).into(),
     ])
     .spacing(space::S)
-    .align_y(Alignment::Center);
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
     let mut children = vec![row.into()];
     if let Some(reason) = &error {
         children.push(
