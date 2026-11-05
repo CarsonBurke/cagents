@@ -121,6 +121,44 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        // The obscured workspace still paints. Keep its resize measurements,
+        // virtual viewport and text-shaping requests progressing, without
+        // delivering input or adopting an obscured editor's IME/capture state.
+        if matches!(
+            event,
+            Event::Window(cosmic::iced::window::Event::RedrawRequested(_))
+        ) && let Some(background) = layout.children().next()
+        {
+            let mut messages = Vec::new();
+            let (layout_invalid, widgets_invalid, redraw) = {
+                let mut rendering = Shell::new(&mut messages);
+                self.background.as_widget_mut().update(
+                    &mut tree.children[0],
+                    event,
+                    background,
+                    mouse::Cursor::Unavailable,
+                    renderer,
+                    clipboard,
+                    &mut rendering,
+                    viewport,
+                );
+                (
+                    rendering.is_layout_invalid(),
+                    rendering.are_widgets_invalid(),
+                    rendering.redraw_request(),
+                )
+            };
+            for message in messages {
+                shell.publish(message);
+            }
+            if layout_invalid {
+                shell.invalidate_layout();
+            }
+            if widgets_invalid {
+                shell.invalidate_widgets();
+            }
+            shell.request_redraw_at(redraw);
+        }
         if let Some(foreground) = layout.children().nth(1) {
             self.foreground.as_widget_mut().update(
                 &mut tree.children[1],

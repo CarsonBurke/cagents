@@ -452,7 +452,11 @@ mod inspector_widget {
                 None
             };
             let anchor = row_anchor(&app, card);
-            assert!(frames.shaped > 0, "actual redraw completed Flow shaping");
+            // The tail can contain only Image 2 and static diagnostic text.
+            // The natural paragraph case must exercise asynchronous Flow.
+            if bottom > 0.0 {
+                assert!(frames.shaped > 0, "actual redraw completed Flow shaping");
+            }
 
             drop(app.update(Message::WindowResized(960.0, 800.0)));
             assert!(app.context_inspector_is_overlay());
