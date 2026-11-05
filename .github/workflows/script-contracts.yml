@@ -243,10 +243,14 @@ jobs:
           CHECK_FORMAT_CARGO_FIXTURE: "1"
         run: python3 tests/check_format.py -v
 
+      - name: Check native evidence contracts
+        run: python3 -I -B tests/native_evidence.py -v
+
       - name: Check shell syntax
         run: |
           sh -n scripts/run-development
           sh -n scripts/check-format
+          bash -n scripts/native-evidence
 
       - name: Check repository formatting
         run: scripts/check-format
