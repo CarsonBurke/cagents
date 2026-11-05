@@ -5867,6 +5867,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         }
                     }
                 }
+                // Another remote answered with the branch, so it is tracked
+                // rather than created anew; an unreachable one changed nothing.
+                if !candidates.is_empty() {
+                    resolution_warnings.clear();
+                }
             }
             if candidates.len() > 1 {
                 return Err(ValidationError::InvalidBranch(format!(
