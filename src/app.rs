@@ -283,7 +283,7 @@ impl NoticeSeverity {
 /// raised: a retry that fails again does not stack a second report, and one
 /// that succeeds replaces the failure with its confirmation. Resolving a key
 /// withdraws its notice without announcing anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum NoticeKey {
     /// Opening the conversation in this card, or switching its terminal to one.
     ChatAttach(CardId),
@@ -293,6 +293,8 @@ enum NoticeKey {
     AccountLink,
     /// Telling panes whether they are on screen.
     SurfaceVisibility,
+    /// Committing this exact project/worktree/path identity.
+    GitCommit(ActiveWorktreeKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,10 +361,13 @@ impl NoticeLog {
         // failures in turn would otherwise alternate them forever and fill the
         // log with copies. The repeat moves to the back because the user cares
         // that it is happening now, and `recent` reads newest first.
-        let previous = self.entries.iter().position(|entry| match notice.key {
-            Some(key) => entry.notice.key == Some(key),
-            None => entry.notice == notice,
-        });
+        let previous = self
+            .entries
+            .iter()
+            .position(|entry| match notice.key.as_ref() {
+                Some(key) => entry.notice.key.as_ref() == Some(key),
+                None => entry.notice == notice,
+            });
         if let Some(index) = previous {
             let mut entry = self.entries.remove(index).expect("index came from the log");
             if entry.notice == notice {
@@ -423,13 +428,14 @@ impl NoticeLog {
     fn has(&self, key: NoticeKey) -> bool {
         self.entries
             .iter()
-            .any(|entry| entry.notice.key == Some(key))
+            .any(|entry| entry.notice.key.as_ref() == Some(&key))
     }
 
     /// Withdraws whatever `key` last reported, because its condition no
     /// longer holds.
     fn resolve(&mut self, key: NoticeKey) {
-        self.entries.retain(|entry| entry.notice.key != Some(key));
+        self.entries
+            .retain(|entry| entry.notice.key.as_ref() != Some(&key));
     }
 
     /// Retires every confirmation due by `now`. Nothing is due while paused,
@@ -3200,7 +3206,7 @@ impl SettingsField {
             Self::ChatEnterSends => "Chat send key",
             Self::ShowStatusBar => "Status bar",
             Self::ShowWorktreeChangesIcons => "Worktree changes icons",
-            Self::AutoDeleteMergedWorktrees => "Delete merged worktrees automatically",
+            Self::AutoDeleteMergedWorktrees => "Notify about merged worktrees",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
             Self::CheckForUpdates => "Automatic checks",
             Self::EditorSyntaxTheme => "Syntax theme",
@@ -4168,6 +4174,9 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
 fn shortcut_refusal(action: usize, shortcuts: &KeyboardShortcuts) -> Option<String> {
     let fault = shortcuts.fault()?;
     let Some(owner) = fault.conflicts_with else {
+        if fault.action != action {
+            return None;
+        }
         let settings::SettingsError::InvalidShortcut(reason) = fault.error else {
             return None;
         };
@@ -10229,6 +10238,7 @@ impl Cagents {
                 settings_ui::SettingsContext {
                     feedback: self.settings_feedback.as_ref(),
                     invalid: &self.settings_invalid,
+                    pressed_key: self.palette.pressed_key_filter(),
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
@@ -12218,13 +12228,13 @@ impl Cagents {
             .notices
             .entries
             .iter()
-            .filter_map(|entry| match entry.notice.key {
+            .filter_map(|entry| match entry.notice.key.as_ref() {
                 Some(key @ NoticeKey::ChatAttach(card))
                     if self
-                        .card_state(card)
+                        .card_state(*card)
                         .is_none_or(|state| !state.existence.is_open()) =>
                 {
-                    Some(key)
+                    Some(key.clone())
                 }
                 _ => None,
             })
@@ -12239,7 +12249,7 @@ impl Cagents {
     fn notice_stands(&self, key: NoticeKey) -> bool {
         self.status
             .as_ref()
-            .is_some_and(|notice| notice.key == Some(key))
+            .is_some_and(|notice| notice.key.as_ref() == Some(&key))
             || self.notices.has(key)
     }
 
@@ -12250,7 +12260,7 @@ impl Cagents {
         if self
             .status
             .as_ref()
-            .is_some_and(|notice| notice.key == Some(key))
+            .is_some_and(|notice| notice.key.as_ref() == Some(&key))
         {
             self.status = None;
         }
@@ -13733,6 +13743,47 @@ impl Cagents {
         }
     }
 
+    /// Retry refused shortcut drafts against the newly saved table. A different
+    /// row may have released the chord they were waiting for.
+    fn retry_shortcut_drafts(&mut self) {
+        loop {
+            let mut progressed = false;
+            let fields: Vec<_> = SettingsField::SHORTCUTS
+                .into_iter()
+                .filter(|field| self.settings_invalid.contains_key(field))
+                .collect();
+            for field in fields {
+                let action = field.shortcut_action().expect("shortcut field");
+                let value = self
+                    .settings_draft
+                    .keyboard_shortcuts
+                    .shortcut_values()
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .expect("registered shortcut")
+                    .1
+                    .to_owned();
+                match settings_update(&self.settings, field, &value) {
+                    SettingsDecision::Persist(settings) => {
+                        self.settings = settings;
+                        self.settings_invalid.remove(&field);
+                        progressed = true;
+                    }
+                    SettingsDecision::Unchanged => {
+                        self.settings_invalid.remove(&field);
+                        progressed = true;
+                    }
+                    SettingsDecision::Invalid(reason) => {
+                        self.settings_invalid.insert(field, reason);
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
     fn apply_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
         self.settings_pending.remove(&field);
         self.settings_draft.set(field, value.clone());
@@ -13744,15 +13795,26 @@ impl Cagents {
             }
             SettingsDecision::Unchanged => {
                 self.settings_invalid.remove(&field);
-                if self.settings_save_error.is_some() {
-                    return self.save_settings_task(false);
-                }
+                let previous = self.settings.clone();
+                self.retry_shortcut_drafts();
+                let changed = previous != self.settings;
+                let save = if changed || self.settings_save_error.is_some() {
+                    self.save_settings_task(false)
+                } else {
+                    Task::none()
+                };
                 self.refresh_settings_feedback();
-                Task::none()
+                let effect = if changed {
+                    self.synchronize_settings(&previous)
+                } else {
+                    Task::none()
+                };
+                Task::batch([save, effect])
             }
             SettingsDecision::Persist(settings) => {
                 let previous = std::mem::replace(&mut self.settings, settings);
                 self.settings_invalid.remove(&field);
+                self.retry_shortcut_drafts();
                 let save = self.save_settings_task(false);
                 self.refresh_settings_feedback();
                 let effect = self.synchronize_settings(&previous);
@@ -17276,6 +17338,11 @@ impl Application for Cagents {
                     self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
                     return cosmic::task::message(Message::WorkspaceSwitcherReleased(since));
                 }
+                // Modal key capture must not swallow the modifier release
+                // that commits an already active navigation cycle.
+                if let Some(task) = self.palette_key_event(&event) {
+                    return task;
+                }
                 if self.chrome_ui.workspace_preview.is_some() {
                     return self.workspace_switcher_key(&event);
                 }
@@ -17298,9 +17365,6 @@ impl Application for Cagents {
                         return self.apply_viewport(update, true, false);
                     }
                     return Task::none();
-                }
-                if let Some(task) = self.palette_key_event(&event) {
-                    return task;
                 }
                 if let Some(task) = self.chrome_key_event(&event) {
                     return task;
@@ -17612,11 +17676,13 @@ impl Application for Cagents {
             Message::ContextInspector(_) if self.modal_is_open() => Task::none(),
             Message::ContextInspector(action) => self.handle_context_inspector_action(action),
             Message::SelectSettingsCategory(category) => {
+                self.palette.clear_pressed_key_filter();
                 self.settings_search.clear();
                 self.settings_category = category;
                 crate::settings_widgets::reveal_content_start()
             }
             Message::SettingsSearchChanged(query) => {
+                self.palette.clear_pressed_key_filter();
                 self.settings_search = query;
                 crate::settings_widgets::reveal_content_start()
             }
@@ -17953,6 +18019,8 @@ impl Application for Cagents {
                 else {
                     return Task::none();
                 };
+                let notice_key = (mutation.kind == MutationKind::Commit)
+                    .then(|| NoticeKey::GitCommit(key.clone()));
                 self.source_control_mutations.remove(&key.canonical_path);
                 if committed && let Some(revision) = mutation.commit_revision {
                     self.sidebar_state.clear_submitted_commit(&key, revision);
@@ -17976,10 +18044,19 @@ impl Application for Cagents {
                         source.key.clone()
                     });
                 if let Some(report) = report {
-                    self.status = Some(TransientNotice::error(format!(
+                    let notice = TransientNotice::error(format!(
                         "{}: {report}",
                         display_path(&key.canonical_path)
-                    )));
+                    ));
+                    self.status = Some(match notice_key {
+                        Some(key) => notice.with_key(key),
+                        None => notice,
+                    });
+                } else if let Some(notice_key) = notice_key {
+                    // Only an admitted Commit's complete success resolves its
+                    // report. Path selections and push targets are not captured
+                    // here, so other Git actions retain their unkeyed notices.
+                    self.resolve_notice(notice_key);
                 }
                 // Navigation does not cancel Git. Only this exact completion
                 // releases the worktree, then the index is read afresh.
@@ -21418,6 +21495,19 @@ mod tests {
     }
 
     #[test]
+    fn settings_releasing_a_conflict_retries_the_other_rows_refused_draft() {
+        let mut app = context_inspector_test_app(false);
+        let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
+        let field = SettingsField::ShortcutToggleProjects;
+        drop(app.apply_setting_input(field, chord.clone()));
+        assert!(app.settings_invalid.contains_key(&field));
+        drop(app.apply_setting_input(SettingsField::ShortcutCommandPalette, String::new()));
+        assert!(app.settings_invalid.is_empty());
+        assert_eq!(app.settings.keyboard_shortcuts.toggle_projects, [chord]);
+        assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
+    }
+
+    #[test]
     fn invalid_autosaved_draft_survives_dismissal_and_other_valid_edits() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
@@ -22019,13 +22109,13 @@ mod tests {
         log.record(
             TransientNotice::error("Could not reopen “Fix parser”.")
                 .with_details("Exact native chat not found")
-                .with_key(key),
+                .with_key(key.clone()),
         );
         let first = log.recent().next().unwrap().id;
         log.record(
             TransientNotice::error("Could not reopen “Fix parser”.")
                 .with_details("daemon refused")
-                .with_key(key),
+                .with_key(key.clone()),
         );
         assert_eq!(log.len(), 2, "re-raising a key replaces its report");
         let replaced = log.recent().next().unwrap();
@@ -22035,20 +22125,20 @@ mod tests {
         log.record(
             TransientNotice::error("Could not reopen “Fix parser”.")
                 .with_details("daemon refused")
-                .with_key(key),
+                .with_key(key.clone()),
         );
         assert_eq!(log.recent().next().unwrap().repeats, 2);
 
         // Another object's report under the same operation is its own.
         let other = NoticeKey::ChatAttach(CardId::new());
-        log.record(TransientNotice::error("Could not reopen “Other”.").with_key(other));
+        log.record(TransientNotice::error("Could not reopen “Other”.").with_key(other.clone()));
         assert_eq!(log.len(), 3);
 
-        log.record(TransientNotice::success("Reopened.").with_key(key));
+        log.record(TransientNotice::success("Reopened.").with_key(key.clone()));
         assert_eq!(log.len(), 3, "the success takes the failure's place");
         assert!(
             log.recent()
-                .filter(|entry| entry.notice.key == Some(key))
+                .filter(|entry| entry.notice.key.as_ref() == Some(&key))
                 .all(|entry| entry.notice.severity == NoticeSeverity::Success)
         );
 
@@ -28269,6 +28359,329 @@ mod tests {
         assert_eq!(parked.at, LspPosition::new(4, 2));
         assert_eq!(parked.coordinates, LspCoordinates::Utf16);
         assert_eq!(notice(&app), None);
+    }
+
+    #[test]
+    fn a_confirmed_git_retry_resolves_its_failed_commit_notice() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let notice_key = NoticeKey::GitCommit(key.clone());
+        app.notices
+            .record(TransientNotice::warning("Unrelated report"));
+        let first = app
+            .begin_mutation(&key, MutationKind::Commit, None)
+            .unwrap();
+        let (report, committed) = commit_report(Ok(CommitOutcome::NotCreated {
+            failure: crate::repository::MutationFailure::Rejected {
+                reason: "fixture pre-commit refusal".into(),
+            },
+        }));
+        assert!(report.is_some() && !committed);
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: first,
+            report,
+            committed,
+        }));
+        assert!(app.notices.has(notice_key.clone()));
+        assert!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .error
+                .is_some()
+        );
+        let original_notice = app.notices.recent().next().unwrap().notice.clone();
+        let retry = app
+            .begin_mutation(&key, MutationKind::Commit, None)
+            .unwrap();
+        assert!(
+            app.notices.has(notice_key.clone()),
+            "admission is not success"
+        );
+        assert_eq!(app.notices.recent().next().unwrap().notice, original_notice);
+        let (report, committed) = commit_report(Ok(CommitOutcome::Created {
+            oid: crate::repository::Oid::parse_object("a".repeat(40)).unwrap(),
+            warnings: Vec::new(),
+        }));
+        assert!(report.is_none() && committed);
+        drop(app.update(Message::SourceControlMutated {
+            key,
+            operation: retry,
+            report,
+            committed,
+        }));
+        assert!(!app.notices.has(notice_key));
+        assert!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .error
+                .is_none()
+        );
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(
+            app.notices.recent().next().unwrap().notice.message,
+            "Unrelated report"
+        );
+    }
+
+    #[test]
+    fn git_notice_resolution_keeps_other_worktrees_and_mutation_kinds() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let sibling = app
+            .sidebar_model
+            .worktree_at(Path::new("/repo/fix-sidebar"))
+            .unwrap();
+        let primary_notice = NoticeKey::GitCommit(key.clone());
+        let sibling_notice = NoticeKey::GitCommit(sibling.clone());
+        for target in [&key, &sibling] {
+            app.active_workspace = Some(target.canonical_path.clone());
+            drop(app.rebind_source_control());
+            let operation = app
+                .begin_mutation(target, MutationKind::Commit, None)
+                .unwrap();
+            let (report, committed) = commit_report(Ok(CommitOutcome::NotCreated {
+                failure: crate::repository::MutationFailure::Rejected {
+                    reason: "fixture refusal".into(),
+                },
+            }));
+            drop(app.update(Message::SourceControlMutated {
+                key: target.clone(),
+                operation,
+                report,
+                committed,
+            }));
+        }
+        assert!(app.notices.has(primary_notice.clone()));
+        assert!(app.notices.has(sibling_notice.clone()));
+        app.active_workspace = Some(key.canonical_path.clone());
+        drop(app.rebind_source_control());
+        let operation = app.begin_mutation(&key, MutationKind::Stage, None).unwrap();
+        let report = mutation_report("Stage", Ok(MutationOutcome::Applied { paths: Vec::new() }));
+        assert!(report.is_none());
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation,
+            report,
+            committed: false,
+        }));
+        assert!(
+            app.notices.has(primary_notice.clone()),
+            "Stage cannot resolve Commit"
+        );
+        assert!(app.notices.has(sibling_notice.clone()));
+        app.active_workspace = Some(sibling.canonical_path.clone());
+        drop(app.rebind_source_control());
+        let operation = app
+            .begin_mutation(&sibling, MutationKind::Commit, None)
+            .unwrap();
+        let (report, committed) = commit_report(Ok(CommitOutcome::Created {
+            oid: crate::repository::Oid::parse_object("b".repeat(40)).unwrap(),
+            warnings: Vec::new(),
+        }));
+        drop(app.update(Message::SourceControlMutated {
+            key: sibling,
+            operation,
+            report,
+            committed,
+        }));
+        assert!(!app.notices.has(sibling_notice));
+        assert!(app.notices.has(primary_notice));
+    }
+
+    #[test]
+    fn a_stale_git_completion_cannot_clear_or_replace_a_newer_owners_notice() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let notice_key = NoticeKey::GitCommit(key.clone());
+        let first = app
+            .begin_mutation(&key, MutationKind::Commit, None)
+            .unwrap();
+        let (report, committed) = commit_report(Ok(CommitOutcome::NotCreated {
+            failure: crate::repository::MutationFailure::Rejected {
+                reason: "first refusal".into(),
+            },
+        }));
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: first,
+            report,
+            committed,
+        }));
+        let first_notice = app.notices.recent().next().unwrap().clone();
+        let retry = app
+            .begin_mutation(&key, MutationKind::Commit, None)
+            .unwrap();
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: first,
+            report: None,
+            committed: true,
+        }));
+        assert_eq!(app.source_control_mutations[&key.canonical_path].id, retry);
+        assert_eq!(app.notices.recent().next().unwrap(), &first_notice);
+        let (report, committed) = commit_report(Ok(CommitOutcome::NotCreated {
+            failure: crate::repository::MutationFailure::Rejected {
+                reason: "newer refusal".into(),
+            },
+        }));
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: retry,
+            report,
+            committed,
+        }));
+        let replacement = app.notices.recent().next().unwrap().clone();
+        assert_ne!(replacement.id, first_notice.id);
+        assert_eq!(app.notices.len(), 1, "same-key retry replaces its report");
+        let newest = app
+            .begin_mutation(&key, MutationKind::Commit, None)
+            .unwrap();
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: retry,
+            report: Some("stale other failure".into()),
+            committed: false,
+        }));
+        drop(app.update(Message::DismissNotice(first_notice.id)));
+        assert_eq!(app.source_control_mutations[&key.canonical_path].id, newest);
+        assert_eq!(app.notices.recent().next().unwrap(), &replacement);
+        assert!(app.notices.has(notice_key.clone()));
+        let (report, committed) = commit_report(Ok(CommitOutcome::Created {
+            oid: crate::repository::Oid::parse_object("c".repeat(40)).unwrap(),
+            warnings: Vec::new(),
+        }));
+        drop(app.update(Message::SourceControlMutated {
+            key,
+            operation: newest,
+            report,
+            committed,
+        }));
+        assert!(!app.notices.has(notice_key));
+    }
+
+    #[test]
+    fn successful_stage_of_another_selection_keeps_unkeyed_failure_partial_and_unknown_notices() {
+        use crate::repository::{MutationFailure, PathSelection, RepoPath};
+
+        let path_a = RepoPath::parse("src/a.rs").unwrap();
+        let path_b = RepoPath::parse("src/b.rs").unwrap();
+        let path_c = RepoPath::parse("src/c.rs").unwrap();
+        assert_ne!(path_a, path_b);
+        for outcome in [
+            MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected {
+                    reason: "A was refused before execution".into(),
+                },
+            },
+            MutationOutcome::PartiallyApplied {
+                paths: vec![path_a.clone()],
+                failures: vec![MutationFailure::Rejected {
+                    reason: "another selected path refused".into(),
+                }],
+            },
+            MutationOutcome::OutcomeUnknown {
+                failure: MutationFailure::Rejected {
+                    reason: "A has no completion proof".into(),
+                },
+            },
+        ] {
+            let mut app = context_inspector_test_app(false);
+            app.sidebar_model = sidebar::tests::panel_model();
+            app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+            let key = app.sidebar_state.active_worktree().unwrap().clone();
+            app.active_workspace = Some(key.canonical_path.clone());
+
+            // Use the public reducer's selected-path action, not a synthetic
+            // begin_mutation which could conceal loss of the original subject.
+            // Worker tasks are not polled: these are callback custody oracles,
+            // not actual Git or filesystem qualification.
+            let selected_a = if matches!(&outcome, MutationOutcome::PartiallyApplied { .. }) {
+                vec![path_a.clone(), path_c.clone()]
+            } else {
+                vec![path_a.clone()]
+            };
+            drop(
+                app.update(Message::Sidebar(SidebarAction::Stage {
+                    key: key.clone(),
+                    selection: selected_a
+                        .into_iter()
+                        .map(|path| PathSelection {
+                            path,
+                            old_path: None,
+                        })
+                        .collect(),
+                })),
+            );
+            let first = app.source_control_mutations[&key.canonical_path];
+            assert_eq!(first.kind, MutationKind::Stage);
+            let report = mutation_report("Stage", Ok(outcome));
+            assert!(report.is_some());
+            drop(app.update(Message::SourceControlMutated {
+                key: key.clone(),
+                operation: first.id,
+                report,
+                committed: false,
+            }));
+            assert_eq!(app.notices.len(), 1);
+            let original = app.notices.recent().next().unwrap().clone();
+            assert_eq!(original.notice.key, None);
+            assert_eq!(original.expires_at, None);
+
+            drop(app.update(Message::Sidebar(SidebarAction::Stage {
+                key: key.clone(),
+                selection: vec![PathSelection {
+                    path: path_b.clone(),
+                    old_path: None,
+                }],
+            })));
+            let second = app.source_control_mutations[&key.canonical_path];
+            assert_eq!(second.kind, MutationKind::Stage);
+            assert_ne!(second.id, first.id);
+            let report = mutation_report(
+                "Stage",
+                Ok(MutationOutcome::Applied {
+                    paths: vec![path_b.clone()],
+                }),
+            );
+            assert!(report.is_none());
+            drop(app.update(Message::SourceControlMutated {
+                key: key.clone(),
+                operation: second.id,
+                report,
+                committed: false,
+            }));
+            assert!(
+                !app.source_control_mutations
+                    .contains_key(&key.canonical_path)
+            );
+            assert!(
+                app.sidebar_model
+                    .source_control
+                    .as_ref()
+                    .unwrap()
+                    .error
+                    .is_none()
+            );
+            assert_eq!(app.notices.len(), 1);
+            assert_eq!(
+                app.notices.recent().next().unwrap(),
+                &original,
+                "Stage(B) success does not resolve Stage(A)'s failure or uncertainty"
+            );
+        }
     }
 
     #[test]
