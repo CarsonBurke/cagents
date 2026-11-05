@@ -10,11 +10,12 @@ found to differ from the last one judged. Exits 0 when it installed a gate,
 1 when there was nothing to install or another gate is installing, and 2 when
 installing failed, which it reports.
 
-The installed gate is main's to replace when its files differ from main's and
-main changed the gate after it was installed. One installed later, such as a
-branch's under test, stays until main changes the gate again. Only checkouts
-of the repository it was installed from act on it, so another clone's or a
-fork's main never replaces it.
+The installed gate is main's to replace when its files differ from main's
+and either main contains the commit it was installed from or main changed
+the gate after it was installed. One installed from elsewhere, such as a
+branch under test, stays until main changes the gate again; so does one of a
+newer gate_version than main's. Only checkouts of the repository it came
+from act on it, so a fork's main never replaces it.
 """
 
 import fcntl
@@ -37,6 +38,18 @@ def git(*arguments):
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def same_repository(first, second):
+    """Whether two origin URLs name one repository, however they reach it."""
+    def plain(url):
+        url = url.strip().rstrip("/").removesuffix(".git")
+        for scheme in ("https://", "http://", "ssh://", "git://"):
+            url = url.removeprefix(scheme)
+        url = url.split("@", 1)[-1]  # user@ in SSH and HTTPS forms
+        host, _, path = url.replace(":", "/", 1).partition("/")
+        return host.lower(), path
+    return plain(first) == plain(second)
+
+
 def read_json(path):
     try:
         with open(path) as file:
@@ -51,6 +64,7 @@ def write_atomically(path, text):
     try:
         with os.fdopen(descriptor, "w") as file:
             file.write(text)
+            os.fchmod(file.fileno(), 0o644)
         os.replace(temporary, path)
     except OSError:
         try:
@@ -83,11 +97,14 @@ class Installation:
     def checked(self, main):
         write_atomically(self.checked_path, main + "\n")
 
-    def judge(self, main, repository):
+    def judge(self, main, repository, origin):
         """What to do about MAIN: "current", "keep" or "install"."""
         record = self.record()
-        if record.get("repository") and record["repository"] != repository:
-            return "keep"  # Another clone's or a fork's main.
+        if record.get("origin") and origin:
+            if not same_repository(record["origin"], origin):
+                return "keep"  # A fork's main, or another project's.
+        elif record.get("repository") and record["repository"] != repository:
+            return "keep"  # Another clone's main, which cannot say where it came from.
         files = record.get("files")
         paths = sorted(files) if isinstance(files, dict) and files else list(GATE_FILES)
         if INSTALLER not in paths:
@@ -96,12 +113,19 @@ class Installation:
         if blobs is not None and isinstance(files, dict) and \
                 dict(zip(paths, blobs.split())) == files:
             return "current"
-        changed = git("log", "-1", "--format=%ct", main, "--", *paths)
+        commit = record.get("commit")
+        if commit and git("merge-base", "--is-ancestor", commit, main) is not None:
+            return "install"  # Main has what was installed and has changed it since.
+        # Installed from elsewhere, such as a branch under test: it stays
+        # until main changes the gate after it was installed. Main's own
+        # history dates each change by when it reached main, not when the
+        # branch that made it was written.
+        changed = git("log", "-1", "--first-parent", "--format=%ct", main, "--", *paths)
         if not changed or int(changed) <= record["installed_at"]:
-            return "keep"  # Installed after main last changed the gate.
+            return "keep"
         return "install"
 
-    def install(self, main, repository):
+    def install(self, main, repository, origin):
         with tempfile.TemporaryDirectory(prefix="cagents-gate-sync-") as stage:
             archive = os.path.join(stage, "scripts.tar")
             steps = [["git", "archive", "-o", archive, main, "scripts"],
@@ -109,11 +133,14 @@ class Installation:
                      ["sh", os.path.join(stage, INSTALLER), os.path.dirname(self.installed)]]
             environment = dict(os.environ, CAGENTS_BUILD_INSTALL_LOCK_HELD="1",
                                CAGENTS_BUILD_INSTALL_COMMIT=main,
-                               CAGENTS_BUILD_INSTALL_REPOSITORY=repository)
+                               CAGENTS_BUILD_INSTALL_REPOSITORY=repository,
+                               CAGENTS_BUILD_INSTALL_ORIGIN=origin or "")
             output = []
             for step in steps:
                 result = subprocess.run(step, capture_output=True, text=True, env=environment)
                 output.append(result.stdout + result.stderr)
+                if result.returncode == 3 and step[0] == "sh":
+                    return None, "".join(output)  # The installed gate is a newer version.
                 if result.returncode:
                     return False, "".join(output)
         record = read_json(self.record_path)
@@ -130,17 +157,18 @@ def say(message):
 
 def main(installed, main):
     installation = Installation(installed)
+    failed = read_json(installation.failed_path)
+    if isinstance(failed, dict) and failed.get("main") == main:
+        say(f"{installed} is not origin/main's gate, which could not be installed; "
+            f"{installation.failed_path} says why")
+        return 1
     repository = git("rev-parse", "--path-format=absolute", "--git-common-dir")
     # Not a checkout of the repository the gate belongs to.
     if repository is None or git("cat-file", "-e", f"{main}:{INSTALLER}") is None:
         return 1
-    if installation.judge(main, repository) != "install":
+    origin = git("remote", "get-url", "origin")
+    if installation.judge(main, repository, origin) != "install":
         installation.checked(main)
-        return 1
-    failed = read_json(installation.failed_path)
-    if isinstance(failed, dict) and failed.get("main") == main:
-        say(f"{installed} is older than origin/main's gate, which could not be installed; "
-            f"{installation.failed_path} says why")
         return 1
     with open(installation.lock_path, "a") as lock:
         try:
@@ -150,13 +178,17 @@ def main(installed, main):
         # Decided again under the lock: another gate may have installed
         # meanwhile, or origin/main moved.
         latest = git("rev-parse", "-q", "--verify", "refs/remotes/origin/main^{commit}") or main
-        verdict = installation.judge(latest, repository)
+        verdict = installation.judge(latest, repository, origin)
         if verdict != "install":
             installation.checked(latest)
             # Current now: another gate installed it while this one waited.
             return 0 if verdict == "current" else 1
         started = time.monotonic()
-        installed_ok, output = installation.install(latest, repository)
+        installed_ok, output = installation.install(latest, repository, origin)
+        if installed_ok is None:
+            # Installed later from a newer gate than main's: it stays.
+            installation.checked(latest)
+            return 1
         if not installed_ok:
             write_atomically(installation.failed_path, json.dumps(
                 {"main": latest, "output": output}, indent=1) + "\n")

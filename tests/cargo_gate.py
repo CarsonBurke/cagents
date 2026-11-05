@@ -433,6 +433,63 @@ class InstalledGateSync(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
         self.assertEqual(self.recorded(), merged)
 
+    def test_a_merged_branch_counts_from_when_main_merged_it(self):
+        # Installed from a branch main never takes.
+        self.git("checkout", "-q", "-b", "unmerged")
+        self.change_gate("# unmerged change")
+        self.commit("unmerged")
+        self.install()
+        # A branch written before that installation, merged into main after.
+        self.git("checkout", "-q", "-b", "written-earlier", self.first)
+        self.change_gate("# merged change")
+        self.commit("written earlier")
+        self.git("checkout", "-q", "-b", "trunk", self.first)
+        self.git("merge", "-q", "--no-ff", "-m", "merge", "written-earlier",
+                 env=self.git_env | {"GIT_COMMITTER_DATE": f"@{self.later()} +0000"})
+        merged = self.git("rev-parse", "HEAD")
+        self.main_moves_to(merged)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("installed origin/main's gate", result.stderr)
+        self.assertEqual(self.recorded(), merged)
+
+    def test_a_newer_gate_installed_from_changed_files_stays(self):
+        gate = self.checkout / "scripts/cargo-gate"
+        text = gate.read_text()
+        version = int(re.search(r"^gate_version=(\d+)$", text, re.M).group(1))
+        gate.write_text(text.replace(f"gate_version={version}\n", f"gate_version={version + 1}\n"))
+        self.install()
+        # Files that are not their commit's record no commit.
+        self.assertIsNone(self.recorded())
+        installed = self.target()
+        gate.write_text(text + "# merged change\n")
+        self.main_moves_to(self.commit("change the gate", at=self.later()))
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "ran", ""))
+        self.assertEqual(self.target(), installed)
+        again = self.run_installed()
+        self.assertEqual((again.returncode, again.stdout, again.stderr), (0, "ran", ""))
+
+    def test_another_clone_of_the_same_repository_installs_mains(self):
+        self.git("remote", "add", "origin", "https://github.com/example/gate.git")
+        self.install()
+        clone = self.root / "clone"
+        subprocess.run(["git", "clone", "-q", str(self.checkout), str(clone)], env=self.git_env,
+                       check=True, capture_output=True)
+        def in_clone(*arguments, env=None):
+            subprocess.run(["git", *arguments], cwd=clone, env=env or self.git_env, check=True,
+                           capture_output=True)
+        in_clone("remote", "set-url", "origin", "git@github.com:example/gate")
+        with open(clone / "scripts/cargo-gate", "a") as gate:
+            gate.write("# merged change\n")
+        in_clone("commit", "-qam", "change the gate",
+                 env=self.git_env | {"GIT_COMMITTER_DATE": f"@{self.later()} +0000"})
+        in_clone("update-ref", "refs/remotes/origin/main", "HEAD")
+        result = self.run_installed(cwd=clone)
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("installed origin/main's gate", result.stderr)
+        self.assertEqual(self.record()["origin"], "git@github.com:example/gate")
+
     def test_a_checkout_of_another_repository_changes_nothing(self):
         other = self.root / "other"
         (other / "scripts").mkdir(parents=True)
@@ -440,7 +497,10 @@ class InstalledGateSync(unittest.TestCase):
             shutil.copy2(self.checkout / "scripts" / name, other / "scripts" / name)
         with open(other / "scripts/cargo-gate", "a") as gate:
             gate.write("# a fork's change\n")
+        self.git("remote", "add", "origin", "https://github.com/example/gate.git")
+        self.install()
         for arguments in (["init", "-q", "-b", "main"], ["add", "-A"],
+                          ["remote", "add", "origin", "https://github.com/fork/gate.git"],
                           ["commit", "-q", "-m", "x"],
                           ["update-ref", "refs/remotes/origin/main", "HEAD"]):
             subprocess.run(["git", *arguments], cwd=other, env=self.git_env, check=True,

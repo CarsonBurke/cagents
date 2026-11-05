@@ -24,7 +24,8 @@ Usage: scripts/install-cargo-gate [DIRECTORY]
 
 Installs scripts/cargo-gate as DIRECTORY/cagents-cargo-gate, with
 cargo-gate-command.py, cargo-gate-sync.py, cargo-offload, seed-build-dir and
-build-disk-guard beside it (default DIRECTORY: /var/tmp).
+build-disk-guard beside it (default DIRECTORY: /var/tmp). Exits 3, changing
+nothing, when the installed gate's version is newer than this checkout's.
 EOF
 }
 
@@ -95,8 +96,10 @@ version() {
 }
 staged=$(version "$stage/cagents-cargo-gate")
 current=$(version "$destination/cagents-cargo-gate")
-[ "${staged:-0}" -ge "${current:-0}" ] ||
-    fail "the installed gate is version $current, newer than this checkout's ${staged:-0}; install from a checkout that has it"
+if [ "${staged:-0}" -lt "${current:-0}" ]; then
+    printf '%s: %s\n' "$program" "the installed gate is version $current, newer than this checkout's ${staged:-0}; install from a checkout that has it" >&2
+    exit 3
+fi
 
 # What was installed, file by file, from which commit of which repository,
 # and when.
@@ -114,11 +117,19 @@ for installed, file in names:
         blobs = None
         break
     blobs[f"scripts/{file}"] = blob
-commit = os.environ.get("CAGENTS_BUILD_INSTALL_COMMIT") or git("rev-parse", "-q", "--verify", "HEAD^{commit}")
+commit = os.environ.get("CAGENTS_BUILD_INSTALL_COMMIT")
+if not commit and blobs:
+    # The checkout's commit, unless these files are not that commit's: then
+    # the installation is judged by when it was made.
+    head = git("rev-parse", "-q", "--verify", "HEAD^{commit}")
+    at_head = head and git("rev-parse", *[f"{head}:{path}" for path in blobs])
+    if at_head and at_head.split() == list(blobs.values()):
+        commit = head
 repository = os.environ.get("CAGENTS_BUILD_INSTALL_REPOSITORY") or git(
     "rev-parse", "--path-format=absolute", "--git-common-dir")
+origin = os.environ.get("CAGENTS_BUILD_INSTALL_ORIGIN") or git("remote", "get-url", "origin")
 with open(record + ".new", "w") as file:
-    json.dump({"files": blobs, "commit": commit, "repository": repository,
+    json.dump({"files": blobs, "commit": commit, "repository": repository, "origin": origin,
                "installed_at": time.time(), "directory": os.path.basename(stage)}, file, indent=1)
     file.write("\n")
 PY
@@ -126,6 +137,7 @@ PY
 # Each name in the destination now leads into the new installation: helpers
 # first, for a gate from before installations had directories of their own,
 # which finds them by name beside it.
+retired=$(readlink -f -- "$destination/cagents-cargo-gate" 2>/dev/null) || retired=
 printf '%s\n' "$files" | while IFS=: read -r installed file; do
     ln -s -- "cagents-cargo-gate.d/${stage##*/}/$installed" "$destination/.$installed.new"
     mv -f -- "$destination/.$installed.new" "$destination/$installed"
@@ -135,7 +147,11 @@ mv -f -- "$destination/cagents-cargo-gate.installation.new" "$destination/cagent
 # Gates judge main afresh against this installation.
 rm -f -- "$destination/cagents-cargo-gate.checked" "$destination/cagents-cargo-gate.install-failed"
 smoke "$destination/cagents-cargo-gate"
-# Earlier installations a running build may still be using stay a week.
+# Earlier installations a running build may still be using stay a week after
+# they were replaced.
+case $retired in
+    "$(readlink -f -- "$versions")"/v.*/cagents-cargo-gate) touch -c -- "${retired%/*}" ;;
+esac
 find "$versions" -mindepth 1 -maxdepth 1 -type d -name 'v.*' ! -name "${stage##*/}" -mtime +7 \
     -exec rm -rf -- {} + 2>/dev/null || true
 printf '%s: installed %s/cagents-cargo-gate from %s\n' "$program" "$destination" \

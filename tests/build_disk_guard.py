@@ -171,6 +171,23 @@ class InstallCargoGate(unittest.TestCase):
         self.assertEqual({path.name: path.read_bytes() for path in first.iterdir()}, contents)
         self.assertNotEqual((self.root / "cagents-cargo-gate").resolve().parent, first)
 
+    def test_an_installation_replaced_long_ago_is_removed_and_a_recent_one_kept(self):
+        install = [str(ROOT / "scripts/install-cargo-gate"), str(self.root)]
+        versions = self.root / "cagents-cargo-gate.d"
+        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=60)
+        (old,) = versions.iterdir()
+        ancient = time.time() - 30 * 86400
+        os.utime(old, (ancient, ancient))
+        # Made long ago, replaced just now: running builds may still use it.
+        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=60)
+        self.assertTrue(old.is_dir())
+        (replaced,) = set(versions.iterdir()) - {old}
+        os.utime(old, (ancient, ancient))
+        os.utime(replaced, (ancient, ancient))
+        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=60)
+        self.assertFalse(old.exists())
+        self.assertTrue(replaced.is_dir())
+
     def test_a_gate_that_cannot_run_is_not_installed(self):
         scripts = self.root / "checkout/scripts"
         scripts.mkdir(parents=True)

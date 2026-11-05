@@ -493,17 +493,20 @@ Merged gate changes install themselves. Each installation is its own
 directory under `/var/tmp/cagents-cargo-gate.d`, and the installed names are
 links into it, so a running gate keeps its own helpers while a newer one
 takes over. `/var/tmp/cagents-cargo-gate.installation` records each file's
-Git blob, the repository and commit it came from, and when. When a gate runs
-in a checkout whose `origin/main` it has not yet judged,
+Git blob, the origin and commit it came from, and when. When a gate runs in
+a checkout whose `origin/main` it has not yet judged,
 `scripts/cargo-gate-sync.py` compares main's files with that record. It
-installs main's gate when they differ and main changed the gate after the
+installs main's gate when they differ and main either contains the recorded
+commit or changed the gate, by its first-parent history, after the
 installation; then main's gate runs the command, and the run says so. An
-installation made later, such as a branch under test, stays until main
-changes the gate again. A branch that main squashed or rebased has the same
-files, so nothing happens. Checkouts of another clone or fork leave the
-installation alone. When main's gate cannot be installed, every run says
-so, with the reason in `/var/tmp/cagents-cargo-gate.install-failed`, and it
-is tried again only once main moves. The installation waits for a fetch of
+installation from elsewhere, such as a branch under test or changed files,
+stays until main changes the gate again; one of a newer `gate_version`
+than main's stays until main's is as new. A branch that main squashed or rebased has the
+same files, so nothing happens. Checkouts of a fork leave the installation
+alone. When main's gate cannot be installed, every run says so, with the
+reason in `/var/tmp/cagents-cargo-gate.install-failed`, and it is tried
+again only once main moves. Replaced installations stay a week for builds
+still running them. The installation waits for a fetch of
 main, and it runs main's installer, so fetched main code installs itself.
 `CAGENTS_BUILD_INSTALL_SYNC=0` turns this off.
 
