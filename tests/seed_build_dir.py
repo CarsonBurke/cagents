@@ -590,23 +590,30 @@ class SeedBuildDir(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.destination / "debug/deps/libzstd-1.rlib").read_bytes(), b"rlib")
 
-    def test_a_cargo_reporting_no_build_directory_is_seeded_at_its_target(self):
+    def test_the_destination_is_the_build_directory_else_the_target(self):
         if not reflinks(self.root):
             self.skipTest("this file system cannot reflink")
         tools = self.root / "tools"
         tools.mkdir()
         cargo = tools / "cargo"
-        cargo.write_text(f"""#!/bin/sh
-printf '%s\\n' '{{"target_directory":"{self.destination}"}}'
+        wrong = self.root / "not-this-one"
+        for metadata in (f'"target_directory":"{self.destination}"',
+                         f'"build_directory":"{self.destination}","target_directory":"{wrong}"',
+                         f'"target_directory":"{wrong}","build_directory":"{self.destination}"'):
+            with self.subTest(metadata=metadata):
+                shutil.rmtree(self.destination, ignore_errors=True)
+                cargo.write_text(f"""#!/bin/sh
+printf '%s\\n' '{{{metadata}}}'
 """)
-        cargo.chmod(0o755)
-        result = subprocess.run(
-            [str(SEED), "--from", str(self.source)], cwd=self.root,
-            env={**self.env, "PATH": f"{tools}:{os.environ['PATH']}"},
-            capture_output=True, text=True, timeout=60,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.destination / "debug/deps/libzstd-1.rlib").read_bytes(), b"rlib")
+                cargo.chmod(0o755)
+                result = subprocess.run(
+                    [str(SEED), "--from", str(self.source)], cwd=self.root,
+                    env={**self.env, "PATH": f"{tools}:{os.environ['PATH']}"},
+                    capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.destination / "debug/deps/libzstd-1.rlib").read_bytes(), b"rlib")
+                self.assertFalse(wrong.exists())
 
     def test_a_build_holding_either_cargo_lock_delays_the_copy(self):
         if not reflinks(self.root):
