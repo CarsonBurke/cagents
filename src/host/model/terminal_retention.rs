@@ -119,23 +119,50 @@ pub(super) fn pinned_terminals(
 }
 
 impl Registry {
-    pub(crate) fn pin_window_terminals(&mut self, terminals: &[TerminalId]) -> Result<(), String> {
-        let tx = self
+    /// A pin only defers retiring a worker alive on this boot. A process crash
+    /// keeps a committed WAL frame in the OS, and power loss ends the worker
+    /// with its pin, so a window or Close need not wait for the disk here.
+    fn commit_without_sync(
+        &mut self,
+        write: impl FnOnce(&Transaction<'_>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let synchronous: i64 = self
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
             .map_err(|error| error.to_string())?;
-        schema::require_current(&tx)?;
-        // Even delete/recreate must differ from a stale close's opaque receipt.
-        let generation = uuid::Uuid::new_v4().to_string();
-        for terminal in terminals {
-            tx.execute(
-                "INSERT INTO terminal_retention_pins(terminal,generation) VALUES (?1,?2)
-                 ON CONFLICT(terminal) DO UPDATE SET generation=excluded.generation",
-                params![terminal.to_string(), generation],
-            )
+        self.db
+            .pragma_update(None, "synchronous", "NORMAL")
             .map_err(|error| error.to_string())?;
-        }
-        tx.commit().map_err(|error| error.to_string())
+        let committed = (|| {
+            let tx = self
+                .db
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            schema::require_current(&tx)?;
+            write(&tx)?;
+            tx.commit().map_err(|error| error.to_string())
+        })();
+        let restored = self
+            .db
+            .pragma_update(None, "synchronous", synchronous)
+            .map_err(|error| error.to_string());
+        committed.and(restored)
+    }
+
+    pub(crate) fn pin_window_terminals(&mut self, terminals: &[TerminalId]) -> Result<(), String> {
+        self.commit_without_sync(|tx| {
+            // Even delete/recreate must differ from a stale close's opaque receipt.
+            let generation = uuid::Uuid::new_v4().to_string();
+            for terminal in terminals {
+                tx.execute(
+                    "INSERT INTO terminal_retention_pins(terminal,generation) VALUES (?1,?2)
+                     ON CONFLICT(terminal) DO UPDATE SET generation=excluded.generation",
+                    params![terminal.to_string(), generation],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn retention_pin_generation(
@@ -164,17 +191,14 @@ impl Registry {
         terminal: TerminalId,
         generation: &str,
     ) -> Result<(), String> {
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        schema::require_current(&tx)?;
-        tx.execute(
-            "DELETE FROM terminal_retention_pins WHERE terminal=?1 AND generation=?2",
-            params![terminal.to_string(), generation],
-        )
-        .map_err(|error| error.to_string())?;
-        tx.commit().map_err(|error| error.to_string())
+        self.commit_without_sync(|tx| {
+            tx.execute(
+                "DELETE FROM terminal_retention_pins WHERE terminal=?1 AND generation=?2",
+                params![terminal.to_string(), generation],
+            )
+            .map(drop)
+            .map_err(|error| error.to_string())
+        })
     }
 }
 
@@ -268,6 +292,38 @@ mod tests {
             path.file_name().unwrap().to_str().unwrap()
         ));
         (std::fs::read(path).unwrap(), std::fs::read(wal).ok())
+    }
+
+    #[test]
+    fn pin_commits_leave_the_connection_as_durable_as_they_found_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = Registry::at(&directory.path().join("registry.sqlite3")).unwrap();
+        let synchronous = |registry: &Registry| -> i64 {
+            registry
+                .db
+                .pragma_query_value(None, "synchronous", |row| row.get(0))
+                .unwrap()
+        };
+        let durable = synchronous(&registry);
+        let terminal = TerminalId::new();
+        registry.pin_window_terminals(&[terminal]).unwrap();
+        assert_eq!(synchronous(&registry), durable);
+        let generation = registry
+            .retention_pin_generation(terminal)
+            .unwrap()
+            .unwrap();
+        registry
+            .forget_retention_pin(terminal, &generation)
+            .unwrap();
+        assert_eq!(synchronous(&registry), durable);
+        assert_eq!(registry.retention_pin_generation(terminal).unwrap(), None);
+        // A failed write reports its own cause and still restores durability.
+        registry
+            .db
+            .execute_batch("PRAGMA user_version=9999")
+            .unwrap();
+        assert!(registry.pin_window_terminals(&[terminal]).is_err());
+        assert_eq!(synchronous(&registry), durable);
     }
 
     #[test]
