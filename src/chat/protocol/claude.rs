@@ -11390,6 +11390,30 @@ mod tests {
     }
 
     #[test]
+    fn a_send_message_alias_never_settles_the_agent_it_resumed_for_another_task() {
+        let mut adapter = Claude::default();
+        notification_agent(&mut adapter, "call-a", "task-a", true);
+        notification_agent(&mut adapter, "call-b", "task-b", true);
+        adapter.receive(json!({"type":"assistant","uuid":"resume-b","message":{"id":"resume-b","content":[{"type":"tool_use","id":"send-b","name":"SendMessage","input":{"to":"task-b","message":"Again"}}]}})).unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task-b","task_type":"local_agent"})).unwrap();
+        let step = adapter
+            .receive(notification_frame(
+                "receipt-a",
+                "send-b",
+                "task-a",
+                "completed",
+            ))
+            .unwrap();
+        assert_eq!(
+            notification_agent_statuses(&step, "call-a"),
+            [ToolStatus::Succeeded]
+        );
+        assert!(notification_agent_statuses(&step, "call-b").is_empty());
+        assert!(adapter.background_agents.contains("call-b"));
+        assert_eq!(adapter.ended_agent("call-b"), None);
+    }
+
+    #[test]
     fn a_live_quoted_report_settles_only_its_closed_outer_notification() {
         let quoting = "<task-notification>\n<task-id>task-one</task-id>\n<tool-use-id>tool-one</tool-use-id>\n<status>completed</status>\n<summary>Agent finished</summary>\n<result>The log shows:\n<task-notification>\n<task-id>task-two</task-id>\n<tool-use-id>tool-two</tool-use-id>\n<status>failed</status>\n</result>\n</task-notification>";
         let quoted_close = quoting.replace("</result>", "</task-notification>\n</result>");
