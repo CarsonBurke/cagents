@@ -3132,18 +3132,35 @@ fn charge_host<T>(
     result
 }
 
-/// The data of a GraphQL envelope whose errors are all `NOT_FOUND`.
+/// The data of a GraphQL envelope whose errors all say a nested object is
+/// missing: each is `NOT_FOUND` at a path whose parent object was found. A
+/// missing top-level object, such as a renamed or inaccessible repository,
+/// stays a failure.
 fn not_found_data(output: &[u8]) -> Option<serde_json::Value> {
     let mut envelope: serde_json::Value = serde_json::from_slice(output).ok()?;
+    let data = envelope.as_object_mut()?.remove("data")?;
     let errors = envelope.get("errors")?.as_array()?;
-    let all_not_found = !errors.is_empty()
-        && errors.iter().all(|error| {
-            error.get("type").and_then(serde_json::Value::as_str) == Some("NOT_FOUND")
-        });
-    all_not_found
-        .then(|| envelope.as_object_mut()?.remove("data"))
-        .flatten()
-        .filter(serde_json::Value::is_object)
+    let nested_not_found = |error: &serde_json::Value| {
+        error.get("type").and_then(serde_json::Value::as_str) == Some("NOT_FOUND")
+            && error
+                .get("path")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|path| path.split_last())
+                .is_some_and(|(_, parent)| {
+                    !parent.is_empty()
+                        && parent
+                            .iter()
+                            .try_fold(&data, |value, segment| match segment {
+                                serde_json::Value::String(key) => value.get(key.as_str()),
+                                serde_json::Value::Number(index) => {
+                                    value.get(usize::try_from(index.as_u64()?).ok()?)
+                                }
+                                _ => None,
+                            })
+                            .is_some_and(serde_json::Value::is_object)
+                })
+    };
+    (data.is_object() && !errors.is_empty() && errors.iter().all(nested_not_found)).then_some(data)
 }
 
 fn parse_graphql(output: &[u8]) -> Result<serde_json::Value, GitHubError> {

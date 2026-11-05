@@ -47,7 +47,13 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 next_cursor: None,
             });
         }
-        let search = search_query(repository, text);
+        let Some(search) = search_query(repository, text) else {
+            // Nothing searchable remains, such as a query of only quotes.
+            return Ok(PullRequestPage {
+                pull_requests: Vec::new(),
+                next_cursor: None,
+            });
+        };
         let query = format!(
             "query($searchText:String!,$cursor:String){{search(type:ISSUE,query:$searchText,first:50,after:$cursor){{nodes{{... on PullRequest{{{BROWSER_PULL_REQUEST_FIELDS}}}}} pageInfo{{hasNextPage endCursor}}}}}}"
         );
@@ -89,7 +95,8 @@ fn exact_number(text: &str) -> Option<u64> {
 
 /// Match the browser's explicit #number and @author affordances. Query terms
 /// remain variables; user text cannot change the repository/open constraints.
-fn search_query(repository: &GitHubRepoKey, text: &str) -> String {
+/// `None` when no searchable text remains.
+fn search_query(repository: &GitHubRepoKey, text: &str) -> Option<String> {
     let text = text.trim();
     // Creation order matches the open list, so a refreshed search keeps its
     // rows and pages in place instead of reordering by relevance.
@@ -104,12 +111,13 @@ fn search_query(repository: &GitHubRepoKey, text: &str) -> String {
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     });
     if let Some(author) = author {
-        return format!("{scope} author:{author}");
+        return Some(format!("{scope} author:{author}"));
     }
     // GitHub search has no escape for a quote inside a phrase. Dropping
     // quotes keeps all user text inside the one title phrase.
     let phrase = text.replace('"', " ");
-    format!("{scope} \"{}\" in:title", phrase.trim())
+    let phrase = phrase.trim();
+    (!phrase.is_empty()).then(|| format!("{scope} \"{phrase}\" in:title"))
 }
 
 #[cfg(test)]
@@ -261,21 +269,65 @@ mod tests {
     fn search_scope_and_search_modes_are_explicit() {
         let repo = GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap();
         assert_eq!(
-            search_query(&repo, "@alice"),
-            "repo:owner/repo is:pr is:open sort:created-desc author:alice"
+            search_query(&repo, "@alice").as_deref(),
+            Some("repo:owner/repo is:pr is:open sort:created-desc author:alice")
         );
         assert_eq!(exact_number("#1234"), Some(1234));
         assert_eq!(exact_number("1234"), None, "a bare number is title text");
         assert_eq!(exact_number("##1234"), None);
         assert_eq!(exact_number("#0"), None);
         assert_eq!(
-            search_query(&repo, "fix sidebar"),
-            "repo:owner/repo is:pr is:open sort:created-desc \"fix sidebar\" in:title"
+            search_query(&repo, "fix sidebar").as_deref(),
+            Some("repo:owner/repo is:pr is:open sort:created-desc \"fix sidebar\" in:title")
         );
         assert_eq!(
-            search_query(&repo, "say \"hi\" repo:other/other"),
-            "repo:owner/repo is:pr is:open sort:created-desc \"say  hi  repo:other/other\" in:title",
+            search_query(&repo, "say \"hi\" repo:other/other").as_deref(),
+            Some(
+                "repo:owner/repo is:pr is:open sort:created-desc \"say  hi  repo:other/other\" in:title"
+            ),
             "user text cannot close the phrase and add qualifiers"
         );
+        assert_eq!(
+            search_query(&repo, " \"\" "),
+            None,
+            "nothing left to search"
+        );
+    }
+
+    #[test]
+    fn missing_repository_is_a_failure_not_an_empty_search() {
+        struct Gone;
+        impl ProcessExecutor for Gone {
+            fn execute(
+                &self,
+                _: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                let response = serde_json::json!({
+                    "data": {"repository": null},
+                    "errors": [{
+                        "type": "NOT_FOUND",
+                        "path": ["repository"],
+                        "message": "Could not resolve to a Repository with the name 'owner/repo'."
+                    }]
+                });
+                Ok(ProcessOutput {
+                    success: false,
+                    exit_code: Some(1),
+                    signal: None,
+                    stdout: response.to_string().into_bytes(),
+                    stderr: b"gh: Could not resolve to a Repository".to_vec(),
+                })
+            }
+        }
+        let repo = GitHubRepoKey::new("missing-repository.invalid", None, "owner", "repo").unwrap();
+        let service = GitHubService::new("gh", Arc::new(Gone));
+        assert!(
+            service
+                .search_pull_request_page(&repo, "#2", None, &CancellationToken::new())
+                .is_err(),
+            "a renamed or inaccessible repository is not an empty result"
+        );
+        crate::github::polling::succeeded(&repo.host);
     }
 }
