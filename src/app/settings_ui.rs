@@ -1397,22 +1397,33 @@ fn shortcut_input<'a>(
                 .into()
         })
         .collect();
-    // Record and Reset wrap as one unit, so they never part across lines.
+    // Record, Reset and Source end the row as one unit: they never part
+    // across lines, Source keeps its column in every row, and it stays on
+    // the keys' line when they move beneath the action's name.
     controls.push(
         widget::row::with_children(vec![
-            crate::ui_controls::icon_button(Icon::Keyboard, format!("Record shortcut for {label}"))
+            widget::row::with_children(vec![
+                crate::ui_controls::icon_button(
+                    Icon::Keyboard,
+                    format!("Record shortcut for {label}"),
+                )
                 .compact()
                 .on_press(Message::Palette(palette_ui::Action::Record(field)))
                 .into(),
-            crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label} shortcut"))
-                .compact()
-                .on_press_maybe((value != default).then(|| Message::SettingsDraftChanged {
-                    field,
-                    value: default,
-                }))
-                .into(),
+                crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label} shortcut"))
+                    .compact()
+                    .on_press_maybe((value != default).then(|| Message::SettingsDraftChanged {
+                        field,
+                        value: default,
+                    }))
+                    .into(),
+            ])
+            .spacing(2)
+            .into(),
+            design::caption(source).width(64).into(),
         ])
-        .spacing(2)
+        .spacing(space::S)
+        .align_y(Alignment::Center)
         .into(),
     );
     let required = if settings::shortcut_required(index) {
@@ -1452,20 +1463,14 @@ fn shortcut_input<'a>(
             }
         }
     }
-    let row = widget::row::with_children(vec![
-        // Source keeps its column. The keys and their Record and Reset
-        // buttons end the action's line while its name keeps readable room,
-        // and otherwise move beneath the name and wrap there, in order.
+    // The keys and their buttons end the action's line while its name keeps
+    // readable room, and otherwise move beneath the name and wrap there, in
+    // order.
+    let row =
         crate::ui_controls::labeled_controls(design::body(format!("{label}{required}")), controls)
             .min_label(SHORTCUT_LABEL_MIN_WIDTH)
             .spacing(2.0)
-            .label_gap(space::S)
-            .into(),
-        design::caption(source).width(64).into(),
-    ])
-    .spacing(space::S)
-    .align_y(Alignment::Center)
-    .width(Length::Fill);
+            .label_gap(space::S);
     let mut children = vec![row.into()];
     if let Some(reason) = &error {
         children.push(
@@ -1641,8 +1646,9 @@ mod keyboard_table_tests {
                 assert!(source.width > 0.0 && source.height > 0.0);
                 assert!(source.x >= 0.0 && source.x + source.width <= width + 0.1);
                 assert!(
-                    controls.buttons.last().unwrap().x + controls.buttons.last().unwrap().width
-                        <= source.x + 0.1
+                    reset.x + reset.width <= source.x + 0.1
+                        && (source.center_y() - reset.center_y()).abs() < 4.1,
+                    "{field:?} at{width}: Source {source:?} left Reset {reset:?}"
                 );
                 if width == 560.0 {
                     assert!(
