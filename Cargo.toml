@@ -301,6 +301,15 @@ debug = "line-tables-only"
 lto = "thin"
 codegen-units = 1
 
+# Production builds for this workstation: release identity and optimization,
+# without the whole-crate code generation that makes each release take tens of
+# minutes. `scripts/install-local` uses it; published releases keep `release`.
+[profile.local]
+inherits = "release"
+lto = false
+codegen-units = 256
+incremental = true
+
 [profile.dev.package."*"]
 debug = 0
 

@@ -302,8 +302,33 @@ impl FilesystemRecoveryContext {
                     bootstrap: None,
                 })
             }
-            Err(_) => {
-                let sticky = StickyParent::acquire(target.parent().clone())?;
+            Err(ref _local_error) => {
+                #[cfg(test)]
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "retained-save diagnostic: stage=save-local-placement; kind={:?}; \
+                         raw_errno={:?}; error={}",
+                        _local_error.kind(),
+                        _local_error.raw_os_error(),
+                        _local_error
+                    );
+                }
+                let sticky = StickyParent::acquire(target.parent().clone());
+                #[cfg(test)]
+                if let Err(error) = &sticky {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "retained-save diagnostic: stage=save-local-sticky-fallback; kind={:?}; \
+                         raw_errno={:?}; error={}",
+                        error.kind(),
+                        error.raw_os_error(),
+                        error
+                    );
+                }
+                let sticky = sticky?;
                 Self::bootstrap(
                     target.source().clone(),
                     Arc::from([]),

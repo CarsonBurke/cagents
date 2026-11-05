@@ -58,11 +58,13 @@ fn standalone_help_and_shell_completions_work_without_a_device_or_daemon() {
     );
     let fish = Path::new("/usr/bin/fish");
     if fish.exists() {
+        let mut failing_script = fish_script.clone();
+        failing_script.extend_from_slice(b"\nfalse\n");
         let command = CommandSpec::new(fish)
             .args([
                 "--no-config",
                 "-c",
-                "source /dev/stdin; complete -C 'cagents agent sp'",
+                "source /dev/stdin; and complete -C 'cagents agent sp'",
             ])
             .env("HOME", directory.path())
             .env("XDG_CONFIG_HOME", directory.path().join("config"))
@@ -83,5 +85,20 @@ fn standalone_help_and_shell_completions_work_without_a_device_or_daemon() {
                 .any(|line| line.split('\t').next() == Some("spawn")),
             "{completions}"
         );
+
+        // Registration succeeds before the appended false. Its source failure
+        // must remain a failure instead of being hidden by a later completion.
+        let failed = SystemProcessExecutor
+            .execute(
+                &command.clone().stdin(failing_script),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(failed.exit_code, Some(1), "{failed:?}");
+        assert!(!failed.success);
+        assert!(failed.stdout.is_empty(), "{failed:?}");
+        eprintln!("coverage: fish completion and failed-source guard exercised");
+    } else {
+        eprintln!("coverage: /usr/bin/fish unavailable; fish source-status checks UNEXECUTED");
     }
 }

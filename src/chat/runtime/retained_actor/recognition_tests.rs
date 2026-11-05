@@ -346,7 +346,7 @@ print(read(struct.unpack('<I',read(4))[0]).decode())
     );
     original.0.refresh_state().unwrap();
     assert_eq!(original.0.state().next_input, sequence);
-    original.0.preserve().unwrap();
+    fixture_preserve_and_join(&original.0);
     drop(lease);
     let mut proof = source.proof.clone().unwrap();
     proof.host_incarnation = crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string());

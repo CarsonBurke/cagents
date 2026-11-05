@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -75,9 +76,11 @@ generation = os.environ["MOCK_GENERATION"]
 product.write_text(
     "#!" + sys.executable + "\n"
     "import json, os, sys\n"
-    "with open(os.environ['MOCK_LAUNCH'], 'w') as output:\n"
+    "temporary = os.environ['MOCK_LAUNCH'] + '.tmp'\n"
+    "with open(temporary, 'w') as output:\n"
     "    json.dump({'executable': sys.argv[0], 'args': sys.argv[1:], "
     "'cwd': os.getcwd(), 'generation': " + repr(generation) + "}, output)\n"
+    "os.replace(temporary, os.environ['MOCK_LAUNCH'])\n"
 )
 product.chmod(0o755)
 mode = os.environ.get("MOCK_ARTIFACT_MODE") if name == "ceditor" else None
@@ -94,7 +97,12 @@ if mode != "missing":
         product.chmod(0o644)
     print(json.dumps(record))
     if mode == "ambiguous":
-        other = dict(record, executable=str(product.with_name("other-ceditor")))
+        # Both choices must be runnable so missing-file rejection cannot hide
+        # an artifact selector that incorrectly accepts the last candidate.
+        other_product = product.with_name("other-ceditor")
+        other_product.write_bytes(product.read_bytes())
+        other_product.chmod(0o755)
+        other = dict(record, executable=str(other_product))
         print(json.dumps(other))
 print(json.dumps({"reason": "build-finished", "success": mode != "failed"}))
 sys.exit(101 if mode == "failed" else 0)
@@ -132,6 +140,71 @@ sys.exit(101 if mode == "failed" else 0)
         self.assertEqual(launched["cwd"], str(self.directory))
         self.assertEqual(len(self.cargo_calls()), 1)
         self.assertIn("fixture compiler warning", result.stderr)
+
+    @unittest.skipUnless(shutil.which("gio"), "gio is required to exercise desktop Exec parsing")
+    def test_desktop_launcher_preserves_special_characters_and_file_arguments(self):
+        gio = shutil.which("gio")
+        documents = [
+            self.directory / 'document "quote" \\backslash $dollar `backtick` %F.rs',
+            self.directory / "second document %U.rs",
+        ]
+        for document in documents:
+            document.write_text("fixture document\n")
+        arguments = [str(document) for document in documents]
+        # Keep the caller's context; only fixture build/data paths are overridden.
+        environment = os.environ.copy()
+        for name in ("PATH", "XDG_DATA_HOME", "MOCK_CHECKOUT", "MOCK_CALLS",
+                     "MOCK_LAUNCH", "MOCK_GENERATION"):
+            environment[name] = self.environment[name]
+        environment["CARGO_BUILD_TARGET"] = "x86_64-unknown-linux-gnu"
+        directories = (
+            "target with spaces",
+            'target "quote"',
+            "target \\backslash",
+            "target $dollar",
+            "target `backtick`",
+            "target %F 100%",
+            'target "quote" \\backslash $dollar `backtick` %F',
+            "target %F=assigned",
+        )
+        desktop = self.home / "data/applications/io.github.cagents.ceditor.Development.desktop"
+        for directory in directories:
+            with self.subTest(target=directory):
+                target = self.directory / directory
+                environment["MOCK_TARGET"] = str(target)
+                executable = str(target / "x86_64-unknown-linux-gnu/dev-runtime/ceditor")
+                result = subprocess.run(
+                    ["/bin/sh", str(self.checkout / "scripts/run-ceditor-development"),
+                     "--", *arguments],
+                    cwd=self.directory, env=environment, text=True, capture_output=True, timeout=10,
+                )
+                self.assert_success(result)
+                direct = json.loads(self.launch.read_text())
+                self.assertEqual(direct["executable"], executable)
+                self.assertEqual(direct["args"], arguments)
+                self.assertEqual(direct["cwd"], str(self.directory))
+                file_sets = [arguments]
+                if "%" in directory:
+                    file_sets.append([])
+                for files in file_sets:
+                    with self.subTest(files=files):
+                        self.launch.unlink(missing_ok=True)
+                        # GLib expands the entry and starts only our inert fixture.
+                        result = subprocess.run(
+                            [gio, "launch", str(desktop), *files],
+                            cwd=self.directory, env=environment,
+                            text=True, capture_output=True, timeout=10,
+                        )
+                        self.assert_success(result)
+                        deadline = time.monotonic() + 2
+                        while not self.launch.exists() and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertTrue(self.launch.exists(),
+                                        "desktop launch did not execute the fixture: " + result.stderr)
+                        launched = json.loads(self.launch.read_text())
+                        self.assertEqual(launched["executable"], executable)
+                        self.assertEqual(launched["args"], files)
+                        self.assertEqual(launched["cwd"], str(self.directory))
 
     def test_runner_does_not_launch_stale_unqualified_artifact(self):
         stale = self.target / "dev-runtime/ceditor"
@@ -189,12 +262,29 @@ sys.exit(101 if mode == "failed" else 0)
         self.assertEqual(public_cli.read_text(), "unrelated installed CLI\n")
         self.assertEqual(len(self.cargo_calls()), 6)
 
-    def test_failed_missing_or_ambiguous_artifact_never_launches_or_replaces_installation(self):
+    def test_ambiguous_runnable_artifacts_never_launch_or_replace_installation(self):
         self.assert_success(self.run_script("install-ceditor", "--prefix", str(self.prefix)))
         installed = self.prefix / "bin/ceditor"
         original = installed.resolve()
         releases = sorted((self.prefix / "lib/ceditor/releases").iterdir())
-        for mode in ("failed", "missing", "ambiguous", "relative", "absent", "not-executable"):
+        ambiguity = "Cargo did not report exactly one executable for ceditor (found 2)"
+        self.environment["MOCK_ARTIFACT_MODE"] = "ambiguous"
+        for name, arguments in (("run-ceditor-development", ()),
+                                ("install-ceditor", ("--prefix", str(self.prefix)))):
+            with self.subTest(script=name):
+                result = self.run_script(name, *arguments)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn(ambiguity, result.stderr)
+                self.assertFalse(self.launch.exists())
+                self.assertEqual(installed.resolve(), original)
+                self.assertEqual(sorted((self.prefix / "lib/ceditor/releases").iterdir()), releases)
+
+    def test_failed_missing_or_invalid_artifact_never_launches_or_replaces_installation(self):
+        self.assert_success(self.run_script("install-ceditor", "--prefix", str(self.prefix)))
+        installed = self.prefix / "bin/ceditor"
+        original = installed.resolve()
+        releases = sorted((self.prefix / "lib/ceditor/releases").iterdir())
+        for mode in ("failed", "missing", "relative", "absent", "not-executable"):
             with self.subTest(mode=mode):
                 self.environment["MOCK_ARTIFACT_MODE"] = mode
                 runner = self.run_script("run-ceditor-development")

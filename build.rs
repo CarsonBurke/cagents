@@ -27,6 +27,24 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    // The browser bundles HarfBuzz while system FreeType loads system HarfBuzz.
+    // Exporting either bundled font API lets the dynamic loader mix their state.
+    // Localize only these definitions in the final Linux browser UI; imported
+    // system functions and unrelated runtime exports retain their usual binding.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && std::env::var_os("CARGO_FEATURE_INTEGRATED_BROWSER").is_some()
+    {
+        let output = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
+        let map = output.join("linux-ui-font-symbols.map");
+        std::fs::write(&map, "{ local: hb_*; FT_*; };\n")
+            .expect("write Linux browser UI font symbol map");
+        // Forward the complete path as one linker argument, including commas.
+        // The compiler driver splits -Wl arguments at commas in filesystem paths.
+        println!("cargo:rustc-link-arg-bin=cagents-ui=-Xlinker");
+        println!("cargo:rustc-link-arg-bin=cagents-ui=--version-script");
+        println!("cargo:rustc-link-arg-bin=cagents-ui=-Xlinker");
+        println!("cargo:rustc-link-arg-bin=cagents-ui={}", map.display());
+    }
     println!("cargo:rerun-if-env-changed=CAGENTS_CHECKOUT_ROOT");
     println!("cargo:rerun-if-env-changed=CAGENTS_BUILD_METADATA");
     let base = std::env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION");
@@ -55,7 +73,11 @@ fn valid_metadata(metadata: &str) -> bool {
 }
 
 fn git(manifest: &Path, arguments: &[&str]) -> Option<String> {
+    // `git status` otherwise refreshes the index it reads. The index is a
+    // watched input, so rewriting it would make Cargo rebuild this crate
+    // again at its next invocation with no change to the checkout.
     let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(manifest)
         .args(arguments)
@@ -77,18 +99,30 @@ fn git_metadata(base: &str) -> Option<String> {
     } else {
         manifest.join(head)
     };
-    // Rebuild when the checkout moves: the HEAD file itself, and the ref it
-    // points at when it is symbolic. A packed ref changes through the HEAD
-    // file's own directory less predictably, so the index is watched as well;
-    // a commit always rewrites it.
+    // Rerun when the stamp could change, and not otherwise: each rerun
+    // recompiles this crate.
+    //
+    // The commit moves with the HEAD file itself and this checkout's HEAD
+    // reflog, which records every commit, checkout and reset here, including a
+    // commit on a packed branch. Without a reflog, watch the branch's loose ref
+    // instead. packed-refs is not watched: every worktree shares it, and
+    // pruning or deleting any branch rewrites it. A ref move without a reflog
+    // entry, such as `update-ref`, leaves a stale short SHA until the next
+    // rerun.
     println!("cargo:rerun-if-changed={}", head.display());
-    if let Some(reference) = git(&manifest, &["symbolic-ref", "-q", "HEAD"]) {
-        if let Some(path) = git(&manifest, &["rev-parse", "--git-path", &reference]) {
-            println!("cargo:rerun-if-changed={path}");
-        }
-    }
-    if let Some(index) = git(&manifest, &["rev-parse", "--git-path", "index"]) {
-        println!("cargo:rerun-if-changed={index}");
+    // Cargo treats a watched path that does not exist as always changed, so
+    // watch only the files that are there.
+    let existing = |path: &str| {
+        git(&manifest, &["rev-parse", "--git-path", path])
+            .map(|path| manifest.join(path))
+            .filter(|path| path.exists())
+    };
+    if let Some(reflog) = existing("logs/HEAD") {
+        println!("cargo:rerun-if-changed={}", reflog.display());
+    } else if let Some(reference) = git(&manifest, &["symbolic-ref", "-q", "HEAD"])
+        && let Some(path) = existing(&reference)
+    {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
     let sha = git(&manifest, &["rev-parse", "--short", "HEAD"])?;
     let dirty = git(
@@ -96,6 +130,38 @@ fn git_metadata(base: &str) -> Option<String> {
         &["status", "--porcelain", "--untracked-files=no"],
     )
     .is_some_and(|status| !status.is_empty());
+    // A clean checkout becomes dirty by an edit, so watch the sources that
+    // compile into these executables; edits elsewhere show at the next rerun.
+    // A dirty checkout becomes clean by a commit, which moves HEAD, or by
+    // restoring or stashing, which rewrites the index. Watching the index
+    // while clean, or the sources while dirty, would only recompile this
+    // crate with the same stamp: git rewrites the index whenever it refreshes
+    // stale file times, and every edit touches the sources.
+    if dirty {
+        if let Some(index) = existing("index") {
+            println!("cargo:rerun-if-changed={}", index.display());
+        }
+    } else {
+        for source in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "build.rs",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+            "src",
+            "crates",
+            "vendor",
+            "assets",
+            "packaging",
+            "fixtures",
+            "tests/fixtures",
+        ] {
+            let path = manifest.join(source);
+            if path.exists() {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
     let release_tag = format!("v{base}");
     let at_release = git(&manifest, &["tag", "--points-at", "HEAD"])
         .is_some_and(|tags| tags.lines().any(|tag| tag == release_tag));

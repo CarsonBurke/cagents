@@ -122,14 +122,11 @@ struct Wire {
     codec: FrameCodec,
     body_requested: Arc<AtomicBool>,
 }
-type Pending = Arc<
-    Mutex<
-        BTreeMap<
-            u64,
-            crossbeam_channel::Sender<Result<Option<crate::model::TerminalSession>, String>>,
-        >,
-    >,
->;
+struct PendingCommand {
+    prompt: bool,
+    reply: crossbeam_channel::Sender<Result<Option<crate::model::TerminalSession>, String>>,
+}
+type Pending = Arc<Mutex<BTreeMap<u64, PendingCommand>>>;
 type FilePending =
     Arc<Mutex<BTreeMap<u64, crossbeam_channel::Sender<Result<super::FileChangeReply, String>>>>>;
 type TextCopyPending =
@@ -553,6 +550,7 @@ struct InnerPayload {
     // First-prompt receipt evidence survives body eviction, without retaining
     // user text. This is scoped to this exact authenticated connection.
     user_item_seen: Arc<AtomicBool>,
+    prompt_accepted: Arc<AtomicBool>,
     activity: Arc<Mutex<ActivityObservation>>,
     observed: Arc<Mutex<OutputObservation>>,
     account_usage: Arc<Mutex<AccountUsage>>,
@@ -1113,15 +1111,17 @@ fn restore(
     proof: &HostSessionProof,
     mut session: Session,
     upgrade_recovery: &mut Option<(Session, Session)>,
+    retry_explicit_start: bool,
 ) -> Result<ClientRequest, StartFailure> {
-    if session.proof.as_ref() == Some(proof) {
+    if session.proof.as_ref() == Some(proof) && !retry_explicit_start {
         return Ok(ClientRequest::ChatAttach { session });
     }
     let mut refusal = None;
-    if !session
-        .proof
-        .as_ref()
-        .is_some_and(HostSessionProof::is_complete)
+    if retry_explicit_start
+        || !session
+            .proof
+            .as_ref()
+            .is_some_and(HostSessionProof::is_complete)
     {
         // Shared panes can be published before their first attachment records
         // ownership. Recover the daemon's exact descriptor before considering
@@ -1152,6 +1152,63 @@ fn restore(
             {
                 return Err("The hosted chat does not match the exact saved conversation".into());
             }
+            if retry_explicit_start && session.launch.provider == crate::agent::Provider::Claude {
+                // A lost successful reply attaches the existing owner. A
+                // genuinely failed named initialization may instead retain an
+                // exact unfinished Close; only normal authenticated resume
+                // preparation can finish it and return the original request.
+                let request_id = *attach_request;
+                *attach_request += 1;
+                codec
+                    .write(
+                        stream,
+                        &ClientEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: Some(proof.clone()),
+                            request: ClientRequest::ChatPrepareResume {
+                                source: hosted.clone(),
+                            },
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                let prepared = match receive(stream, codec, request_id, Some(proof))? {
+                    ServerResponse::ChatResumePrepared { session } => session,
+                    _ => {
+                        return Err(
+                            "The failed start did not receive exact resume preparation".into()
+                        );
+                    }
+                };
+                if prepared == hosted {
+                    if hosted.is_saved_claude_history() {
+                        if hosted != session {
+                            return Err(
+                                "The saved-history reader changed the explicit retry request"
+                                    .into(),
+                            );
+                        }
+                        let execution_environment = native_environment(&hosted, true);
+                        return Ok(ClientRequest::ChatStart {
+                            session: hosted,
+                            source: None,
+                            terminate_source: false,
+                            execution_environment,
+                        });
+                    }
+                    return Ok(ClientRequest::ChatAttach { session: hosted });
+                }
+                if prepared == session {
+                    let execution_environment = native_environment(&prepared, true);
+                    return Ok(ClientRequest::ChatStart {
+                        session: prepared,
+                        source: None,
+                        terminate_source: false,
+                        execution_environment,
+                    });
+                }
+                return Err("Resume preparation changed the exact failed-start request".into());
+            }
             return Ok(ClientRequest::ChatAttach { session: hosted });
         }
     }
@@ -1181,6 +1238,20 @@ fn restore(
                     && restored.proof.as_ref() == Some(proof)
                     && restored.launch.provider == session.launch.provider =>
             {
+                if retry_explicit_start && restored.is_saved_claude_history() {
+                    if restored != session {
+                        return Err(
+                            "The saved-history reader changed the explicit retry request".into(),
+                        );
+                    }
+                    let execution_environment = native_environment(&restored, true);
+                    return Ok(ClientRequest::ChatStart {
+                        session: restored,
+                        source: None,
+                        terminate_source: false,
+                        execution_environment,
+                    });
+                }
                 if session != restored {
                     if UpgradeRecovery::candidate(&session, &restored).is_none() {
                         return Err("The daemon's upgrade replacement changed the saved conversation configuration".into());
@@ -1205,6 +1276,12 @@ fn restore(
         return Err(StartFailure::from(format!(
             "The saved native conversation could not be reattached. Its uncertain work was not restarted or resubmitted. {}",
             refusal.unwrap_or_else(|| "No authenticated native holder was available.".into())
+        )));
+    }
+    if session.launch.provider == crate::agent::Provider::Claude && !retry_explicit_start {
+        return Err(StartFailure::from(format!(
+            "Saved Claude history could not be opened without starting a provider. Its exact conversation and draft are retained. {}",
+            refusal.unwrap_or_else(|| "No authenticated history attachment was available.".into())
         )));
     }
     if session.launch.session_id.is_none() {
@@ -1266,6 +1343,7 @@ impl ClientHandle {
                     publication: Arc::new(Publications::new(snapshot)),
                     body_requested,
                     user_item_seen: Arc::new(AtomicBool::new(user_item_seen)),
+                    prompt_accepted: Arc::new(AtomicBool::new(false)),
                     activity: Arc::new(Mutex::new(ActivityObservation {
                         generation: 0,
                         state: ActivityState::Idle,
@@ -1321,6 +1399,27 @@ impl ClientHandle {
                 response: ServerResponse::ChatAttached { session, snapshot },
             }
         })
+    }
+
+    /// Test-only access to the real start handshake and reader on a private
+    /// socket. It never discovers a daemon or launches a provider.
+    #[cfg(test)]
+    pub(crate) fn fixture_start_on(
+        stream: UnixStream,
+        session: Session,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        Self::connect_on(
+            stream,
+            session,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            wake,
+        )
     }
 
     /// Publishes `snapshot` as the reader thread would on a presentation
@@ -1706,6 +1805,18 @@ impl ClientHandle {
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         let retirement = ClientRetirement::for_client(session.id)?;
+        if intent == Intent::RetryStart
+            && (source.is_some()
+                || terminate_source
+                || selection.is_some()
+                || account_recovery.is_some()
+                || upgrade_expected.is_some()
+                || session.terminal.is_some()
+                || session.launch.session_id.is_none()
+                || session.native_continuity.retains_provider())
+        {
+            return Err("Only an exact explicit history start can be retried".into());
+        }
         if let Some(expected) = &upgrade_expected
             && (intent != Intent::Restore
                 || source.is_some()
@@ -1822,6 +1933,7 @@ impl ClientHandle {
                 &proof,
                 session,
                 &mut upgrade_recovery,
+                intent == Intent::RetryStart,
             )?
         };
         codec
@@ -1936,6 +2048,7 @@ impl ClientHandle {
                 .iter()
                 .any(|item| item.role == super::Role::User),
         ));
+        let prompt_accepted = Arc::new(AtomicBool::new(false));
         let publication = Arc::new(Publications::new(initial));
         let next = Arc::new(AtomicU64::new(attach_request + 1));
         let alive = Arc::new(AtomicBool::new(true));
@@ -1955,6 +2068,7 @@ impl ClientHandle {
                 publication: publication.clone(),
                 body_requested: body_requested.clone(),
                 user_item_seen: user_item_seen.clone(),
+                prompt_accepted: prompt_accepted.clone(),
                 activity: activity.clone(),
                 observed: observed.clone(),
                 account_usage: account_usage.clone(),
@@ -2050,7 +2164,7 @@ impl ClientHandle {
                             } else { read_again = true; }
                         }
                         if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&id)) {
-                            let _ = reply.try_send(Ok(terminal));
+                            let _ = reply.reply.try_send(Ok(terminal));
                         }
                         wake(Wake::Changed);
                         continue;
@@ -2068,7 +2182,7 @@ impl ClientHandle {
                     let _=reader_stream.shutdown(Shutdown::Both);
                     let replies=std::mem::take(&mut *pending.lock().unwrap_or_else(|p|p.into_inner()));
                     for (request,reply) in replies {
-                        let _=reply.try_send(if Some(request)==envelope.request_id { Ok(terminal.clone()) } else { Err("Chat was explicitly closed".into()) });
+                        let _=reply.reply.try_send(if Some(request)==envelope.request_id { Ok(terminal.clone()) } else { Err("Chat was explicitly closed".into()) });
                     }
                     for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.try_send(Err("Chat was explicitly closed".into()));}
                     for (_,reply) in std::mem::take(&mut *text_copy_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.try_send(Err("Chat was explicitly closed".into()));}
@@ -2091,8 +2205,14 @@ impl ClientHandle {
                     continue;
                 }
                 if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&id)) {
+                    // Latch the authenticated prompt receipt before either EOF
+                    // or delayed UI delivery can restore its sendable draft.
+                    // Other Accepted replies do not prove prompt acceptance.
+                    if reply.prompt && matches!(&envelope.message, ServerMessage::Response { response: ServerResponse::Accepted }) {
+                        prompt_accepted.store(true, Ordering::Release);
+                    }
                     let result = match &envelope.message { ServerMessage::Response { response: ServerResponse::Accepted | ServerResponse::Detached } => Ok(None), ServerMessage::Error(error) => Err(error.message.clone()), _ => Err("Unexpected chat command response".into()) };
-                    let _ = reply.try_send(result);
+                    let _ = reply.reply.try_send(result);
                     // Request-specific command failures are delivered to the
                     // caller; they do not make presentation unavailable.
                     continue;
@@ -2224,7 +2344,7 @@ impl ClientHandle {
             }
             let _=visibility_stop.try_send(());
             for (_, reply) in std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner())) {
-                let _ = reply.try_send(Err(failure.clone()));
+                let _ = reply.reply.try_send(Err(failure.clone()));
             }
             for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {
                 let _=reply.try_send(Err(failure.clone()));
@@ -2252,12 +2372,7 @@ impl ClientHandle {
         if let Some(id) = snapshot.session_id.clone() {
             session.launch.session_id = Some(id);
         }
-        if matches!(
-            snapshot.native_continuity,
-            super::NativeContinuity::Durable { .. }
-        ) {
-            session.native_continuity = snapshot.native_continuity.clone();
-        }
+        session.learn_native_continuity(&snapshot.native_continuity);
         session
     }
     pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
@@ -2296,6 +2411,12 @@ impl ClientHandle {
 
     pub(crate) fn has_observed_user_item(&self) -> bool {
         self.inner.user_item_seen.load(Ordering::Acquire)
+    }
+
+    /// A prompt receipt can precede its first transcript publication. Either
+    /// authenticated observation forbids offering that prompt as an unsent draft.
+    pub(crate) fn has_accepted_user_input(&self) -> bool {
+        self.has_observed_user_item() || self.inner.prompt_accepted.load(Ordering::Acquire)
     }
 
     /// A renderable publication, absent until a hidden client's full history
@@ -2376,7 +2497,19 @@ impl ClientHandle {
             if pending.len() >= 64 {
                 return Err("Chat client command capacity reached".into());
             }
-            pending.insert(id, reply);
+            pending.insert(
+                id,
+                PendingCommand {
+                    prompt: matches!(
+                        &request,
+                        ClientRequest::ChatCommand {
+                            command: Command::Prompt { .. },
+                            ..
+                        }
+                    ),
+                    reply,
+                },
+            );
         }
         let result = transmit(&self.inner.wire, &self.inner.proof, id, request).and_then(|()| {
             response
@@ -3498,6 +3631,155 @@ mod tests {
         }
     }
 
+    #[test]
+    fn failed_saved_claude_restore_sends_no_start_request() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let live = host_proof("current");
+        let mut source = omp_card(Some(CONVERSATION), Some(host_proof("old")));
+        source.launch.provider = crate::agent::Provider::Claude;
+        source.launch.recipe.program = "must-not-run".into();
+        source.launch.recipe.arguments.clear();
+        let expected = source.clone();
+        let worker = thread::spawn(move || {
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            for step in 0..2 {
+                let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
+                let message = match (step, request.request) {
+                    (0, ClientRequest::Connect { .. }) => ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: live.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                    (1, ClientRequest::ResolveUpgradeChat { source }) if source == expected => {
+                        ServerMessage::Error(ipc::ProtocolError::new(
+                            ipc::ProtocolErrorCode::TerminalUnavailable,
+                            "Exact history is unavailable",
+                            false,
+                        ))
+                    }
+                    other => panic!("Unexpected saved history request: {other:?}"),
+                };
+                ipc::write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: live.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            }
+            let extra: Option<ClientEnvelope> = ipc::read_frame(&mut peer).unwrap();
+            assert!(extra.is_none(), "a failed restore must not send ChatStart");
+        });
+        let result = ClientHandle::connect_on(
+            stream,
+            source,
+            Intent::Restore,
+            None,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        );
+        assert!(result.is_err());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_retry_classifies_exact_history_reader_and_live_successor() {
+        for state in 0..5 {
+            let proof = host_proof("current");
+            let mut source = omp_card(Some(CONVERSATION), Some(proof.clone()));
+            source.launch.provider = crate::agent::Provider::Claude;
+            source.launch.recipe.program = "claude".into();
+            source.launch.recipe.arguments.clear();
+            let mut hosted = source.clone();
+            if state == 1 {
+                hosted.native_continuity =
+                    super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            } else if state == 2 || state == 4 {
+                source.proof = Some(host_proof("previous"));
+            }
+            let expected = hosted.clone();
+            let expected_source = source.clone();
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let server_proof = proof.clone();
+            let worker = thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                for step in 0..2 {
+                    let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                    let response = match (step, request.request) {
+                        (0, ClientRequest::ChatList) => ServerResponse::ChatListed {
+                            sessions: if state < 3 {
+                                vec![expected.clone()]
+                            } else {
+                                vec![]
+                            },
+                        },
+                        (1, ClientRequest::ChatPrepareResume { source })
+                            if state < 3 && source == expected =>
+                        {
+                            ServerResponse::ChatResumePrepared {
+                                session: expected.clone(),
+                            }
+                        }
+                        (1, ClientRequest::ResolveUpgradeChat { source })
+                            if state >= 3 && source == expected_source =>
+                        {
+                            ServerResponse::UpgradeChatResolved {
+                                session: expected.clone(),
+                            }
+                        }
+                        other => panic!("unexpected explicit retry request: {other:?}"),
+                    };
+                    codec
+                        .write(
+                            &mut server,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(request.request_id),
+                                proof: server_proof.clone(),
+                                message: ServerMessage::Response { response },
+                            },
+                        )
+                        .unwrap();
+                }
+            });
+            let result = restore(
+                &mut client,
+                &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+                &mut 1,
+                &proof,
+                source,
+                &mut None,
+                true,
+            );
+            worker.join().unwrap();
+            match state {
+                0 | 3 => assert!(
+                    matches!(result, Ok(ClientRequest::ChatStart { session, source: None, terminate_source: false, .. }) if session == hosted)
+                ),
+                1 => assert!(
+                    matches!(result, Ok(ClientRequest::ChatAttach { session }) if session == hosted)
+                ),
+                2 | 4 => assert!(
+                    result
+                        .unwrap_err()
+                        .message
+                        .contains("changed the explicit retry request")
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
     fn negotiate_with_recovery(
         live: &HostSessionProof,
         session: Session,
@@ -3538,6 +3820,7 @@ mod tests {
             live,
             session,
             &mut recovery,
+            false,
         );
         (outcome, worker.join().unwrap(), recovery)
     }
@@ -3673,6 +3956,7 @@ mod tests {
             &live,
             omp_card(Some(CONVERSATION), Some(live.clone())),
             &mut None,
+            false,
         )
         .expect("a live proof attaches");
         assert!(matches!(attach, ClientRequest::ChatAttach { .. }));

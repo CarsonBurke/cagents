@@ -131,18 +131,85 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
         let HostedSession::Chat(source) = source else {
             return Err("This agent has no native cleanup contract".into());
         };
-        let handle = {
-            let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            let record = state
-                .chats
-                .get(&source.id)
-                .filter(|record| {
-                    HostedSession::Chat(source.clone())
-                        .same_process(&HostedSession::Chat(record.session.clone()))
+        let (handle, previous_boot) = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let record = state.chats.get(&source.id).filter(|record| {
+                HostedSession::Chat(source.clone())
+                    .same_process(&HostedSession::Chat(record.session.clone()))
+            });
+            // A provider from an earlier kernel boot cannot still own a
+            // process. Retire only its completed historical execution; never
+            // borrow cleanup authority from a replacement with the same ID.
+            let previous_boot = retire
+                && state.proof().is_complete()
+                && source.proof.as_ref().is_some_and(|proof| {
+                    proof.is_complete() && proof.boot_id != state.proof().boot_id
                 })
-                .ok_or("The exact provider ownership is unavailable for reconciliation")?;
-            record.handle.clone()
+                && !state.chats.contains_key(&source.id)
+                && !state.terminals.contains_key(&source.id)
+                && !state.any_live(&[source.id])
+                && source
+                    .terminal
+                    .as_ref()
+                    .is_none_or(|terminal| !state.any_live(&[terminal.id]))
+                && agent
+                    .console
+                    .as_ref()
+                    .is_none_or(|terminal| !state.any_live(&[terminal.id]))
+                && !state.chat_spawning.contains_key(&source.id)
+                && !state.chat_handoffs.contains_key(&source.id)
+                && !state.native_closing.contains_key(&source.id)
+                && !state.native_actor_startups.contains_key(&source.id);
+            let handle = record.map(|record| record.handle.clone());
+            if previous_boot {
+                state.chat_spawning.insert(source.id, source.clone());
+                state
+                    .historical_chat_retirements
+                    .insert(source.id, source.clone());
+                state.inventory_generation += 1;
+            }
+            (handle, previous_boot)
         };
+        if previous_boot {
+            struct HistoricalRetirement<'a>(&'a SharedHost, &'a chat::Session);
+            impl Drop for HistoricalRetirement<'_> {
+                fn drop(&mut self) {
+                    let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+                    if state.historical_chat_retirements.get(&self.1.id) == Some(self.1) {
+                        state.historical_chat_retirements.remove(&self.1.id);
+                    }
+                    if state.chat_spawning.get(&self.1.id) == Some(self.1) {
+                        state.chat_spawning.remove(&self.1.id);
+                        state.inventory_generation += 1;
+                    }
+                }
+            }
+            let _reservation = HistoricalRetirement(host, source);
+            let mut store = registry.lock().unwrap_or_else(|p| p.into_inner());
+            if store.latest_agent_run(agent.id)? != *expected {
+                return Err(
+                    "A newer run changed this agent before automatic reconciliation".into(),
+                );
+            }
+            if store.agent(agent.id)? != agent || store.pending_agent_launch(agent.id)?.is_some() {
+                return Err("The historical agent changed before its retirement".into());
+            }
+            if store.agent_is_interactive(agent.id)? {
+                return Ok(Reconciliation::UserOwned);
+            }
+            // The transaction repeats these fences against the scheduler's
+            // independent WAL connection before any authority is revoked.
+            if !store.retire_completed_automation_process(&agent, expected, now())? {
+                return Err("The historical agent changed before its retirement".into());
+            }
+            drop(store);
+            drop(_reservation);
+            announce(host, &registry);
+            return Ok(Reconciliation::Closed);
+        }
+        let handle = handle.ok_or(
+            "The saved agent is not attached. Open its latest run to restore or close the agent, then retry this action",
+        )?;
         let idle_generation = if !handle.is_completed() {
             let snapshot = handle
                 .snapshot(None)
@@ -175,7 +242,17 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
         )
         .map_err(|error| error.message)?;
     } else if !retire {
-        return Err("The agent never established a reusable provider".into());
+        // A conclusive pre-provider failure has nothing to reuse. Retire only
+        // its exact empty dispatch, so normal scheduler release can clear the
+        // reusable slot without replaying the failed run. Pending or uncertain
+        // startup still refuses above and the write transaction repeats every
+        // ownership/run predicate before publishing the ordinary retirement.
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .close_unstarted_automation_agent(&agent, expected)?;
+        announce(host, &registry);
+        return Ok(Reconciliation::Closed);
     }
     registry
         .lock()

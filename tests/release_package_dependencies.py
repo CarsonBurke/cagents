@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Inspect real generated Debian metadata using disposable executable fixtures."""
+"""Inspect generated Linux packages using disposable executable fixtures."""
+import io
 import os
 from pathlib import Path
 import platform
@@ -7,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -127,20 +129,25 @@ class PackageDependencies(unittest.TestCase):
         self.binaries = self.work / "target/release"
         self.tools.mkdir()
         self.binaries.mkdir(parents=True)
-        # These are deliberately shell fixtures, never application ELFs. Only
-        # the fake CLI protocol query executes; UI/daemon execution fails.
+        # Shell fixtures, never application ELFs. Only version queries and the
+        # fake CLI protocol query execute; UI/daemon startup still fails.
         fixtures = {
             self.tools / "cargo": '#!/bin/sh\n[ "$1" = tree ] || exit 91\nprintf "fixture v1\\n"\n',
             self.tools / "strip": "#!/bin/sh\nexit 0\n",
-            self.binaries / "cagents": '#!/bin/sh\n[ "$*" = "daemon protocol-version" ] || exit 92\nprintf "1\\n"\n',
-            self.binaries / "cagents-ui": "#!/bin/sh\nexit 93\n",
-            self.binaries / "cagentsd": "#!/bin/sh\nexit 94\n",
+            self.binaries / "cagents": '#!/bin/sh\ncase "$*" in\n'
+            f'--version) printf "cagents {VERSION}\\n" ;;\n'
+            "'daemon protocol-version') printf '1\\n' ;;\n*) exit 92 ;;\nesac\n",
+            self.binaries / "cagents-ui": '#!/bin/sh\n[ "$*" = --version ] || exit 93\n'
+            f'printf "cagents-ui {VERSION}\\n"\n',
+            self.binaries / "cagentsd": '#!/bin/sh\n[ "$*" = --version ] || exit 94\n'
+            f'printf "cagentsd {VERSION}\\n"\n',
         }
         for path, contents in fixtures.items():
             path.write_text(contents)
             path.chmod(0o755)
         self.environment = os.environ.copy()
         self.environment.pop("CARGO_BUILD_TARGET", None)
+        self.environment.pop("CAGENTS_SKIP_STRIP", None)
         self.environment.update(
             PATH=f"{self.tools}:{os.environ['PATH']}",
             CARGO_TARGET_DIR=str(self.work / "target"),
@@ -178,7 +185,20 @@ class PackageDependencies(unittest.TestCase):
         failures = failures or {}
         warnings = warnings or {}
         source = (
-            '#!/bin/sh\n[ "$#" = 3 ] && [ "$1" = --wide ] '
+            '#!/bin/sh\n'
+            # Full UI font visibility is a separate pre-publication inspection.
+            # Keep this log/count dedicated to the existing GLIBC version needs.
+            'if [ "$#" = 3 ] && [ "$1" = --wide ] && [ "$2" = --dyn-syms ]; then\n'
+            '  [ "${3##*/}" = cagents-ui ] || exit 95\n'
+            '  cat <<EOF\n'
+            "Symbol table '.dynsym' contains 2 entries:\n"
+            ' Num: Value Size Type Bind Vis Ndx Name\n'
+            ' 0: 0000000000000000 0 NOTYPE LOCAL DEFAULT UND\n'
+            ' 1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND FT_Init_FreeType\n'
+            'EOF\n'
+            '  exit 0\n'
+            'fi\n'
+            '[ "$#" = 3 ] && [ "$1" = --wide ] '
             '&& [ "$2" = --version-info ] || exit 95\n'
             f'printf "%s\\n" "${{3##*/}}" >> {shlex.quote(str(self.invocations))}\n'
             'case ${3##*/} in\n'
@@ -249,6 +269,53 @@ class PackageDependencies(unittest.TestCase):
                     required_packages - runtime_packages, set(),
                     f"{variant} runtime dependencies missing from rootfs provisioning",
                 )
+
+    def test_explicit_strip_opt_out_preserves_all_executable_payloads(self):
+        originals = {
+            binary: (self.binaries / binary).read_bytes()
+            for binary in ("cagents", "cagents-ui", "cagentsd")
+        }
+        strip_calls = self.work / "strip-calls"
+        marker = b"# fixture strip mutation\n"
+        # A real byte change makes both an ignored opt-out and accidentally
+        # disabled default stripping observable in the generated artifacts.
+        (self.tools / "strip").write_text(
+            '#!/bin/sh\n[ "$#" = 4 ] && [ "$1" = --strip-unneeded ] || exit 97\n'
+            'shift\nfor binary in "$@"; do\n'
+            f'  printf "%s\\n" "${{binary##*/}}" >> {shlex.quote(str(strip_calls))}\n'
+            '  printf "# fixture strip mutation\\n" >> "$binary"\ndone\n'
+        )
+        for variant in ("full", "browserless"):
+            for preserve in (False, True):
+                with self.subTest(variant=variant, preserve=preserve):
+                    strip_calls.unlink(missing_ok=True)
+                    self.environment.pop("CAGENTS_SKIP_STRIP", None)
+                    if preserve:
+                        self.environment["CAGENTS_SKIP_STRIP"] = "1"
+                    result, dist = self.package(variant)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(
+                        strip_calls.read_text().splitlines() if strip_calls.exists() else [],
+                        [] if preserve else list(originals),
+                    )
+                    self.assertEqual(self.invocations.read_text().splitlines(), list(originals))
+                    name = "cagents" if variant == "full" else "cagents-browserless"
+                    archive = dist / f"{name}-{VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+                    deb = dist / f"{name}_{VERSION}_amd64.deb"
+                    deb_payload = subprocess.check_output(
+                        ["dpkg-deb", "--fsys-tarfile", str(deb)], timeout=10,
+                    )
+                    with tarfile.open(archive, "r:gz") as portable, \
+                            tarfile.open(fileobj=io.BytesIO(deb_payload), mode="r:") as debian:
+                        for binary, original in originals.items():
+                            expected = original if preserve else original + marker
+                            for payload, member in (
+                                (portable, f"{name}-{VERSION}/bin/{binary}"),
+                                (debian, f"./usr/libexec/{name}/{binary}"),
+                            ):
+                                with self.subTest(binary=binary, member=member):
+                                    self.assertEqual(payload.extractfile(member).read(), expected)
+                            self.assertEqual((self.binaries / binary).read_bytes(), original)
 
     def test_newer_requirement_from_each_packaged_elf_raises_both_variants(self):
         for newer in ("cagents", "cagents-ui", "cagentsd"):

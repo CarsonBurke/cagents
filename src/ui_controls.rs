@@ -11,6 +11,7 @@ pub use find_options::{FindOption, find_options};
 mod gauge;
 mod icon;
 mod icon_button;
+mod labeled_controls;
 mod owned;
 mod placeholder;
 mod popover;
@@ -19,11 +20,16 @@ mod shrinkable;
 mod tabs;
 
 pub use display::{badge, change_counts, comment_card};
-pub use gauge::{activity_spinner, budget_bar, budget_radial, budget_radial_toned};
+#[cfg(test)]
+pub(crate) use gauge::activity_animates;
+pub use gauge::{
+    activity_spinner, animate_activity, budget_bar, budget_radial, budget_radial_toned,
+};
 pub use icon::{Icon, ceditor_icon, ceditor_window_icon, passive_icon, provider_icon};
 pub use icon_button::{
     IconButton, control_style, icon_button, segmented_controls, toolbar_actions,
 };
+pub use labeled_controls::labeled_controls;
 pub use owned::owned;
 pub use placeholder::{Placeholder, placeholder};
 pub use popover::{popover, popover_item};
