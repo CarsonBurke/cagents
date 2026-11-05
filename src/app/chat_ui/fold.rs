@@ -109,7 +109,8 @@ impl<Message> Fold<'_, Message> {
 /// Passes an operation through to cut content, leaving out the controls the
 /// cut hides. Keyboard traversal then skips what the reader cannot see, as
 /// assistive technology does. A control that already holds focus is still
-/// offered, so traversal can move focus off it.
+/// offered, so traversal can move focus off it. Focusing a cut control by its
+/// id is dropped too, on purpose: unfold first to reach it.
 struct ShownFocus<'a> {
     inner: &'a mut dyn Operation,
     shown: Rectangle,
