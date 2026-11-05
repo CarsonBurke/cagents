@@ -5,6 +5,7 @@
 - [Development runner](#development-runner)
 - [Build and test resource usage](#build-and-test-resource-usage)
 - [Testing](#testing)
+- [Native evidence](#native-evidence)
 - [Installer and package checks](#installer-and-package-checks)
 - [Troubleshooting](#troubleshooting)
 - [Standalone editor](#standalone-editor)
@@ -745,6 +746,73 @@ For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
 changes, verify both the browserless and integrated lanes. Performance
 workloads are described in [Performance](performance.md).
+
+## Native evidence
+
+`scripts/native-evidence` captures before/after screenshots of the actual native
+app, from a shell where the desktop session or `DISPLAY` is unavailable, such as
+plain SSH. It runs headless: KWin's virtual backend hosts a nested niri session,
+driven by `niri-harness`, running `scripts/run-development --browserless`.
+Each task keeps everything in one directory outside Git ancestry. Avoid `/tmp`,
+`/var/tmp` and `~/.cache`, where Codex sandboxes can leave an empty `.git` that
+fixtures refuse.
+
+Build before taking the native lock, and never wait for Cargo while holding it: every other native session queues behind you. `build` takes one `scripts/cargo-gate` slot. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
+
+```sh
+export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/my-task
+git worktree add --detach .worktrees/my-task-before origin/main
+
+# A build slot only. Seed a new target copy-on-write from a finished one.
+scripts/native-evidence build before .worktrees/my-task-before --seed-target /var/tmp/other/target
+scripts/native-evidence build after . --seed-target "$CAGENTS_EVIDENCE_TASK/target-before"
+
+# Prepare data once, then keep it. Every later start restores this seed.
+scripts/native-evidence start before
+scripts/native-evidence cli project open "$CAGENTS_EVIDENCE_TASK/fixture/project"
+scripts/native-evidence stop
+scripts/native-evidence save-seed
+
+scripts/native-evidence start before --width 1200
+scripts/native-evidence drive observe
+scripts/native-evidence drive click 'Open repository'
+scripts/native-evidence shot channel-prs     # shots/before-channel-prs.webp
+scripts/native-evidence stop
+
+scripts/native-evidence start after --width 1200
+# ...the same steps...
+scripts/native-evidence stop
+```
+
+Run `scripts/native-evidence --help` for every command. Beyond a hand-written
+harness, it provides:
+
+- **Isolation.** The fixture has its own HOME, XDG directories, daemon and runtime
+  directory, and the compositor has separate ones, so a session leaves the desktop's
+  settings alone. The app starts from an empty environment: nothing from your shell
+  reaches it except locale and terminal settings, and where Cargo and rustup live. `claude` is the offline
+  [synthetic provider](chat-composer-fixture.md), the same file on both sides, and
+  `gh` always fails. Files in `$CAGENTS_EVIDENCE_FIXTURE/home/.claude` switch fixture
+  behaviors. `env CMD` runs your own setup in this environment, with the fixture's
+  root in `CAGENTS_EVIDENCE_FIXTURE`. Terminals and agents still enroll in scopes on
+  the host's user manager, as development sessions do.
+- **Matching evidence.** `start` refuses a checkout that changed since its build.
+  `shots/manifest.tsv` records each image's revision, source state, requested
+  width and size, so a pair can be compared and named in the PR.
+- **A shared path caveat.** With no worktree selected, the Workspace page shows
+  the app's working directory, which is the checkout and so differs between
+  sides. Select the fixture project's worktree before capturing a pair.
+- **One session at a time.** `start` waits for `/var/tmp/cagents-fw16-native.lock`
+  (override with `CAGENTS_EVIDENCE_NATIVE_LOCK`). Stop as soon as you have the
+  evidence. A session gives the lock up after `--limit` seconds even if its
+  owner has gone. `build` uses `/var/tmp/cagents-fw16-cargo.lock` the same way.
+- **Cleanup.** `stop` stops the fixture daemon, then ends any process that
+  inherited the task's private runtime directory. That path is the proof of
+  ownership, so nothing else on the host is touched.
+
+Like `fixture_env`, it exits 77 under inherited agent authority and never removes
+that authority, so a hosted agent shell cannot use it. Remove the task directory
+when the PR merges; its targets are large.
 
 ## Installer and package checks
 
