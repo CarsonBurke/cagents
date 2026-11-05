@@ -804,6 +804,14 @@ exec sleep 60
         cargo.chmod(0o755)
         self.env["PATH"] = f"{binary}:{self.env['PATH']}"
 
+    def open_files(self, pid):
+        # A process still starting closes files as it loads, so one listed may be gone.
+        files = []
+        for entry in Path(f"/proc/{pid}/fd").iterdir():
+            with contextlib.suppress(FileNotFoundError):
+                files.append(os.readlink(entry))
+        return files
+
     def kill_gate_and_check_the_daemon(self, child):
         self.wait_for((self.root / "ready").exists, "the leftover daemon")
         daemon, stub = map(int, (self.root / "ready").read_text().split())
@@ -813,8 +821,7 @@ exec sleep 60
         child.kill()
         child.wait(timeout=5)
         os.kill(daemon, 0)
-        open_files = [os.readlink(entry) for entry in Path(f"/proc/{daemon}/fd").iterdir()]
-        self.assertNotIn(str(self.lock), open_files)
+        self.assertNotIn(str(self.lock), self.open_files(daemon))
         self.wait_for(self.slot_is_free, "the slot of a killed gate")
         os.kill(daemon, 0)
 
