@@ -613,6 +613,38 @@ scripts/cargo-gate test --locked --no-default-features --features host --test te
 scripts/cargo-gate test --locked --no-default-features --features ui --test session_restore_contract
 ```
 
+For focused root library tests, compile one isolated test harness and run the
+Cargo-reported executable directly, after its build admission has ended:
+
+```sh
+scripts/test-lib cli search_match::tests::overlapping_occurrences_keep_the_best_boundary_rank
+scripts/test-lib host --prefix terminal:: --test-threads 1
+scripts/test-lib ui --profile dev-runtime --prefix app::chat_ui::
+```
+
+Use actual full test names, or repeat `--prefix MODULE::` for literal module
+groups. Prefixes expand to ordinary full names and overlapping selections run
+once. The command rejects missing names, duplicate exact names, empty groups,
+ambiguous artifacts and ignored-only selections. An explicitly named ignored
+test is refused; ignored tests within a prefix are visibly skipped. Use the
+existing explicit opt-in workflow for ignored cases, after satisfying their
+fixture and authority requirements.
+
+The helper fixes `--locked --no-default-features --package cagents --lib` and
+selects only the requested CLI, HOST or UI boundary. It preserves the caller's
+Cargo environment, stdin, test exit status and cancellation. It submits one
+test-compilation command through `scripts/cargo-gate`, then performs discovery
+and exact execution without Cargo. Set the usual `CARGO_BUILD_JOBS`,
+`CARGO_TARGET_DIR` and `CAGENTS_BUILD_LOCK` as needed. The gate's existing build
+directory seeding policy also applies; `CAGENTS_BUILD_SEED=0` disables it. Keep
+source and target unchanged until the command finishes; a detected executable
+replacement is refused.
+
+Run the helper outside `cargo-gate exec`, a parent `flock`, or a coordinator's
+held build lease. It refuses inherited admission because a child cannot release
+its parent's lock. The ordinary `cargo-gate test` commands above remain useful
+for integration targets, broader suites and explicit ignored-test workflows.
+
 The selected IPC source contract can be checked without compiling Rust:
 
 ```sh
