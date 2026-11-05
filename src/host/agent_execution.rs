@@ -335,10 +335,30 @@ const UNDELIVERED_CANCELLATION: &str = "Cancelled before the provider received t
 /// Waits, without the agent's gate, until a bound provider can take its
 /// first prompt.
 fn await_provider_ready(handle: &chat::runtime::Handle) -> Result<(), (State, String)> {
+    await_provider_ready_until(handle, Instant::now() + Duration::from_secs(30))
+}
+
+fn await_provider_ready_until(
+    handle: &chat::runtime::Handle,
+    deadline: Instant,
+) -> Result<(), (State, String)> {
     let before = |message| (State::Failed, message);
-    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let snapshot = provider_launch_snapshot(handle)?;
+        // A retained snapshot is a helper RPC, and one call can miss its
+        // deadline on a busy host while the helper stays healthy. Reading a
+        // snapshot sends no prompt, so keep polling within the launch budget.
+        // Stop at once when the attachment itself records a failure or exit.
+        let snapshot = match provider_launch_snapshot(handle) {
+            Ok(snapshot) => snapshot,
+            Err(unconfirmed) => {
+                if handle.failure().is_some() || handle.is_completed() || Instant::now() >= deadline
+                {
+                    return Err(unconfirmed);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+        };
         if snapshot.exited || handle.is_completed() {
             return Err(before("Provider exited before accepting the prompt".into()));
         }

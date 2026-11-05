@@ -1214,6 +1214,10 @@ fn submitted(
         "agent": accepted.agent,
         "run": accepted.run,
         "created": accepted.created,
+        // Whether this invocation resubmitted after losing the daemon's
+        // answer. A retry reports `created: false` even when its own lost
+        // attempt created the work.
+        "retried": retried,
         "idempotency_key": key,
     });
     if wait.wait {

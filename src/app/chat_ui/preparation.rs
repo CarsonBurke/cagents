@@ -2,7 +2,7 @@
 use super::*;
 use std::sync::atomic::AtomicUsize;
 
-const SOURCE_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const QUEUED_BYTES: usize = 72 * 1024 * 1024;
 const QUEUED_ITEMS: usize = 128;
 // Bytes leased across the application, bounded by QUEUED_BYTES.

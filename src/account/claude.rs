@@ -84,7 +84,16 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
         None => keyed_windows(limits),
     };
     let credits = credits(limits);
-    let status = status_for(&windows, false, provider_warning);
+    // An object (or metadata about credits/plan) is not positive quota.
+    // Missing or malformed windows must not authorize automatic routing.
+    let (status, detail) = if windows.is_empty() {
+        (
+            UsageStatus::Unavailable,
+            Some("Claude did not report usable usage limits".into()),
+        )
+    } else {
+        (status_for(&windows, false, provider_warning), None)
+    };
     UsageSnapshot {
         windows,
         credits,
@@ -93,7 +102,29 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
         observed_at,
         source: UsageSource::Probe,
         plan,
-        detail: None,
+        detail,
+    }
+}
+
+/// A probe must distinguish a transient missing reading from the provider
+/// explicitly saying that this account does not support usage reporting.
+/// Scoped-only windows are display data, not an ordinary-usage observation.
+/// Returning an error keeps the prior snapshot and identity under the existing
+/// probe failure policy; no replacement quota or catalog is published.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(super) fn probe_usage(
+    response: &Value,
+    observed_at: u64,
+) -> Result<UsageSnapshot, &'static str> {
+    let snapshot = parse_usage(response, observed_at);
+    let ordinary_quota = snapshot
+        .windows
+        .iter()
+        .any(|window| window.kind != WindowKind::Scoped && window.used.is_finite());
+    if !ordinary_quota && response["rate_limits_available"].as_bool() != Some(false) {
+        Err("Claude Code could not read usage just now")
+    } else {
+        Ok(snapshot)
     }
 }
 
@@ -139,7 +170,9 @@ fn normalized_window(limit: &Value) -> Option<UsageWindow> {
     if !percent.is_finite() {
         return None;
     }
-    let kind_name = limit["kind"].as_str().unwrap_or_default();
+    let kind_name = limit["kind"]
+        .as_str()
+        .filter(|kind| !kind.trim().is_empty())?;
     let group = limit["group"].as_str().unwrap_or_default();
     let scope = scope_label(&limit["scope"]);
     let (kind, label, key, span) = match kind_name {
@@ -716,5 +749,91 @@ mod tests {
                 .unwrap();
         merge_live(&mut usage, update, 30);
         assert_eq!(usage.status, UsageStatus::Warning);
+    }
+
+    #[test]
+    fn sparse_or_malformed_probe_limits_do_not_authorize_routing() {
+        let now = 1_000;
+        for response in [
+            json!(null),
+            json!({}),
+            json!({"rate_limits": null}),
+            json!({"rate_limits": []}),
+            json!({"rate_limits": {}}),
+            json!({"rate_limits": {"limits": []}}),
+            json!({"rate_limits": {"limits": "unavailable"}}),
+            json!({"rate_limits": {"limits": [null, {},
+                {"kind": "session", "percent": null},
+                {"kind": "session", "percent": "0"},
+                {"kind": "session", "percent": false},
+                {"kind": "session", "percent": []},
+                {"kind": "session", "percent": {}},
+            ]}}),
+            json!({"rate_limits": {"limits": [
+                {"percent": 0}, {"kind": null, "percent": 0},
+                {"kind": 1, "percent": 0}, {"kind": "", "percent": 0},
+                {"kind": "  ", "percent": 0},
+            ]}}),
+            json!({"rate_limits": {
+                "five_hour": {"utilization": null},
+                "seven_day": {"utilization": "0"},
+                "model_scoped": [{"display_name": "Opus", "utilization": false}],
+            }}),
+            json!({"rate_limits": {"future_internal_name": {"utilization": 0}}}),
+        ] {
+            let usage = parse_usage(&response, now);
+            assert_eq!(usage.status, UsageStatus::Unavailable, "{response}");
+            assert!(usage.windows.is_empty(), "{response}");
+            assert!(usage.detail.is_some(), "{response}");
+            assert_eq!(usage.observed_at, now);
+            assert_eq!(usage.source, UsageSource::Probe);
+            assert!(!super::super::routing::available(&usage, now), "{response}");
+            assert!(
+                !super::super::routing::needs_alternate(&usage, now),
+                "unknown quota is not an exhaustion or sign-in rejection: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_metadata_is_retained_without_inventing_quota_permission() {
+        let mut response = json!({"subscription_type": "max", "rate_limits": {
+            "limits": [],
+            "spend": {"enabled": true, "percent": 25,
+                "used": {"amount_minor": 125, "currency": "USD", "exponent": 2},
+                "limit": {"amount_minor": 500, "currency": "USD", "exponent": 2}},
+        }});
+        let unknown = parse_usage(&response, 1_000);
+        assert_eq!(unknown.plan.as_deref(), Some("max"));
+        assert_eq!(
+            unknown.credits.as_ref().unwrap().summary(),
+            "$1.25 of $5.00 used"
+        );
+        assert_eq!(unknown.status, UsageStatus::Unavailable);
+        assert!(!super::super::routing::available(&unknown, 1_000));
+        for (percent, status, available) in [
+            (0, UsageStatus::Ok, true),
+            (81, UsageStatus::Warning, true),
+            (100, UsageStatus::Limited, false),
+        ] {
+            response["rate_limits"]["limits"] = json!([
+                {"kind": "session", "percent": percent},
+            ]);
+            let reported = parse_usage(&response, 1_001);
+            assert_eq!(reported.status, status);
+            assert_eq!(reported.windows.len(), 1);
+            assert_eq!(reported.plan, unknown.plan);
+            assert_eq!(reported.credits, unknown.credits);
+            assert_eq!(
+                super::super::routing::available(&reported, 1_001),
+                available
+            );
+        }
+        response["rate_limits"]["limits"] = json!([
+            {"kind": "future_daily_burst", "group": "session", "percent": 5},
+        ]);
+        let future = parse_usage(&response, 1_002);
+        assert_eq!(future.windows[0].key, "future_daily_burst");
+        assert!(super::super::routing::available(&future, 1_002));
     }
 }

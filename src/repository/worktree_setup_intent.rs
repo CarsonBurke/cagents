@@ -136,6 +136,7 @@ mod tests {
 
     fn request(root: &Path) -> CreateWorktreeRequest {
         CreateWorktreeRequest {
+            resolution_warnings: Vec::new(),
             repository: root.join("repo"),
             managed_root: root.join("managed"),
             managed_ignore_root: None,

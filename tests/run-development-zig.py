@@ -72,6 +72,7 @@ exit 83
             SHIM_CALLS=str(self.shim_calls), CARGO_CALLS=str(self.cargo_calls),
             # The runner builds through the gate; keep it off the host's locks.
             CAGENTS_BUILD_LOCK=str(self.root / "cargo.lock"),
+            CAGENTS_BUILD_INSTALLED_GATE="", CAGENTS_BUILD_REMOTE="local",
         )
         self.env.pop("CAGENTS_BUILD_SLOT_HELD", None)
         self.env.pop("MISE_DATA_DIR", None)
@@ -235,6 +236,16 @@ exit 83
         self.assert_built("--browserless")
         self.assert_skipped("--browserless")
         self.assert_skipped("--browserless")
+
+    def test_a_launch_building_on_the_build_host_always_asks_it(self):
+        # Cargo's dependency lists stay there, so nothing here can say the
+        # products are current.
+        offload = self.runner.with_name("cargo-offload")
+        offload.write_text('#!/bin/sh\n[ "$1" != --host ] || { echo build-host; exit 0; }\n'
+                           'exec cargo "$@"\n')
+        offload.chmod(0o755)
+        self.assert_built("--browserless")
+        self.assert_built("--browserless")
 
     def test_identity_records_hide_environment_values_and_stay_private(self):
         # Build tools are inert; these are synthetic values, including an

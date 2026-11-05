@@ -1,5 +1,6 @@
-//! Absolute-budget framing for read-only holder census. Partial progress never
-//! renews its budget, and nonblocking descriptors keep socket syscalls finite.
+//! Absolute-budget framing for every retained actor request. Partial progress
+//! never renews its budget, and nonblocking descriptors keep socket syscalls
+//! finite.
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     io::{Read, Write},
@@ -11,7 +12,7 @@ fn remaining(deadline: Instant) -> Result<Duration, String> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|left| !left.is_zero())
-        .ok_or_else(|| "Retained actor inspection deadline expired".into())
+        .ok_or_else(|| "Retained actor socket deadline expired".into())
 }
 fn ready(control: &UnixStream, events: libc::c_short, deadline: Instant) -> Result<(), String> {
     loop {
@@ -35,7 +36,7 @@ fn ready(control: &UnixStream, events: libc::c_short, deadline: Instant) -> Resu
             return Err(error.to_string());
         }
         if event.revents & libc::POLLNVAL != 0 {
-            return Err("Retained actor inspection descriptor closed".into());
+            return Err("Retained actor socket descriptor closed".into());
         }
         return Ok(());
     }
@@ -49,7 +50,7 @@ fn write_exact_until(
     while !bytes.is_empty() {
         remaining(deadline)?;
         match writer.write(bytes) {
-            Ok(0) => return Err("Retained actor inspection socket stopped accepting data".into()),
+            Ok(0) => return Err("Retained actor socket stopped accepting data".into()),
             Ok(count) => bytes = &bytes[count..],
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -69,7 +70,7 @@ fn read_exact_until(
     while !bytes.is_empty() {
         remaining(deadline)?;
         match reader.read(bytes) {
-            Ok(0) => return Err("Retained actor inspection response ended early".into()),
+            Ok(0) => return Err("Retained actor response ended early".into()),
             Ok(count) => bytes = &mut bytes[count..],
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
