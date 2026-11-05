@@ -373,6 +373,78 @@ impl Cagents {
         }
     }
 
+    /// A terminal start that has to wait. An automatic or explicit creation
+    /// waits for the registry to accept its pane, and a restored terminal this
+    /// window may share waits for the registry to say whether it does.
+    pub(super) fn terminal_start_held(&self, card: CardId, explicit_retry: bool) -> bool {
+        self.shared_views.defaults.contains_key(&card)
+            || self.durable.pending_terminal_creations.contains(&card)
+            || (self.shared_views.attached.contains(&card)
+                && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+                && !explicit_retry)
+    }
+
+    /// Whether another window may host this terminal, so this one only
+    /// attaches to it. A restored window marks every saved terminal as
+    /// possibly shared until the registry answers; one the registry lists in
+    /// no view belongs to this window alone and recovers like any other.
+    pub(super) fn terminal_shared_in_registry(&self, card: CardId) -> bool {
+        self.shared_views.attached.contains(&card)
+            && self
+                .workspace_model
+                .views
+                .iter()
+                .any(|view| view.panes.iter().any(|pane| pane.id == card))
+    }
+
+    /// Admits again the hydration of a restored terminal whose start was held
+    /// for the registry. The lifecycle already counts it as hydrating, so it
+    /// would otherwise never be asked to start and its pane would stay on
+    /// "Starting terminal…" for as long as the window is open.
+    fn readmit_held_terminal(&mut self, card: CardId, exposure: Exposure) {
+        self.cards.insert(card, CardRuntime::Loading);
+        self.lifecycle
+            .register(card, exposure, Residency::Cold, Instant::now());
+        if let Some(state) = self.card_state_mut(card) {
+            state.residency = Residency::Cold;
+        }
+    }
+
+    /// Projecting a view admits its own held terminals again, but a terminal
+    /// can have no projection to do that: the registry lists a window-local
+    /// one in no view, and a view can stay unprojected while its scope is
+    /// still loading. Once the registry has answered, every terminal still
+    /// held is admitted here, so none waits on a projection that never comes.
+    fn readmit_held_terminals(&mut self) -> Task<Message> {
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return Task::none();
+        }
+        let held = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| {
+                matches!(&card.kind, CardKind::Terminal(session) if !terminal_ended(session))
+                    && card.existence.is_open()
+                    && matches!(card.residency, Residency::Hydrating { .. })
+                    && matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
+                    && self.shared_views.attached.contains(&card.id)
+                    && !self.terminal_start_held(card.id, false)
+                    && !self.terminal_start_in_flight(card.id)
+                    && !self.terminal_retry_pending(card.id)
+                    && !self.pane_close_owned(card.id)
+            })
+            .map(|card| (card.id, card.exposure))
+            .collect::<Vec<_>>();
+        if held.is_empty() {
+            return Task::none();
+        }
+        for (card, exposure) in held {
+            self.readmit_held_terminal(card, exposure);
+        }
+        cosmic::task::message(Message::LifecycleSweep)
+    }
+
     pub(super) fn worktree_view_scope(&self, path: &Path) -> Option<Scope> {
         let project = self.sidebar_model.projects.iter().find(|project| {
             project
@@ -1461,6 +1533,7 @@ impl Cagents {
             }
         }
         self.reproject_notification_unread();
+        tasks.push(self.readmit_held_terminals());
         Task::batch(tasks)
     }
 
@@ -1824,15 +1897,10 @@ impl Cagents {
                 && matches!(self.cards.get(&pane.id), Some(CardRuntime::Failed(_)));
             if matches!(pane.kind, CardKind::Terminal(_)) && no_start && (waiting || failed_pending)
             {
-                self.cards.insert(pane.id, CardRuntime::Loading);
                 let exposure = existing
                     .as_ref()
                     .map_or(Exposure::Offscreen, |card| card.exposure);
-                self.lifecycle
-                    .register(pane.id, exposure, Residency::Cold, Instant::now());
-                if let Some(card) = self.card_state_mut(pane.id) {
-                    card.residency = Residency::Cold;
-                }
+                self.readmit_held_terminal(pane.id, exposure);
             }
             match existing {
                 Some(card) if card.existence.is_open() => {
@@ -5243,6 +5311,101 @@ mod tests {
         app.workspace_model.views = vec![view];
         drop(app.reconcile_shared_views());
         assert!(app.terminal_starts.lock().unwrap().contains_key(&id));
+    }
+
+    /// #2104: a window restored while its registry is still connecting holds
+    /// every saved terminal it may share. Projecting a view admits its own held
+    /// terminals again once the registry answers; a terminal the registry lists
+    /// in no view has no projection, so it must be admitted too, and recovers
+    /// as this window's own rather than waiting for another window to host it.
+    #[test]
+    fn restored_terminal_held_for_registry_starts_once_it_answers() {
+        let (mut app, _, _, _) = fixture();
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(session, None));
+        let id = app.workspace.focused().unwrap();
+        assert!(!app.durable.pending_terminal_creations.contains(&id));
+        // Restart: the saved window had joined a registry, so its terminal
+        // may be shared, and the new process has not heard from one yet.
+        let identity = app.workspace_model.identity;
+        Arc::make_mut(&mut app.durable).workspace_model_identity = Some(identity);
+        app.shared_views = State::for_workspace(&app.durable);
+        app.workspace_model = crate::workspace_model::WorkspaceModel::default();
+        app.terminal_starts.lock().unwrap().clear();
+        app.cards.insert(id, CardRuntime::Loading);
+        app.card_state_mut(id).unwrap().residency = Residency::Hibernated;
+        app.lifecycle
+            .register(id, Exposure::Visible, Residency::Hibernated, Instant::now());
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        assert!(
+            matches!(
+                app.lifecycle.state(id),
+                Some((_, Residency::Hydrating { .. }))
+            ),
+            "the lifecycle counts the held terminal as hydrating"
+        );
+        assert!(
+            app.terminal_starts.lock().unwrap().is_empty(),
+            "a possibly shared terminal waits for the registry"
+        );
+
+        let mut model = crate::workspace_model::WorkspaceModel::default();
+        model.identity = identity;
+        model.sequence = 1;
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Connected(model),
+        ));
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        assert_eq!(
+            app.terminal_starts.lock().unwrap().get(&id),
+            Some(&1),
+            "the registry answering admits the held start again"
+        );
+        assert!(
+            !app.terminal_shared_in_registry(id),
+            "a terminal in no shared view recovers as this window's own"
+        );
+        // A later reconciliation leaves the start in flight alone.
+        drop(app.reconcile_shared_views());
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        assert_eq!(app.terminal_starts.lock().unwrap().get(&id), Some(&1));
+    }
+
+    /// The shared counterpart: a held terminal the registry lists in a view
+    /// starts too, through the attach-only path, since another window may
+    /// host it.
+    #[test]
+    fn restored_shared_terminal_held_for_registry_attaches_once_it_answers() {
+        let (mut app, a, _, _) = fixture();
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(session, None));
+        let id = app.workspace.focused().unwrap();
+        let identity = app.workspace_model.identity;
+        Arc::make_mut(&mut app.durable).workspace_model_identity = Some(identity);
+        app.shared_views = State::for_workspace(&app.durable);
+        app.shared_views.initialized.insert(Scope::Channel(a));
+        app.workspace_model = crate::workspace_model::WorkspaceModel::default();
+        app.terminal_starts.lock().unwrap().clear();
+        app.cards.insert(id, CardRuntime::Loading);
+        app.card_state_mut(id).unwrap().residency = Residency::Hibernated;
+        app.lifecycle
+            .register(id, Exposure::Visible, Residency::Hibernated, Instant::now());
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+
+        let mut view = View::empty(a);
+        view.panes
+            .push(Pane::from_card(app.card_state(id).unwrap(), None).unwrap());
+        let mut model = crate::workspace_model::WorkspaceModel::default();
+        model.identity = identity;
+        model.sequence = 1;
+        model.views = vec![view];
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Connected(model),
+        ));
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        assert_eq!(app.terminal_starts.lock().unwrap().get(&id), Some(&1));
+        assert!(app.terminal_shared_in_registry(id));
     }
 
     #[test]
