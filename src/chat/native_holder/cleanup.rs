@@ -134,6 +134,27 @@ impl Detached {
         if self.receipt(retain)? {
             return Ok(());
         }
+        match self.release_through_holder(retain) {
+            Ok(()) => Ok(()),
+            // A holder releasing itself retires its listener just before it
+            // publishes the receipt, so a refused or reset connection may only
+            // mean that cleanup is already finishing.
+            Err(error) => {
+                let deadline = std::time::Instant::now() + RETIREMENT_GRACE;
+                loop {
+                    if self.receipt(retain)? {
+                        return Ok(());
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    fn release_through_holder(&self, retain: bool) -> Result<(), String> {
         let (recovery, _) = super::transport::inspect(&self.record, &self.proof)?;
         // A retained source is lineage evidence, not authority over a new
         // daemon owner. Adoption may not silently rotate a successor backwards.
