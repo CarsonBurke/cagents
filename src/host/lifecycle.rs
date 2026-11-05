@@ -1,10 +1,11 @@
 //! Deadline-driven retirement. Cleanup and receipt reads run outside HostState.
+use super::model::Registry;
 use super::state::{Retirement, SharedHost};
 use crate::{model::TerminalId, terminal::TerminalRetirement};
 use std::{
     collections::BTreeSet,
     fs::File,
-    sync::{Arc, RwLock, RwLockWriteGuard, TryLockError},
+    sync::{Arc, Mutex, RwLock, RwLockWriteGuard, TryLockError},
     time::{Duration, Instant},
 };
 
@@ -166,14 +167,14 @@ impl Lifecycle {
             .collect();
         // Fences normal pin publications and rechecks durable membership just
         // before removal. Unknown or newly pinned results remain listed.
-        let pinned = registry
-            .ok_or_else(|| "The workspace registry is unavailable".to_owned())
-            .and_then(|registry| {
-                registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .pinned_terminals(&candidates)
-            });
+        let pinned = match pin_census(registry.as_ref(), &candidates) {
+            Census::Busy => {
+                self.settlement_retry = Some(Instant::now() + RETENTION_RETRY);
+                return;
+            }
+            Census::Pinned(pinned) => Ok(pinned),
+            Census::Failed(error) => Err(error),
+        };
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let mut dropped = Vec::new();
         let mut retired = Vec::new();
@@ -251,23 +252,12 @@ impl Lifecycle {
                 .map(|(id, _)| id)
                 .collect::<BTreeSet<TerminalId>>()
         };
-        let census = |candidates: &BTreeSet<TerminalId>| {
-            registry
-                .as_ref()
-                .ok_or_else(|| "The workspace registry is unavailable".to_owned())
-                .and_then(|registry| {
-                    registry
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .pinned_terminals(candidates)
-                })
-        };
         // Any wake reaches here while a saved pane's expired terminal exists.
         // A writer queued at the gate holds back every new reader, including
         // terminal input, until the slowest shared request ends. So settle
         // pinned candidates without it, and never queue for the rest.
         let unfenced = expired();
-        if let Ok(pinned) = census(&unfenced)
+        if let Census::Pinned(pinned) = pin_census(registry.as_ref(), &unfenced)
             && unfenced.is_subset(&pinned)
         {
             self.retention_error_reported = false;
@@ -279,12 +269,13 @@ impl Lifecycle {
         let Some(admission) = try_admission(&gate) else {
             return Some(Instant::now() + RETENTION_RETRY);
         };
-        let pinned = match census(&expired()) {
-            Ok(pinned) => {
+        let pinned = match pin_census(registry.as_ref(), &expired()) {
+            Census::Busy => return Some(Instant::now() + RETENTION_RETRY),
+            Census::Pinned(pinned) => {
                 self.retention_error_reported = false;
                 pinned
             }
-            Err(error) => {
+            Census::Failed(error) => {
                 if !self.retention_error_reported {
                     tracing::warn!(%error, "Completed terminal retention is deferred; pane ownership is unknown");
                     self.retention_error_reported = true;
@@ -321,6 +312,33 @@ impl Lifecycle {
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
             .terminal_retention_deadline(self.retention, &pinned)
+    }
+}
+
+enum Census {
+    Pinned(BTreeSet<TerminalId>),
+    /// Another thread holds the registry, possibly across a durable commit.
+    Busy,
+    Failed(String),
+}
+
+// Maintenance shares the accept loop's thread, and may hold the control gate.
+// Waiting out a slow commit here would stop every new connection with it.
+fn pin_census(
+    registry: Option<&Arc<Mutex<Registry>>>,
+    candidates: &BTreeSet<TerminalId>,
+) -> Census {
+    let Some(registry) = registry else {
+        return Census::Failed("The workspace registry is unavailable".to_owned());
+    };
+    let registry = match registry.try_lock() {
+        Ok(registry) => registry,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => return Census::Busy,
+    };
+    match registry.pinned_terminals(candidates) {
+        Ok(pinned) => Census::Pinned(pinned),
+        Err(error) => Census::Failed(error),
     }
 }
 
@@ -943,7 +961,7 @@ mod tests {
     /// queue a writer behind it, or every new reader, including terminal input,
     /// would wait for that unrelated request to finish.
     #[test]
-    fn retention_never_queues_a_gate_writer_behind_a_slow_shared_request() {
+    fn retention_maintenance_never_waits_for_a_slow_request_or_commit() {
         if isolated_lifecycle_case() {
             return;
         }
@@ -1042,6 +1060,33 @@ mod tests {
         assert!(host.lock().unwrap().terminal_retirements.is_empty());
 
         drop(slow_request);
+
+        // Maintenance shares the accept loop's thread. A durable commit holds
+        // the registry across fsync, and must not stop new connections.
+        let slow_commit = registry.lock().unwrap();
+        let (mut lifecycle, deadline) = maintain_unblocked(lifecycle, &host);
+        assert!(deadline.is_some_and(|deadline| deadline > Instant::now()));
+        assert!(host.lock().unwrap().terminal_retirements.is_empty());
+        assert!(gate.try_write().is_ok(), "no writer outlives maintenance");
+        drop(slow_commit);
+
+        lifecycle.maintain(&host, true);
+        assert!(!host.lock().unwrap().terminal_retirements.is_empty());
+        wait_until(|| {
+            matches!(
+                handle.completed_retirement(&source, &proof),
+                TerminalRetirement::Released
+            )
+        });
+
+        // Settling needs the same census, and holds the gate while it runs.
+        let slow_commit = registry.lock().unwrap();
+        let (mut lifecycle, deadline) = maintain_unblocked(lifecycle, &host);
+        assert!(deadline.is_some_and(|deadline| deadline > Instant::now()));
+        assert_eq!(host.lock().unwrap().list(1).len(), 1);
+        assert!(gate.try_write().is_ok(), "no writer outlives settlement");
+        drop(slow_commit);
+
         wait_until(|| {
             lifecycle.maintain(&host, true);
             host.lock().unwrap().list(1).is_empty()
