@@ -66,7 +66,7 @@ pub(super) struct State {
     baseline: HashMap<Scope, Vec<Pane>>,
     initialized: HashSet<Scope>,
     seeding: HashSet<Scope>,
-    pending: Vec<(uuid::Uuid, Scope, Change)>,
+    pub(super) pending: Vec<(uuid::Uuid, Scope, Change)>,
     /// Immutable logical-source identity captured when each Update is queued.
     /// A later watcher snapshot must not redefine the origin of a stale edit.
     source_bases: HashMap<uuid::Uuid, (uuid::Uuid, PathBuf)>,
@@ -234,6 +234,22 @@ impl Cagents {
             // An old-scope receipt cannot retire an already retargeted retry.
             return self.reconcile_workspace_model();
         };
+        // Another window can publish the same session update first, as when two
+        // windows attached to one conversation both learn its provider session.
+        // Nothing was lost, so there is nothing to tell anyone about.
+        let already_applied = matches!(&change, Change::Update { pane, .. } if {
+            let mut owners = self
+                .workspace_model
+                .views
+                .iter()
+                .flat_map(|view| &view.panes)
+                .filter(|current| current.id == pane.id);
+            owners.next().is_some_and(|current| {
+                current.kind == pane.kind
+                    && current.pending_terminal_start == pane.pending_terminal_start
+                    && current.scope == pane.scope
+            }) && owners.next().is_none()
+        });
         let mut retry = None;
         if let Change::Update { before, pane } = &change
             && before.id == pane.id
@@ -293,7 +309,9 @@ impl Cagents {
                 }
             }
         }
-        tracing::warn!(?scope, %operation, %error, "refused source-sensitive pane intent; host applied no fields");
+        if !already_applied {
+            tracing::warn!(?scope, %operation, %error, "refused source-sensitive pane intent; host applied no fields");
+        }
         self.shared_views.pending.remove(index);
         let source_basis = self.shared_views.source_bases.remove(&operation);
         if let Some((operation, scope, revision, change)) = retry {
@@ -312,9 +330,11 @@ impl Cagents {
                 change,
             });
         }
-        self.notices.record(TransientNotice::warning(
-            "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
-        ));
+        if !already_applied {
+            self.notices.record(TransientNotice::warning(
+                "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
+            ));
+        }
         self.reconcile_workspace_model()
     }
 
@@ -1855,6 +1875,7 @@ impl Cagents {
                         if !same_session {
                             // A held title belongs to the replaced session.
                             self.reported_title_save.cards.remove(&pane.id);
+                            self.forget_peer_started(pane.id);
                             // Sending in another window replaces a shared draft
                             // with a new one; what this window wrote stays.
                             if matches!(&pane.kind, CardKind::Chat(session) if session.is_unstarted())
@@ -1891,7 +1912,9 @@ impl Cagents {
                     if !self.cards.contains_key(&pane.id) && !starting {
                         tasks.push(self.attach_shared_pane(pane));
                     } else if let CardKind::Chat(session) = &pane.kind {
-                        if self.release_draft_started_elsewhere(pane.id, session) {
+                        if self.release_chat_returned_to_draft(pane.id, session)
+                            || self.release_draft_started_elsewhere(pane.id, session)
+                        {
                             tasks.push(self.attach_shared_pane(pane));
                         } else {
                             tasks.push(self.adopt_shared_draft_session(pane.id, session));
@@ -1978,6 +2001,29 @@ impl Cagents {
             self.persist();
         }
         Task::batch(tasks)
+    }
+
+    /// Attaches draft `card` to the conversation another window started in the
+    /// shared view while the card could not let its draft go.
+    pub(super) fn attach_draft_started_elsewhere(
+        &mut self,
+        card: CardId,
+        session: &crate::chat::Session,
+    ) -> Task<Message> {
+        let Some(pane) = self
+            .workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .find(|pane| pane.id == card && pane.kind == CardKind::Chat(session.clone()))
+            .cloned()
+        else {
+            return Task::none();
+        };
+        if !self.release_draft_started_elsewhere(card, session) {
+            return Task::none();
+        }
+        self.attach_shared_pane(&pane)
     }
 
     fn attach_shared_pane(&mut self, pane: &Pane) -> Task<Message> {

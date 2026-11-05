@@ -244,3 +244,302 @@ fn a_window_starting_the_draft_itself_keeps_its_own_start() {
     assert!(peer.app.chat_is_draft(peer.card));
     assert!(peer.app.chat_start_matches(peer.card, &own));
 }
+
+fn attach_started(peer: &mut Peer) -> chat::Session {
+    let accepted = started(&peer.draft);
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(accepted.clone()),
+    ));
+    assert!(peer.app.chat_start_matches(peer.card, &accepted));
+    accepted
+}
+
+fn attempt_target(peer: &Peer) -> Target {
+    match peer.app.chat_ui.phases.get(&peer.card) {
+        Some(Phase::Starting(attempt)) => attempt.target,
+        _ => panic!("expected an attachment under way"),
+    }
+}
+
+/// The other window's start failed or was cancelled while this one was still
+/// attaching: it returns to the draft, and the late answer changes nothing.
+#[test]
+fn a_start_given_up_elsewhere_returns_an_attaching_window_to_the_draft() {
+    let mut peer = peer();
+    write(&mut peer.app, peer.card, "not sent yet");
+    attach_started(&mut peer);
+    let target = attempt_target(&peer);
+
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(peer.draft.clone()),
+    ));
+
+    let runtime = draft_runtime(&peer.app, peer.card);
+    assert_eq!(runtime.session, peer.draft);
+    assert_eq!(runtime.unsent_text(), "not sent yet");
+    assert!(!peer.app.chat_start_pending(peer.card));
+
+    drop(peer.app.handle_chat_ui(Action::Ready(
+        target,
+        Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure::retry(
+            "the conversation ended".to_string(),
+        )))))),
+    )));
+    assert!(peer.app.chat_ui.retiring.is_empty());
+    assert_eq!(draft_runtime(&peer.app, peer.card).session, peer.draft);
+}
+
+/// An attachment that already failed is not left on the failure when the
+/// window it was attaching to goes back to its draft.
+#[test]
+fn a_start_given_up_elsewhere_replaces_a_failed_attachment_with_the_draft() {
+    let mut peer = peer();
+    attach_started(&mut peer);
+    let target = attempt_target(&peer);
+    drop(peer.app.handle_chat_ui(Action::Ready(
+        target,
+        Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure::retry(
+            "the daemon went away".to_string(),
+        )))))),
+    )));
+    assert!(matches!(
+        peer.app.cards.get(&peer.card),
+        Some(CardRuntime::Failed(_))
+    ));
+
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(peer.draft.clone()),
+    ));
+
+    assert_eq!(draft_runtime(&peer.app, peer.card).session, peer.draft);
+    assert!(peer.app.chat_ui.retiring.is_empty());
+}
+
+/// Only a card this window released follows the shared pane back. A window's
+/// own attachment is not taken down by an unstarted descriptor of the same id.
+#[test]
+fn a_chat_this_window_did_not_release_ignores_a_returned_draft() {
+    let mut peer = peer();
+    assert!(
+        !peer
+            .app
+            .release_chat_returned_to_draft(peer.card, &peer.draft)
+    );
+    attach_started(&mut peer);
+    peer.app.forget_peer_started(peer.card);
+    assert!(
+        !peer
+            .app
+            .release_chat_returned_to_draft(peer.card, &peer.draft)
+    );
+    assert!(peer.app.chat_start_pending(peer.card));
+}
+
+#[test]
+fn a_file_choice_holds_the_draft_until_it_ends_and_then_attaches() {
+    let mut peer = peer();
+    let ticket = {
+        let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get_mut(&peer.card) else {
+            panic!("expected a chat runtime");
+        };
+        let ticket = runtime.begin_attachment_insert();
+        runtime.attachment_chooser_pending = Some(ticket.id);
+        ticket
+    };
+    let target = draft_runtime(&peer.app, peer.card).target;
+    let accepted = started(&peer.draft);
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(accepted.clone()),
+    ));
+    assert!(peer.app.chat_is_draft(peer.card));
+
+    drop(
+        peer.app
+            .handle_chat_ui(Action::Attached(target, ticket, Ok(None))),
+    );
+
+    assert!(peer.app.chat_start_matches(peer.card, &accepted));
+    assert!(peer.app.chat_ui.retiring.is_empty());
+}
+
+#[test]
+fn a_paste_holds_the_draft_until_it_ends_and_then_attaches() {
+    let mut peer = peer();
+    let ticket = {
+        let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get_mut(&peer.card) else {
+            panic!("expected a chat runtime");
+        };
+        runtime.begin_attachment_insert()
+    };
+    let target = draft_runtime(&peer.app, peer.card).target;
+    let accepted = started(&peer.draft);
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(accepted.clone()),
+    ));
+    assert!(peer.app.chat_is_draft(peer.card));
+
+    drop(peer.app.handle_chat_ui(Action::PastedText(
+        target,
+        ticket,
+        Some("pasted".to_string()),
+    )));
+
+    assert!(peer.app.chat_start_matches(peer.card, &accepted));
+    assert!(
+        peer.app
+            .chat_ui
+            .drafts
+            .get(&peer.card)
+            .is_some_and(|text| text.contains("pasted")),
+        "the finished paste goes with the rest of the draft"
+    );
+}
+
+/// A window whose own save lost the race has no pending start any more, and
+/// its Send would otherwise do nothing until the next model update. What it
+/// tried to send is still its writing.
+#[test]
+fn losing_a_start_to_another_window_attaches_once_the_save_has_answered() {
+    let mut peer = peer();
+    write(&mut peer.app, peer.card, "my own first message");
+    let target = draft_runtime(&peer.app, peer.card).target;
+    peer.app
+        .chat_ui
+        .phases
+        .insert(peer.card, Phase::SavingDraft { target });
+    let accepted = started(&peer.draft);
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(accepted.clone()),
+    ));
+    assert!(
+        peer.app.chat_is_draft(peer.card),
+        "a save under way keeps its draft"
+    );
+
+    peer.app.chat_ui.phases.remove(&peer.card);
+    drop(peer.app.adopt_stored_draft_session(peer.card));
+
+    assert!(peer.app.chat_start_matches(peer.card, &accepted));
+    assert_eq!(
+        peer.app.chat_ui.drafts.get(&peer.card).map(String::as_str),
+        Some("my own first message")
+    );
+}
+
+fn session_update(peer: &mut Peer, publish: chat::Session, current: chat::Session) -> uuid::Uuid {
+    let pane = |kind| Pane {
+        id: peer.card,
+        title: "Shared".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 1.0,
+        scope: None,
+        kind,
+    };
+    let change = crate::workspace_model::views::Change::Update {
+        before: pane(CardKind::Chat(peer.draft.clone())),
+        pane: pane(CardKind::Chat(publish)),
+    };
+    let operation = uuid::Uuid::new_v4();
+    let scope = Scope::Channel(peer.channel);
+    peer.app
+        .shared_views
+        .pending
+        .push((operation, scope.clone(), change.clone()));
+    let mut model = peer.app.workspace_model.clone();
+    let view = model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == scope)
+        .unwrap();
+    view.revision += 1;
+    view.panes = vec![pane(CardKind::Chat(current))];
+    model.sequence += 1;
+    drop(peer.app.refuse_conflicting_view_update(
+        scope,
+        operation,
+        change,
+        model,
+        "The workspace view changed".into(),
+    ));
+    operation
+}
+
+fn warned_of_refused_update(peer: &Peer) -> bool {
+    peer.app
+        .notices
+        .recent()
+        .any(|entry| entry.notice.message.contains("session update was refused"))
+}
+
+/// Two windows attached to one conversation learn its provider session at the
+/// same time. The one that publishes second has lost nothing.
+#[test]
+fn losing_a_race_to_the_same_session_update_is_not_worth_a_warning() {
+    let mut peer = peer();
+    let accepted = started(&peer.draft);
+    let operation = session_update(&mut peer, accepted.clone(), accepted);
+
+    assert!(!warned_of_refused_update(&peer));
+    assert!(
+        !peer
+            .app
+            .shared_views
+            .pending
+            .iter()
+            .any(|(id, _, _)| *id == operation)
+    );
+}
+
+#[test]
+fn losing_a_race_to_a_different_session_update_still_warns() {
+    let mut peer = peer();
+    let accepted = started(&peer.draft);
+    let mut other = accepted.clone();
+    other.launch.session_id = Some("another-provider-conversation".into());
+
+    session_update(&mut peer, accepted, other);
+
+    assert!(warned_of_refused_update(&peer));
+}
+
+/// What this window wrote reaches the composer of the conversation it attaches
+/// to, not only the stash it waits in.
+#[test]
+fn what_this_window_wrote_is_in_the_composer_once_attached() {
+    let mut peer = peer();
+    write(&mut peer.app, peer.card, "not sent yet");
+    attach_started(&mut peer);
+    let target = attempt_target(&peer);
+
+    let handle = super::tests::fixture_handle(&peer.app, peer.card, Some("provider-conversation"));
+    drop(peer.app.update(Message::ChatUi(Action::Ready(
+        target,
+        Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+    ))));
+
+    let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get(&peer.card) else {
+        panic!("expected the attached conversation");
+    };
+    assert!(!runtime.is_draft());
+    assert_eq!(runtime.unsent_text(), "not sent yet");
+    assert!(!peer.app.chat_ui.drafts.contains_key(&peer.card));
+}

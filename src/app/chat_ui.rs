@@ -690,6 +690,10 @@ pub(super) struct State {
     /// workspace snapshot saves this stash across a restart.
     drafts: HashMap<CardId, String>,
     draft_attachments: HashMap<CardId, Vec<Attachment>>,
+    /// The conversation each card attached to when another window started its
+    /// draft. If that window's start fails, the shared pane goes back to the
+    /// same conversation as a draft, and so does this card.
+    peer_started: HashMap<CardId, TerminalId>,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -723,6 +727,7 @@ impl Default for State {
             retiring: HashSet::new(),
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
+            peer_started: HashMap::new(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -6125,7 +6130,9 @@ impl Cagents {
     /// The draft runtime cannot attach in place: its start attempt would be
     /// taken for this window's own first send, and a failure would retire the
     /// other window's running conversation. A window with a start of its own
-    /// under way keeps it, whatever the shared view says.
+    /// under way keeps it, whatever the shared view says. So does a file choice
+    /// or paste under way, whose result the draft runtime has to receive;
+    /// `adopt_stored_draft_session` catches the card up once each has ended.
     pub(super) fn release_draft_started_elsewhere(
         &mut self,
         card: CardId,
@@ -6140,14 +6147,48 @@ impl Cagents {
                 if runtime.is_draft()
                     && runtime.session.is_unstarted()
                     && runtime.session.id == session.id
+                    && runtime.attachment_chooser_pending.is_none()
+                    && runtime.pastes_pending == 0
         );
         if !draft_of_session {
             return false;
         }
+        // A first message whose start was given up is unsent writing again.
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            runtime.unqueue();
+        }
         self.stash_unsent_chat_draft(card);
         self.lifecycle.remove(card);
         self.shared_views.attached.insert(card);
+        self.chat_ui.peer_started.insert(card, session.id);
         true
+    }
+
+    /// Takes down what `card` attached to when the window that started its
+    /// conversation has given the start up, so the card can show the draft
+    /// that window is back on. The attachment is dropped, not retired: the
+    /// conversation is the other window's to end.
+    pub(super) fn release_chat_returned_to_draft(
+        &mut self,
+        card: CardId,
+        session: &chat::Session,
+    ) -> bool {
+        if !session.is_unstarted()
+            || self.chat_ui.peer_started.get(&card) != Some(&session.id)
+            || self.chat_is_draft(card)
+        {
+            return false;
+        }
+        self.chat_ui.peer_started.remove(&card);
+        self.chat_ui.phases.remove(&card);
+        self.stash_unsent_chat_draft(card);
+        self.cards.remove(&card);
+        self.lifecycle.remove(card);
+        true
+    }
+
+    pub(super) fn forget_peer_started(&mut self, card: CardId) {
+        self.chat_ui.peer_started.remove(&card);
     }
 
     pub(in crate::app) fn chat_is_draft(&self, card: CardId) -> bool {
@@ -6175,14 +6216,18 @@ impl Cagents {
         }
     }
 
-    /// Catches draft `card` up, once it can choose again, with launch options
-    /// another window chose while it could not: while its file chooser was
-    /// open or its first message was on the way.
+    /// Catches draft `card` up, once it can choose again, with what another
+    /// window did while it could not: launch options chosen, or the
+    /// conversation started, while its file chooser was open, a paste was
+    /// under way or its first message was on the way.
     fn adopt_stored_draft_session(&mut self, card: CardId) -> Task<Message> {
         let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| state.kind.clone())
         else {
             return Task::none();
         };
+        if !session.is_unstarted() {
+            return self.attach_draft_started_elsewhere(card, &session);
+        }
         self.adopt_shared_draft_session(card, &session)
     }
 
@@ -8770,7 +8815,25 @@ impl Cagents {
             }
             _ => None,
         };
+        let insert_ended = match &action {
+            Action::PastedImage(target, ..)
+            | Action::PastedText(target, ..)
+            | Action::PasteRefused(target, ..)
+            | Action::ImageSaved(target, ..)
+            | Action::AttachmentsPrepared(target, ..) => Some(*target),
+            _ => None,
+        };
         let task = self.handle_chat_ui_inner(action);
+        let task = match insert_ended {
+            Some(target)
+                if self
+                    .chat_runtime_mut(target)
+                    .is_some_and(|runtime| runtime.pastes_pending == 0) =>
+            {
+                Task::batch([task, self.adopt_stored_draft_session(target.card)])
+            }
+            _ => task,
+        };
         self.reconcile_chat_failure_presentations();
         if let Some(card) = closed_refresh {
             self.sync_closed_chat_draft(card);
@@ -19725,7 +19788,7 @@ mod tests {
             })
     }
 
-    fn fixture_handle(app: &Cagents, card: CardId, session_id: Option<&str>) -> Arc<ClientHandle> {
+    pub(super) fn fixture_handle(app: &Cagents, card: CardId, session_id: Option<&str>) -> Arc<ClientHandle> {
         let mut session = app.chat_ui.attempt(card).unwrap().session.clone();
         // The daemon starts a new Codex thread on a listener of its own and
         // hands the thread back naming it.
