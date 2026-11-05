@@ -532,7 +532,7 @@ impl State {
             let Some(state) = self.account_mut(&restored.id) else {
                 continue;
             };
-            state.discovered_absent = !restored.present;
+            state.absent_since = (!restored.present).then(now_ms);
             // A probe that answered first knows better than the load.
             if state.snapshot.is_some() {
                 continue;
@@ -719,9 +719,11 @@ struct AccountState {
     /// its home exists. An absent system account gets no chip, because most
     /// people use one of the two CLIs rather than both.
     present: bool,
-    /// The latest discovery found the CLI or home missing. Live usage from a
-    /// conversation that is still running cannot overrule that finding.
-    discovered_absent: bool,
+    /// When the latest discovery found the CLI or home missing. Live usage
+    /// from a conversation that is still running cannot overrule that
+    /// finding; only a later discovery, or a probe started after it that
+    /// reached the CLI, can.
+    absent_since: Option<Millis>,
     identity: Option<Identity>,
     snapshot: Option<UsageSnapshot>,
     schedule: Schedule,
@@ -755,7 +757,7 @@ impl AccountState {
             id: account.id(),
             account,
             present: false,
-            discovered_absent: false,
+            absent_since: None,
             identity: None,
             snapshot: None,
             schedule: Schedule::default(),
@@ -2196,7 +2198,7 @@ impl Cagents {
             // executable or home absent, and a report may have been buffered
             // before then. Keep those figures without undoing discovery: only
             // a fresh discovery restores presence it found missing.
-            if cli_not_absent && !state.discovered_absent {
+            if cli_not_absent && state.absent_since.is_none() {
                 state.present = true;
                 state.failure = None;
             }
@@ -2445,7 +2447,6 @@ impl Cagents {
                         state.schedule.invalidate();
                     }
                     state.present = restored.present;
-                    state.discovered_absent = !restored.present;
                     let absent = format!(
                         "{} is not installed",
                         probe::cli_name(state.account.provider)
@@ -3070,6 +3071,7 @@ impl Cagents {
             return Task::none();
         };
         let provider = state.account.provider;
+        let started = state.schedule.started();
         let mut learned = None;
         match outcome {
             // Another window's cached answer can be older than what this
@@ -3114,8 +3116,17 @@ impl Cagents {
                     state.signing_in_from = None;
                     state.sign_in_terminal = None;
                 }
-                state.present =
-                    snapshot.status != UsageStatus::Unavailable || !state.account.is_system();
+                // Only a probe that started after discovery found the account
+                // missing, and then reached its CLI, shows it is back.
+                if snapshot.status != UsageStatus::Unavailable
+                    && state
+                        .absent_since
+                        .is_some_and(|absent| started.is_some_and(|started| started >= absent))
+                {
+                    state.absent_since = None;
+                }
+                state.present = state.absent_since.is_none()
+                    && (snapshot.status != UsageStatus::Unavailable || !state.account.is_system());
                 // A signed-out answer, or an identity lookup that failed this
                 // time, names nobody; the account last seen is still the one
                 // it is, or the one to sign back in to.
@@ -4178,7 +4189,9 @@ impl Cagents {
                     .and_then(|identity| identity.email.clone())
                     .unwrap_or_else(|| format!("A {} account", login.provider.label()));
                 if let Some(state) = self.account_ui.account_mut(&id) {
+                    // Signing in just ran its CLI in this home.
                     state.present = true;
+                    state.absent_since = None;
                     if let Some(snapshot) = snapshot {
                         state.schedule.start(Trigger::Manual, now);
                         state.schedule.succeed(snapshot.observed_at);
@@ -9347,6 +9360,85 @@ mod app_tests {
         let _ = app.locate_accounts();
         finish_discovery(&mut app, BTreeMap::from([(Provider::Claude, true)]));
         assert!(app.account_ui.account(&id).unwrap().present);
+    }
+
+    #[test]
+    fn only_a_probe_started_after_discovery_can_restore_a_missing_home() {
+        let mut app = context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 913);
+        let answer = |app: &Cagents, status| {
+            Message::AccountUi(Action::Probed {
+                owner: app.account_ui.account(&id).unwrap().owner,
+                id: id.clone(),
+                outcome: Outcome::Answered {
+                    catalog: None,
+                    identity: None,
+                    snapshot: UsageSnapshot::state(status, "", now_ms()),
+                },
+            })
+        };
+        let missing = |app: &mut Cagents| {
+            let _ = app.locate_accounts();
+            let restored = app
+                .account_ui
+                .accounts
+                .iter()
+                .filter(|state| !state.account.is_brokered())
+                .map(|state| Restored {
+                    id: state.id.clone(),
+                    present: state.id != id,
+                    entry: None,
+                })
+                .collect();
+            let _ = app.update(Message::AccountUi(Action::Located {
+                generation: app.account_ui.discovery_generation,
+                owners: app.account_ui.discovery_owners(),
+                restored,
+                installed: BTreeMap::from([(Provider::Claude, true)]),
+            }));
+        };
+
+        // A probe already running when discovery found the home missing
+        // describes the home as it was.
+        let before = now_ms().saturating_sub(1_000);
+        app.account_ui
+            .account_mut(&id)
+            .unwrap()
+            .schedule
+            .start(Trigger::Focus, before);
+        missing(&mut app);
+        let _ = app.update(answer(&app, UsageStatus::Ok));
+        assert!(!app.account_ui.account(&id).unwrap().present);
+
+        // The probe discovery starts next confirms the home is not set up.
+        let after = now_ms();
+        app.account_ui
+            .account_mut(&id)
+            .unwrap()
+            .schedule
+            .start(Trigger::Focus, after);
+        let _ = app.update(answer(&app, UsageStatus::Unavailable));
+        assert!(!app.account_ui.account(&id).unwrap().present);
+
+        // Once the home is back, a later probe that reaches the CLI restores
+        // it, and live usage can again clear a failure.
+        app.account_ui
+            .account_mut(&id)
+            .unwrap()
+            .schedule
+            .start(Trigger::Focus, now_ms());
+        let _ = app.update(answer(&app, UsageStatus::Ok));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(state.present);
+        assert_eq!(state.absent_since, None);
+        app.account_ui.account_mut(&id).unwrap().failure = Some("timed out".into());
+        let recipe = recipe_on(&app, &id);
+        let _ = app.account_reported(
+            Provider::Claude,
+            &recipe,
+            vec![(claude_report(0.4), now_ms())],
+        );
+        assert_eq!(app.account_ui.account(&id).unwrap().failure, None);
     }
 
     #[test]

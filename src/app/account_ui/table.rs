@@ -575,13 +575,19 @@ fn group<'a>(
         lines.push(design::horizontal_rule());
         lines.push(login_row(login));
     }
-    if lines.is_empty() {
-        let empty = match state.omp_problem().filter(|_| provider == Provider::Omp) {
+    // A missing CLI stops every account of the provider, so the group says
+    // so once, with its remedy, rather than each row reporting a failed check.
+    let missing = state.installed.get(&provider) == Some(&false);
+    if lines.is_empty() || missing {
+        let notice = match state
+            .omp_problem()
+            .filter(|_| provider == Provider::Omp && lines.is_empty())
+        {
             Some(problem) => format!(
                 "{problem}, so the accounts {} keeps cannot be listed.",
                 probe::cli_name(provider)
             ),
-            None if state.installed.get(&provider) == Some(&false) => format!(
+            None if missing => format!(
                 "{} CLI not found on PATH. Install it, then refresh Accounts.",
                 probe::cli_name(provider)
             ),
@@ -591,14 +597,17 @@ fn group<'a>(
                 probe::cli_name(provider),
             ),
         };
+        if !lines.is_empty() {
+            lines.push(design::horizontal_rule());
+        }
         lines.push(
             widget::container(
-                design::caption(empty).wrapping(cosmic::iced::widget::text::Wrapping::Word),
+                design::caption(notice).wrapping(cosmic::iced::widget::text::Wrapping::Word),
             )
             .padding([space::M, space::M])
             .into(),
         );
-        if state.installed.get(&provider) == Some(&false) {
+        if missing {
             lines.push(
                 crate::ui_controls::button::primary(format!("Install {}", provider.label()))
                     .on_press(Message::AccountUi(Action::Install(provider)))
@@ -767,7 +776,10 @@ fn row<'a>(
     // background check fails. The explanation can wrap below the fixed-height
     // row, including when the Status column has been dropped for space.
     let mut lines = vec![content];
-    if let Some(reason) = failure_caption(account) {
+    // The group explains a missing CLI once, with the way to install it.
+    if let Some(reason) = failure_caption(account)
+        .filter(|_| state.installed.get(&account.account.provider) != Some(&false))
+    {
         lines.push(
             widget::container(
                 design::caption(reason)
@@ -1673,6 +1685,58 @@ mod tests {
             !texts
                 .iter()
                 .any(|(text, _)| text.contains("last known usage"))
+        );
+    }
+
+    #[test]
+    fn a_missing_cli_is_explained_once_for_the_group_with_its_remedy() {
+        use iced::advanced::{
+            Layout as WidgetLayout, layout,
+            widget::{Operation, Tree},
+        };
+
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let first = app.account_ui.add_managed_fixture(Provider::Codex, 1168);
+        let second = app.account_ui.add_managed_fixture(Provider::Codex, 1169);
+        app.account_ui.installed.insert(Provider::Codex, false);
+        for id in [&first, &second] {
+            app.account_ui.account_mut(id).unwrap().failure = Some("Codex is not installed".into());
+        }
+        let width = 1_100.0;
+        let mut element = group(&app, Provider::Codex, &layout(width), None);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 2_000.0)),
+        );
+        let mut texts = Texts::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, WidgetLayout::new(&node), &renderer, &mut texts);
+        let texts = texts.0;
+        let count = |wanted: &str| texts.iter().filter(|text| text.as_str() == wanted).count();
+        assert_eq!(
+            count("Codex CLI not found on PATH. Install it, then refresh Accounts."),
+            1
+        );
+        assert_eq!(count("Install Codex"), 1);
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.starts_with("Last check failed:")),
+            "rows do not repeat the group's explanation: {texts:?}"
         );
     }
 
