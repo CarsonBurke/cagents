@@ -162,7 +162,9 @@ impl Fixture {
         let hang_guard = Instant::now() + Duration::from_secs(120);
         let mut repeated = false;
         loop {
-            let output = self.output(arguments);
+            // Five seconds per submit, its built-in retry and the 10 s wait
+            // can together use output()'s whole 20 s, so allow more here.
+            let output = self.output_until(arguments, Instant::now() + Duration::from_secs(60));
             let unanswered = !output.status.success()
                 && serde_json::from_slice::<Value>(&output.stderr).is_ok_and(|error| {
                     error["error"]["details"]["idempotency_key"].is_string()
@@ -291,9 +293,11 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
             "10",
         ]);
         let receipt = fixture.settled_spawn(spawned);
-        // A repeat finds the acceptance its unanswered attempt committed.
+        assert!(receipt["retried"].is_boolean(), "{receipt}");
+        // A repeat, or the CLI's own retry after a lost answer, finds the
+        // acceptance its unanswered attempt committed.
         assert!(
-            receipt["created"] == true || repeated,
+            receipt["created"] == true || receipt["retried"] == true || repeated,
             "conversation {index}: {receipt}"
         );
         let accepted = &receipt["settled"];
