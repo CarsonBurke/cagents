@@ -507,7 +507,7 @@ struct Claude {
     background_agents: HashSet<String>,
     /// Agents whose settled run `SendMessage` started again: their tool row
     /// still shows the earlier outcome, which the next receipt must replace.
-    restarted_agents: HashSet<String>,
+    restarted_agents: VecDeque<String>,
     /// The agent ID Claude Code gave each agent it runs in the background,
     /// with the Agent tool call that started it, oldest first. A task's frames
     /// name the agent by this ID, and after `SendMessage` resumes it, by no
@@ -1809,9 +1809,13 @@ impl Claude {
         Ok(())
     }
     fn agent_tool(&self, tool: &str) -> bool {
+        self.unique_tool_named(tool, "Agent")
+    }
+
+    fn unique_tool_named(&self, tool: &str, expected: &str) -> bool {
         let mut candidates = self.tools.iter().filter(|(key, _)| key.id == tool);
         candidates.next().is_some_and(
-            |(_, item)| matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent"),
+            |(_, item)| matches!(&item.content, ItemContent::Tool { name, .. } if name == expected),
         ) && candidates.next().is_none()
     }
 
@@ -1851,11 +1855,15 @@ impl Claude {
                 return Err(());
             }
             // SendMessage names its own call when it restarts an Agent. That
-            // alias is valid only on the start or its already recorded task.
+            // alias is valid on the start, on its already recorded task, or
+            // when it is that SendMessage call: a resumed run's start need not
+            // name it, but its receipt does.
             if reported.is_some_and(|tool| {
                 tool != owner
                     && (self.agent_tool(tool)
-                        || (!started && !bindings().any(|(known, _)| known == tool)))
+                        || (!started
+                            && !self.unique_tool_named(tool, "SendMessage")
+                            && !bindings().any(|(known, _)| known == tool)))
             }) {
                 return Err(());
             }
@@ -1910,7 +1918,12 @@ impl Claude {
                 .and_then(|item| item.content.status())
                 .is_some_and(|status| status != ToolStatus::Running)
             {
-                self.restarted_agents.insert(tool.into());
+                if !self.restarted_agents.iter().any(|known| known == tool) {
+                    self.restarted_agents.push_back(tool.into());
+                    if self.restarted_agents.len() > MAX_TOOLS {
+                        self.restarted_agents.pop_front();
+                    }
+                }
             }
             ToolStatus::Running
         } else if ended.is_some() && self.ended_agent(tool) == Some(ToolStatus::Stopped) {
@@ -1933,7 +1946,7 @@ impl Claude {
         let settled = !started
             && ended.is_some()
             && !self.background_agents.contains(tool)
-            && !self.restarted_agents.contains(tool)
+            && !self.restarted_agents.iter().any(|known| known == tool)
             && self
                 .tools
                 .get(&ScopedId::new(None, tool))
@@ -1957,7 +1970,7 @@ impl Claude {
                 self.background_agents.insert(tool.into());
             } else if status != ToolStatus::Running {
                 self.background_agents.remove(tool);
-                self.restarted_agents.remove(tool);
+                self.restarted_agents.retain(|known| known != tool);
             }
         }
         status
@@ -11331,6 +11344,48 @@ mod tests {
                 );
                 assert!(adapter.visible_task_rows.is_empty());
             }
+        }
+    }
+
+    /// After `SendMessage` resumes a settled background Agent, the new run's
+    /// start need not name a call, but its receipt names the `SendMessage`
+    /// call rather than the Agent's own.
+    #[test]
+    fn a_resumed_background_agent_settles_from_a_receipt_naming_send_message() {
+        for text_receipt in [false, true] {
+            let mut adapter = Claude::default();
+            notification_agent(&mut adapter, "agent-call", "agent-task", true);
+            adapter
+                .receive(notification_frame(
+                    "first-receipt",
+                    "agent-call",
+                    "agent-task",
+                    "completed",
+                ))
+                .unwrap();
+            assert_eq!(
+                adapter.ended_agent("agent-call"),
+                Some(ToolStatus::Succeeded)
+            );
+            adapter.receive(json!({"type":"assistant","uuid":"resume-call","message":{"id":"resume-message","content":[{"type":"tool_use","id":"send-call","name":"SendMessage","input":{"to":"agent-task","message":"Check again"}}]}})).unwrap();
+            let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"agent-task","task_type":"local_agent"})).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&started, "agent-call"),
+                [ToolStatus::Running]
+            );
+            let receipt = if text_receipt {
+                notification_frame("second-receipt", "send-call", "agent-task", "failed")
+            } else {
+                json!({"type":"system","subtype":"task_notification","uuid":"second-receipt","task_id":"agent-task","tool_use_id":"send-call","status":"failed","summary":"Agent failed"})
+            };
+            let settled = adapter.receive(receipt).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&settled, "agent-call"),
+                [ToolStatus::Failed],
+                "text receipt: {text_receipt}"
+            );
+            assert_eq!(adapter.ended_agent("agent-call"), Some(ToolStatus::Failed));
+            assert!(adapter.restarted_agents.is_empty());
         }
     }
 
