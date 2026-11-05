@@ -23,6 +23,7 @@ class ZigDiscovery(unittest.TestCase):
         self.runner = checkout / "scripts/run-development"
         shutil.copy2(SOURCE, self.runner)
         shutil.copy2(GATE, checkout / "scripts/cargo-gate")
+        shutil.copy2(GATE.with_name("cargo-gate-command.py"), checkout / "scripts/cargo-gate-command.py")
         (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
 
         self.data = self.root / "data with spaces/mise"
