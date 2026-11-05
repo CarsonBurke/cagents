@@ -270,6 +270,52 @@ fn registry_wide_registered_and_pending_keys_are_not_candidates() {
 }
 
 #[test]
+fn two_orphan_provider_homes_with_the_same_key_are_ambiguous() {
+    let directory = tempfile::tempdir().unwrap();
+    let homes = Homes::at(directory.path().join("accounts"));
+    let key = Uuid::from_u128(1);
+    let paths =
+        [Provider::Claude, Provider::Codex].map(|provider| make_home(&homes, provider, key));
+    let before = paths.each_ref().map(|path| metadata_identity(path));
+    for path in &paths {
+        fs::write(
+            path.join("history.fixture"),
+            b"retained ambiguous history\n",
+        )
+        .unwrap();
+    }
+    let registry = Registry::default();
+
+    assert!(discover(&homes, &registry).unwrap().is_empty());
+    for provider in [Provider::Claude, Provider::Codex] {
+        assert_eq!(
+            inspect(&homes, &registry, provider, key).unwrap(),
+            HomeStatus::Ambiguous
+        );
+    }
+    assert_eq!(paths.each_ref().map(|path| metadata_identity(path)), before);
+    for path in &paths {
+        assert_eq!(
+            fs::read(path.join("history.fixture")).unwrap(),
+            b"retained ambiguous history\n"
+        );
+    }
+    // Reinspection never retains whichever provider happened to be enumerated first.
+    fs::rename(
+        &paths[1],
+        paths[1].with_file_name(format!(".removing-{key}")),
+    )
+    .unwrap();
+    assert_eq!(
+        inspect(&homes, &registry, Provider::Claude, key).unwrap(),
+        HomeStatus::Available(Candidate {
+            provider: Provider::Claude,
+            key
+        })
+    );
+}
+
+#[test]
 fn a_registered_physical_linked_alias_prevents_duplicate_discovery() {
     let directory = tempfile::tempdir().unwrap();
     let homes = Homes::at(directory.path().join("accounts"));

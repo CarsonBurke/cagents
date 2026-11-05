@@ -26,6 +26,8 @@ pub(crate) enum HomeStatus {
     Registered,
     Pending,
     Represented,
+    /// Two managed provider directories claim the same registry-wide key.
+    Ambiguous,
     Available(Candidate),
 }
 
@@ -106,6 +108,23 @@ pub(crate) fn inspect(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HomeStatus::Missing),
         Err(error) => return Err(error),
     };
+    for other in Account::PROVIDERS {
+        if other == provider {
+            continue;
+        }
+        let other_path = homes.path(other, key);
+        let other_directory = other_path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Account provider directory is unavailable",
+            )
+        })?;
+        match owned_directory(other_directory).and_then(|_| owned_directory(&other_path)) {
+            Ok(_) => return Ok(HomeStatus::Ambiguous),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
     for linked in registry
         .registered()
         .iter()
