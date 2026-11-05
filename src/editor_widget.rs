@@ -57,6 +57,8 @@ use std::{
 
 #[path = "editor_widget/snapshot.rs"]
 mod snapshot;
+#[cfg(test)]
+pub use snapshot::SnapshotMemory;
 pub use snapshot::TextSnapshot;
 #[path = "editor_widget/match_index.rs"]
 mod match_index;
