@@ -343,11 +343,9 @@ mod tests {
         assert!(
             matches!(&projected.content, ItemContent::Delivery { body, .. } if body.capacity() <= PREVIEW_BYTES)
         );
-        assert!(
-            crate::chat::failure::provider_error_text(Provider::Codex, projected)
-                .unwrap()
-                .contains("Diagnostic preview")
-        );
+        assert!(crate::chat::failure::is_preview(
+            crate::chat::failure::provider_error_text(Provider::Codex, projected).unwrap()
+        ));
         assert!(backing.read("sibling", "same", &first, 0).is_err());
         let mut forged = first.clone();
         forged.scope = TextCopyScope::Subagent {

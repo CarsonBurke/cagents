@@ -645,7 +645,7 @@ impl State {
                         &context,
                         &causes,
                     );
-                    latest = Some((context, text));
+                    latest = Some((context, text, item.id.as_str()));
                 }
             }
             if (matches!(
@@ -656,9 +656,26 @@ impl State {
                 && Failure::parse(provider, &child.detail).is_some()))
                 && !child.detail.trim().is_empty()
             {
+                // A bare status line such as "Turn failed" names no cause of
+                // its own. While the latest proven error is still the child's
+                // last item, nothing after it can be that cause: one failure.
+                let explained = latest.as_ref().and_then(|(_, _, id)| {
+                    (Failure::parse(provider, &child.detail).is_none()
+                        && child.items.last().is_some_and(|last| last.id == *id))
+                    .then(|| Source::ChildItem(child.id.clone(), (*id).to_owned()))
+                });
+                if let Some(cause) = explained
+                    && let Some(incident) = state
+                        .incidents
+                        .iter_mut()
+                        .find(|incident| incident.sources.contains(&cause))
+                {
+                    incident.sources.push(Source::ChildDetail(child.id.clone()));
+                    continue;
+                }
                 // Only a detail containing the exact latest proven error may
                 // join that historical incident. No inference from quoted text.
-                let context = if let Some((context, body)) = latest
+                let context = if let Some((context, body, _)) = latest
                     && child.detail.ends_with(body)
                 {
                     context
@@ -1006,9 +1023,10 @@ impl Runtime {
                             // The resident text is the whole original.
                             None if !chat::failure::is_preview(text) => None,
                             None => {
-                                return Err("Original diagnostic unavailable: it was \
-                                    refused, changed or evicted"
-                                    .into());
+                                return Err(
+                                    "Original diagnostic unavailable: it is no longer retained"
+                                        .into(),
+                                );
                             }
                         },
                         None => None,
@@ -1314,9 +1332,9 @@ impl Runtime {
                 let retained = self.failure_originals_retained(&incident.key);
                 if let Some(available) = retained {
                     let caption = if !available {
-                        "Diagnostic preview only. Original unavailable: it was refused, changed or evicted."
+                        "Shortened preview. The full diagnostic is no longer available to copy."
                     } else {
-                        "Diagnostic preview only. Copy details retrieves the retained originals."
+                        "Shortened preview. Copy details copies the full diagnostic."
                     };
                     rows.push(design::caption(caption).width(Length::Fill).into());
                 } else if omitted {
@@ -1841,6 +1859,50 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn a_bare_failed_status_joins_the_child_error_that_is_still_its_last_item() {
+        let provider = Provider::Codex;
+        let raw = "You've hit your session limit · resets 3:40pm\nrequest-id: child";
+        let child = |items: Vec<chat::Item>| chat::Subagent {
+            id: "child".into(),
+            kind: "Quinn".into(),
+            description: String::new(),
+            model: None,
+            status: chat::ToolStatus::Failed,
+            waiting: false,
+            detail: "Turn failed".into(),
+            background: true,
+            items: items.into_iter().map(Arc::new).collect(),
+        };
+        let (mut runtime, handle) = live_fixture(provider, Vec::new());
+        publish(&mut runtime, &handle, |next| {
+            next.subagents = vec![child(vec![
+                text("work", chat::Role::Assistant, "Original child work"),
+                provider_error(provider, "codex-notice:limit", raw),
+            ])];
+        });
+        let [incident] = runtime.failure_ui.incidents.as_slice() else {
+            panic!("one failure is one card");
+        };
+        assert_eq!(
+            incident.sources,
+            vec![
+                Source::ChildItem("child".into(), "codex-notice:limit".into()),
+                Source::ChildDetail("child".into()),
+            ]
+        );
+
+        // Later work means the status may describe something else, so the
+        // bare status keeps its own notice rather than borrowing that cause.
+        publish(&mut runtime, &handle, |next| {
+            next.subagents = vec![child(vec![
+                provider_error(provider, "codex-notice:limit", raw),
+                text("later", chat::Role::Assistant, "Later child work"),
+            ])];
+        });
+        assert_eq!(runtime.failure_ui.incidents.len(), 2);
     }
 
     #[test]

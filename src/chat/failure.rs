@@ -35,8 +35,7 @@ pub fn mark_provider_error(provider: Provider, item: &mut super::Item) -> bool {
 
 /// Ends a child provider failure whose resident body is a bounded preview;
 /// only its retained copy source holds the complete original.
-pub const PREVIEW_OMITTED: &str =
-    "\n[Diagnostic preview; the original requires its retained copy source.]";
+pub const PREVIEW_OMITTED: &str = "\n[Preview shortened. Copy details copies the full diagnostic.]";
 
 /// Whether a provider failure's resident text is only a preview of it.
 pub fn is_preview(text: &str) -> bool {
