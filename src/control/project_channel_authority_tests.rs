@@ -334,7 +334,11 @@ fn first_edit(peer: &mut UnixStream, verb: &str, model: &WorkspaceModel) -> Clie
             read_model(peer, model);
         }
         "move" => read_model(peer, model),
-        "channel-close" => {}
+        "channel-close" => {
+            let request = next(peer);
+            assert!(matches!(request.request, ClientRequest::Agent { .. }));
+            reply(peer, &request, denied());
+        }
         _ => panic!("unknown verb"),
     }
     let request = next(peer);
@@ -1212,6 +1216,9 @@ fn actual_run_from_captures_scoped_writes_before_staged_lookup_without_user_fall
     let peer = Peer::bound(directory, socket, connected(), move |peer| {
         auth(peer, &expected, scoped);
         if scoped {
+            let request = next(peer);
+            assert!(matches!(request.request, ClientRequest::Agent { .. }));
+            reply(peer, &request, denied());
             let request = next(peer);
             assert_eq!(
                 request.request,

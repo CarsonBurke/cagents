@@ -428,7 +428,8 @@ pub enum ChannelCommand {
         #[arg(long)]
         repository: Option<PathBuf>,
     },
-    /// Delete a channel everywhere.
+    /// Delete a channel everywhere. Refused while a session in it is live, since
+    /// that session would keep running with no pane.
     Close {
         /// The shared channel ID.
         channel_id: ChannelId,
@@ -4218,6 +4219,7 @@ fn channel_output(
             })
         }
         ResolvedChannel::Close { channel_id } => {
+            channels::refuse_close_holding_live_sessions(client, channel_id)?;
             client
                 .edit_workspace_model(ModelEdit::DeleteChannel { id: channel_id })
                 .map_err(protocol_error)?;

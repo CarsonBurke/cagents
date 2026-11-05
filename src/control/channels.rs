@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     agent_execution::{
-        Authority, Operation, Reply,
+        Authority, Operation, Placement, Reply,
         directory::{Entry, Scope as DirectoryScope, Surface},
     },
     model::{CardId, CardKind},
@@ -239,6 +239,58 @@ fn placement_error(error: ControlError) -> AppError {
             .to_owned();
     }
     error
+}
+
+/// `cagents channel close` only removes the channel: nothing here ends a
+/// session, so one still in it would keep running with no pane and no Stop. A
+/// window's delete closes them first; a shell has no dialog to say so in, and
+/// ending someone's running work is a separate, explicit step.
+pub(super) fn refuse_close_holding_live_sessions(
+    client: &mut ControlClient,
+    channel: ChannelId,
+) -> Result<(), AppError> {
+    let reply = client.agent(
+        Authority::default(),
+        Operation::Directory(DirectoryScope::All),
+    );
+    let directory = match reply {
+        Ok(Reply::Directory(directory)) => directory,
+        Ok(_) => {
+            return Err(AppError::new(
+                "protocol",
+                "The daemon did not return its session directory",
+            ));
+        }
+        // A session can't read the directory. The delete it asked for gets the
+        // daemon's own answer.
+        Err(ControlError::Remote {
+            code: ProtocolErrorCode::PermissionDenied,
+            ..
+        }) => return Ok(()),
+        Err(error) => return Err(protocol_error(error)),
+    };
+    let live: Vec<String> = directory
+        .caller
+        .iter()
+        .chain(&directory.sessions)
+        .filter(|entry| {
+            !entry.history_only
+                && matches!(entry.view_scope, Some(Placement::Channel(id)) if id == channel)
+        })
+        .map(|entry| entry.id.to_string())
+        .collect();
+    if live.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::new(
+        "invalid_target",
+        format!(
+            "Channel {channel} still has a live session, which would keep running with no pane: {}. \
+             Move it with `cagents channel move <session> --to <channel>`, or delete the channel \
+             in the app, which closes its sessions.",
+            live.join(", ")
+        ),
+    ))
 }
 
 fn holder(model: &WorkspaceModel, session: TerminalId) -> Option<(&View, &Pane)> {
@@ -1095,6 +1147,51 @@ mod tests {
             kind: CardKind::Chat(session.clone()),
             scope: None,
         }
+    }
+
+    /// Closing only removes the channel, so with a session in it nothing is
+    /// sent: the channel and its pane stay. A session elsewhere doesn't count,
+    /// and neither does a reader of a saved transcript.
+    #[test]
+    fn channel_close_is_refused_while_a_live_session_is_in_the_channel() {
+        let (model, _, to) = fixture();
+        let chat = unplaced_chat();
+        let mut inside = unplaced_entry(chat.id, directory::Surface::Chat);
+        inside.view_scope = Some(Placement::Channel(to));
+        let mut reading = unplaced_entry(TerminalId::new(), directory::Surface::Chat);
+        reading.view_scope = Some(Placement::Channel(to));
+        reading.history_only = true;
+        let mut elsewhere = unplaced_entry(TerminalId::new(), directory::Surface::Chat);
+        elsewhere.view_scope = Some(Placement::Channel(ChannelId::new()));
+
+        let check = |sessions: Vec<Entry>| {
+            let (client_stream, server_stream) = UnixStream::pair().unwrap();
+            let server = FakeDaemon {
+                models: vec![model.clone()],
+                sessions,
+                chats: vec![],
+                terminals: vec![],
+                edits: vec![],
+            }
+            .serve(server_stream);
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            let result = refuse_close_holding_live_sessions(&mut client, to);
+            drop(client);
+            assert!(server.join().unwrap().is_empty());
+            result
+        };
+
+        let refused = check(vec![inside, reading.clone(), elsewhere.clone()]).unwrap_err();
+        assert_eq!(refused.kind, "invalid_target");
+        assert!(
+            refused.message.contains(&chat.id.to_string()),
+            "{}",
+            refused.message
+        );
+        assert!(refused.message.contains("cagents channel move"));
+        assert!(!refused.message.contains(&reading.id.to_string()));
+        assert!(!refused.message.contains(&elsewhere.id.to_string()));
+        assert!(check(vec![reading, elsewhere]).is_ok());
     }
 
     #[test]
