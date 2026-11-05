@@ -27581,7 +27581,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_live_model_upgrade_candidates_keep_account_recipe_proof_and_unstarted_guards() {
+    fn retained_live_model_upgrade_candidates_keep_account_recipe_and_proof_guards() {
         for mutation in [
             "account",
             "program",
@@ -27589,7 +27589,6 @@ mod tests {
             "directory",
             "boot",
             "proof",
-            "unstarted",
         ] {
             let mut f = live_shared_recovery_fixture();
             match mutation {
@@ -27612,15 +27611,7 @@ mod tests {
                 }
                 "boot" => f.canonical.proof.as_mut().unwrap().boot_id = "other-boot".into(),
                 "proof" => f.canonical.proof.as_mut().unwrap().host_incarnation = "".into(),
-                _ => {
-                    f.source.proof = None;
-                    f.source.launch.session_id = None;
-                    f.source.native_continuity = chat::NativeContinuity::ReconnectOnly;
-                    let runtime = f.app.chat_runtime_mut(f.target).unwrap();
-                    runtime.session = f.source.clone();
-                    runtime.connection = Connection::Draft;
-                    f.app.install_chat_session(f.card, f.source.clone());
-                }
+                other => unreachable!("{other}"),
             }
             assert!(
                 !chat::client::UpgradeRecovery::is_candidate(&f.source, &f.canonical),
@@ -27637,6 +27628,38 @@ mod tests {
             assert_live_recovery_content(&f);
             assert_eq!(chat_runtime(&f.app, f.card).session, f.source);
         }
+    }
+
+    /// A draft has no lineage for the strict upgrade to prove. Another window
+    /// started its conversation, so this one attaches as a late window does,
+    /// with what it wrote still unsent.
+    #[test]
+    fn retained_live_model_upgrade_leaves_an_unstarted_source_to_an_ordinary_attachment() {
+        let mut f = live_shared_recovery_fixture();
+        f.source.proof = None;
+        f.source.launch.session_id = None;
+        f.source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        let runtime = f.app.chat_runtime_mut(f.target).unwrap();
+        runtime.session = f.source.clone();
+        runtime.connection = Connection::Draft;
+        f.app.install_chat_session(f.card, f.source.clone());
+        assert!(!chat::client::UpgradeRecovery::is_candidate(
+            &f.source,
+            &f.canonical
+        ));
+        f.model.views[0].panes[0].kind = CardKind::Chat(f.canonical.clone());
+        drop(f.app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::Read(f.model.clone()),
+        )));
+        assert!(matches!(
+            f.app.chat_ui.phases.get(&f.card),
+            Some(Phase::Starting(attempt))
+                if attempt.session == f.canonical
+                    && attempt.intent == chat::Intent::Restore
+                    && attempt.upgrade_admission.is_none()
+        ));
+        assert_eq!(f.app.chat_ui.drafts.get(&f.card), Some(&f.draft));
+        assert!(f.app.chat_ui.retiring.is_empty());
     }
 
     #[test]
