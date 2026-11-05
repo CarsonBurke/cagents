@@ -1701,12 +1701,7 @@ impl Runtime {
         }
         let target = self.target;
         // Nothing is sent past a first message still waiting to go.
-        let available = !transitioning
-            && !self.closed_elsewhere
-            && !self.disconnected
-            && !self.snapshot.exited
-            && self.pending.is_none()
-            && self.queued.is_none();
+        let available = self.composer_available(transitioning);
         let snapshot = &self.snapshot;
         // One theme lookup and one settings value per frame, rather than one
         // per rendered message.
@@ -2640,8 +2635,8 @@ impl Runtime {
         let key_suggestion = suggestion.cloned();
         let placeholder = suggestion.map_or(placeholder, |suggestion| suggestion.text.as_str());
         let suggestion_hint: Element<'_, Message> = if suggestion.is_some() {
-            widget::text("Tab to use suggestion")
-                .size(design::TEXT_CAPTION)
+            widget::container(widget::text("Tab to use suggestion").size(design::TEXT_CAPTION))
+                .padding(iced::Padding::from([0.0, COMPOSER_PADDING]).bottom(space::XS))
                 .into()
         } else {
             iced::widget::Space::new().height(0).into()
@@ -2780,17 +2775,6 @@ impl Runtime {
                 })
                 .into()
         };
-        // The attachment action lives in the `+` menu, so the draft owns the
-        // row; `Some(false)` keeps it listed while a draft cannot take one.
-        let attach = self.accepts_draft_attachments().then(|| {
-            !transitioning
-                && (!snapshot.exited || self.has_connected_saved_history(snapshot))
-                && !self.closed_elsewhere
-                && !self.disconnected
-                && self.pending.is_none()
-                && self.queued.is_none()
-                && self.attachment_chooser_pending.is_none()
-        });
         // Commands are reached by typing `/`, which is how every agent surface
         // a user arrives from works and what the composer already answers to.
         // A dropdown listing them duplicated that path in a control that was
@@ -2867,7 +2851,7 @@ impl Runtime {
                 .padding(iced::Padding::ZERO.bottom(COMPOSER_CONTROL_INSET))
                 .into()
         };
-        let (plus, menu) = match self.composer_actions(available, attach) {
+        let (plus, menu) = match self.composer_actions(transitioning) {
             Some((plus, menu)) => (Some(plus), menu),
             None => (None, None),
         };
@@ -3277,23 +3261,24 @@ impl Runtime {
     /// of them.
     fn composer_actions(
         &self,
-        available: bool,
-        attach: Option<bool>,
+        transitioning: bool,
     ) -> Option<(Element<'_, Message>, Option<Element<'_, Message>>)> {
         let target = self.target;
         let snapshot = &self.snapshot;
-        let steering = !snapshot.capabilities.interrupt_modes.is_empty();
-        if attach.is_none()
-            && !steering
-            && !snapshot.capabilities.branch
-            && !snapshot.capabilities.compact
-        {
+        let rows = self.composer_action_rows(transitioning);
+        if rows.is_empty() {
             return None;
         }
         let open = self.composer_actions || self.branch_picker;
+        let available = self.composer_available(transitioning);
         let enabled =
             available && snapshot.ready && !snapshot.busy && snapshot.read_only_reason.is_none();
-        let anchor = crate::ui_controls::icon_button(Icon::Plus, "Attach files and more actions")
+        let label = if rows.iter().any(|(row, _)| *row == ComposerRow::Attach) {
+            "Attach files and more actions"
+        } else {
+            "More actions"
+        };
+        let anchor = crate::ui_controls::icon_button(Icon::Plus, label)
             .id(card_control_id(target.card, "chat-actions"))
             .selected(open)
             .on_press(action(Action::ComposerActions(target, !open)));
@@ -3348,71 +3333,54 @@ impl Runtime {
                     .spacing(step::GAP_S)
                     .into()
             } else {
-                let mut choices: Vec<Element<'_, Message>> = Vec::new();
-                if let Some(editable) = attach {
-                    choices.push(
-                        crate::ui_controls::button::secondary("Attach files or images…")
-                            .icon(Icon::Attachment)
-                            .id(card_control_id(target.card, "chat-attach"))
-                            .width(Length::Fill)
-                            .on_press_maybe(editable.then(|| action(Action::Attach(target))))
-                            .into(),
-                    );
-                }
-                if steering {
-                    let wait = snapshot.interrupt_mode.as_deref() == Some("wait");
-                    choices.push(
-                        crate::ui_controls::button::secondary(if wait {
-                            "Steering: after turn"
-                        } else {
-                            "Steering: after tools"
-                        })
-                        .icon(Icon::Jump)
-                        .id(card_control_id(target.card, "chat-actions-steering"))
-                        .name(if wait {
-                            "Steering: after turn. Press to steer after tools instead"
-                        } else {
-                            "Steering: after tools. Press to steer after the turn instead"
-                        })
-                        .width(Length::Fill)
-                        .on_press_maybe(available.then(|| {
-                            action(Action::Command(
-                                target,
-                                Command::SetInterruptMode {
-                                    mode: if wait { "immediate" } else { "wait" }.into(),
-                                },
-                            ))
-                        }))
-                        .into(),
-                    );
-                }
-                if snapshot.capabilities.branch {
-                    choices.push(
-                        crate::ui_controls::button::secondary("Fork conversation…")
-                            .icon(Icon::Branch)
-                            .id(card_control_id(target.card, "chat-actions-fork"))
-                            .width(Length::Fill)
-                            .on_press_maybe(
-                                enabled.then(|| action(Action::BranchPicker(target, true))),
-                            )
-                            .into(),
-                    );
-                }
-                if snapshot.capabilities.compact {
-                    choices.push(
-                        crate::ui_controls::button::secondary("Compact conversation")
-                            .icon(Icon::Compress)
-                            .id(card_control_id(target.card, "chat-actions-compact"))
-                            .name(
-                                "Compact the conversation: summarize earlier turns to free context",
-                            )
-                            .width(Length::Fill)
-                            .on_press_maybe(
-                                enabled.then(|| action(Action::Command(target, Command::Compact))),
-                            )
-                            .into(),
-                    );
-                }
+                let choices = rows.into_iter().map(|(row, enabled)| {
+                    let id = card_control_id(target.card, row.id());
+                    let button = match row {
+                        ComposerRow::Attach => {
+                            crate::ui_controls::button::secondary("Attach files or images…")
+                                .icon(Icon::Attachment)
+                                .on_press_maybe(enabled.then(|| action(Action::Attach(target))))
+                        }
+                        ComposerRow::Steering => {
+                            let wait = snapshot.interrupt_mode.as_deref() == Some("wait");
+                            crate::ui_controls::button::secondary(if wait {
+                                "Steering: after turn"
+                            } else {
+                                "Steering: after tools"
+                            })
+                            .icon(Icon::Jump)
+                            .name(if wait {
+                                "Steering: after turn. Press to steer after tools instead"
+                            } else {
+                                "Steering: after tools. Press to steer after the turn instead"
+                            })
+                            .on_press_maybe(enabled.then(|| {
+                                action(Action::Command(
+                                    target,
+                                    Command::SetInterruptMode {
+                                        mode: if wait { "immediate" } else { "wait" }.into(),
+                                    },
+                                ))
+                            }))
+                        }
+                        ComposerRow::Fork => {
+                            crate::ui_controls::button::secondary("Fork conversation…")
+                                .icon(Icon::Branch)
+                                .on_press_maybe(
+                                    enabled.then(|| action(Action::BranchPicker(target, true))),
+                                )
+                        }
+                        ComposerRow::Compact => crate::ui_controls::button::secondary(
+                            "Compact conversation",
+                        )
+                        .icon(Icon::Compress)
+                        .name("Compact the conversation: summarize earlier turns to free context")
+                        .on_press_maybe(
+                            enabled.then(|| action(Action::Command(target, Command::Compact))),
+                        ),
+                    };
+                    button.id(id).width(Length::Fill).into()
+                });
                 widget::column::with_children(choices)
                     .spacing(step::GAP_S)
                     .into()
@@ -5832,7 +5800,10 @@ mod tests {
             // Attaching is one of the `+` menu's choices, and opening the
             // menu starts keyboard focus on it.
             runtime.composer_actions = true;
-            assert_eq!(runtime.first_composer_action(), Some("chat-attach"));
+            assert_eq!(
+                runtime.composer_action_rows(transitioning),
+                [(ComposerRow::Attach, !transitioning)]
+            );
             let mut element = runtime.view(
                 None,
                 transitioning,

@@ -2026,6 +2026,27 @@ impl ChannelNameObservation {
     }
 }
 
+/// A row of the composer's `+` menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ComposerRow {
+    Attach,
+    Steering,
+    Fork,
+    Compact,
+}
+
+impl ComposerRow {
+    /// The row's control id within its card.
+    pub(super) fn id(self) -> &'static str {
+        match self {
+            Self::Attach => "chat-attach",
+            Self::Steering => "chat-actions-steering",
+            Self::Fork => "chat-actions-fork",
+            Self::Compact => "chat-actions-compact",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HistoryNavigation {
     EarlierEdge,
@@ -3441,21 +3462,53 @@ impl Runtime {
         self.snapshot.capabilities.attachments || self.has_connected_saved_history(&self.snapshot)
     }
 
-    /// The control id of the `+` menu's first row, in the order the menu
-    /// lists them. Disabled rows stay in the keyboard order, as elsewhere.
-    pub(super) fn first_composer_action(&self) -> Option<&'static str> {
-        let capabilities = &self.snapshot.capabilities;
+    /// Whether the composer takes a message now. A first or queued message
+    /// still waiting goes before anything else is sent.
+    pub(super) fn composer_available(&self, transitioning: bool) -> bool {
+        !transitioning
+            && !self.closed_elsewhere
+            && !self.disconnected
+            && !self.snapshot.exited
+            && self.pending.is_none()
+            && self.queued.is_none()
+    }
+
+    /// The `+` menu's rows in the order it lists them, each with whether it
+    /// can be pressed now. Attaching stays listed while a draft cannot take
+    /// one, as the paperclip it replaced stayed visible but disabled.
+    pub(super) fn composer_action_rows(&self, transitioning: bool) -> Vec<(ComposerRow, bool)> {
+        let snapshot = &self.snapshot;
+        let available = self.composer_available(transitioning);
+        let commands =
+            available && snapshot.ready && !snapshot.busy && snapshot.read_only_reason.is_none();
+        let attach = !transitioning
+            && (!snapshot.exited || self.has_connected_saved_history(snapshot))
+            && !self.closed_elsewhere
+            && !self.disconnected
+            && self.pending.is_none()
+            && self.queued.is_none()
+            && self.attachment_chooser_pending.is_none();
         [
-            (self.accepts_draft_attachments(), "chat-attach"),
             (
-                !capabilities.interrupt_modes.is_empty(),
-                "chat-actions-steering",
+                self.accepts_draft_attachments(),
+                ComposerRow::Attach,
+                attach,
             ),
-            (capabilities.branch, "chat-actions-fork"),
-            (capabilities.compact, "chat-actions-compact"),
+            (
+                !snapshot.capabilities.interrupt_modes.is_empty(),
+                ComposerRow::Steering,
+                available,
+            ),
+            (snapshot.capabilities.branch, ComposerRow::Fork, commands),
+            (
+                snapshot.capabilities.compact,
+                ComposerRow::Compact,
+                commands,
+            ),
         ]
         .into_iter()
-        .find_map(|(listed, id)| listed.then_some(id))
+        .filter_map(|(listed, row, enabled)| listed.then_some((row, enabled)))
+        .collect()
     }
 
     pub(super) fn parent_transcript_selected(&self) -> bool {
@@ -6802,6 +6855,14 @@ impl Cagents {
             removed = true;
         }
         removed
+    }
+
+    /// Closes one conversation's `+` menu, including its fork choices.
+    pub(super) fn close_composer_actions(&mut self, target: Target) {
+        if let Some(runtime) = self.chat_runtime_mut(target) {
+            runtime.composer_actions = false;
+            runtime.branch_picker = false;
+        }
     }
 
     pub(super) fn dismiss_chat_picker(&mut self) -> bool {
@@ -11229,13 +11290,24 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = open;
                     runtime.branch_picker = false;
-                    // The menu draws over the timeline, after everything the
-                    // keyboard already walks through; start on its first row
-                    // so Tab and Enter work from where it opened.
-                    if open && let Some(first) = runtime.first_composer_action() {
-                        return iced::widget::operation::focus(card_control_id(target.card, first))
-                            .map(cosmic::Action::App);
-                    }
+                }
+                // The menu draws over the timeline, after everything the
+                // keyboard already walks through; start on its first row that
+                // can be pressed so Tab and Enter work from where it opened.
+                // Closing leaves focus alone: a press elsewhere has already
+                // put it where the person meant, and Escape returns it to the
+                // draft on its own.
+                let transitioning = self.chat_ui.phases.contains_key(&target.card);
+                let first = match self.cards.get(&target.card) {
+                    Some(CardRuntime::Chat(runtime)) if open => runtime
+                        .composer_action_rows(transitioning)
+                        .into_iter()
+                        .find_map(|(row, enabled)| enabled.then(|| row.id())),
+                    _ => None,
+                };
+                if let Some(id) = first {
+                    return iced::widget::operation::focus(card_control_id(target.card, id))
+                        .map(cosmic::Action::App);
                 }
             }
             Action::BranchPicker(target, open) => {
@@ -26550,18 +26622,36 @@ mod tests {
         snapshot.ready = true;
         snapshot.capabilities.branch = true;
         snapshot.capabilities.compact = true;
-        // Opening the menu focuses its first row, in the order it lists them.
+        // The menu lists its rows in a fixed order; opening it focuses the
+        // first one that can be pressed.
+        let rows = |app: &Cagents| chat_runtime(app, card).composer_action_rows(false);
         assert_eq!(
-            chat_runtime(&app, card).first_composer_action(),
-            Some("chat-actions-fork")
+            rows(&app),
+            [(ComposerRow::Fork, true), (ComposerRow::Compact, true)]
         );
-        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot)
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot)
             .capabilities
             .interrupt_modes = vec!["immediate".into(), "wait".into()];
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        // While a turn runs only steering can be pressed, so focus skips the
+        // disabled fork and compact rows rather than landing where nothing
+        // shows it.
         assert_eq!(
-            chat_runtime(&app, card).first_composer_action(),
-            Some("chat-actions-steering")
+            rows(&app),
+            [
+                (ComposerRow::Steering, true),
+                (ComposerRow::Fork, false),
+                (ComposerRow::Compact, false),
+            ]
         );
+        assert!(
+            chat_runtime(&app, card)
+                .composer_action_rows(true)
+                .iter()
+                .all(|(_, enabled)| !enabled)
+        );
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = false;
 
         drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
         assert!(chat_runtime(&app, card).composer_actions);

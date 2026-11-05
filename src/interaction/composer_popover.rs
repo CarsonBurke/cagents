@@ -200,21 +200,29 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for ComposerPopo
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        // The composer's own overlays, such as its controls' tooltips, stay
+        // beneath the menu rather than vanishing while it is open.
+        let (anchor_tree, popup_tree) = tree.children.split_at_mut(1);
+        let anchor = self.anchor.as_widget_mut().overlay(
+            &mut anchor_tree[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        );
         let Some(popup) = &mut self.popup else {
-            return self.anchor.as_widget_mut().overlay(
-                &mut tree.children[0],
-                layout,
-                renderer,
-                viewport,
-                translation,
-            );
+            return anchor;
         };
-        Some(overlay::Element::new(Box::new(Popup {
+        let popup = overlay::Element::new(Box::new(Popup {
             content: popup,
-            tree: &mut tree.children[1],
+            tree: &mut popup_tree[0],
             geometry: tree.state.downcast_mut::<Geometry>(),
             anchor: layout.bounds().position() + translation,
-        })))
+        }));
+        Some(match anchor {
+            Some(anchor) => overlay::Group::with_children(vec![anchor, popup]).overlay(),
+            None => popup,
+        })
     }
     fn a11y_nodes(
         &self,
