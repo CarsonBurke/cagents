@@ -1045,7 +1045,10 @@ mod tests {
         drop(app.apply_workspace_model_update(
             super::super::workspace_model_sync::ModelUpdate::Edited {
                 sequence: 9,
-                edit: ModelEdit::DeleteChannel { id: home.channel },
+                edit: ModelEdit::DeleteChannel {
+                    id: home.channel,
+                    reviewed: None,
+                },
             },
         ));
         assert!(app.workspace_model.channel(home.channel).is_none());

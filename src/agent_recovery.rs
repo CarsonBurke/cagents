@@ -776,7 +776,10 @@ pub(crate) fn fresh_native_environment(
     if crate::device::is_remote() {
         return crate::device::environment(provider, persistable);
     }
-    std::env::vars()
+    // `vars` panics on a variable that is not Unicode, and any process can
+    // inherit one. The result holds text, so such entries are skipped.
+    std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .filter(|(name, value)| fresh_environment_key(provider, name, value, persistable))
         .collect()
 }

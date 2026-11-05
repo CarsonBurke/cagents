@@ -69,6 +69,12 @@ pub enum ModelUpdate {
         channel: ChannelId,
         error: String,
     },
+    /// The registry kept a channel this window deleted, because it gained
+    /// panes after the user confirmed. The model read that follows restores it.
+    DeletionRefused {
+        channel: ChannelId,
+        error: String,
+    },
     /// Optional naming yielded after temporary admission pressure. The next
     /// real wake may retry this exact current candidate; this is not a timer.
     TitleDeferred(ModelEdit),
@@ -264,6 +270,19 @@ fn publish(
                             channel: home.channel,
                             error: error.to_string(),
                         });
+                    }
+                    if let ModelEdit::DeleteChannel {
+                        id,
+                        reviewed: Some(_),
+                    } = &request
+                    {
+                        let _ = updates.send_blocking(ModelUpdate::DeletionRefused {
+                            channel: *id,
+                            error: error.to_string(),
+                        });
+                        if let Ok(model) = client.read_workspace_model() {
+                            let _ = updates.send_blocking(ModelUpdate::Read(model));
+                        }
                     }
                     if let ModelEdit::ReopenProject { repository, .. } = request {
                         let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
@@ -592,6 +611,11 @@ impl Cagents {
                 );
                 Task::none()
             }
+            ModelUpdate::DeletionRefused { channel, error } => {
+                self.channel_ui.restore_refused_deletion(channel);
+                self.status = Some(TransientNotice::error(error));
+                Task::none()
+            }
             ModelUpdate::TitleDeferred(edit) => {
                 self.defer_channel_title_suggestion(&edit);
                 Task::none()
@@ -720,7 +744,7 @@ impl Cagents {
                 }
 
                 if sequence <= self.workspace_model.sequence {
-                    if let ModelEdit::DeleteChannel { id } = edit {
+                    if let ModelEdit::DeleteChannel { id, .. } = edit {
                         // A snapshot can overtake this explicit instruction.
                         // It must still revoke automatic revival, even when
                         // absence already removed the local channel.
@@ -738,7 +762,7 @@ impl Cagents {
                 // window had recorded the channel as shared - which is exactly
                 // the case absence may not be trusted in.
                 let deleted = match &edit {
-                    ModelEdit::DeleteChannel { id } => Some(*id),
+                    ModelEdit::DeleteChannel { id, .. } => Some(*id),
                     _ => None,
                 };
                 let closing = match &edit {
@@ -2883,7 +2907,10 @@ mod tests {
                     repository: repository.clone(),
                 }
             } else {
-                ModelEdit::DeleteChannel { id: channel }
+                ModelEdit::DeleteChannel {
+                    id: channel,
+                    reviewed: None,
+                }
             };
             let next_sequence = original.sequence + 2;
             drop(app.apply_workspace_model_update(ModelUpdate::Edited {
@@ -4078,6 +4105,43 @@ mod tests {
         assert_eq!(rows[1].id, mine);
     }
 
+    /// The registry keeps a channel whose confirmed deletion it refused, so
+    /// this window adopts it again from the next read and says why.
+    #[test]
+    fn a_refused_reviewed_deletion_restores_the_channel() {
+        let (mut app, project, repository) = app_with_project();
+        let id = ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(local(id, project, "kept", 4));
+        let mut model = registry(vec![shared(id, &repository, "kept", 4)]);
+        app.workspace_model = model.clone();
+        let published = intercept_publishes(&mut app);
+
+        let _ = app.retire_peer_channel(id);
+        assert!(app.channel_ui.was_deleted(id));
+        assert!(!app.durable.channels.iter().any(|channel| channel.id == id));
+        drain(&published);
+
+        let error = "The channel gained panes after you confirmed its deletion, so it was kept.";
+        let _ = app.apply_workspace_model_update(ModelUpdate::DeletionRefused {
+            channel: id,
+            error: error.into(),
+        });
+        assert!(!app.channel_ui.was_deleted(id));
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|notice| notice.message == error)
+        );
+        model.sequence += 1;
+        let _ = app.apply_workspace_model_update(ModelUpdate::Read(model));
+        assert!(
+            app.durable.channels.iter().any(|channel| channel.id == id),
+            "the registry's channel is adopted again"
+        );
+    }
+
     /// A channel deleted anywhere disappears everywhere, and its cards are
     /// detached locally after the initiating client has retired host work.
     #[test]
@@ -4094,7 +4158,7 @@ mod tests {
 
         let _ = app.apply_workspace_model_update(ModelUpdate::Edited {
             sequence: 5,
-            edit: ModelEdit::DeleteChannel { id },
+            edit: ModelEdit::DeleteChannel { id, reviewed: None },
         });
         assert!(app.channel_ui.was_deleted(id));
         assert!(!app.channel_ui.is_deleting(id));
@@ -4135,7 +4199,7 @@ mod tests {
         let _ = app.delete_channel(id);
         assert!(!app.durable.channels.iter().any(|channel| channel.id == id));
         assert!(drain(&published).iter().any(
-            |edit| matches!(edit, ModelEdit::DeleteChannel { id: deleted } if *deleted == id)
+            |edit| matches!(edit, ModelEdit::DeleteChannel { id: deleted, .. } if *deleted == id)
         ));
 
         let _ = app.reconcile_workspace_model();
@@ -4505,7 +4569,7 @@ mod tests {
         // A real newer delete goes through the application's retirement path.
         drop(app.apply_workspace_model_update(ModelUpdate::Edited {
             sequence: 6,
-            edit: ModelEdit::DeleteChannel { id },
+            edit: ModelEdit::DeleteChannel { id, reviewed: None },
         }));
         assert!(app.workspace_model.channel(id).is_none());
         let durable = Arc::clone(&app.durable);

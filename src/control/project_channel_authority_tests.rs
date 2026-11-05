@@ -468,7 +468,7 @@ fn public_user_close_and_move_preserve_exact_destructive_intent_and_receipts() {
                     edit: ModelEdit::CloseProject { repository: actual },
                 } if verb == "project-close" => assert_eq!(actual, &repository),
                 ClientRequest::EditWorkspaceModel {
-                    edit: ModelEdit::DeleteChannel { id },
+                    edit: ModelEdit::DeleteChannel { id, reviewed: None },
                 } if verb == "channel-close" => assert_eq!(*id, source),
                 ClientRequest::EditWorkspaceModel {
                     edit:
@@ -1179,7 +1179,10 @@ fn actual_run_from_captures_scoped_writes_before_staged_lookup_without_user_fall
             assert_eq!(
                 request.request,
                 ClientRequest::EditWorkspaceModel {
-                    edit: ModelEdit::DeleteChannel { id: channel }
+                    edit: ModelEdit::DeleteChannel {
+                        id: channel,
+                        reviewed: None
+                    }
                 }
             );
             reply(peer, &request, denied());

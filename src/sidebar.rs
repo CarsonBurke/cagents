@@ -4070,6 +4070,7 @@ impl SidebarState {
             | SidebarAction::MarkChannelRead(_)
             | SidebarAction::DeleteRow(_)
             | SidebarAction::DeleteSelectedRows
+            | SidebarAction::DeleteSelectedRowsFrom(_)
             | SidebarAction::ClearRowSelection => {}
         }
     }
@@ -4127,6 +4128,8 @@ pub enum SidebarAction {
     /// Delete or remove one row, confirmed exactly as its context menu is.
     DeleteRow(SelectionRow),
     DeleteSelectedRows,
+    /// Preserve the actual keyboard or context-menu invoker of a group action.
+    DeleteSelectedRowsFrom(SelectionRow),
     ClearRowSelection,
     DragWindow,
     MaximizeWindow,
@@ -7051,7 +7054,7 @@ impl widget::menu::Action for ChannelContextCommand {
             ChannelMenuCommand::Delete => {}
         }
         if self.1 {
-            SidebarAction::DeleteSelectedRows
+            SidebarAction::DeleteSelectedRowsFrom(SelectionRow::Channel(self.0))
         } else {
             SidebarAction::DeleteChannel { channel_id: self.0 }
         }
@@ -7426,7 +7429,10 @@ impl widget::menu::Action for ContextCommand<'_> {
 
     fn message(&self) -> SidebarAction {
         if self.3 {
-            return SidebarAction::DeleteSelectedRows;
+            let row = self.1.map_or(SelectionRow::Project(self.0), |id| {
+                SelectionRow::Worktree(self.0, id)
+            });
+            return SidebarAction::DeleteSelectedRowsFrom(row);
         }
         SidebarAction::ProjectCommand {
             project_id: self.0,
@@ -12124,7 +12130,7 @@ mod row_interaction {
                             // moved off a selection, or a Ctrl-click that
                             // deselected this row, must not aim at other rows.
                             shell.publish(if selected {
-                                SidebarAction::DeleteSelectedRows
+                                SidebarAction::DeleteSelectedRowsFrom(row)
                             } else {
                                 SidebarAction::DeleteRow(row)
                             });
@@ -14302,7 +14308,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             dispatch(&mut element, &mut tree, key()),
-            vec![SidebarAction::DeleteSelectedRows]
+            vec![SidebarAction::DeleteSelectedRowsFrom(row)]
         );
     }
 

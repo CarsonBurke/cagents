@@ -75,7 +75,10 @@ fn canonical_empty_retirement_preserves_work_history_and_rejects_reused_channel_
     assert!(!retained.changed);
     assert!(retained.model.channel(home.channel).is_some());
     registry
-        .apply(&ModelEdit::DeleteChannel { id: home.channel })
+        .apply(&ModelEdit::DeleteChannel {
+            id: home.channel,
+            reviewed: None,
+        })
         .unwrap();
     let history = registry.read_channel_work(&home, Page::default()).unwrap();
     assert_eq!(history.lifecycle, HomeLifecycle::Deleted);

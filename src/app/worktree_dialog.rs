@@ -198,6 +198,10 @@ pub struct WorktreeDialog {
 }
 
 impl WorktreeDialog {
+    pub(super) fn is_resolving(&self) -> bool {
+        self.resolving.is_some()
+    }
+
     pub(super) fn set_checkout_notice(&mut self, notice: String) {
         self.checkout_notice = Some(notice);
     }
@@ -434,10 +438,7 @@ impl Cagents {
                     let _ = self.dismiss_worktree_operation(replaced);
                 }
                 let start = self.start_worktree_operation(project_id, request, Some(draft));
-                let focus = match self.nested_modal_focus_target() {
-                    Some(target) => iced::widget::operation::focus(target).map(cosmic::Action::App),
-                    None => self.focus_context_overlay_if_exposed(),
-                };
+                let focus = self.restore_dialog_focus(|| self.focus_context_overlay_if_exposed());
                 Task::batch([start, focus])
             }
             Err(error) => dialog.show_error(error),

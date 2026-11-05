@@ -1286,7 +1286,10 @@ fn archive_and_delete_cross_ended_keyset_batches_without_losing_live_rows_or_rec
             tx.commit().unwrap();
         } else {
             registry
-                .apply(&ModelEdit::DeleteChannel { id: home.channel })
+                .apply(&ModelEdit::DeleteChannel {
+                    id: home.channel,
+                    reviewed: None,
+                })
                 .unwrap();
         }
         assert_eq!(registry.model().unwrap().sequence, before + 1);
@@ -1629,7 +1632,10 @@ fn metadata_only_home_read_preserves_retained_receipt_scope_without_decoding_pro
             tx.commit().unwrap();
         } else {
             registry
-                .apply(&ModelEdit::DeleteChannel { id: home.channel })
+                .apply(&ModelEdit::DeleteChannel {
+                    id: home.channel,
+                    reviewed: None,
+                })
                 .unwrap();
         }
         // Even an unavailable row projection cannot prevent exact metadata

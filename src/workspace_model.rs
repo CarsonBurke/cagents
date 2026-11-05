@@ -317,7 +317,7 @@ impl WorkspaceModel {
             // Requires canonical work and pane evidence; an optimistic client
             // cannot infer whether retirement was accepted.
             ModelEdit::RetireEmptyChannel { .. } | ModelEdit::ChannelWorkChanged { .. } => {}
-            ModelEdit::DeleteChannel { id } => {
+            ModelEdit::DeleteChannel { id, .. } => {
                 self.channels.retain(|channel| channel.id != *id);
             }
         }
@@ -379,7 +379,15 @@ pub enum ModelEdit {
     },
     /// A no-op on an unknown id, so a second delete of one channel is not an
     /// error for the second window to issue it.
-    DeleteChannel { id: ChannelId },
+    DeleteChannel {
+        id: ChannelId,
+        /// The panes the user reviewed when confirming. The registry refuses
+        /// the deletion if the channel's canonical view has gained any other
+        /// pane since, because deleting retires every current placement.
+        /// `None` for a deletion with nothing to review, such as one the CLI
+        /// issues.
+        reviewed: Option<Vec<crate::model::CardId>>,
+    },
     /// Daemon-only invalidation after a committed execution descriptor change.
     AgentsChanged,
     SeedView {

@@ -203,7 +203,10 @@ fn public_point_and_home_reads_keep_exact_scope_and_recover_retired_home_without
     registry
         .lock()
         .unwrap()
-        .apply(&ModelEdit::DeleteChannel { id: home.channel })
+        .apply(&ModelEdit::DeleteChannel {
+            id: home.channel,
+            reviewed: None,
+        })
         .unwrap();
     assert!(matches!(
         wire(&host, Authority::default(), Request::ReadHome { home }),
