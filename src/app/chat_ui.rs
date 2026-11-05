@@ -224,6 +224,10 @@ pub enum Action {
     /// Points a draft at another account of its provider.
     ChooseAccount(Target, AccountId),
     RecoverAccount(CardId, AccountId),
+    /// Asks the device to list a conversation's account again: its home is
+    /// still there, but the account list lost it.
+    RestoreAccount(CardId),
+    AccountRestored(CardId, Result<account::remote::RestoredHome, String>),
     /// Installed skills read without starting the draft's provider.
     DraftSkills(Target, chat::Launch, Vec<chat::Skill>),
     /// Opens or closes the account choice.
@@ -666,6 +670,54 @@ fn draft_start_backend() -> Option<(String, String, String)> {
     })
 }
 
+/// The account home `session` launches its provider in, as its launch names it.
+fn chat_account_home(session: &chat::Session) -> Option<&str> {
+    let variable = account::home_variable(session.launch.provider)?;
+    session
+        .launch
+        .recipe
+        .environment
+        .get(variable)
+        .map(String::as_str)
+}
+
+/// The account a refused start was on, which the account list lost but whose
+/// home the device kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestorableAccount {
+    provider: Provider,
+    key: uuid::Uuid,
+    /// The home the refused start used, as its launch named it.
+    home: String,
+    /// While the device is restoring it.
+    restoring: bool,
+    /// Why the last restore left it unlisted.
+    failure: Option<String>,
+    /// A draft's message the refusal returned to its composer, sent once the
+    /// account is back.
+    resend: Option<Resend>,
+}
+
+/// What a refused draft was about to send. Once the reader edits the message
+/// or chooses another account, it is no longer what they asked to send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Resend {
+    text: String,
+    /// The home the draft's account choice names; `None` while it lets the
+    /// router choose.
+    account: Option<String>,
+}
+
+impl Resend {
+    fn of(runtime: &Runtime) -> Option<Self> {
+        let text = runtime.composer.text();
+        (runtime.is_draft() && !text.trim().is_empty()).then(|| Self {
+            text,
+            account: chat_account_home(&runtime.session).map(str::to_owned),
+        })
+    }
+}
+
 pub(super) struct State {
     channel_names: HashMap<Target, ChannelNameObservation>,
     pub(super) image_viewer: Option<images::Gallery>,
@@ -708,6 +760,9 @@ pub(super) struct State {
     /// Capacity failures before a chat runtime exists (saved-pane hydration).
     capacity_offers: HashSet<CardId>,
     removed_accounts: HashSet<CardId>,
+    /// Cards refused because the account list does not name their account,
+    /// whose home is still on the device and can be restored.
+    restorable_accounts: HashMap<CardId, RestorableAccount>,
     /// The model last chosen for each provider, and its effort, which a new
     /// conversation of that provider starts on.
     last_models: HashMap<Provider, (String, Option<String>)>,
@@ -734,6 +789,7 @@ impl Default for State {
             fresh_offers: HashSet::new(),
             capacity_offers: HashSet::new(),
             removed_accounts: HashSet::new(),
+            restorable_accounts: HashMap::new(),
             last_models: HashMap::new(),
         }
     }
@@ -5792,6 +5848,184 @@ impl Cagents {
         self.load_draft_skills(target)
     }
 
+    /// The managed account `session` was recorded on, when the account list
+    /// lost it but its home may still be on the device, and that home.
+    fn restorable_chat_account(
+        &self,
+        session: &chat::Session,
+    ) -> Option<(Provider, uuid::Uuid, String)> {
+        let home = chat_account_home(session)?;
+        self.account_ui
+            .restorable_home(Path::new(home))
+            .filter(|(provider, _)| *provider == session.launch.provider)
+            .map(|(provider, key)| (provider, key, home.to_owned()))
+    }
+
+    /// Offers to restore `own`'s account after the daemon refused `card`
+    /// because its account list does not name it, and asks for that at once.
+    ///
+    /// Restoring is what the daemon does by itself for such a home, so the
+    /// refusal asks for it rather than waiting on a click or the daemon's next
+    /// look. Unless `again`, a later refusal for the same account keeps its
+    /// reason on screen and leaves retrying, or another account, to the
+    /// reader. A draft's message, back in its composer, is remembered to be
+    /// sent once the account is restored.
+    fn offer_chat_account_restore(
+        &mut self,
+        card: CardId,
+        own: &chat::Session,
+        again: bool,
+    ) -> Task<Message> {
+        let Some((provider, key, home)) = self.restorable_chat_account(own) else {
+            self.chat_ui.restorable_accounts.remove(&card);
+            return Task::none();
+        };
+        let resend = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Resend::of(runtime),
+            _ => None,
+        };
+        let offered = self
+            .chat_ui
+            .restorable_accounts
+            .get(&card)
+            .filter(|offered| (offered.provider, offered.key) == (provider, key));
+        if offered.is_some() && !again {
+            return Task::none();
+        }
+        let restoring = offered.is_some_and(|offered| offered.restoring);
+        self.chat_ui.restorable_accounts.insert(
+            card,
+            RestorableAccount {
+                provider,
+                key,
+                home,
+                restoring,
+                failure: None,
+                resend,
+            },
+        );
+        self.restore_chat_account(card)
+    }
+
+    /// Lists the conversation's own account again, on the device that keeps
+    /// its home, so the conversation continues where its history is.
+    fn restore_chat_account(&mut self, card: CardId) -> Task<Message> {
+        if self.chat_start_pending(card) {
+            return Task::none();
+        }
+        let Some(restorable) = self.chat_ui.restorable_accounts.get_mut(&card) else {
+            return Task::none();
+        };
+        if restorable.restoring {
+            return Task::none();
+        }
+        restorable.restoring = true;
+        restorable.failure = None;
+        let operation = account::remote::Operation::Restore {
+            provider: restorable.provider,
+            key: restorable.key,
+        };
+        // A draft has no recovery controls; its refusal says what is under way.
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card)
+            && runtime.is_draft()
+        {
+            runtime.error = Some(
+                "This account isn't in the account list, but its files were kept. Checking its sign-in to restore it…"
+                    .into(),
+            );
+        }
+        cosmic::task::future(async move {
+            let result =
+                tokio::task::spawn_blocking(
+                    move || match crate::device_service::request_for_reader(
+                        crate::device_service::Operation::AccountLifecycle { operation },
+                    )? {
+                        crate::device_service::Reply::AccountLifecycle(value) => {
+                            serde_json::from_value(value).map_err(|error| error.to_string())
+                        }
+                        _ => Err("The device did not restore the account".into()),
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            Message::ChatUi(Action::AccountRestored(card, result))
+        })
+    }
+
+    fn chat_account_restored(
+        &mut self,
+        card: CardId,
+        result: Result<account::remote::RestoredHome, String>,
+    ) -> Task<Message> {
+        let Some(restorable) = self.chat_ui.restorable_accounts.get_mut(&card) else {
+            if let Ok(restored) = result {
+                self.account_ui.set_registry(restored.registry);
+            }
+            return Task::none();
+        };
+        restorable.restoring = false;
+        let restored = match result {
+            Ok(restored) => restored,
+            Err(error) => {
+                // The card shows why, in place of the promise that the account
+                // could be restored: a draft in place of the conversation it
+                // has not started, where sending again asks again.
+                if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card)
+                    && runtime.is_draft()
+                {
+                    runtime.error = Some(format!("{error} Choose another account, or send again."));
+                }
+                restorable.failure = Some(error);
+                return Task::none();
+            }
+        };
+        let restorable = self
+            .chat_ui
+            .restorable_accounts
+            .remove(&card)
+            .expect("checked above");
+        self.chat_ui.removed_accounts.remove(&card);
+        let email = restored
+            .registry
+            .find(restorable.key)
+            .and_then(|account| account.email.clone());
+        self.account_ui.set_registry(restored.registry);
+        let Some(CardKind::Chat(source)) = self.card_state(card).map(|state| &state.kind) else {
+            return Task::none();
+        };
+        let session = source.clone();
+        let name =
+            email.unwrap_or_else(|| format!("The {} account", session.launch.provider.label()));
+        let notice = match restored.restored {
+            account::registry::Restored::Archived { .. } => format!(
+                "{name} was restored and archived, because another account uses the same login."
+            ),
+            _ => format!("{name} was restored."),
+        };
+        self.status = Some(TransientNotice::success(notice).with_key(NoticeKey::ChatAttach(card)));
+        // A draft has no conversation to reopen: the refusal answered its
+        // first send, whose message is back in the composer. Sending it again
+        // finishes what the reader asked for - if it is still what they
+        // asked, on the account that was restored.
+        if session.launch.session_id.is_none() {
+            let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+                return Task::none();
+            };
+            if !runtime.is_draft() {
+                return Task::none();
+            }
+            runtime.error = None;
+            if restorable.resend.is_none() || restorable.resend != Resend::of(runtime) {
+                return Task::none();
+            }
+            let target = runtime.target;
+            return self.handle_chat_ui(Action::Submit(target, PromptMode::Send));
+        }
+        let intent = self.chat_retry_intent(card, &session);
+        self.start_chat(card, session, intent, None, false)
+    }
+
     fn recover_chat_account(&mut self, card: CardId, id: AccountId) -> Task<Message> {
         self.change_chat_account(card, id, None, None)
     }
@@ -5858,6 +6092,11 @@ impl Cagents {
     ) -> Task<Message> {
         if (generation.is_none() && !self.chat_ui.removed_accounts.contains(&card))
             || self.chat_start_pending(card)
+            || self
+                .chat_ui
+                .restorable_accounts
+                .get(&card)
+                .is_some_and(|restorable| restorable.restoring)
         {
             return Task::none();
         }
@@ -5970,10 +6209,50 @@ impl Cagents {
             .filter(|choice| !choice.selected)
             .collect::<Vec<_>>();
         let pending = self.chat_start_pending(card);
-        let mut content: Vec<Element<'_, Message>> = vec![design::caption(if pending {
-            "Checking the saved conversation on the selected account…"
-        } else { "Continue this saved conversation on another account. Its identity stays unchanged until the provider confirms it." }).into()];
-        if choices.is_empty() && !pending {
+        let restorable = self.chat_ui.restorable_accounts.get(&card);
+        let restoring = restorable.map(|restorable| restorable.restoring);
+        // Choosing another account while the conversation's own is being
+        // restored would start it twice.
+        let busy = pending || restoring == Some(true);
+        let mut content: Vec<Element<'_, Message>> = Vec::new();
+        if let Some(restorable) = restorable {
+            // The conversation's own account is the one that holds its
+            // history, so getting it back comes before moving elsewhere.
+            content.push(
+                design::caption(match (&restorable.failure, restorable.restoring) {
+                    (_, true) => "Checking the account's sign-in…".into(),
+                    (Some(failure), false) => failure.clone(),
+                    (None, false) => {
+                        "Restore the account to continue this conversation where its history is."
+                            .to_owned()
+                    }
+                })
+                .into(),
+            );
+            // Once a restore has failed, asking again is one way forward
+            // among the other accounts, not the obvious next step.
+            let restore = Message::ChatUi(Action::RestoreAccount(card));
+            content.push(if restorable.failure.is_some() {
+                crate::ui_controls::button::secondary("Try again")
+                    .on_press_maybe((!busy).then_some(restore))
+                    .into()
+            } else {
+                crate::ui_controls::button::primary("Restore account")
+                    .on_press_maybe((!busy).then_some(restore))
+                    .into()
+            });
+        }
+        content.push(
+            design::caption(if pending {
+                "Checking the saved conversation on the selected account…"
+            } else if restoring.is_some() {
+                "Or continue on another account. The conversation's identity stays unchanged until the provider confirms it."
+            } else {
+                "Continue this saved conversation on another account. Its identity stays unchanged until the provider confirms it."
+            })
+            .into(),
+        );
+        if choices.is_empty() && !pending && restoring.is_none() {
             content.push(
                 design::caption("Add or sign in to another account in Accounts to continue.")
                     .into(),
@@ -5991,7 +6270,7 @@ impl Cagents {
                     }
                 ))
                 .on_press_maybe(
-                    (!pending).then_some(Message::ChatUi(Action::RecoverAccount(card, choice.id))),
+                    (!busy).then_some(Message::ChatUi(Action::RecoverAccount(card, choice.id))),
                 )
                 .into(),
             );
@@ -7064,6 +7343,7 @@ impl Cagents {
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
         self.chat_ui.removed_accounts.remove(&card);
+        self.chat_ui.restorable_accounts.remove(&card);
     }
     pub(super) fn chat_capacity_guidance(&self, card: CardId) -> Option<&'static str> {
         (self.chat_ui.capacity_offers.contains(&card)
@@ -8963,6 +9243,10 @@ impl Cagents {
                 return self.choose_chat_account(target, id);
             }
             Action::RecoverAccount(card, id) => return self.recover_chat_account(card, id),
+            Action::RestoreAccount(card) => return self.restore_chat_account(card),
+            Action::AccountRestored(card, result) => {
+                return self.chat_account_restored(card, result);
+            }
             Action::DraftSkills(target, launch, skills) => {
                 if let Some(runtime) = self.chat_card_runtime_mut(target)
                     && runtime.is_draft()
@@ -9440,6 +9724,7 @@ impl Cagents {
                         }
                         self.chat_ui.fresh_offers.remove(&target.card);
                         self.chat_ui.removed_accounts.remove(&target.card);
+                        self.chat_ui.restorable_accounts.remove(&target.card);
                         let mut session = handle.session();
                         session.proof = handle.proof();
                         let snapshot = handle.snapshot();
@@ -9577,12 +9862,22 @@ impl Cagents {
                         // given up, since a lost answer is not proof it
                         // started nothing; the next send starts afresh under
                         // an identity of its own.
+                        // Each refusal follows the reader's own send, so
+                        // each one asks for its account to be restored.
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.unqueue();
                             runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
                             runtime.error = Some(failure.message);
                         }
-                        return self.retire_chat(target.card, None, Some(attempt.session));
+                        let restore = if failure.recovery == chat::Recovery::Account {
+                            self.offer_chat_account_restore(target.card, &attempt.session, true)
+                        } else {
+                            Task::none()
+                        };
+                        return Task::batch([
+                            self.retire_chat(target.card, None, Some(attempt.session)),
+                            restore,
+                        ]);
                     }
                     Err(failure)
                         if failure.recovery == chat::Recovery::Fresh
@@ -9622,8 +9917,13 @@ impl Cagents {
                         );
                         let account_removed =
                             failure.recovery == chat::Recovery::Account || account_source.is_some();
+                        let mut restore = Task::none();
                         if account_removed {
                             self.chat_ui.removed_accounts.insert(target.card);
+                            // The conversation's own account, also while
+                            // another one was being tried for it.
+                            let own = account_source.as_ref().unwrap_or(&attempt.session);
+                            restore = self.offer_chat_account_restore(target.card, own, false);
                         }
                         // A card that cannot resume has to say what refused it
                         // and offer the action that answers that refusal, so
@@ -9704,6 +10004,7 @@ impl Cagents {
                             } else {
                                 Task::none()
                             },
+                            restore,
                         ]);
                     }
                 }
@@ -23557,6 +23858,359 @@ mod tests {
         let _ = app.update(Message::AccountUi(account_ui::Action::OpenPane));
         assert!(app.utility_card(&CardKind::Accounts).is_some());
         assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(session));
+    }
+
+    #[test]
+    fn a_conversation_whose_account_list_lost_its_kept_home_offers_to_restore_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let directory = tempfile::tempdir().unwrap();
+        let homes = crate::account::home::Homes::at(directory.path().join("accounts"));
+        let (key, home) = homes.create(Provider::Codex, None).unwrap();
+        app.account_ui.use_homes(homes.clone());
+        let refuse = |app: &mut Cagents, source: &chat::Session| {
+            app.install_chat_session(card, source.clone());
+            app.chat_forget(card);
+            app.cards.insert(card, CardRuntime::Loading);
+            let _ = app.open_chat(card, source.clone(), chat::Intent::Restore);
+            let target = chat_runtime_attempt(app, card);
+            answer_start(
+                app,
+                target,
+                Err(chat::StartFailure {
+                    message: "This Codex account isn't in the account list".into(),
+                    recovery: chat::Recovery::Account,
+                }),
+            );
+        };
+
+        // A home whose files are gone is plainly removed: no restore offer.
+        let mut gone = chat_runtime(&app, card).session.clone();
+        gone.launch.recipe.environment.insert(
+            "CODEX_HOME".into(),
+            homes
+                .path(Provider::Codex, uuid::Uuid::new_v4())
+                .to_str()
+                .unwrap()
+                .into(),
+        );
+        refuse(&mut app, &gone);
+        assert!(app.chat_ui.removed_accounts.contains(&card));
+        assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
+
+        let restored = || {
+            let mut registry = crate::account::registry::Registry::default();
+            assert!(
+                registry
+                    .restore(
+                        crate::account::registry::Registered {
+                            key,
+                            provider: Provider::Codex,
+                            linked_home: None,
+                            label: None,
+                            email: Some("plan@example.com".into()),
+                            organization: None,
+                            added_at: 1,
+                        },
+                        &[],
+                        &homes,
+                    )
+                    .is_none()
+            );
+            registry
+        };
+        // This window's copy of the list still names the account: the list
+        // was reset under it. The daemon's refusal is the current answer.
+        app.account_ui.set_registry(restored());
+        let mut source = gone.clone();
+        source
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+        refuse(&mut app, &source);
+        assert_eq!(
+            app.chat_ui.restorable_accounts.get(&card).map(|offer| (
+                offer.provider,
+                offer.key,
+                offer.restoring
+            )),
+            Some((Provider::Codex, key, true)),
+            "the first refusal asks the device to restore the account at once"
+        );
+        assert!(app.account_recovery_controls(card).is_some());
+        let _ = app.update(Message::ChatUi(Action::RestoreAccount(card)));
+        // The device refuses - its provider reports no sign-in, say. The
+        // offer stays, with what refused it.
+        let _ = app.update(Message::ChatUi(Action::AccountRestored(
+            card,
+            Err("Codex reports no sign-in for this account, so it was not restored.".into()),
+        )));
+        assert_eq!(
+            app.chat_ui.restorable_accounts.get(&card).map(|offer| (
+                offer.provider,
+                offer.key,
+                offer.restoring
+            )),
+            Some((Provider::Codex, key, false))
+        );
+        assert_eq!(
+            app.chat_ui.restorable_accounts[&card].failure.as_deref(),
+            Some("Codex reports no sign-in for this account, so it was not restored."),
+            "the card says why, in place of the offer"
+        );
+        assert!(app.chat_ui.removed_accounts.contains(&card));
+        assert!(
+            app.chat_ui.attempt(card).is_none(),
+            "nothing starts on a refusal"
+        );
+
+        let _ = app.update(Message::ChatUi(Action::RestoreAccount(card)));
+        assert_eq!(
+            app.chat_ui.restorable_accounts.get(&card).map(|offer| (
+                offer.provider,
+                offer.key,
+                offer.restoring
+            )),
+            Some((Provider::Codex, key, true)),
+            "asking again shows the check under way"
+        );
+        let _ = app.update(Message::ChatUi(Action::AccountRestored(
+            card,
+            Ok(crate::account::remote::RestoredHome {
+                registry: restored(),
+                restored: crate::account::registry::Restored::Listed,
+            }),
+        )));
+        assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
+        assert!(!app.chat_ui.removed_accounts.contains(&card));
+        assert_eq!(
+            app.chat_ui
+                .attempt(card)
+                .unwrap()
+                .session
+                .launch
+                .recipe
+                .environment
+                .get("CODEX_HOME"),
+            Some(&home.to_str().unwrap().to_owned()),
+            "the conversation starts again on its own account"
+        );
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source));
+    }
+
+    #[test]
+    fn a_draft_whose_account_list_lost_its_kept_home_restores_it_and_sends() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        let homes = crate::account::home::Homes::at(directory.path().join("accounts"));
+        let (key, home) = homes.create(Provider::Codex, None).unwrap();
+        app.account_ui.use_homes(homes);
+        let (card, target) = starting_chat(&mut app);
+        let Some(Phase::Starting(attempt)) = app.chat_ui.phases.get_mut(&card) else {
+            panic!("the draft is starting");
+        };
+        let failed = attempt.session.id;
+        // The refusal reads its account from the attempt, so naming the kept
+        // home there stands for the draft having chosen it.
+        attempt
+            .session
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+        let refuse = |app: &mut Cagents, target| {
+            answer_start(
+                app,
+                target,
+                Err(chat::StartFailure {
+                    message: "This Codex account isn't in the account list".into(),
+                    recovery: chat::Recovery::Account,
+                }),
+            );
+        };
+        refuse(&mut app, target);
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.choosing(), "the card is a draft again");
+        assert_eq!(runtime.composer.text().trim(), "hello");
+        assert_eq!(
+            app.chat_ui.restorable_accounts.get(&card).map(|offer| (
+                offer.provider,
+                offer.key,
+                offer.restoring
+            )),
+            Some((Provider::Codex, key, true)),
+            "the refusal asks the device to restore the account at once"
+        );
+        let retirement = retired(&mut app, card);
+        let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
+        let reason = "Codex reports no sign-in for this account, so it was not restored.";
+        let _ = app.update(Message::ChatUi(Action::AccountRestored(
+            card,
+            Err(reason.into()),
+        )));
+        assert!(
+            chat_runtime(&app, card)
+                .error
+                .as_deref()
+                .is_some_and(
+                    |error| error.starts_with(reason) && error.contains("Choose another account")
+                ),
+            "the draft says why it was not restored, and what to do instead"
+        );
+        assert!(!app.chat_start_pending(card), "and sends nothing");
+        let _ = app.update(Message::ChatUi(Action::RestoreAccount(card)));
+        // Sending saves the draft first; give it somewhere to.
+        let storage = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            storage.path().join("restored-draft.sqlite3"),
+            crate::model::BootId::new("restored-draft-test"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        let task = app.update(Message::ChatUi(Action::AccountRestored(
+            card,
+            Ok(crate::account::remote::RestoredHome {
+                registry: crate::account::registry::Registry::default(),
+                restored: crate::account::registry::Restored::AlreadyRegistered,
+            }),
+        )));
+        settle_first_start_checkpoint(&mut app, card, task);
+        assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
+        assert_eq!(
+            chat_runtime(&app, card).error,
+            None,
+            "the refusal no longer applies"
+        );
+        let attempt = app
+            .chat_ui
+            .attempt(card)
+            .expect("the message the refusal answered is sent again");
+        assert_ne!(attempt.session.id, failed, "under an identity of its own");
+        assert_eq!(
+            attempt.session.launch.recipe.environment,
+            chat_runtime(&app, card).session.launch.recipe.environment,
+            "on the account the draft names"
+        );
+        drop(app.session.take());
+    }
+
+    #[test]
+    fn a_draft_restored_before_its_refused_start_retires_still_sends_once() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        let homes = crate::account::home::Homes::at(directory.path().join("accounts"));
+        let (_, home) = homes.create(Provider::Codex, None).unwrap();
+        app.account_ui.use_homes(homes);
+        let (card, target) = starting_chat(&mut app);
+        let Some(Phase::Starting(attempt)) = app.chat_ui.phases.get_mut(&card) else {
+            panic!("the draft is starting");
+        };
+        let failed = attempt.session.id;
+        attempt
+            .session
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: "This Codex account isn't in the account list".into(),
+                recovery: chat::Recovery::Account,
+            }),
+        );
+        let retirement = retired(&mut app, card);
+        let storage = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            storage.path().join("restored-draft.sqlite3"),
+            crate::model::BootId::new("restored-draft-order-test"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        // The device answers the restore before the refused start's cleanup.
+        let task = app.update(Message::ChatUi(Action::AccountRestored(
+            card,
+            Ok(crate::account::remote::RestoredHome {
+                registry: crate::account::registry::Registry::default(),
+                restored: crate::account::registry::Restored::Listed,
+            }),
+        )));
+        settle_first_start_checkpoint(&mut app, card, task);
+        let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
+        let attempt = app
+            .chat_ui
+            .attempt(card)
+            .expect("the message is sent once the account is back");
+        assert_ne!(attempt.session.id, failed, "under an identity of its own");
+        assert!(chat_runtime(&app, card).composer.text().trim().is_empty());
+        drop(app.session.take());
+    }
+
+    #[test]
+    fn a_refused_draft_the_reader_changed_is_not_sent_when_its_account_is_restored() {
+        type Change = fn(&mut Runtime, &std::path::Path);
+        let changes: [(&str, Change); 2] = [
+            ("edited message", |runtime, _| {
+                runtime.replace_draft(text_editor::Content::with_text("hello, but different"));
+            }),
+            ("other account", |runtime, other| {
+                runtime
+                    .session
+                    .launch
+                    .recipe
+                    .environment
+                    .insert("CODEX_HOME".into(), other.to_str().unwrap().into());
+            }),
+        ];
+        for (change, apply) in changes {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let directory = tempfile::tempdir().unwrap();
+            let homes = crate::account::home::Homes::at(directory.path().join("accounts"));
+            let (_, home) = homes.create(Provider::Codex, None).unwrap();
+            let (_, other) = homes.create(Provider::Codex, None).unwrap();
+            app.account_ui.use_homes(homes);
+            let (card, target) = starting_chat(&mut app);
+            let Some(Phase::Starting(attempt)) = app.chat_ui.phases.get_mut(&card) else {
+                panic!("the draft is starting");
+            };
+            attempt
+                .session
+                .launch
+                .recipe
+                .environment
+                .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+            answer_start(
+                &mut app,
+                target,
+                Err(chat::StartFailure {
+                    message: "This Codex account isn't in the account list".into(),
+                    recovery: chat::Recovery::Account,
+                }),
+            );
+            assert!(app.chat_ui.restorable_accounts[&card].resend.is_some());
+            let retirement = retired(&mut app, card);
+            let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                panic!("the card is a draft");
+            };
+            apply(runtime, &other);
+            let _ = app.update(Message::ChatUi(Action::AccountRestored(
+                card,
+                Ok(crate::account::remote::RestoredHome {
+                    registry: crate::account::registry::Registry::default(),
+                    restored: crate::account::registry::Restored::Listed,
+                }),
+            )));
+            assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
+            assert!(
+                !app.chat_start_pending(card),
+                "{change}: nothing is sent the reader did not ask for"
+            );
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.choosing() && runtime.error.is_none(), "{change}");
+        }
     }
 
     #[test]
