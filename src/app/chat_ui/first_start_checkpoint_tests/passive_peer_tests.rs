@@ -1179,6 +1179,23 @@ fn run_with_peer_draft(initialized: bool, late_identity: bool, images: Vec<Attac
             &peer_draft,
             &images,
         );
+        let after_settlement =
+            std::iter::from_fn(|| peer_edits.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            after_settlement.iter().all(|edit| match edit {
+                ModelEdit::ChangeView {
+                    change: Change::Update { before, pane },
+                    ..
+                } => {
+                    before.kind == pane.kind
+                        && before.pending_terminal_start == pane.pending_terminal_start
+                        && before.scope == pane.scope
+                }
+                ModelEdit::ChangeView { .. } | ModelEdit::SeedView { .. } => false,
+                _ => true,
+            }),
+            "settling the achieved provider-ID update must not replay source intent: {after_settlement:?}",
+        );
         cleanup.finish();
         creator_wire.finish();
         assert!(observed.lock().unwrap().closes.is_empty());

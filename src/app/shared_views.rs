@@ -220,6 +220,7 @@ impl Cagents {
             return self.reconcile_workspace_model();
         };
         let mut retry = None;
+        let mut source_matches_current = false;
         if let Change::Update { before, pane } = &change
             && before.id == pane.id
             && self
@@ -244,6 +245,16 @@ impl Cagents {
                     .iter()
                     .find(|current| current.id == pane.id)
                     .unwrap();
+                // Two readers can publish the same authenticated enrichment.
+                // The host still refuses the stale base; no source write is
+                // needed when this exact intent is already canonical here.
+                source_matches_current = owner.scope == scope
+                    && (before.kind != pane.kind
+                        || before.pending_terminal_start != pane.pending_terminal_start
+                        || before.scope != pane.scope)
+                    && current.kind == pane.kind
+                    && current.pending_terminal_start == pane.pending_terminal_start
+                    && current.scope == pane.scope;
                 let mut presentation = current.clone();
                 let later = &self.shared_views.pending[index + 1..];
                 let superseded = |field: fn(&Pane, &Pane) -> bool| {
@@ -278,7 +289,11 @@ impl Cagents {
                 }
             }
         }
-        tracing::warn!(?scope, %operation, %error, "refused source-sensitive pane intent; host applied no fields");
+        if source_matches_current {
+            tracing::debug!(?scope, %operation, "shared pane intent already matches canonical source; no source retry");
+        } else {
+            tracing::warn!(?scope, %operation, %error, "refused source-sensitive pane intent; host applied no fields");
+        }
         self.shared_views.pending.remove(index);
         let source_basis = self.shared_views.source_bases.remove(&operation);
         if let Some((operation, scope, revision, change)) = retry {
@@ -297,9 +312,11 @@ impl Cagents {
                 change,
             });
         }
-        self.notices.record(TransientNotice::warning(
-            "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
-        ));
+        if !source_matches_current {
+            self.notices.record(TransientNotice::warning(
+                "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
+            ));
+        }
         self.reconcile_workspace_model()
     }
 
@@ -3097,8 +3114,11 @@ mod tests {
             ("foreign-watch-first", true),
             ("uncaptured", true),
             ("later-title", true),
+            ("pending-start-only", true),
+            ("scope-only", true),
+            ("moved-owner", true),
         ] {
-            let (mut app, source, _, before) = channel_move_fixture();
+            let (mut app, source, destination, before) = channel_move_fixture();
             let (tx, rx) = async_channel::unbounded();
             app.workspace_model_tx = tx;
             let operation = uuid::Uuid::new_v4();
@@ -3150,9 +3170,24 @@ mod tests {
                 current.pending_terminal_start = desired.pending_terminal_start;
                 current.scope = desired.scope.clone();
             }
+            if control == "pending-start-only" {
+                current.pending_terminal_start = false;
+            } else if control == "scope-only" {
+                current.scope = Some("/authoritative-source".into());
+            }
             let expected = current.clone();
             if control == "missing" {
                 model.views[0].panes.clear();
+            }
+            if control == "moved-owner" {
+                views::transfer(
+                    &mut model.views,
+                    &Scope::Channel(source),
+                    before.id,
+                    &Scope::Channel(destination),
+                    None,
+                )
+                .unwrap();
             }
             if matches!(control, "foreign-project" | "foreign-watch-first") {
                 model
@@ -3203,8 +3238,9 @@ mod tests {
             }
             let ModelEdit::ChangeView {
                 operation: retry,
+                scope: retry_scope,
                 change,
-                ..
+                expected_revision: _,
             } = rx.try_recv().unwrap()
             else {
                 panic!("presentation retry");
@@ -3246,10 +3282,16 @@ mod tests {
                 );
                 assert_eq!(app.card_state(pane.id).unwrap().title, "Later user title");
             }
-            model.views[0].apply(&change).unwrap();
+            model
+                .views
+                .iter_mut()
+                .find(|view| view.scope == retry_scope)
+                .unwrap()
+                .apply(&change)
+                .unwrap();
             model.sequence += 1;
             drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
-                scope: Scope::Channel(source),
+                scope: retry_scope,
                 operation: Some(retry),
                 model,
             }));
@@ -3261,6 +3303,105 @@ mod tests {
             );
             assert!(!app.shared_views.source_bases.contains_key(&retry));
             assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn a_source_conflict_with_the_same_chat_id_still_fences_proof_and_provider_identity() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for control in ["proof", "provider-id"] {
+            let CardKind::Terminal(terminal) = moving_terminal_kind() else {
+                unreachable!()
+            };
+            let session = crate::chat::Session {
+                id: terminal.id,
+                proof: terminal.continuity.live_proof(),
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor {
+                    protocol: 2,
+                },
+                launch: crate::chat::Launch {
+                    draft_model: None,
+                    provider: crate::agent::Provider::Claude,
+                    session_id: Some("before-provider-thread".into()),
+                    recipe: terminal.launch,
+                },
+            };
+            let (mut app, source, _, before) =
+                channel_move_fixture_with_kind(Some(CardKind::Chat(session)));
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            let mut desired = before.clone();
+            let CardKind::Chat(session) = &mut desired.kind else {
+                unreachable!()
+            };
+            session.launch.session_id = Some("desired-provider-thread".into());
+            let operation = uuid::Uuid::new_v4();
+            let change = Change::Update {
+                before: before.clone(),
+                pane: desired.clone(),
+            };
+            app.shared_views
+                .pending
+                .push((operation, Scope::Channel(source), change.clone()));
+            app.publish_model_edit(ModelEdit::ChangeView {
+                scope: Scope::Channel(source),
+                expected_revision: 17,
+                operation,
+                change: change.clone(),
+            });
+            assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+                operation: queued, .. } if queued == operation));
+            let mut current = desired;
+            let CardKind::Chat(session) = &mut current.kind else {
+                unreachable!()
+            };
+            if control == "proof" {
+                session.proof.as_mut().unwrap().host_incarnation =
+                    crate::model::HostIncarnation::new("different-actor-proof");
+            } else {
+                session.launch.session_id = Some("successor-provider-thread".into());
+            }
+            let mut model = app.workspace_model.clone();
+            model.views[0].panes[0] = current.clone();
+            model.views[0].revision += 1;
+            model.sequence += 1;
+            drop(
+                app.apply_workspace_model_update(ModelUpdate::ViewConflicted {
+                    scope: Scope::Channel(source),
+                    operation,
+                    change,
+                    model,
+                    error: "The workspace view changed".into(),
+                }),
+            );
+            assert!(
+                app.notices
+                    .recent()
+                    .any(|entry| entry.notice.message.contains("session update was refused")),
+                "{control}"
+            );
+            assert_eq!(app.workspace_model.views[0].panes[0].kind, current.kind);
+            assert!(
+                !app.shared_views
+                    .pending
+                    .iter()
+                    .any(|(id, _, _)| *id == operation)
+            );
+            assert!(!app.shared_views.source_bases.contains_key(&operation));
+            for edit in std::iter::from_fn(|| rx.try_recv().ok()) {
+                if let ModelEdit::ChangeView {
+                    change: Change::Update { before, pane },
+                    ..
+                } = edit
+                    && pane.id == current.id
+                {
+                    assert_eq!(before.kind, pane.kind, "no source retry: {control}");
+                    assert_eq!(before.pending_terminal_start, pane.pending_terminal_start);
+                    assert_eq!(before.scope, pane.scope);
+                }
+            }
         }
     }
 
