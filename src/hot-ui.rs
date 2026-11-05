@@ -55,7 +55,7 @@ fn restart_matched_daemon() -> Result<(), Box<dyn std::error::Error>> {
         return Err("matched CLI refused the development daemon restart".into());
     }
     let socket = cagents::instance::runtime_directory()?
-        .join("cagents-development")
+        .join(cagents::instance::runtime_subdirectory())
         .join("cagentsd.sock");
     let deadline = Instant::now() + Duration::from_secs(5);
     while socket.try_exists()? {

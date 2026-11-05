@@ -3157,6 +3157,30 @@ impl RepositoryRuntime {
         }
     }
 
+    /// Drives a document load as the shell would, including the re-read the
+    /// runtime starts when its watch invalidates a read, and reports whether
+    /// the real file worker answered. Other follow-up tasks are dropped.
+    #[cfg(test)]
+    pub(crate) async fn settle_document_read(&mut self, task: Task<RepositoryAction>) -> bool {
+        retained_save_tests::finish(self, task).await.answered()
+    }
+
+    /// Whether `action` is a file-read completion for the selected document.
+    /// Shell-level drivers check this before applying the action.
+    #[cfg(test)]
+    pub(crate) fn accepts_document_read(&self, action: &RepositoryAction) -> bool {
+        matches!(action,
+            RepositoryAction::FileLoadedAt { identity, .. }
+                | RepositoryAction::DocumentReloaded { identity, .. }
+                if self.accepts_selected(identity))
+    }
+
+    /// Whether an accepted read left the document loading behind a re-read.
+    #[cfg(test)]
+    pub(crate) fn rereading_document(&self) -> bool {
+        matches!(self.document, DocumentState::Loading { .. }) && self.document_reading
+    }
+
     /// Apply only navigation for this exact pane recipe. Shared projections can
     /// replace the recipe but cannot replace another window's local selection.
     pub(crate) fn restore_navigation(&mut self, navigation: &crate::model::RepositoryNavigation) {
@@ -12378,14 +12402,7 @@ mod tests {
     }
 
     async fn finish_navigation_task(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
-        use cosmic::iced::futures::StreamExt;
-        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
-            while let Some(action) = stream.next().await {
-                if let iced::runtime::Action::Output(action) = action {
-                    drop(runtime.update(action));
-                }
-            }
-        }
+        drop(super::retained_save_tests::finish(runtime, task).await);
     }
 
     #[tokio::test]
@@ -12900,6 +12917,10 @@ mod tests {
         };
         let task = runtime.retarget_file(card, text_view.clone());
         finish_navigation_task(&mut runtime, task).await;
+        assert!(matches!(runtime.document, DocumentState::Editable(_)));
+        assert_eq!(runtime.selected_path(), Some(Path::new("notes.txt")));
+        assert_eq!(runtime.editor_text().as_deref(), Some("unsaved baseline"));
+        assert!(runtime.editable_surface_visible());
         drop(runtime.update(RepositoryAction::EditorAction {
             card,
             action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
@@ -13021,6 +13042,94 @@ mod tests {
             assert_eq!(document.content.text(), "working\n");
             assert!(!document.dirty);
             assert!(runtime.editor_focus_target(card).is_none());
+        }
+    }
+
+    #[test]
+    fn working_diff_worker_matches_the_native_source_and_leaves_the_editor_alone() {
+        use cosmic::iced::futures::StreamExt;
+
+        for cancelled in [false, true] {
+            let card = CardId::new();
+            let baseline = "xlet café = \"😀\";\nsecond\r\n\rthird\rfourth";
+            let saved = "let café = \"😀\";\r\nsecond\n\rthird\rfourth\n";
+            let after = "xlet café = \"😀\";\r\nsecond\n\rthird\rfourth\n";
+            let (mut runtime, _) = working_diff_runtime(card, baseline, saved);
+            runtime.set_lsp_document(None);
+            runtime.source_surface = SourceSurface::Editor;
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+            }));
+            runtime.working_diff.applied = None;
+            drop(runtime.working_diff_task(card));
+            let ticket = runtime.working_diff.timer.unwrap();
+            runtime.working_diff.deadline = Some(Instant::now());
+            let editor_state = |runtime: &RepositoryRuntime| {
+                let DocumentState::Editable(document) = &runtime.document else {
+                    panic!("native buffer")
+                };
+                (
+                    document.saved_text.clone(),
+                    document.saved_history_revision,
+                    document.dirty,
+                    document.revision,
+                    document.history.revision(),
+                    document.content.cursor(),
+                )
+            };
+            let original_state = editor_state(&runtime);
+            assert!(runtime.is_dirty());
+
+            let task = runtime.start_working_diff(card, ticket);
+            assert_eq!(editor_state(&runtime), original_state);
+            if cancelled {
+                runtime
+                    .working_diff
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .cancellation
+                    .cancel();
+            }
+
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let completion = executor.block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(action) = action {
+                        return action;
+                    }
+                }
+                panic!("the diff worker must return its completion")
+            });
+            let RepositoryAction::WorkingDiffLoaded { result, .. } = &completion else {
+                panic!("working diff completion")
+            };
+            if cancelled {
+                assert!(matches!(result, Ok(None)));
+            } else {
+                let model = result.as_ref().unwrap().as_ref().unwrap();
+                let expected = crate::diff_view::build_diff(baseline, after);
+                for marker in ["[LF]", "[CRLF]", "[no newline]"] {
+                    assert!(
+                        expected
+                            .inline_rows
+                            .iter()
+                            .any(|row| row.text.ends_with(marker))
+                    );
+                }
+                assert_eq!(model.line_counts, expected.line_counts);
+                assert_eq!(model.inline_rows, expected.inline_rows);
+                assert_eq!(model.split_rows, expected.split_rows);
+            }
+            drop(runtime.update(completion));
+            if !cancelled {
+                assert!(runtime.working_annotations_current());
+            }
+            assert_eq!(editor_state(&runtime), original_state);
         }
     }
 

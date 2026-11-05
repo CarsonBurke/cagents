@@ -152,6 +152,33 @@ impl Fixture {
         value["data"]["results"][0].clone()
     }
 
+    /// Returns an `agent spawn --wait` receipt with its run, once settled, as
+    /// `settled`. The CLI's wait budget is not the contract under test: under
+    /// load a run can still be starting when it lapses, so this keeps waiting
+    /// on that exact run.
+    fn settled_spawn(&self, spawned: Output) -> Value {
+        let json = |output: &Output| {
+            // Exit 3 is the CLI's timed-out wait; anything else is a failure.
+            assert!(matches!(output.status.code(), Some(0 | 3)), "{output:?}");
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["ok"], true, "{value}");
+            value["data"].clone()
+        };
+        let mut receipt = json(&spawned);
+        let run = receipt["run"]["id"].as_str().unwrap().to_owned();
+        let mut settled = receipt.clone();
+        let mut timed_out = !spawned.status.success();
+        let hang_guard = Instant::now() + Duration::from_secs(120);
+        while timed_out {
+            assert!(Instant::now() < hang_guard, "run never settled: {settled}");
+            let waited = self.output(&["agent", "wait", &run, "--timeout", "10"]);
+            settled = json(&waited)["results"][0].clone();
+            timed_out = !waited.status.success();
+        }
+        receipt["settled"] = settled;
+        receipt
+    }
+
     fn cli(&self, arguments: &[&str]) -> Value {
         let output = self.output(arguments);
         assert!(output.status.success(), "{arguments:?}: {output:?}");
@@ -213,7 +240,7 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
     let mut first = None;
     for index in 0..100 {
         let name = format!("capacity-{index}");
-        let accepted = fixture.cli(&[
+        let spawned = fixture.output(&[
             "agent",
             "spawn",
             "--provider",
@@ -234,8 +261,9 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
             "--timeout",
             "10",
         ]);
-        assert_eq!(accepted["created"], true, "conversation {index}");
-        assert_eq!(accepted["timed_out"], false);
+        let receipt = fixture.settled_spawn(spawned);
+        assert_eq!(receipt["created"], true, "conversation {index}");
+        let accepted = &receipt["settled"];
         assert_eq!(accepted["agent"]["origin"], "User");
         assert_eq!(accepted["agent"]["closed"], false);
         assert!(accepted["agent"]["session"]["Chat"].is_object());
@@ -245,7 +273,7 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
         let run = accepted["run"]["id"].as_str().unwrap().to_owned();
         assert!(completed.insert(agent, run).is_none());
         if index == 0 {
-            first = Some(accepted);
+            first = Some(accepted.clone());
         }
     }
     assert_eq!(completed.len(), 100);
@@ -322,8 +350,10 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     let waiting = fixture.wait(&["agent", "wait", first_run, "--timeout", "10"], 5);
     assert_eq!(waiting["run"]["state"], "Waiting", "{waiting}");
     let terminal = waiting["agent"]["console"]["id"].as_str().unwrap();
-    // PTY snapshots can split the heading from its following instructions.
-    // Wait for the actionable line before asserting the complete request.
+    // Wait for the actionable line that ends the console's request block. The
+    // pretty request nearly fills the 24-row screen, so a run status line
+    // printed after it can scroll the block's heading off. Assert the action
+    // IDs the instruction refers to, which stay on screen beside it.
     let displayed = fixture.cli(&[
         "terminal",
         "wait",
@@ -333,12 +363,10 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
         "--timeout",
         "10",
     ]);
-    assert!(
-        displayed["snapshot"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Input requested")
-    );
+    let screen = displayed["snapshot"]["text"].as_str().unwrap();
+    for action in ["\"id\": \"allow\"", "\"id\": \"deny\""] {
+        assert!(screen.contains(action), "{action} in {displayed}");
+    }
     fixture.cli(&[
         "terminal",
         "write",

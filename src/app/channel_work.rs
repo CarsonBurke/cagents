@@ -6,6 +6,9 @@ use crate::{
     model::WorktreeId,
 };
 
+/// Bound a deferred reopen's wait without assuming the retirement was refused.
+pub(super) const RETIREMENT_ANSWERED: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Surface {
     Conversations,
@@ -23,6 +26,11 @@ pub(super) struct Navigation {
 pub(super) struct State {
     pub(super) view: ui::State,
     pub(super) retire_candidates: HashSet<Home>,
+    /// Retirements sent to the registry, with the view revision each expects
+    /// and when it was sent. The registry applies edits in order, so a pane
+    /// published into one of these channels before the answer arrives would
+    /// land after it retired.
+    pub(super) retiring: HashMap<crate::model::ChannelId, (u64, std::time::Instant)>,
     routes: HashMap<Home, Route>,
     main: bool,
     title: String,
@@ -37,6 +45,7 @@ impl Default for State {
         Self {
             view: ui::State::default(),
             retire_candidates: HashSet::new(),
+            retiring: HashMap::new(),
             routes: HashMap::new(),
             main: false,
             title: String::new(),
@@ -780,12 +789,21 @@ impl Cagents {
             if !view.panes.is_empty() {
                 continue;
             }
+            // An empty view can precede a live pane's first publication. Closing
+            // that pane later captures the channel again.
+            if self.channel_holds_unpublished_work(channel) {
+                self.channel_work.retire_candidates.remove(&captured);
+                continue;
+            }
             let edit = crate::workspace_model::ModelEdit::RetireEmptyChannel {
                 home: captured,
                 expected_view_revision: view.revision,
             };
             if self.workspace_model_tx.try_send(edit).is_ok() {
                 self.channel_work.retire_candidates.remove(&captured);
+                self.channel_work
+                    .retiring
+                    .insert(channel, (view.revision, std::time::Instant::now()));
             }
         }
     }
@@ -3209,9 +3227,11 @@ mod tests {
                 .any(|label| label == "Press a shortcut · Escape cancels")
         );
         let _ = tree.into_cache();
+        // Alt+Y is unbound: a chord another action owns would offer Reassign
+        // and keep the recorder open instead of recording.
         let mut event = match key(
-            keyboard::Key::Character("j".into()),
-            keyboard::key::Code::KeyJ,
+            keyboard::Key::Character("y".into()),
+            keyboard::key::Code::KeyY,
             None,
         ) {
             iced::Event::Keyboard(event) => event,
@@ -3233,9 +3253,16 @@ mod tests {
             app.settings_draft
                 .keyboard_shortcuts
                 .command_palette
-                .contains("Alt+J")
+                .contains("Alt+Y")
         );
-        assert!(app.settings_pending.contains_key(&field));
+        // A recorded chord applies at once rather than waiting as a draft.
+        assert!(
+            app.settings
+                .keyboard_shortcuts
+                .command_palette
+                .iter()
+                .any(|chord| chord == "Alt+Y")
+        );
 
         drop(app.update(Message::Palette(palette_ui::Action::Record(field))));
         app.settings_reset_confirm = true;
@@ -3246,7 +3273,7 @@ mod tests {
             .keyboard_shortcuts
             .command_palette
             .clone();
-        let pending = app.settings_pending[&field].clone();
+        let pending = app.settings_pending.get(&field).cloned();
         drop(app.update(Message::KeyEvent {
             event,
             captured: false,
@@ -3259,7 +3286,7 @@ mod tests {
             app.settings_draft.keyboard_shortcuts.command_palette,
             before
         );
-        assert_eq!(app.settings_pending[&field], pending);
+        assert_eq!(app.settings_pending.get(&field).cloned(), pending);
         drop(app.update(Message::CancelResetSettings));
         assert!(!app.modal_is_open());
     }
@@ -3563,7 +3590,7 @@ mod tests {
         drop(app.update(Message::SelectSettingsCategory(SettingsCategory::Keyboard)));
         drop(app.update(Message::SettingsSearchChanged("Command palette".into())));
         let mut tree = utility_native(&app, &mut renderer, true);
-        let point = bounds(&tree, "Record shortcut for Open command palette").center();
+        let point = bounds(&tree, "Record shortcut for Command palette").center();
         let mut messages = click(&mut tree, &mut renderer, point);
         assert!(
             matches!(messages.as_slice(), [Message::UtilityPaneUi(inner)]
@@ -3577,7 +3604,7 @@ mod tests {
         let owner = app.channel_work.view.owner().unwrap();
         drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
         let mut tree = utility_native(&app, &mut renderer, true);
-        let point = bounds(&tree, "Record shortcut for Open command palette").center();
+        let point = bounds(&tree, "Record shortcut for Command palette").center();
         let mut messages = click(&mut tree, &mut renderer, point);
         assert!(
             matches!(messages.as_slice(), [Message::UtilityPaneUi(inner)]
@@ -3728,6 +3755,7 @@ mod tests {
                 settings_ui::SettingsContext {
                     feedback: app.settings_feedback.as_ref(),
                     invalid: &app.settings_invalid,
+                    pressed_key: app.palette.pressed_key_filter(),
                     accounts: app.default_account_choices(),
                     updates: app.update_summary(),
                     testing_notification: app.notification_ui.testing,

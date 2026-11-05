@@ -5,7 +5,9 @@
 //! executed, which keeps argument handling shell-free and makes every operation
 //! straightforward to test with a fake executor.
 
+mod ignored_worktree_files;
 mod managed_worktrees;
+pub use ignored_worktree_files::default_disposable_ignored_directories;
 #[cfg(test)]
 pub(crate) use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
 mod worktree_setup_intent;
@@ -3852,6 +3854,31 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<Option<Oid>, RepositoryError> {
         self.resolve_optional_revision(worktree, "HEAD", cancellation)
+    }
+
+    /// The full symbolic branch named by HEAD, including on an unborn
+    /// branch. Detached HEAD returns None without scanning worktree files.
+    pub fn symbolic_head(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<ValidatedRefName>, RepositoryError> {
+        let command = self.git_read(worktree, ["symbolic-ref", "--quiet", "HEAD"]);
+        let output = self.run(&command, cancellation)?;
+        if !output.success {
+            return if output.exit_code == Some(1) {
+                Ok(None)
+            } else {
+                Err(git_failure(&command, output).into())
+            };
+        }
+        let reference = parse_utf8_line(&output.stdout, "HEAD branch")?;
+        ValidatedRefName::parse(reference)
+            .map(Some)
+            .map_err(|error| RepositoryError::InvalidOutput {
+                field: "HEAD branch",
+                reason: error.to_string(),
+            })
     }
 
     /// Resolves a revision to a commit id, or `None` when it does not exist.
