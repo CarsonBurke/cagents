@@ -65,6 +65,14 @@ fn preflight_in(
         else {
             continue;
         };
+        // Bind the namespace read to the editor we observed. Capturing stat
+        // only after environ can accept a reused PID, or skip its replacement
+        // using the previous process's unrelated runtime directory.
+        let before = std::fs::read_to_string(process.join("stat"))
+            .map_err(|_| editor_ownership_changed())?;
+        if process_start(&before).is_none() {
+            return Err(editor_ownership_changed());
+        }
         // Read only for namespace comparison, never include environment bytes
         // in an error, log or update preview.
         let mut environment = Vec::new();
@@ -72,7 +80,6 @@ fn preflight_in(
             Ok(file) => {
                 file.take(1024 * 1024 + 1).read_to_end(&mut environment)?;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(io::Error::new(
                     error.kind(),
@@ -82,6 +89,7 @@ fn preflight_in(
                 ));
             }
         }
+        verify_editor_identity(&process, &before, &executable)?;
         if environment.len() > 1024 * 1024 {
             return Err(io::Error::other(format!(
                 "Cannot verify Ceditor process {pid}'s service namespace; close it before upgrading"
@@ -118,7 +126,6 @@ fn preflight_in(
                 "Ceditor process {pid}'s terminal service has no matched CLI/daemon pair to verify its protocol; close or update Ceditor before upgrading"
             )));
         }
-        let before = std::fs::read_to_string(process.join("stat"))?;
         let companion_before = std::fs::symlink_metadata(&cli)?;
         let actual = protocol(&cli).map_err(|_| io::Error::other(format!("Cannot verify Ceditor process {pid}'s private service protocol; close or update Ceditor before upgrading")))?;
         let companion_after = std::fs::symlink_metadata(&cli)?;
@@ -151,6 +158,26 @@ fn preflight_in(
                 "Ceditor process {pid}'s private daemon cannot be qualified as the matched destination build. Close or update Ceditor before upgrading; application windows and conversations were kept open"
             )));
         }
+    }
+    Ok(())
+}
+
+fn editor_ownership_changed() -> io::Error {
+    io::Error::other(
+        "Ceditor ownership changed during update preflight; retry without closing the application",
+    )
+}
+
+fn verify_editor_identity(process: &Path, before: &str, executable: &Path) -> io::Result<()> {
+    let after =
+        std::fs::read_to_string(process.join("stat")).map_err(|_| editor_ownership_changed())?;
+    let current =
+        std::fs::read_link(process.join("exe")).map_err(|_| editor_ownership_changed())?;
+    if process_start(before).is_none()
+        || process_start(before) != process_start(&after)
+        || current.as_path() != executable
+    {
+        return Err(editor_ownership_changed());
     }
     Ok(())
 }
@@ -415,6 +442,166 @@ mod tests {
                 daemon_qualified: false
             }))
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn namespace_read_rechecks_identity_before_same_or_other_runtime_classification() {
+        use crate::process::{
+            CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+        };
+        const CHILD: &str = "CAGENTS_COMPANION_NAMESPACE_TEST";
+        let name = concat!(
+            module_path!(),
+            "::namespace_read_rechecks_identity_before_same_or_other_runtime_classification"
+        );
+        let name = name
+            .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
+            .unwrap_or(name);
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            // The fixture's FIFO open can block if its writer is delayed.
+            // Bound the owning process using the executor shared by the CLI,
+            // while inheriting the caller's complete authority unchanged.
+            let command = CommandSpec::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    name,
+                    "--nocapture",
+                    "--test-threads=1",
+                    "--color=never",
+                ])
+                .env(CHILD, name)
+                .timeout(Duration::from_secs(15))
+                .output_limits(1024 * 1024, 1024 * 1024);
+            let output = SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .unwrap_or_else(|error| panic!("bounded namespace fixture failed: {error:?}"));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.success, "{stdout}\n{stderr}");
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("test {name} ... ok")),
+                "the exact namespace child did not pass: {stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+                "the namespace child must execute exactly one test: {stdout}\n{stderr}"
+            );
+            return;
+        }
+        for same_runtime in [true, false] {
+            // A stable process is the control. The other arms change its
+            // identity while the actual namespace read is held open.
+            for change in 0..5 {
+                let root = tempfile::tempdir().unwrap();
+                let proc_root = root.path().join("proc");
+                let bin = root.path().join("editor/bin");
+                let runtime = root.path().join("runtime");
+                editor(&proc_root, &bin, &runtime);
+                let other_runtime = root.path().join("other-runtime");
+                std::fs::create_dir(&other_runtime).unwrap();
+                let observed_runtime = if same_runtime {
+                    &runtime
+                } else {
+                    &other_runtime
+                };
+                let mut environment = b"SECRET=must-not-be-printed\0XDG_RUNTIME_DIR=".to_vec();
+                environment.extend_from_slice(observed_runtime.as_os_str().as_bytes());
+                environment.push(0);
+                let process = proc_root.join("42");
+                let environment_path = process.join("environ");
+                std::fs::remove_file(&environment_path).unwrap();
+                let fifo = std::ffi::CString::new(environment_path.as_os_str().as_bytes()).unwrap();
+                // The FIFO is solely a synchronization seam in the private
+                // proc fixture, not an executable or a real process endpoint.
+                assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+                let writer = thread::spawn(move || -> io::Result<()> {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let mut output = loop {
+                        match std::fs::OpenOptions::new()
+                            .write(true)
+                            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                            .open(&environment_path)
+                        {
+                            Ok(file) => break file,
+                            Err(error)
+                                if error.raw_os_error() == Some(libc::ENXIO)
+                                    && Instant::now() < deadline =>
+                            {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    };
+                    output.write_all(&environment)?;
+                    match change {
+                        0 => {}
+                        1 => {
+                            let mut fields = vec!["0"; 20];
+                            fields[19] = "200";
+                            std::fs::write(
+                                process.join("stat"),
+                                format!("42 (replacement editor) {}", fields.join(" ")),
+                            )?;
+                        }
+                        2 => std::fs::remove_file(process.join("stat"))?,
+                        3 => std::fs::remove_file(process.join("exe"))?,
+                        _ => std::fs::remove_dir_all(&process)?,
+                    }
+                    // EOF releases read_to_end only after the identity change.
+                    drop(output);
+                    Ok(())
+                });
+                let mut probes = 0;
+                let result = preflight_in(
+                    &proc_root,
+                    &runtime,
+                    Some(crate::terminal_ipc::PROTOCOL_VERSION),
+                    |_| {
+                        probes += 1;
+                        Ok(crate::terminal_ipc::PROTOCOL_VERSION.into())
+                    },
+                );
+                writer.join().unwrap().unwrap();
+                if change == 0 {
+                    assert!(result.is_ok());
+                    assert_eq!(probes, usize::from(same_runtime));
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("ownership changed"), "{error}");
+                    assert!(!error.contains("must-not-be-printed"));
+                    assert_eq!(probes, 0, "unconfirmed namespace cannot authorize a probe");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn observed_editor_with_missing_namespace_or_identity_refuses_before_probing() {
+        for missing in ["environ", "stat"] {
+            let root = tempfile::tempdir().unwrap();
+            let proc_root = root.path().join("proc");
+            let runtime = root.path().join("runtime");
+            editor(&proc_root, &root.path().join("editor/bin"), &runtime);
+            std::fs::remove_file(proc_root.join("42").join(missing)).unwrap();
+            let result = preflight_in(&proc_root, &runtime, None, |_| {
+                panic!("missing observed editor evidence cannot authorize a companion")
+            });
+            assert!(
+                result.is_err(),
+                "missing {missing} must retain source windows"
+            );
+        }
+        let root = tempfile::tempdir().unwrap();
+        let proc_root = root.path().join("proc");
+        let runtime = root.path().join("runtime");
+        editor(&proc_root, &root.path().join("editor/bin"), &runtime);
+        std::fs::remove_dir_all(proc_root.join("42")).unwrap();
+        assert!(
+            preflight_in(&proc_root, &runtime, None, |_| panic!("no observed editor")).is_ok(),
+            "a process gone before the census is not an observed editor"
         );
     }
 

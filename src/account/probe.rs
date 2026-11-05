@@ -129,6 +129,7 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
     let setup = {
         let account = account.clone();
         let cache = cache.clone();
+        let search_path = search_path.clone();
         tokio::task::spawn_blocking(move || {
             prepare(&account, cache.as_ref(), force, now, search_path.as_deref())
         })
@@ -139,20 +140,13 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
         Ok(Prepared::Probe { program, key, lock }) => (program, key, lock),
         Err(_) => return Outcome::Failed("The probe could not be prepared".into()),
     };
-    let probed = tokio::time::timeout(TIMEOUT, probe_cli(&account, &program)).await;
+    let probed = tokio::time::timeout(
+        TIMEOUT,
+        probe_cli(&account, &program, search_path.as_deref()),
+    )
+    .await;
     let outcome = match probed {
-        Ok(Ok(Probed {
-            identity,
-            snapshot,
-            models,
-        })) => Outcome::Answered {
-            catalog: (!models.is_empty()).then(|| Catalog {
-                models,
-                observed_at: snapshot.observed_at,
-            }),
-            identity,
-            snapshot,
-        },
+        Ok(Ok(probed)) => probed.into_outcome(),
         Ok(Err(message)) => Outcome::Failed(message),
         Err(_) => Outcome::Failed(format!(
             "{} did not answer within {} seconds",
@@ -264,18 +258,51 @@ fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
 struct Probed {
     identity: Option<Identity>,
     snapshot: UsageSnapshot,
-    /// Empty when the CLI listed none.
-    models: Vec<Model>,
+    /// A model response has its own observation, independent of quota.
+    catalog: Option<Catalog>,
 }
 
 impl Probed {
-    fn state(status: UsageStatus, detail: &str, observed_at: u64, models: Vec<Model>) -> Self {
+    fn state(
+        status: UsageStatus,
+        detail: &str,
+        observed_at: u64,
+        catalog: Option<Catalog>,
+    ) -> Self {
         Self {
             identity: None,
             snapshot: UsageSnapshot::state(status, detail, observed_at),
-            models,
+            catalog,
         }
     }
+
+    fn into_outcome(self) -> Outcome {
+        Outcome::Answered {
+            identity: self.identity,
+            snapshot: self.snapshot,
+            catalog: self.catalog,
+        }
+    }
+}
+
+/// The local observation of one matched answer, before unrelated awaits.
+/// This is neither request-start nor the provider's internal sampling time.
+struct Observed<T> {
+    value: T,
+    observed_at: u64,
+}
+
+fn observed_catalog(models: Vec<Model>, observed_at: u64) -> Option<Catalog> {
+    (!models.is_empty()).then_some(Catalog {
+        models,
+        observed_at,
+    })
+}
+
+// Keep the original result, including its observations, through actual cleanup.
+async fn after_close<T>(result: T, close: impl std::future::Future<Output = ()>) -> T {
+    close.await;
+    result
 }
 
 pub fn cli_name(provider: Provider) -> &'static str {
@@ -290,10 +317,14 @@ fn now_ms() -> u64 {
     crate::chat::now_ms().unwrap_or_default()
 }
 
-async fn probe_cli(account: &Account, program: &Path) -> Result<Probed, String> {
+async fn probe_cli(
+    account: &Account,
+    program: &Path,
+    search_path: Option<&OsStr>,
+) -> Result<Probed, String> {
     match account.provider {
-        Provider::Claude => probe_claude(account, program).await,
-        Provider::Codex => probe_codex(account, program).await,
+        Provider::Claude => probe_claude_with_path(account, program, search_path).await,
+        Provider::Codex => probe_codex_with_path(account, program, search_path).await,
         Provider::Omp => Err("Omp does not report account usage".into()),
     }
 }
@@ -302,6 +333,60 @@ async fn probe_cli(account: &Account, program: &Path) -> Result<Probed, String> 
 /// could not say.
 static SHELL_PATH: tokio::sync::OnceCell<Option<OsString>> = tokio::sync::OnceCell::const_new();
 
+/// Refreshes share one read when they overlap. Every reader receives an owned
+/// path, so a later installation cannot invalidate a command already prepared.
+struct ShellPathRefresh {
+    serial: tokio::sync::Mutex<()>,
+    state: std::sync::Mutex<(u64, Option<OsString>)>,
+}
+
+impl ShellPathRefresh {
+    const fn new() -> Self {
+        Self {
+            serial: tokio::sync::Mutex::const_new(()),
+            state: std::sync::Mutex::new((0, None)),
+        }
+    }
+
+    fn path(&self) -> Option<OsString> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .1
+            .clone()
+    }
+
+    async fn refresh<F, R>(&self, read: F) -> Option<OsString>
+    where
+        F: FnOnce() -> R,
+        R: std::future::Future<Output = Option<OsString>>,
+    {
+        let observed = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .0;
+        let _serial = self.serial.lock().await;
+        {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.0 != observed {
+                return state.1.clone();
+            }
+        }
+        let path = read().await;
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        // A failed shell read preserves the last usable path, but still settles
+        // this cohort of waiters rather than repeating the failed startup.
+        if path.is_some() {
+            state.1 = path;
+        }
+        state.0 = state.0.wrapping_add(1);
+        state.1.clone()
+    }
+}
+
+static REFRESHED_SHELL_PATH: ShellPathRefresh = ShellPathRefresh::new();
+
 /// The directories a provider's CLI is looked for in: the ones a terminal
 /// would search.
 ///
@@ -309,8 +394,9 @@ static SHELL_PATH: tokio::sync::OnceCell<Option<OsString>> = tokio::sync::OnceCe
 /// are where installers put `~/.local/bin` or a Node version manager's `bin`.
 /// The interface may have been started from a desktop launcher with a much
 /// shorter `PATH`, and a CLI the reader runs in every terminal would then
-/// read as not installed. So the shell is asked, once per process; where it
-/// cannot say, this process's own `PATH` stands in.
+/// read as not installed. The first request initializes the shell path;
+/// explicit Accounts discovery can refresh it after installation. Where the
+/// shell cannot say, this process's own `PATH` stands in.
 pub async fn search_path() -> Option<OsString> {
     SHELL_PATH
         .get_or_init(|| async {
@@ -324,9 +410,7 @@ pub async fn search_path() -> Option<OsString> {
 /// What [`search_path`] would answer now, without waiting for the shell:
 /// this process's own `PATH` until the shell has been asked.
 pub fn current_search_path() -> Option<OsString> {
-    shell_search_path()
-        .map(OsStr::to_owned)
-        .or_else(|| std::env::var_os("PATH"))
+    shell_search_path().or_else(|| std::env::var_os("PATH"))
 }
 
 /// Whether the shell has been asked for its `PATH`, so that
@@ -338,8 +422,28 @@ pub fn shell_asked() -> bool {
 /// The shell's `PATH`, if [`search_path`] has already read one. A CLI found on
 /// it runs with it, as it would in a terminal: a Node CLI's
 /// `#!/usr/bin/env node` looks for Node there.
-pub fn shell_search_path() -> Option<&'static OsStr> {
-    SHELL_PATH.get()?.as_deref()
+pub fn shell_search_path() -> Option<OsString> {
+    REFRESHED_SHELL_PATH
+        .path()
+        .or_else(|| SHELL_PATH.get().cloned().flatten())
+}
+
+/// Re-read interactive shell startup after an explicit setup refresh or return
+/// from installing a CLI. The existing bounded shell reader never runs a
+/// provider; concurrent requests share one result and failures keep the old path.
+pub async fn refresh_search_path() -> Option<OsString> {
+    REFRESHED_SHELL_PATH
+        .refresh(|| async {
+            if !shell_asked() {
+                search_path().await;
+                SHELL_PATH.get().cloned().flatten()
+            } else {
+                let shell = crate::model::login_shell().ok()?;
+                shell_path(Path::new(&shell), SHELL_TIMEOUT).await
+            }
+        })
+        .await;
+    current_search_path()
 }
 
 /// The `PATH` `shell` sets up when started interactively, as a terminal
@@ -452,7 +556,12 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
+#[cfg(test)]
 fn command(account: &Account, program: &Path) -> Command {
+    command_with_path(account, program, current_search_path().as_deref())
+}
+
+fn command_with_path(account: &Account, program: &Path, search_path: Option<&OsStr>) -> Command {
     let mut command = Command::new(program);
     for variable in SCRUBBED_ENVIRONMENT {
         command.env_remove(variable);
@@ -470,7 +579,7 @@ fn command(account: &Account, program: &Path) -> Command {
         }
         None => {}
     }
-    if let Some(path) = shell_search_path() {
+    if let Some(path) = search_path {
         command.env("PATH", path);
     }
     for variable in account.credential_overrides() {
@@ -671,15 +780,25 @@ fn spawn_failure(error: &io::Error) -> String {
 }
 
 /// Runs a CLI that prints one JSON document and exits.
-async fn run_json(command: Command) -> Result<Value, String> {
+async fn run_json(command: Command) -> Result<Observed<Value>, String> {
     let mut group = Group::spawn(command).await?;
     let mut output = Vec::new();
     // The output is dropped once read, so a CLI that writes past the limit
     // meets a closed pipe rather than blocking until the timeout.
     let read = group.stdout()?.read_to_end(&mut output).await;
-    group.finish().await;
-    read.map_err(|_| "The CLI's output could not be read".to_owned())?;
-    serde_json::from_slice(&output).map_err(|_| "The CLI printed something unexpected".to_owned())
+    let result = read
+        .map_err(|_| "The CLI's output could not be read".to_owned())
+        .and_then(|_| observed_json(&output, now_ms));
+    after_close(result, group.finish()).await
+}
+
+fn observed_json(bytes: &[u8], now: impl FnOnce() -> u64) -> Result<Observed<Value>, String> {
+    let value = serde_json::from_slice(bytes)
+        .map_err(|_| "The CLI printed something unexpected".to_owned())?;
+    Ok(Observed {
+        value,
+        observed_at: now(),
+    })
 }
 
 /// Signs `account` out through its own CLI - `claude auth logout`, `codex
@@ -690,6 +809,7 @@ async fn run_json(command: Command) -> Result<Value, String> {
 /// not an error: the home is going regardless, and only the CLI knows where
 /// else its login lived. Only a managed account is ever signed out here; the
 /// system account's login is the reader's own.
+#[cfg(test)]
 pub async fn logout(account: Account) -> Result<(), String> {
     if account.is_system() {
         return Err("The system account is not signed out by cagents".into());
@@ -701,15 +821,16 @@ pub async fn logout(account: Account) -> Result<(), String> {
     };
     let executable = account.provider.executable();
     let search_path = search_path().await;
+    let lookup_path = search_path.clone();
     let Some(program) =
-        tokio::task::spawn_blocking(move || find_executable(executable, search_path.as_deref()))
+        tokio::task::spawn_blocking(move || find_executable(executable, lookup_path.as_deref()))
             .await
             .ok()
             .flatten()
     else {
         return Ok(());
     };
-    let mut command = command(&account, &program);
+    let mut command = command_with_path(&account, &program, search_path.as_deref());
     command.args(arguments);
     let mut group = Group::spawn(command).await?;
     let finished = tokio::time::timeout(TIMEOUT, async {
@@ -736,10 +857,19 @@ pub async fn logout(account: Account) -> Result<(), String> {
 /// slash commands and no session persistence: it only ever answers two
 /// control requests and never takes a turn, and that way it runs none of the
 /// user's hooks and leaves nothing behind in their history.
+#[cfg(test)]
 async fn probe_claude(account: &Account, program: &Path) -> Result<Probed, String> {
-    let mut status = command(account, program);
+    probe_claude_with_path(account, program, current_search_path().as_deref()).await
+}
+
+async fn probe_claude_with_path(
+    account: &Account,
+    program: &Path,
+    search_path: Option<&OsStr>,
+) -> Result<Probed, String> {
+    let mut status = command_with_path(account, program, search_path);
     status.args(["auth", "status", "--json"]);
-    let mut usage = command(account, program);
+    let mut usage = command_with_path(account, program, search_path);
     usage.args([
         "-p",
         "--input-format",
@@ -753,27 +883,46 @@ async fn probe_claude(account: &Account, program: &Path) -> Result<Probed, Strin
         "",
         "--disable-slash-commands",
     ]);
-    let (status, usage) = tokio::join!(run_json(status), claude_usage(usage));
-    let observed_at = now_ms();
-    let (models, usage) = match usage {
-        Ok(ClaudeSession { models, usage }) => (models, Ok(usage)),
-        Err(message) => (Vec::new(), Err(message)),
+    join_claude(run_json(status), claude_usage(usage)).await
+}
+
+async fn join_claude(
+    status: impl std::future::Future<Output = Result<Observed<Value>, String>>,
+    usage: impl std::future::Future<Output = Result<ClaudeSession, String>>,
+) -> Result<Probed, String> {
+    let (status, usage) = tokio::join!(status, usage);
+    finish_claude_probe(status, usage)
+}
+
+fn finish_claude_probe(
+    status: Result<Observed<Value>, String>,
+    usage: Result<ClaudeSession, String>,
+) -> Result<Probed, String> {
+    let (catalog, usage) = match usage {
+        Ok(ClaudeSession { catalog, usage }) => (catalog, Ok(usage)),
+        Err(message) => (None, Err(message)),
     };
-    let identity = match status.as_ref().map(super::claude::parse_auth_status) {
-        Ok(Err(state)) => {
-            return Ok(Probed::state(
-                state,
-                "Signed out of Claude Code",
-                observed_at,
-                models,
-            ));
-        }
-        Ok(Ok(identity)) => Some(identity),
+    let identity = match status {
+        Ok(status) => match super::claude::parse_auth_status(&status.value) {
+            Err(state) => {
+                return Ok(Probed::state(
+                    state,
+                    "Signed out of Claude Code",
+                    status.observed_at,
+                    catalog,
+                ));
+            }
+            Ok(identity) => Some(identity),
+        },
         Err(_) => None,
     };
-    let snapshot = match usage {
-        Ok(Ok(response)) => super::claude::parse_usage(&response, observed_at),
-        Ok(Err(message)) => match super::claude::error_status(&message) {
+    // An auth failure still takes precedence above. Otherwise a missing usage
+    // answer remains the original failure, even when identity was available.
+    let usage = usage?;
+    let observed_at = usage.observed_at;
+    let snapshot = match usage.value {
+        Ok(response) => super::claude::parse_usage(&response, observed_at),
+        Err(message) => match super::claude::error_status(&message) {
             Some(UsageStatus::NeedsLogin) => UsageSnapshot::state(
                 UsageStatus::NeedsLogin,
                 "Signed out of Claude Code",
@@ -788,31 +937,27 @@ async fn probe_claude(account: &Account, program: &Path) -> Result<Probed, Strin
             // backoff while the figures already on screen stay.
             None => return Err("Claude Code could not read usage just now".into()),
         },
-        // The session never answered: a failure to back off from, even when
-        // the identity came back, since the limits are what is shown.
-        Err(message) => return Err(message),
     };
     Ok(Probed {
         identity,
         snapshot,
-        models,
+        catalog,
     })
 }
 
 /// What the usage session answered.
 struct ClaudeSession {
     /// The models `initialize` listed.
-    models: Vec<Model>,
+    catalog: Option<Catalog>,
     /// The `get_usage` control response's inner `response`, or the error
     /// message Claude answered either request with.
-    usage: Result<Value, String>,
+    usage: Observed<Result<Value, String>>,
 }
 
 async fn claude_usage(command: Command) -> Result<ClaudeSession, String> {
     let mut session = Session::spawn(command).await?;
     let result = claude_exchange(&mut session).await;
-    session.close().await;
-    result
+    after_close(result, session.close()).await
 }
 
 async fn claude_exchange(session: &mut Session) -> Result<ClaudeSession, String> {
@@ -822,23 +967,30 @@ async fn claude_exchange(session: &mut Session) -> Result<ClaudeSession, String>
         .send(&json!({"type": "control_request", "request_id": INITIALIZE,
             "request": {"subtype": "initialize"}}))
         .await?;
-    let initialized = match claude_response(session, INITIALIZE).await? {
-        Ok(initialized) => initialized,
-        Err(message) => {
-            return Ok(ClaudeSession {
-                models: Vec::new(),
-                usage: Err(message),
-            });
-        }
-    };
-    let models = models(initialized["models"].as_array(), Model::from_claude);
+    let initialized = claude_response(session, INITIALIZE).await?;
+    let catalog = claude_catalog(&initialized);
+    if initialized.value.is_err() {
+        return Ok(ClaudeSession {
+            catalog,
+            usage: initialized,
+        });
+    }
     session
         .send(&json!({"type": "control_request", "request_id": USAGE,
             "request": {"subtype": "get_usage", "skip_behaviors": true}}))
         .await?;
     Ok(ClaudeSession {
-        models,
+        catalog,
         usage: claude_response(session, USAGE).await?,
+    })
+}
+
+fn claude_catalog(initialized: &Observed<Result<Value, String>>) -> Option<Catalog> {
+    initialized.value.as_ref().ok().and_then(|value| {
+        observed_catalog(
+            models(value["models"].as_array(), Model::from_claude),
+            initialized.observed_at,
+        )
     })
 }
 
@@ -862,13 +1014,24 @@ fn models(entries: Option<&Vec<Value>>, parse: fn(&Value) -> Option<Model>) -> V
 async fn claude_response(
     session: &mut Session,
     request_id: &str,
-) -> Result<Result<Value, String>, String> {
+) -> Result<Observed<Result<Value, String>>, String> {
     loop {
         let frame = session.next().await?;
-        if let Some(answer) = match_control_response(&frame, request_id) {
+        if let Some(answer) = observed_control_response(&frame, request_id, now_ms) {
             return Ok(answer);
         }
     }
+}
+
+fn observed_control_response(
+    frame: &Value,
+    request_id: &str,
+    now: impl FnOnce() -> u64,
+) -> Option<Observed<Result<Value, String>>> {
+    match_control_response(frame, request_id).map(|value| Observed {
+        value,
+        observed_at: now(),
+    })
 }
 
 /// The answer `frame` carries for `request_id`, if it is that control
@@ -892,23 +1055,38 @@ pub fn match_control_response(frame: &Value, request_id: &str) -> Option<Result<
 
 /// Codex: `codex app-server` over stdio, asked for the account and its
 /// limits and then closed.
+#[cfg(test)]
 async fn probe_codex(account: &Account, program: &Path) -> Result<Probed, String> {
-    let mut command = command(account, program);
+    probe_codex_with_path(account, program, current_search_path().as_deref()).await
+}
+
+async fn probe_codex_with_path(
+    account: &Account,
+    program: &Path,
+    search_path: Option<&OsStr>,
+) -> Result<Probed, String> {
+    let mut command = command_with_path(account, program, search_path);
     command.arg("app-server");
     let mut session = Session::spawn(command).await?;
     let result = codex_exchange(&mut session).await;
-    session.close().await;
+    finish_codex_probe(after_close(result, session.close()).await)
+}
+
+fn finish_codex_probe(result: Result<CodexSession, String>) -> Result<Probed, String> {
     let CodexSession {
         account: account_read,
         limits: limits_read,
         models,
     } = result?;
-    let models = models
-        .ok()
-        .map(|result| self::models(result["data"].as_array(), Model::from_codex))
-        .unwrap_or_default();
-    let observed_at = now_ms();
-    let identity = match account_read {
+    let catalog = models.and_then(|answer| {
+        answer.value.ok().and_then(|result| {
+            observed_catalog(
+                self::models(result["data"].as_array(), Model::from_codex),
+                answer.observed_at,
+            )
+        })
+    });
+    let identity = match account_read.value {
         Ok(result) => match super::codex::parse_account(&result) {
             Ok(identity) => Some(identity),
             Err(state) => {
@@ -916,12 +1094,18 @@ async fn probe_codex(account: &Account, program: &Path) -> Result<Probed, String
                     UsageStatus::NeedsLogin => "Signed out of Codex",
                     _ => "Codex is not signed in to a ChatGPT plan",
                 };
-                return Ok(Probed::state(state, detail, observed_at, models));
+                return Ok(Probed::state(
+                    state,
+                    detail,
+                    account_read.observed_at,
+                    catalog,
+                ));
             }
         },
         Err(_) => None,
     };
-    let snapshot = match limits_read {
+    let observed_at = limits_read.observed_at;
+    let snapshot = match limits_read.value {
         Ok(result) => super::codex::parse_rate_limits(&result, observed_at),
         Err(error) => match super::codex::error_status(&error) {
             Some(UsageStatus::NeedsLogin) => UsageSnapshot::state(
@@ -940,7 +1124,7 @@ async fn probe_codex(account: &Account, program: &Path) -> Result<Probed, String
     Ok(Probed {
         identity,
         snapshot,
-        models,
+        catalog,
     })
 }
 
@@ -948,12 +1132,12 @@ type RpcResult = Result<Value, Value>;
 
 /// What the app server answered.
 struct CodexSession {
-    account: RpcResult,
-    limits: RpcResult,
+    account: Observed<RpcResult>,
+    limits: Observed<RpcResult>,
     /// The first page of `model/list`, which lists every model Codex offers
     /// in one page of this size. A version without it answers an error, and
     /// one that did not answer within [`MODELS_GRACE`] reads as one.
-    models: RpcResult,
+    models: Option<Observed<RpcResult>>,
 }
 
 async fn codex_exchange(session: &mut Session) -> Result<CodexSession, String> {
@@ -977,34 +1161,30 @@ async fn codex_exchange(session: &mut Session) -> Result<CodexSession, String> {
         .await?;
     let mut answers = CodexAnswers::default();
     while answers.account.is_none() || answers.limits.is_none() {
-        answers.take(session.next().await?);
+        answers.take(session.next().await?, now_ms);
     }
     // The usage is what the probe is for, so the listing is only waited for
     // a little longer, and a probe that has its answer never fails for it.
     let _ = tokio::time::timeout(MODELS_GRACE, async {
         while answers.models.is_none() {
-            answers.take(session.next().await?);
+            answers.take(session.next().await?, now_ms);
         }
         Ok::<(), String>(())
     })
     .await;
-    Ok(CodexSession {
-        account: answers.account.unwrap(),
-        limits: answers.limits.unwrap(),
-        models: answers.models.unwrap_or(Err(Value::Null)),
-    })
+    Ok(answers.finish())
 }
 
 #[derive(Default)]
 struct CodexAnswers {
-    account: Option<RpcResult>,
-    limits: Option<RpcResult>,
-    models: Option<RpcResult>,
+    account: Option<Observed<RpcResult>>,
+    limits: Option<Observed<RpcResult>>,
+    models: Option<Observed<RpcResult>>,
 }
 
 impl CodexAnswers {
     /// Keeps `frame` if it answers one of the requests.
-    fn take(&mut self, frame: Value) {
+    fn take(&mut self, frame: Value, now: impl FnOnce() -> u64) {
         if frame.get("method").is_some() {
             return;
         }
@@ -1014,7 +1194,18 @@ impl CodexAnswers {
             Some(4) => &mut self.models,
             _ => return,
         };
-        *slot = Some(rpc_result(frame));
+        *slot = Some(Observed {
+            value: rpc_result(frame),
+            observed_at: now(),
+        });
+    }
+
+    fn finish(self) -> CodexSession {
+        CodexSession {
+            account: self.account.unwrap(),
+            limits: self.limits.unwrap(),
+            models: self.models,
+        }
     }
 }
 
@@ -1174,6 +1365,283 @@ mod tests {
         );
     }
 
+    fn claude_reply(request: &str, response: Value) -> Value {
+        json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": request, "response": response}})
+    }
+
+    fn assert_pending<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.poll(&mut context).is_pending());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_matched_usage_keeps_observation_through_auth_and_close() {
+        for signed_in in [true, false] {
+            let clock = std::cell::Cell::new(5);
+            let initialized = observed_control_response(
+                &claude_reply("initialize", json!({"models": [{"value": "opus"}]})),
+                "initialize",
+                || clock.get(),
+            )
+            .unwrap();
+            let catalog = claude_catalog(&initialized);
+            clock.set(10);
+            let usage = observed_control_response(
+                &claude_reply(
+                    "usage",
+                    serde_json::from_str(include_str!(
+                        "../../fixtures/accounts/claude-get-usage.json"
+                    ))
+                    .unwrap(),
+                ),
+                "usage",
+                || clock.get(),
+            )
+            .unwrap();
+            let (auth_ready, auth_wait) = tokio::sync::oneshot::channel::<()>();
+            let (close_ready, close_wait) = tokio::sync::oneshot::channel::<()>();
+            let auth_clock = &clock;
+            let status = async move {
+                auth_wait.await.unwrap();
+                observed_json(
+                    &serde_json::to_vec(&json!({"loggedIn": signed_in,
+                        "email": "user@example.com", "subscriptionType": "max"}))
+                    .unwrap(),
+                    || auth_clock.get(),
+                )
+            };
+            let usage = after_close(Ok(ClaudeSession { catalog, usage }), async {
+                close_wait.await.unwrap();
+            });
+            let mut completion = Box::pin(join_claude(status, usage));
+            assert_pending(completion.as_mut());
+            clock.set(30);
+            auth_ready.send(()).unwrap();
+            assert_pending(completion.as_mut());
+            clock.set(40);
+            close_ready.send(()).unwrap();
+            let Outcome::Answered {
+                identity,
+                snapshot,
+                catalog,
+            } = completion.await.unwrap().into_outcome()
+            else {
+                panic!("the matched collector must produce its ordinary answer");
+            };
+            assert_eq!(catalog.unwrap().observed_at, 5);
+            assert_eq!(snapshot.observed_at, if signed_in { 10 } else { 30 });
+            if signed_in {
+                assert_eq!(identity.unwrap().email.as_deref(), Some("user@example.com"));
+                assert_eq!(snapshot.plan.as_deref(), Some("max"));
+                assert!(!snapshot.windows.is_empty());
+                assert_ne!(snapshot.status, UsageStatus::NeedsLogin);
+            } else {
+                assert!(identity.is_none());
+                assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
+                assert!(snapshot.windows.is_empty());
+            }
+        }
+
+        // A matched protocol rejection has its own observation even when the
+        // separate auth process failed, and a transient error remains Failed.
+        for (message, expected) in [
+            ("Not logged in", Some(UsageStatus::NeedsLogin)),
+            ("service overloaded", None),
+        ] {
+            let usage = observed_control_response(
+                &json!({"type":"control_response", "response": {
+                    "subtype":"error", "request_id":"usage", "error":message}}),
+                "usage",
+                || 12,
+            )
+            .unwrap();
+            let result = finish_claude_probe(
+                Err("auth transport failed".into()),
+                Ok(ClaudeSession {
+                    catalog: None,
+                    usage,
+                }),
+            );
+            if let Some(expected) = expected {
+                let probed = result.unwrap();
+                assert_eq!(probed.snapshot.status, expected);
+                assert_eq!(probed.snapshot.observed_at, 12);
+                assert!(probed.identity.is_none());
+            } else {
+                assert_eq!(
+                    result.err().as_deref(),
+                    Some("Claude Code could not read usage just now")
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_collector_keeps_independent_quota_and_catalog_times_through_close() {
+        for models_first in [false, true] {
+            for signed_in in [false, true] {
+                let clock = std::cell::Cell::new(3);
+                let mut answers = CodexAnswers::default();
+                let listing = json!({"id":4,"result":{"data":[{"model":"gpt-5"}]}});
+                if models_first {
+                    answers.take(listing.clone(), || clock.get());
+                }
+                clock.set(10);
+                answers.take(
+                    serde_json::from_str(include_str!(
+                        "../../fixtures/accounts/codex-rate-limits-read.json"
+                    ))
+                    .unwrap(),
+                    || clock.get(),
+                );
+                clock.set(15);
+                let account = if signed_in {
+                    serde_json::from_str(include_str!(
+                        "../../fixtures/accounts/codex-account-read.json"
+                    ))
+                    .unwrap()
+                } else {
+                    json!({"id":2,"result":{"account":null,"requiresOpenaiAuth":true}})
+                };
+                answers.take(account, || clock.get());
+                let (models_ready, models_wait) = tokio::sync::oneshot::channel::<()>();
+                let (close_ready, close_wait) = tokio::sync::oneshot::channel::<()>();
+                let models_clock = &clock;
+                let collected = async move {
+                    models_wait.await.unwrap();
+                    if !models_first {
+                        answers.take(listing, || models_clock.get());
+                    }
+                    Ok(answers.finish())
+                };
+                let mut completion = Box::pin(async {
+                    finish_codex_probe(
+                        after_close(collected.await, async {
+                            close_wait.await.unwrap();
+                        })
+                        .await,
+                    )
+                });
+                assert_pending(completion.as_mut());
+                clock.set(20);
+                models_ready.send(()).unwrap();
+                assert_pending(completion.as_mut());
+                clock.set(40);
+                close_ready.send(()).unwrap();
+                let Outcome::Answered {
+                    identity,
+                    snapshot,
+                    catalog,
+                } = completion.await.unwrap().into_outcome()
+                else {
+                    panic!("the matched collector must answer");
+                };
+                assert_eq!(
+                    catalog.unwrap().observed_at,
+                    if models_first { 3 } else { 20 }
+                );
+                assert_eq!(snapshot.observed_at, if signed_in { 10 } else { 15 });
+                if signed_in {
+                    assert_eq!(identity.unwrap().plan.as_deref(), Some("prolite"));
+                    assert_eq!(snapshot.ordinary_usage_allowed, Some(true));
+                    assert!(!snapshot.windows.is_empty());
+                } else {
+                    assert!(identity.is_none());
+                    assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
+                }
+            }
+        }
+        for classified in [false, true] {
+            let mut answers = CodexAnswers::default();
+            answers.take(
+                serde_json::from_str(include_str!(
+                    "../../fixtures/accounts/codex-account-read.json"
+                ))
+                .unwrap(),
+                || 5,
+            );
+            let error = if classified {
+                serde_json::from_str(include_str!(
+                    "../../fixtures/accounts/codex-rate-limits-401.json"
+                ))
+                .unwrap()
+            } else {
+                json!({"id":3,"error":{"code":-1,"message":"service overloaded"}})
+            };
+            answers.take(error, || 11);
+            // Neither a missing nor an error model response creates a catalog.
+            if classified {
+                answers.take(json!({"id":4,"error":{"code":-1}}), || 14);
+            }
+            let result = finish_codex_probe(Ok(answers.finish()));
+            if classified {
+                let probed = result.unwrap();
+                assert_eq!(probed.snapshot.status, UsageStatus::NeedsLogin);
+                assert_eq!(probed.snapshot.observed_at, 11);
+                assert!(probed.catalog.is_none());
+                assert!(probed.identity.is_some());
+            } else {
+                assert_eq!(
+                    result.err().as_deref(),
+                    Some("Codex could not read usage just now")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unmatched_and_duplicate_frames_keep_value_and_observation_together() {
+        let calls = std::cell::Cell::new(0);
+        let now = || {
+            calls.set(calls.get() + 1);
+            calls.get()
+        };
+        assert!(
+            observed_control_response(&claude_reply("other", json!({})), "usage", now).is_none()
+        );
+        let mut answers = CodexAnswers::default();
+        answers.take(json!({"id":99,"result":{}}), now);
+        answers.take(json!({"id":3,"method":"notification","result":{}}), now);
+        assert_eq!(calls.get(), 0, "unmatched frames are not observations");
+        let first = observed_control_response(
+            &claude_reply("usage", json!({"value":"first"})),
+            "usage",
+            now,
+        )
+        .unwrap();
+        assert_eq!(first.value.unwrap()["value"], "first");
+        assert_eq!(first.observed_at, 1);
+        answers.take(json!({"id":3,"result":{"value":"old"}}), now);
+        answers.take(json!({"id":3,"result":{"value":"current"}}), now);
+        let limits = answers.limits.as_ref().unwrap();
+        assert_eq!(limits.value.as_ref().unwrap()["value"], "current");
+        assert_eq!(
+            limits.observed_at, 3,
+            "preserve existing same-id overwrite policy"
+        );
+        let initialized = observed_control_response(
+            &json!({"type":"control_response","response":{
+            "subtype":"error","request_id":"initialize","error":"Not logged in"}}),
+            "initialize",
+            now,
+        )
+        .unwrap();
+        assert!(claude_catalog(&initialized).is_none());
+        let probed = finish_claude_probe(
+            Err("auth failed".into()),
+            Ok(ClaudeSession {
+                catalog: None,
+                usage: initialized,
+            }),
+        )
+        .unwrap();
+        assert_eq!(probed.snapshot.status, UsageStatus::NeedsLogin);
+        assert_eq!(probed.snapshot.observed_at, 4);
+        assert!(probed.catalog.is_none());
+        assert_eq!(calls.get(), 4);
+    }
+
     /// A fake CLI stands in for the provider's: the probe has to speak the
     /// protocol, read only the answer it asked for, and leave nothing running.
     #[tokio::test]
@@ -1202,8 +1670,9 @@ sleep 30
         let Probed {
             identity,
             snapshot,
-            models,
+            catalog,
         } = probe_claude(&account, &script).await.unwrap();
+        let models = catalog.unwrap().models;
         assert_eq!(identity.unwrap().email.as_deref(), Some("user@example.com"));
         assert_eq!(models.len(), 1, "initialize listed one model");
         assert_eq!(snapshot.windows.len(), 1);
@@ -1263,10 +1732,11 @@ cat >/dev/null
         let Probed {
             identity,
             snapshot,
-            models,
+            catalog,
         } = probe_codex(&Account::system(Provider::Codex), &script)
             .await
             .unwrap();
+        let models = catalog.unwrap().models;
         assert_eq!(identity.unwrap().plan.as_deref(), Some("plus"));
         assert_eq!(models.len(), 1, "a signed-out Codex still lists its models");
         assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
@@ -1400,5 +1870,123 @@ cat >/dev/null
     fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlapping_path_refreshes_share_one_read_and_failure_keeps_owned_readers() {
+        use std::future::Future;
+        let cache = ShellPathRefresh::new();
+        let calls = std::cell::Cell::new(0);
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let first_path = OsString::from("/first/private/bin");
+        let mut first = Box::pin(cache.refresh(|| async {
+            calls.set(calls.get() + 1);
+            released.await.unwrap();
+            Some(first_path.clone())
+        }));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(first.as_mut().poll(&mut context).is_pending());
+        let mut waiting = Box::pin(cache.refresh(|| async {
+            calls.set(calls.get() + 1);
+            Some(OsString::from("/must/not/read"))
+        }));
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        release.send(()).unwrap();
+        let (first, waiting) = tokio::join!(first, waiting);
+        assert_eq!(
+            calls.get(),
+            1,
+            "overlapping requests share the settled read"
+        );
+        assert_eq!(first, Some(first_path.clone()));
+        assert_eq!(waiting, first);
+        let old_reader = cache.path().unwrap();
+        let next = OsString::from("/new/installer/bin");
+        assert_eq!(
+            cache.refresh(|| async { Some(next.clone()) }).await,
+            Some(next.clone())
+        );
+        assert_eq!(
+            old_reader, first_path,
+            "published readers retain their owned path"
+        );
+        assert_eq!(cache.refresh(|| async { None }).await, Some(next.clone()));
+        assert_eq!(cache.path(), Some(next));
+        // No process-global PATH, shell, OnceCell or environment was changed.
+    }
+
+    #[tokio::test]
+    async fn rediscovery_observes_executable_metadata_on_the_refreshed_path_without_running_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("old bin");
+        let second = directory.path().join("new bin");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let cache = ShellPathRefresh::new();
+        let old = cache
+            .refresh(|| async { Some(first.clone().into_os_string()) })
+            .await
+            .unwrap();
+        assert!(find_executable("codex", Some(&old)).is_none());
+        let codex = first.join("codex");
+        std::fs::write(&codex, "not an executable program: metadata fixture only").unwrap();
+        make_executable(&codex);
+        assert_eq!(find_executable("codex", Some(&old)), Some(codex.clone()));
+        std::fs::remove_file(codex).unwrap();
+        let other = second.join("codex");
+        std::fs::write(&other, "not an executable program: metadata fixture only").unwrap();
+        make_executable(&other);
+        let changed = cache
+            .refresh(|| async { Some(second.clone().into_os_string()) })
+            .await
+            .unwrap();
+        assert_eq!(find_executable("codex", Some(&changed)), Some(other));
+        assert!(find_executable("codex", Some(&old)).is_none());
+        assert_eq!(cache.refresh(|| async { None }).await, Some(changed));
+        assert_eq!(
+            old,
+            first.into_os_string(),
+            "existing readers never borrow replaced storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prepared_probe_command_keeps_its_selected_executable_and_path_together() {
+        let cache = ShellPathRefresh::new();
+        let selected = cache
+            .refresh(|| async { Some(OsString::from("/old/node/bin:/old/cli/bin")) })
+            .await;
+        let _ = cache
+            .refresh(|| async { Some(OsString::from("/new/node/bin:/new/cli/bin")) })
+            .await;
+        let command = command_with_path(
+            &Account::system(Provider::Codex),
+            Path::new("/old/cli/bin/codex"),
+            selected.as_deref(),
+        );
+        assert_eq!(
+            command.as_std().get_program(),
+            OsStr::new("/old/cli/bin/codex")
+        );
+        let path = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("PATH"))
+            .unwrap()
+            .1;
+        assert_eq!(path, selected.as_deref());
+        assert_ne!(path, cache.path().as_deref());
+        let missing = command_with_path(
+            &Account::system(Provider::Codex),
+            Path::new("/old/cli/bin/codex"),
+            None,
+        );
+        assert!(
+            !missing
+                .as_std()
+                .get_envs()
+                .any(|(key, _)| key == OsStr::new("PATH")),
+            "a missing captured path never substitutes a later published shell path"
+        );
     }
 }

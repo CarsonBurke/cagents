@@ -7,7 +7,10 @@ turn busy, acknowledges queued-message removal, and settles on interrupt.
 Later turns complete immediately. Busy messages deliberately stay queued;
 this fixture checks composer interactions, not provider delivery.
 
-Use a new directory beneath the repository's ignored `.worktrees/` for every
+From a shell without a desktop session, such as plain SSH,
+[`scripts/native-evidence`](development.md#native-evidence) sets up this environment;
+you still open the project and start the conversation.
+By hand, use a new directory beneath the repository's ignored `.worktrees/` for every
 run. Keep its HOME, XDG data/config/cache, daemon runtime, and project isolated
 from the development application you normally use. For example, from the
 checkout being validated:
@@ -116,6 +119,12 @@ and copyable. Collapse them while the first turn is still busy, stop that
 turn, and reopen the saved chat; compare the completed and restored content.
 The fixture represents a reproducible payload path, not a captured user
 conversation or evidence about the provider's answer prose.
+
+For a chosen set of tool calls, write `fixture-tools.jsonl`: one call per
+line, as `{"name":"Bash","input":{"command":"cargo test","description":"Run
+the tests"},"result":"error[E0308]: mismatched types","is_error":true}`.
+Every turn emits each call and its result in order, before its answer, and
+records them in the synthetic history like the other behaviors.
 
 For image preview and viewer checks, copy a PNG to
 `"$fixture_root/home/fixture-image.png"` before spawning the agent. Native

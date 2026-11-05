@@ -14,6 +14,10 @@ The installer and the commands below use an authenticated GitHub CLI account.
 You can also download release assets directly from the releases page; tagged
 builds stamp the repository into the released copy of `install.sh` automatically.
 
+Run the installation and removal commands below from a system terminal outside
+cagents. Terminals opened in cagents are hosted sessions; these protected commands
+refuse there even when you type them yourself.
+
 ## Requirements
 
 The supported release target is **Linux x86_64 with glibc**, built on Ubuntu
