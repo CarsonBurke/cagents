@@ -148,10 +148,15 @@ automatically. The runner prints this impact before signaling the daemon.
 
 How the runner works:
 
-- It builds the three sibling executables with separate feature sets and runs
-  the selected UI through Cargo, so configured target directories and target
-  triples are honored. UI-only compilation never builds Ghostty; daemon-only
-  compilation never builds libcosmic or Servo.
+- It builds the three sibling executables with separate feature sets in one
+  slot of the [build gate](#sharing-a-host-between-several-checkouts), then
+  runs them from the target directory Cargo reports, so configured target
+  directories are honored.
+  UI-only compilation never builds Ghostty; daemon-only compilation never
+  builds libcosmic or Servo.
+- A launch with nothing to build skips the gate and starts at once, printing
+  `The matched set is already built for this checkout; skipping the build.`
+  See [Up-to-date launches](#up-to-date-launches).
 - The normal runner enables `integrated-browser` only for the UI; the matched
   CLI and daemon keep the same full-product identity without resolving Servo.
 - It uses the `dev-runtime` profile, which keeps UI dependencies optimized for
@@ -162,6 +167,32 @@ How the runner works:
   production instance.
 - Browserless and integrated development sessions share that state; do not run
   them at the same time. Use [parallel instances](#parallel-instances) instead.
+
+### Up-to-date launches
+
+Waiting for a build slot only to learn that nothing needs building can take
+minutes on a busy host, so the runner decides first whether the matched set is
+already current. After each successful build it writes a record,
+`.run-development-ui` or `.run-development-integrated-browser`, beside the
+executables in `target/dev-runtime/`. The next launch skips the gate only if
+all of these still hold:
+
+- The lane, `rustc -vV`, the checked-out commit and the Zig toolchain match the
+  record.
+- The build environment matches: `RUST*`, `CARGO_*` (except `CARGO_BUILD_JOBS`
+  and `CARGO_HOME`), the C toolchain and `pkg-config` variables, and every
+  variable a build script asked Cargo to watch.
+- All three executables are the files that build produced.
+- No file changed after the build started: anything in the checkout outside
+  `target/`, `.git/`, `website/`, `dist/` and nested worktrees; any file in
+  the executables' Cargo dependency lists; any absolute path a build script
+  watches, such as the shared repository's Git index; and any Cargo
+  configuration file Cargo would load for the checkout.
+
+Otherwise the launch builds through the gate as before, and Cargo makes the
+real decision. The check never runs Cargo's build, so nothing compiles outside
+a slot. Launching the other lane rebuilds the UI and invalidates this lane's
+record. Delete the record to force the next launch through the gate.
 
 ### Parallel instances
 
@@ -205,9 +236,9 @@ the running instances. Run the other lane from a second checkout.
 
 An idle instance takes about 0.4 GiB: the UI, its daemon, a headless niri
 compositor and the session's portals. Memory rarely limits how many run at
-once; building them does. Each checkout compiles its own matched set, so start
-instances from checkouts that are already built, and let `scripts/cargo-gate`
-admit the builds.
+once; building them does. Each checkout compiles its own matched set through
+`scripts/cargo-gate`. Once a checkout is built, its later launches skip the
+gate and start in seconds; see [Up-to-date launches](#up-to-date-launches).
 
 The browserless UI keeps saved browser descriptors and opens their URLs through
 the system browser instead of compiling Servo.
@@ -301,7 +332,8 @@ tests or program run after it is released, so do not wrap the gate in another
 lock. Rustdoc compiles doctests while they run, so `cargo test --doc` keeps
 its slot throughout; a plain `cargo test` compiles its doctests after the
 slot is released. The development runner builds its matched set through the
-gate itself.
+gate itself, and skips the gate when the set is
+[already current](#up-to-date-launches).
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock /var/tmp/cagents-cargo.lock` takes exactly one

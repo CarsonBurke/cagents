@@ -234,17 +234,24 @@ fi
 
 # Where Cargo places the dev-runtime executables. They are run directly: a
 # `cargo run` would check the build again outside any build slot.
-find_products() {
+locate_products() {
     [ -z "${products:-}" ] || return 0
-    target=$(cargo metadata --locked --format-version 1 --no-deps |
-        sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
-    [ -n "$target" ] || {
+    metadata=$(cargo metadata --locked --format-version 1 --no-deps 2>/dev/null) || return 1
+    target=$(printf '%s\n' "$metadata" | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+    [ -n "$target" ] || return 1
+    products=$target/dev-runtime
+    # Build scripts run in the build directory, which defaults to the target.
+    build_dir=$(printf '%s\n' "$metadata" | sed -n 's/.*"build_directory":"\([^"]*\)".*/\1/p')
+    build_dir=${build_dir:-$target}
+}
+find_products() {
+    locate_products || {
         printf '%s\n' 'cannot find the Cargo target directory' >&2
         exit 1
     }
-    products=$target/dev-runtime
 }
 products=
+build_dir=
 
 # Builds the matched set in one build slot, so an up-to-date checkout waits
 # for a slot once rather than three times. Each product is a separate Cargo
@@ -258,6 +265,107 @@ build_products() {
         cargo build --locked --profile dev-runtime $1 --features development,host --bin cagentsd
         cargo build --locked --profile dev-runtime $1 --features "development,$2" --bin cagents-ui
     ' build-products "$default_features" "$ui_feature"
+}
+
+# A launch with nothing to build skips the build gate, whose queue can be long
+# on a shared host. The runner records what its last successful build used:
+# the lane, toolchain, commit, Zig and build environment, and the identity of
+# each executable. The set counts as current only if all of that still
+# matches and no file the build read changed since the build started. When anything is unsure, the build runs through the gate,
+# where Cargo makes the real decision; this never builds outside the gate.
+build_identity() {
+    printf 'lane %s\n' "$ui_feature"
+    rustc -vV || return 1
+    git -C "$root" rev-parse HEAD 2>/dev/null || printf '%s\n' 'no commit'
+    printf 'zig %s %s\n' "$zig_executable" "$zig_version"
+    env | grep -E '^(RUST|CARGO_|CC=|CXX=|AR=|CFLAGS=|CXXFLAGS=|LDFLAGS=|PKG_CONFIG)' |
+        grep -v -e '^CARGO_BUILD_JOBS=' -e '^CARGO_HOME=' | LC_ALL=C sort
+    # Variables a build script asked Cargo to watch.
+    watched=$(build_script_watches env-changed)
+    env | awk -v watched="$watched" '
+        BEGIN { count = split(watched, names, "\n"); for (i = 1; i <= count; i++) seen[names[i]] }
+        { name = $0; sub(/=.*/, "", name) }
+        name in seen { print "env " $0 }
+    ' | LC_ALL=C sort
+}
+# What the dev-runtime build scripts asked Cargo to watch: env-changed for
+# variable names, or changed for paths. Outputs of earlier builds count too,
+# which only makes the check stricter.
+build_script_watches() {
+    for output in "$build_dir"/dev-runtime/build/*/output; do
+        [ ! -f "$output" ] || sed -n "s/^cargo::\{0,1\}rerun-if-$1=//p" "$output"
+    done | LC_ALL=C sort -u
+}
+# Files the build read outside the checkout scan: the executables' dependency
+# lists from Cargo, absolute paths the build scripts watch (such as Git
+# metadata in the shared repository), and every Cargo configuration file
+# Cargo would load from this checkout.
+outside_inputs() {
+    for executable in cagents cagentsd cagents-ui; do
+        dependencies=$products/$executable.d
+        [ -f "$dependencies" ] || return 1
+        # Escaped spaces would split a path; let Cargo decide instead.
+        ! grep -q '\\' "$dependencies" || return 1
+        sed 's/^[^:]*://' "$dependencies" | tr ' ' '\n' | sed '/^$/d'
+    done
+    build_script_watches changed | grep '^/' | sed 's/^/optional /'
+    directory=$root
+    while :; do
+        printf 'optional %s/.cargo/config.toml\noptional %s/.cargo/config\n' \
+            "$directory" "$directory"
+        [ "$directory" != / ] || break
+        directory=$(dirname -- "$directory")
+    done
+    cargo_home=${CARGO_HOME:-$HOME/.cargo}
+    printf 'optional %s/config.toml\noptional %s/config\n' "$cargo_home" "$cargo_home"
+}
+built_executables() {
+    for executable in cagents cagentsd cagents-ui; do
+        stat -c '%n %i %s %.9Y' "$products/$executable" || return 1
+    done
+}
+build_record() {
+    printf '%s/.run-development-%s' "$products" "$ui_feature"
+}
+products_current() {
+    locate_products || return 1
+    record=$(build_record)
+    [ -f "$record" ] || return 1
+    current=$(build_identity && built_executables 2>/dev/null) || return 1
+    [ "$(cat "$record")" = "$current" ] || return 1
+    changed=$(find "$root" \( -path "$root/target" -o -path "$root/.git" \
+        -o -path "$root/.worktrees" -o -path "$root/worktrees" -o -path "$root/dist" \
+        -o -path "$root/website" -o -name node_modules \) -prune \
+        -o -newer "$record" -print -quit 2>/dev/null) || return 1
+    [ -z "$changed" ] || return 1
+    inputs=$(outside_inputs) || return 1
+    printf '%s\n' "$inputs" | while IFS= read -r input; do
+        case $input in
+        'optional '*)
+            input=${input#optional }
+            [ ! -e "$input" ] || [ ! "$input" -nt "$record" ] || return 1
+            ;;
+        *) [ -e "$input" ] && [ ! "$input" -nt "$record" ] || return 1 ;;
+        esac
+    done
+}
+# The record's time is when the build started, so a file saved during the
+# build counts as changed at the next launch.
+build_and_record() {
+    locate_products || { build_products; return; }
+    record=$(build_record)
+    started=$record.started
+    mkdir -p -- "$products"
+    rm -f -- "$record" "$started"
+    : >"$started"
+    build_products
+    build_identity >"$started.new" && built_executables >>"$started.new" || {
+        rm -f -- "$started" "$started.new"
+        return 0
+    }
+    touch -r "$started" "$started.new"
+    mv -f -- "$started.new" "$record"
+    rm -f -- "$started"
 }
 
 run_cli() {
@@ -353,7 +461,11 @@ if [ "$stop_instance" = true ]; then
     exit 0
 fi
 
-build_products
+if products_current; then
+    printf '%s\n' 'The matched set is already built for this checkout; skipping the build.' >&2
+else
+    build_and_record
+fi
 find_products
 
 # Keep the current development session alive if any part of the matched build

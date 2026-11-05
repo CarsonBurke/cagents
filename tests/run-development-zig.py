@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Exercise Zig discovery before any Cargo build, without building the app."""
+"""Exercise Zig discovery before any Cargo build, and the decision to skip an
+up-to-date build, without building the app."""
 
 import os
 from pathlib import Path
@@ -53,6 +54,7 @@ fi
         self.cargo_calls = self.root / "cargo-calls"
         cargo = fake_bin / "cargo"
         cargo.write_text('''#!/bin/sh
+if [ "$1" = metadata ]; then exit 1; fi
 printf '%s|zig=%s|home=%s|xdg=%s|mise=%s\\n' "$*" "$(command -v zig)" "$HOME" "$XDG_DATA_HOME" "${MISE_DATA_DIR-unset}" >> "$CARGO_CALLS"
 exit 83
 ''')
@@ -143,6 +145,121 @@ exit 83
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("executable named zig", result.stderr)
         self.assertEqual(calls, [], "Cargo could resolve the original unverified shim")
+
+
+class LaunchFreshness(unittest.TestCase):
+    """A launch whose matched set is built skips the build gate; anything that
+    could make Cargo rebuild sends the launch back through it."""
+
+    def setUp(self):
+        ZigDiscovery.setUp(self)
+        checkout = self.runner.parents[1]
+        self.source = checkout / "src/main.rs"
+        self.source.parent.mkdir()
+        self.source.write_text("fn main() {}\n")
+        self.target = self.root / "target with spaces"
+        fake_bin = self.root / "bin"
+        (fake_bin / "cargo").write_text('''#!/bin/sh
+case $1 in
+    metadata)
+        printf '{"packages":[],"target_directory":"%s","build_directory":"%s","version":1}\\n' \\
+            "$FAKE_TARGET" "$FAKE_BUILD"
+        exit 0 ;;
+    build)
+        printf '%s\\n' "$*" >> "$CARGO_CALLS"
+        for argument do binary=$argument; done
+        mkdir -p "$FAKE_TARGET/dev-runtime" "$FAKE_BUILD/dev-runtime/build/script-1"
+        printf '#!/bin/sh\\nexit 0\\n' > "$FAKE_TARGET/dev-runtime/$binary"
+        chmod +x "$FAKE_TARGET/dev-runtime/$binary"
+        printf '%s: %s %s\\n' "$FAKE_TARGET/dev-runtime/$binary" "$FAKE_SOURCE" "$FAKE_VENDORED" \\
+            > "$FAKE_TARGET/dev-runtime/$binary.d"
+        printf 'cargo:rerun-if-changed=%s\\ncargo::rerun-if-changed=build.rs\\ncargo:rerun-if-env-changed=FAKE_WATCHED\\ncargo:rerun-if-env-changed=AR_x86_64-unknown-linux-gnu\\n' \\
+            "$FAKE_GIT_INDEX" > "$FAKE_BUILD/dev-runtime/build/script-1/output"
+        exit 0 ;;
+esac
+exit 83
+''')
+        rustc = fake_bin / "rustc"
+        rustc.write_text('#!/bin/sh\nprintf "rustc %s\\n" "${FAKE_RUSTC:-1.93.0}"\n')
+        rustc.chmod(0o755)
+        # Inputs outside the checkout: a path dependency from Cargo's
+        # dependency list, and Git metadata a build script watches.
+        self.vendored = self.root / "shared/vendored.rs"
+        self.git_index = self.root / "shared/index"
+        self.vendored.parent.mkdir()
+        self.vendored.write_text("")
+        self.git_index.write_text("")
+        self.ancestor_config = self.root / ".cargo/config.toml"
+        self.env.update(
+            FAKE_TARGET=str(self.target), FAKE_BUILD=str(self.root / "build"),
+            FAKE_SOURCE=str(self.source), FAKE_VENDORED=str(self.vendored),
+            FAKE_GIT_INDEX=str(self.git_index),
+        )
+        self.env.pop("FAKE_WATCHED", None)
+
+    def launch(self, *arguments, **changes):
+        environment = self.env.copy()
+        environment.update(changes)
+        result = subprocess.run(
+            [str(self.runner), *arguments], cwd=self.root,
+            env=environment, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.cargo_calls.read_text().splitlines() if self.cargo_calls.exists() else []
+        if self.cargo_calls.exists():
+            self.cargo_calls.unlink()
+        return result, calls
+
+    def assert_built(self, *arguments, **changes):
+        result, calls = self.launch(*arguments, **changes)
+        self.assertEqual(len(calls), 3, result.stderr)
+        self.assertNotIn("skipping the build", result.stderr)
+
+    def assert_skipped(self, *arguments, **changes):
+        result, calls = self.launch(*arguments, **changes)
+        self.assertEqual(calls, [], "an up-to-date launch built")
+        self.assertIn("skipping the build", result.stderr)
+
+    def test_up_to_date_launch_skips_the_build(self):
+        self.assert_built("--browserless")
+        self.assert_skipped("--browserless")
+        self.assert_skipped("--browserless")
+
+    def test_changes_send_the_launch_through_the_build(self):
+        self.assert_built("--browserless")
+        for name, change in (
+            ("source edit", lambda: self.source.write_text("fn main() { }\n")),
+            ("new file", lambda: (self.source.parent / "new.rs").write_text("")),
+            ("executable replaced", lambda: (self.target / "dev-runtime/cagentsd").write_text("#!/bin/sh\n")),
+            ("record removed", lambda: (self.target / "dev-runtime/.run-development-ui").unlink()),
+            ("dependency outside the checkout", lambda: self.vendored.write_text("//\n")),
+            ("path a build script watches", lambda: self.git_index.write_text("staged")),
+            ("dependency list removed", lambda: (self.target / "dev-runtime/cagents.d").unlink()),
+            ("Cargo configuration in a parent directory", self.write_ancestor_config),
+        ):
+            with self.subTest(change=name):
+                change()
+                self.assert_built("--browserless")
+                self.assert_skipped("--browserless")
+        for name, changes in (
+            ("toolchain", {"FAKE_RUSTC": "1.94.0"}),
+            ("compiler flags", {"RUSTFLAGS": "-Ctarget-cpu=native"}),
+            ("variable a build script watches", {"FAKE_WATCHED": "1"}),
+        ):
+            with self.subTest(change=name):
+                self.assert_built("--browserless", **changes)
+                self.assert_skipped("--browserless", **changes)
+                self.assert_built("--browserless")
+
+    def write_ancestor_config(self):
+        self.ancestor_config.parent.mkdir(exist_ok=True)
+        self.ancestor_config.write_text("[build]\n")
+
+    def test_the_other_lane_rebuilds_and_invalidates_this_one(self):
+        self.assert_built("--browserless")
+        self.assert_built()
+        self.assert_skipped()
+        self.assert_built("--browserless")
 
 
 if __name__ == "__main__":
