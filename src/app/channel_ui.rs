@@ -261,6 +261,8 @@ struct Deletion {
     title: String,
     /// Open conversations the deletion closes, reported before it happens.
     chats: usize,
+    /// What it leaves running in another channel, in the reader's terms.
+    held_elsewhere: Vec<String>,
     /// Why the last deletion of this channel failed, when the dialog is
     /// opened again after it. Confirming retries it.
     failure: Option<String>,
@@ -618,13 +620,15 @@ impl Cagents {
         let title = channel_display_title(channel, self.sidebar_model.project(channel.project_id))
             .into_owned();
         let chats = self.channel_conversation_count(channel);
-        if chats == 0 && !always_confirm {
+        let held_elsewhere = self.channel_held_elsewhere_notes(channel);
+        if chats == 0 && held_elsewhere.is_empty() && !always_confirm {
             return self.delete_channel(id);
         }
         self.channel_ui.dialog = Some(Deletion {
             channel: id,
             title,
             chats,
+            held_elsewhere,
             failure: self.channel_ui.failed.get(&id).cloned(),
         });
         iced::widget::operation::focus(State::focus_target()).map(cosmic::Action::App)
@@ -641,9 +645,22 @@ impl Cagents {
                     state.id == **card
                         && state.existence.is_open()
                         && matches!(&state.kind, CardKind::Chat(_) | CardKind::Terminal(_))
-                })
+                }) && !self.another_pane_holds_session(**card)
             })
             .count()
+    }
+
+    /// What deleting `channel` leaves running because another pane holds it.
+    pub(super) fn channel_held_elsewhere_notes(&self, channel: &ProjectChannel) -> Vec<String> {
+        channel
+            .cards
+            .iter()
+            .filter(|card| {
+                self.card_state(**card)
+                    .is_some_and(|state| state.existence.is_open())
+            })
+            .filter_map(|card| self.session_held_elsewhere_note(*card))
+            .collect()
     }
 
     pub(super) fn delete_channels(&mut self, ids: Vec<ChannelId>) -> Task<Message> {
@@ -1024,6 +1041,12 @@ impl Cagents {
                 ),
             }),
         ];
+        rows.extend(
+            dialog
+                .held_elsewhere
+                .iter()
+                .map(|note| super::notice_body(note.as_str())),
+        );
         if let Some(failure) = &dialog.failure {
             rows.push(super::notice_body(format!(
                 "The last attempt failed: {failure}"

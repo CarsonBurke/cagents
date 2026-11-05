@@ -704,7 +704,7 @@ impl Cagents {
                  Terminals and chats running in them, including detached ones, are closed first.",
             ),
             SelectionRow::Channel(_) => {
-                let conversations = dialog
+                let channels = dialog
                     .targets
                     .iter()
                     .filter_map(|target| match target.row {
@@ -715,15 +715,28 @@ impl Cagents {
                             .find(|channel| channel.id == id),
                         _ => None,
                     })
+                    .collect::<Vec<_>>();
+                let conversations = channels
+                    .iter()
                     .map(|channel| self.channel_conversation_count(channel))
                     .sum::<usize>();
+                let closes = (conversations > 0).then(|| {
+                    format!(
+                        "Deleting them closes the {conversations} conversation{} inside them.",
+                        if conversations == 1 { "" } else { "s" }
+                    )
+                });
+                let cascade = closes
+                    .into_iter()
+                    .chain(
+                        channels
+                            .iter()
+                            .flat_map(|channel| self.channel_held_elsewhere_notes(channel)),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 (
-                    (conversations > 0).then(|| {
-                        format!(
-                            "Deleting them closes the {conversations} conversation{} inside them.",
-                            if conversations == 1 { "" } else { "s" }
-                        )
-                    }),
+                    (!cascade.is_empty()).then_some(cascade),
                     "The channels and the conversations they hold are removed from this \
                      workspace. Nothing outside them is touched.",
                 )

@@ -246,6 +246,20 @@ fn deleting_a_channel_only_closes_sessions_no_other_pane_holds() {
         if held_elsewhere {
             hold_in_view(&mut app, &mut view, &attached);
         }
+        // The confirmation has to say the same thing the deletion does.
+        let channel = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == old)
+            .unwrap();
+        assert_eq!(
+            app.channel_conversation_count(channel),
+            usize::from(!held_elsewhere)
+        );
+        let notes = app.channel_held_elsewhere_notes(channel);
+        assert_eq!(notes.len(), usize::from(held_elsewhere), "{notes:?}");
+        assert!(notes.iter().all(|note| note.contains("keeps running in")));
         drop(app.delete_channel(old));
         let remains = app.durable.channels.iter().any(|channel| channel.id == old);
         assert_eq!(

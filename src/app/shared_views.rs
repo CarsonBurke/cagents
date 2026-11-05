@@ -1712,6 +1712,20 @@ impl Cagents {
         ))
     }
 
+    /// What going without `card` leaves behind, when another pane holds its session.
+    pub(super) fn session_held_elsewhere_note(&self, card: CardId) -> Option<String> {
+        let view = self.view_holding_card_session(card)?;
+        let title = &self.card_state(card)?.title;
+        let scope = self.scope_display_name(&view.scope);
+        Some(if self.shared_views.blocked_aliases.contains_key(&card) {
+            format!(
+                "\u{201c}{title}\u{201d} keeps running in {scope}. What's waiting for it here is discarded."
+            )
+        } else {
+            format!("\u{201c}{title}\u{201d} keeps running in {scope}.")
+        })
+    }
+
     /// Lets go of a card whose session a shared pane holds. The session belongs
     /// to that pane now, so only this card and its local work go away.
     pub(super) fn release_card_held_elsewhere(&mut self, card: CardId) -> Task<Message> {
