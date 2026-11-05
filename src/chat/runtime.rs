@@ -7433,6 +7433,22 @@ mod tests {
                 .iter()
                 .all(|item| { !format!("{:?}", item.content).contains("fixture-private-payload") })
         );
+        // Claude Code 2.1.296 sends `post_turn_summary` before each result.
+        handle
+            .command(Command::Prompt {
+                text: "post-turn-summary check".into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        let snapshot = until(&handle, |snapshot| {
+            !snapshot.busy
+                && snapshot.items.iter().any(|item| {
+                    matches!(&item.content, ItemContent::Text { text, .. } if text == "ready")
+                })
+        });
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert!(!snapshot.exited);
         handle.close().unwrap();
         assert!(handle.failure().is_none());
     }

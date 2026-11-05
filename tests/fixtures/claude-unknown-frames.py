@@ -4,6 +4,9 @@
 Exercises normal initialize/prompt/result traffic without network, credentials,
 provider history, tools or subprocesses. Use an isolated development account.
 The prompt `noise-limit` emits eight malformed lines instead of a result.
+The prompt `post-turn-summary` answers with only known frames plus the
+`post_turn_summary` system event Claude Code 2.1.296 sends before each result;
+its fields are copied from a live haiku turn, with fixture identifiers.
 """
 import json
 import sys
@@ -41,6 +44,20 @@ for line in sys.stdin:
         if "noise-limit" in json.dumps(frame.get("message", {})):
             for index in range(8):
                 print(f"offline wrapper diagnostic {index}", flush=True)
+            continue
+        if "post-turn-summary" in json.dumps(frame.get("message", {})):
+            send({"type": "system", "subtype": "init", "session_id": session})
+            send(dict(frame, session_id=session))
+            answer = str(uuid.uuid4())
+            send({"type": "assistant", "uuid": answer, "session_id": session,
+                  "message": {"id": str(uuid.uuid4()), "role": "assistant",
+                              "content": [{"type": "text", "text": "ready"}]}})
+            send({"type": "system", "subtype": "post_turn_summary",
+                  "summarizes_uuid": answer, "status_category": "completed",
+                  "status_detail": "replied 'ready' as requested", "needs_action": "",
+                  "uuid": str(uuid.uuid4()), "session_id": session})
+            send({"type": "result", "subtype": "success", "is_error": False, "result": "ready",
+                  "session_id": session, "usage": {"input_tokens": 1, "output_tokens": 1}})
             continue
         send({"type": "system", "subtype": "init", "session_id": session})
         send(dict(frame, session_id=session))

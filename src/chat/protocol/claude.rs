@@ -6398,6 +6398,39 @@ mod tests {
         }
     }
 
+    /// Claude Code 2.1.296 sends `post_turn_summary` before every result; the
+    /// frame below keeps a live haiku turn's fields with fixture identifiers.
+    #[test]
+    fn a_post_turn_summary_does_not_fail_the_turn() {
+        let mut adapter = Claude::default();
+        adapter.busy = true;
+        adapter.receive(json!({"type":"assistant","uuid":"answer","message":{"id":"m","role":"assistant","content":[{"type":"text","text":"ready"}]}})).unwrap();
+        let summary = adapter
+            .receive(json!({
+                "type": "system",
+                "subtype": "post_turn_summary",
+                "summarizes_uuid": "answer",
+                "status_category": "completed",
+                "status_detail": "replied 'ready' as requested",
+                "needs_action": "",
+                "uuid": "summary",
+                "session_id": "session"
+            }))
+            .unwrap();
+        assert!(summary.events.is_empty());
+        let result = adapter
+            .receive(json!({"type":"result","subtype":"success","result":"ready","is_error":false,"session_id":"session"}))
+            .unwrap();
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
+        assert!(!adapter.busy);
+    }
+
     #[test]
     fn unknown_frames_do_not_interrupt_a_streamed_turn() {
         let mut adapter = Claude::default();
