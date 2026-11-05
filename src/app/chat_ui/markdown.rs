@@ -113,8 +113,11 @@ impl Content {
         // A syntax-free single-line paragraph cannot change interpretation
         // while more ordinary text arrives. Delimiters/newlines return to the
         // CommonMark path, including markers split across provider deltas.
+        // A colon can make the word being written a bare reference that
+        // `linked` turns into a link, so that word is parsed again.
         if self.open_plain
             && markdown.chars().all(plain_character)
+            && !markdown.contains(':')
             && let Some(Item::Paragraph(text)) = self.items.last_mut()
         {
             let suffix = visible_suffix(markdown, &mut self.pending_spaces);
@@ -240,6 +243,12 @@ impl Content {
             .next()
             .is_some_and(char::is_alphabetic)
             && self.state.leftover.chars().all(plain_character)
+            && !self
+                .state
+                .leftover
+                .rsplit(' ')
+                .next()
+                .is_some_and(|word| word.contains(':'))
             && matches!(self.items.last(), Some(Item::Paragraph(text)) if text.is_plain_source(rendered_source));
 
         // A reference destination/title may grow, disappear, or be shadowed
@@ -1317,7 +1326,7 @@ fn parse_with<'a>(
                 ..
             } if !metadata => {
                 if !spans.is_empty() {
-                    let text = Text::new(spans.drain(..).collect());
+                    let text = Text::new(linked(spans.drain(..)));
                     RefCell::borrow_mut(&inline_items).push(match inline_heading {
                         Some(level) => Item::Heading(level, text),
                         None => Item::Paragraph(text),
@@ -1343,7 +1352,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(spans.drain(..).collect())),
+                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
                         source,
                     )
                 };
@@ -1369,7 +1378,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(spans.drain(..).collect())),
+                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
                         source,
                     )
                 };
@@ -1390,7 +1399,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(spans.drain(..).collect())),
+                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
                         source,
                     )
                 }
@@ -1432,7 +1441,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Heading(level, Text::new(spans.drain(..).collect())),
+                        Item::Heading(level, Text::new(linked(spans.drain(..)))),
                         source,
                     )
                 }
@@ -1460,7 +1469,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(spans.drain(..).collect())),
+                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
                         source,
                     )
                 }
@@ -1472,7 +1481,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(spans.drain(..).collect())),
+                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
                         source,
                     )
                 }
@@ -1570,7 +1579,7 @@ fn parse_with<'a>(
                     let _ = produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(spans.drain(..).collect())),
+                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
                         source.clone(),
                     );
                 }
@@ -1685,6 +1694,216 @@ fn parse_with<'a>(
         }
         _ => None,
     })
+}
+
+/// A paragraph's spans with its bare web addresses and file positions made
+/// into links.
+///
+/// Agents write `https://example.com/docs` and `src/app.rs:42` in prose far
+/// more often than they write Markdown links, and a reader expects both to
+/// open, as a terminal would. Only plain text is read: code spans and text
+/// already inside a link keep what the author wrote. The text itself is never
+/// changed, so selection, Find and Copy see exactly the answer.
+///
+/// The parser can hand over one run of text as several pieces, so neighbours
+/// set in the same style are joined first: an address cut in two would
+/// otherwise link neither half.
+fn linked(spans: impl Iterator<Item = Span>) -> Vec<Span> {
+    let mut joined: Vec<Span> = Vec::new();
+    for span in spans {
+        if let (
+            Some(Span::Standard {
+                text: previous,
+                strikethrough: a,
+                link: None,
+                strong: b,
+                emphasis: c,
+                code: false,
+            }),
+            Span::Standard {
+                text,
+                strikethrough: d,
+                link: None,
+                strong: e,
+                emphasis: f,
+                code: false,
+            },
+        ) = (joined.last_mut(), &span)
+            && (*a, *b, *c) == (*d, *e, *f)
+        {
+            previous.push_str(text);
+            continue;
+        }
+        joined.push(span);
+    }
+    let mut out = Vec::with_capacity(joined.len());
+    for mut span in joined {
+        // Agents set positions in code (`src/lib.rs:12`) as often as in
+        // prose; a code span that is exactly one keeps its face and opens.
+        if let Span::Standard {
+            text,
+            link: link @ None,
+            code: true,
+            ..
+        } = &mut span
+        {
+            *link = destination(text);
+            out.push(span);
+            continue;
+        }
+        let Span::Standard {
+            text,
+            strikethrough,
+            link: None,
+            strong,
+            emphasis,
+            code: false,
+        } = span
+        else {
+            out.push(span);
+            continue;
+        };
+        let piece = |text: &str, link: Option<Uri>| Span::Standard {
+            text: text.to_owned(),
+            strikethrough,
+            link,
+            strong,
+            emphasis,
+            code: false,
+        };
+        let mut copied = 0;
+        for (start, end, destination) in references(&text) {
+            if copied < start {
+                out.push(piece(&text[copied..start], None));
+            }
+            out.push(piece(&text[start..end], Some(destination)));
+            copied = end;
+        }
+        match copied {
+            0 => out.push(piece(&text, None)),
+            copied if copied < text.len() => out.push(piece(&text[copied..], None)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Where in `text` a bare reference sits, and what it opens.
+fn references(text: &str) -> impl Iterator<Item = (usize, usize, Uri)> + '_ {
+    text.split_inclusive(char::is_whitespace)
+        .scan(0, |offset, word| {
+            let start = *offset;
+            *offset += word.len();
+            Some((start, word.trim_end()))
+        })
+        .filter_map(|(start, word)| {
+            // Brackets and quotes around a reference are the sentence's, as
+            // is the punctuation after it, except a closing bracket that
+            // the reference itself opened, as in a wiki address.
+            let inner = word.trim_start_matches(['(', '[', '{', '<', '"', '\'', '`', '*', '_']);
+            let start = start + word.len() - inner.len();
+            let mut end = inner.len();
+            while let Some(last) = inner[..end].chars().next_back() {
+                let unbalanced = |open: char, close: char| {
+                    last == close
+                        && inner[..end].matches(close).count() > inner[..end].matches(open).count()
+                };
+                if matches!(
+                    last,
+                    '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | '>' | '`' | '*' | '_'
+                ) || unbalanced('(', ')')
+                    || unbalanced('[', ']')
+                    || unbalanced('{', '}')
+                {
+                    end -= last.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let reference = &inner[..end];
+            destination(reference).map(|destination| (start, start + end, destination))
+        })
+}
+
+/// Domain suffixes that end a host name far more often than a file name.
+const HOST_SUFFIXES: [&str; 17] = [
+    "com",
+    "net",
+    "org",
+    "io",
+    "co",
+    "dev",
+    "app",
+    "ai",
+    "edu",
+    "gov",
+    "test",
+    "localhost",
+    "internal",
+    "local",
+    "lan",
+    "cloud",
+    "svc",
+];
+
+/// File names that are conventionally written without an extension.
+const EXTENSIONLESS_FILES: [&str; 12] = [
+    "Makefile",
+    "GNUmakefile",
+    "makefile",
+    "Dockerfile",
+    "Containerfile",
+    "Justfile",
+    "justfile",
+    "Rakefile",
+    "Gemfile",
+    "Procfile",
+    "Vagrantfile",
+    "Jenkinsfile",
+];
+
+/// What a bare reference opens: a web address, or a file at a line.
+///
+/// A file position needs a line and a file name that reads as one: an
+/// extension that starts with a letter, a dotfile, or a conventional
+/// extensionless name in a directory, such as `docker/Dockerfile`. So a time
+/// such as `12:30`, `issue:42`, and an image tag such as `bitnami/redis:7`
+/// stay text.
+fn destination(reference: &str) -> Option<Uri> {
+    // A code span holding a command (`cargo test src/a.rs:3`) is not a link.
+    if reference.is_empty() || reference.contains(char::is_whitespace) {
+        return None;
+    }
+    let lower = reference.get(..8).unwrap_or(reference).to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let url = url::Url::parse(reference).ok()?;
+        return url
+            .host_str()
+            .is_some_and(|host| !host.is_empty())
+            .then(|| Arc::from(reference));
+    }
+    if reference.contains("://") {
+        return None;
+    }
+    let (path, position) = crate::document_link::file_position(reference);
+    position?;
+    // `api.example.com:5432` and `ghcr.io/org/app:2` name a host's port or an
+    // image's tag, not a line of a file.
+    // No host starts with a dot, and dotfiles such as `.env.local` end in one.
+    let first = path.split('/').next().unwrap_or(path);
+    if !first.starts_with('.')
+        && first.rsplit_once('.').is_some_and(|(_, suffix)| {
+            HOST_SUFFIXES.contains(&suffix.to_ascii_lowercase().as_str())
+        })
+    {
+        return None;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let file = EXTENSIONLESS_FILES.contains(&name)
+        || name.rsplit_once('.').is_some_and(|(_, extension)| {
+            extension.starts_with(|ch: char| ch.is_ascii_alphabetic())
+        });
+    (file && !path.contains(':')).then(|| Arc::from(reference))
 }
 
 #[cfg(test)]
@@ -1823,6 +2042,120 @@ mod tests {
             "cold Item bytes: {}",
             std::mem::size_of::<Item>()
         );
+    }
+
+    /// The links a paragraph's text carries, with the text each covers.
+    fn links(content: &Content) -> Vec<(String, String)> {
+        let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
+        content
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Paragraph(text) | Item::Heading(_, text) => Some(text.spans(style)),
+                _ => None,
+            })
+            .flat_map(|spans| {
+                spans
+                    .iter()
+                    .filter_map(|span| {
+                        span.link
+                            .as_ref()
+                            .map(|link| (span.text.to_string(), link.to_string()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Bare addresses and file positions in prose open like Markdown links,
+    /// and the text a reader selects or copies is unchanged.
+    #[test]
+    fn bare_addresses_and_file_positions_are_links() {
+        let answer = "See (https://example.com/a_(b)), src/main.rs:42:7. Then \
+            docs/guide.md:9, *lib.rs:3*, docker/Dockerfile:4, .env:2, .env.local:3 and <https://kept.example>.";
+        let content = Content::parse(answer);
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(text, link)| (text.to_string(), link.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            links(&content),
+            pairs(&[
+                ("https://example.com/a_(b)", "https://example.com/a_(b)"),
+                ("src/main.rs:42:7", "src/main.rs:42:7"),
+                ("docs/guide.md:9", "docs/guide.md:9"),
+                ("lib.rs:3", "lib.rs:3"),
+                ("docker/Dockerfile:4", "docker/Dockerfile:4"),
+                (".env:2", ".env:2"),
+                (".env.local:3", ".env.local:3"),
+                ("https://kept.example", "https://kept.example"),
+            ])
+        );
+        let Item::Paragraph(text) = &content.items()[0] else {
+            panic!("paragraph")
+        };
+        assert_eq!(
+            text.plain().as_ref(),
+            "See (https://example.com/a_(b)), src/main.rs:42:7. Then docs/guide.md:9, \
+             lib.rs:3, docker/Dockerfile:4, .env:2, .env.local:3 and https://kept.example."
+        );
+        // A code span that is exactly a position opens too, still as code.
+        let content = Content::parse("Open `src/code.rs:22` or `cargo test src/a.rs:3`.");
+        assert_eq!(
+            links(&content),
+            pairs(&[("src/code.rs:22", "src/code.rs:22")])
+        );
+        let Item::Paragraph(text) = &content.items()[0] else {
+            panic!("paragraph")
+        };
+        let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
+        assert!(
+            text.spans(style)
+                .iter()
+                .any(|span| { span.link.is_some() && span.font == Some(style.inline_code_font) })
+        );
+        // An author's own link, hosts, image tags, and colons that are not
+        // positions stay as written.
+        let content = Content::parse(
+            "[the docs](https://display.example) at 12:30, issue:42, v1.2:3, \
+             ftp://host/x, https:// alone, api.example.com:5432, db.internal:6379, \
+             ghcr.io/org/app:2, docker.io/library/node:20, bitnami/redis:7, \
+             app.localhost:3000, api.example.dev:8443, src/bin:3 and std::fmt.",
+        );
+        assert_eq!(
+            links(&content),
+            pairs(&[("the docs", "https://display.example")])
+        );
+    }
+
+    /// An answer that arrives a few bytes at a time links what the whole
+    /// answer links, including a position whose line arrives last.
+    #[test]
+    fn a_streamed_reference_is_linked_when_it_completes() {
+        let answer = "Open src/lib.rs:12 and see https://example.com/docs now";
+        for cut in [
+            "Open src/lib.rs:".len(),
+            "Open src/lib.rs:1".len(),
+            "Open src/lib.rs:12 and see https".len(),
+            "Open src/lib.rs:12 and see https://example.com/do".len(),
+        ] {
+            let mut streamed = Content::new();
+            for piece in [&answer[..cut], &answer[cut..]] {
+                streamed.push_str(piece);
+            }
+            assert_eq!(
+                links(&streamed),
+                links(&Content::parse(answer)),
+                "cut at {cut}"
+            );
+            assert_eq!(links(&streamed).len(), 2, "cut at {cut}");
+        }
+        let mut streamed = Content::new();
+        for ch in answer.chars() {
+            streamed.push_str(&ch.to_string());
+        }
+        assert_eq!(links(&streamed), links(&Content::parse(answer)));
     }
 
     #[test]

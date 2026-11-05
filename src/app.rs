@@ -14900,6 +14900,10 @@ impl Application for Cagents {
                     | chat_ui::Action::Dropped(..),
                 )
                 | Message::TerminalDropped { .. } => {
+                    // The refusal answers the `+` menu's choice as a chooser would.
+                    if let Message::ChatUi(chat_ui::Action::Attach(target)) = &message {
+                        self.close_composer_actions(*target);
+                    }
                     self.status = Some(TransientNotice::warning(
                         "File attachments require transfer to the selected device; use files already on that device",
                     ));
@@ -17386,7 +17390,7 @@ impl Application for Cagents {
                 result,
             } => {
                 match result {
-                    Ok(WorktreeCreationOutcome::Created { worktree, .. }) => {
+                    Ok(WorktreeCreationOutcome::Created { worktree, warnings }) => {
                         if let Some(session) = &self.session {
                             session.save_worktrees([WorktreeState {
                                 id: worktree.id,
@@ -17402,10 +17406,10 @@ impl Application for Cagents {
                                 existence: Existence::Open,
                             }]);
                         }
-                        self.status = Some(TransientNotice::success(format!(
-                            "Created worktree {}",
-                            worktree.path.display()
-                        )));
+                        self.status = Some(worktree_operations::created_worktree_notice(
+                            &worktree.path,
+                            &warnings,
+                        ));
                         if let Some(project) = self
                             .sidebar_model
                             .projects
