@@ -115,6 +115,13 @@ class Rewrite(unittest.TestCase):
             "executable": "/c/target/debug/x", "src_path": "/c/src/main.rs",
             "filenames": ["/h/slot-0/src-other/y"], "fresh": True, "n": 1})
 
+    def test_search_paths_from_build_scripts_name_this_hosts_directories(self):
+        mappings = [("/h/slot-0/src/target", "/c/target")]
+        self.assertEqual(offload.rewrite({"linked_paths": ["native=/h/slot-0/src/target/x", "/usr/lib"]},
+                                         mappings),
+                         {"linked_paths": ["native=/c/target/x", "/usr/lib"]})
+        self.assertEqual(offload.rewrite("a=b", mappings), "a=b")
+
     def test_path_package_ids_name_this_hosts_checkout(self):
         mappings = [("/h/slot-0/src", "/c")]
         self.assertEqual(offload.rewrite("path+file:///h/slot-0/src/crates/x#x@0.1.0", mappings),
@@ -336,7 +343,34 @@ class Settings(unittest.TestCase):
             ["CAGENTS_FIXTURE", "CAGENTS_TEST_RETAINED_ACTOR_HELPER"])
 
 
+class Sweep(unittest.TestCase):
+    def test_only_old_unused_connection_directories_are_removed(self):
+        with tempfile.TemporaryDirectory() as root:
+            old, fresh, live, other = (Path(root, f"cof-ssh-{name}") for name in ("old", "fresh", "live", "x"))
+            for path in (old, fresh, live):
+                path.mkdir()
+            Path(root, "unrelated").mkdir()
+            listener = socket.socket(socket.AF_UNIX)
+            self.addCleanup(listener.close)
+            listener.bind(str(live / "m"))
+            listener.listen()
+            ancient = time.time() - 3600
+            for path in (old, live):
+                os.utime(path, (ancient, ancient))
+            offload.sweep_connections(root)
+            self.assertEqual(sorted(path.name for path in Path(root).iterdir()),
+                             ["cof-ssh-fresh", "cof-ssh-live", "unrelated"])
+
+
 class ThisHost(unittest.TestCase):
+    def test_where_builds_go_is_a_status_failure_cannot_give(self):
+        script = str(ROOT / "scripts/cargo-offload")
+        here = subprocess.run([script, "--host"], capture_output=True, text=True,
+                              env=os.environ | {"CAGENTS_BUILD_REMOTE": "local"})
+        self.assertEqual(here.returncode, offload.FALL_BACK)
+        self.assertNotIn(here.returncode, (0, 1))
+
+
     def test_this_hosts_names_and_addresses_build_here(self):
         self.assertTrue(offload.is_this_host(socket.gethostname()))
         self.assertTrue(offload.is_this_host("localhost"))
@@ -445,7 +479,12 @@ class StandInHost(unittest.TestCase):
             if not key.startswith(("CAGENTS_BUILD_", "CARGO_BUILD_"))
         } | {
             "PATH": f"{tools}:{os.environ['PATH']}",
-            "STAND_IN_HOST_PATH": os.environ["PATH"],
+            # A build host's `cargo` is rustup's, as fw16's is, rather than
+            # whatever wraps it first on this host's PATH: mise's shim, for
+            # one, raises the open-file limit the build is meant to keep.
+            "STAND_IN_HOST_PATH": os.pathsep.join([
+                os.path.join(os.environ.get("CARGO_HOME", str(home / ".cargo")), "bin"),
+                os.environ["PATH"]]),
             "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
             "CAGENTS_BUILD_REMOTE": "stand-in",
             "CAGENTS_BUILD_REMOTE_SLOTS": "2",
@@ -532,8 +571,12 @@ class StandInHost(unittest.TestCase):
         self.assertEqual(self.gate_run("build", env=env).returncode, 0)
         # A slot copied the old way: its copy now matches this checkout, with
         # this checkout's older time, but its build is of the other sources.
+        # A gate from before copied this checkout's file with its own older
+        # time into the slot and built nothing new; its lease wrote the
+        # owner.
         slot = self.host_home / ".cache/cagents-offload/crate/slot-0"
-        (slot / "synced-by-content").unlink(missing_ok=True)
+        self.assertTrue((slot / "synced-by-content").is_file())
+        (slot / "owner").write_text("older-gate\n")
         old = time.time() - 3600
         for copy in (main, slot / "src/src/main.rs"):
             copy.write_text(original)
@@ -542,6 +585,22 @@ class StandInHost(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout), (0, "probe\n"), result.stderr)
         result = self.gate_run("build", env=env)
         self.assertNotIn("Compiling", result.stderr)
+
+    def test_a_programs_own_status_is_never_taken_for_building_here(self):
+        # 75 is EX_TEMPFAIL, and also how cargo-offload says this host builds.
+        (self.crate / "src/main.rs").write_text("fn main() { std::process::exit(75); }\n")
+        result = self.gate_run("run", "--quiet", env=self.remote_env())
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertFalse((self.root / "local-build").exists())
+        self.assertEqual(list(Path(self.env["XDG_RUNTIME_DIR"]).glob("cof-ssh-*")), [])
+
+    def test_a_gate_without_its_offload_helper_does_not_build_here(self):
+        (self.root / "tools/cargo-offload").unlink()
+        result = self.gate_run("build", env=self.remote_env())
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("cargo-offload is missing", result.stderr)
+        self.assertIn("CAGENTS_BUILD_REMOTE=local", result.stderr)
+        self.assertFalse((self.root / "local-build").exists())
 
     def test_run_builds_there_and_runs_the_program_here(self):
         (self.crate / "src/main.rs").write_text(textwrap.dedent("""
@@ -645,7 +704,8 @@ class StandInHost(unittest.TestCase):
         result = self.gate_run(
             "exec", "sh", "-ec",
             "cargo build --bin probe; cargo metadata --format-version 1 >/dev/null; "
-            "command -v cargo", env=self.remote_env())
+            "cargo --help | grep -q 'Rust.s package manager'; command -v cargo",
+            env=self.remote_env())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(result.stdout.strip().endswith("/cargo"))
         self.assertNotIn(os.path.dirname(shutil.which("cargo")), result.stdout)
@@ -655,6 +715,32 @@ class StandInHost(unittest.TestCase):
         self.assertFalse((self.root / "local-build").exists())
         # Its shim is gone afterwards.
         self.assertFalse(Path(result.stdout.strip()).exists())
+
+    def test_cargo_in_an_exec_command_reaches_cargo_through_a_wrapper(self):
+        # Like mise's shim, the wrapper runs the next `cargo` on PATH after its
+        # own directory, which inside the command is the gate's shim.
+        wrappers = self.root / "wrappers"
+        wrappers.mkdir()
+        (wrappers / "cargo").write_text(textwrap.dedent("""\
+            #!/bin/sh
+            here=$(dirname "$0")
+            IFS=:
+            for entry in $PATH; do
+                [ "$entry" != "$here" ] && [ -x "$entry/cargo" ] && exec "$entry/cargo" "$@"
+            done
+            exit 127
+        """))
+        (wrappers / "cargo").chmod(0o755)
+        env = self.remote_env()
+        # Rustup's Cargo follows the wrapper, ahead of any wrapper of this
+        # host's own, which would look for the next `cargo` the same way.
+        env["PATH"] = os.pathsep.join(
+            [str(wrappers), os.path.join(env["CARGO_HOME"], "bin"), env["PATH"]])
+        result = self.gate_run("exec", "sh", "-ec", "cargo build --bin probe",
+                               env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.crate / "target/debug/probe").is_file())
+        self.assertFalse((self.root / "local-build").exists())
 
     def test_documentation_opens_here(self):
         (self.crate / "src/lib.rs").write_text("//! Probe documentation.\n")
@@ -736,9 +822,18 @@ class StandInHost(unittest.TestCase):
                 println!("cargo:rerun-if-changed=build.rs");
             }
         """))
+        # Like mise's shim, the interpreter cargo-offload runs under raises
+        # the limit for itself; the build still gets the caller's.
+        wrappers = self.root / "wrappers"
+        wrappers.mkdir()
+        (wrappers / "python3").write_text(
+            f"#!/bin/sh\nulimit -Sn 1024\nexec '{sys.executable}' \"$@\"\n")
+        (wrappers / "python3").chmod(0o755)
+        env = self.remote_env()
+        env["PATH"] = f"{wrappers}:{env['PATH']}"
         hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
         result = subprocess.run(
-            [str(self.gate), "check"], cwd=self.crate, env=self.remote_env(),
+            [str(self.gate), "check"], cwd=self.crate, env=env,
             capture_output=True, text=True, timeout=120,
             preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (512, hard)))
         self.assertEqual(result.returncode, 0, result.stderr)

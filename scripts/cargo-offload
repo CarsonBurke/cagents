@@ -263,6 +263,12 @@ def rewrite(value, mappings):
         for remote, local in mappings:
             if value == remote or value.startswith(remote + "/"):
                 return local + value[len(remote):]
+        # Search paths a build script gives, such as `native=/path`.
+        kind, mark, path = value.partition("=")
+        if mark and path.startswith("/") and kind.isidentifier():
+            changed = rewrite(path, mappings)
+            if changed != path:
+                return kind + mark + changed
         return value
     if isinstance(value, list):
         return [rewrite(item, mappings) for item in value]
@@ -443,9 +449,22 @@ def resolve(name, found):
 
 
 def real_cargo(environment):
-    """This host's Cargo, rather than the gate's `cargo` shim, which leads
-    back here."""
+    """This host's Cargo: the first on PATH, from which the gate has taken an
+    `exec` command's `cargo` shim, unless CAGENTS_BUILD_CARGO names one."""
     return environment.get("CAGENTS_BUILD_CARGO") or "cargo"
+
+
+def open_files(environment):
+    """The soft open-file limit the build gets: the caller's, as the gate
+    measured it, or this process's when run without the gate. -1 is
+    unlimited, which the build host reads as its hard limit."""
+    given = environment.get("CAGENTS_BUILD_OPEN_FILES", "").strip()
+    if given == "unlimited":
+        return -1
+    if given.isdigit():
+        return int(given)
+    soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    return -1 if soft == resource.RLIM_INFINITY else soft
 
 
 # Runs on the build host as `python3 -c REMOTE_AGENT COMMAND ...`. Every
@@ -747,12 +766,25 @@ if command == "lease":
         if free() < floor:
             say("refuse", free() // 2**30, sys.argv[5])
             sys.exit(0)
+    # Gates from before copies were compared by content keep each file's
+    # time from the calling host, under which the slot can hold a build of
+    # other sources than its copy has. They lease the slot without this
+    # marker, which records when this kind of gate last wrote the owner: when
+    # it is missing or another lease wrote the owner since, every source file
+    # is new to Cargo once.
+    owner = os.path.join(slot, "owner")
     marker = os.path.join(slot, "synced-by-content")
-    if not os.path.exists(marker):
-        # Copies used to keep each file's time from the calling host, under
-        # which a slot can hold a build of other sources than its copy has.
-        # Every source file is new to Cargo once; later copies are compared
-        # by content.
+    def stamp():
+        try:
+            return str(os.stat(owner).st_mtime_ns)
+        except OSError:
+            return ""
+    try:
+        with open(marker) as file:
+            current = file.read().strip() == stamp() != ""
+    except OSError:
+        current = False
+    if not current:
         now = time.time()
         for directory, names, files in os.walk(os.path.join(slot, "src")):
             names[:] = [name for name in names if name != "target"]
@@ -761,9 +793,10 @@ if command == "lease":
                     os.utime(os.path.join(directory, name), (now, now), follow_symlinks=False)
                 except OSError:
                     pass
-        open(marker, "w").close()
-    with open(os.path.join(slot, "owner"), "w") as file:
+    with open(owner, "w") as file:
         file.write(key + "\n")
+    with open(marker, "w") as file:
+        file.write(stamp() + "\n")
     # Files a command's settings name on the calling host, copied in beside
     # the checkout: from the checkout's ignored files, or its target.
     for kind in ("checkout", "target"):
@@ -936,6 +969,33 @@ BOOTSTRAP = ("'import base64, json, sys; code, sys.argv[1:] = "
              "json.loads(base64.b64decode(sys.argv[1])); exec(compile(code, \"cargo-offload\", \"exec\"))'")
 
 
+def sweep_connections(directory, age=120):
+    """Removes the connection directories of builds that were killed before
+    they could: older than `age` seconds, with no connection listening."""
+    try:
+        names = [name for name in os.listdir(directory) if name.startswith("cof-ssh-")]
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(directory, name)
+        try:
+            status = os.lstat(path)
+        except OSError:
+            continue
+        if (not os.path.isdir(path) or os.path.islink(path) or status.st_uid != os.getuid()
+                or time.time() - status.st_mtime < age):
+            continue
+        probe = socket.socket(socket.AF_UNIX)
+        try:
+            probe.connect(os.path.join(path, "m"))
+            continue  # A build's connection is still open.
+        except OSError:
+            pass
+        finally:
+            probe.close()
+        shutil.rmtree(path, ignore_errors=True)
+
+
 class Offload:
     def __init__(self, host, plan, environment):
         self.host = host
@@ -1029,6 +1089,8 @@ class Offload:
         repository = Path(common).parent.name or Path(top).name
         base = f"~/.cache/cagents-offload/{repository}"
 
+        if self.cancelled:
+            return 128 + self.cancelled
         self.share_connection()
         try:
             status, slot = self.lease_slot(base, top)
@@ -1058,6 +1120,7 @@ class Offload:
         runtime = self.environment.get("XDG_RUNTIME_DIR") or ""
         if not os.path.isdir(runtime):
             runtime = None
+        sweep_connections(runtime or tempfile.gettempdir())
         try:
             self.control = tempfile.mkdtemp(prefix="cof-ssh-", dir=runtime)
         except OSError:
@@ -1301,7 +1364,7 @@ class Offload:
         )
         try:
             request = {"environment": environment,
-                       "open_files": resource.getrlimit(resource.RLIMIT_NOFILE)[0],
+                       "open_files": open_files(self.environment),
                        "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1"}
             if plan.captures:
                 request["directories"] = [arg for value in configs for arg in ("--config", value)]
@@ -1359,7 +1422,11 @@ class Offload:
         if status:
             return status
         if plan.subcommand in ("doc", "rustdoc"):
-            for triple in [""] + [value for value in plan.values("--target")]:
+            # A target given by its specification file builds into a
+            # directory named for the file.
+            for triple in [""] + [
+                    os.path.splitext(os.path.basename(value))[0] if value.endswith(".json") else value
+                    for value in plan.values("--target")]:
                 back = back or self.fetch(
                     os.path.join(remote_target, triple, "doc") + "/",
                     os.path.join(local_target, triple, "doc") + "/", shell, delete=True,
@@ -1409,7 +1476,7 @@ class Offload:
             destination = os.path.join(slot, "inputs", kind)
             shell = " ".join(shlex.quote(word) for word in self.ssh)
             status = self.spawn(
-                ["rsync", "-a", "-z", "-R", f"--link-dest={link}", "-e", shell,
+                ["rsync", "-a", "--modify-window=-1", "-z", "-R", f"--link-dest={link}", "-e", shell,
                  f"{base}/./{relative}", f"{self.host}:{destination}/"]).wait()
             if self.cancelled:
                 raise Refusal("cancelled")
@@ -1421,8 +1488,10 @@ class Offload:
 
     def fetch(self, remote, local, shell, *, files=None, delete=False, missing_ok=False):
         """Copies `remote` from the build host into `local`: the listed
-        files, or the whole directory. Returns rsync's status."""
-        command = ["rsync", "-a", "-z", "-e", shell]
+        files, or the whole directory. Returns rsync's status. Times are
+        compared to the nanosecond: an executable rebuilt within the second
+        is often the same size."""
+        command = ["rsync", "-a", "--modify-window=-1", "-z", "-e", shell]
         if delete:
             command.append("--delete")
         if files is not None:
@@ -1494,6 +1563,10 @@ class Offload:
         environment["CARGO"] = shutil.which(real_cargo(self.environment)) or environment.get("CARGO", "")
         sys.stdout.flush()
         sys.stderr.flush()
+        # The program replaces this process, and with it the cleanup at the
+        # end of the build.
+        self.lease.stdin.close()
+        self.close_connection()
         try:
             os.execve(executable, [executable, *self.plan.program], environment)
         except OSError as error:
@@ -1590,10 +1663,10 @@ def main(arguments):
     host = environment.get("CAGENTS_BUILD_REMOTE", "fw16")
     here = host in ("", "local") or is_this_host(host)
     if arguments[:1] == ["--host"]:
-        # Where builds go, for callers choosing between one gated command
-        # per build and one slot for several.
+        # Where builds go: 0, printing the build host, or FALL_BACK when
+        # this host builds. Any other status is a failure.
         if here:
-            return 1
+            return FALL_BACK
         print(host)
         return 0
     if here:

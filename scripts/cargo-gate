@@ -16,7 +16,8 @@ set -eu
 # builds.
 gate_version=2
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
-if [ -n "$installed" ] && [ -x "$installed" ] && ! [ "$installed" -ef "$0" ]; then
+if [ -n "$installed" ] && [ -x "$installed" ] &&
+    [ "$(readlink -f -- "$installed")" != "$(readlink -f -- "$0")" ]; then
     theirs=$(sed -n 's/^gate_version=\([0-9][0-9]*\)$/\1/p' "$installed" 2>/dev/null | head -n 1)
     if [ "${theirs:-0}" -gt "$gate_version" ]; then
         exec "$installed" "$@"
@@ -115,12 +116,31 @@ EOF
 }
 
 [ "$#" -gt 0 ] || { usage >&2; exit 2; }
+# Entered from an `exec` command's `cargo` shim: what this gate runs finds
+# this host's Cargo on PATH as it would without the shim. A wrapper such as
+# mise's shim looks for the next `cargo` on PATH, which would otherwise be
+# the shim again, leading back here without end.
+if [ -n "${CAGENTS_BUILD_EXEC_SHIMS-}" ]; then
+    rest=$PATH:
+    PATH=
+    separator=
+    while [ -n "$rest" ]; do
+        entry=${rest%%:*}
+        rest=${rest#*:}
+        if [ "$entry" != "$CAGENTS_BUILD_EXEC_SHIMS" ]; then
+            PATH=$PATH$separator$entry
+            separator=:
+        fi
+    done
+    export PATH
+fi
+named=false
 case $1 in
     -h|--help) usage; exit 0 ;;
-    cargo) shift ;;
+    cargo) shift; named=true ;;
 esac
 [ "$#" -gt 0 ] || fail 'missing Cargo subcommand'
-if [ "$1" = exec ]; then
+if [ "$1" = exec ] && [ "$named" = false ]; then
     shift
     [ "$#" -gt 0 ] || fail 'missing command for exec'
     mode=exec
@@ -642,12 +662,26 @@ started_by_flock() {
     return 1
 }
 # Rust compiles on the build host when there is one, whether or not this
-# command is inside a slot here; scripts/cargo-offload exits 75 when this is
-# the build host, or CAGENTS_BUILD_REMOTE is `local`. Its wait for that host
-# spends the admission budget; the build there does not.
+# command is inside a slot here. `scripts/cargo-offload --host` exits 0 when
+# there is one, and 75 when this is the build host or CAGENTS_BUILD_REMOTE is
+# `local`; anything else is a failure, never a reason to build here. Its wait
+# for that host spends the admission budget; the build there does not.
 cargo=${CAGENTS_BUILD_CARGO:-cargo}
 offload=$(dirname "$0")/cargo-offload
 if [ -x "$offload" ]; then
+    where=0
+    "$offload" --host >/dev/null || where=$?
+elif [ "${CAGENTS_BUILD_REMOTE-}" = local ]; then
+    where=75
+else
+    fail "$offload is missing, and Rust compiles only on the build host; reinstall the gate, or set CAGENTS_BUILD_REMOTE=local to build here instead"
+fi
+case $where in
+    0) ;;
+    75) ;;
+    *) fail "$offload could not tell where Rust compiles (status $where)" ;;
+esac
+if [ "$where" -eq 0 ]; then
     deadline=
     if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
         deadline=$(python3 "$(dirname "$0")/cargo-gate-command.py" \
@@ -655,31 +689,35 @@ if [ -x "$offload" ]; then
     fi
     admission_deadline=
     if [ "$mode" = cargo ]; then
+        # Its status is the command's, whatever it is: `cargo run` exits
+        # with the program's.
         status=0
         # The build host admits the build by the memory it is expected to
-        # need, as this host would.
+        # need, as this host would, and gives it the caller's open-file
+        # limit, measured here: an interpreter wrapper such as mise's raises
+        # its own before cargo-offload could read it.
         supervised '' env CAGENTS_BUILD_ADMISSION_DEADLINE="$deadline" \
-            CAGENTS_BUILD_EXPECTED_KIB="$(expected_cost "$@")" "$offload" "$@" || status=$?
-        [ "$status" -eq 75 ] || exit "$status"
-    elif "$offload" --host >/dev/null 2>&1; then
-        # Each Cargo command in COMMAND goes through this gate: nothing here
-        # holds a slot while they build there. The shim reaches this gate by
-        # its own path, and the gate reaches this host's Cargo, not the shim.
-        self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
-        CAGENTS_BUILD_CARGO=${CAGENTS_BUILD_CARGO:-$(command -v cargo)} ||
-            fail 'cannot find cargo'
-        export CAGENTS_BUILD_CARGO
-        shims=$(mktemp -d "${TMPDIR:-/tmp}/cagents-cargo-shim.XXXXXX")
-        quoted=$(printf '%s' "$self" | sed "s/'/'\\\\''/g")
-        printf "#!/bin/sh\nexec '%s' \"\$@\"\n" "$quoted" >"$shims/cargo"
-        chmod 755 "$shims/cargo"
-        PATH=$shims:$PATH
-        export PATH
-        status=0
-        supervised '' "$@" || status=$?
-        rm -rf -- "$shims"
+            CAGENTS_BUILD_EXPECTED_KIB="$(expected_cost "$@")" \
+            CAGENTS_BUILD_OPEN_FILES="$(ulimit -Sn)" "$offload" "$@" || status=$?
         exit "$status"
     fi
+    # Each Cargo command in COMMAND goes through this gate, with its own
+    # admission budget: nothing here holds a slot while they build there.
+    # The shim reaches this gate by its own path, naming Cargo so that
+    # `cargo --help` is Cargo's; the gate takes the shim off PATH again, so
+    # it reaches this host's Cargo.
+    self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+    shims=$(mktemp -d "${TMPDIR:-/tmp}/cagents-cargo-shim.XXXXXX")
+    quoted=$(printf '%s' "$self" | sed "s/'/'\\\\''/g")
+    printf "#!/bin/sh\nexec '%s' cargo \"\$@\"\n" "$quoted" >"$shims/cargo"
+    chmod 755 "$shims/cargo"
+    CAGENTS_BUILD_EXEC_SHIMS=$shims
+    PATH=$shims:$PATH
+    export CAGENTS_BUILD_EXEC_SHIMS PATH
+    status=0
+    supervised '' "$@" || status=$?
+    rm -rf -- "$shims"
+    exit "$status"
 fi
 
 # Building here. Already inside a slot: a gated command running Cargo again,

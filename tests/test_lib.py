@@ -184,7 +184,7 @@ class TestLib(unittest.TestCase):
             "CAGENTS_BUILD_LOCK": str(self.lock), "CAGENTS_BUILD_SLOTS": "1",
             "CAGENTS_BUILD_SEED": "0", "CAGENTS_BUILD_FREE_FLOOR_GIB": "0",
             "CARGO_BUILD_JOBS": "1", "TEST_ROOT": str(self.root),
-            "CAGENTS_BUILD_INSTALLED_GATE": "",
+            "CAGENTS_BUILD_INSTALLED_GATE": "", "CAGENTS_BUILD_REMOTE": "local",
             "TMPDIR": str(self.root / "tmp"), "LC_ALL": "C",
         }
         self.configure()

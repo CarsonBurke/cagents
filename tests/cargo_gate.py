@@ -269,8 +269,9 @@ class HeldCommand(unittest.TestCase):
             "CAGENTS_BUILD_LOCK": str(self.lock),
             "CAGENTS_BUILD_SLOTS": "1",
             "CARGO_BUILD_JOBS": "1",
-            # This copy of the gate, not a newer installed one.
+            # This copy of the gate, not a newer installed one, building here.
             "CAGENTS_BUILD_INSTALLED_GATE": "",
+            "CAGENTS_BUILD_REMOTE": "local",
         }
         self.env.pop("CAGENTS_BUILD_SLOT_HELD", None)
         self.children = []
@@ -835,6 +836,7 @@ class PreflightCancellation(unittest.TestCase):
             "CAGENTS_BUILD_LOCK": str(self.lock), "CAGENTS_BUILD_SLOTS": "1",
             "CARGO_BUILD_JOBS": "1", "FIXTURE_ROOT": str(self.root),
             "TMPDIR": str(self.root / "tmp"), "LC_ALL": "C",
+            "CAGENTS_BUILD_REMOTE": "local", "CAGENTS_BUILD_INSTALLED_GATE": "",
         }
         self.children = []
         self.descendants = []
@@ -1008,7 +1010,8 @@ class TwoSlots(unittest.TestCase):
             key: value for key, value in os.environ.items()
             if not key.startswith("CAGENTS_BUILD_") and key != "CARGO_BUILD_JOBS"
         } | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_SLOTS": "2",
-              "CAGENTS_BUILD_CPU_PRESSURE": "0"}
+              "CAGENTS_BUILD_CPU_PRESSURE": "0", "CAGENTS_BUILD_REMOTE": "local",
+              "CAGENTS_BUILD_INSTALLED_GATE": ""}
 
     def hold(self, cost):
         holder = subprocess.Popen(
@@ -1501,6 +1504,7 @@ class CpuPressureAdmission(TwoSlots):
             "CAGENTS_BUILD_CPU_SETTLE_SECS": "60",
             "CAGENTS_BUILD_CPU_PRESSURE_FILE": str(self.pressure),
             "CAGENTS_BUILD_COST_GIB": "7", "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1",
+            "CAGENTS_BUILD_REMOTE": "local", "CAGENTS_BUILD_INSTALLED_GATE": "",
         }
         now = self.uptime()
         dates = {"future":now + 10**6, "fresh":now, "old":now - 600}
