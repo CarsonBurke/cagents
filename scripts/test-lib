@@ -24,7 +24,7 @@ def refuse(message):
 def outside_admission():
     if os.environ.get("CAGENTS_BUILD_SLOT_HELD"):
         refuse("run outside cargo-gate exec or any enclosing build admission")
-    base = Path(os.environ.get("CAGENTS_BUILD_LOCK", "/var/tmp/cagents-cargo.lock"))
+    base = Path(os.environ.get("CAGENTS_BUILD_LOCK") or "/var/tmp/cagents-cargo.lock")
     paths = [base, *(path for path in base.parent.glob(base.name + ".*")
                      if path.name[len(base.name) + 1:].isdecimal())]
     locks = set()

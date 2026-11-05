@@ -398,6 +398,28 @@ class TestLib(unittest.TestCase):
         self.assertIn("inherited descriptor holds build admission", result.stderr)
         self.assertEqual(self.events(), [])
 
+    def test_empty_or_unset_lock_uses_the_same_default_as_the_gate(self):
+        # Remap both copied tools' default to a fixture-owned path: never
+        # inspect or acquire the host's default admission for this regression.
+        for name in ("test-lib", "cargo-gate"):
+            path = self.root / "scripts" / name
+            source = path.read_text()
+            self.assertIn("/var/tmp/cagents-cargo.lock", source)
+            path.write_text(source.replace("/var/tmp/cagents-cargo.lock", str(self.lock)))
+        for value in ("", None):
+            with self.subTest(value=value), self.lock.open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                environment = self.env.copy()
+                if value is None:
+                    environment.pop("CAGENTS_BUILD_LOCK")
+                else:
+                    environment["CAGENTS_BUILD_LOCK"] = value
+                result = self.invoke("cli", "module::one", pass_fds=(lock.fileno(),),
+                                     env=environment)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("inherited descriptor holds build admission", result.stderr)
+            self.assertEqual(self.events(), [])
+
     def test_unrelated_holder_is_waited_for_instead_of_falsely_refused(self):
         with self.lock.open("a") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX)
