@@ -21031,6 +21031,7 @@ mod tests {
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
         let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
         let runtime = RepositoryRuntime::post_persist_warning_fixture(card);
         assert!(runtime.is_dirty(), "the buffer has edited back from B to A");
         assert!(runtime.has_durability_warning());
@@ -23237,6 +23238,7 @@ mod tests {
             CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(second))),
         );
         let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
 
         let _ = app.update(Message::WindowCloseRequested(window));
         let _ = app.update(Message::DiscardAndCloseRepository(first));
