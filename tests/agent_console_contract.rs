@@ -322,8 +322,10 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     let waiting = fixture.wait(&["agent", "wait", first_run, "--timeout", "10"], 5);
     assert_eq!(waiting["run"]["state"], "Waiting", "{waiting}");
     let terminal = waiting["agent"]["console"]["id"].as_str().unwrap();
-    // PTY snapshots can split the heading from its following instructions.
-    // Wait for the actionable line before asserting the complete request.
+    // Wait for the actionable line that ends the console's request block. The
+    // pretty request nearly fills the 24-row screen, so a run status line
+    // printed after it can scroll the block's heading off. Assert the action
+    // IDs the instruction refers to, which stay on screen beside it.
     let displayed = fixture.cli(&[
         "terminal",
         "wait",
@@ -333,12 +335,10 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
         "--timeout",
         "10",
     ]);
-    assert!(
-        displayed["snapshot"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Input requested")
-    );
+    let screen = displayed["snapshot"]["text"].as_str().unwrap();
+    for action in ["\"id\": \"allow\"", "\"id\": \"deny\""] {
+        assert!(screen.contains(action), "{action} in {displayed}");
+    }
     fixture.cli(&[
         "terminal",
         "write",
