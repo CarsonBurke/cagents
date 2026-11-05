@@ -312,17 +312,23 @@ impl Cagents {
                 }
             }
         }
-        // Nothing was lost once any name or width it carried is on its way again
-        // or already there, so there is nothing to tell anyone about.
+        // Nothing was lost once any name or width it changed is on its way again
+        // or already there, so there is nothing to tell anyone about. A field it
+        // did not change may have moved on since, as a suggested title does.
         let already_applied = session_already_applied
             && (retry.is_some()
-                || matches!(&change, Change::Update { pane, .. }
+                || matches!(&change, Change::Update { before, pane }
                     if self
                         .workspace_model
                         .views
                         .iter()
                         .flat_map(|view| &view.panes)
-                        .any(|current| current == pane)));
+                        .any(|current| current.id == pane.id
+                            && (before.title == pane.title || current.title == pane.title)
+                            && (before.user_title == pane.user_title
+                                || current.user_title == pane.user_title)
+                            && (before.width_fraction == pane.width_fraction
+                                || current.width_fraction == pane.width_fraction))));
         if already_applied {
             tracing::debug!(?scope, %operation, %error, "pane session update lost to an identical one");
         } else {

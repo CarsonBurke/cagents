@@ -550,6 +550,15 @@ fn losing_a_start_to_another_window_attaches_once_the_save_has_answered() {
 }
 
 fn session_update(peer: &mut Peer, publish: chat::Session, current: chat::Session) -> uuid::Uuid {
+    session_update_under_title(peer, publish, current, "Shared")
+}
+
+fn session_update_under_title(
+    peer: &mut Peer,
+    publish: chat::Session,
+    current: chat::Session,
+    current_title: &str,
+) -> uuid::Uuid {
     let pane = |kind| Pane {
         id: peer.card,
         title: "Shared".into(),
@@ -576,7 +585,10 @@ fn session_update(peer: &mut Peer, publish: chat::Session, current: chat::Sessio
         .find(|view| view.scope == scope)
         .unwrap();
     view.revision += 1;
-    view.panes = vec![pane(CardKind::Chat(current))];
+    view.panes = vec![Pane {
+        title: current_title.into(),
+        ..pane(CardKind::Chat(current))
+    }];
     model.sequence += 1;
     drop(peer.app.refuse_conflicting_view_update(
         scope,
@@ -647,6 +659,23 @@ fn what_this_window_wrote_is_in_the_composer_once_attached() {
     assert!(!runtime.is_draft());
     assert_eq!(runtime.unsent_text(), "not sent yet");
     assert!(!peer.app.chat_ui.drafts.contains_key(&peer.card));
+}
+
+/// The first send names the conversation while each window's session update is
+/// on its way. The update never changed the name, so losing it loses nothing.
+#[test]
+fn losing_a_race_after_the_conversation_was_named_stays_quiet() {
+    let mut peer = peer();
+    let accepted = started(&peer.draft);
+
+    session_update_under_title(
+        &mut peer,
+        accepted.clone(),
+        accepted,
+        "Summarize the release checklist",
+    );
+
+    assert!(!warned_of_refused_update(&peer));
 }
 
 /// A refused edit that changed no session can be a lost name or width, so it
