@@ -413,6 +413,8 @@ impl Action {
         matches!(
             self,
             Self::Ready(..)
+                | Self::DraftSkills(..)
+                | Self::SessionLinkOpened(..)
                 | Self::DraftStartCheckpointed(..)
                 | Self::FindAvailable
                 | Self::FindGroups(..)
@@ -6689,8 +6691,7 @@ impl Cagents {
         snapshot.permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
         let target = self.chat_ui.next_target(card);
-        let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible)
-            && self.workspace_surfaces_visible();
+        let visible = self.chat_card_is_painted(card);
         let mut runtime = Runtime::draft(
             target,
             session,
@@ -7561,8 +7562,7 @@ impl Cagents {
             runtime.capacity_refused = false;
         }
         let selection = None;
-        let initially_visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible)
-            && self.workspace_surfaces_visible();
+        let initially_visible = self.chat_card_is_painted(card);
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
             card,
@@ -8922,7 +8922,7 @@ impl Cagents {
                     return Task::none();
                 }
                 if let Some(mut runtime) = self.chat_ui.parked.remove(&card) {
-                    runtime.show(true);
+                    runtime.show(self.chat_card_is_painted(card));
                     runtime.refresh();
                     let session = runtime.session.clone();
                     if let Some(CardRuntime::Terminal(terminal)) =
@@ -9366,9 +9366,7 @@ impl Cagents {
                             state: handle.take_activity(),
                         };
                         handle.take_observed();
-                        let visible = self.workspace.visibility(target.card)
-                            == Some(VisibilityClass::Visible)
-                            && self.workspace_surfaces_visible();
+                        let visible = self.chat_card_is_painted(target.card);
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.preparation.clear();
                             if let Some(queued) = &mut runtime.queued {
@@ -28559,6 +28557,8 @@ mod tests {
             "an old account wake must not drain the replacement connection's report queue"
         );
     }
+
+    include!("chat_ui/inspector_paint_tests.rs");
 }
 
 #[cfg(test)]

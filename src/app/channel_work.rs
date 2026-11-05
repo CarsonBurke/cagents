@@ -451,7 +451,7 @@ impl Cagents {
     fn finish_channel_conversations(&mut self) -> Task<Message> {
         self.channel_work.main = false;
         self.channel_work.generation = uuid::Uuid::new_v4();
-        self.set_workspace_surfaces_visible(self.workspace_surfaces_visible());
+        self.set_workspace_surfaces_visible(true);
         if let Some(deferred) = self.channel_work.deferred.take() {
             let Deferred::Navigation {
                 registry,
