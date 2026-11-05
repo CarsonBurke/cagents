@@ -198,7 +198,7 @@ impl RuntimePaths {
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .ok_or(PlatformError::MissingRuntimeDirectory)?;
-        let directory = base.join(instance::RUNTIME_SUBDIRECTORY);
+        let directory = base.join(instance::runtime_subdirectory());
         Ok(Self {
             socket: directory.join(SOCKET_FILE_NAME),
             lock: directory.join("cagentsd.lock"),
@@ -610,6 +610,20 @@ fn restart_target_at(paths: &RuntimePaths) -> Result<RestartTarget, PlatformErro
 
 #[cfg(feature = "ui")]
 impl RestartTarget {
+    /// An inert UI state-machine fixture. The regular file cannot name or
+    /// signal a process; tests must drop restart tasks without polling them.
+    #[cfg(test)]
+    pub(crate) fn inert_for_ui_test() -> Self {
+        Self {
+            process: tempfile::tempfile().expect("inert restart fixture"),
+            proof: HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("inert-ui-test"),
+                boot_id: BootId::new("inert-ui-test"),
+                host_incarnation: crate::model::HostIncarnation::new("inert-ui-test"),
+            },
+        }
+    }
+
     /// Try graceful termination, then finish the same confirmed process if it
     /// cannot respond. The kernel descriptor fences PID reuse throughout.
     pub(crate) fn terminate(&self) -> Result<(), PlatformError> {
@@ -1099,7 +1113,7 @@ mod tests {
         // subprocess, where a blocking regression is bounded and cleaned up
         // through its original pidfd rather than stranding a libtest thread.
         let runtime = tempdir().unwrap();
-        let directory = runtime.path().join(instance::RUNTIME_SUBDIRECTORY);
+        let directory = runtime.path().join(instance::runtime_subdirectory());
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         for name in ["cagentsd.lock", "cagentsd.recovery.lock"] {

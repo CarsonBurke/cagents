@@ -418,13 +418,25 @@ mod tests {
     }
 
     fn assert_pipe_closed(reader: &OwnedFd) {
-        let mut byte = 0_u8;
-        assert_eq!(
-            unsafe { libc::read(reader.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
-            0,
-            "a received write descriptor leaked: {}",
-            io::Error::last_os_error()
-        );
+        // A concurrent test's fork briefly duplicates every descriptor,
+        // close-on-exec or not, until its child execs. Only a write end that
+        // stays open past that window is a leak.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut byte = 0_u8;
+            let read = unsafe { libc::read(reader.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+            let error = io::Error::last_os_error();
+            if read == 0 {
+                return;
+            }
+            assert!(
+                read == -1
+                    && error.kind() == io::ErrorKind::WouldBlock
+                    && Instant::now() < deadline,
+                "a received write descriptor leaked: read {read}: {error}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn raw_send(socket: &UnixStream, bytes: &[u8], descriptors: &[BorrowedFd<'_>]) {
