@@ -515,6 +515,45 @@ scripts/cargo-gate test --locked --no-default-features --features host --test te
 scripts/cargo-gate test --locked --no-default-features --features ui --test session_restore_contract
 ```
 
+The selected IPC source contract can be checked without compiling Rust:
+
+```sh
+scripts/check-protocol-contract
+python3 -I -B tests/protocol_contract.py -v
+scripts/check-protocol-contract --base-ref origin/main
+```
+
+It covers `ClientRequest`, `ServerMessage` and `ServerResponse` in
+`src/terminal/ipc.rs`, `Provider` in `src/agent.rs`, and `Run`, `Summary` and
+`Reply` in `src/agent_execution.rs`. Ordered fields, variants, types, relevant
+attributes and discriminants are recorded as Rust tokens; comments, formatting,
+runtime methods and standard nonserialization derives do not change the record.
+This partial contract covers the parallel protocol-number collisions reported
+in #2119. It is a source guard, not a serializer schema or a wire fingerprint.
+
+When a covered declaration changes, choose a fresh `PROTOCOL_VERSION`, then run
+`scripts/check-protocol-contract --record`. Commit the new
+`tests/fixtures/protocol-contract/<version>.json` alongside the source change.
+Keep old snapshots unchanged. Two branches choosing the same new version add
+the same snapshot path: different contracts cause a Git add/add conflict. After
+combining the source changes, choose another unused version and regenerate its
+snapshot rather than keeping one branch's stale snapshot.
+
+Script CI supplies the PR base or previous main revision from the GitHub event,
+fetching that exact object if the checkout is shallow. The guard refuses changed
+or deleted base snapshots and unbumped selected declarations relative to that
+base, including its first adoption before snapshots existed. A missing base
+fails explicitly. A local check without `--base-ref` confirms the current
+snapshot only; it does not establish historical immutability.
+
+The guard selects by declaration name; it does not resolve modules, imported
+types or aliases, expand macros, evaluate enclosing-module `cfg` or numeric
+expressions, or inspect custom serializers, dependency changes
+and semantic compatibility rules. Changes outside these seven declarations
+still need protocol review and, where applicable, a version bump. Two divergent
+branches cannot detect one another before comparison or merge. The historical
+upgrade inspector's supported-version policy remains a separate decision.
+
 The four named-tree reconciliation contracts share their cases between the root
 UI target and a focused workspace package. For edits confined to vendored
 iced-core tree reconciliation, run the focused package first:
