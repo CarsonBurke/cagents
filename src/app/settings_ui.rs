@@ -412,10 +412,10 @@ fn settings_category_controls<'a>(
                 }),
             );
             let cleanup = setting_field(
-                "Merged worktree cleanup",
-                "Delete clean, inactive GitHub worktrees after their exact current commit is merged. Cleanup waits until hosted processes have ended, preserves branches, and never discards changes.",
+                "Merged worktrees",
+                "Show a notice when a GitHub worktree's pull request is merged, naming uncommitted changes and ignored files such as .env that deleting it would discard. Worktrees are never deleted automatically.",
                 crate::settings_widgets::toggle(
-                    "Delete merged worktrees automatically",
+                    "Notify about merged worktrees",
                     draft.auto_delete_merged_worktrees,
                     |enabled| Message::SettingsChanged {
                         field: SettingsField::AutoDeleteMergedWorktrees,

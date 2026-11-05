@@ -255,6 +255,96 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
     arguments
 }
 
+/// The run whose dispatcher released the agent's gate to wait for its
+/// provider to become ready. Its prompt stays undelivered until that
+/// dispatcher reclaims it, so an interrupt in the meantime withdraws the run
+/// instead of interrupting a turn the provider never started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::host) struct Undelivered {
+    run: RunId,
+    withdrawn: bool,
+}
+
+/// Clears a dispatcher's claim if readiness polling unwinds, so a panic cannot
+/// leave reconciliation waiting on a dispatcher that no longer exists.
+struct ClaimUnwind<'a> {
+    gate: &'a Mutex<Option<Undelivered>>,
+    run: RunId,
+}
+
+impl Drop for ClaimUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.gate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take_if(|claim| claim.run == self.run);
+        }
+    }
+}
+
+/// Cancels the run whose dispatcher is still waiting for the provider, or only
+/// `run` when given. The dispatcher finds its claim withdrawn and submits
+/// nothing. Returns whether such a run existed, including one an earlier
+/// interrupt already withdrew. Requires the agent's gate, whose value
+/// `dispatch` is.
+fn withdraw_undelivered(
+    host: &SharedHost,
+    dispatch: &mut Option<Undelivered>,
+    run: Option<RunId>,
+) -> Result<bool, String> {
+    let Some(claim) = dispatch
+        .as_mut()
+        .filter(|claim| run.is_none_or(|run| claim.run == run))
+    else {
+        return Ok(false);
+    };
+    if !claim.withdrawn {
+        let registry = registry(host)?;
+        claim.withdrawn = true;
+        // A failed write still leaves the claim withdrawn: the dispatcher
+        // then reports this cancellation and finish_failure retries it.
+        if finish_failure_registry(
+            &registry,
+            claim.run,
+            State::Cancelled,
+            UNDELIVERED_CANCELLATION.into(),
+        ) {
+            announce(host, &registry);
+        }
+    }
+    Ok(true)
+}
+
+const UNDELIVERED_CANCELLATION: &str = "Cancelled before the provider received the prompt";
+
+/// Waits, without the agent's gate, until a bound provider can take its
+/// first prompt.
+fn await_provider_ready(handle: &chat::runtime::Handle) -> Result<(), (State, String)> {
+    let before = |message| (State::Failed, message);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let snapshot = provider_launch_snapshot(handle)?;
+        if snapshot.exited || handle.is_completed() {
+            return Err(before("Provider exited before accepting the prompt".into()));
+        }
+        if snapshot.ready {
+            if snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty() {
+                return Err(before(
+                    "The hosted provider is not idle; no additional prompt was submitted".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(before(
+                "Provider did not become ready before the launch deadline".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// An unavailable remote snapshot proves neither provider exit nor safe retry.
 fn provider_launch_snapshot(
     handle: &chat::runtime::Handle,
@@ -277,7 +367,7 @@ fn dispatch(
     let _control = control.read().unwrap_or_else(|p| p.into_inner());
     super::client::ensure_control_open(host).map_err(|error| before(error.message))?;
     let gate = agent_gate(host, accepted.agent.id);
-    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host).map_err(before)?;
     let mut context = Arc::new(chat::protocol::ExecutionContext::new(directory));
     context
@@ -462,32 +552,27 @@ fn dispatch(
         announce(host, &registry);
         (session, handle)
     };
-    // A visible, bound startup may be closed while a provider is initializing.
-    // Reacquire and revalidate before the first external prompt, rather than
-    // making interactive close wait through the whole readiness deadline.
-    drop(_dispatch);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let snapshot = provider_launch_snapshot(&handle)?;
-        if snapshot.exited || handle.is_completed() {
-            return Err(before("Provider exited before accepting the prompt".into()));
-        }
-        if snapshot.ready {
-            if snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty() {
-                return Err(before(
-                    "The hosted provider is not idle; no additional prompt was submitted".into(),
-                ));
-            }
-            break;
-        }
-        if Instant::now() >= deadline {
-            return Err(before(
-                "Provider did not become ready before the launch deadline".into(),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    // A visible, bound startup may be closed or interrupted while a provider
+    // is initializing. Reacquire and revalidate before the first external
+    // prompt, rather than making those wait through the readiness deadline.
+    *dispatch = Some(Undelivered {
+        run: accepted.run.id,
+        withdrawn: false,
+    });
+    drop(dispatch);
+    let ready = {
+        let _unwind = ClaimUnwind {
+            gate: &gate,
+            run: accepted.run.id,
+        };
+        await_provider_ready(&handle)
+    };
+    let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let claim = dispatch.take_if(|claim| claim.run == accepted.run.id);
+    ready?;
+    if claim.is_none_or(|claim| claim.withdrawn) {
+        return Err((State::Cancelled, UNDELIVERED_CANCELLATION.into()));
     }
-    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         if registry.agent(accepted.agent.id).map_err(before)?.closed
@@ -699,7 +784,10 @@ pub(super) fn preflight_retirement(
     result
 }
 
-fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
+/// Serializes an agent's operations. The value is the run whose dispatcher
+/// released the gate to await provider readiness: until that dispatcher
+/// takes it back, the provider has not received the run's prompt.
+fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<Option<Undelivered>>> {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     // A holder or waiter keeps its Arc alive, so pruning cannot split an
     // active agent's serialization. Failed and repeated closes need no
@@ -714,7 +802,7 @@ fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
     {
         return gate;
     }
-    let gate = Arc::new(Mutex::new(()));
+    let gate = Arc::new(Mutex::new(None));
     state.execution_gates.insert(id, Arc::downgrade(&gate));
     gate
 }
@@ -901,6 +989,7 @@ pub(super) fn process(
         }
         Operation::Requests(id) => {
             let (_, _, handle) = owned_provider(host, &authority, id)?;
+            refresh_retained_requests(&handle);
             Ok(Reply::Requests(displayed_requests(&handle)))
         }
         Operation::Control { agent, command } => {
@@ -947,6 +1036,14 @@ fn owned_provider(
     Ok((agent, run, handle))
 }
 
+/// A retained provider reports its run Waiting through the durable outbox,
+/// which can overtake the proxy's cached metadata, so a caller reading a
+/// Waiting run's requests refreshes that metadata first. A failed refresh
+/// leaves the cached requests, which the actor's own pump keeps converging.
+fn refresh_retained_requests(handle: &chat::runtime::Handle) {
+    let _ = handle.refresh_retained_state();
+}
+
 /// Pending requests as a caller may see them: a secret field's prefilled
 /// value is never sent back out of the provider.
 fn displayed_requests(handle: &chat::runtime::Handle) -> Vec<chat::Request> {
@@ -983,7 +1080,7 @@ fn control(
     // agent it does not own.
     status(host, authority, id)?;
     let gate = agent_gate(host, id);
-    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let (_, run, handle) = owned_provider(host, authority, id)?;
     if registry(host)?
         .lock()
@@ -1002,7 +1099,9 @@ fn control(
         Control::Interrupt {
             including_subagents,
         } => {
-            handle.interrupt_owned(Some(run.id), including_subagents)?;
+            if !withdraw_undelivered(host, &mut dispatch, Some(run.id))? {
+                handle.interrupt_owned(Some(run.id), including_subagents)?;
+            }
             None
         }
         Control::Answer {
@@ -1010,6 +1109,7 @@ fn control(
             action,
             answers,
         } => {
+            refresh_retained_requests(&handle);
             let requests = handle.requests();
             let request = requests
                 .iter()
@@ -1322,8 +1422,10 @@ fn console(
             including_subagents,
         } => {
             let gate = agent_gate(host, id);
-            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
-            handle.interrupt_owned(None, including_subagents)?;
+            let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            if !withdraw_undelivered(host, &mut dispatch, None)? {
+                handle.interrupt_owned(None, including_subagents)?;
+            }
             registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
