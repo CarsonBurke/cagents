@@ -1,15 +1,41 @@
+use cagents::process::{
+    CancellationToken, CommandSpec, ProcessExecutor, ProcessOutput, SystemProcessExecutor,
+};
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::Write,
     os::unix::fs::PermissionsExt,
     path::Path,
-    process::{Command, Output, Stdio},
+    process::{Command, Stdio},
+    time::Duration,
 };
 
 const ISSUE_ID: &str = "2b498c52-7dc7-4c76-ad59-dfc488c40111";
 const TEAM_ID: &str = "2b498c52-7dc7-4c76-ad59-dfc488c40222";
 const KEY: &str = "fixture-linear-secret";
+// Let the production keyring's 15-second deadline report its own error before
+// this independent guard terminates a stuck CLI and its process group.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(22);
+const OUTPUT_LIMIT: usize = 1024 * 1024;
+
+fn isolated(mut command: CommandSpec) -> CommandSpec {
+    // Keep the invoking agent's authority unchanged while excluding host tools,
+    // credentials, Git overrides and configuration from private fixtures.
+    for (name, _) in std::env::vars_os() {
+        if name != std::ffi::OsStr::new(cagents::agent_execution::AUTHORITY_ENV) {
+            command = command.env_remove(name);
+        }
+    }
+    command
+        .timeout(COMMAND_TIMEOUT)
+        .output_limits(OUTPUT_LIMIT, OUTPUT_LIMIT)
+}
+
+fn capture(command: CommandSpec) -> ProcessOutput {
+    SystemProcessExecutor
+        .execute(&command, &CancellationToken::new())
+        .unwrap_or_else(|error| panic!("bounded fixture process failed: {error:?}"))
+}
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -34,12 +60,17 @@ impl Fixture {
         fs::write(&keyring, "#!/bin/sh\nexit 1\n").unwrap();
         fs::set_permissions(&keyring, fs::Permissions::from_mode(0o700)).unwrap();
         let f = Self { root };
-        let output = Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(f.path())
-            .output()
-            .unwrap();
-        assert!(output.status.success());
+        let output = capture(
+            isolated(CommandSpec::new("git"))
+                .args(["init", "-q", "--template="])
+                .cwd(f.path())
+                .env("HOME", f.path())
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1"),
+        );
+        assert!(output.success, "{output:?}");
         f.read(json!({"issue":{
             "id": ISSUE_ID,"identifier":"ENG-12","title":"Fixture issue","description":"Body",
             "team":{"id":TEAM_ID,"key":"ENG"}, "state":{"id":TEAM_ID,"name":"In Progress","type":"started"},
@@ -66,9 +97,8 @@ impl Fixture {
         )
         .unwrap();
     }
-    fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_cagents"));
-        c.env_clear()
+    fn command(&self, args: &[&str]) -> CommandSpec {
+        isolated(CommandSpec::new(env!("CARGO_BIN_EXE_cagents")))
             .env("HOME", self.path())
             .env(
                 "PATH",
@@ -77,18 +107,26 @@ impl Fixture {
             .env("LINEAR_FIXTURE", self.path())
             .env("LINEAR_API_KEY", KEY)
             .env("CAGENTS_LINEAR_API_KEY_WORK", KEY)
-            .current_dir(self.path())
+            .cwd(self.path())
             .arg("--json")
-            .args(args);
-        c
+            .args(args.iter().copied())
     }
-    fn run(&self, args: &[&str]) -> Output {
-        self.command(args).output().unwrap()
+    fn without_api_key(&self, args: &[&str]) -> CommandSpec {
+        let mut command = self.command(args);
+        // CommandSpec applies removals before explicit overrides. Remove the
+        // fixture override too so these tests really exercise the keyring.
+        command
+            .environment
+            .remove(std::ffi::OsStr::new("LINEAR_API_KEY"));
+        command.env_remove("LINEAR_API_KEY")
+    }
+    fn run(&self, args: &[&str]) -> ProcessOutput {
+        capture(self.command(args))
     }
     fn success(&self, args: &[&str]) -> Value {
         let o = self.run(args);
         assert!(
-            o.status.success(),
+            o.success,
             "{args:?}: {}",
             String::from_utf8_lossy(&o.stderr)
         );
@@ -98,7 +136,7 @@ impl Fixture {
     }
     fn failure(&self, args: &[&str]) -> Value {
         let o = self.run(args);
-        assert!(!o.status.success(), "{args:?}");
+        assert!(!o.success, "{args:?}");
         assert!(!String::from_utf8_lossy(&o.stderr).contains(KEY));
         serde_json::from_slice::<Value>(&o.stderr).unwrap()["error"].clone()
     }
@@ -158,14 +196,13 @@ fn issue_reads_link_current_and_unlink_need_no_daemon() {
 fn inherited_git_overrides_cannot_redirect_worktree_link() {
     let f = Fixture::new();
     let other = Fixture::new();
-    let o = f
-        .command(&["linear", "link", "ENG-12"])
-        .env("GIT_DIR", other.path().join(".git"))
-        .env("GIT_WORK_TREE", other.path())
-        .env("GIT_COMMON_DIR", other.path().join(".git"))
-        .output()
-        .unwrap();
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = capture(
+        f.command(&["linear", "link", "ENG-12"])
+            .env("GIT_DIR", other.path().join(".git"))
+            .env("GIT_WORK_TREE", other.path())
+            .env("GIT_COMMON_DIR", other.path().join(".git")),
+    );
+    assert!(o.success, "{}", String::from_utf8_lossy(&o.stderr));
     assert!(f.path().join(".git/cagents-linear.json").exists());
     assert!(!other.path().join(".git/cagents-linear.json").exists());
 }
@@ -207,12 +244,8 @@ fn setters_use_resolved_ids_and_uncertain_writes_are_single_attempt() {
 #[test]
 fn missing_credentials_and_invalid_inputs_fail_without_network() {
     let f = Fixture::new();
-    let o = f
-        .command(&["linear", "issue", "ENG-12"])
-        .env_remove("LINEAR_API_KEY")
-        .output()
-        .unwrap();
-    assert!(!o.status.success());
+    let o = capture(f.without_api_key(&["linear", "issue", "ENG-12"]));
+    assert!(!o.success);
     assert_eq!(
         serde_json::from_slice::<Value>(&o.stderr).unwrap()["error"]["kind"],
         "linear_auth_required"
@@ -252,8 +285,8 @@ fn create_uncertainty_preserves_uuid_and_selected_workspace() {
 #[test]
 fn comments_accept_multiline_stdin_and_resolved_issue_id() {
     let f = Fixture::new();
-    let mut child = f
-        .command(&[
+    let output = capture(
+        f.command(&[
             "linear",
             "comment",
             "add",
@@ -264,20 +297,10 @@ fn comments_accept_multiline_stdin_and_resolved_issue_id() {
             "--request-id",
             TEAM_ID,
         ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"Done.\n\nPR: https://github.com/org/repo/pull/1\n")
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+        .stdin(b"Done.\n\nPR: https://github.com/org/repo/pull/1\n".to_vec()),
+    );
     assert!(
-        output.status.success(),
+        output.success,
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -364,13 +387,9 @@ fn stored_key_authenticates_without_shell_environment_and_environment_overrides_
     let helper = f.path().join("bin/secret-tool");
     fs::write(&helper, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LINEAR_FIXTURE/keyring-argv\"\nprintf '%s' 'fixture-keyring-secret'\n").unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
-    let output = f
-        .command(&["linear", "issue", "ENG-12"])
-        .env_remove("LINEAR_API_KEY")
-        .output()
-        .unwrap();
+    let output = capture(f.without_api_key(&["linear", "issue", "ENG-12"]));
     assert!(
-        output.status.success(),
+        output.success,
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -435,13 +454,11 @@ fn unavailable_keyring_helper_reports_the_install_and_unlock_action() {
     let f = Fixture::new();
     let missing = f.path().join("missing-bin");
     fs::create_dir(&missing).unwrap();
-    let output = f
-        .command(&["linear", "issue", "ENG-12"])
-        .env_remove("LINEAR_API_KEY")
-        .env("PATH", &missing)
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
+    let output = capture(
+        f.without_api_key(&["linear", "issue", "ENG-12"])
+            .env("PATH", &missing),
+    );
+    assert!(!output.success);
     let error = serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"].clone();
     assert_eq!(error["kind"], "linear_keyring_unavailable");
     assert!(error["message"].as_str().unwrap().contains("secret-tool"));
@@ -458,12 +475,8 @@ fn keyring_lookup_service_failure_preserves_guidance_without_exposing_diagnostic
         "#!/bin/sh\nprintf '%s' 'private-fixture-diagnostic' >&2\nexit 1\n",
     )
     .unwrap();
-    let output = f
-        .command(&["linear", "issue", "ENG-12"])
-        .env_remove("LINEAR_API_KEY")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
+    let output = capture(f.without_api_key(&["linear", "issue", "ENG-12"]));
+    assert!(!output.success);
     let error = serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"].clone();
     assert_eq!(error["kind"], "linear_keyring_unavailable");
     assert!(error["message"].as_str().unwrap().contains("unlock"));
@@ -475,12 +488,8 @@ fn keyring_lookup_service_failure_preserves_guidance_without_exposing_diagnostic
     // Genuine absence retains the normal credential fallback rather than
     // reporting the private service as unavailable.
     fs::write(&helper, "#!/bin/sh\nexit 1\n").unwrap();
-    let missing = f
-        .command(&["linear", "issue", "ENG-12"])
-        .env_remove("LINEAR_API_KEY")
-        .output()
-        .unwrap();
-    assert!(!missing.status.success());
+    let missing = capture(f.without_api_key(&["linear", "issue", "ENG-12"]));
+    assert!(!missing.success);
     let error = serde_json::from_slice::<Value>(&missing.stderr).unwrap()["error"].clone();
     assert_eq!(error["kind"], "linear_auth_required");
     assert_eq!(f.calls(), 0);
@@ -488,10 +497,7 @@ fn keyring_lookup_service_failure_preserves_guidance_without_exposing_diagnostic
 
 #[test]
 fn keyring_stderr_writer_cannot_extend_the_original_helper_deadline() {
-    use std::{
-        process::Child,
-        time::{Duration, Instant},
-    };
+    use std::{process::Child, time::Instant};
 
     // The fixture owns this original holder throughout. Transfer just stderr's
     // write descriptor rather than launching an unowned background descendant.
@@ -557,11 +563,7 @@ raise SystemExit(1)
     )
     .unwrap();
     let started = Instant::now();
-    let output = f
-        .command(&["linear", "issue", "ENG-12"])
-        .env_remove("LINEAR_API_KEY")
-        .output()
-        .unwrap();
+    let output = capture(f.without_api_key(&["linear", "issue", "ENG-12"]));
     let elapsed = started.elapsed();
     assert!(
         f.path().join("stderr-held").exists(),
@@ -575,11 +577,22 @@ raise SystemExit(1)
         elapsed < Duration::from_secs(20),
         "stderr outlived helper deadline: {elapsed:?}"
     );
-    assert!(!output.status.success());
+    assert!(!output.success);
     let error = serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"].clone();
     assert_eq!(error["kind"], "linear_keyring_unavailable");
     assert!(output.stdout.is_empty());
     assert_eq!(f.calls(), 0);
     drop(holder.0.stdin.take());
-    assert!(holder.0.wait().unwrap().success());
+    let settled_by = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = holder.0.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < settled_by,
+            "private stderr holder did not settle after releasing stdin"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

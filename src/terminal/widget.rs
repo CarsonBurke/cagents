@@ -1926,12 +1926,19 @@ impl<Message> TerminalWidget<Message> {
     /// at the moment the text arrives.
     fn paste(&self, text: &str, shell: &mut Shell<'_, Message>) {
         if self.read_only || text.is_empty() {
+            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+                stage = "widget_dispatch", bytes = text.len(),
+                outcome = if self.read_only { "read_only" } else { "empty" });
             return;
         }
         if let Some(callback) = &self.on_paste {
+            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+                stage = "widget_dispatch", bytes = text.len(), outcome = "callback");
             shell.publish(callback(text.to_owned()));
             return;
         }
+        tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+            stage = "widget_dispatch", bytes = text.len(), outcome = "hosted");
         if let Err(error) = self.handle.paste(text, PasteOrigin::Clipboard) {
             self.publish_error(error, shell);
         }
@@ -2498,7 +2505,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                             }
                         }
                         ClipboardChord::Paste => {
-                            if let Some(text) = clipboard.read(clipboard::Kind::Standard) {
+                            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+                                stage = "clipboard_read", origin = "standard", outcome = "started");
+                            let text = clipboard.read(clipboard::Kind::Standard);
+                            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+                                stage = "clipboard_read", origin = "standard",
+                                bytes = text.as_ref().map_or(0, String::len),
+                                outcome = if text.is_some() { "some" } else { "none" });
+                            if let Some(text) = text {
                                 self.paste(&text, shell);
                             }
                         }
@@ -2657,7 +2671,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         IcedMouseButton::Middle if ours => {
                             // The primary selection is what a middle click
                             // pastes everywhere else on X11 and Wayland.
-                            if let Some(text) = clipboard.read(clipboard::Kind::Primary) {
+                            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+                                stage = "clipboard_read", origin = "primary", outcome = "started");
+                            let text = clipboard.read(clipboard::Kind::Primary);
+                            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.handle.terminal_id(),
+                                stage = "clipboard_read", origin = "primary",
+                                bytes = text.as_ref().map_or(0, String::len),
+                                outcome = if text.is_some() { "some" } else { "none" });
+                            if let Some(text) = text {
                                 self.paste(&text, shell);
                             }
                         }

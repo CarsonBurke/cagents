@@ -306,6 +306,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository::test_fixture::isolated_fixture_case;
     use crate::repository::{ExistingPrCheckoutRequest, PrCheckoutTracking, ValidatedRefName};
     use cosmic::iced::futures::StreamExt as _;
 
@@ -339,6 +340,13 @@ mod tests {
     #[test]
     fn existing_checkout_tracking_changes_only_after_confirmation_and_opens_only_after_verified_receipt()
      {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::",
+            "existing_checkout_tracking_changes_only_after_confirmation_and_opens_only_after_verified_receipt"
+        )) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let repository = directory.path().join("repository");
         let remote = directory.path().join("remote.git");
@@ -523,11 +531,25 @@ mod tests {
 
     #[test]
     fn preserving_ahead_and_dirty_local_work_requires_confirmation_and_a_matching_typed_receipt() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::",
+            "preserving_ahead_and_dirty_local_work_requires_confirmation_and_a_matching_typed_receipt"
+        )) {
+            return;
+        }
         preserve_ahead_and_dirty_local_work(false);
     }
 
     #[test]
     fn configuring_missing_upstream_while_preserving_local_work_requires_explicit_confirmation() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::",
+            "configuring_missing_upstream_while_preserving_local_work_requires_explicit_confirmation"
+        )) {
+            return;
+        }
         preserve_ahead_and_dirty_local_work(true);
     }
 

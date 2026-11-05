@@ -180,6 +180,21 @@ pub(crate) fn create_with_listener(
     launch: &Launch,
     socket: PathBuf,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    let bytes = socket.as_os_str().as_encoded_bytes();
+    // Match the actual platform Unix address before any provider can start.
+    // All sockaddr_un fields are integers, so its all-zero value is valid.
+    let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+        .sun_path
+        .len();
+    if socket.to_str().is_none()
+        || bytes.is_empty()
+        || bytes.contains(&0)
+        || bytes.len() >= capacity
+    {
+        return Err(format!(
+            "Owned Codex listener requires a nonempty, UTF-8, NUL-free Unix socket path shorter than {capacity} bytes; use a shorter UTF-8 temporary directory"
+        ));
+    }
     create_inner(launch, Some(socket), None)
 }
 
@@ -457,6 +472,7 @@ fn create_inner(
             children: BTreeMap::new(),
             branch_points: Vec::new(),
             is_child: false,
+            child_failure: None,
             child_buffer: BTreeMap::new(),
         }),
     ))
@@ -614,6 +630,9 @@ struct Codex {
     children: BTreeMap<String, Box<Codex>>,
     branch_points: Vec<chat::BranchPoint>,
     is_child: bool,
+    /// The turn and message of the last final error a child reported, which
+    /// Codex repeats in that turn's failed completion: one failure, one item.
+    child_failure: Option<(String, String)>,
     child_buffer: BTreeMap<String, Vec<Value>>,
 }
 
@@ -736,7 +755,7 @@ impl Codex {
     // Child parsers share a server connection, so their local RPC IDs must
     // never escape into the parent's ID space. Keep the original correlation
     // inside the child and allocate every wire request through the parent.
-    fn child_step(&mut self, id: &str, content: Step, step: &mut Step) -> Result<(), String> {
+    fn child_step(&mut self, id: &str, mut content: Step, step: &mut Step) -> Result<(), String> {
         if content.events.iter().any(|event| {
             matches!(
                 event,
@@ -761,6 +780,15 @@ impl Codex {
                     .and_then(|child| child.subagent_status),
                 background: None,
             });
+        }
+        // Client/RPC errors belong to the child too, but do not prove a
+        // provider-marked failure. Genuine provider errors already carry
+        // their provenance from the notification decoder. Preserve other
+        // diagnostics as plain notices without changing lifecycle state.
+        for event in &mut content.events {
+            if let Event::Error { message, .. } = event {
+                *event = session_notice(std::mem::take(message));
+            }
         }
         step.events.extend(chat::child_events(id, content.events));
         for frame in content.writes {
@@ -2920,13 +2948,24 @@ impl Adapter for Codex {
                     });
                 }
                 if turn["error"].is_object() {
-                    step.events.push(Event::Error {
-                        message: turn["error"]["message"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| turn["error"].to_string()),
-                        fatal: false,
-                    });
+                    let message = turn["error"]["message"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| turn["error"].to_string());
+                    // Codex repeats a child's final error notification in the
+                    // turn's failed completion; one failure keeps one item.
+                    let reported = self
+                        .child_failure
+                        .as_ref()
+                        .is_some_and(|(turn, text)| turn == turn_id && *text == message);
+                    if self.is_child && !reported {
+                        step.events.push(provider_error_notice(message));
+                    } else if !self.is_child {
+                        step.events.push(Event::Error {
+                            message,
+                            fatal: false,
+                        });
+                    }
                 }
                 if method == "turn/completed" {
                     self.finish_execution(turn, &mut step, false)?;
@@ -3134,6 +3173,7 @@ impl Adapter for Codex {
                 self.subagent_waiting = false;
                 self.subagent_detail = "Agent disconnected".into();
                 step.events.push(Event::Ready(false));
+                let interrupted = self.busy;
                 self.busy = false;
                 self.subagent_status = Some(
                     self.subagent_status
@@ -3142,10 +3182,24 @@ impl Adapter for Codex {
                 );
                 self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
                 self.invalidate(&mut step);
-                step.events.push(Event::Error {
-                    message: format!("Codex {method}; reconnect explicitly"),
-                    fatal: true,
-                });
+                if !self.is_child {
+                    step.events.push(Event::Error {
+                        message: format!("Codex {method}; reconnect explicitly"),
+                        fatal: true,
+                    });
+                } else if interrupted {
+                    // Codex also closes a child's thread once its work is
+                    // done; only a close that cut work short is news, and the
+                    // child has no reconnect of its own to point at.
+                    step.events.push(session_notice(
+                        if method == "thread/deleted" {
+                            "Codex removed this agent before it finished"
+                        } else {
+                            "Codex closed this agent before it finished"
+                        }
+                        .into(),
+                    ));
+                }
             }
             "error" => {
                 let message = params["error"]["message"]
@@ -3154,8 +3208,16 @@ impl Adapter for Codex {
                     .unwrap_or_else(|| params["error"].to_string());
                 // A retry describes work still in progress. Putting it in
                 // Snapshot.error leaves a recovered turn marked as failed.
-                if params["willRetry"] == true {
-                    step.events.push(session_notice(message));
+                // Child diagnostics must likewise stay in their own timeline
+                // before generic child routing discards parent error state.
+                if params["willRetry"] == true || self.is_child {
+                    if self.is_child
+                        && params["willRetry"] != true
+                        && let Some(turn) = params["turnId"].as_str()
+                    {
+                        self.child_failure = Some((turn.to_owned(), message.clone()));
+                    }
+                    step.events.push(provider_error_notice(message));
                 } else {
                     step.events.push(Event::Error {
                         message,
@@ -3251,6 +3313,17 @@ fn session_notice(text: String) -> Event {
         at: None,
     })
 }
+
+/// Only the provider's explicit error notification/turn field grants this
+/// provenance. Client-generated disconnect or RPC diagnostics remain notices.
+fn provider_error_notice(text: String) -> Event {
+    let mut notice = session_notice(text);
+    if let Event::Item(item) = &mut notice {
+        chat::failure::mark_provider_error(crate::agent::Provider::Codex, item);
+    }
+    notice
+}
+
 impl Codex {
     fn observe_thread_status(&mut self, status: &Value) {
         if matches!(status["type"].as_str(), Some("active" | "systemError")) {
@@ -4116,6 +4189,136 @@ fn skill_mentions(text: &str) -> Vec<Mention<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Provider;
+
+    fn owned_listener_test_launch(home: &std::path::Path) -> Launch {
+        Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: None,
+            recipe: crate::model::LaunchRecipe {
+                unset_environment: Default::default(),
+                program: home
+                    .join("never-executed-codex")
+                    .to_string_lossy()
+                    .into_owned(),
+                arguments: vec!["--remote".into(), "unix://".into()],
+                working_directory: home.into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    home.to_string_lossy().into_owned(),
+                )]),
+            },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_listener_rejects_unusable_unix_addresses_before_preparation_or_spawn() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let launch = owned_listener_test_launch(home.path());
+        let before = launch.recipe.clone();
+        for socket in [
+            PathBuf::new(),
+            PathBuf::from("/nul\0socket"),
+            PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff])),
+            PathBuf::from(format!("/{}", "x".repeat(107))),
+            PathBuf::from(format!("/{}", "x".repeat(108))),
+            PathBuf::from(format!("/{}x", "λ".repeat(53))),
+        ] {
+            let failure = create_with_listener(&launch, socket)
+                .err()
+                .expect("invalid address must fail before returning a spawn specification");
+            assert!(failure.contains("Owned Codex listener"), "{failure}");
+            assert!(failure.contains("shorter than 108 bytes"), "{failure}");
+            assert_eq!(launch.recipe, before);
+            assert_eq!(
+                std::fs::read_dir(home.path()).unwrap().count(),
+                0,
+                "invalid owned addresses must not create endpoint directories or execute the provider"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_listener_accepts_107_actual_bytes_without_changing_launch_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let launch = owned_listener_test_launch(home.path());
+        let before = launch.recipe.clone();
+        for socket in [
+            PathBuf::from(format!("/{}", "x".repeat(106))),
+            PathBuf::from(format!("/{}", "λ".repeat(53))),
+        ] {
+            assert_eq!(socket.as_os_str().as_encoded_bytes().len(), 107);
+            let (spec, _adapter) = create_with_listener(&launch, socket.clone()).unwrap();
+            assert!(
+                matches!(&spec.transport, TransportSpec::OwnedUnixWebSocket { socket: actual } if actual == &socket)
+            );
+            assert_eq!(
+                spec.arguments,
+                [
+                    "app-server".to_owned(),
+                    "--listen".to_owned(),
+                    format!("unix://{}", socket.display())
+                ]
+            );
+            assert_eq!(spec.program, launch.recipe.program);
+            assert_eq!(spec.working_directory, launch.recipe.working_directory);
+            assert_eq!(spec.environment, launch.recipe.environment);
+            assert_eq!(launch.recipe, before);
+            assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_long_listener_keeps_its_existing_verified_alias_and_never_launches() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let home = tempfile::tempdir().unwrap();
+        let socket = home.path().join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let original = std::fs::metadata(&socket).unwrap();
+        let long = home
+            .path()
+            .join("long-exact-socket-".to_owned() + &"x".repeat(108));
+        symlink(&socket, &long).unwrap();
+        assert!(long.as_os_str().as_encoded_bytes().len() >= 108);
+        let mut launch = owned_listener_test_launch(home.path());
+        launch.recipe.arguments = vec!["--remote".into(), format!("unix://{}", long.display())];
+        let before = launch.recipe.clone();
+        let (spec, adapter) = create(&launch).unwrap();
+        let TransportSpec::UnixWebSocket {
+            socket: alias,
+            device,
+            inode,
+        } = &spec.transport
+        else {
+            panic!(
+                "shared listener must remain a verified existing connection, never an owned launch"
+            );
+        };
+        assert!(alias.as_os_str().as_encoded_bytes().len() < 108);
+        assert_ne!(alias, &long);
+        assert_eq!((*device, *inode), (original.dev(), original.ino()));
+        let aliased = std::fs::metadata(alias).unwrap();
+        assert_eq!(
+            (aliased.dev(), aliased.ino()),
+            (original.dev(), original.ino())
+        );
+        assert!(spec.arguments.is_empty());
+        assert_eq!(launch.recipe, before);
+        let alias = alias.clone();
+        drop(adapter);
+        assert!(std::fs::symlink_metadata(&alias).is_err());
+        assert!(std::fs::metadata(&long).is_ok());
+        let unchanged = std::fs::metadata(&socket).unwrap();
+        assert_eq!(
+            (unchanged.dev(), unchanged.ino()),
+            (original.dev(), original.ino())
+        );
+    }
 
     #[test]
     fn unverified_owned_image_history_never_reads_or_replays_a_coincident_device_path() {
@@ -5718,6 +5921,7 @@ mod tests {
             children: BTreeMap::new(),
             branch_points: Vec::new(),
             is_child: false,
+            child_failure: None,
             child_buffer: BTreeMap::new(),
         }
     }
@@ -5732,13 +5936,63 @@ mod tests {
             panic!("{:?}", first.events)
         };
         assert_eq!(item.role, Role::System);
-        assert!(
-            matches!(&item.content, ItemContent::Text { text, thinking: false, phase: Phase::Commentary } if text == "Reconnecting... 1/2")
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Codex, item),
+            Some("Reconnecting... 1/2")
         );
+        assert!(chat::failure::provider_error_text(Provider::Claude, item).is_none());
         let [Event::Item(next)] = second.events.as_slice() else {
             panic!("{:?}", second.events)
         };
         assert_ne!(item.id, next.id);
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Codex, next),
+            Some("Reconnecting... 1/2")
+        );
+        for (cause, expected_kind) in [
+            (
+                "You've hit your limit · resets 1:30pm (America/Los_Angeles)",
+                chat::failure::FailureKind::AccountLimit,
+            ),
+            (
+                "Your access token could not be refreshed. Please sign in again.",
+                chat::failure::FailureKind::Authentication,
+            ),
+        ] {
+            let raw = format!(
+                "{cause}\nHTTP raw response: {}",
+                "retained diagnostic ".repeat(120_000)
+            );
+            assert!(raw.len() > 2 * 1024 * 1024);
+            let mut retry = frame.clone();
+            retry["params"]["error"]["message"] = json!(raw);
+            let retry = adapter.receive(retry).unwrap();
+            let [Event::Item(error)] = retry.events.as_slice() else {
+                panic!("retry must remain only a timeline item");
+            };
+            assert!(error.id.starts_with("codex-notice:"));
+            assert_ne!(error.id, item.id);
+            assert_eq!(
+                chat::failure::provider_error_text(Provider::Codex, error),
+                Some(raw.as_str())
+            );
+            assert_eq!(
+                chat::failure::Failure::parse(Provider::Codex, &raw)
+                    .unwrap()
+                    .kind,
+                expected_kind
+            );
+            let warning = adapter
+                .receive(
+                    json!({"method":"warning","params":{"threadId":"thread-exact","message":raw}}),
+                )
+                .unwrap();
+            let [Event::Item(warning)] = warning.events.as_slice() else {
+                panic!("warning must remain a timeline item");
+            };
+            assert!(chat::failure::provider_error_text(Provider::Codex, warning).is_none());
+            assert!(matches!(&warning.content, ItemContent::Text { text, .. } if text == &raw));
+        }
         for will_retry in [json!(false), Value::Null] {
             let mut failed = frame.clone();
             failed["params"]["willRetry"] = will_retry;
@@ -5762,9 +6016,521 @@ mod tests {
             .children
             .insert("child-thread".into(), Box::new(child));
         let step = parent.receive(json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","willRetry":true,"error":{"message":"Reconnecting... 1/2"}}})).unwrap();
-        assert!(
-            matches!(step.events.as_slice(), [Event::SubagentItem { id, item: Item { role: Role::System, .. } }] if id == "child-thread")
+        let [Event::SubagentItem { id, item }] = step.events.as_slice() else {
+            panic!("A child retry must remain only in its exact child timeline");
+        };
+        assert_eq!(id, "child-thread");
+        assert_eq!(item.role, Role::System);
+        assert!(item.id.starts_with("codex-notice:"));
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Codex, item),
+            Some("Reconnecting... 1/2")
         );
+        assert!(chat::failure::provider_error_text(Provider::Claude, item).is_none());
+    }
+
+    #[test]
+    fn a_child_failed_turn_restating_its_final_error_adds_no_second_notice() {
+        let mut parent = adapter();
+        let mut child = adapter();
+        child.thread = Some("child-thread".into());
+        child.is_child = true;
+        parent
+            .children
+            .insert("child-thread".into(), Box::new(child));
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-turn","items":[]}}})).unwrap();
+        let notices = |step: Step| {
+            step.events
+                .iter()
+                .filter(|event| {
+                    matches!(event, Event::SubagentItem { item, .. }
+                    if chat::failure::provider_error_text(Provider::Codex, item).is_some())
+                })
+                .count()
+        };
+        let error = parent.receive(json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","willRetry":false,"error":{"message":"Usage limit · resets 3:40pm"}}})).unwrap();
+        assert_eq!(notices(error), 1);
+        let failed = |turn: &str, message: &str| json!({"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":turn,"status":"failed","error":{"message":message},"items":[]}}});
+        let restated = parent
+            .receive(failed("child-turn", "Usage limit · resets 3:40pm"))
+            .unwrap();
+        assert_eq!(notices(restated), 0, "the same failure is already shown");
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"next-turn","items":[]}}})).unwrap();
+        let different = parent
+            .receive(failed("next-turn", "Usage limit · resets 3:40pm"))
+            .unwrap();
+        assert_eq!(notices(different), 1, "another turn's failure is its own");
+    }
+
+    #[test]
+    fn terminal_child_errors_keep_exact_provider_notices_without_claiming_lifecycle() {
+        let mut parent = adapter();
+        let mut child = adapter();
+        child.thread = Some("child-thread".into());
+        child.is_child = true;
+        parent
+            .children
+            .insert("child-thread".into(), Box::new(child));
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"parent-turn","items":[]}}})).unwrap();
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-turn","items":[]}}})).unwrap();
+        parent.receive(json!({"method":"thread/status/changed","params":{"threadId":"child-thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}})).unwrap();
+        let raw = format!(
+            "You've hit your session limit · resets 3:40pm (America/Vancouver)\nrequest-id: child-original\n{}\nFinal diagnostic λ",
+            "original response\n".repeat(5_000)
+        );
+        let mut ids = std::collections::BTreeSet::new();
+        for will_retry in [Some(json!(false)), Some(Value::Null), None] {
+            let mut frame = json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","error":{"message":raw}}});
+            if let Some(flag) = will_retry {
+                frame["params"]["willRetry"] = flag;
+            }
+            // Repeated occurrences have no event ID on this wire. Preserve
+            // each original rather than deduplicating equal diagnostic text.
+            for _ in 0..2 {
+                let observed = parent.receive(frame.clone()).unwrap();
+                let [Event::SubagentItem { id, item }] = observed.events.as_slice() else {
+                    panic!("A child failure must be only its own transcript item");
+                };
+                assert_eq!(id, "child-thread");
+                assert_eq!(item.role, Role::System);
+                assert!(ids.insert(item.id.clone()));
+                assert_eq!(
+                    chat::failure::provider_error_text(Provider::Codex, item),
+                    Some(raw.as_str())
+                );
+                assert!(chat::failure::provider_error_text(Provider::Claude, item).is_none());
+                assert!(
+                    observed.writes.is_empty(),
+                    "A diagnostic never retries or sends a command"
+                );
+                assert!(parent.busy);
+                assert_eq!(parent.turn.as_deref(), Some("parent-turn"));
+                let child = &parent.children["child-thread"];
+                assert!(child.busy && child.subagent_waiting);
+                assert_eq!(child.turn.as_deref(), Some("child-turn"));
+                assert_eq!(child.subagent_status, Some(ToolStatus::Running));
+                assert_eq!(child.subagent_detail, "Waiting for your answer");
+            }
+            let mut foreign = frame.clone();
+            foreign["params"]["threadId"] = json!("unrelated-thread");
+            let ignored = parent.receive(foreign).unwrap();
+            assert!(ignored.events.is_empty() && ignored.writes.is_empty());
+            frame["params"]["threadId"] = json!("thread-exact");
+            let original = parent.receive(frame).unwrap();
+            assert!(
+                matches!(original.events.as_slice(), [Event::Error {message, fatal:false}] if message == &raw)
+            );
+            assert!(original.writes.is_empty());
+        }
+        let warning = parent
+            .receive(json!({"method":"warning","params":{"threadId":"child-thread","message":raw}}))
+            .unwrap();
+        let [Event::SubagentItem { id, item }] = warning.events.as_slice() else {
+            panic!("A child advisory must remain a child advisory");
+        };
+        assert_eq!(id, "child-thread");
+        assert!(chat::failure::provider_error_text(Provider::Codex, item).is_none());
+        assert!(matches!(&item.content, ItemContent::Text {text,..} if text == &raw));
+    }
+
+    /// Known child parsers already attached to this account's parent thread,
+    /// as in the existing child routing tests. Native metadata frames below
+    /// publish their exact names through the real adapter and runtime store.
+    fn child_error_runtime_fixture() -> (Codex, Vec<Value>) {
+        let mut parent = adapter();
+        for id in ["child-thread", "sibling-thread"] {
+            let mut child = adapter();
+            child.thread = Some(id.into());
+            child.is_child = true;
+            parent.children.insert(id.into(), Box::new(child));
+        }
+        let mut frames = vec![
+            json!({"method":"thread/name/updated","params":{"threadId":"thread-exact","threadName":"Parent conversation"}}),
+            json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"parent-turn","items":[{"id":"parent-answer","type":"agentMessage","text":"Parent work remains here"}]}}}),
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-exact","turnId":"parent-turn","tokenUsage":{"total":{"inputTokens":71,"outputTokens":19},"last":{"totalTokens":90},"modelContextWindow":1000}}}),
+        ];
+        for (id, name) in [("child-thread", "Quinn"), ("sibling-thread", "Nora")] {
+            frames.push(json!({"method":"thread/started","params":{"thread":{"id":id,"parentThreadId":"thread-exact","agentNickname":name,"model":"child-model","status":{"type":"active"}}}}));
+            frames.push(json!({"method":"turn/started","params":{"threadId":id,"turn":{"id":"child-turn","items":[{"id":"answer","type":"agentMessage","text":"Original child work"}]}}}));
+        }
+        (parent, frames)
+    }
+
+    fn parent_question_after_child_error() -> Value {
+        // Supply an independently fingerprinted parent question while its
+        // turn stays running. A waiting child can already produce aggregate
+        // Waiting attention; a child error must not supply a parent outcome.
+        json!({"id":71,"method":"item/tool/requestUserInput","params":{"threadId":"thread-exact","turnId":"parent-turn","questions":[{"id":"parent-choice","header":"Parent choice","question":"Continue parent work?","options":[{"label":"Keep","description":"Keep parent work"},{"label":"Replace","description":"Replace parent work"}]}]}})
+    }
+
+    fn assert_child_error_parent_and_sibling(state: &chat::Snapshot) {
+        assert_eq!(state.session_id.as_deref(), Some("thread-exact"));
+        assert_eq!(state.title.as_deref(), Some("Parent conversation"));
+        assert!(state.busy && state.ready && !state.exited);
+        assert!(
+            state.error.is_none(),
+            "Child failures must not become parent errors"
+        );
+        assert_eq!(
+            state.turn_generation, 2,
+            "Only the helper's initial and actual parent starts count"
+        );
+        assert_eq!(state.usage.input_tokens, 71);
+        assert_eq!(state.usage.output_tokens, 19);
+        assert_eq!(state.usage.context_tokens, 90);
+        assert_eq!(state.usage.context_limit, 1000);
+        assert_eq!(
+            state.requests.len(),
+            1,
+            "Only the genuine parent question requests attention"
+        );
+        assert_eq!(state.items.len(), 1);
+        assert!(
+            matches!(&state.items[0].content, ItemContent::Text {text,..} if text == "Parent work remains here")
+        );
+        assert!(chat::failure::provider_error_text(Provider::Codex, &state.items[0]).is_none());
+        assert_eq!(
+            state.subagents.len(),
+            2,
+            "Foreign thread frames must not create a child"
+        );
+        let sibling = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "sibling-thread")
+            .unwrap();
+        assert_eq!(sibling.kind, "Nora");
+        assert_eq!(sibling.model.as_deref(), Some("child-model"));
+        assert!(sibling.background && !sibling.waiting);
+        assert_eq!(sibling.status, ToolStatus::Running);
+        assert!(sibling.detail.is_empty());
+        assert_eq!(sibling.items.len(), 1);
+        assert!(
+            matches!(&sibling.items[0].content, ItemContent::Text {text,..} if text == "Original child work")
+        );
+    }
+
+    #[test]
+    fn terminal_child_error_originals_survive_actor_store_without_parent_contamination() {
+        let (parent, mut frames) = child_error_runtime_fixture();
+        frames.push(json!({"method":"thread/status/changed","params":{"threadId":"child-thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}}));
+        let first = format!(
+            "You've hit your session limit · resets 3:40pm (America/Vancouver)\nrequest-id: first\n{}\nFinal original λ",
+            "response line\n".repeat(400)
+        );
+        let second = "Connection reset by peer\nrequest-id: second\nDistinct original diagnostic";
+        let retry = "Reconnecting... 1/2\nrequest-id: genuine-retry";
+        for (flag, raw) in [
+            (Some(json!(false)), first.as_str()),
+            (None, second),
+            (Some(Value::Null), first.as_str()),
+            (Some(json!(true)), retry),
+        ] {
+            let mut frame = json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","error":{"message":raw}}});
+            if let Some(flag) = flag {
+                frame["params"]["willRetry"] = flag;
+            }
+            frames.push(frame);
+        }
+        frames
+            .push(json!({"method":"warning","params":{"threadId":"child-thread","message":first}}));
+        frames.push(json!({"method":"error","params":{"threadId":"unrelated-thread","turnId":"child-turn","error":{"message":"Foreign child diagnostic"}}}));
+        frames.push(json!({"method":"thread/tokenUsage/updated","params":{"threadId":"child-thread","turnId":"child-turn","tokenUsage":{"total":{"inputTokens":9000,"outputTokens":8000},"last":{"totalTokens":17000},"modelContextWindow":20000}}}));
+        frames.push(parent_question_after_child_error());
+        let (receipts, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(parent),
+            frames,
+            false,
+        );
+        let [
+            (child_waiting, child_context),
+            (parent_question, parent_context),
+        ] = receipts.as_slice()
+        else {
+            panic!("only the real child wait and parent question notify: {receipts:?}");
+        };
+        assert_eq!(child_waiting.kind, crate::notifications::Kind::Waiting);
+        assert_eq!(parent_question.kind, crate::notifications::Kind::Waiting);
+        assert_eq!(
+            child_context,
+            &crate::notifications::Content {
+                conversation: "Parent conversation".into(),
+                preview: "Parent work remains here".into(),
+                request: None,
+            },
+            "child waiting announces aggregate activity before a parent request exists"
+        );
+        assert_eq!(
+            parent_context,
+            &crate::notifications::Content {
+                conversation: "Parent conversation".into(),
+                preview: "Parent choice · Continue parent work?".into(),
+                request: Some(crate::notifications::RequestType::Question),
+            },
+            "only the genuine parent question changes actionable request metadata"
+        );
+        let (child_owner, child_generation) = child_waiting.key.rsplit_once(":waiting:").unwrap();
+        let (parent_owner, parent_generation) =
+            parent_question.key.rsplit_once(":waiting:").unwrap();
+        assert_eq!(child_owner, parent_owner);
+        assert!(
+            child_generation.parse::<u64>().unwrap() < parent_generation.parse::<u64>().unwrap()
+        );
+        assert_child_error_parent_and_sibling(&state);
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "child-thread")
+            .unwrap();
+        assert_eq!(child.kind, "Quinn");
+        assert_eq!(child.model.as_deref(), Some("child-model"));
+        assert!(child.background && child.waiting);
+        assert_eq!(
+            child.status,
+            ToolStatus::Running,
+            "No error invents a terminal lifecycle transition"
+        );
+        assert_eq!(child.detail, "Waiting for your answer");
+        let notices: Vec<_> = child
+            .items
+            .iter()
+            .filter(|item| chat::failure::provider_error_text(Provider::Codex, item).is_some())
+            .collect();
+        assert_eq!(notices.len(), 4);
+        assert_eq!(
+            notices
+                .iter()
+                .map(|item| chat::failure::provider_error_text(Provider::Codex, item).unwrap())
+                .collect::<Vec<_>>(),
+            [first.as_str(), second, first.as_str(), retry]
+        );
+        assert_eq!(
+            notices
+                .iter()
+                .map(|item| &item.id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4
+        );
+        assert!(
+            notices
+                .iter()
+                .all(|item| item.id.starts_with("codex-notice:")
+                    && item.role == Role::System
+                    && chat::failure::provider_error_text(Provider::Claude, item).is_none())
+        );
+        assert_eq!(
+            child.items.len(),
+            6,
+            "Original answer, four failures and unmarked advisory all remain"
+        );
+        assert!(
+            matches!(&child.items[0].content, ItemContent::Text {text,..} if text == "Original child work")
+        );
+        assert!(matches!(&child.items[5].content, ItemContent::Text {text,..} if text == &first));
+    }
+
+    #[test]
+    fn failed_child_turn_keeps_original_error_and_authentic_outcome_through_actor_store() {
+        let (parent, mut frames) = child_error_runtime_fixture();
+        let raw = "You've hit your session limit · resets 3:40pm (America/Vancouver)\nrequest-id: failed-turn\nOriginal server response λ";
+        frames.push(json!({"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"failed","error":{"message":raw},"items":[{"id":"partial","type":"agentMessage","text":"Partial child answer"}]}}}));
+        frames.push(json!({"method":"thread/status/changed","params":{"threadId":"child-thread","status":{"type":"idle"}}}));
+        frames.push(json!({"method":"turn/completed","params":{"threadId":"unrelated-thread","turn":{"id":"foreign-turn","status":"failed","error":{"message":"Foreign failure"},"items":[]}}}));
+        frames.push(parent_question_after_child_error());
+        let (receipts, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(parent),
+            frames,
+            false,
+        );
+        assert_eq!(
+            receipts.len(),
+            1,
+            "Child failure must not notify as a parent result"
+        );
+        assert_eq!(receipts[0].0.kind, crate::notifications::Kind::Waiting);
+        assert_child_error_parent_and_sibling(&state);
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "child-thread")
+            .unwrap();
+        assert_eq!(child.kind, "Quinn");
+        assert_eq!(child.status, ToolStatus::Failed);
+        assert!(!child.waiting);
+        assert_eq!(child.items.len(), 3);
+        for (item, expected) in child
+            .items
+            .iter()
+            .zip(["Original child work", "Partial child answer"])
+        {
+            assert!(matches!(&item.content, ItemContent::Text {text,..} if text == expected));
+        }
+        let error = &child.items[2];
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Codex, error),
+            Some(raw)
+        );
+        assert!(chat::failure::provider_error_text(Provider::Claude, error).is_none());
+        assert!(error.id.starts_with("codex-notice:"));
+    }
+
+    #[test]
+    fn child_disconnect_diagnostics_remain_unmarked_and_do_not_fail_the_parent() {
+        for method in ["thread/closed", "thread/deleted"] {
+            let (parent, mut frames) = child_error_runtime_fixture();
+            frames.push(json!({"method":method,"params":{"threadId":"child-thread"}}));
+            frames.push(parent_question_after_child_error());
+            let (receipts, state) =
+                crate::chat::runtime::notification_frames_with_snapshot_for_test(
+                    Box::new(parent),
+                    frames,
+                    false,
+                );
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].0.kind, crate::notifications::Kind::Waiting);
+            assert_child_error_parent_and_sibling(&state);
+            let child = state
+                .subagents
+                .iter()
+                .find(|child| child.id == "child-thread")
+                .unwrap();
+            assert_eq!(child.status, ToolStatus::Stopped);
+            assert!(!child.waiting);
+            assert_eq!(child.items.len(), 2);
+            let notice = &child.items[1];
+            assert_eq!(notice.role, Role::System);
+            let expected = if method == "thread/deleted" {
+                "Codex removed this agent before it finished"
+            } else {
+                "Codex closed this agent before it finished"
+            };
+            assert!(matches!(&notice.content, ItemContent::Text {text,..} if text == expected));
+            assert!(chat::failure::provider_error_text(Provider::Codex, notice).is_none());
+        }
+    }
+
+    #[test]
+    fn large_child_originals_survive_actor_reads_and_old_completion_cannot_settle_next_turn() {
+        let (parent, mut frames) = child_error_runtime_fixture();
+        let raw = format!(
+            "You've hit your session limit · resets 3:40pm (America/Vancouver)\nrequest-id: large-original\n{}\nTAIL original λ",
+            "猫 café diagnostic\n".repeat(20_000)
+        );
+        frames.push(json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","error":{"message":raw},"willRetry":false}}));
+        let failed = json!({"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"failed","error":{"message":raw},"items":[]}}});
+        frames.push(failed.clone());
+        frames.push(json!({"method":"thread/status/changed","params":{"threadId":"child-thread","status":{"type":"idle"}}}));
+        frames.push(json!({"method":"thread/closed","params":{"threadId":"child-thread"}}));
+        frames.push(json!({"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"next-child","status":"inProgress","items":[]}}}));
+        frames.push(failed);
+        frames.push(parent_question_after_child_error());
+        let (receipts, state, originals) =
+            crate::chat::runtime::notification_frames_with_probe_for_test(
+                Box::new(parent),
+                frames,
+                false,
+                |state, read| -> Result<Vec<String>, String> {
+                    let child = state
+                        .subagents
+                        .iter()
+                        .find(|child| child.id == "child-thread")
+                        .ok_or("missing child")?;
+                    let sources = state
+                        .text_copy_sources
+                        .children
+                        .get("child-thread")
+                        .ok_or("missing child authority")?;
+                    let mut originals = Vec::new();
+                    for (index, item) in child.items.iter().enumerate() {
+                        if chat::failure::provider_error_text(Provider::Codex, item).is_none() {
+                            continue;
+                        }
+                        let source = sources
+                            .get(index)
+                            .and_then(Option::as_ref)
+                            .ok_or("original not retained")?;
+                        let mut raw = String::new();
+                        loop {
+                            let page = read(source, raw.len() as u64)?;
+                            if page.source != *source || page.offset != raw.len() as u64 {
+                                return Err("wrong page identity".into());
+                            }
+                            raw.push_str(&page.text);
+                            if page.done {
+                                break;
+                            }
+                            if page.text.is_empty() {
+                                return Err("empty original page".into());
+                            }
+                        }
+                        originals.push(raw);
+                    }
+                    Ok(originals)
+                },
+            );
+        assert_child_error_parent_and_sibling(&state);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].0.kind, crate::notifications::Kind::Waiting);
+        assert_eq!(
+            receipts[0].1.preview,
+            "Parent choice · Continue parent work?"
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "child-thread")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Running);
+        assert!(!child.waiting);
+        assert!(child.items.len() <= 64);
+        assert!(
+            child
+                .items
+                .iter()
+                .map(|item| item.content.byte_len())
+                .sum::<usize>()
+                <= 64 * 1024
+        );
+        let originals = originals.unwrap();
+        // The failed completion and its stale repeat restate the error
+        // notification, so the child shows the one failure once.
+        assert_eq!(originals, vec![raw]);
+    }
+
+    #[test]
+    fn sparse_child_diagnostic_shapes_preserve_exact_fallback_without_lifecycle_claims() {
+        for flag in [
+            Value::Null,
+            json!(false),
+            json!(true),
+            json!(0),
+            json!(1),
+            json!("true"),
+            json!("false"),
+            json!([]),
+            json!({}),
+        ] {
+            for error in [
+                Value::Null,
+                json!("diagnostic string"),
+                json!({"code":429,"requestId":"exact λ"}),
+                json!({"message":17}),
+            ] {
+                let (mut parent, _) = child_error_runtime_fixture();
+                let observed = parent.receive(json!({"method":"error","params":{"threadId":"child-thread","willRetry":flag,"error":error}})).unwrap();
+                let [Event::SubagentItem { id, item }] = observed.events.as_slice() else {
+                    panic!("only an exact child diagnostic is allowed");
+                };
+                assert_eq!(id, "child-thread");
+                assert_eq!(
+                    chat::failure::provider_error_text(Provider::Codex, item),
+                    Some(error.to_string().as_str())
+                );
+                assert!(observed.writes.is_empty());
+                assert!(!parent.busy && !parent.children["child-thread"].busy);
+            }
+        }
     }
 
     #[test]
@@ -6045,6 +6811,15 @@ mod tests {
             ] {
                 let observed = parent.receive(frame).unwrap();
                 assert!(observed.events.iter().any(|event| matches!(event, Event::Subagent {status:Some(status), ..} if *status == expected)), "{:?}", observed.events);
+                // A finished child's thread closing is routine, not a notice.
+                assert!(
+                    !observed
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, Event::SubagentItem { .. })),
+                    "{:?}",
+                    observed.events
+                );
             }
             let next = parent.receive(json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"next","items":[]}}})).unwrap();
             assert!(next.events.iter().any(|event| matches!(
@@ -7468,6 +8243,7 @@ mod tests {
                 std::fs::File::open(&cwd).unwrap(),
             )));
             let spec = ProcessSpec {
+                stdout_noise: None,
                 execution: Some(Arc::new(context)),
                 messages: None,
                 transport: TransportSpec::History,

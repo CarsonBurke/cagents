@@ -127,6 +127,7 @@ impl RequestRaceFixture {
         std::fs::create_dir(&home).unwrap();
         std::fs::create_dir(&cache).unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),

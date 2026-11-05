@@ -5,6 +5,7 @@ use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
+pub mod failure;
 pub mod notification;
 pub mod presentation;
 pub mod pricing;
@@ -298,6 +299,9 @@ pub enum Intent {
     /// Begin this launch. A conversation the launch names by id is resumed by
     /// the provider's own argv rather than by attaching to a daemon writer.
     Start,
+    /// Retry an exact, explicitly requested named launch. Resolve any existing
+    /// owner first so a lost start reply cannot create a second provider.
+    RetryStart,
     /// Put a saved card back on the conversation it was showing, by whichever
     /// route the live daemon still supports.
     Restore,
@@ -535,6 +539,29 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
 /// Inline tool images are spooled to private files before entering a snapshot.
 pub(crate) const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_INLINE_IMAGE_URL_BYTES: usize = (MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4) + 128;
+
+/// Whether `path` names an inline image the host's transcript store decoded
+/// into a conversation's private cache (`chat-<uuid>/image-<sha256>.<ext>`).
+/// Such a file lives only as long as that cache, so it is no path to hand to
+/// anyone else.
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
+pub(crate) fn is_cached_inline_image(path: &std::path::Path) -> bool {
+    let name = |part: Option<&std::ffi::OsStr>, prefix: &str| {
+        part.and_then(|part| part.to_str())
+            .and_then(|part| part.strip_prefix(prefix))
+            .map(str::to_owned)
+    };
+    let image = name(path.file_name(), "image-").is_some_and(|name| {
+        name.split_once('.').is_some_and(|(digest, extension)| {
+            digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && matches!(extension, "png" | "jpg" | "webp" | "gif")
+        })
+    });
+    image
+        && name(path.parent().and_then(|parent| parent.file_name()), "chat-")
+            .is_some_and(|id| uuid::Uuid::parse_str(&id).is_ok())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
@@ -824,7 +851,53 @@ impl Session {
     }
 
     pub fn has_valid_native_continuity(&self) -> bool {
-        match &self.native_continuity {
+        self.valid_native_continuity(&self.native_continuity)
+    }
+
+    /// A saved transcript is eligible for the forced, read-only history API.
+    /// This shape is never authority to launch, close or resume a provider.
+    pub(crate) fn is_saved_claude_history(&self) -> bool {
+        self.launch.provider == Provider::Claude
+            && matches!(self.native_continuity, NativeContinuity::ReconnectOnly)
+            && self.terminal.is_none()
+            && self.owned_codex_listener.is_none()
+            && self
+                .proof
+                .as_ref()
+                .is_some_and(crate::model::HostSessionProof::is_complete)
+            && self
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+    }
+
+    /// Import an installed capability observed on this exact authenticated
+    /// attachment. A missing capability never revokes one already recorded.
+    /// Validation applies to the resulting descriptor, including pre-ID
+    /// Claude actors; a valid ReconnectOnly source alone grants nothing.
+    pub(crate) fn learn_native_continuity(&mut self, observed: &NativeContinuity) {
+        if observed.retains_provider() && self.valid_native_continuity(observed) {
+            self.native_continuity = observed.clone();
+        }
+    }
+
+    /// Runtime projections may learn provider identity/capability, but may
+    /// never borrow it from another allocation, account or daemon epoch.
+    pub(crate) fn learn_native_continuity_from(&mut self, observed: &Self) {
+        if self.id == observed.id
+            && self.proof == observed.proof
+            && self.launch.provider == observed.launch.provider
+            && self.launch.recipe == observed.launch.recipe
+            && self.terminal == observed.terminal
+            && self.owned_codex_listener == observed.owned_codex_listener
+        {
+            self.learn_native_continuity(&observed.native_continuity);
+        }
+    }
+
+    fn valid_native_continuity(&self, continuity: &NativeContinuity) -> bool {
+        match continuity {
             NativeContinuity::ReconnectOnly => true,
             NativeContinuity::RetainedClaudeActor { protocol } => {
                 *protocol == 2
@@ -1190,12 +1263,12 @@ impl PermissionDenial {
 
 impl QueuedMessage {
     pub const LIMIT: usize = 128;
+    pub const PREVIEW_BYTES: usize = 16 * 1024;
     pub fn new(mut id: String, mut text: String) -> Self {
         id.truncate(id.floor_char_boundary(256));
-        const PREVIEW_BYTES: usize = 16 * 1024;
-        let whole = text.len() <= PREVIEW_BYTES;
+        let whole = text.len() <= Self::PREVIEW_BYTES;
         if !whole {
-            text.truncate(text.floor_char_boundary(PREVIEW_BYTES));
+            text.truncate(text.floor_char_boundary(Self::PREVIEW_BYTES));
             text.push_str("\n[Queue preview truncated]");
         }
         Self {
@@ -1285,6 +1358,29 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
 }
 
 impl Snapshot {
+    /// Drop renderable history while retaining provider continuity, controls,
+    /// activity and pending interactions. Only the UI client's disposable copy
+    /// uses this: the daemon still owns paging and the authoritative transcript.
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
+    pub(crate) fn evict_transcript(&mut self) {
+        self.items = Vec::new();
+        for child in &mut self.subagents {
+            child.items = Vec::new();
+        }
+    }
+
+    /// Logical body bytes referenced by this owner, not unique heap bytes:
+    /// immutable items can be Arc-shared with other snapshots and caches.
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
+    pub(crate) fn transcript_bytes(&self) -> usize {
+        self.items
+            .iter()
+            .chain(self.subagents.iter().flat_map(|child| &child.items))
+            .fold(0usize, |bytes, item| {
+                bytes.saturating_add(item.content.byte_len())
+            })
+    }
+
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
         self.busy
@@ -1714,12 +1810,13 @@ pub enum ItemContent {
         #[serde(default)]
         reference: Option<ImageReference>,
     },
-    /// Something another agent, or the harness on its behalf, delivered to
-    /// this conversation: a subagent's report, a teammate's or another
-    /// session's message, or word that background work changed state.
+    /// Something another agent or the provider harness delivered to this
+    /// conversation: a report, a message, a background-work notice, or context
+    /// the provider added without attributing it to the user.
     ///
-    /// It arrives in the user's slot and the agent acts on it as on a
-    /// prompt, but the user did not write it. Typesetting it as their own
+    /// It can arrive in the user's slot and the agent acts on it as on a
+    /// prompt; provider context uses the System role. The user did not write
+    /// either. Typesetting it as their own
     /// message, wrapped in the framing the harness adds for the model,
     /// made the transcript read as though they had.
     Delivery {
@@ -1734,8 +1831,8 @@ pub enum ItemContent {
         /// `Agent "Review" finished`, or the one a teammate wrote for its
         /// message. Empty when there is none.
         summary: String,
-        /// A report's or message's Markdown, or the output a notice quotes,
-        /// with the harness's framing removed.
+        /// A report/message with harness framing removed, a notice's quoted
+        /// output, or provider context retained verbatim without interpretation.
         body: String,
     },
 }
@@ -1746,8 +1843,8 @@ pub enum DeliveryKind {
     Report,
     /// A message from a teammate or another session.
     Message,
-    /// The harness reporting that background work - a command, a monitor or
-    /// an agent - finished or produced an event.
+    /// A provider/harness notice, including background-work events and
+    /// provider context. An empty sender makes no agent-origin claim.
     Notice,
 }
 
@@ -1900,6 +1997,23 @@ pub struct Item {
     /// when it finished for an item that is no longer being written to.
     #[serde(default)]
     pub at: Option<u64>,
+}
+
+impl Item {
+    /// Bodies whose complete canonical bytes can be copied through the owned
+    /// transcript source. Provider context uses the same field as ordinary
+    /// prose; other deliveries retain their existing presentation copy rules.
+    pub(crate) fn logical_copy_body(&self) -> Option<&str> {
+        match &self.content {
+            ItemContent::Text { text, .. } => Some(text),
+            ItemContent::Delivery {
+                kind: DeliveryKind::Notice,
+                body,
+                ..
+            } if self.role == Role::System => Some(body),
+            _ => None,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Choice {
@@ -2311,6 +2425,48 @@ mod retained_native_pair_tests {
             host_session_id: proof.host_session_id.clone(),
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
+        }
+    }
+
+    #[test]
+    fn observed_retained_capability_requires_the_exact_valid_owner_and_never_downgrades() {
+        for confirmed in [false, true] {
+            let (observed, _) = pair(confirmed);
+            let mut source = observed.clone();
+            source.native_continuity = NativeContinuity::ReconnectOnly;
+            for mutation in 0..5 {
+                let mut foreign = observed.clone();
+                match mutation {
+                    0 => foreign.id = TerminalId::new(),
+                    1 => foreign.proof.as_mut().unwrap().host_incarnation = "another-owner".into(),
+                    2 => foreign.launch.provider = Provider::Codex,
+                    3 => {
+                        foreign
+                            .launch
+                            .recipe
+                            .environment
+                            .insert("CLAUDE_CONFIG_DIR".into(), "/another-account".into());
+                    }
+                    _ => foreign.launch.recipe.arguments.push("--different".into()),
+                }
+                let mut retained = source.clone();
+                retained.learn_native_continuity_from(&foreign);
+                assert_eq!(retained, source);
+            }
+            let mut missing_proof = source.clone();
+            missing_proof.proof = None;
+            missing_proof.learn_native_continuity(&observed.native_continuity);
+            assert_eq!(
+                missing_proof.native_continuity,
+                NativeContinuity::ReconnectOnly
+            );
+            source.learn_native_continuity_from(&observed);
+            assert_eq!(source, observed);
+            assert!(source.has_valid_native_continuity());
+            source.learn_native_continuity(&NativeContinuity::ReconnectOnly);
+            assert_eq!(source, observed);
+            source.learn_native_continuity(&NativeContinuity::RetainedClaudeActor { protocol: 3 });
+            assert_eq!(source, observed);
         }
     }
 

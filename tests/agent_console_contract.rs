@@ -3,6 +3,9 @@
 #[path = "support/hosted_agent_cleanup.rs"]
 mod hosted_agent_cleanup;
 
+#[path = "support/private_cli_capture.rs"]
+mod private_cli_capture;
+
 use serde_json::Value;
 use std::{
     fs,
@@ -61,6 +64,31 @@ impl Fixture {
             fs::create_dir_all(root.path().join(directory)).unwrap();
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        // These console scenarios use a private checkout with a HEAD. Keep
+        // its Git identity, configuration and initial commit in this fixture.
+        for arguments in [
+            vec!["init", "--initial-branch=main", "--template="],
+            vec!["commit", "--allow-empty", "-m", "fixture"],
+        ] {
+            let output = Self::command(root.path(), Path::new("/usr/bin/git"))
+                .current_dir(root.path().join("project"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "private Git setup: {output:?}");
+        }
         let provider = root.path().join("bin/claude");
         fs::write(&provider, script).unwrap();
         fs::set_permissions(provider, fs::Permissions::from_mode(0o700)).unwrap();
@@ -77,7 +105,7 @@ impl Fixture {
         };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let output = fixture.output(&["daemon", "status"]);
+            let output = fixture.output_until(&["daemon", "status"], deadline);
             if output.status.success()
                 && serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"]["running"]
                     == true
@@ -91,13 +119,6 @@ impl Fixture {
     }
 
     fn output(&self, arguments: &[&str]) -> Output {
-        let mut child = Self::command(self.root.path(), Path::new(env!("CARGO_BIN_EXE_cagents")))
-            .arg("--json")
-            .args(arguments)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
         // Explicit close includes the provider's bounded interrupt/teardown
         // budget, which is deliberately longer than ordinary RPCs.
         let timeout = if arguments.starts_with(&["agent", "close"]) {
@@ -105,16 +126,15 @@ impl Fixture {
         } else {
             20
         };
-        let deadline = Instant::now() + Duration::from_secs(timeout);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let output = child.wait_with_output().unwrap();
-                panic!("CLI timed out: {arguments:?}: {output:?}");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        let output = child.wait_with_output().unwrap();
+        self.output_until(arguments, Instant::now() + Duration::from_secs(timeout))
+    }
+
+    fn output_until(&self, arguments: &[&str], deadline: Instant) -> Output {
+        let spec = private_cli_capture::private_cli(self.root.path())
+            .env("TERM", "xterm-256color")
+            .args(arguments.iter().copied());
+        let output = private_cli_capture::capture(spec, deadline)
+            .unwrap_or_else(|failure| panic!("CLI failed: {arguments:?}: {failure:?}"));
         self.agents.observe(&output);
         output
     }
@@ -130,6 +150,33 @@ impl Fixture {
         assert_eq!(value["ok"], true);
         assert_eq!(value["data"]["results"].as_array().unwrap().len(), 1);
         value["data"]["results"][0].clone()
+    }
+
+    /// Returns an `agent spawn --wait` receipt with its run, once settled, as
+    /// `settled`. The CLI's wait budget is not the contract under test: under
+    /// load a run can still be starting when it lapses, so this keeps waiting
+    /// on that exact run.
+    fn settled_spawn(&self, spawned: Output) -> Value {
+        let json = |output: &Output| {
+            // Exit 3 is the CLI's timed-out wait; anything else is a failure.
+            assert!(matches!(output.status.code(), Some(0 | 3)), "{output:?}");
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["ok"], true, "{value}");
+            value["data"].clone()
+        };
+        let mut receipt = json(&spawned);
+        let run = receipt["run"]["id"].as_str().unwrap().to_owned();
+        let mut settled = receipt.clone();
+        let mut timed_out = !spawned.status.success();
+        let hang_guard = Instant::now() + Duration::from_secs(120);
+        while timed_out {
+            assert!(Instant::now() < hang_guard, "run never settled: {settled}");
+            let waited = self.output(&["agent", "wait", &run, "--timeout", "10"]);
+            settled = json(&waited)["results"][0].clone();
+            timed_out = !waited.status.success();
+        }
+        receipt["settled"] = settled;
+        receipt
     }
 
     fn cli(&self, arguments: &[&str]) -> Value {
@@ -193,7 +240,7 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
     let mut first = None;
     for index in 0..100 {
         let name = format!("capacity-{index}");
-        let accepted = fixture.cli(&[
+        let spawned = fixture.output(&[
             "agent",
             "spawn",
             "--provider",
@@ -214,8 +261,9 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
             "--timeout",
             "10",
         ]);
-        assert_eq!(accepted["created"], true, "conversation {index}");
-        assert_eq!(accepted["timed_out"], false);
+        let receipt = fixture.settled_spawn(spawned);
+        assert_eq!(receipt["created"], true, "conversation {index}");
+        let accepted = &receipt["settled"];
         assert_eq!(accepted["agent"]["origin"], "User");
         assert_eq!(accepted["agent"]["closed"], false);
         assert!(accepted["agent"]["session"]["Chat"].is_object());
@@ -225,7 +273,7 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
         let run = accepted["run"]["id"].as_str().unwrap().to_owned();
         assert!(completed.insert(agent, run).is_none());
         if index == 0 {
-            first = Some(accepted);
+            first = Some(accepted.clone());
         }
     }
     assert_eq!(completed.len(), 100);
@@ -302,8 +350,10 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     let waiting = fixture.wait(&["agent", "wait", first_run, "--timeout", "10"], 5);
     assert_eq!(waiting["run"]["state"], "Waiting", "{waiting}");
     let terminal = waiting["agent"]["console"]["id"].as_str().unwrap();
-    // PTY snapshots can split the heading from its following instructions.
-    // Wait for the actionable line before asserting the complete request.
+    // Wait for the actionable line that ends the console's request block. The
+    // pretty request nearly fills the 24-row screen, so a run status line
+    // printed after it can scroll the block's heading off. Assert the action
+    // IDs the instruction refers to, which stay on screen beside it.
     let displayed = fixture.cli(&[
         "terminal",
         "wait",
@@ -313,12 +363,10 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
         "--timeout",
         "10",
     ]);
-    assert!(
-        displayed["snapshot"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Input requested")
-    );
+    let screen = displayed["snapshot"]["text"].as_str().unwrap();
+    for action in ["\"id\": \"allow\"", "\"id\": \"deny\""] {
+        assert!(screen.contains(action), "{action} in {displayed}");
+    }
     fixture.cli(&[
         "terminal",
         "write",
@@ -349,7 +397,12 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     ]);
     let deadline = Instant::now() + Duration::from_secs(10);
     let second = loop {
-        let second = fixture.cli(&["agent", "status", agent]);
+        let arguments = ["agent", "status", agent];
+        let output = fixture.output_until(&arguments, deadline);
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+        let second: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(second["ok"], true, "{second}");
+        let second = second["data"].clone();
         if second["run"]["id"] != first_run && second["run"]["state"] == "Succeeded" {
             break second;
         }
@@ -375,6 +428,31 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     );
     let closed = fixture.cli(&["agent", "close", agent]);
     assert_eq!(closed["agent"]["closed"], true);
+}
+
+#[test]
+fn repeated_private_cli_capture_does_not_renew_original_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let command = |script: &str| {
+        let mut spec = private_cli_capture::private_cli(root.path());
+        spec.program = "/bin/sh".into();
+        spec.arguments.clear();
+        spec.args(["-c", script])
+    };
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let output =
+        private_cli_capture::capture(command("sleep 2; printf first-poll"), deadline).unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"first-poll");
+
+    // This finite command fits a renewed four-second budget, but cannot
+    // finish in what remains after the first poll. Unlike a 300-second
+    // stall, it distinguishes a renewed budget from the original deadline.
+    let failure = private_cli_capture::capture(command("printf next-poll; exec sleep 3"), deadline)
+        .unwrap_err();
+    assert_eq!(failure.kind, cagents::process::ProcessFailureKind::TimedOut);
+    assert!(failure.started, "first poll exhausted the fixture budget");
+    assert_eq!(failure.stdout, b"next-poll");
 }
 
 #[test]

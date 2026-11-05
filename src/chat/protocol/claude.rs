@@ -45,6 +45,50 @@ pub(super) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Ad
     create_inner(launch, None, true)
 }
 
+/// Whether a non-JSON stdout line carries a complete Claude frame next to other
+/// text, as when a wrapper prints without a newline. Skipping that line would
+/// lose the frame, and a lost `result` or `control_request` never settles. A
+/// candidate must be a whole JSON object with the shape of a real frame, so
+/// ordinary text that merely has braces or mentions a frame type is still noise.
+pub(crate) fn embedded_protocol_frame(line: &[u8]) -> bool {
+    // Inspect a bounded number of objects, however many braces a line has.
+    const CANDIDATES: usize = 64;
+    if !line.windows(6).any(|window| window == b"\"type\"") {
+        return false;
+    }
+    let mut start = 0;
+    for _ in 0..CANDIDATES {
+        let Some(offset) = line[start..].iter().position(|byte| *byte == b'{') else {
+            return false;
+        };
+        let at = start + offset;
+        let mut values = serde_json::Deserializer::from_slice(&line[at..]).into_iter::<Value>();
+        match values.next() {
+            Some(Ok(value)) => {
+                if has_frame_shape(&value) {
+                    return true;
+                }
+                // Fields nested in a complete object are not top-level frames.
+                start = at + values.byte_offset();
+            }
+            _ => start = at + 1,
+        }
+    }
+    false
+}
+
+fn has_frame_shape(value: &Value) -> bool {
+    match value["type"].as_str() {
+        Some("result" | "system") => value["subtype"].is_string(),
+        Some("control_request") => value["request_id"].is_string() && value["request"].is_object(),
+        Some("control_cancel_request") => value["request_id"].is_string(),
+        Some("control_response") => value["response"].is_object(),
+        Some("assistant" | "user") => value["message"].is_object(),
+        Some("stream_event") => value["event"].is_object(),
+        _ => false,
+    }
+}
+
 /// Transient identity selected by the original adapter during preparation.
 /// A fresh UUID is not provider confirmation or a disk-resume descriptor.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -101,6 +145,7 @@ fn create_inner(
         );
     }
     let mut spec = ProcessSpec::from(&launch.recipe);
+    spec.stdout_noise = Some(embedded_protocol_frame);
     spec.arguments = arguments(launch)?;
     let history = launch
         .session_id
@@ -129,6 +174,8 @@ fn create_inner(
             resumed: launch.session_id.is_some(),
             history_only,
             forced_history,
+            turn_unsupported_content: false,
+            turn_visible_content: false,
             cwd: launch.recipe.working_directory.clone(),
             history,
             titles: super::claude_titles::ClaudeTitles::new(launch),
@@ -414,11 +461,15 @@ struct Claude {
     pending: HashMap<String, Value>,
     retired: VecDeque<String>,
     controls: HashMap<String, Value>,
+    unknown_frames: HashSet<String>,
     streams: HashMap<String, Stream>,
     /// Blocks of the messages still streaming. Claude emits each block's
     /// assistant frame before that block stops, so a message's blocks are
     /// dropped at its `message_stop`, or when its stream starts another message.
     blocks: HashMap<(ScopedId, u64), Item>,
+    /// Unknown block types still own their stream index. Their later deltas
+    /// must not mutate an older block or look like an orphan known block.
+    ignored_blocks: HashSet<(ScopedId, u64)>,
     stream_events: VecDeque<String>,
     carrier_offsets: HashMap<String, usize>,
     message_offsets: HashMap<ScopedId, usize>,
@@ -444,13 +495,19 @@ struct Claude {
     tool_order: VecDeque<ScopedId>,
     /// Running background tasks, oldest first.
     tasks: VecDeque<String>,
-    /// Report-producing tasks, oldest first. Preserve their explicit native
-    /// kind through progress frames, which omit it, until final notification.
+    /// Bounded origin metadata, not running state. Preserve the explicit
+    /// native kind through progress and terminal-notification replay.
     report_tasks: VecDeque<(String, ReportTask)>,
+    /// Exact successful child failure/result and task-notification receipts,
+    /// not bodies or running work. Changed payloads remain observable.
+    failure_receipts: VecDeque<[u8; 32]>,
     /// Agents whose report was handed back as a peer message, newest last,
     /// so the notification that follows it does not show it again.
     handed_back: VecDeque<String>,
     background_agents: HashSet<String>,
+    /// Agents whose settled run `SendMessage` started again: their tool row
+    /// still shows the earlier outcome, which the next receipt must replace.
+    restarted_agents: VecDeque<String>,
     /// The agent ID Claude Code gave each agent it runs in the background,
     /// with the Agent tool call that started it, oldest first. A task's frames
     /// name the agent by this ID, and after `SendMessage` resumes it, by no
@@ -460,9 +517,10 @@ struct Claude {
     /// with the task, oldest first: what stopping one subagent addresses,
     /// whether it runs in the foreground or the background.
     agent_task_calls: VecDeque<(String, String)>,
-    /// Agent tool calls whose agent was stopped, oldest first, so a delayed
-    /// launch or refused result cannot overwrite the terminal outcome.
-    stopped_agents: VecDeque<String>,
+    /// Agent tool calls whose agent ended, with how, oldest first, so a
+    /// delayed launch acknowledgement cannot reopen it and a refused result
+    /// cannot turn a stop into a failure.
+    ended_agents: VecDeque<(String, ToolStatus)>,
     models: Vec<Model>,
     selected: Option<String>,
     cache_read_tokens: u64,
@@ -487,8 +545,29 @@ struct Claude {
     /// A saved directory is gone; only its exact persisted history is readable.
     history_only: bool,
     forced_history: bool,
+    /// The running main turn received content this version cannot show.
+    turn_unsupported_content: bool,
+    /// The running main turn produced something the transcript can show.
+    turn_visible_content: bool,
 }
 impl Claude {
+    fn warn_unknown(&mut self, kind: &str, name: &str) {
+        // Provider-controlled names cannot grow the rate-limit map forever.
+        let key = format!("{kind}:{}", super::diagnostic_preview(name.as_bytes(), 128));
+        if self.unknown_frames.len() < 64 && self.unknown_frames.insert(key.clone()) {
+            tracing::warn!(frame_type = %key, "Skipping unknown Claude protocol frame");
+        }
+    }
+
+    fn remember_failure_receipt(&mut self, receipt: Option<[u8; 32]>) {
+        if let Some(receipt) = receipt {
+            self.failure_receipts.push_back(receipt);
+            if self.failure_receipts.len() > MAX_TOOLS {
+                self.failure_receipts.pop_front();
+            }
+        }
+    }
+
     fn observe_title(&mut self, step: &mut Step) {
         if let Some(id) = self.session_id.clone()
             && let Some(titles) = &mut self.titles
@@ -1201,6 +1280,9 @@ impl Claude {
         if self.retracted.contains(carrier) {
             return Ok(());
         }
+        // Capture provenance before this carrier updates correlation state.
+        // Replaying an old answer is not evidence that a blocked child resumed.
+        let fresh_live_carrier = !history && !self.carrier_items.contains_key(carrier);
         self.retract(&frame["supersedes"], step)?;
         let child = frame["parent_tool_use_id"]
             .as_str()
@@ -1212,6 +1294,54 @@ impl Claude {
         } else {
             Role::Assistant
         };
+        if let Some(parent) = child
+            && fresh_live_carrier
+            && role == Role::Assistant
+            && frame["error"].is_null()
+            && frame["isMeta"].as_bool() != Some(true)
+            && (frame["message"]["content"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty())
+                || frame["message"]["content"]
+                    .as_array()
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| match string(block, "type") {
+                            "text" => !string(block, "text").trim().is_empty(),
+                            "thinking" => !string(block, "thinking").trim().is_empty(),
+                            "redacted_thinking" => !string(block, "data").trim().is_empty(),
+                            "tool_use" | "server_tool_use" => {
+                                !string(block, "id").trim().is_empty()
+                                    && !string(block, "name").trim().is_empty()
+                            }
+                            "tool_result" => !string(block, "tool_use_id").trim().is_empty(),
+                            "image" => match string(&block["source"], "type") {
+                                "url" => !string(&block["source"], "url").trim().is_empty(),
+                                "base64" => {
+                                    matches!(
+                                        string(&block["source"], "media_type"),
+                                        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                                    ) && !string(&block["source"], "data").trim().is_empty()
+                                }
+                                _ => false,
+                            },
+                            "document" => ["data", "url", "text"]
+                                .iter()
+                                .any(|field| !string(&block["source"], field).trim().is_empty()),
+                            _ => false,
+                        })
+                    }))
+        {
+            step.events.push(Event::Subagent {
+                id: parent.into(),
+                kind: String::new(),
+                description: String::new(),
+                status: None,
+                background: None,
+                model: None,
+                waiting: Some(false),
+                detail: Some(String::new()),
+            });
+        }
         // Another agent's delivery is shown as one, including the hand-backs
         // Claude marks as meta.
         let delivered = if role == Role::User && !model_only(frame) {
@@ -1222,12 +1352,27 @@ impl Claude {
         } else {
             Vec::new()
         };
-        // Claude injects skill bodies as meta messages during a turn.
-        // They are context for the agent, not conversation messages.
+        if fresh_live_carrier && role == Role::User && child.is_none() && !model_only(frame) {
+            self.settle_live_notifications(frame, step);
+        }
+        // Explicit meta context is model-only. The wire isSynthetic marker is
+        // broader: it also covers intentionally visible compact summaries.
         if delivered.is_empty() && frame["isMeta"].as_bool() == Some(true) {
             self.track_carrier(carrier, Vec::new(), child);
             return Ok(());
         }
+        // Raw transcripts retain the more specific summary/transcript-only
+        // flags that stream-json folds into isSynthetic. All preserve their
+        // text under the same honest, generic provider-context disclosure.
+        let context = role == Role::User
+            && [
+                "isSynthetic",
+                "isCompactSummary",
+                "isVisibleInTranscriptOnly",
+            ]
+            .iter()
+            .any(|key| frame[*key].as_bool() == Some(true));
+        let content_role = if context { Role::System } else { role };
         let message = &frame["message"];
         let id = message["id"]
             .as_str()
@@ -1244,16 +1389,20 @@ impl Claude {
                 }));
             }
         } else if let Some(content) = message["content"].as_str() {
-            step.events.push(Event::Item(text_item(
-                format!("{id}:0"),
-                role,
-                if role == Role::User {
-                    slash_command_prompt(content).unwrap_or_else(|| content.into())
-                } else {
-                    content.into()
-                },
-                false,
-            )));
+            step.events.push(Event::Item(if context {
+                context_item(format!("{id}:0"), content.into())
+            } else {
+                text_item(
+                    format!("{id}:0"),
+                    role,
+                    if role == Role::User {
+                        slash_command_prompt(content).unwrap_or_else(|| content.into())
+                    } else {
+                        content.into()
+                    },
+                    false,
+                )
+            }));
         } else if let Some(content) = message["content"].as_array() {
             let message_key = ScopedId::new(child, id);
             let base = frame["_cagents_block_base"]
@@ -1345,7 +1494,17 @@ impl Claude {
                     .map(|((_, index), _)| *index as usize)
                     .min()
                     .unwrap_or(base + index);
-                match string(block, "type") {
+                let block_type = match required(block, "type") {
+                    Ok(block_type) => block_type,
+                    // One damaged saved block must not make the whole
+                    // conversation unreadable. Live frames stay strict.
+                    Err(_) if history => {
+                        self.warn_unknown("content", "<untyped>");
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                match block_type {
                     "text" | "thinking" | "redacted_thinking" => {
                         let thinking = string(block, "type") != "text";
                         let text = if string(block, "type") == "redacted_thinking" {
@@ -1353,12 +1512,11 @@ impl Claude {
                         } else {
                             string(block, if thinking { "thinking" } else { "text" })
                         };
-                        step.events.push(Event::Item(text_item(
-                            format!("{id}:{index}"),
-                            role,
-                            text.into(),
-                            thinking,
-                        )));
+                        step.events.push(Event::Item(if context {
+                            context_item(format!("{id}:{index}"), text.into())
+                        } else {
+                            text_item(format!("{id}:{index}"), role, text.into(), thinking)
+                        }));
                     }
                     "tool_use" | "server_tool_use" => {
                         let tool_id = required(block, "id")?.to_owned();
@@ -1475,15 +1633,21 @@ impl Claude {
                         {
                             // A nested agent's progress never reaches this
                             // conversation, so only its launch is known.
-                            if child.is_none() && async_launch(frame) {
-                                self.background_agents.insert(tool_id.clone());
+                            let launched = child.is_none() && async_launch(frame);
+                            let ended = self.ended_agent(&tool_id);
+                            if launched {
+                                if ended.is_none() {
+                                    self.background_agents.insert(tool_id.clone());
+                                }
                                 if let Some(agent) = frame["tool_use_result"]["agentId"].as_str() {
                                     self.agent_call(agent, &tool_id);
                                 }
                             }
                             let background = self.background_agents.contains(&tool_id);
-                            let status = if self.stopped_agents.contains(&tool_id) {
-                                ToolStatus::Stopped
+                            let status = if let Some(ended) =
+                                ended.filter(|ended| launched || *ended == ToolStatus::Stopped)
+                            {
+                                ended
                             } else if background
                                 && item.content.status() == Some(ToolStatus::Succeeded)
                             {
@@ -1524,7 +1688,7 @@ impl Claude {
                     }
                     "image" => step.events.push(Event::Item(Item {
                         id: format!("{id}:{index}"),
-                        role,
+                        role: content_role,
                         content: match image_content(block) {
                             ItemContent::Image {
                                 path, description, ..
@@ -1549,7 +1713,7 @@ impl Claude {
                     })),
                     "document" => step.events.push(Event::Item(Item {
                         id: format!("{id}:{index}"),
-                        role,
+                        role: content_role,
                         content: ItemContent::Image {
                             reference: None,
                             path: String::new(),
@@ -1558,16 +1722,31 @@ impl Claude {
                         started_at: None,
                         at: None,
                     })),
-                    other => step.events.push(Event::Item(text_item(
-                        format!("{id}:{index}"),
-                        role,
-                        format!("Unsupported Claude content block {other}: {block}"),
-                        false,
-                    ))),
+                    other => {
+                        self.warn_unknown("content", other);
+                        if !history && child.is_none() && role == Role::Assistant {
+                            self.turn_unsupported_content = true;
+                        }
+                    }
                 }
             }
         }
         if role == Role::Assistant {
+            if !history
+                && child.is_none()
+                && step.events[event_start..]
+                    .iter()
+                    .any(|event| matches!(event, Event::Item(_)))
+            {
+                self.turn_visible_content = true;
+            }
+            if frame["error"].as_str().is_some() {
+                for event in &mut step.events[event_start..] {
+                    if let Event::Item(item) = event {
+                        chat::failure::mark_provider_error(Provider::Claude, item);
+                    }
+                }
+            }
             if child.is_none()
                 && let Some(usage) = frame["context_usage"].as_object()
             {
@@ -1583,7 +1762,14 @@ impl Claude {
             }
             if let Some(error) = frame["error"].as_str() {
                 step.events.push(Event::Error {
-                    message: format!("Claude: {error}"),
+                    message: {
+                        let body = content_text(&message["content"]);
+                        if body.is_empty() {
+                            format!("Claude: {error}")
+                        } else {
+                            format!("Claude: {error}\n{body}")
+                        }
+                    },
                     fatal: false,
                 });
             }
@@ -1622,12 +1808,238 @@ impl Claude {
         }
         Ok(())
     }
+    fn agent_tool(&self, tool: &str) -> bool {
+        self.unique_tool_named(tool, "Agent")
+    }
+
+    fn unique_tool_named(&self, tool: &str, expected: &str) -> bool {
+        let mut candidates = self.tools.iter().filter(|(key, _)| key.id == tool);
+        candidates.next().is_some_and(
+            |(_, item)| matches!(&item.content, ItemContent::Tool { name, .. } if name == expected),
+        ) && candidates.next().is_none()
+    }
+
+    /// Notifications have no transcript scope. Resolve only one existing Agent,
+    /// and never let a contradictory tool hint retarget a known task owner.
+    fn task_agent(
+        &self,
+        task: &str,
+        reported: Option<&str>,
+        started: bool,
+    ) -> Result<Option<String>, ()> {
+        let launched = self
+            .agent_calls
+            .iter()
+            .find(|(agent, _)| agent == task)
+            .map(|(_, tool)| tool.as_str());
+        let bindings = || {
+            self.agent_task_calls
+                .iter()
+                .filter(|(_, known)| known == task)
+        };
+        let owner = launched
+            .or_else(|| {
+                bindings()
+                    .find(|(tool, _)| self.agent_tool(tool))
+                    .map(|(tool, _)| tool.as_str())
+            })
+            .or_else(|| bindings().next().map(|(tool, _)| tool.as_str()));
+        if let Some(owner) = owner {
+            if (self.tools.keys().any(|key| key.id == owner) && !self.agent_tool(owner))
+                || bindings().any(|(tool, _)| {
+                    tool != owner
+                        && (self.agent_tool(tool)
+                            || (launched.is_none() && !self.agent_tool(owner)))
+                })
+            {
+                return Err(());
+            }
+            // SendMessage names its own call when it restarts an Agent. That
+            // alias is valid on the start, on its already recorded task, or
+            // when it is that SendMessage call: a resumed run's start need not
+            // name it, but its receipt does.
+            if reported.is_some_and(|tool| {
+                tool != owner
+                    && (self.agent_tool(tool)
+                        || (!started
+                            && !self.unique_tool_named(tool, "SendMessage")
+                            && !bindings().any(|(known, _)| known == tool)))
+            }) {
+                return Err(());
+            }
+            // A task can arrive before its Agent tool. Retain its bounded
+            // lifecycle binding without inventing that Agent's presentation.
+            return Ok(Some(owner.to_owned()));
+        }
+        let Some(tool) = reported.filter(|tool| self.agent_tool(tool)) else {
+            return Ok(None);
+        };
+        // A launch acknowledgement's agentId need not match the task ID that
+        // later reports on it. While the reported Agent is still running in the
+        // background, that acknowledgement alone does not contradict its tool.
+        if !started
+            && (self
+                .agent_task_calls
+                .iter()
+                .any(|(known, bound)| known == tool && bound != task)
+                || (!self.background_agents.contains(tool)
+                    && self
+                        .agent_calls
+                        .iter()
+                        .any(|(bound, known)| known == tool && bound != task)))
+        {
+            return Err(());
+        }
+        Ok(Some(tool.to_owned()))
+    }
+
+    /// Shared live-text/system lifecycle reducer. A terminal receipt preserves
+    /// an earlier stop; only an actual task_started can restart that owner.
+    fn update_task_agent(
+        &mut self,
+        task: &str,
+        owner: Option<&str>,
+        started: bool,
+        ended: Option<ToolStatus>,
+        status: ToolStatus,
+        step: &mut Step,
+    ) -> ToolStatus {
+        let Some(tool) = owner else { return status };
+        let background = self.background_agents.contains(tool)
+            || self
+                .agent_calls
+                .iter()
+                .any(|(agent, known)| agent == task && known == tool);
+        let status = if started {
+            self.ended_agents.retain(|(known, _)| known != tool);
+            if self
+                .tools
+                .get(&ScopedId::new(None, tool))
+                .and_then(|item| item.content.status())
+                .is_some_and(|status| status != ToolStatus::Running)
+            {
+                if !self.restarted_agents.iter().any(|known| known == tool) {
+                    self.restarted_agents.push_back(tool.into());
+                    if self.restarted_agents.len() > MAX_TOOLS {
+                        self.restarted_agents.pop_front();
+                    }
+                }
+            }
+            ToolStatus::Running
+        } else if ended.is_some() && self.ended_agent(tool) == Some(ToolStatus::Stopped) {
+            ToolStatus::Stopped
+        } else {
+            status
+        };
+        if !started && ended.is_some() {
+            self.tasks.retain(|running| running != task);
+            if self.ended_agent(tool) != Some(ToolStatus::Stopped) {
+                self.ended_agents.retain(|(known, _)| known != tool);
+                self.ended_agents.push_back((tool.into(), status));
+                if self.ended_agents.len() > MAX_TOOLS {
+                    self.ended_agents.pop_front();
+                }
+            }
+        }
+        // The child's own result already settled this Agent with its exact
+        // diagnostic. Repeating the same terminal status would clear it.
+        let settled = !started
+            && ended.is_some()
+            && !self.background_agents.contains(tool)
+            && !self.restarted_agents.iter().any(|known| known == tool)
+            && self
+                .tools
+                .get(&ScopedId::new(None, tool))
+                .and_then(|item| item.content.status())
+                == Some(status);
+        if !settled
+            && (self.agent_tool(tool) || background)
+            && (background || started || ended.is_some())
+        {
+            step.events.push(Event::Subagent {
+                model: None,
+                waiting: None,
+                detail: None,
+                id: tool.into(),
+                kind: String::new(),
+                description: String::new(),
+                status: Some(status),
+                background: background.then_some(true),
+            });
+            if background && status == ToolStatus::Running {
+                self.background_agents.insert(tool.into());
+            } else if status != ToolStatus::Running {
+                self.background_agents.remove(tool);
+                self.restarted_agents.retain(|known| known != tool);
+            }
+        }
+        status
+    }
+
+    fn settle_live_notifications(&mut self, frame: &Value, step: &mut Step) {
+        let Some(content) = recorded_notification(frame) else {
+            return;
+        };
+        // A result is opaque and may quote an unclosed notification opener.
+        // Keep the outcome parser's fallback only when both that result and
+        // its outer notification close; truncated live reports stay inert.
+        let closed_result = content
+            .split_once(NOTIFICATION_OPEN)
+            .and_then(|(_, outer)| outer.trim_end().strip_suffix("</task-notification>"))
+            .and_then(|inner| inner.split_once("<result>"))
+            .is_some_and(|(_, result)| result.trim_end().ends_with("</result>"));
+        if notification_elements(&content).is_empty() && !closed_result {
+            return;
+        }
+        for (reported, task, status) in notification_outcomes(&content) {
+            if task.is_empty() {
+                continue;
+            }
+            // Only an Agent's notice settles its task. Other tasks, such as a
+            // Monitor, notify while they still run, and an unmatched advisory
+            // remains a Delivery rather than an invented task.
+            let Ok(Some(owner)) = self.task_agent(
+                &task,
+                (!reported.is_empty()).then_some(reported.as_str()),
+                false,
+            ) else {
+                continue;
+            };
+            let id = format!("claude-task:{task}");
+            let key = ScopedId::new(None, &id);
+            let status =
+                self.update_task_agent(&task, Some(&owner), false, Some(status), status, step);
+            self.tasks.retain(|running| running != &task);
+            let represented = self.agent_tool(&owner);
+            if let Some(item) = self.tools.get_mut(&key)
+                && let ItemContent::Tool {
+                    status: current, ..
+                } = &mut item.content
+            {
+                *current = status;
+                if represented {
+                    if self.visible_task_rows.remove(&id) {
+                        step.events.push(Event::ItemsRemoved { ids: vec![id] });
+                    }
+                } else if self.visible_task_rows.contains(&id) {
+                    step.events.push(Event::Item(item.clone()));
+                }
+            }
+        }
+    }
+
     fn agent_call(&mut self, agent: &str, tool: &str) {
         self.agent_calls.retain(|(known, _)| known != agent);
         self.agent_calls.push_back((agent.into(), tool.into()));
         if self.agent_calls.len() > MAX_TOOLS {
             self.agent_calls.pop_front();
         }
+    }
+    fn ended_agent(&self, tool: &str) -> Option<ToolStatus> {
+        self.ended_agents
+            .iter()
+            .find(|(known, _)| known == tool)
+            .map(|(_, status)| *status)
     }
     fn track_carrier(&mut self, carrier: &str, ids: Vec<String>, parent: Option<&str>) {
         if !self.carrier_items.contains_key(carrier) {
@@ -1813,6 +2225,9 @@ impl Adapter for Claude {
         );
         Ok(step)
     }
+    fn initialization_pending(&self) -> bool {
+        !self.history_only && !self.ready
+    }
     fn initialize(&mut self) -> Result<Step, String> {
         let mut step = if self.history_only {
             Step::default()
@@ -1877,7 +2292,10 @@ impl Adapter for Claude {
                 for mut frame in frames {
                     frame["parent_tool_use_id"] = json!(parent);
                     let mut child_step = Step::default();
-                    if self.message(&frame, &mut child_step).is_ok() {
+                    if self
+                        .message_with_tools(&frame, &mut child_step, &HashMap::new(), true)
+                        .is_ok()
+                    {
                         history_step.events.extend(child_step.events);
                     }
                 }
@@ -2142,6 +2560,29 @@ impl Adapter for Claude {
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
+        // Reject only exact previously accepted receipts, before metadata or
+        // lifecycle bookkeeping. An old child failure cannot re-block fresh
+        // activity; parent result and unrelated SDK frames are untouched.
+        let child = frame["parent_tool_use_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty());
+        let guarded = match string(&frame, "type") {
+            "result" => child,
+            "stream_event" => child && string(&frame["event"], "type") == "error",
+            "system" => string(&frame, "subtype") == "task_notification",
+            _ => false,
+        };
+        let receipt = if guarded {
+            scoped_failure_receipt(&frame)?
+        } else {
+            None
+        };
+        if receipt
+            .as_ref()
+            .is_some_and(|key| self.failure_receipts.contains(key))
+        {
+            return Ok(step);
+        }
         if frame["parent_tool_use_id"].is_null() {
             self.fast_mode_metadata(&frame, &mut step);
         }
@@ -2178,7 +2619,7 @@ impl Adapter for Claude {
                 title: None,
             });
         }
-        match string(&frame, "type") {
+        match required(&frame, "type")? {
             "control_request" => return self.permission(frame),
             "control_cancel_request" => {
                 self.retire(required(&frame, "request_id")?.into(), &mut step);
@@ -2191,6 +2632,7 @@ impl Adapter for Claude {
                 self.retired.clear();
                 self.streams.clear();
                 self.blocks.clear();
+                self.ignored_blocks.clear();
                 self.carrier_offsets.clear();
                 self.message_offsets.clear();
                 self.message_order.clear();
@@ -2204,8 +2646,9 @@ impl Adapter for Claude {
                 self.tool_order.clear();
                 self.tasks.clear();
                 self.report_tasks.clear();
+                self.failure_receipts.clear();
                 self.agent_task_calls.clear();
-                self.stopped_agents.clear();
+                self.ended_agents.clear();
                 self.handed_back.clear();
                 self.submissions.clear();
                 self.queued.clear();
@@ -2436,7 +2879,7 @@ impl Adapter for Claude {
                 }
             }
             "stream_event" => {
-                if let Some(id) = frame["uuid"].as_str() {
+                if !guarded && let Some(id) = frame["uuid"].as_str() {
                     if self.stream_events.iter().any(|seen| seen == id) {
                         return Ok(step);
                     }
@@ -2455,14 +2898,8 @@ impl Adapter for Claude {
                 }
             }
             "result" => {
-                if frame["parent_tool_use_id"].is_null() {
-                    self.observe_title(&mut step);
-                }
-                let can_suggest = frame["parent_tool_use_id"].is_null()
-                    && frame["is_error"] != true
-                    && frame["subtype"] == "success"
-                    && self.interruption.is_none()
-                    && self.started_generation == Some(self.attention_generation);
+                // A delegated result still carries scoped permission evidence,
+                // even though it must never settle the parent turn.
                 for denial in frame["permission_denials"]
                     .as_array()
                     .into_iter()
@@ -2475,6 +2912,87 @@ impl Adapter for Claude {
                         &mut step,
                     )?;
                 }
+                if let Some(parent) = frame["parent_tool_use_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                {
+                    // A child result settles this exact delegated turn, not the
+                    // parent's prompt, usage, interrupt or accepted execution.
+                    let errors = content_text(&frame["errors"]);
+                    let detail = if !errors.is_empty() {
+                        errors
+                    } else {
+                        string(&frame, "result").to_owned()
+                    };
+                    let status = if self.ended_agent(parent) == Some(ToolStatus::Stopped) {
+                        ToolStatus::Stopped
+                    } else if frame["is_error"].as_bool() == Some(true) {
+                        ToolStatus::Failed
+                    } else {
+                        ToolStatus::Succeeded
+                    };
+                    self.background_agents.remove(parent);
+                    if let Some(Item {
+                        content: ItemContent::Tool { status: known, .. },
+                        ..
+                    }) = self.tools.get_mut(&ScopedId::new(None, parent))
+                    {
+                        *known = status;
+                    }
+                    self.tasks.retain(|task| {
+                        !self
+                            .agent_task_calls
+                            .iter()
+                            .any(|(tool, known)| tool == parent && known == task)
+                            && !self
+                                .agent_calls
+                                .iter()
+                                .any(|(known, tool)| tool == parent && known == task)
+                    });
+                    if let Some(stream) = self.streams.remove(parent) {
+                        self.settle(Some(parent), &stream.message);
+                    }
+                    if frame["is_error"].as_bool() == Some(true) && !detail.is_empty() {
+                        step.events.push(Event::SubagentItem {
+                            id: parent.into(),
+                            item: child_failure_item(&frame, "result-error", detail.clone()),
+                        });
+                    }
+                    step.events.push(Event::Subagent {
+                        id: parent.into(),
+                        kind: String::new(),
+                        description: String::new(),
+                        status: Some(status),
+                        background: None,
+                        model: None,
+                        waiting: Some(false),
+                        detail: Some(detail),
+                    });
+                    self.remember_failure_receipt(receipt);
+                    return Ok(step);
+                }
+                if frame["parent_tool_use_id"].is_null() {
+                    self.observe_title(&mut step);
+                }
+                // A successful reply must not look empty when its only content
+                // could not be shown. The private content itself stays omitted.
+                if std::mem::take(&mut self.turn_unsupported_content)
+                    && !std::mem::take(&mut self.turn_visible_content)
+                    && frame["is_error"] != true
+                {
+                    step.events.push(Event::Item(unsupported_content_item(
+                        frame["uuid"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    )));
+                }
+                self.turn_visible_content = false;
+                let can_suggest = frame["parent_tool_use_id"].is_null()
+                    && frame["is_error"] != true
+                    && frame["subtype"] == "success"
+                    && self.interruption.is_none()
+                    && self.started_generation == Some(self.attention_generation);
                 let had_turn = self.busy;
                 let interruption = self.interruption.take();
                 if had_turn || frame["uuid"].as_str().is_some() {
@@ -2698,8 +3216,9 @@ impl Adapter for Claude {
                 }
             }
             "keep_alive" => {}
-            other => return Err(format!("Unsupported Claude stream-json frame type {other}")),
+            other => self.warn_unknown("frame", other),
         }
+        self.remember_failure_receipt(receipt);
         Ok(step)
     }
 }
@@ -2861,6 +3380,50 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("Claude protocol frame is missing {key}"))
 }
+/// Explicit child API/result failures retain their original diagnostic in
+/// history as well as transient status. A carrier identifies exact replay;
+/// without one, distinct actual receipts must never share a fabricated ID.
+fn child_failure_item(frame: &Value, source: &str, message: String) -> Item {
+    let carrier = frame["uuid"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mut item = text_item(
+        format!("claude-{source}:{carrier}:0"),
+        Role::System,
+        message,
+        false,
+    );
+    chat::failure::mark_provider_error(Provider::Claude, &mut item);
+    item
+}
+
+/// Hash the already parsed frame without allocating another full diagnostic.
+/// UUID-less receipts have no replay authority and are always processed.
+fn scoped_failure_receipt(frame: &Value) -> Result<Option<[u8; 32]>, String> {
+    if frame["uuid"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .is_none()
+    {
+        return Ok(None);
+    }
+    struct HashWriter(sha2::Sha256);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            sha2::Digest::update(&mut self.0, bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(<sha2::Sha256 as sha2::Digest>::new());
+    serde_json::to_writer(&mut writer, frame).map_err(|error| error.to_string())?;
+    Ok(Some(sha2::Digest::finalize(writer.0).into()))
+}
+
 /// A child frame belongs to its agent's transcript, even when Claude gives it
 /// the wire role `user` for an internal prompt or tool result.
 fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
@@ -2901,6 +3464,18 @@ fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
             Event::ItemsRemoved { ids } => Event::SubagentItemsRemoved {
                 id: parent.into(),
                 ids,
+            },
+            Event::Error { message, .. } => Event::Subagent {
+                id: parent.into(),
+                kind: String::new(),
+                description: String::new(),
+                // A retryable API error is not proof that the task stopped.
+                // Keep its exact status, but expose that it needs attention.
+                status: None,
+                background: None,
+                model: None,
+                waiting: Some(true),
+                detail: Some(message),
             },
             event => event,
         })
@@ -3004,9 +3579,44 @@ fn delivery(frame: &Value) -> Vec<ItemContent> {
 
 /// Claude marks as meta what it injects for the model alone, such as a
 /// skill's body. A peer's delivery is marked too, being meta to the model,
-/// but is a message to the reader.
+/// but is a message to the reader. The broader isSynthetic flag cannot prove
+/// model-only intent: visible compact summaries carry that flag as well.
 fn model_only(frame: &Value) -> bool {
     frame["isMeta"].as_bool() == Some(true) && string(&frame["origin"], "kind") != "peer"
+}
+
+/// Preserve opaque provider context without attributing it to the user, a
+/// particular tool, or another agent. System notices are explicit disclosures.
+fn context_item(id: String, body: String) -> Item {
+    Item {
+        id,
+        role: Role::System,
+        content: ItemContent::Delivery {
+            kind: DeliveryKind::Notice,
+            from: String::new(),
+            sender: String::new(),
+            summary: "Claude context".into(),
+            body,
+        },
+        started_at: None,
+        at: None,
+    }
+}
+
+fn unsupported_content_item(result: String) -> Item {
+    Item {
+        id: format!("{result}:unsupported-content"),
+        role: Role::System,
+        content: ItemContent::Delivery {
+            kind: DeliveryKind::Notice,
+            from: String::new(),
+            sender: String::new(),
+            summary: "Claude sent unsupported content, which was omitted".into(),
+            body: String::new(),
+        },
+        started_at: None,
+        at: None,
+    }
 }
 
 /// The text of a message whose content is a string or a list of text blocks.
@@ -3805,7 +4415,7 @@ impl Claude {
     fn stream(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
         let event = &frame["event"];
         let parent = string(frame, "parent_tool_use_id").to_owned();
-        match string(event, "type") {
+        match required(event, "type")? {
             "message_start" => {
                 if self.streams.len() >= MAX_PENDING && !self.streams.contains_key(&parent) {
                     return Err("Too many simultaneous Claude streams".into());
@@ -3830,16 +4440,39 @@ impl Claude {
                     self.start_turn(step);
                     self.update_usage(&event["message"]["usage"], step);
                     self.status(true, "Claude is working", step);
+                } else {
+                    // Only actual new child API activity clears a retryable
+                    // child failure; an unrelated background notice cannot.
+                    step.events.push(Event::Subagent {
+                        id: parent.clone(),
+                        kind: String::new(),
+                        description: String::new(),
+                        status: None,
+                        background: None,
+                        model: None,
+                        waiting: Some(false),
+                        detail: Some(String::new()),
+                    });
                 }
             }
             "content_block_start" => {
+                let block = &event["content_block"];
+                let block_type = required(block, "type")?;
+                // Overflow still requires valid known protocol fields.
+                if matches!(block_type, "tool_use" | "server_tool_use") {
+                    required(block, "id")?;
+                    required(block, "name")?;
+                }
                 let stream = self
                     .streams
                     .get_mut(&parent)
                     .ok_or("Claude block arrived before message_start")?;
                 let message = stream.message.clone();
                 let index = event["index"].as_u64().ok_or("Claude block has no index")?;
-                if self.blocks.len() >= MAX_TOOLS {
+                let key = (ScopedId::new(Some(&parent), &message), index);
+                self.blocks.remove(&key);
+                self.ignored_blocks.remove(&key);
+                if self.blocks.len() + self.ignored_blocks.len() >= MAX_TOOLS {
                     if !stream.truncated {
                         stream.truncated = true;
                         step.events.push(Event::Error {
@@ -3849,8 +4482,7 @@ impl Claude {
                     }
                     return Ok(());
                 }
-                let block = &event["content_block"];
-                let item = match string(block, "type") {
+                let item = match block_type {
                     "text" => text_item(
                         format!("{message}:{index}"),
                         Role::Assistant,
@@ -3882,13 +4514,17 @@ impl Claude {
                         at: None,
                     },
                     other => {
-                        step.events.push(Event::Error {
-                            message: format!("Unsupported Claude streaming content block {other}"),
-                            fatal: false,
-                        });
+                        self.ignored_blocks.insert(key);
+                        self.warn_unknown("stream content", other);
+                        if parent.is_empty() {
+                            self.turn_unsupported_content = true;
+                        }
                         return Ok(());
                     }
                 };
+                if parent.is_empty() {
+                    self.turn_visible_content = true;
+                }
                 if !matches!(&item.content, ItemContent::Tool { .. })
                     || !self.completed_tool(Some(&parent), &item.id)
                 {
@@ -3904,8 +4540,35 @@ impl Claude {
                     .ok_or("Claude delta arrived before message_start")?;
                 let index = event["index"].as_u64().ok_or("Claude delta has no index")?;
                 let delta = &event["delta"];
-                if matches!(string(delta, "type"), "signature_delta" | "citations_delta") {
+                let delta_type = required(delta, "type")?;
+                if self
+                    .ignored_blocks
+                    .contains(&(ScopedId::new(Some(&parent), &stream.message), index))
+                {
                     return Ok(());
+                }
+                if matches!(delta_type, "signature_delta" | "citations_delta") {
+                    return Ok(());
+                }
+                let payload_field = match delta_type {
+                    "text_delta" => "text",
+                    "thinking_delta" => "thinking",
+                    "input_json_delta" => "partial_json",
+                    other => {
+                        self.warn_unknown("stream delta", other);
+                        return Ok(());
+                    }
+                };
+                // A discarded known block still requires a well-formed known
+                // delta. Only an explicitly ignored future block bypasses its
+                // payload, above; budget truncation must not hide corruption.
+                if !delta[payload_field].is_string() {
+                    return Err(if delta_type == "input_json_delta" {
+                        "Claude tool input delta has no string payload"
+                    } else {
+                        "Claude text delta has no string payload"
+                    }
+                    .into());
                 }
                 let Some(item) = self
                     .blocks
@@ -3928,7 +4591,7 @@ impl Claude {
                 {
                     return Ok(());
                 }
-                match (&mut item.content, string(delta, "type")) {
+                match (&mut item.content, delta_type) {
                     (ItemContent::Text { text, thinking, .. }, "text_delta" | "thinking_delta") => {
                         let value = delta[if *thinking { "thinking" } else { "text" }]
                             .as_str()
@@ -3970,6 +4633,12 @@ impl Claude {
                 let index = event["index"]
                     .as_u64()
                     .ok_or("Claude block stop has no index")?;
+                if self
+                    .ignored_blocks
+                    .remove(&(ScopedId::new(Some(&parent), &message), index))
+                {
+                    return Ok(());
+                }
                 if let Some(mut item) = self
                     .blocks
                     .get(&(ScopedId::new(Some(&parent), &message), index))
@@ -4024,14 +4693,24 @@ impl Claude {
                 }
             }
             "ping" => {}
-            "error" => step.events.push(Event::Error {
-                message: content_text(&event["error"]),
-                fatal: false,
-            }),
-            other => step.events.push(Event::Error {
-                message: format!("Unsupported Claude API stream event {other}"),
-                fatal: false,
-            }),
+            "error" => {
+                let message = content_text(&event["error"]);
+                if !parent.is_empty() {
+                    // Transient child detail is cleared by terminal task
+                    // notifications. Keep explicit API failures in that child's
+                    // transcript as well, with the same exact original cause.
+                    step.events.push(Event::Item(child_failure_item(
+                        frame,
+                        "stream-error",
+                        message.clone(),
+                    )));
+                }
+                step.events.push(Event::Error {
+                    message,
+                    fatal: false,
+                });
+            }
+            other => self.warn_unknown("stream event", other),
         }
         Ok(())
     }
@@ -4039,6 +4718,7 @@ impl Claude {
     fn settle(&mut self, parent: Option<&str>, message: &str) {
         let key = ScopedId::new(parent, message);
         self.blocks.retain(|(id, _), _| id != &key);
+        self.ignored_blocks.retain(|(id, _)| id != &key);
     }
 
     fn permission_denied(
@@ -4089,6 +4769,7 @@ impl Claude {
     }
 
     fn system(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
+        let subtype = required(frame, "subtype")?;
         // Both initial metadata and autonomous plan-mode transitions report
         // the effective permission mode, independent of our control replies.
         if let Some(mode) = frame["permissionMode"].as_str() {
@@ -4096,7 +4777,7 @@ impl Claude {
                 if mode == "default" { "manual" } else { mode }.into(),
             )));
         }
-        match string(frame, "subtype") {
+        match subtype {
             "permission_denied" => {
                 self.permission_denied(frame["parent_tool_use_id"].as_str(), frame, step)?
             }
@@ -4137,6 +4818,25 @@ impl Claude {
             ))),
             "task_started" | "task_progress" | "task_notification" | "task_updated" => {
                 let task = required(frame, "task_id")?;
+                let started = string(frame, "subtype") == "task_started";
+                let Ok(known_tool) = self.task_agent(task, frame["tool_use_id"].as_str(), started)
+                else {
+                    // Contradictory advisory identities do not retarget an
+                    // existing owner or make the conversation fail.
+                    return Ok(());
+                };
+                let known_tool = known_tool.or_else(|| {
+                    // Preserve unresolved local-agent lifecycle metadata and
+                    // its fallback task row before the Agent tool arrives.
+                    (started && string(frame, "task_type") == "local_agent")
+                        .then(|| {
+                            frame["tool_use_id"]
+                                .as_str()
+                                .filter(|tool| !tool.is_empty())
+                                .map(str::to_owned)
+                        })
+                        .flatten()
+                });
                 let id = format!("claude-task:{task}");
                 let previous = self.tools.get(&ScopedId::new(None, &id)).cloned();
                 let mut item = previous.unwrap_or(Item {
@@ -4202,81 +4902,25 @@ impl Claude {
                         *status
                     });
                 }
-                let parent = frame["tool_use_id"]
-                    .as_str()
-                    .filter(|parent| self.background_agents.contains(*parent))
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        self.agent_calls
-                            .iter()
-                            .find(|(agent, _)| agent == task)
-                            .map(|(_, tool)| tool.clone())
-                    });
-                // Keep task identity even after removing a stopped agent from
-                // the running set: its tool result can arrive afterwards.
-                let known_tool = parent.clone().or_else(|| {
-                    self.agent_task_calls
-                        .iter()
-                        .find(|(_, known)| known == task)
-                        .map(|(tool, _)| tool.clone())
-                });
                 // Lifecycle bookkeeping and notification summaries still need
                 // the synthetic tool. Only its duplicate presentation is hidden.
                 let represented = known_tool
                     .as_deref()
                     .or_else(|| frame["tool_use_id"].as_str())
-                    .is_some_and(|tool| {
-                        // Task notifications do not identify a transcript. A
-                        // unique nested Agent is valid prior correlation, but
-                        // an opaque ID shared by multiple scopes is ambiguous.
-                        let mut candidates = self.tools.iter().filter(|(key, _)| key.id == tool);
-                        let candidate = candidates.next();
-                        candidate.is_some_and(|(_, item)| matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent"))
-                            && candidates.next().is_none()
-                    });
-                if let Some(tool) = &known_tool {
-                    if string(frame, "subtype") == "task_started" {
-                        self.stopped_agents.retain(|known| known != tool);
-                    } else if ended == Some(ToolStatus::Stopped)
-                        && !self.stopped_agents.contains(tool)
-                    {
-                        self.stopped_agents.push_back(tool.clone());
-                        if self.stopped_agents.len() > MAX_TOOLS {
-                            self.stopped_agents.pop_front();
-                        }
-                    }
-                }
-                if let Some(parent) = parent {
-                    let status = item.content.status().unwrap_or(ToolStatus::Running);
-                    step.events.push(Event::Subagent {
-                        model: None,
-                        waiting: None,
-                        detail: None,
-                        id: parent.clone(),
-                        kind: String::new(),
-                        description: String::new(),
-                        status: Some(status),
-                        background: Some(true),
-                    });
-                    if status == ToolStatus::Running {
-                        self.background_agents.insert(parent);
-                    } else {
-                        self.background_agents.remove(&parent);
-                    }
-                } else if (ended == Some(ToolStatus::Stopped)
-                    || string(frame, "subtype") == "task_started")
-                    && let Some(tool) = known_tool
+                    .is_some_and(|tool| self.agent_tool(tool));
+                let status = self.update_task_agent(
+                    task,
+                    known_tool.as_deref(),
+                    started,
+                    ended,
+                    item.content.status().unwrap_or(ToolStatus::Running),
+                    step,
+                );
+                if let ItemContent::Tool {
+                    status: current, ..
+                } = &mut item.content
                 {
-                    step.events.push(Event::Subagent {
-                        model: None,
-                        waiting: None,
-                        detail: None,
-                        id: tool,
-                        kind: String::new(),
-                        description: String::new(),
-                        status: Some(ended.unwrap_or(ToolStatus::Running)),
-                        background: None,
-                    });
+                    *current = status;
                 }
                 self.tool(None, item.clone());
                 if represented {
@@ -4289,18 +4933,20 @@ impl Claude {
                     self.visible_task_rows.insert(item.id.clone());
                     step.events.push(Event::Item(item.clone()));
                 }
-                if string(frame, "subtype") == "task_started"
-                    && matches!(string(frame, "task_type"), "local_agent" | "local_workflow")
-                {
-                    let kind = if string(frame, "task_type") == "local_workflow" {
-                        ReportTask::Workflow
-                    } else {
-                        ReportTask::Agent
-                    };
+                if string(frame, "subtype") == "task_started" {
+                    // A new task identity binding retires any prior native
+                    // origin, including reuse for a Bash or unknown task.
                     self.report_tasks.retain(|(known, _)| known != task);
-                    self.report_tasks.push_back((task.into(), kind));
-                    if self.report_tasks.len() > MAX_TOOLS {
-                        self.report_tasks.pop_front();
+                    if matches!(string(frame, "task_type"), "local_agent" | "local_workflow") {
+                        let kind = if string(frame, "task_type") == "local_workflow" {
+                            ReportTask::Workflow
+                        } else {
+                            ReportTask::Agent
+                        };
+                        self.report_tasks.push_back((task.into(), kind));
+                        if self.report_tasks.len() > MAX_TOOLS {
+                            self.report_tasks.pop_front();
+                        }
                     }
                 }
                 // Headless Claude Code tells the model a task finished in a turn
@@ -4318,7 +4964,6 @@ impl Claude {
                         .report_tasks
                         .iter()
                         .find_map(|(known, kind)| (known == task).then_some(*kind));
-                    self.report_tasks.retain(|(known, _)| known != task);
                     let recorded = ["skip_transcript", "ambient"]
                         .iter()
                         .all(|key| frame.get(key).and_then(Value::as_bool) != Some(true));
@@ -4362,10 +5007,7 @@ impl Claude {
             | "background_tasks_changed"
             | "vcs_state_changed"
             | "elicitation_complete" => {}
-            other => step.events.push(Event::Error {
-                message: format!("Unsupported Claude system event {other}: {frame}"),
-                fatal: false,
-            }),
+            other => self.warn_unknown("system", other),
         }
         Ok(())
     }
@@ -4508,9 +5150,9 @@ impl History {
         let mut agent_ids = HashMap::<String, String>::new();
         let mut agent_status = HashMap::new();
         let mut background_agent_tools = HashSet::new();
-        // Stopped agents whose delayed launch or refused result would
-        // otherwise overwrite their terminal outcome.
-        let mut stopped_agent_tools = HashSet::<String>::new();
+        // Ended agents whose delayed launch acknowledgement, or refused result
+        // after a stop, would otherwise overwrite their terminal outcome.
+        let mut ended_agent_tools = HashMap::<String, ToolStatus>::new();
         let mut position = 0;
         let mut line = Vec::new();
         let mut tool_ref_bytes = 0_usize;
@@ -4553,16 +5195,22 @@ impl History {
                         && let Some(tool_id) = block["tool_use_id"].as_str()
                         && agent_tools.contains_key(tool_id)
                     {
-                        if async_launch(&value) {
-                            background_agent_tools.insert(tool_id.to_owned());
+                        let launched = async_launch(&value);
+                        let ended = ended_agent_tools.get(tool_id).copied();
+                        if launched {
+                            if ended.is_none() {
+                                background_agent_tools.insert(tool_id.to_owned());
+                            }
                             if let Some(agent) = value["toolUseResult"]["agentId"].as_str() {
                                 agent_ids.insert(tool_id.to_owned(), agent.to_owned());
                             }
                         }
                         agent_status.insert(
                             tool_id.to_owned(),
-                            if stopped_agent_tools.contains(tool_id) {
-                                ToolStatus::Stopped
+                            if let Some(ended) =
+                                ended.filter(|ended| launched || *ended == ToolStatus::Stopped)
+                            {
+                                ended
                             } else if block["is_error"].as_bool() == Some(true) {
                                 ToolStatus::Failed
                             } else if background_agent_tools.contains(tool_id) {
@@ -4592,9 +5240,11 @@ impl History {
                     string(&value, "subtype") == "task_notification",
                 );
                 if string(&value, "subtype") == "task_started" {
-                    stopped_agent_tools.remove(tool_id);
-                } else if status == Some(ToolStatus::Stopped) {
-                    stopped_agent_tools.insert(tool_id.into());
+                    ended_agent_tools.remove(tool_id);
+                } else if let Some(status) = status
+                    && ended_agent_tools.get(tool_id) != Some(&ToolStatus::Stopped)
+                {
+                    ended_agent_tools.insert(tool_id.into(), status);
                 }
                 if background_agent_tools.contains(tool_id)
                     || string(&value, "subtype") == "task_started"
@@ -4619,8 +5269,8 @@ impl History {
                             .map(|(tool, _)| tool.clone())
                     };
                     if let Some(tool) = tool {
-                        if status == ToolStatus::Stopped {
-                            stopped_agent_tools.insert(tool.clone());
+                        if ended_agent_tools.get(&tool) != Some(&ToolStatus::Stopped) {
+                            ended_agent_tools.insert(tool.clone(), status);
                         }
                         agent_status.insert(tool, status);
                     }
@@ -5352,6 +6002,821 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     #[test]
+    fn embedded_frames_are_recognized_without_flagging_ordinary_text() {
+        for line in [
+            r#"wrapper diag{"type":"result","subtype":"success","is_error":false}"#,
+            r#"{"type":"result","subtype":"success"} wrapper tail"#,
+            r#"x{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool"}}"#,
+            r#"x{"type":"control_response","response":{"subtype":"success"}}"#,
+            r#"x{"type":"assistant","message":{"content":[]}}"#,
+            r#"{"unterminated {"type":"stream_event","event":{"type":"ping"}}"#,
+        ] {
+            assert!(embedded_protocol_frame(line.as_bytes()), "{line}");
+        }
+        for line in [
+            "plain wrapper diagnostic",
+            "Loaded {config} with { braces }",
+            r#"the "type" field is {broken"#,
+            r#"note {"type":"info","subtype":"x"}"#,
+            r#"a result looks like {"type":"result"}"#,
+            r#"logged {"payload":{"type":"result","subtype":"success"}}"#,
+            r#"partial {"type":"result","subtype":"succ"#,
+        ] {
+            assert!(!embedded_protocol_frame(line.as_bytes()), "{line}");
+        }
+        // The candidate bound holds on a line made of unparsable openers.
+        assert!(!embedded_protocol_frame(
+            format!(r#"{}"type""#, "{".repeat(100_000)).as_bytes()
+        ));
+    }
+
+    #[test]
+    fn a_reply_of_only_unknown_content_says_it_was_omitted() {
+        let private = "private protocol payload";
+        let notices = |step: &Step| {
+            step.events
+                .iter()
+                .filter(|event| {
+                    matches!(event, Event::Item(Item {
+                        content: ItemContent::Delivery { kind: DeliveryKind::Notice, summary, body, .. },
+                        ..
+                    }) if summary.contains("unsupported content") && body.is_empty())
+                })
+                .count()
+        };
+        let result = || json!({"type":"result","subtype":"success","is_error":false,"uuid":"r"});
+        let unknown = json!({"type":"assistant","uuid":"a","message":{"content":[{"type":"future","opaque":private}]}});
+
+        // A complete assistant frame with nothing else to show.
+        let mut adapter = Claude::default();
+        adapter.receive(unknown.clone()).unwrap();
+        let step = adapter.receive(result()).unwrap();
+        assert_eq!(notices(&step), 1);
+        assert!(!format!("{:?}", step.events).contains(private));
+        // The next turn starts clean.
+        assert_eq!(notices(&adapter.receive(result()).unwrap()), 0);
+
+        // A streamed future block with nothing else to show.
+        let mut adapter = Claude::default();
+        for event in [
+            json!({"type":"message_start","message":{"id":"m"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"future","opaque":private}}),
+        ] {
+            adapter
+                .receive(json!({"type":"stream_event","event":event}))
+                .unwrap();
+        }
+        assert_eq!(notices(&adapter.receive(result()).unwrap()), 1);
+
+        // Visible content next to the unknown block needs no notice.
+        let mut adapter = Claude::default();
+        adapter.receive(unknown.clone()).unwrap();
+        adapter
+            .receive(json!({"type":"assistant","uuid":"b","message":{"content":[{"type":"text","text":"Answer"}]}}))
+            .unwrap();
+        assert_eq!(notices(&adapter.receive(result()).unwrap()), 0);
+
+        // A failed turn already reports its failure.
+        let mut adapter = Claude::default();
+        adapter.receive(unknown).unwrap();
+        let step = adapter
+            .receive(json!({"type":"result","subtype":"error_during_execution","is_error":true,"uuid":"r"}))
+            .unwrap();
+        assert_eq!(notices(&step), 0);
+    }
+
+    #[test]
+    fn saved_untyped_blocks_are_skipped_but_live_frames_stay_strict() {
+        let frame =
+            |content: Value| json!({"type":"assistant","uuid":"a","message":{"content":content}});
+        let content = json!([
+            {"text":"no discriminant"},
+            {"type":""},
+            {"type":7},
+            "bare string",
+            {"type":"text","text":"Still readable"},
+        ]);
+        let record = HistoryRecord {
+            frame: frame(content),
+            tool_calls: HashMap::new(),
+        };
+        let mut adapter = Claude::default();
+        let mut step = Step::default();
+        adapter.history_message(&record, &mut step).unwrap();
+        let texts: Vec<_> = step
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Item(Item {
+                    content: ItemContent::Text { text, .. },
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Still readable"]);
+
+        let mut adapter = Claude::default();
+        assert!(
+            adapter
+                .receive(frame(json!([{"text":"no discriminant"}])))
+                .is_err()
+        );
+    }
+
+    // Damage on both sides of the page boundary: `initialize` opens the newest
+    // page and `LoadEarlier` replays the older one.
+    #[test]
+    fn a_saved_conversation_with_untyped_blocks_opens_and_pages() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("removed-worktree");
+        std::fs::create_dir(&cwd).unwrap();
+        let config = root.path().join("config");
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let history_dir = config.join("projects").join(project);
+        std::fs::create_dir_all(&history_dir).unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut file = File::create(history_dir.join(format!("{id}.jsonl"))).unwrap();
+        let count = 220;
+        for index in 0..count {
+            let parent = (index > 0).then(|| format!("record-{}", index - 1));
+            let damaged = index == 0 || index == count - 1;
+            let content = if damaged {
+                json!([{"text":"no discriminant"}, {"type":"text","text":format!("Saved {index}")}])
+            } else {
+                json!(format!("Saved {index}"))
+            };
+            writeln!(file, "{}", json!({"type":"assistant","uuid":format!("record-{index}"),"parentUuid":parent,"sessionId":id,"message":{"role":"assistant","content":content}})).unwrap();
+        }
+        drop(file);
+        std::fs::remove_dir(&cwd).unwrap();
+        let launch = Launch {
+            provider: Provider::Claude,
+            session_id: Some(id.into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(),
+                arguments: Vec::new(),
+                working_directory: cwd,
+                environment: std::collections::BTreeMap::from([(
+                    "CLAUDE_CONFIG_DIR".into(),
+                    config.to_string_lossy().into_owned(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        let (_, mut adapter) = create(&launch).unwrap();
+        let opened = format!("{:?}", adapter.initialize().unwrap().events);
+        assert!(opened.contains("Saved 219"));
+        let mut oldest = false;
+        for _ in 0..count {
+            let page = format!(
+                "{:?}",
+                adapter.command(Command::LoadEarlier).unwrap().events
+            );
+            if page.contains("\"Saved 0\"") {
+                oldest = true;
+                break;
+            }
+        }
+        assert!(oldest);
+    }
+
+    #[test]
+    fn initialization_waits_for_the_matching_success_including_optional_retry() {
+        let mut adapter = Claude::default();
+        assert!(adapter.initialization_pending());
+        let initial = adapter.initialize().unwrap();
+        let first = initial.writes[0]["request_id"].as_str().unwrap();
+        for frame in [
+            json!({"type":"keep_alive"}),
+            json!({"type":"future_advisory"}),
+            reply("unrelated-request", json!({})),
+        ] {
+            adapter.receive(frame).unwrap();
+            assert!(adapter.initialization_pending());
+        }
+        let retry = adapter
+            .receive(json!({"type":"control_response","response":{
+                "subtype":"error","request_id":first,"error":"Unsupported initialize option"
+            }}))
+            .unwrap();
+        assert_eq!(retry.writes.len(), 1);
+        assert!(adapter.initialization_pending());
+        // A late reply to the replaced request cannot acknowledge the retry.
+        adapter.receive(reply(first, json!({}))).unwrap();
+        assert!(adapter.initialization_pending());
+        let ready = adapter
+            .receive(reply(
+                retry.writes[0]["request_id"].as_str().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        assert!(!adapter.initialization_pending());
+        assert!(
+            ready
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Ready(true)))
+        );
+        adapter
+            .receive(json!({"type":"conversation_reset"}))
+            .unwrap();
+        assert!(
+            !adapter.initialization_pending(),
+            "a reset is not a new transport handshake"
+        );
+
+        let mut history = Claude {
+            history_only: true,
+            ..Claude::default()
+        };
+        assert!(!history.initialization_pending());
+        assert!(history.initialize().unwrap().writes.is_empty());
+    }
+
+    #[test]
+    fn malformed_nested_discriminants_are_not_future_protocol_variants() {
+        for value in [
+            None,
+            Some(Value::Null),
+            Some(json!(false)),
+            Some(json!(7)),
+            Some(json!({})),
+            Some(json!([])),
+            Some(json!("")),
+        ] {
+            let tagged = |key: &str| {
+                let mut object = json!({});
+                if let Some(value) = &value {
+                    object[key] = value.clone();
+                }
+                object
+            };
+            for frame in [
+                {
+                    let mut frame = tagged("subtype");
+                    frame["type"] = json!("system");
+                    frame
+                },
+                stream(tagged("type")),
+                json!({"type":"assistant","uuid":"malformed-content",
+                    "message":{"role":"assistant","content":[tagged("type")]}}),
+            ] {
+                let mut adapter = Claude::default();
+                assert!(adapter.receive(frame.clone()).is_err(), "accepted {frame}");
+                assert!(adapter.unknown_frames.is_empty());
+            }
+
+            let start = || stream(json!({"type":"message_start","message":{"id":"m"}}));
+            let mut adapter = Claude::default();
+            adapter.receive(start()).unwrap();
+            adapter
+                .receive(stream(json!({"type":"content_block_start","index":0,
+                    "content_block":{"type":"text","text":"retained"}})))
+                .unwrap();
+            assert!(
+                adapter
+                    .receive(stream(json!({"type":"content_block_start","index":0,
+                "content_block":tagged("type")})))
+                    .is_err()
+            );
+            assert_eq!(adapter.blocks.len(), 1);
+            assert!(adapter.ignored_blocks.is_empty());
+            assert!(matches!(
+                &adapter.blocks[&(ScopedId::new(None, "m"), 0)].content,
+                ItemContent::Text { text, .. } if text == "retained"
+            ));
+
+            // Even deltas for a deliberately ignored future block need a type.
+            for block_type in ["text", "future_content"] {
+                let mut adapter = Claude::default();
+                adapter.receive(start()).unwrap();
+                adapter
+                    .receive(stream(json!({"type":"content_block_start","index":0,
+                    "content_block":{"type":block_type,"text":""}})))
+                    .unwrap();
+                assert!(
+                    adapter
+                        .receive(stream(json!({"type":"content_block_delta","index":0,
+                    "delta":tagged("type")})))
+                        .is_err(),
+                    "accepted {value:?} for {block_type}"
+                );
+            }
+        }
+
+        let mut adapter = Claude::default();
+        adapter
+            .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+            .unwrap();
+        for index in 0..MAX_TOOLS {
+            adapter
+                .receive(stream(json!({"type":"content_block_start","index":index,
+                "content_block":{"type":"future_content"}})))
+                .unwrap();
+        }
+        assert!(
+            adapter
+                .receive(stream(
+                    json!({"type":"content_block_start","index":MAX_TOOLS,
+            "content_block":{}})
+                ))
+                .is_err(),
+            "a full block budget must not hide a missing type"
+        );
+        assert_eq!(adapter.ignored_blocks.len(), MAX_TOOLS);
+    }
+
+    #[test]
+    fn known_stream_tool_metadata_is_validated_before_the_block_budget() {
+        for (retained_type, count) in [
+            ("future_content", 0),
+            ("future_content", MAX_TOOLS - 1),
+            ("future_content", MAX_TOOLS),
+            ("text", MAX_TOOLS),
+        ] {
+            for block_type in ["tool_use", "server_tool_use"] {
+                for field in ["id", "name"] {
+                    for value in [
+                        None,
+                        Some(Value::Null),
+                        Some(json!(false)),
+                        Some(json!(7)),
+                        Some(json!({})),
+                        Some(json!([])),
+                        Some(json!("")),
+                    ] {
+                        let mut adapter = Claude::default();
+                        adapter
+                            .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+                            .unwrap();
+                        for index in 0..count {
+                            adapter
+                                .receive(stream(json!({"type":"content_block_start","index":index,
+                                    "content_block":{"type":retained_type,"text":""}})))
+                                .unwrap();
+                        }
+                        let mut block = json!({"type":block_type,"id":"tool","name":"Bash"});
+                        if let Some(value) = &value {
+                            block[field] = value.clone();
+                        } else {
+                            block.as_object_mut().unwrap().remove(field);
+                        }
+                        assert_eq!(
+                            adapter
+                                .receive(stream(json!({"type":"content_block_start","index":count,
+                                    "content_block":block})))
+                                .err(),
+                            Some(format!("Claude protocol frame is missing {field}")),
+                            "accepted {block_type} with {field}={value:?} after {count} {retained_type} blocks"
+                        );
+                        assert_eq!(adapter.blocks.len() + adapter.ignored_blocks.len(), count);
+                        assert!(!adapter.streams[""].truncated);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn valid_stream_tools_still_overflow_the_block_budget_nonfatally() {
+        for retained_type in ["future_content", "text"] {
+            for count in [MAX_TOOLS - 1, MAX_TOOLS] {
+                for block_type in ["tool_use", "server_tool_use"] {
+                    let mut adapter = Claude::default();
+                    adapter
+                        .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+                        .unwrap();
+                    for index in 0..count {
+                        adapter
+                            .receive(stream(json!({"type":"content_block_start","index":index,
+                                "content_block":{"type":retained_type,"text":""}})))
+                            .unwrap();
+                    }
+                    let mut events = Vec::new();
+                    for index in count..MAX_TOOLS + 2 {
+                        events.extend(
+                            adapter
+                                .receive(stream(json!({"type":"content_block_start","index":index,
+                                    "content_block":{"type":block_type,"id":format!("tool-{index}"),"name":"Bash"}})))
+                                .unwrap()
+                                .events,
+                        );
+                        assert_eq!(
+                            adapter.blocks.len() + adapter.ignored_blocks.len(),
+                            MAX_TOOLS
+                        );
+                    }
+                    assert_eq!(errors(&events).len(), 1);
+                    assert!(events.iter().any(|event| matches!(event,
+                        Event::Error { message, fatal: false }
+                            if message.contains("too many streaming blocks")
+                    )));
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, Event::Item(_)))
+                            .count(),
+                        MAX_TOOLS - count
+                    );
+                    assert!(adapter.busy && adapter.streams[""].truncated);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn known_stream_delta_payloads_are_validated_before_the_block_budget() {
+        for count in [MAX_TOOLS - 1, MAX_TOOLS] {
+            for (block_type, delta_type, field) in [
+                ("text", "text_delta", "text"),
+                ("thinking", "thinking_delta", "thinking"),
+                ("tool_use", "input_json_delta", "partial_json"),
+                ("server_tool_use", "input_json_delta", "partial_json"),
+            ] {
+                for payload in [
+                    None,
+                    Some(Value::Null),
+                    Some(json!(false)),
+                    Some(json!(7)),
+                    Some(json!({})),
+                    Some(json!([])),
+                ] {
+                    let mut adapter = Claude::default();
+                    adapter
+                        .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+                        .unwrap();
+                    for index in 0..count {
+                        adapter
+                            .receive(stream(json!({"type":"content_block_start","index":index,
+                                "content_block":{"type":"future_content"}})))
+                            .unwrap();
+                    }
+                    let block = match block_type {
+                        "text" => json!({"type":"text","text":""}),
+                        "thinking" => json!({"type":"thinking","thinking":""}),
+                        _ => json!({"type":block_type,"id":"tool","name":"Opaque"}),
+                    };
+                    adapter
+                        .receive(stream(json!({"type":"content_block_start","index":count,
+                            "content_block":block})))
+                        .unwrap();
+                    assert_eq!(adapter.streams[""].truncated, count == MAX_TOOLS);
+                    let mut delta = json!({"type":delta_type});
+                    if let Some(payload) = &payload {
+                        delta[field] = payload.clone();
+                    }
+                    assert_eq!(
+                        adapter
+                            .receive(stream(json!({"type":"content_block_delta","index":count,
+                                "delta":delta})))
+                            .err(),
+                        Some(
+                            if delta_type == "input_json_delta" {
+                                "Claude tool input delta has no string payload"
+                            } else {
+                                "Claude text delta has no string payload"
+                            }
+                            .into()
+                        ),
+                        "accepted {delta_type} with {field}={payload:?} after {count} future blocks"
+                    );
+                    assert_eq!(
+                        adapter.blocks.len() + adapter.ignored_blocks.len(),
+                        MAX_TOOLS
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn valid_stream_delta_overflow_keeps_unknown_indices_and_next_text_usable() {
+        for count in [MAX_TOOLS - 1, MAX_TOOLS] {
+            for (block_type, delta_type, field, payload) in [
+                ("text", "text_delta", "text", "kept"),
+                ("thinking", "thinking_delta", "thinking", "kept"),
+                ("tool_use", "input_json_delta", "partial_json", "{}"),
+                ("server_tool_use", "input_json_delta", "partial_json", "{}"),
+            ] {
+                let mut adapter = Claude::default();
+                adapter
+                    .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+                    .unwrap();
+                for index in 0..count {
+                    adapter
+                        .receive(stream(json!({"type":"content_block_start","index":index,
+                            "content_block":{"type":"future_content"}})))
+                        .unwrap();
+                }
+                let block = match block_type {
+                    "text" => json!({"type":"text","text":""}),
+                    "thinking" => json!({"type":"thinking","thinking":""}),
+                    _ => json!({"type":block_type,"id":"tool","name":"Opaque"}),
+                };
+                let start = adapter
+                    .receive(stream(json!({"type":"content_block_start","index":count,
+                        "content_block":block})))
+                    .unwrap();
+                assert_eq!(errors(&start.events).len(), usize::from(count == MAX_TOOLS));
+                for payload in ["", payload] {
+                    let mut delta = json!({"type":delta_type});
+                    delta[field] = json!(payload);
+                    let step = adapter
+                        .receive(stream(json!({"type":"content_block_delta","index":count,
+                            "delta":delta})))
+                        .unwrap();
+                    assert!(errors(&step.events).is_empty());
+                    if count == MAX_TOOLS {
+                        assert!(step.events.is_empty());
+                    } else {
+                        assert!(step.events.iter().any(|event| match event {
+                            Event::TextDelta { delta, .. } => delta == payload,
+                            Event::Item(Item {
+                                content: ItemContent::Tool { input, .. },
+                                ..
+                            }) => input == payload,
+                            _ => false,
+                        }));
+                    }
+                }
+                // Future delta types remain advisory even at an unowned index.
+                assert!(
+                    adapter
+                        .receive(stream(json!({"type":"content_block_delta","index":count+1,
+                            "delta":{"type":"future_delta"}})))
+                        .unwrap()
+                        .events
+                        .is_empty()
+                );
+                // An index explicitly owned by future content keeps its opaque
+                // delta behavior, even when a known-looking payload is absent.
+                assert!(
+                    adapter
+                        .receive(stream(json!({"type":"content_block_delta","index":0,
+                            "delta":{"type":"text_delta"}})))
+                        .unwrap()
+                        .events
+                        .is_empty()
+                );
+                // Replacing just that ignored index makes room for real text;
+                // truncation must not poison the next retained valid block.
+                adapter
+                    .receive(stream(json!({"type":"content_block_start","index":0,
+                        "content_block":{"type":"text","text":""}})))
+                    .unwrap();
+                let resumed = adapter
+                    .receive(stream(json!({"type":"content_block_delta","index":0,
+                        "delta":{"type":"text_delta","text":"next valid answer"}})))
+                    .unwrap();
+                assert!(resumed.events.iter().any(|event| matches!(event,
+                    Event::TextDelta { delta, .. } if delta == "next valid answer"
+                )));
+                assert!(errors(&resumed.events).is_empty());
+                assert_eq!(
+                    adapter.blocks.len() + adapter.ignored_blocks.len(),
+                    MAX_TOOLS
+                );
+            }
+        }
+    }
+
+    /// Claude Code 2.1.296 sends `post_turn_summary` before every result; the
+    /// frame below keeps a live haiku turn's fields with fixture identifiers.
+    #[test]
+    fn a_post_turn_summary_does_not_fail_the_turn() {
+        let mut adapter = Claude::default();
+        adapter.busy = true;
+        adapter.receive(json!({"type":"assistant","uuid":"00000000-0000-4000-8000-000000000002","message":{"id":"m","role":"assistant","content":[{"type":"text","text":"ready"}]}})).unwrap();
+        let summary = adapter
+            .receive(json!({
+                "type": "system",
+                "subtype": "post_turn_summary",
+                "summarizes_uuid": "00000000-0000-4000-8000-000000000002",
+                "status_category": "completed",
+                "status_detail": "replied 'ready' as requested",
+                "needs_action": "",
+                "uuid": "00000000-0000-4000-8000-000000000003",
+                "session_id": "00000000-0000-4000-8000-000000000001"
+            }))
+            .unwrap();
+        assert!(
+            !summary
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_) | Event::Error { .. }))
+        );
+        let result = adapter
+            .receive(json!({"type":"result","subtype":"success","result":"ready","is_error":false,"session_id":"00000000-0000-4000-8000-000000000001"}))
+            .unwrap();
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
+        assert!(!adapter.busy);
+    }
+
+    #[test]
+    fn unknown_frames_do_not_interrupt_a_streamed_turn() {
+        let mut adapter = Claude::default();
+        adapter.busy = true;
+        for frame in [
+            json!({"type":"future_frame", "payload":"private protocol payload"}),
+            json!({"type":"system", "subtype":"future_system", "payload":"private protocol payload"}),
+        ] {
+            assert!(adapter.receive(frame).unwrap().events.is_empty());
+        }
+        adapter.receive(json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}})).unwrap();
+        for event in [
+            json!({"type":"future_stream_event"}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"future_content","opaque":"private protocol payload"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"future_delta"}}),
+        ] {
+            assert!(
+                adapter
+                    .receive(json!({"type":"stream_event","event":event}))
+                    .unwrap()
+                    .events
+                    .is_empty()
+            );
+        }
+        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}})).unwrap();
+        let delta = adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}})).unwrap();
+        assert!(
+            delta
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TextDelta { delta, .. } if delta == "answer"))
+        );
+        let result = adapter
+            .receive(
+                json!({"type":"result","subtype":"success","result":"answer","is_error":false}),
+            )
+            .unwrap();
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
+        assert!(
+            !result
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        assert!(!adapter.busy);
+
+        let message = adapter.receive(json!({"type":"assistant","uuid":"unknown-body","message":{"role":"assistant","content":[{"type":"future_content","payload":"private protocol payload"}]}})).unwrap();
+        assert!(
+            !message
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_) | Event::Error { .. }))
+        );
+    }
+
+    #[test]
+    fn unknown_frame_warnings_keep_bounded_names_and_cardinality() {
+        let mut adapter = Claude::default();
+        for index in 0..100 {
+            let name = format!("future-{index}-\u{1b}\n{}", "🦀".repeat(200));
+            adapter.receive(json!({"type":name})).unwrap();
+        }
+        assert_eq!(adapter.unknown_frames.len(), 64);
+        assert!(adapter.unknown_frames.iter().all(|key| {
+            key.len() <= "frame:".len() + 128 && !key.chars().any(char::is_control)
+        }));
+    }
+
+    #[test]
+    fn unknown_stream_blocks_own_scoped_indices_until_stop_or_settlement() {
+        fn event(adapter: &mut Claude, parent: &str, event: Value) -> Result<Step, String> {
+            adapter
+                .receive(json!({"type":"stream_event","parent_tool_use_id":parent,"event":event}))
+        }
+        let mut adapter = Claude::default();
+        for parent in ["", "child"] {
+            event(
+                &mut adapter,
+                parent,
+                json!({"type":"message_start","message":{"id":"m"}}),
+            )
+            .unwrap();
+        }
+        event(&mut adapter, "", json!({"type":"content_block_start","index":1,"content_block":{"type":"future_content"}})).unwrap();
+        for delta in [
+            json!({"type":"text_delta","text":"omitted text"}),
+            json!({"type":"thinking_delta","thinking":"omitted thinking"}),
+            json!({"type":"input_json_delta","partial_json":"{}"}),
+        ] {
+            assert!(
+                event(
+                    &mut adapter,
+                    "",
+                    json!({"type":"content_block_delta","index":1,"delta":delta})
+                )
+                .unwrap()
+                .events
+                .is_empty()
+            );
+        }
+        assert!(event(&mut adapter, "child", json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"unowned child index"}})).is_err());
+        event(&mut adapter, "", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"old"}})).unwrap();
+        event(&mut adapter, "", json!({"type":"content_block_start","index":0,"content_block":{"type":"future_content"}})).unwrap();
+        assert!(event(&mut adapter, "", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"must not append to old"}})).unwrap().events.is_empty());
+        assert!(!adapter.blocks.contains_key(&(ScopedId::new(None, "m"), 0)));
+        event(&mut adapter, "", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"fresh"}})).unwrap();
+        let delta = event(&mut adapter, "", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" answer"}})).unwrap();
+        assert!(
+            delta
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TextDelta { delta, .. } if delta == " answer"))
+        );
+        event(
+            &mut adapter,
+            "",
+            json!({"type":"content_block_stop","index":1}),
+        )
+        .unwrap();
+        assert!(adapter.ignored_blocks.is_empty());
+        assert!(event(&mut adapter, "", json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"after stop"}})).is_err());
+        event(&mut adapter, "", json!({"type":"content_block_start","index":2,"content_block":{"type":"future_content"}})).unwrap();
+        event(
+            &mut adapter,
+            "",
+            json!({"type":"message_start","message":{"id":"successor"}}),
+        )
+        .unwrap();
+        assert!(
+            adapter.ignored_blocks.is_empty(),
+            "a new message settles the abandoned stream"
+        );
+        assert!(adapter.blocks.is_empty());
+    }
+
+    #[test]
+    fn unknown_stream_blocks_share_the_existing_block_budget_and_clear_on_reset() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}})).unwrap();
+        for index in 0..MAX_TOOLS {
+            adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":index,"content_block":{"type":"future_content"}}})).unwrap();
+        }
+        assert_eq!(adapter.ignored_blocks.len(), MAX_TOOLS);
+        // Replacement at a full budget releases only that exact index.
+        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"known"}}})).unwrap();
+        assert_eq!(adapter.blocks.len(), 1);
+        assert_eq!(adapter.ignored_blocks.len(), MAX_TOOLS - 1);
+        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":MAX_TOOLS,"content_block":{"type":"future_content"}}})).unwrap();
+        assert_eq!(
+            adapter.blocks.len() + adapter.ignored_blocks.len(),
+            MAX_TOOLS
+        );
+        adapter
+            .receive(json!({"type":"conversation_reset"}))
+            .unwrap();
+        assert!(adapter.blocks.is_empty() && adapter.ignored_blocks.is_empty());
+    }
+
+    #[test]
+    fn unknown_frame_tolerance_preserves_identity_and_known_protocol_errors() {
+        let mut adapter = Claude::default();
+        let session = uuid::Uuid::new_v4().to_string();
+        adapter.session_id = Some(session.clone());
+        assert!(
+            adapter
+                .receive(
+                    json!({"type":"future_frame","session_id":uuid::Uuid::new_v4().to_string()})
+                )
+                .unwrap_err()
+                .contains("different session ID")
+        );
+        assert_eq!(adapter.session_id.as_deref(), Some(session.as_str()));
+        assert!(adapter.receive(json!({"payload":"missing type"})).is_err());
+        let control = adapter.control(json!({"subtype":"initialize"})).unwrap();
+        let id = control.writes[0]["request_id"].clone();
+        assert!(adapter.receive(json!({"type":"control_response","response":{"request_id":id,"subtype":"future_response"}})).is_err());
+        let auth = adapter
+            .receive(json!({"type":"auth_status","error":"Authentication failed"}))
+            .unwrap();
+        assert!(auth.events.iter().any(|event| matches!(event, Event::Error { message, .. } if message == "Authentication failed")));
+        adapter.receive(json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}})).unwrap();
+        assert!(adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"unowned"}}})).is_err());
+        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}})).unwrap();
+        assert!(adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta"}}})).is_err());
+    }
+
+    #[test]
     fn unverified_owned_claude_image_history_never_downgrades_to_a_coincident_path() {
         crate::chat::attachment_assets::with_test_image(|image| {
             let reference = image.reference.as_ref().unwrap();
@@ -5633,6 +7098,631 @@ mod tests {
     use std::io::Write as _;
 
     #[test]
+    fn child_result_settles_only_its_exact_task_without_settling_parent_or_siblings() {
+        let run = crate::model::RunId::new();
+        let mut adapter = Claude {
+            busy: true,
+            execution: Some(run),
+            interruption: Some(false),
+            ..Default::default()
+        };
+        for (tool, task) in [("failed-child", "task-failed"), ("live-child", "task-live")] {
+            adapter.receive(json!({"type":"assistant","uuid":format!("launch-{tool}"),"message":{"id":format!("message-{tool}"),"content":[{"type":"tool_use","id":tool,"name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+            adapter.receive(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"})).unwrap();
+        }
+        let child_input =
+            json!({"file_path":"child.rs","old_string":"before","new_string":"after"});
+        adapter
+            .receive(scoped_call(
+                Some("failed-child"),
+                "child-edit",
+                "colliding-edit",
+                "Edit",
+                child_input.clone(),
+            ))
+            .unwrap();
+        let root_input = json!({"file_path":"root.rs","content":"root stays separate"});
+        adapter
+            .receive(scoped_call(
+                None,
+                "root-edit",
+                "colliding-edit",
+                "Write",
+                root_input.clone(),
+            ))
+            .unwrap();
+        let generation = adapter.attention_generation;
+        let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
+        let step = adapter.receive(json!({"type":"result","uuid":"child-result","parent_tool_use_id":"failed-child","is_error":true,"errors":[failure],"usage":{"input_tokens":999},"permission_denials":[{"tool_use_id":"colliding-edit","tool_name":"Edit","decision_reason":"Child edit was refused"}]})).unwrap();
+        assert!(adapter.busy);
+        assert_eq!(adapter.execution, Some(run));
+        assert_eq!(adapter.interruption, Some(false));
+        assert_eq!(adapter.attention_generation, generation);
+        assert_eq!(adapter.usage.input_tokens, 0);
+        assert!(!adapter.background_agents.contains("failed-child"));
+        assert!(adapter.background_agents.contains("live-child"));
+        assert!(!adapter.tasks.iter().any(|task| task == "task-failed"));
+        assert!(adapter.tasks.iter().any(|task| task == "task-live"));
+        assert!(
+            matches!(step.events.as_slice(), [Event::PermissionDenied(denial), Event::SubagentItem { id:owner,item }, Event::Subagent { id, status:Some(ToolStatus::Failed), waiting:Some(false), detail:Some(detail), .. }]
+                if owner=="failed-child" && id=="failed-child" && detail==failure
+                && item.id=="claude-result-error:child-result:0"
+                && chat::failure::provider_error_text(Provider::Claude,item)==Some(failure)
+                && denial.tool_use_id=="colliding-edit" && denial.tool_name=="Edit"
+                && denial.reason=="Child edit was refused"
+                && denial.tool_input.as_deref().and_then(|input|serde_json::from_str::<Value>(input).ok())==Some(child_input))
+        );
+        assert_eq!(
+            adapter
+                .tool_inputs
+                .get(&ScopedId::new(None, "colliding-edit"))
+                .and_then(|input| serde_json::from_str::<Value>(input).ok()),
+            Some(root_input),
+            "A child result cannot overwrite the colliding root permission input"
+        );
+        assert!(adapter.completed_tool(None, "failed-child"));
+        let replay = adapter.receive(json!({"type":"assistant","uuid":"launch-failed-child","message":{"id":"message-failed-child","content":[{"type":"tool_use","id":"failed-child","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+        assert!(!replay.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                status: Some(ToolStatus::Running),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn retryable_child_error_is_scoped_and_only_actual_child_activity_clears_it() {
+        let mut adapter = Claude {
+            busy: true,
+            ..Default::default()
+        };
+        let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
+        let error = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"waiting-child","event":{"type":"error","error":{"type":"rate_limit_error","message":failure}}})).unwrap();
+        assert!(
+            matches!(error.events.as_slice(), [Event::SubagentItem { id:owner, item }, Event::Subagent { id, status:None, waiting:Some(true), detail:Some(detail), .. }]
+                if owner=="waiting-child" && id=="waiting-child" && detail.contains(failure)
+                && chat::failure::provider_error_text(Provider::Claude,item)==Some(detail.as_str()))
+        );
+        assert!(adapter.busy);
+        let notice = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"bash-done","status":"completed","summary":"Background command completed (exit code 0)","uuid":"bash-notice"})).unwrap();
+        assert!(!notice.events.iter().any(|event| matches!(
+            event,
+            Event::Status { .. } | Event::TurnStarted | Event::Subagent { .. }
+        )));
+        assert!(adapter.busy);
+        let resumed = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"waiting-child","event":{"type":"message_start","message":{"id":"recovered-child"}}})).unwrap();
+        assert!(resumed.events.iter().any(|event| matches!(event, Event::Subagent { id, status:None, waiting:Some(false), detail:Some(detail), .. } if id=="waiting-child" && detail.is_empty())));
+        assert!(
+            !resumed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnStarted | Event::Status { .. }))
+        );
+    }
+
+    #[test]
+    fn child_api_failures_survive_terminal_task_notifications_and_replay_through_runtime_store() {
+        let first = json!({"type":"connection_error","message":"Connection reset by peer\nrequest-id: original-network"});
+        let second = json!({"type":"rate_limit_error","message":"You've hit your limit · resets 1:30pm\nrequest-id: distinct-quota"});
+        let error = |carrier: &str, cause: &Value| json!({"type":"stream_event","uuid":carrier,"parent_tool_use_id":"failed-child","event":{"type":"error","error":cause}});
+        let mut frames = vec![
+            json!({"type":"stream_event","uuid":"actual-parent-start","event":{"type":"message_start","message":{"id":"live-parent-message"}}}),
+        ];
+        for (tool, task) in [("failed-child", "failed-task"), ("live-child", "live-task")] {
+            frames.push(scoped_call(
+                None,
+                &format!("launch-{tool}"),
+                tool,
+                "Agent",
+                json!({"run_in_background":true}),
+            ));
+            frames.push(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"}));
+        }
+        frames.push(json!({"type":"assistant","uuid":"retained-child-answer","parent_tool_use_id":"failed-child","message":{"id":"retained-child-answer","content":[{"type":"text","text":"Original child work remains visible"}]}}));
+        frames.push(error("first-failure", &first));
+        frames.push(error("second-failure", &second));
+        frames.push(json!({"type":"system","subtype":"task_notification","uuid":"terminal-notification","task_id":"failed-task","tool_use_id":"failed-child","status":"failed","summary":"The child task failed"}));
+        // Exact old API frames after the terminal notification cannot erase or
+        // multiply history, or put this failed child back into waiting.
+        frames.push(error("first-failure", &first));
+        frames.push(error("second-failure", &second));
+        // The helper requires a real outcome callback, then returns the actual
+        // resident Actor/Store snapshot and proves its cat process teardown.
+        frames.push(json!({"type":"result","uuid":"parent-settlement","subtype":"success","is_error":false}));
+        let (_, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(Claude {
+                busy: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "failed-child")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Failed);
+        assert!(!child.waiting);
+        assert!(
+            child.detail.is_empty(),
+            "terminal transient-detail cleanup remains unchanged"
+        );
+        assert!(child.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text=="Original child work remains visible")));
+        let failures: Vec<_> = child
+            .items
+            .iter()
+            .filter_map(|item| {
+                chat::failure::provider_error_text(Provider::Claude, item)
+                    .map(|body| (item.id.as_str(), body))
+            })
+            .collect();
+        let first_raw = content_text(&first);
+        let second_raw = content_text(&second);
+        assert_eq!(
+            failures,
+            [
+                ("claude-stream-error:first-failure:0", first_raw.as_str()),
+                ("claude-stream-error:second-failure:0", second_raw.as_str()),
+            ]
+        );
+        assert_eq!(
+            child.items.len(),
+            3,
+            "one original answer plus two errors; replay adds no entries"
+        );
+        assert!(
+            !state
+                .items
+                .iter()
+                .any(|item| chat::failure::provider_error_text(Provider::Claude, item).is_some()),
+            "child diagnostic originals must not enter the parent transcript"
+        );
+        assert!(
+            state
+                .subagents
+                .iter()
+                .any(|child| child.id == "live-child" && child.status == ToolStatus::Running)
+        );
+        assert!(
+            state.error.is_none(),
+            "child API errors must never become parent failures"
+        );
+        assert!(
+            !state.busy,
+            "only the explicit parent result settles parent busy"
+        );
+        assert!(state.is_working(), "the live sibling remains genuine work");
+
+        // Without a provider carrier ID, preserve distinct actual receipts
+        // rather than guessing that identical unkeyed errors are replay.
+        let mut adapter = Claude::default();
+        let mut unkeyed = error("discarded", &first);
+        unkeyed.as_object_mut().unwrap().remove("uuid");
+        let a = adapter.receive(unkeyed.clone()).unwrap();
+        let b = adapter.receive(unkeyed).unwrap();
+        let item = |step: &Step| {
+            step.events
+                .iter()
+                .find_map(|event| match event {
+                    Event::SubagentItem { item, .. } => Some(item.id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_ne!(item(&a), item(&b));
+        for carrier in ["", " \t\n"] {
+            let blank = error(carrier, &first);
+            let a = adapter.receive(blank.clone()).unwrap();
+            let b = adapter.receive(blank).unwrap();
+            assert_ne!(
+                item(&a),
+                item(&b),
+                "a blank carrier is not replay authority"
+            );
+        }
+        let parent = adapter.receive(json!({"type":"stream_event","uuid":"root-error","event":{"type":"error","error":first}})).unwrap();
+        assert!(
+            matches!(parent.events.as_slice(), [Event::Error { .. }]),
+            "ordinary parent API errors keep their existing event representation"
+        );
+    }
+
+    #[test]
+    fn a_foreground_agent_restarted_by_send_message_settles_from_its_next_receipt() {
+        let frames = vec![
+            json!({"type":"stream_event","uuid":"restart-parent-start","event":{"type":"message_start","message":{"id":"restart-parent"}}}),
+            scoped_call(None, "launch-restart", "restart-child", "Agent", json!({})),
+            json!({"type":"system","subtype":"task_started","task_id":"restart-task","tool_use_id":"restart-child","task_type":"local_agent"}),
+            json!({"type":"user","uuid":"restart-first-result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"restart-child","content":"First report.","is_error":false}]}}),
+            // SendMessage resumes the same agent after its row settled.
+            json!({"type":"system","subtype":"task_started","task_id":"restart-task","task_type":"local_agent"}),
+            json!({"type":"system","subtype":"task_notification","uuid":"restart-notification","task_id":"restart-task","status":"completed","summary":"Second report"}),
+            json!({"type":"result","uuid":"restart-parent-result","subtype":"success","is_error":false}),
+        ];
+        let (_, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(Claude {
+                busy: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "restart-child")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Succeeded);
+        assert!(!state.is_working());
+    }
+
+    #[test]
+    fn child_result_failures_keep_exact_history_across_terminal_notifications_without_parent_failure()
+     {
+        let raw = "Authentication failed: invalid_api_key\nrequest-id: exact-child-result";
+        let result = json!({"type":"result","uuid":"failed-result","parent_tool_use_id":"failed-child","is_error":true,"errors":[raw],"usage":{"input_tokens":9000}});
+        let terminal = json!({"type":"system","subtype":"task_notification","uuid":"failed-notification","task_id":"failed-task","tool_use_id":"failed-child","status":"failed","summary":raw});
+        let mut frames = vec![
+            json!({"type":"stream_event","uuid":"actual-parent-start","event":{"type":"message_start","message":{"id":"live-parent-message"}}}),
+        ];
+        for (tool, task) in [("failed-child", "failed-task"), ("live-child", "live-task")] {
+            frames.push(scoped_call(
+                None,
+                &format!("launch-{tool}"),
+                tool,
+                "Agent",
+                json!({"run_in_background":true}),
+            ));
+            frames.push(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"}));
+            // Keep accepted async-result metadata alongside task_started.
+            // The child result itself owns its terminal diagnostic; a later
+            // notification need not emit another child status patch.
+            frames.push(json!({"type":"user","uuid":format!("async-{tool}"),"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":task},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":tool,"content":"Async agent launched successfully.","is_error":false}]}}));
+        }
+        frames.extend([result.clone(), terminal.clone(), result.clone(), terminal,
+            json!({"type":"result","uuid":"only-parent-settlement","subtype":"success","is_error":false})]);
+        let (_, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(Claude {
+                busy: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "failed-child")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Failed);
+        assert!(!child.waiting);
+        assert_eq!(
+            child.detail, raw,
+            "without a later child status patch, the result's exact diagnostic remains"
+        );
+        assert_eq!(
+            child.items.len(),
+            1,
+            "stable result replay upserts only its original failure"
+        );
+        assert_eq!(child.items[0].id, "claude-result-error:failed-result:0");
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Claude, &child.items[0]),
+            Some(raw)
+        );
+        assert!(state.error.is_none());
+        assert!(!state.busy);
+        assert!(state.is_working());
+        assert!(
+            state
+                .subagents
+                .iter()
+                .any(|child| child.id == "live-child" && child.status == ToolStatus::Running)
+        );
+        assert!(
+            state
+                .items
+                .iter()
+                .all(|item| chat::failure::provider_error_text(Provider::Claude, item).is_none())
+        );
+
+        let mut adapter = Claude {
+            busy: true,
+            interruption: Some(false),
+            ..Default::default()
+        };
+        let generation = adapter.attention_generation;
+        let mut unkeyed = result.clone();
+        unkeyed.as_object_mut().unwrap().remove("uuid");
+        let a = adapter.receive(unkeyed.clone()).unwrap();
+        let b = adapter.receive(unkeyed).unwrap();
+        let id = |step: &Step| {
+            step.events
+                .iter()
+                .find_map(|event| match event {
+                    Event::SubagentItem { item, .. } => Some(item.id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_ne!(id(&a), id(&b));
+        for carrier in ["", " \t\n"] {
+            let mut blank = result.clone();
+            blank["uuid"] = json!(carrier);
+            let a = adapter.receive(blank.clone()).unwrap();
+            let b = adapter.receive(blank).unwrap();
+            assert_ne!(id(&a), id(&b));
+        }
+        assert!(adapter.busy);
+        assert_eq!(adapter.interruption, Some(false));
+        assert_eq!(adapter.attention_generation, generation);
+        assert_eq!(adapter.usage.input_tokens, 0);
+        assert!(a.events.iter().chain(&b.events).all(|event| !matches!(
+            event,
+            Event::Error { .. }
+                | Event::TurnStarted
+                | Event::TurnSettled
+                | Event::TurnFinished { .. }
+                | Event::Status { .. }
+        )));
+    }
+
+    #[test]
+    fn exact_child_failure_receipts_cannot_rollback_fresh_activity_but_changed_payloads_remain_visible()
+     {
+        for source in ["stream", "result"] {
+            let mut adapter = Claude {
+                busy: true,
+                ..Default::default()
+            };
+            adapter
+                .receive(scoped_call(
+                    None,
+                    "launch-receipt-child",
+                    "child",
+                    "Agent",
+                    json!({"run_in_background":true}),
+                ))
+                .unwrap();
+            let started = json!({"type":"system","subtype":"task_started","task_id":"task","tool_use_id":"child","task_type":"local_agent"});
+            adapter.receive(started.clone()).unwrap();
+            adapter.receive(json!({"type":"user","uuid":"async-receipt-child","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"task"},"message":{"content":[{"type":"tool_result","tool_use_id":"child","content":"Async agent launched successfully."}]}})).unwrap();
+            let mut failure = if source == "stream" {
+                json!({"type":"stream_event","uuid":"actual-failure","parent_tool_use_id":"child","event":{"type":"error","error":{"type":"rate_limit_error","message":"quota exceeded"}}})
+            } else {
+                json!({"type":"result","uuid":"actual-failure","parent_tool_use_id":"child","is_error":true,"errors":["quota exceeded"]})
+            };
+            failure["session_id"] = json!("00000000-0000-4000-8000-000000000001");
+            adapter.receive(failure.clone()).unwrap();
+            let terminal = json!({"type":"system","subtype":"task_notification","task_id":"task","tool_use_id":"child","uuid":"actual-terminal","status":"failed","summary":"quota exceeded"});
+            adapter.receive(terminal.clone()).unwrap();
+            adapter.receive(started).unwrap();
+            let fresh = adapter.receive(json!({"type":"stream_event","uuid":"actual-new-work","parent_tool_use_id":"child","event":{"type":"message_start","message":{"id":"new-child-message"}}})).unwrap();
+            assert!(fresh.events.iter().any(|event|matches!(event,Event::Subagent { id, waiting:Some(false),.. } if id=="child")));
+            let generation = adapter.attention_generation;
+            for replay in [failure.clone(), terminal] {
+                assert!(
+                    adapter.receive(replay).unwrap().events.is_empty(),
+                    "an exact old failure/result/notification cannot re-block or settle fresh child work"
+                );
+            }
+            assert!(adapter.tasks.iter().any(|task| task == "task"));
+            assert_eq!(adapter.streams["child"].message, "new-child-message");
+            assert!(adapter.busy);
+            assert_eq!(adapter.attention_generation, generation);
+            if source == "stream" {
+                failure["event"]["error"]["message"] = json!("quota exceeded; revised diagnostics");
+            } else {
+                failure["errors"] = json!(["quota exceeded; revised diagnostics"]);
+            }
+            let changed = adapter.receive(failure).unwrap();
+            assert!(changed.events.iter().any(|event| matches!(event,Event::SubagentItem { id,item }
+                if id=="child" && chat::failure::provider_error_text(Provider::Claude,item).is_some_and(|body|body.contains("revised diagnostics")))),
+                "a reused UUID with new payload remains observable");
+        }
+    }
+
+    #[test]
+    fn replayed_and_historical_child_answers_do_not_clear_a_later_retry_failure() {
+        let mut adapter = Claude {
+            busy: true,
+            ..Default::default()
+        };
+        let answer = |uuid: &str| json!({"type":"assistant","uuid":uuid,"parent_tool_use_id":"blocked-child","message":{"id":uuid,"content":[{"type":"text","text":"Earlier child answer"}]}});
+        adapter.receive(answer("old-live-carrier")).unwrap();
+        let failure = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"blocked-child","event":{"type":"error","error":{"type":"rate_limit_error","message":"quota exceeded"}}})).unwrap();
+        assert!(failure.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                waiting: Some(true),
+                ..
+            }
+        )));
+        let clears = |events: &[Event]| {
+            events.iter().any(|event| matches!(event, Event::Subagent { id, waiting:Some(false), detail:Some(detail), .. } if id=="blocked-child" && detail.is_empty()))
+        };
+        let replay = adapter.receive(answer("old-live-carrier")).unwrap();
+        assert!(
+            !clears(&replay.events),
+            "An identical already-seen live carrier is not recovery"
+        );
+        let mut history = Step::default();
+        adapter
+            .message_with_tools(
+                &answer("previously-unseen-history-carrier"),
+                &mut history,
+                &HashMap::new(),
+                true,
+            )
+            .unwrap();
+        assert!(
+            !clears(&history.events),
+            "An unseen saved sidecar carrier is still history"
+        );
+        let replay_history = adapter
+            .receive(answer("previously-unseen-history-carrier"))
+            .unwrap();
+        assert!(
+            !clears(&replay_history.events),
+            "Previously imported history cannot become fresh through replay"
+        );
+        let mut meta = answer("new-model-only-carrier");
+        meta["isMeta"] = json!(true);
+        assert!(!clears(&adapter.receive(meta).unwrap().events));
+        for (index, content) in [
+            json!([]),
+            json!("   \n\t"),
+            json!([{"type":"text","text":"   \n\t"}]),
+            json!([{"type":"thinking","thinking":" "}]),
+            json!([{"type":"image","source":{}}]),
+            json!([{"type":"unknown-content","text":"not proven activity"}]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut empty = answer(&format!("fresh-empty-envelope-{index}"));
+            empty["message"]["content"] = content;
+            assert!(
+                !clears(&adapter.receive(empty).unwrap().events),
+                "A new envelope without meaningful assistant activity cannot clear the blocked child"
+            );
+        }
+        let fresh = adapter
+            .receive(answer("genuinely-new-live-carrier"))
+            .unwrap();
+        assert!(clears(&fresh.events));
+        for (index, content) in [
+            json!("Actual live child response"),
+            json!([{"type":"thinking","thinking":"Considering the current change"}]),
+            json!([{"type":"tool_use","id":"new-child-tool","name":"Read","input":{"file_path":"current.rs"}}]),
+            json!([{"type":"image","source":{"type":"url","url":"https://example.test/current.png"}}]),
+        ].into_iter().enumerate() {
+            let mut active = answer(&format!("fresh-meaningful-envelope-{index}"));
+            active["message"]["content"] = content;
+            assert!(clears(&adapter.receive(active).unwrap().events),
+                "Fresh parsed assistant activity still clears its exact child failure");
+        }
+        assert!(
+            adapter.busy,
+            "Child recovery does not settle or restart the parent"
+        );
+        assert!(!fresh.events.iter().any(|event| matches!(
+            event,
+            Event::Status { .. } | Event::TurnStarted | Event::TurnSettled
+        )));
+    }
+
+    #[test]
+    fn explicit_assistant_failure_keeps_raw_text_system_identity_and_reset_cause() {
+        let mut adapter = Claude::default();
+        let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)\nrequest diagnostics retained";
+        let step = adapter.receive(json!({"type":"assistant","uuid":"quota-carrier","error":"rate_limit","message":{"id":"quota-message","content":[{"type":"text","text":failure}]}})).unwrap();
+        assert!(step.events.iter().any(|event| matches!(event, Event::Item(item) if item.id=="quota-message:0" && chat::failure::provider_error_text(Provider::Claude, item)==Some(failure))));
+        let current = step
+            .events
+            .iter()
+            .find_map(|event| {
+                if let Event::Error { message, .. } = event {
+                    Some(message)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(current.contains("Claude: rate_limit") && current.contains(failure));
+        assert_eq!(
+            chat::failure::Failure::parse(Provider::Claude, current)
+                .unwrap()
+                .key,
+            chat::failure::Failure::parse(Provider::Claude, failure)
+                .unwrap()
+                .key
+        );
+        let quote = adapter.receive(json!({"type":"assistant","uuid":"quote-carrier","message":{"id":"quote-message","content":[{"type":"text","text":failure}]}})).unwrap();
+        assert!(quote.events.iter().any(|event| matches!(
+            event,
+            Event::Item(Item {
+                role: Role::Assistant,
+                ..
+            })
+        )));
+        assert!(
+            !quote
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+    }
+
+    #[test]
+    fn explicit_child_failure_blocks_share_only_their_proven_carrier() {
+        let mut adapter = Claude::default();
+        let bodies = [
+            "You've hit your limit · resets 1:30pm (America/Los_Angeles)",
+            "request-id: same-provider-envelope\nOriginal details stay separate and exact.",
+        ];
+        for carrier in ["first-error-message", "next-error-message"] {
+            let step = adapter.receive(json!({"type":"assistant","uuid":carrier,"parent_tool_use_id":"same-child","error":"rate_limit","message":{"id":carrier,"content":[{"type":"text","text":bodies[0]},{"type":"text","text":bodies[1]}]}})).unwrap();
+            let items: Vec<_> = step
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::SubagentItem { id, item } if id == "same-child" => Some(item),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(items.len(), 2);
+            for (index, item) in items.iter().enumerate() {
+                assert_eq!(item.id, format!("{carrier}:{index}"));
+                assert_eq!(
+                    chat::failure::provider_error_text(Provider::Claude, item),
+                    Some(bodies[index])
+                );
+                assert_eq!(
+                    chat::failure::provider_error_carrier(Provider::Claude, item),
+                    Some(carrier)
+                );
+            }
+            assert!(!step.events.iter().any(|event| matches!(
+                event,
+                Event::Error { .. } | Event::TurnStarted | Event::TurnSettled
+            )));
+        }
+    }
+
+    #[test]
+    fn child_user_quotations_are_not_provider_errors_and_followup_failures_keep_their_ids() {
+        let mut adapter = Claude::default();
+        let quota = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
+        let frame = |kind: &str, id: &str, error: bool| {
+            let mut value = json!({"type":kind,"uuid":id,"parent_tool_use_id":"same-child","message":{"id":id,"content":[{"type":"text","text":quota}]}});
+            if error {
+                value["error"] = json!("rate_limit");
+            }
+            value
+        };
+        for id in ["original-child-prompt", "followup-child-prompt"] {
+            let quote = adapter.receive(frame("user", id, false)).unwrap();
+            assert!(quote.events.iter().any(|event| matches!(event, Event::SubagentItem { id, item } if id=="same-child" && item.role==Role::System && matches!(&item.content,ItemContent::Text{text,..} if text==quota) && chat::failure::provider_error_text(Provider::Claude,item).is_none())));
+            let error_id = format!("{id}-error");
+            let error = adapter
+                .receive(frame("assistant", &error_id, true))
+                .unwrap();
+            assert!(error.events.iter().any(|event| matches!(event, Event::SubagentItem { id,item } if id=="same-child" && item.id==format!("{error_id}:0") && chat::failure::provider_error_text(Provider::Claude,item)==Some(quota))));
+            assert!(!error.events.iter().any(|event| matches!(
+                event,
+                Event::Error { .. } | Event::TurnStarted | Event::TurnSettled
+            )));
+        }
+        let replay = adapter
+            .receive(frame("assistant", "original-child-prompt-error", true))
+            .unwrap();
+        assert!(replay.events.iter().any(|event| matches!(event, Event::SubagentItem { item,.. } if item.id=="original-child-prompt-error:0" && chat::failure::provider_error_text(Provider::Claude,item)==Some(quota))));
+    }
+
+    #[test]
     fn confirmed_claude_session_observes_only_its_saved_names_at_result_boundaries() {
         let root = tempfile::tempdir().unwrap();
         let cwd = root.path().canonicalize().unwrap();
@@ -5717,7 +7807,7 @@ mod tests {
         )
         .unwrap();
         let streaming = adapter
-            .receive(json!({"type":"stream_event","session_id":id,"event":{}}))
+            .receive(json!({"type":"stream_event","session_id":id,"event":{"type":"future_stream_event"}}))
             .unwrap();
         assert!(
             !streaming
@@ -7953,6 +10043,7 @@ mod tests {
                 "type": "user",
                 "uuid": "skill-context",
                 "isMeta": true,
+                "isSynthetic": true,
                 "turnCompanion": true,
                 "message": {"role": "user", "content": [{"type": "text", "text": "Base directory for this skill: /skills/example"}]}
             }))
@@ -7973,6 +10064,312 @@ mod tests {
             .unwrap();
         assert!(user.events.iter().any(|event| matches!(event, Event::Item(item)
             if item.role == Role::User && matches!(&item.content, ItemContent::Text { text, .. } if text == "Use the skill"))));
+    }
+
+    #[test]
+    fn synthetic_context_live_preserves_skill_calls_results_and_user_quotes() {
+        let body = "Base directory for this skill: /skills/example\n\nInternal instructions";
+        for marker in [
+            "isMeta",
+            "isSynthetic",
+            "isCompactSummary",
+            "isVisibleInTranscriptOnly",
+        ] {
+            for content in [json!(body), json!([{"type":"text","text":body}])] {
+                let mut adapter = Claude::default();
+                let call = adapter.receive(json!({"type":"assistant","uuid":"call","message":{"id":"call-message","content":[{"type":"tool_use","id":"skill-1","name":"Skill","input":{"skill":"example"}}]}})).unwrap();
+                assert!(
+                    matches!(&items(&call)[..], [ItemContent::Tool { name, input, status: ToolStatus::Running, .. }]
+                    if name == "Skill" && serde_json::from_str::<Value>(input).unwrap()["skill"] == "example")
+                );
+                let call_id = call
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::Item(item) if matches!(item.content, ItemContent::Tool { .. }) => {
+                            Some(item.id.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(call_id, "skill-1");
+
+                let mut frame = json!({"type":"user","uuid":"internal","message":{"role":"user","content":content}});
+                frame[marker] = json!(true);
+                // Stream-json omits the other internal fields, including
+                // turnCompanion and sourceToolUseID, so do not depend on them.
+                let context = adapter.receive(frame).unwrap();
+                if marker == "isMeta" {
+                    assert!(context.events.is_empty(), "{marker}: {context:?}");
+                    assert!(adapter.carrier_items["internal"].is_empty());
+                } else {
+                    assert_eq!(
+                        deliveries(&context),
+                        vec![(
+                            Role::System,
+                            context_item("internal:0".into(), body.into()).content
+                        )]
+                    );
+                    assert_eq!(adapter.carrier_items["internal"], vec!["internal:0"]);
+                }
+
+                for flag in [
+                    None,
+                    Some(json!(false)),
+                    Some(Value::Null),
+                    Some(json!("true")),
+                ] {
+                    let mut quoted = json!({"type":"user","uuid":"quoted","message":{"role":"user","content":body}});
+                    if let Some(flag) = flag {
+                        quoted[marker] = flag;
+                    }
+                    let visible = adapter.receive(quoted).unwrap();
+                    assert!(
+                        matches!(&deliveries(&visible)[..], [(Role::User, ItemContent::Text { text, .. })] if text == body)
+                    );
+                }
+                let result = adapter.receive(json!({"type":"user","uuid":"result","message":{"content":[{"type":"tool_result","tool_use_id":"skill-1","content":"Launching skill: example"}]}})).unwrap();
+                assert!(
+                    matches!(&items(&result)[..], [ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. }]
+                    if name == "Skill" && output == "Launching skill: example")
+                );
+                let result_id = result
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::Item(item) if matches!(item.content, ItemContent::Tool { .. }) => {
+                            Some(item.id.as_str())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(result_id, call_id);
+                let replacement = adapter.receive(json!({"type":"user","uuid":"replacement","supersedes":["internal"],"message":{"content":"Continue"}})).unwrap();
+                assert!(
+                    !replacement
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, Event::Error { .. }))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn synthetic_context_history_preserves_opaque_context_without_rewriting_source() {
+        let body = "Base directory for this skill: /skills/example\n\nInternal instructions";
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        let mut source = file.try_clone().unwrap();
+        for frame in [
+            json!({"type":"user","uuid":"root","parentUuid":null,"sessionId":id,"message":{"content":"Use the example skill"}}),
+            json!({"type":"assistant","uuid":"call","parentUuid":"root","sessionId":id,"message":{"id":"call-message","content":[{"type":"tool_use","id":"skill-1","name":"Skill","input":{"skill":"example"}}]}}),
+            json!({"type":"user","uuid":"legacy","parentUuid":"call","sessionId":id,"isMeta":true,"turnCompanion":true,"sourceToolUseID":"skill-1","message":{"content":body}}),
+            json!({"type":"user","uuid":"wire","parentUuid":"legacy","sessionId":id,"isSynthetic":true,"message":{"content":[{"type":"text","text":body}]}}),
+            json!({"type":"user","uuid":"raw-summary","parentUuid":"wire","sessionId":id,"isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"content":body}}),
+            json!({"type":"user","uuid":"result","parentUuid":"raw-summary","sessionId":id,"message":{"content":[{"type":"tool_result","tool_use_id":"skill-1","content":"Launching skill: example"}]}}),
+            json!({"type":"assistant","uuid":"answer","parentUuid":"result","sessionId":id,"message":{"content":"Skill completed"}}),
+        ] {
+            writeln!(file, "{frame}").unwrap();
+        }
+        let mut expected = vec![
+            "root".to_owned(),
+            "call".into(),
+            "wire".into(),
+            "raw-summary".into(),
+            "result".into(),
+            "answer".into(),
+        ];
+        let mut parent = "answer".to_owned();
+        for marker in [
+            "isMeta",
+            "isSynthetic",
+            "isCompactSummary",
+            "isVisibleInTranscriptOnly",
+        ] {
+            for (index, flag) in [
+                None,
+                Some(json!(false)),
+                Some(Value::Null),
+                Some(json!("true")),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let uuid = format!("quoted-{marker}-{index}");
+                let mut frame = json!({"type":"user","uuid":uuid,"parentUuid":parent,"sessionId":id,"message":{"content":body}});
+                if let Some(flag) = flag {
+                    frame[marker] = flag;
+                }
+                writeln!(file, "{frame}").unwrap();
+                parent = uuid.clone();
+                expected.push(uuid);
+            }
+        }
+        writeln!(file, "{}", json!({"type":"user","uuid":"tail","parentUuid":parent,"sessionId":id,"isSynthetic":true,"message":{"content":body}})).unwrap();
+        expected.push("tail".into());
+        source.rewind().unwrap();
+        let mut before = String::new();
+        source.read_to_string(&mut before).unwrap();
+        file.rewind().unwrap();
+        let mut history = History::index(file, id).unwrap();
+        let records = history.page().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|frame| frame["uuid"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        let mut adapter = Claude::default();
+        let mut replay = Step::default();
+        for record in &records {
+            adapter.history_message(record, &mut replay).unwrap();
+        }
+        assert_eq!(
+            deliveries(&replay)
+                .iter()
+                .filter(|(role, content)| *role == Role::User
+                    && matches!(content, ItemContent::Text { text, .. } if text == body))
+                .count(),
+            16
+        );
+        assert!(items(&replay).iter().any(|content| matches!(content, ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. } if name == "Skill" && output == "Launching skill: example")));
+        let skill_ids = replay.events.iter().filter_map(|event| match event {
+            Event::Item(item) if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Skill") => Some(item.id.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(skill_ids, vec!["skill-1", "skill-1"]);
+        let contexts = replay
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Item(item) if item.role == Role::System => Some(item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contexts
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wire:0", "raw-summary:0", "tail:0"]
+        );
+        assert!(contexts.iter().all(|item| matches!(&item.content, ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body: original } if from.is_empty() && sender.is_empty() && summary == "Claude context" && original.as_bytes() == body.as_bytes())));
+        source.rewind().unwrap();
+        let mut after = String::new();
+        source.read_to_string(&mut after).unwrap();
+        assert_eq!(after, before, "raw provider evidence must remain intact");
+    }
+
+    #[test]
+    fn synthetic_context_peer_delivery_and_assistant_text_remain_visible() {
+        let mut frame = json!({"type":"user","uuid":"peer","isSynthetic":true,"origin":{"kind":"peer","from":"worker","body":"Skill findings"},"message":{"content":"Skill findings"}});
+        let mut adapter = Claude::default();
+        let step = adapter.receive(frame.clone()).unwrap();
+        assert!(
+            matches!(&deliveries(&step)[..], [(Role::User, ItemContent::Delivery { body, .. })] if body == "Skill findings")
+        );
+        let mut history = correlation_history(vec![frame.clone()]);
+        let records = history.page().unwrap();
+        assert_eq!(records.len(), 1);
+        let mut replay = Step::default();
+        Claude::default()
+            .history_message(&records[0], &mut replay)
+            .unwrap();
+        assert_eq!(deliveries(&replay), deliveries(&step));
+
+        frame["type"] = json!("assistant");
+        frame["uuid"] = json!("answer");
+        frame.as_object_mut().unwrap().remove("origin");
+        let answer = adapter.receive(frame).unwrap();
+        assert!(
+            matches!(&deliveries(&answer)[..], [(Role::Assistant, ItemContent::Text { text, .. })] if text == "Skill findings")
+        );
+    }
+
+    #[test]
+    fn synthetic_context_compact_summary_wire_forms_preserve_full_text_and_history() {
+        // Installed Claude 2.1.289: Hen keeps string content, Ule normalizes
+        // it to text blocks, and Py adds isReplay:false for a compact summary.
+        // None preserves the flags distinguishing that summary from a Skill
+        // injection. These are producer-shaped fixtures, not a live capture.
+        let body = "Conversation summary\nObjective: preserve the conversation\nDecisions and unfinished work remain available.\nTranscript: /fixture/session.jsonl";
+        for (content, replay) in [
+            (json!(body), None),
+            (json!([{"type":"text","text":body}]), None),
+            (json!(body), Some(false)),
+        ] {
+            let mut frame = json!({"type":"user","uuid":"summary","session_id":"00000000-0000-4000-8000-000000000001","parent_tool_use_id":null,"isSynthetic":true,"message":{"role":"user","content":content}});
+            if let Some(replay) = replay {
+                frame["isReplay"] = json!(replay);
+            }
+            let live = Claude::default().receive(frame.clone()).unwrap();
+            let expected = context_item("summary:0".into(), body.into());
+            assert!(
+                matches!(&live.events[..], [Event::Session { .. }, Event::Item(item)] if item == &expected),
+                "{:#?}",
+                live.events
+            );
+            let mut history = correlation_history(vec![frame]);
+            let records = history.page().unwrap();
+            assert_eq!(
+                records.len(),
+                1,
+                "opaque synthetic context stays in the history index"
+            );
+            let mut replay = Step::default();
+            Claude::default()
+                .history_message(&records[0], &mut replay)
+                .unwrap();
+            assert_eq!(deliveries(&replay), deliveries(&live));
+        }
+    }
+
+    #[test]
+    fn synthetic_context_does_not_wrap_or_erase_correlated_tool_results() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"call","message":{"content":[{"type":"tool_use","id":"skill-1","name":"Skill","input":{"skill":"example"}}]}})).unwrap();
+        let body = "Opaque provider context";
+        let result = adapter.receive(json!({"type":"user","uuid":"result","isSynthetic":true,"message":{"content":[{"type":"text","text":body},{"type":"tool_result","tool_use_id":"skill-1","content":"Launching skill: example"}]}})).unwrap();
+        assert!(
+            matches!(&result.events[..], [Event::Item(context), Event::Item(tool)] if context == &context_item("result:0".into(), body.into()) && tool.id == "skill-1" && tool.role == Role::Assistant && matches!(&tool.content, ItemContent::Tool { name, input, output, status: ToolStatus::Succeeded } if name == "Skill" && serde_json::from_str::<Value>(input).unwrap()["skill"] == "example" && output == "Launching skill: example"))
+        );
+    }
+
+    #[test]
+    fn synthetic_context_raw_compact_summary_history_matches_wire_presentation() {
+        // Actual raw compaction constructors retain these explicit flags;
+        // partial summaries with kept messages use summarizeMetadata instead
+        // of isVisibleInTranscriptOnly. The SDK folds either case to synthetic.
+        let body = "Conversation summary\nImportant decisions\nUnfinished work and the transcript recovery path remain available.";
+        for flags in [
+            json!({"isCompactSummary":true,"isVisibleInTranscriptOnly":true}),
+            json!({"isCompactSummary":true,"summarizeMetadata":{"messagesSummarized":3,"userContext":"fixture","direction":"up_to"}}),
+            json!({"isVisibleInTranscriptOnly":true}),
+        ] {
+            let mut raw =
+                json!({"type":"user","uuid":"summary","message":{"role":"user","content":body}});
+            raw.as_object_mut()
+                .unwrap()
+                .extend(flags.as_object().unwrap().clone());
+            let mut history = correlation_history(vec![raw]);
+            let records = history.page().unwrap();
+            assert_eq!(records.len(), 1);
+            let mut restored = Step::default();
+            Claude::default()
+                .history_message(&records[0], &mut restored)
+                .unwrap();
+            let wire = Claude::default().receive(json!({"type":"user","uuid":"summary","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":body}]}})).unwrap();
+            assert_eq!(deliveries(&restored), deliveries(&wire));
+            assert_eq!(
+                deliveries(&restored),
+                vec![(
+                    Role::System,
+                    context_item("summary:0".into(), body.into()).content
+                )]
+            );
+        }
     }
 
     /// The framing Claude Code wraps a subagent's hand-back in, as recorded.
@@ -8461,8 +10858,107 @@ mod tests {
             let mut adapter = Claude::default();
             adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":kind,"description":"Review"})).unwrap();
             adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"task","patch":{"summary":"Making progress"}})).unwrap();
-            let done = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Findings","uuid":"report"})).unwrap();
+            let notification = json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Findings","uuid":"report"});
+            let done = adapter.receive(notification.clone()).unwrap();
             assert!(done.events.iter().any(|event| matches!(event, Event::Item(Item {content:ItemContent::Delivery {kind, summary, body, .. }, .. }) if summary == heading && if report { *kind == DeliveryKind::Report && body == "Findings" } else { *kind == DeliveryKind::Notice && body.is_empty() })));
+            assert!(
+                adapter.tasks.is_empty(),
+                "origin retention is never running work"
+            );
+            assert_eq!(adapter.report_tasks.len(), usize::from(report));
+            let replay = adapter.receive(notification.clone()).unwrap();
+            assert!(
+                replay.events.is_empty(),
+                "exact replay cannot replace the original role/ID/kind/heading/raw body"
+            );
+            let mut changed = notification;
+            changed["summary"] = json!("Revised findings");
+            let changed = adapter.receive(changed).unwrap();
+            assert!(changed.events.iter().any(|event|matches!(event, Event::Item(Item { content:ItemContent::Delivery {kind,summary,body,..},.. })
+                if if report { *kind==DeliveryKind::Report && summary==heading && body=="Revised findings" } else { *kind==DeliveryKind::Notice && summary=="Revised findings" && body.is_empty() })),
+                "same UUID with changed payload must still be processed");
+            // Same task ID reused for a nonreport producer must not inherit an
+            // old native-agent/workflow origin.
+            adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":"local_bash","description":"New command"})).unwrap();
+            let command = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Command finished","uuid":"new-command-report"})).unwrap();
+            assert!(command.events.iter().any(|event|matches!(event, Event::Item(Item { content:ItemContent::Delivery {kind:DeliveryKind::Notice, summary,body,..},.. }) if summary=="Command finished" && body.is_empty())));
+            assert!(adapter.report_tasks.is_empty());
+        }
+    }
+
+    #[test]
+    fn exact_task_receipts_do_not_reexpose_a_handed_back_report_and_cache_stays_bounded() {
+        for kind in ["local_agent", "local_workflow"] {
+            let mut adapter = Claude::default();
+            adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":kind,"description":"Review"})).unwrap();
+            adapter.receive(json!({"type":"user","uuid":"actual-handback","isMeta":true,
+                "origin":{"kind":"peer","from":"task","senderTaskId":"task","body":format!("{HANDBACK_PREAMBLE}\n  Original findings"),"handback":true},
+                "message":{"role":"user","content":"unused"}})).unwrap();
+            let mut notification = json!({"type":"system","subtype":"task_notification","task_id":"task","uuid":"terminal-after-handback","status":"completed","summary":"Original findings"});
+            let done = adapter.receive(notification.clone()).unwrap();
+            assert!(done.events.iter().any(|event|matches!(event,Event::Item(Item {content:ItemContent::Delivery {kind:DeliveryKind::Notice,body,..},..}) if body.is_empty())));
+            assert!(
+                adapter
+                    .receive(notification.clone())
+                    .unwrap()
+                    .events
+                    .is_empty(),
+                "exact replay must not consume handoff state again or re-expose its body"
+            );
+            notification["summary"] = json!("Revised findings");
+            let changed = adapter.receive(notification.clone()).unwrap();
+            assert!(changed.events.iter().any(|event|matches!(event,Event::Item(Item {content:ItemContent::Delivery {kind:DeliveryKind::Report,body,..},..}) if body=="Revised findings")));
+            notification["uuid"] = json!("fresh-report");
+            let fresh = adapter.receive(notification.clone()).unwrap();
+            assert!(fresh.events.iter().any(|event|matches!(event,Event::Item(Item {content:ItemContent::Delivery {kind:DeliveryKind::Report,body,..},..}) if body=="Revised findings")));
+            notification.as_object_mut().unwrap().remove("uuid");
+            for _ in 0..2 {
+                assert!(
+                    adapter
+                        .receive(notification.clone())
+                        .unwrap()
+                        .events
+                        .iter()
+                        .any(|event| matches!(
+                            event,
+                            Event::Item(Item {
+                                content: ItemContent::Delivery { .. },
+                                ..
+                            })
+                        )),
+                    "missing UUID never authorizes global replay suppression"
+                );
+            }
+            for carrier in ["", " \t\n"] {
+                notification["uuid"] = json!(carrier);
+                for _ in 0..2 {
+                    assert!(
+                        adapter
+                            .receive(notification.clone())
+                            .unwrap()
+                            .events
+                            .iter()
+                            .any(|event| matches!(
+                                event,
+                                Event::Item(Item {
+                                    content: ItemContent::Delivery { .. },
+                                    ..
+                                })
+                            )),
+                        "blank UUID does not suppress an actual notification"
+                    );
+                }
+            }
+            for index in 0..=MAX_TOOLS {
+                notification["uuid"] = json!(format!("bounded-{index}"));
+                adapter.receive(notification.clone()).unwrap();
+            }
+            assert_eq!(adapter.failure_receipts.len(), MAX_TOOLS);
+            assert!(adapter.tasks.is_empty());
+            adapter
+                .receive(json!({"type":"conversation_reset"}))
+                .unwrap();
+            assert!(adapter.failure_receipts.is_empty());
             assert!(adapter.report_tasks.is_empty());
         }
     }
@@ -8789,6 +11285,459 @@ mod tests {
         assert_eq!(adapter.visible_task_rows.len(), 3);
     }
 
+    fn notification_agent(adapter: &mut Claude, tool: &str, task: &str, background: bool) {
+        adapter.receive(json!({"type":"assistant","uuid":format!("launch-{tool}"),"message":{"id":format!("message-{tool}"),"content":[{"type":"tool_use","id":tool,"name":"Agent","input":{"run_in_background":background}}]}})).unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"})).unwrap();
+    }
+
+    fn notification_frame(uuid: &str, tool: &str, task: &str, status: &str) -> Value {
+        json!({"type":"user","uuid":uuid,"origin":{"kind":"task-notification"},"message":{"role":"user","content":format!("<task-notification>\n<task-id>{task}</task-id>\n<tool-use-id>{tool}</tool-use-id>\n<status>{status}</status>\n<summary>Agent finished</summary>\n<result>Exact report</result>\n</task-notification>")}})
+    }
+
+    fn notification_agent_statuses(step: &Step, tool: &str) -> Vec<ToolStatus> {
+        step.events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Subagent { id, status, .. } if id == tool => *status,
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn live_recorded_notifications_settle_the_bound_agent_without_a_second_delivery() {
+        for (status, expected) in [
+            ("completed", ToolStatus::Succeeded),
+            ("failed", ToolStatus::Failed),
+        ] {
+            for explicit_origin in [false, true] {
+                let mut adapter = Claude::default();
+                notification_agent(&mut adapter, "tool-one", "task-one", true);
+                notification_agent(&mut adapter, "tool-two", "task-two", true);
+                assert!(
+                    adapter.agent_calls.is_empty(),
+                    "no async-ID acknowledgement yet"
+                );
+                let mut frame = notification_frame("text-finished", "tool-one", "task-one", status);
+                if !explicit_origin {
+                    frame.as_object_mut().unwrap().remove("origin");
+                }
+                let expected_delivery = delivery(&frame);
+                let step = adapter.receive(frame).unwrap();
+                assert_eq!(notification_agent_statuses(&step, "tool-one"), [expected]);
+                assert!(notification_agent_statuses(&step, "tool-two").is_empty());
+                assert_eq!(
+                    items(&step),
+                    expected_delivery,
+                    "one original Delivery, no fallback duplicate"
+                );
+                assert!(!adapter.tasks.iter().any(|id| id == "task-one"));
+                assert!(adapter.tasks.iter().any(|id| id == "task-two"));
+                assert!(!adapter.background_agents.contains("tool-one"));
+                assert!(adapter.background_agents.contains("tool-two"));
+                assert_eq!(adapter.ended_agent("tool-one"), Some(expected));
+                assert_eq!(
+                    adapter.tools[&ScopedId::new(None, "claude-task:task-one")]
+                        .content
+                        .status(),
+                    Some(expected)
+                );
+                assert!(adapter.visible_task_rows.is_empty());
+            }
+        }
+    }
+
+    /// After `SendMessage` resumes a settled background Agent, the new run's
+    /// start need not name a call, but its receipt names the `SendMessage`
+    /// call rather than the Agent's own.
+    #[test]
+    fn a_resumed_background_agent_settles_from_a_receipt_naming_send_message() {
+        for text_receipt in [false, true] {
+            let mut adapter = Claude::default();
+            notification_agent(&mut adapter, "agent-call", "agent-task", true);
+            adapter
+                .receive(notification_frame(
+                    "first-receipt",
+                    "agent-call",
+                    "agent-task",
+                    "completed",
+                ))
+                .unwrap();
+            assert_eq!(
+                adapter.ended_agent("agent-call"),
+                Some(ToolStatus::Succeeded)
+            );
+            adapter.receive(json!({"type":"assistant","uuid":"resume-call","message":{"id":"resume-message","content":[{"type":"tool_use","id":"send-call","name":"SendMessage","input":{"to":"agent-task","message":"Check again"}}]}})).unwrap();
+            let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"agent-task","task_type":"local_agent"})).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&started, "agent-call"),
+                [ToolStatus::Running]
+            );
+            let receipt = if text_receipt {
+                notification_frame("second-receipt", "send-call", "agent-task", "failed")
+            } else {
+                json!({"type":"system","subtype":"task_notification","uuid":"second-receipt","task_id":"agent-task","tool_use_id":"send-call","status":"failed","summary":"Agent failed"})
+            };
+            let settled = adapter.receive(receipt).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&settled, "agent-call"),
+                [ToolStatus::Failed],
+                "text receipt: {text_receipt}"
+            );
+            assert_eq!(adapter.ended_agent("agent-call"), Some(ToolStatus::Failed));
+            assert!(adapter.restarted_agents.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_send_message_alias_never_settles_the_agent_it_resumed_for_another_task() {
+        let mut adapter = Claude::default();
+        notification_agent(&mut adapter, "call-a", "task-a", true);
+        notification_agent(&mut adapter, "call-b", "task-b", true);
+        adapter.receive(json!({"type":"assistant","uuid":"resume-b","message":{"id":"resume-b","content":[{"type":"tool_use","id":"send-b","name":"SendMessage","input":{"to":"task-b","message":"Again"}}]}})).unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task-b","task_type":"local_agent"})).unwrap();
+        let step = adapter
+            .receive(notification_frame(
+                "receipt-a",
+                "send-b",
+                "task-a",
+                "completed",
+            ))
+            .unwrap();
+        assert_eq!(
+            notification_agent_statuses(&step, "call-a"),
+            [ToolStatus::Succeeded]
+        );
+        assert!(notification_agent_statuses(&step, "call-b").is_empty());
+        assert!(adapter.background_agents.contains("call-b"));
+        assert_eq!(adapter.ended_agent("call-b"), None);
+    }
+
+    #[test]
+    fn a_live_quoted_report_settles_only_its_closed_outer_notification() {
+        let quoting = "<task-notification>\n<task-id>task-one</task-id>\n<tool-use-id>tool-one</tool-use-id>\n<status>completed</status>\n<summary>Agent finished</summary>\n<result>The log shows:\n<task-notification>\n<task-id>task-two</task-id>\n<tool-use-id>tool-two</tool-use-id>\n<status>failed</status>\n</result>\n</task-notification>";
+        let quoted_close = quoting.replace("</result>", "</task-notification>\n</result>");
+        for (label, content, settled) in [
+            ("closed", quoting.to_owned(), true),
+            (
+                "outer-open",
+                quoting
+                    .strip_suffix("</task-notification>")
+                    .unwrap()
+                    .to_owned(),
+                false,
+            ),
+            ("result-open", quoting.replace("</result>", ""), false),
+            (
+                "only-quoted-close",
+                quoted_close
+                    .strip_suffix("</task-notification>")
+                    .unwrap()
+                    .to_owned(),
+                false,
+            ),
+        ] {
+            let mut adapter = Claude::default();
+            notification_agent(&mut adapter, "tool-one", "task-one", true);
+            notification_agent(&mut adapter, "tool-two", "task-two", true);
+            let frame = json!({"type":"user","uuid":label,"origin":{"kind":"task-notification"},"message":{"content":content}});
+            let expected_delivery = delivery(&frame);
+            assert!(matches!(
+                expected_delivery.as_slice(),
+                [ItemContent::Delivery { .. }]
+            ));
+            let step = adapter.receive(frame).unwrap();
+            assert_eq!(
+                items(&step),
+                expected_delivery,
+                "{label}: original Delivery exactly once"
+            );
+            assert_eq!(
+                notification_agent_statuses(&step, "tool-one"),
+                if settled {
+                    vec![ToolStatus::Succeeded]
+                } else {
+                    Vec::new()
+                },
+                "{label}"
+            );
+            assert!(
+                notification_agent_statuses(&step, "tool-two").is_empty(),
+                "{label}: quoted identity is inert"
+            );
+            assert_eq!(
+                adapter.background_agents.contains("tool-one"),
+                !settled,
+                "{label}"
+            );
+            assert_eq!(
+                adapter.tasks.iter().any(|id| id == "task-one"),
+                !settled,
+                "{label}"
+            );
+            assert_eq!(
+                adapter.ended_agent("tool-one"),
+                settled.then_some(ToolStatus::Succeeded),
+                "{label}"
+            );
+            assert!(adapter.background_agents.contains("tool-two"), "{label}");
+            assert!(adapter.tasks.iter().any(|id| id == "task-two"), "{label}");
+            assert_eq!(adapter.ended_agent("tool-two"), None, "{label}");
+            assert!(adapter.visible_task_rows.is_empty(), "{label}");
+        }
+    }
+
+    #[test]
+    fn task_only_completed_and_failed_notifications_settle_before_async_id_ack() {
+        for (status, expected) in [
+            ("completed", ToolStatus::Succeeded),
+            ("failed", ToolStatus::Failed),
+        ] {
+            for background in [false, true] {
+                let mut adapter = Claude::default();
+                notification_agent(&mut adapter, "tool-one", "task-one", background);
+                assert!(adapter.agent_calls.is_empty());
+                let step = adapter.receive(json!({"type":"system","subtype":"task_notification","uuid":"task-only","task_id":"task-one","status":status})).unwrap();
+                assert_eq!(notification_agent_statuses(&step, "tool-one"), [expected]);
+                assert!(step.events.iter().any(|event| matches!(event, Event::Subagent { id, background: reported, .. } if id == "tool-one" && *reported == background.then_some(true))));
+                assert!(!adapter.background_agents.contains("tool-one"));
+                assert!(adapter.tasks.is_empty());
+                assert_eq!(adapter.ended_agent("tool-one"), Some(expected));
+                assert!(adapter.visible_task_rows.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn notification_settlement_ignores_partial_human_unmatched_and_conflicting_identities() {
+        let full = notification_frame("negative", "tool-one", "task-one", "completed");
+        let mut human = full.clone();
+        human["origin"]["kind"] = json!("human");
+        let mut partial = full.clone();
+        partial["message"]["content"] = json!(
+            "<task-notification><task-id>task-one</task-id><tool-use-id>tool-one</tool-use-id><status>completed</status>"
+        );
+        let mut quoted = full.clone();
+        quoted.as_object_mut().unwrap().remove("origin");
+        quoted["message"]["content"] = json!(format!(
+            "Ordinary quoted text: {}",
+            full["message"]["content"].as_str().unwrap()
+        ));
+        let mut child = full.clone();
+        child["parent_tool_use_id"] = json!("tool-two");
+        let frames = [
+            human,
+            partial,
+            quoted,
+            child,
+            notification_frame("missing-task", "tool-one", "", "completed"),
+            notification_frame("unknown", "foreign-tool", "foreign-task", "failed"),
+            notification_frame("wrong-task", "tool-one", "foreign-task", "completed"),
+            notification_frame("foreign-hint", "foreign-tool", "task-one", "completed"),
+            notification_frame("wrong-tool", "tool-two", "task-one", "completed"),
+            json!({"type":"system","subtype":"task_notification","task_id":"task-one","tool_use_id":"tool-two","status":"completed"}),
+        ];
+        for frame in frames {
+            let mut adapter = Claude::default();
+            notification_agent(&mut adapter, "tool-one", "task-one", true);
+            notification_agent(&mut adapter, "tool-two", "task-two", true);
+            let step = adapter.receive(frame).unwrap();
+            assert!(notification_agent_statuses(&step, "tool-one").is_empty());
+            assert!(notification_agent_statuses(&step, "tool-two").is_empty());
+            assert_eq!(
+                adapter.tasks.iter().cloned().collect::<Vec<_>>(),
+                ["task-one", "task-two"]
+            );
+            assert_eq!(adapter.background_agents.len(), 2);
+            assert!(adapter.ended_agents.is_empty());
+            assert_eq!(
+                adapter.tools[&ScopedId::new(None, "claude-task:task-one")]
+                    .content
+                    .status(),
+                Some(ToolStatus::Running)
+            );
+        }
+        for parent in [None, Some("nested-parent")] {
+            let mut adapter = Claude::default();
+            notification_agent(&mut adapter, "tool-one", "task-one", true);
+            adapter
+                .receive(scoped_call(
+                    parent,
+                    "colliding-call",
+                    "tool-one",
+                    if parent.is_none() { "Read" } else { "Agent" },
+                    json!({}),
+                ))
+                .unwrap();
+            let step = adapter
+                .receive(notification_frame(
+                    "collision",
+                    "tool-one",
+                    "task-one",
+                    "completed",
+                ))
+                .unwrap();
+            assert!(notification_agent_statuses(&step, "tool-one").is_empty());
+            assert!(adapter.tasks.iter().any(|id| id == "task-one"));
+            assert!(adapter.ended_agents.is_empty());
+        }
+        let mut adapter = Claude::default();
+        notification_agent(&mut adapter, "tool-one", "task-one", true);
+        let step = adapter
+            .receive(
+                json!({"type":"user","uuid":"ordinary","message":{"content":"ordinary user text"}}),
+            )
+            .unwrap();
+        assert_eq!(
+            items(&step),
+            [ItemContent::Text {
+                text: "ordinary user text".into(),
+                thinking: false,
+                phase: Phase::Final
+            }]
+        );
+        assert!(adapter.background_agents.contains("tool-one"));
+    }
+
+    #[test]
+    fn notification_settlement_refuses_foreign_sessions_before_mutation() {
+        for mut frame in [
+            notification_frame("foreign-text", "tool-one", "task-one", "completed"),
+            json!({"type":"system","subtype":"task_notification","task_id":"task-one","status":"failed"}),
+        ] {
+            let mut adapter = Claude {
+                session_id: Some("00000000-0000-4000-8000-000000000001".into()),
+                ..Claude::default()
+            };
+            notification_agent(&mut adapter, "tool-one", "task-one", true);
+            frame["session_id"] = json!("00000000-0000-4000-8000-000000000002");
+            assert!(
+                adapter
+                    .receive(frame)
+                    .unwrap_err()
+                    .contains("different session ID")
+            );
+            assert!(adapter.background_agents.contains("tool-one"));
+            assert!(adapter.tasks.iter().any(|id| id == "task-one"));
+            assert!(adapter.ended_agents.is_empty());
+        }
+    }
+
+    #[test]
+    fn history_notification_rendering_does_not_settle_live_owners() {
+        let mut adapter = Claude::default();
+        notification_agent(&mut adapter, "tool-one", "task-one", true);
+        let frame = notification_frame("old-history", "tool-one", "task-one", "completed");
+        let expected = delivery(&frame);
+        let record = HistoryRecord {
+            frame: frame.clone(),
+            tool_calls: HashMap::new(),
+        };
+        let mut step = Step::default();
+        adapter.history_message(&record, &mut step).unwrap();
+        assert_eq!(items(&step), expected);
+        assert!(notification_agent_statuses(&step, "tool-one").is_empty());
+        assert!(adapter.background_agents.contains("tool-one"));
+        assert!(adapter.ended_agents.is_empty());
+        let repeated = adapter.receive(frame).unwrap();
+        assert!(notification_agent_statuses(&repeated, "tool-one").is_empty());
+        assert!(adapter.background_agents.contains("tool-one"));
+        assert!(adapter.ended_agents.is_empty());
+    }
+
+    #[test]
+    fn live_monitor_events_leave_their_running_task_row_running() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"monitor-call","task_type":"local_bash"})).unwrap();
+        let event = adapter
+            .receive(json!({
+                "type": "user",
+                "uuid": "event",
+                "message": {"role": "user", "content": "<task-notification>\n<task-id>b1</task-id>\n<summary>Monitor event: \"queue\"</summary>\n<event>6329:queued</event>\n</task-notification>"}
+            }))
+            .unwrap();
+        assert!(
+            !event
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(item) if item.id == "claude-task:b1"))
+        );
+        let row = &adapter.tools[&ScopedId::new(None, "claude-task:b1")];
+        assert_eq!(row.content.status(), Some(ToolStatus::Running));
+    }
+
+    #[test]
+    fn unresolved_terminal_notifications_keep_the_existing_fallback_task_row() {
+        let mut adapter = Claude::default();
+        let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task-one","tool_use_id":"not-yet-seen","task_type":"local_agent"})).unwrap();
+        assert!(
+            started.events.iter().any(
+                |event| matches!(event, Event::Item(item) if item.id == "claude-task:task-one")
+            )
+        );
+        let stopped = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task-one","status":"stopped"})).unwrap();
+        assert!(stopped.events.iter().any(|event| matches!(event, Event::Item(item) if item.id == "claude-task:task-one" && item.content.status() == Some(ToolStatus::Stopped))));
+        assert!(notification_agent_statuses(&stopped, "not-yet-seen").is_empty());
+        let failed = adapter
+            .receive(notification_frame(
+                "late-failed",
+                "not-yet-seen",
+                "task-one",
+                "failed",
+            ))
+            .unwrap();
+        assert!(failed.events.iter().any(|event| matches!(event, Event::Item(item) if item.id == "claude-task:task-one" && item.content.status() == Some(ToolStatus::Stopped))));
+        assert!(adapter.visible_task_rows.contains("claude-task:task-one"));
+        assert_eq!(
+            adapter.ended_agent("not-yet-seen"),
+            Some(ToolStatus::Stopped)
+        );
+    }
+
+    #[test]
+    fn text_task_stops_survive_failed_notices_late_ack_and_restart() {
+        for system_failure in [false, true] {
+            let mut adapter = Claude::default();
+            notification_agent(&mut adapter, "tool-one", "task-one", true);
+            adapter
+                .receive(notification_frame(
+                    "stopped", "tool-one", "task-one", "stopped",
+                ))
+                .unwrap();
+            let failure = if system_failure {
+                json!({"type":"system","subtype":"task_notification","uuid":"failed","task_id":"task-one","status":"failed"})
+            } else {
+                notification_frame("failed", "tool-one", "task-one", "failed")
+            };
+            let failed = adapter.receive(failure.clone()).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&failed, "tool-one"),
+                [ToolStatus::Stopped]
+            );
+            let ack = json!({"type":"user","uuid":"late-ack","tool_use_result":{"status":"async_launched","agentId":"task-one"},"message":{"content":[{"type":"tool_result","tool_use_id":"tool-one","content":"Launched"}]}});
+            let late = adapter.receive(ack.clone()).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&late, "tool-one"),
+                [ToolStatus::Stopped]
+            );
+            assert!(!adapter.background_agents.contains("tool-one"));
+            let restart = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task-one","tool_use_id":"tool-one","task_type":"local_agent"})).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&restart, "tool-one"),
+                [ToolStatus::Running]
+            );
+            let acknowledged = adapter.receive(ack).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&acknowledged, "tool-one"),
+                [ToolStatus::Running]
+            );
+            let duplicate = adapter.receive(failure).unwrap();
+            assert!(notification_agent_statuses(&duplicate, "tool-one").is_empty());
+            assert!(adapter.background_agents.contains("tool-one"));
+            assert!(adapter.ended_agents.is_empty());
+        }
+    }
+
     #[test]
     fn background_agent_stays_running_until_task_notification() {
         let mut adapter = Claude::default();
@@ -8869,25 +11818,62 @@ mod tests {
         assert!(returned.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Stopped), .. } if id == "tool-foreground")));
         let restarted = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"a-foreground","tool_use_id":"tool-foreground","task_type":"local_agent"})).unwrap();
         assert!(restarted.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Running), .. } if id == "tool-foreground")));
-        assert!(
-            !adapter
-                .stopped_agents
-                .contains(&"tool-foreground".to_owned())
-        );
+        assert_eq!(adapter.ended_agent("tool-foreground"), None);
     }
 
     #[test]
-    fn stopped_agents_survive_late_launch_results_but_can_restart() {
+    fn ended_agents_survive_late_launch_results_but_can_restart() {
+        for (reported, ended) in [
+            ("stopped", ToolStatus::Stopped),
+            ("completed", ToolStatus::Succeeded),
+            ("failed", ToolStatus::Failed),
+        ] {
+            let mut adapter = Claude::default();
+            adapter.receive(json!({"type":"assistant","uuid":"launch","message":{"id":"launch-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+            let started = json!({"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"tool-agent","task_type":"local_agent"});
+            adapter.receive(started.clone()).unwrap();
+            adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"tool-agent","status":reported})).unwrap();
+            let late_ack = json!({"type":"user","uuid":"result","tool_use_result":{"status":"async_launched","agentId":"a1"},"message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Launched"}]}});
+            let late = adapter.receive(late_ack.clone()).unwrap();
+            let statuses = |step: &Step| {
+                step.events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Subagent { id, status, .. } if id == "tool-agent" => *status,
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(statuses(&late), [ended], "{reported}");
+            assert!(
+                !adapter.background_agents.contains("tool-agent"),
+                "{reported}"
+            );
+            let restarted = adapter.receive(started).unwrap();
+            assert_eq!(statuses(&restarted), [ToolStatus::Running], "{reported}");
+            // The restarted agent's own acknowledgement keeps it running.
+            let acknowledged = adapter.receive(late_ack.clone()).unwrap();
+            assert_eq!(statuses(&acknowledged), [ToolStatus::Running], "{reported}");
+        }
+    }
+
+    #[test]
+    fn a_stop_outlasts_a_later_terminal_report() {
         let mut adapter = Claude::default();
-        adapter.receive(json!({"type":"assistant","uuid":"launch","message":{"id":"launch-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
-        let started = json!({"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"tool-agent","task_type":"local_agent"});
-        adapter.receive(started.clone()).unwrap();
-        adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"tool-agent","status":"stopped"})).unwrap();
-        let late = adapter.receive(json!({"type":"user","uuid":"result","tool_use_result":{"status":"async_launched","agentId":"a1"},"message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Launched"}]}})).unwrap();
-        assert!(late.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Stopped), .. } if id == "tool-agent")));
-        let restarted = adapter.receive(started).unwrap();
-        assert!(restarted.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Running), .. } if id == "tool-agent")));
-        assert!(!adapter.stopped_agents.contains(&"tool-agent".to_owned()));
+        adapter.receive(json!({"type":"assistant","uuid":"launch","message":{"id":"launch-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{}}]}})).unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"tool-agent","task_type":"local_agent"})).unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_updated","task_id":"a1","tool_use_id":"tool-agent","patch":{"status":"killed"}})).unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"tool-agent","status":"failed"})).unwrap();
+        let returned = adapter.receive(json!({"type":"user","uuid":"result","message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","is_error":true,"content":"The user doesn't want to proceed with this tool use."}]}})).unwrap();
+        let statuses = returned
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Subagent { id, status, .. } if id == "tool-agent" => *status,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, [ToolStatus::Stopped]);
     }
 
     /// An agent resumed from a saved conversation has no task frame of its
@@ -9137,6 +12123,62 @@ mod tests {
                     ToolStatus::Stopped
                 })
             );
+        }
+    }
+
+    #[test]
+    fn a_replayed_stop_outlasts_a_later_terminal_report() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        for value in [
+            json!({"type":"assistant","uuid":"launch","sessionId":session,"message":{"content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{}}]}}),
+            json!({"type":"system","subtype":"task_updated","uuid":"killed","sessionId":session,"tool_use_id":"tool-agent","task_id":"a1","patch":{"status":"killed"}}),
+            json!({"type":"system","subtype":"task_notification","uuid":"failed","sessionId":session,"tool_use_id":"tool-agent","task_id":"a1","status":"failed"}),
+            json!({"type":"user","uuid":"result","sessionId":session,"message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","is_error":true,"content":"The user doesn't want to proceed with this tool use."}]}}),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+        file.rewind().unwrap();
+        let history = History::index(file, session).unwrap();
+        assert_eq!(
+            history.agent_status.get("tool-agent"),
+            Some(&ToolStatus::Stopped)
+        );
+    }
+
+    #[test]
+    fn replayed_ended_agents_survive_a_late_launch_acknowledgement() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        let system = |status: &str| json!({"type":"system","subtype":"task_notification","uuid":"ended","sessionId":session,"tool_use_id":"tool-agent","task_id":"a1","status":status});
+        let recorded = |status: &str| json!({"type":"user","uuid":"ended","sessionId":session,"origin":{"kind":"task-notification"},"message":{"role":"user","content":format!("<task-notification>\n<task-id>a1</task-id>\n<tool-use-id>tool-agent</tool-use-id>\n<status>{status}</status>\n</task-notification>")}});
+        for (in_transcript, reported, ended) in [
+            (false, "completed", ToolStatus::Succeeded),
+            (false, "failed", ToolStatus::Failed),
+            (true, "completed", ToolStatus::Succeeded),
+            (true, "failed", ToolStatus::Failed),
+        ] {
+            for restart in [false, true] {
+                let mut file = tempfile::tempfile().unwrap();
+                let ending = if in_transcript {
+                    recorded(reported)
+                } else {
+                    system(reported)
+                };
+                writeln!(file, "{}", json!({"type":"assistant","uuid":"launch","sessionId":session,"message":{"content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+                writeln!(file, "{ending}").unwrap();
+                // A restart before the acknowledgement leaves it acknowledging running work.
+                if restart {
+                    writeln!(file, "{}", json!({"type":"system","subtype":"task_started","uuid":"restart","sessionId":session,"tool_use_id":"tool-agent","task_id":"a1","task_type":"local_agent"})).unwrap();
+                }
+                writeln!(file, "{}", json!({"type":"user","uuid":"result","sessionId":session,"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"a1"},"message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Async agent launched successfully."}]}})).unwrap();
+                file.rewind().unwrap();
+                let history = History::index(file, session).unwrap();
+                assert_eq!(
+                    history.agent_status.get("tool-agent"),
+                    Some(&if restart { ToolStatus::Running } else { ended }),
+                    "{reported} in_transcript={in_transcript} restart={restart}"
+                );
+            }
         }
     }
 

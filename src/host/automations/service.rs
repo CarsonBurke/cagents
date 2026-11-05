@@ -40,23 +40,26 @@ pub(in crate::host) fn process_under_control(
                 "Prepare automation approval requests from a live hosted conversation".into(),
             );
         }
-        Request::Proposal { id } => Response::Proposal(Box::new(
-            registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .automation_proposal(id, None)?
-                .ok_or("The automation proposal is unavailable")?,
-        )),
+        Request::Proposal { id } => {
+            return Ok(Response::Proposal(Box::new(
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .automation_proposal(id, None)?
+                    .ok_or("The automation proposal is unavailable")?,
+            )));
+        }
         Request::PendingProposals {
             repository,
             after,
             limit,
-        } => Response::Proposals(
-            registry
+        } => {
+            return registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .pending_automation_proposals(&repository, after, limit)?,
-        ),
+                .pending_automation_proposals(&repository, after, limit)
+                .map(Response::Proposals);
+        }
         Request::ResolveProposal {
             id,
             revision,
@@ -118,6 +121,13 @@ pub(in crate::host) fn process_under_control(
                 .unwrap_or_else(|p| p.into_inner())
                 .automation_history(id, before, limit)
                 .map(Response::History);
+        }
+        Request::Audit { id, before, limit } => {
+            return registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .automation_audit(id, before, limit)
+                .map(Response::Audit);
         }
         Request::ShowFiring { id } => {
             return registry
@@ -267,6 +277,10 @@ fn process_hosted(
             let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
             require_scope(&registry.automation(id)?.definition.agent.target.repository)?;
             registry.automation_history(Some(id), before, limit).map(Response::History)
+        }
+        Request::Audit { id, before, limit } => {
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            registry.project_automation_audit(&repository, id, before, limit).map(Response::Audit)
         }
         Request::ShowFiring { id } => {
             let detail = registry.lock().unwrap_or_else(|p| p.into_inner()).automation_run_detail(id)?;
@@ -519,5 +533,137 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("Invalid agent session authority"));
         assert!(!error.contains("unregistered-capability"));
+    }
+    #[test]
+    fn automation_lifecycle_audit_scopes_live_hosted_reads_and_never_dispatches() {
+        use crate::automations::{Request, Response, Schedule, SchedulePattern, SessionMode};
+        use std::time::{Duration, Instant};
+        let name = "host::automations::service::tests::automation_lifecycle_audit_scopes_live_hosted_reads_and_never_dispatches";
+        if crate::host::agent_execution::tests::isolated(name).is_some() {
+            return;
+        }
+        let (host, request, path) = crate::host::agent_execution::tests::fixture();
+        let accepted = agent_execution::submit(&host, &Authority::default(), request).unwrap();
+        let registry = agent_execution::registry(&host).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let run = registry.lock().unwrap().agent_run(accepted.run.id).unwrap();
+            if run.state.is_terminal() {
+                assert_eq!(run.state, crate::agent_execution::State::Succeeded);
+                break;
+            }
+            assert!(Instant::now() < deadline, "fake provider did not settle");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (authority, own, other) = {
+            let mut registry = registry.lock().unwrap();
+            let session = registry.agent(accepted.agent.id).unwrap().session.unwrap();
+            let authority = registry.retained_agent_authority(session.id()).unwrap();
+            let own_definition = Definition {
+                name: "Own receipt".into(),
+                prompt: "PRIVATE_AUDIT_PROMPT".into(),
+                agent: accepted.agent.spec.clone(),
+                schedule: Schedule {
+                    pattern: SchedulePattern::Daily { hour: 0, minute: 0 },
+                    timezone: "UTC".into(),
+                },
+                session_mode: SessionMode::Fresh,
+                precheck: None,
+            };
+            let own = registry
+                .create_automation(
+                    own_definition.clone(),
+                    100,
+                    DirectoryIdentity {
+                        device: 1,
+                        inode: 1,
+                    },
+                )
+                .unwrap();
+            let other_path = path.parent().unwrap().join("other-project");
+            std::fs::create_dir(&other_path).unwrap();
+            registry
+                .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                    repository: other_path.clone(),
+                    name: "Other project".into(),
+                    kind: crate::model::ProjectKind::Folder,
+                })
+                .unwrap();
+            let mut other_definition = own_definition;
+            other_definition.agent.target.repository = other_path.clone();
+            other_definition.agent.target.directory = other_path;
+            let other = registry
+                .create_automation(
+                    other_definition,
+                    100,
+                    DirectoryIdentity {
+                        device: 1,
+                        inode: 2,
+                    },
+                )
+                .unwrap();
+            registry
+                .remove_automation(own.id, own.revision, 200)
+                .unwrap();
+            (authority, own.id, other.id)
+        };
+        let root = path.parent().unwrap();
+        let prompts = std::fs::read(root.join("prompts")).unwrap();
+        let spawns = std::fs::read(root.join("spawns")).unwrap();
+        for _ in 0..3 {
+            let Response::Audit(page) = process_under_control(
+                &host,
+                authority.clone(),
+                Request::Audit {
+                    id: own,
+                    before: None,
+                    limit: 100,
+                },
+            )
+            .unwrap() else {
+                panic!("expected audit");
+            };
+            assert_eq!(page.events.len(), 2);
+            assert!(
+                !serde_json::to_string(&page)
+                    .unwrap()
+                    .contains("PRIVATE_AUDIT_PROMPT")
+            );
+            let error = process_under_control(
+                &host,
+                authority.clone(),
+                Request::Audit {
+                    id: other,
+                    before: None,
+                    limit: 100,
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains("only in their own project"), "{error}");
+        }
+        assert_eq!(std::fs::read(root.join("prompts")).unwrap(), prompts);
+        assert_eq!(std::fs::read(root.join("spawns")).unwrap(), spawns);
+        assert!(matches!(
+            agent_execution::process(
+                &host,
+                Authority::default(),
+                crate::agent_execution::Operation::Close(accepted.agent.id)
+            )
+            .unwrap(),
+            crate::agent_execution::Reply::Closed(_)
+        ));
+        assert!(
+            process_under_control(
+                &host,
+                authority,
+                Request::Audit {
+                    id: own,
+                    before: None,
+                    limit: 1
+                }
+            )
+            .is_err(),
+            "closed session cannot retain project read authority"
+        );
     }
 }

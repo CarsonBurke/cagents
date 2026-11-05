@@ -170,7 +170,12 @@ impl Tracker {
             Kind::Succeeded => State::Succeeded,
             Kind::Failed => State::Failed,
             Kind::Cancelled => State::Cancelled,
-            Kind::Waiting | Kind::Interrupted | Kind::ReviewRequested | Kind::MessageReceived => {
+            Kind::Waiting
+            | Kind::Interrupted
+            | Kind::ReviewRequested
+            | Kind::MessageReceived
+            | Kind::AutomationPaused
+            | Kind::AutomationBlocked => {
                 return Err("Attention is not a confirmed provider outcome".into());
             }
         };
@@ -283,7 +288,13 @@ mod tests {
         tracker.observe(run, &text("message", "Completed answer"));
         tracker.settle(run, Usage::default()).unwrap();
 
-        assert!(tracker.finish(run, Kind::MessageReceived).is_err());
+        for attention in [
+            Kind::MessageReceived,
+            Kind::AutomationPaused,
+            Kind::AutomationBlocked,
+        ] {
+            assert!(tracker.finish(run, attention).is_err());
+        }
         let Update::Finished { state, result } = tracker.finish(run, Kind::Succeeded).unwrap()
         else {
             panic!("expected result")

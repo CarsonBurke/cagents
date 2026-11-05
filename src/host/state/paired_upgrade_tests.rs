@@ -938,9 +938,15 @@ fn restore_missing_native_with_carried_scope(
     let store = Store::open(&store_root).unwrap();
     store.save(&checkpoint).unwrap();
     let restored = Arc::new(HostLock::new(HostState::new(proof.clone())));
-    // Match host::run: retained-holder adoption is explicitly enabled before
-    // reading the upgrade checkpoint, rather than silently omitting Recovery.
-    restored.lock().unwrap().enable_holder_recovery();
+    // Match host::run: install the real execution registry and enable holder
+    // recovery before authenticated original adoption reads the checkpoint.
+    {
+        let mut state = restored.lock().unwrap();
+        state.install_model(
+            crate::host::model::Registry::at(&root.join("failed-native-model.sqlite3")).unwrap(),
+        );
+        state.enable_holder_recovery();
+    }
     let holders = crate::terminal::holder::directory().unwrap();
     let proc_root = root.join("empty-proc");
     fs::create_dir(&proc_root).unwrap();

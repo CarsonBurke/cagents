@@ -434,6 +434,48 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
     }
 }
 
+/// Convert the existing validated dispatch grammar to a native menu hint.
+pub fn menu_keybind(raw: &str) -> Option<cosmic::widget::menu::KeyBind> {
+    use cosmic::widget::menu::{KeyBind, key_bind::Modifier};
+    use keyboard::{Key, key::Named};
+    let binding = crate::settings::parse_shortcut(raw).ok()?;
+    let modifiers = [
+        (binding.control, Modifier::Ctrl),
+        (binding.alt, Modifier::Alt),
+        (binding.logo, Modifier::Super),
+        (binding.shift, Modifier::Shift),
+    ]
+    .into_iter()
+    .filter_map(|(held, modifier)| held.then_some(modifier))
+    .collect();
+    let key = match binding.key {
+        ShortcutKey::Character(ch) => Key::Character(ch.to_string().into()),
+        ShortcutKey::ArrowLeft => Key::Named(Named::ArrowLeft),
+        ShortcutKey::ArrowRight => Key::Named(Named::ArrowRight),
+        ShortcutKey::ArrowUp => Key::Named(Named::ArrowUp),
+        ShortcutKey::ArrowDown => Key::Named(Named::ArrowDown),
+        ShortcutKey::Tab => Key::Named(Named::Tab),
+        ShortcutKey::PageUp => Key::Named(Named::PageUp),
+        ShortcutKey::PageDown => Key::Named(Named::PageDown),
+        ShortcutKey::Function(number) => Key::Named(match number {
+            1 => Named::F1,
+            2 => Named::F2,
+            3 => Named::F3,
+            4 => Named::F4,
+            5 => Named::F5,
+            6 => Named::F6,
+            7 => Named::F7,
+            8 => Named::F8,
+            9 => Named::F9,
+            10 => Named::F10,
+            11 => Named::F11,
+            12 => Named::F12,
+            _ => return None,
+        }),
+    };
+    Some(KeyBind { modifiers, key })
+}
+
 /// The chords bound to `action`, in the one-line form the settings pane
 /// reads back.
 pub fn shortcut_chords(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> String {
@@ -555,11 +597,32 @@ pub fn focus_after_loading<Message: Send + 'static>(
     placeholder: widget::Id,
     target: widget::Id,
 ) -> Task<Message> {
-    use cosmic::iced::advanced::widget::operation::{self, Outcome, focusable};
+    use cosmic::iced::advanced::widget::operation::{self, Outcome};
+    use cosmic::iced::core::id::IdEq;
     struct Restore {
         foreign_focus: bool,
         placeholder: widget::Id,
         target: widget::Id,
+    }
+    struct FocusLoaded(widget::Id);
+    impl<Message: Send + 'static> Operation<Message> for FocusLoaded {
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            if id.is_some_and(|id| IdEq::eq(&id.0, &self.0.0)) {
+                state.focus();
+            } else if state.is_focused() {
+                // Unfocusing a fresh, already unfocused editor can publish
+                // ClearSelection. A loading handoff must retain its cursor.
+                state.unfocus();
+            }
+        }
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Message>)) {
+            operate(self);
+        }
     }
     impl<Message: Send + 'static> Operation<Message> for Restore {
         fn focusable(
@@ -568,7 +631,8 @@ pub fn focus_after_loading<Message: Send + 'static>(
             _bounds: Rectangle,
             state: &mut dyn operation::Focusable,
         ) {
-            self.foreign_focus |= state.is_focused() && id != Some(&self.placeholder);
+            self.foreign_focus |=
+                state.is_focused() && !id.is_some_and(|id| IdEq::eq(&id.0, &self.placeholder.0));
         }
         fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Message>)) {
             operate(self);
@@ -577,7 +641,7 @@ pub fn focus_after_loading<Message: Send + 'static>(
             if self.foreign_focus {
                 Outcome::None
             } else {
-                Outcome::Chain(Box::new(focusable::focus(self.target.clone())))
+                Outcome::Chain(Box::new(FocusLoaded(self.target.clone())))
             }
         }
     }
@@ -670,25 +734,54 @@ where
 
 /// The action a key press triggers while `focused` has focus. A chord whose
 /// action does not apply there triggers nothing, since
-/// [`is_global_shortcut_chord`] left it to the card.
+/// the workspace left it to the card.
 pub fn global_shortcut(
     event: &keyboard::Event,
     shortcuts: &KeyboardShortcuts,
     focused: FocusedPane,
 ) -> Option<GlobalShortcut> {
+    let keyboard::Event::KeyPressed { repeat, .. } = event else {
+        return None;
+    };
+    let descriptor = global_shortcut_event_descriptor(event, shortcuts)?;
+    (descriptor.scope.applies_to(focused) && (!*repeat || descriptor.repeatable))
+        .then_some(descriptor.action)
+}
+
+fn global_shortcut_event_descriptor(
+    event: &keyboard::Event,
+    shortcuts: &KeyboardShortcuts,
+) -> Option<&'static ShortcutDescriptor> {
     let keyboard::Event::KeyPressed {
         key,
+        modified_key,
         physical_key,
         modifiers,
-        repeat,
         ..
     } = event
     else {
         return None;
     };
-    let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts)?;
-    (descriptor.scope.applies_to(focused) && (!*repeat || descriptor.repeatable))
-        .then_some(descriptor.action)
+    // Preserve the existing action precedence across the whole registry before
+    // considering the symbol produced by Shift (for example 1 versus !).
+    global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts).or_else(|| {
+        (modified_key != key)
+            .then(|| global_shortcut_descriptor(modified_key, *physical_key, *modifiers, shortcuts))
+            .flatten()
+    })
+}
+
+fn is_global_shortcut_press(
+    event: &keyboard::Event,
+    shortcuts: &KeyboardShortcuts,
+    focused: FocusedPane,
+) -> bool {
+    let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+        return false;
+    };
+    crate::tab_history::is_chord(key, *modifiers)
+        || global_shortcut_event_descriptor(event, shortcuts)
+            .is_some_and(|descriptor| descriptor.scope.applies_to(focused))
 }
 
 /// Whether a chord is withheld from the process inside a card: whether it is
@@ -790,6 +883,18 @@ fn shortcut_matches(
         }
 }
 
+/// A character chord that this physical event can actually dispatch. Number
+/// bindings use the number row even when Shift changes the logical character.
+pub(crate) fn recordable_shortcut_character(
+    key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
+) -> Option<char> {
+    physical_digit(physical_key).or_else(|| {
+        // A logical numpad digit cannot trigger a number-row binding.
+        latin_key(key, physical_key).filter(|character| !character.is_ascii_digit())
+    })
+}
+
 fn latin_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> Option<char> {
     if let keyboard::Key::Character(value) = key.as_ref() {
         let mut characters = value.chars();
@@ -833,6 +938,31 @@ fn physical_digit(physical_key: keyboard::key::Physical) -> Option<char> {
 /// parser accepts never fired at all without the physical-digit fallback.
 #[must_use]
 pub fn shortcut_event_matches(binding: ShortcutBinding, event: &keyboard::Event) -> bool {
+    if shortcut_event_matches_unmodified(binding, event) {
+        return true;
+    }
+    let keyboard::Event::KeyPressed {
+        key,
+        modified_key,
+        physical_key,
+        modifiers,
+        repeat: false,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    modified_key != key && shortcut_matches(binding, modified_key, *physical_key, *modifiers)
+}
+
+/// Matches the unmodified/native physical form of a pressed chord. Dispatchers
+/// with several actions should prefer these matches across their action list
+/// before trying [`shortcut_event_matches`]'s modified-symbol fallback.
+#[must_use]
+pub fn shortcut_event_matches_unmodified(
+    binding: ShortcutBinding,
+    event: &keyboard::Event,
+) -> bool {
     let keyboard::Event::KeyPressed {
         key,
         physical_key,
@@ -1515,6 +1645,9 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             let previous_band = mem::take(&mut state.mounted);
             for (id, mut child) in previous_band.iter().copied().zip(children.drain(..)) {
                 reclaim_named_states(&mut child);
+                if !self.cards.iter().any(|card| card.id == id) {
+                    crate::ui_memory::release_parked(&mut child);
+                }
                 state.detached.insert(id, child);
             }
             for card in &mut self.cards {
@@ -1992,20 +2125,18 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         let content_layout = Self::child_layout(layout);
 
         match event {
-            Event::Keyboard(
-                keyboard::Event::KeyPressed {
-                    key,
-                    physical_key,
-                    modifiers,
-                    ..
-                }
-                | keyboard::Event::KeyReleased {
-                    key,
-                    physical_key,
-                    modifiers,
-                    ..
-                },
-            ) if is_global_shortcut_chord(
+            Event::Keyboard(press @ keyboard::Event::KeyPressed { .. })
+                if is_global_shortcut_press(press, self.shortcuts, self.focused_pane) =>
+            {
+                shell.capture_event();
+                return;
+            }
+            Event::Keyboard(keyboard::Event::KeyReleased {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            }) if is_global_shortcut_chord(
                 key,
                 *physical_key,
                 *modifiers,
@@ -2173,7 +2304,10 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
 /// The strip mounts cards past its edges and scrolls them without clipping
 /// their drop targets, so a card scrolled half out of view would otherwise
 /// reach under the sidebar and take a drop aimed there.
-fn clip_drag_destinations(rectangles: &mut Vec<DndDestinationRectangle>, bounds: Rectangle) {
+pub(crate) fn clip_drag_destinations(
+    rectangles: &mut Vec<DndDestinationRectangle>,
+    bounds: Rectangle,
+) {
     let (left, top) = (f64::from(bounds.x), f64::from(bounds.y));
     let (right, bottom) = (
         left + f64::from(bounds.width),
@@ -2207,6 +2341,131 @@ mod tests {
     use crate::settings::parse_chords;
     use crate::workspace::{CardWidth, WorkspaceCard};
     use std::collections::HashSet;
+
+    #[test]
+    fn workspace_surface_forwards_drop_targets_in_native_collection_order() {
+        use super::forwarding_test::{leaf, renderer};
+        use cosmic::iced::advanced::clipboard::DndDestinationRectangles;
+        use cosmic::iced::clipboard::dnd::{DndAction, Rectangle as DndRectangle};
+
+        let renderer = renderer();
+        let shortcuts = KeyboardShortcuts::default();
+        let offset = Vector::new(7.0, -22.0);
+        for wrapper in [
+            "plain",
+            "surface",
+            "scroll",
+            "file drop",
+            "scroll and file drop",
+            "file drop at 2x",
+        ] {
+            let scale = if wrapper.ends_with("2x") { 2.0 } else { 1.0 };
+            let (content, visits) = leaf::<()>(
+                Size::new(100.0, 60.0),
+                vec![
+                    (
+                        1,
+                        Rectangle::new(Point::new(-30.0, 0.0), Size::new(100.0, 40.0)),
+                    ),
+                    (
+                        2,
+                        Rectangle::new(Point::new(10.0, 0.0), Size::new(70.0, 40.0)),
+                    ),
+                    (
+                        3,
+                        Rectangle::new(Point::new(200.0, 0.0), Size::new(50.0, 40.0)),
+                    ),
+                ],
+            );
+            let content: Element<'_, ()> = match wrapper {
+                "surface" => {
+                    WorkspaceSurface::new(content, &shortcuts, FocusedPane::Other, 100.0, |_| ())
+                        .into()
+                }
+                "scroll" | "scroll and file drop" => cosmic::widget::scrollable(content)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+                _ => content,
+            };
+            let mut surface: Element<'_, ()> =
+                WorkspaceSurface::new(content, &shortcuts, FocusedPane::Other, 100.0, |_| ())
+                    .into();
+            if wrapper.contains("file drop") {
+                surface = crate::file_drop::surface(surface, scale);
+            }
+            let mut tree = Tree::new(&surface);
+            let node = surface
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(100.0, 60.0)),
+                )
+                .move_to(Point::new(20.0, 30.0));
+            let mut destinations = DndDestinationRectangles::new();
+            // A preceding root sibling is already registered. The surface
+            // must preserve its own later child order within that collection.
+            destinations.push(DndDestinationRectangle {
+                id: 99,
+                rectangle: DndRectangle {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                },
+                mime_types: Vec::new(),
+                actions: DndAction::Copy,
+                preferred: DndAction::Copy,
+            });
+            surface.as_widget().drag_destinations(
+                &tree,
+                Layout::new(&node).with_virtual_offset(offset),
+                &renderer,
+                &mut destinations,
+            );
+            assert_eq!(
+                destinations
+                    .as_ref()
+                    .iter()
+                    .map(|target| target.id)
+                    .collect::<Vec<_>>(),
+                vec![99, 1, 2],
+                "each internal wrapper preserves registration order: {wrapper}"
+            );
+            // This is the exact extraction performed by the iced native
+            // consumer, after all enclosing widgets finished registration.
+            let actual: Vec<_> = destinations
+                .into_native_rectangles()
+                .into_iter()
+                .map(|target| {
+                    (
+                        target.id,
+                        target.rectangle.x,
+                        target.rectangle.y,
+                        target.rectangle.width,
+                        target.rectangle.height,
+                    )
+                })
+                .collect();
+            // The scale wrapper converts logical targets to physical ones;
+            // the sibling registered before it is not scaled.
+            let scaled = |id, x: f64, y: f64, width: f64, height: f64| {
+                let scale = f64::from(scale);
+                (id, x * scale, y * scale, width * scale, height * scale)
+            };
+            assert_eq!(
+                actual,
+                vec![
+                    scaled(2, 30.0, 30.0, 70.0, 40.0),
+                    scaled(1, 20.0, 30.0, 70.0, 40.0),
+                    (99, 0.0, 0.0, 10.0, 10.0)
+                ],
+                "{wrapper}"
+            );
+            assert_eq!(visits.offsets("drag"), vec![offset]);
+        }
+    }
 
     #[test]
     fn drop_targets_end_at_the_edges_of_the_strip() {
@@ -2605,6 +2864,55 @@ mod tests {
     }
 
     #[test]
+    fn parked_presentation_reclaims_named_state_before_releasing_its_subtree() {
+        let ids = [CardId::new(), CardId::new()];
+        let retained = Arc::new(HashMap::from([(ids[0], 0), (ids[1], 1)]));
+        let make = |index: usize| -> Element<'_, ()> {
+            VirtualStrip {
+                total_width: 320.0,
+                retained: retained.clone(),
+                focused: Some(ids[index]),
+                cards: vec![VirtualCard {
+                    id: ids[index],
+                    x: 0.0,
+                    width: 320.0,
+                    content_width: 320.0,
+                    on_screen: true,
+                    content: cosmic::widget::id_container(
+                        crate::ui_memory::gate(widget::Space::new()),
+                        widget::Id::new(format!("disposable-presentation-{index}")),
+                    )
+                    .into(),
+                }],
+            }
+            .into()
+        };
+        let mut element = make(0);
+        let mut tree = Tree::new(&element);
+        let owner = Arc::new(());
+        let released = Arc::downgrade(&owner);
+        // Model a retained/shaped allocation owned by the presentation tree.
+        // The named ancestor moves this entire subtree into iced's pool.
+        tree.children[0].children[0].children[0].state = tree::State::new(owner);
+        tree::NAMED.with(|cache| *cache.borrow_mut() = tree.take_all_named());
+        assert!(released.upgrade().is_some());
+        element = make(1);
+        tree.diff(&mut element);
+        assert!(
+            released.upgrade().is_none(),
+            "named extraction must not leave a presentation owner behind"
+        );
+        let parked = &tree.state.downcast_ref::<VirtualStripState>().detached[&ids[0]];
+        assert!(parked.children[0].children.is_empty());
+        // A real remount reconstructs the emptied gate through normal diffing.
+        tree::NAMED.with(|cache| *cache.borrow_mut() = tree.take_all_named());
+        element = make(0);
+        tree.diff(&mut element);
+        assert_eq!(tree.children[0].children[0].children.len(), 1);
+        tree::NAMED.with(|cache| cache.borrow_mut().clear());
+    }
+
+    #[test]
     fn parked_editor_preserves_focus_across_named_state_extraction() {
         use cosmic::iced::advanced::{renderer::Headless, widget::operation};
         let renderer = tokio::runtime::Builder::new_current_thread()
@@ -2804,7 +3112,7 @@ mod tests {
         use cosmic::iced::advanced::widget::operation::{Focusable, Outcome};
         use cosmic::iced::futures::{StreamExt, executor::block_on};
 
-        struct Focus(bool);
+        struct Focus(bool, usize);
         impl Focusable for Focus {
             fn is_focused(&self) -> bool {
                 self.0
@@ -2814,15 +3122,21 @@ mod tests {
             }
             fn unfocus(&mut self) {
                 self.0 = false;
+                self.1 += 1;
             }
         }
 
-        for foreign_id in [None, Some(widget::Id::new("sidebar.search"))] {
+        for (foreign_id, foreign_focused, placeholder_focused) in [
+            (None, true, false),
+            (Some(widget::Id::new("sidebar.search")), true, false),
+            (None, false, false),
+            (None, false, true),
+        ] {
             let placeholder = widget::Id::new("loading-pane.header");
             let target = widget::Id::new("loaded-pane.editor");
-            let mut header = Focus(false);
-            let mut foreign = Focus(true);
-            let mut editor = Focus(false);
+            let mut header = Focus(placeholder_focused, 0);
+            let mut foreign = Focus(foreign_focused, 0);
+            let mut editor = Focus(false, 0);
             let mut stream = cosmic::iced::runtime::task::into_stream(focus_after_loading::<()>(
                 placeholder.clone(),
                 target.clone(),
@@ -2843,8 +3157,14 @@ mod tests {
                     }
                 }
             }
-            assert!(foreign.0, "loading must preserve the chosen control");
-            assert!(!editor.0, "the loaded editor must not take its keyboard");
+            assert_eq!(foreign.0, foreign_focused, "keep the chosen control");
+            assert_eq!(
+                editor.0, !foreign_focused,
+                "handoff only without foreign focus"
+            );
+            assert_eq!(header.1, usize::from(placeholder_focused));
+            assert_eq!(foreign.1, 0, "do not unfocus an already unfocused control");
+            assert_eq!(editor.1, 0, "do not clear the target's selection");
         }
     }
 
@@ -3528,6 +3848,122 @@ mod tests {
     fn captured_typing_is_not_forwarded_to_raw_card_children() {
         assert!(!should_forward_to_raw_children(true));
         assert!(should_forward_to_raw_children(false));
+    }
+
+    #[test]
+    fn shifted_native_symbols_preserve_primary_dispatch_and_card_input() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        use keyboard::key::{Code, Physical};
+
+        let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        // iced-winit supplies key_without_modifiers as key and logical_key as
+        // modified_key. Setting both to ! hides the native number-row case.
+        let press = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("1".into()),
+            modified_key: keyboard::Key::Character("!".into()),
+            physical_key: Physical::Code(Code::Digit1),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        };
+        for chord in ["Ctrl+Shift+1", "Ctrl+Shift+!"] {
+            assert!(shortcut_event_matches(
+                parse_shortcut(chord).unwrap(),
+                &press
+            ));
+        }
+        assert!(!shortcut_event_matches_unmodified(
+            parse_shortcut("Ctrl+Shift+!").unwrap(),
+            &press
+        ));
+        let mut shortcuts = KeyboardShortcuts {
+            chat_model: vec!["Ctrl+Shift+!".into()],
+            rename_pane: vec!["Ctrl+Shift+1".into()],
+            ..KeyboardShortcuts::default()
+        };
+        // ChatModel appears earlier in the registry, but its new fallback must
+        // not displace an action that already matched the physical digit.
+        for focused in [FocusedPane::Chat, FocusedPane::Other] {
+            assert_eq!(
+                global_shortcut(&press, &shortcuts, focused),
+                Some(GlobalShortcut::RenamePane)
+            );
+            assert!(is_global_shortcut_press(&press, &shortcuts, focused));
+        }
+        shortcuts.rename_pane.clear();
+        assert_eq!(
+            global_shortcut(&press, &shortcuts, FocusedPane::Chat),
+            Some(GlobalShortcut::ChatModel)
+        );
+        assert_eq!(
+            global_shortcut(&press, &shortcuts, FocusedPane::Other),
+            None
+        );
+        assert!(!is_global_shortcut_press(
+            &press,
+            &shortcuts,
+            FocusedPane::Other
+        ));
+
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let card = CardId::new();
+        let release = keyboard::Event::KeyReleased {
+            key: keyboard::Key::Character("1".into()),
+            modified_key: keyboard::Key::Character("!".into()),
+            physical_key: Physical::Code(Code::Digit1),
+            location: keyboard::Location::Standard,
+            modifiers,
+        };
+        assert!(!shortcut_event_matches(
+            parse_shortcut("Ctrl+Shift+!").unwrap(),
+            &release
+        ));
+        for (focused, event, captured, delivered) in [
+            (FocusedPane::Chat, press.clone(), true, false),
+            (FocusedPane::Other, press.clone(), false, true),
+            // Adding symbol press support must not introduce release capture.
+            (FocusedPane::Chat, release, false, false),
+        ] {
+            let mut element: Element<'_, Option<CardId>> = WorkspaceSurface::new(
+                Element::new(KeyProbe(card)),
+                &shortcuts,
+                focused,
+                400.0,
+                |_| None,
+            )
+            .into();
+            let mut tree = Tree::new(&element);
+            let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(viewport.size(), viewport.size()),
+            );
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Keyboard(event),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            assert_eq!(shell.is_event_captured(), captured);
+            assert_eq!(messages.contains(&Some(card)), delivered);
+        }
     }
 
     #[test]
@@ -5176,3 +5612,7 @@ mod tests {
         assert_eq!(positions, expected_overlay_positions(&moved, VIEWPORT));
     }
 }
+
+#[cfg(test)]
+#[path = "widget_forwarding_test.rs"]
+pub(crate) mod forwarding_test;

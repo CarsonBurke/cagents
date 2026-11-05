@@ -1,7 +1,7 @@
 //! Bounded raw selection reads for the X11 backend, including ICCCM INCR.
 //!
 //! Each read owns a fresh requestor connection: abandoned transfers and their
-//! queued events cannot contaminate a later paste. Text and Wayland still use
+//! queued events cannot contaminate a later paste. Wayland still uses
 //! window_clipboard's existing implementation.
 use crate::core::clipboard::Kind;
 use clipboard_x11::Context;
@@ -43,6 +43,54 @@ impl Reader {
             }
             _ => None,
         }
+    }
+
+    pub(super) fn read_text(
+        &self,
+        kind: Kind,
+    ) -> Result<Option<String>, Error> {
+        self.read_text_bounded(kind, MAX_BYTES)
+    }
+
+    fn read_text_bounded(
+        &self,
+        kind: Kind,
+        max_bytes: usize,
+    ) -> Result<Option<String>, Error> {
+        let deadline = Instant::now() + TIMEOUT;
+        // A fresh requestor also retires an interrupted INCR transfer. Never
+        // share the legacy text reader's property or queued selection events.
+        let context = Context::new(Some(&self.display))?;
+        let selection = match kind {
+            Kind::Standard => context.atoms.clipboard,
+            Kind::Primary => context.atoms.primary,
+        };
+        let owner = context
+            .connection
+            .get_selection_owner(selection)?
+            .reply()?
+            .owner;
+        if owner == x11rb::NONE {
+            return Ok(None);
+        }
+        let transfer = Transfer {
+            context,
+            selection,
+            owner,
+            deadline,
+        };
+        // Preserve the text backend's direct UTF8_STRING contract. A text
+        // owner need not advertise a new MIME name or answer TARGETS first.
+        transfer
+            .convert(
+                transfer.context.atoms.utf8_string,
+                transfer.context.atoms.utf8_string,
+                8,
+                max_bytes,
+            )?
+            .map(|reply| String::from_utf8(reply.value))
+            .transpose()
+            .map_err(Into::into)
     }
 
     pub(super) fn read(
@@ -380,5 +428,453 @@ mod tests {
             }
         }
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    // The production requestor talks to a real X server and a separate owner
+    // connection. These ignored tests run only on an owned private display.
+    enum TextOffer {
+        Direct(Vec<u8>),
+        Incremental(Vec<u8>),
+        WrongFormat,
+        WrongType,
+        WrongProperty,
+        ChangeOwner,
+        Refuse,
+        Stall,
+    }
+
+    struct TextOwner {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+        destroyed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TextOwner {
+        fn start(display: &str, offers: Vec<TextOffer>) -> Self {
+            use std::sync::{
+                Arc,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            };
+            use x11rb::{protocol::xproto::EventMask, wrapper::ConnectionExt};
+            let context = Context::new(Some(display)).unwrap();
+            for selection in [context.atoms.clipboard, context.atoms.primary] {
+                context
+                    .connection
+                    .set_selection_owner(
+                        context.window,
+                        selection,
+                        x11rb::CURRENT_TIME,
+                    )
+                    .unwrap()
+                    .check()
+                    .unwrap();
+                assert_eq!(
+                    context
+                        .connection
+                        .get_selection_owner(selection)
+                        .unwrap()
+                        .reply()
+                        .unwrap()
+                        .owner,
+                    context.window
+                );
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = Arc::clone(&stop);
+            let destroyed = Arc::new(AtomicUsize::new(0));
+            let observed_destroy = Arc::clone(&destroyed);
+            let display = display.to_owned();
+            let worker = thread::spawn(move || {
+                let deadline = Instant::now()
+                    + Duration::from_secs(5 * (offers.len() as u64 + 1));
+                let mut _replacement_owner: Option<Context> = None;
+                let mut offers = std::collections::VecDeque::from(offers);
+                let mut pending: Vec<(XWindow, Atom, Atom, Vec<u8>, usize)> =
+                    Vec::new();
+                while !stopping.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "private selection owner exceeded its bound"
+                    );
+                    let Some(event) =
+                        context.connection.poll_for_event().unwrap()
+                    else {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    };
+                    match event {
+                        Event::SelectionRequest(request) => {
+                            // Advertise no TARGETS, including to private
+                            // desktop clients. Refusal must not consume the
+                            // next scripted direct UTF8_STRING offer.
+                            if request.target == context.atoms.targets {
+                                context
+                                    .connection
+                                    .send_event(
+                                        false,
+                                        request.requestor,
+                                        EventMask::NO_EVENT,
+                                        x11rb::protocol::xproto::SelectionNotifyEvent {
+                                            response_type: x11rb::protocol::xproto::SELECTION_NOTIFY_EVENT,
+                                            sequence: 0,
+                                            time: request.time,
+                                            requestor: request.requestor,
+                                            selection: request.selection,
+                                            target: request.target,
+                                            property: x11rb::NONE,
+                                        },
+                                    )
+                                    .unwrap()
+                                    .check()
+                                    .unwrap();
+                                context.connection.flush().unwrap();
+                                continue;
+                            }
+                            assert_eq!(
+                                request.target,
+                                context.atoms.utf8_string
+                            );
+                            context
+                                .connection
+                                .change_window_attributes(
+                                    request.requestor,
+                                    &x11rb::protocol::xproto::ChangeWindowAttributesAux::new()
+                                        .event_mask(
+                                            EventMask::PROPERTY_CHANGE
+                                                | EventMask::STRUCTURE_NOTIFY,
+                                        ),
+                                )
+                                .unwrap()
+                                .check()
+                                .unwrap();
+                            let offer = offers
+                                .pop_front()
+                                .expect("unexpected selection read");
+                            if matches!(offer, TextOffer::Stall) {
+                                continue;
+                            }
+                            let mut property = request.property;
+                            match offer {
+                                TextOffer::Direct(bytes) => {
+                                    context
+                                        .connection
+                                        .change_property8(
+                                            x11rb::protocol::xproto::PropMode::REPLACE,
+                                            request.requestor,
+                                            property,
+                                            request.target,
+                                            &bytes,
+                                        )
+                                        .unwrap()
+                                        .check()
+                                        .unwrap();
+                                }
+                                TextOffer::Incremental(bytes) => {
+                                    context
+                                        .connection
+                                        .change_property32(
+                                            x11rb::protocol::xproto::PropMode::REPLACE,
+                                            request.requestor,
+                                            property,
+                                            context.atoms.incr,
+                                            &[u32::try_from(bytes.len()).unwrap()],
+                                        )
+                                        .unwrap()
+                                        .check()
+                                        .unwrap();
+                                    pending.push((
+                                        request.requestor,
+                                        property,
+                                        request.target,
+                                        bytes,
+                                        0,
+                                    ));
+                                }
+                                TextOffer::WrongFormat => {
+                                    context
+                                        .connection
+                                        .change_property32(
+                                            x11rb::protocol::xproto::PropMode::REPLACE,
+                                            request.requestor,
+                                            property,
+                                            request.target,
+                                            &[65],
+                                        )
+                                        .unwrap()
+                                        .check()
+                                        .unwrap();
+                                }
+                                TextOffer::WrongType => {
+                                    context.connection.change_property8(
+                                        x11rb::protocol::xproto::PropMode::REPLACE,
+                                        request.requestor, property, context.atoms.string, b"wrong type",
+                                    ).unwrap().check().unwrap();
+                                }
+                                TextOffer::WrongProperty => {
+                                    property = context.atoms.string;
+                                    context.connection.change_property8(
+                                        x11rb::protocol::xproto::PropMode::REPLACE,
+                                        request.requestor, property, request.target, b"wrong property bytes",
+                                    ).unwrap().check().unwrap();
+                                }
+                                TextOffer::ChangeOwner => {
+                                    let next =
+                                        Context::new(Some(&display)).unwrap();
+                                    next.connection
+                                        .set_selection_owner(
+                                            next.window,
+                                            request.selection,
+                                            x11rb::CURRENT_TIME,
+                                        )
+                                        .unwrap()
+                                        .check()
+                                        .unwrap();
+                                    _replacement_owner = Some(next);
+                                    context.connection.change_property8(
+                                        x11rb::protocol::xproto::PropMode::REPLACE,
+                                        request.requestor, property, request.target, b"changed owner bytes",
+                                    ).unwrap().check().unwrap();
+                                }
+                                TextOffer::Refuse => property = x11rb::NONE,
+                                TextOffer::Stall => unreachable!(),
+                            }
+                            context
+                                .connection
+                                .send_event(
+                                    false,
+                                    request.requestor,
+                                    EventMask::NO_EVENT,
+                                    x11rb::protocol::xproto::SelectionNotifyEvent {
+                                        response_type:
+                                            x11rb::protocol::xproto::SELECTION_NOTIFY_EVENT,
+                                        sequence: 0,
+                                        time: request.time,
+                                        requestor: request.requestor,
+                                        selection: request.selection,
+                                        target: request.target,
+                                        property,
+                                    },
+                                )
+                                .unwrap()
+                                .check()
+                                .unwrap();
+                            context.connection.flush().unwrap();
+                        }
+                        Event::PropertyNotify(event)
+                            if event.state == Property::DELETE =>
+                        {
+                            let Some(index) =
+                                pending.iter().position(|entry| {
+                                    entry.0 == event.window
+                                        && entry.1 == event.atom
+                                })
+                            else {
+                                continue;
+                            };
+                            let (window, property, target, bytes, offset) =
+                                &mut pending[index];
+                            let end = offset
+                                .saturating_add(16 * 1024)
+                                .min(bytes.len());
+                            context
+                                .connection
+                                .change_property8(
+                                    x11rb::protocol::xproto::PropMode::REPLACE,
+                                    *window,
+                                    *property,
+                                    *target,
+                                    &bytes[*offset..end],
+                                )
+                                .unwrap()
+                                .check()
+                                .unwrap();
+                            context.connection.flush().unwrap();
+                            let finished = *offset == bytes.len();
+                            *offset = end;
+                            if finished {
+                                pending.remove(index);
+                            }
+                        }
+                        Event::DestroyNotify(event) => {
+                            pending.retain(|entry| entry.0 != event.window);
+                            observed_destroy.fetch_add(1, Ordering::Release);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            Self {
+                stop,
+                thread: Some(worker),
+                destroyed,
+            }
+        }
+    }
+
+    impl Drop for TextOwner {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            let result = self.thread.take().unwrap().join();
+            if !thread::panicking() {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an owned private X11 display"]
+    fn text_selection_preserves_standard_and_primary_direct_and_incr() {
+        let display = std::env::var("DISPLAY").unwrap();
+        let megabyte = vec![b'x'; 1024 * 1024];
+        let _owner = TextOwner::start(
+            &display,
+            vec![
+                TextOffer::Direct(megabyte.clone()),
+                TextOffer::Incremental(megabyte.clone()),
+                TextOffer::Direct(megabyte.clone()),
+                TextOffer::Incremental(megabyte.clone()),
+                TextOffer::Direct("π🧪".as_bytes().to_vec()),
+                TextOffer::Direct(vec![0xff]),
+                TextOffer::WrongFormat,
+                TextOffer::WrongType,
+                TextOffer::Direct(vec![b'x'; 33]),
+                TextOffer::Incremental(vec![b'x'; 33]),
+                TextOffer::Refuse,
+                TextOffer::WrongProperty,
+                TextOffer::ChangeOwner,
+            ],
+        );
+        let reader = Reader { display };
+        // Real raw MIME negotiation is refused without consuming the next
+        // scripted text offer; subsequent UTF8 assertions verify the queue.
+        assert!(
+            reader
+                .read(Kind::Standard, &["image/png".into()])
+                .unwrap()
+                .is_none()
+        );
+        for kind in [Kind::Standard, Kind::Primary] {
+            for _ in 0..2 {
+                assert_eq!(
+                    reader.read_text(kind).unwrap().unwrap().as_bytes(),
+                    megabyte
+                );
+            }
+        }
+        assert_eq!(
+            reader.read_text(Kind::Standard).unwrap().as_deref(),
+            Some("π🧪")
+        );
+        assert!(
+            reader
+                .read_text(Kind::Standard)
+                .unwrap_err()
+                .is::<std::string::FromUtf8Error>()
+        );
+        assert_eq!(
+            reader
+                .read_text(Kind::Standard)
+                .unwrap_err()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            reader
+                .read_text(Kind::Standard)
+                .unwrap_err()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            reader
+                .read_text_bounded(Kind::Standard, 32)
+                .unwrap_err()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            reader
+                .read_text_bounded(Kind::Standard, 32)
+                .unwrap_err()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(reader.read_text(Kind::Standard).unwrap().is_none());
+        let wrong_property_start = Instant::now();
+        assert_eq!(
+            reader
+                .read_text(Kind::Standard)
+                .unwrap_err()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(
+            wrong_property_start.elapsed() >= TIMEOUT
+                && wrong_property_start.elapsed() < Duration::from_secs(5)
+        );
+        assert_eq!(
+            reader
+                .read_text(Kind::Standard)
+                .unwrap_err()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an owned private X11 display"]
+    fn text_selection_timeout_retires_requestor_before_next_read() {
+        let display = std::env::var("DISPLAY").unwrap();
+        let owner = TextOwner::start(
+            &display,
+            vec![TextOffer::Stall, TextOffer::Direct(b"fresh text".to_vec())],
+        );
+        let reader = Reader { display };
+        // Real raw MIME negotiation is refused without consuming the next
+        // scripted text offer; subsequent UTF8 assertions verify the queue.
+        assert!(
+            reader
+                .read(Kind::Standard, &["image/png".into()])
+                .unwrap()
+                .is_none()
+        );
+        let start = Instant::now();
+        assert_eq!(
+            reader
+                .read_text(Kind::Standard)
+                .unwrap_err()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(
+            start.elapsed() >= TIMEOUT
+                && start.elapsed() < Duration::from_secs(5)
+        );
+        let retired = Instant::now() + Duration::from_secs(1);
+        while owner.destroyed.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < retired,
+                "timed-out requestor window was retained"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            reader.read_text(Kind::Standard).unwrap().as_deref(),
+            Some("fresh text")
+        );
     }
 }

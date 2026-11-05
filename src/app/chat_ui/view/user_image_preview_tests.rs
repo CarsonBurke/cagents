@@ -66,6 +66,9 @@ fn click_prompt(
             self.controls.push(bounds);
         }
     }
+    let item = runtime
+        .active_item(&item.id)
+        .expect("prompt fixture renders the actual active transcript source");
     let mut element = runtime.prompt_view(item);
     let mut tree = Tree::new(element.as_widget());
     let viewport = Rectangle::with_size(Size::new(600.0, 600.0));

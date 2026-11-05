@@ -13,8 +13,7 @@ use crate::{
     linear::context::LinkedIssue,
     model::{ProjectId, WorktreeId},
     repository::{
-        CancellationToken, Divergence, HeadState, RepositoryService, StatusSnapshot,
-        WorktreeRecord,
+        CancellationToken, Divergence, HeadState, RepositoryService, StatusSnapshot, WorktreeRecord,
     },
     work::{Comparison, Dirty, Head},
 };
@@ -148,8 +147,8 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
 
     let mut worktrees = Vec::new();
     for record in records.iter().filter(|record| !record.bare) {
-        let old = previous
-            .and_then(|previous| previous.worktrees.iter().find(|old| old.id == record.id));
+        let old =
+            previous.and_then(|previous| previous.worktrees.iter().find(|old| old.id == record.id));
         // A shared ref change names no worktree; a commit, reset or branch
         // switch moves the head `git worktree list` reports.
         let reread = full
@@ -166,10 +165,12 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             created_at_unix_ms: record
                 .created_at_unix_ms
                 .and_then(|at| u64::try_from(at).ok()),
-            branch: record
-                .branch
-                .as_deref()
-                .map(|branch| branch.strip_prefix("refs/heads/").unwrap_or(branch).to_owned()),
+            branch: record.branch.as_deref().map(|branch| {
+                branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch)
+                    .to_owned()
+            }),
             head: record.head_oid.clone().map(|oid| Head {
                 oid,
                 committed_at_unix_ms: None,
@@ -234,7 +235,10 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         let times = git
             .commit_times(repository, &missing_times, cancellation)
             .unwrap_or_default();
-        for head in worktrees.iter_mut().filter_map(|worktree| worktree.head.as_mut()) {
+        for head in worktrees
+            .iter_mut()
+            .filter_map(|worktree| worktree.head.as_mut())
+        {
             if head.committed_at_unix_ms.is_none() {
                 head.committed_at_unix_ms = times.get(&head.oid).copied();
             }
@@ -344,9 +348,9 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         };
         for head in heads {
             let key = (branch.oid.clone(), head.clone());
-            let known = (branch.oid == *head).then_some(true).or_else(|| {
-                previous.and_then(|previous| previous.ancestry.get(&key).copied())
-            });
+            let known = (branch.oid == *head)
+                .then_some(true)
+                .or_else(|| previous.and_then(|previous| previous.ancestry.get(&key).copied()));
             let contained = match known {
                 Some(contained) => Some(contained),
                 None => git
@@ -568,12 +572,23 @@ mod tests {
         git(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         git(
             &root,
-            &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
         );
         let linked = directory.path().join("linked");
         git(
             &root,
-            &["worktree", "add", "-q", "-b", "feature", linked.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
         );
         std::fs::write(linked.join("README"), "two\n").unwrap();
         git(&linked, &["commit", "-q", "-am", "two"]);
@@ -649,7 +664,11 @@ mod tests {
         assert!(first.worktrees.iter().any(|worktree| worktree.primary));
 
         assert_eq!(
-            first.branches.keys().map(String::as_str).collect::<Vec<_>>(),
+            first
+                .branches
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             ["feature", "main", "mine"],
             "a branch without a worktree or pull request is not a candidate"
         );
@@ -689,10 +708,14 @@ mod tests {
         };
         assert_eq!(dirty(&second, &fixture.root), 1);
         assert_eq!(dirty(&second, &fixture.linked), 1, "not re-read");
-        let third = run(&fixture, Some(&second), &git_watch::Change {
-            topology: true,
-            ..git_watch::Change::default()
-        });
+        let third = run(
+            &fixture,
+            Some(&second),
+            &git_watch::Change {
+                topology: true,
+                ..git_watch::Change::default()
+            },
+        );
         assert_eq!(dirty(&third, &fixture.linked), 0);
 
         // A shared ref change re-reads the worktree whose head it moved and
@@ -715,10 +738,14 @@ mod tests {
         let fixture = fixture();
         let first = run(&fixture, None, &git_watch::Change::default());
         std::fs::remove_dir_all(&fixture.linked).unwrap();
-        let second = run(&fixture, Some(&first), &git_watch::Change {
-            topology: true,
-            ..git_watch::Change::default()
-        });
+        let second = run(
+            &fixture,
+            Some(&first),
+            &git_watch::Change {
+                topology: true,
+                ..git_watch::Change::default()
+            },
+        );
         assert_eq!(second.worktrees.len(), 1);
         assert!(second.worktrees[0].primary);
     }

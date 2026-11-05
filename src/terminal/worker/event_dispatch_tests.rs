@@ -16,8 +16,8 @@ fn stream() -> (TerminalHandle, Arc<Sender<TerminalEvent>>) {
         inner: Arc::new(HandleInner {
             commands,
             events: received,
+            worker: joins::JoinOwner::empty(published.clone()),
             published,
-            worker: Mutex::new(None),
         }),
     };
     (handle, events)

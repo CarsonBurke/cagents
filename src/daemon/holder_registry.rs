@@ -30,13 +30,23 @@ pub(crate) struct Process {
 
 impl Process {
     pub fn read(pid: i32) -> io::Result<Self> {
-        let stat = fs::read(format!("/proc/{pid}/stat"))?;
+        let stat = fs::read(format!("/proc/{pid}/stat")).map_err(exited_as_absent)?;
         let (_, start) = crate::model::agent_recovery::process_identity(&stat)
             .ok_or_else(|| io::Error::other("invalid process identity"))?;
         Ok(Self { pid, start })
     }
     pub fn is_current(&self) -> bool {
         Self::read(self.pid).is_ok_and(|actual| actual == *self)
+    }
+}
+
+/// A process reaped between opening and reading its stat file fails the read
+/// with ESRCH. It is as absent as one whose entry is already gone.
+fn exited_as_absent(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        io::Error::new(io::ErrorKind::NotFound, error)
+    } else {
+        error
     }
 }
 
@@ -319,7 +329,7 @@ impl Record {
 
     fn supported_version(&self) -> bool {
         match self.kind {
-            Kind::Terminal => matches!(self.version, 3 | 4),
+            Kind::Terminal => matches!(self.version, 3 | 4 | 5),
             Kind::Native => matches!(self.version, 2 | 3 | 4),
         }
     }
@@ -561,6 +571,16 @@ fn discover_inner(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_process_reaped_while_its_stat_is_read_is_absent() {
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let mut stat = fs::File::open(format!("/proc/{}/stat", child.id())).unwrap();
+        child.wait().unwrap();
+        let error = stat.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        assert_eq!(exited_as_absent(error).kind(), io::ErrorKind::NotFound);
+    }
 
     #[test]
     fn retained_claude_family_visibility_keeps_original_record_and_codex_isolation() {
@@ -933,6 +953,37 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn terminal_directory_pin_protocol_is_discovered_but_future_evidence_is_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        for version in [3, 4, 5] {
+            let mut terminal = record();
+            terminal.version = version;
+            terminal.create(directory.path()).unwrap();
+            assert_eq!(
+                evidence(&socket(directory.path(), terminal.terminal), Kind::Terminal).unwrap(),
+                Some(terminal.clone())
+            );
+            assert_eq!(
+                discover(directory.path(), &terminal.boot, Kind::Terminal).unwrap(),
+                vec![terminal.clone()]
+            );
+            terminal.remove(directory.path());
+        }
+
+        let mut future = record();
+        future.version = 6;
+        future.create(directory.path()).unwrap();
+        let before = fs::read(future.path(directory.path())).unwrap();
+        assert!(evidence(&socket(directory.path(), future.terminal), Kind::Terminal).is_err());
+        assert!(
+            discover(directory.path(), &future.boot, Kind::Terminal)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(future.path(directory.path())).unwrap(), before);
     }
 
     #[test]

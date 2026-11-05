@@ -91,10 +91,9 @@ mod tests {
     }
     #[test]
     fn heading_fragments_preserve_duplicate_and_explicit_suffix_collisions() {
-        let items: Vec<_> = markdown::parse(
-            "# Repeated\n# Repeated-1\n# Repeated\n# Repeated-1\n# Repeated\n",
-        )
-        .collect();
+        let items: Vec<_> =
+            markdown::parse("# Repeated\n# Repeated-1\n# Repeated\n# Repeated-1\n# Repeated\n")
+                .collect();
         for (fragment, index) in [
             ("repeated", 0),
             ("repeated-1", 1),

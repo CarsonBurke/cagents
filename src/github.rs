@@ -25,6 +25,8 @@ use crate::repository::{
 #[cfg(feature = "ui")]
 pub mod avatar;
 pub mod checkout;
+pub mod polling;
+pub mod review_actions;
 pub mod review_requests;
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
@@ -551,6 +553,7 @@ pub struct PullRequestReviewThread {
 
 #[derive(Debug, Clone, Default)]
 pub struct PullRequestConversation {
+    pub threads_truncated: bool,
     pub threads: Vec<PullRequestReviewThread>,
     pub comments: Vec<PullRequestComment>,
     pub reviews: Vec<PullRequestReview>,
@@ -814,7 +817,7 @@ pub struct PullRequestFilePage {
 
 /// The viewer's unsubmitted review, if one exists. GitHub keeps at most one
 /// per viewer per pull request, and only its owner can see it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingReview {
     pub id: String,
     pub comment_count: u64,
@@ -824,7 +827,7 @@ pub struct PendingReview {
 /// What a review pane needs before its first mutation: the node id every
 /// mutation addresses, the endpoints its diff must match, and whether a
 /// pending review already exists to adopt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewContext {
     pub pull_request_id: String,
     pub head_oid: String,
@@ -1180,6 +1183,18 @@ pub trait GitHubReviewApi: Send + Sync {
         cancellation: &CancellationToken,
     ) -> Result<Vec<PullRequest>, GitHubError>;
 
+    fn search_pull_requests(
+        &self,
+        _repository: &GitHubRepoKey,
+        _query: &str,
+        _cursor: Option<&str>,
+        _cancellation: &CancellationToken,
+    ) -> Result<PullRequestPage, GitHubError> {
+        Err(GitHubError::Inspection(
+            "Repository search is unavailable".into(),
+        ))
+    }
+
     fn pull_request_page(
         &self,
         repository: &GitHubRepoKey,
@@ -1218,6 +1233,8 @@ pub trait GitHubReviewApi: Send + Sync {
 
 #[derive(Debug, Error)]
 pub enum GitHubError {
+    #[error("{limit}")]
+    RateLimited { limit: polling::RateLimit },
     #[error(transparent)]
     Validation(#[from] GitHubValidationError),
     #[error(transparent)]
@@ -1250,6 +1267,34 @@ pub enum GitHubError {
     Inspection(String),
 }
 
+impl GitHubError {
+    pub fn rate_limit(&self) -> Option<polling::RateLimit> {
+        match self {
+            Self::RateLimited { limit } => Some(limit.clone()),
+            Self::InvalidResponse { source, process } => source.rate_limit().or_else(|| {
+                polling::RateLimit::classify(
+                    &format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&process.stdout),
+                        String::from_utf8_lossy(&process.stderr)
+                    ),
+                    polling::now(),
+                )
+            }),
+            Self::Process(failure) => polling::RateLimit::classify(
+                &format!(
+                    "{}\n{}\n{}",
+                    failure.message,
+                    String::from_utf8_lossy(&failure.stdout),
+                    String::from_utf8_lossy(&failure.stderr)
+                ),
+                polling::now(),
+            ),
+            _ => polling::RateLimit::classify(&self.to_string(), polling::now()),
+        }
+    }
+}
+
 /// Authority to mutate is the repository identity established by the last
 /// completed successful refresh. It therefore survives an in-flight refresh,
 /// which `Loading` carries forward, and is revoked only by a completed refresh
@@ -1270,6 +1315,9 @@ pub enum GitHubAvailability {
         pull_requests: Vec<(PullRequest, Vec<PullRequestCheck>)>,
         refreshed_at: i64,
     },
+    RateLimited {
+        limit: polling::RateLimit,
+    },
     Failed {
         detail: String,
     },
@@ -1283,6 +1331,7 @@ impl GitHubAvailability {
             Self::Unauthenticated => "GitHub CLI is not signed in. Run gh auth login in a terminal, then refresh.".into(),
             Self::NotAssociated => "This repository has no supported GitHub remote. Add a GitHub remote, then refresh.".into(),
             Self::Loading { .. } => "Connecting to GitHub…".into(),
+            Self::RateLimited { limit } => limit.to_string(),
             Self::Failed { detail } => format!("Could not connect to GitHub: {detail}. Check your connection and refresh to retry."),
             Self::Ready { .. } => self.label().into(),
         }
@@ -1306,6 +1355,7 @@ impl GitHubAvailability {
                 "GitHub is up to date; no open pull requests."
             }
             Self::Ready { .. } => "GitHub is up to date.",
+            Self::RateLimited { .. } => "GitHub rate limit reached. Waiting until reset.",
             Self::Failed { .. } => {
                 "Could not connect to GitHub. Check your connection and refresh."
             }
@@ -1313,6 +1363,9 @@ impl GitHubAvailability {
     }
 
     pub fn from_error(error: GitHubError) -> Self {
+        if let Some(limit) = error.rate_limit() {
+            return Self::RateLimited { limit };
+        }
         match error {
             GitHubError::UnsupportedAuthStatus { .. } => Self::UnsupportedCli,
             GitHubError::Process(failure) if failure.kind == ProcessFailureKind::Spawn => {
@@ -1651,8 +1704,32 @@ impl<E: ProcessExecutor> GitHubService<E> {
         key: &PullRequestKey,
         cancellation: &CancellationToken,
     ) -> Result<PullRequest, GitHubError> {
+        self.view_with_budget(key, cancellation, None)
+    }
+
+    /// A targeted read can use a smaller process budget without changing the
+    /// defaults of unrelated GitHub operations. Cancellation also bounds its
+    /// wait for the shared process permit.
+    pub fn view_with_timeout(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<PullRequest, GitHubError> {
+        self.view_with_budget(key, cancellation, Some(timeout))
+    }
+
+    fn view_with_budget(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+        timeout: Option<Duration>,
+    ) -> Result<PullRequest, GitHubError> {
         key.validate()?;
-        let command = self.view_command(key);
+        let mut command = self.view_command(key);
+        if let Some(timeout) = timeout {
+            command = command.timeout(timeout);
+        }
         let output = self.run_checked(&command, &key.repository, cancellation)?;
         let pull_request =
             attach_process(parse_pull_request(&output.stdout, &key.repository), &output)?;
@@ -1817,7 +1894,43 @@ impl<E: ProcessExecutor> GitHubService<E> {
     ) -> Result<serde_json::Value, GitHubError> {
         let command = self.graphql_command(repository, query, variables);
         let output = self.run_checked(&command, repository, cancellation)?;
-        attach_process(parse_graphql(&output.stdout), &output)
+        let result = attach_process(parse_graphql(&output.stdout), &output);
+        if let Err(error) = &result {
+            polling::failed(&repository.host, error);
+        }
+        result
+    }
+
+    /// Like [`Self::graphql`], but a response whose only errors are
+    /// `NOT_FOUND` is an answer: the missing objects are `null` in its data.
+    pub(crate) fn graphql_allowing_not_found(
+        &self,
+        repository: &GitHubRepoKey,
+        query: &str,
+        variables: Vec<(&str, GraphQlValue)>,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, GitHubError> {
+        repository.validate()?;
+        let command = self.graphql_command(repository, query, variables);
+        let output = self
+            .execute(&command, cancellation)
+            .map_err(GitHubError::from);
+        if let Ok(output) = &output
+            && !output.success
+            && let Some(data) = not_found_data(&output.stdout)
+        {
+            polling::succeeded(&repository.host);
+            return Ok(data);
+        }
+        let output = charge_host(
+            repository,
+            output.and_then(|output| self.checked_output(output, repository)),
+        )?;
+        let result = attach_process(parse_graphql(&output.stdout), &output);
+        if let Err(error) = &result {
+            polling::failed(&repository.host, error);
+        }
+        result
     }
 
     fn pull_request_variables(key: &PullRequestKey) -> Vec<(&'static str, GraphQlValue)> {
@@ -1904,6 +2017,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 }
                 if page == 3 {
                     result.truncated = true;
+                    result.threads_truncated |= section == "reviewThreads";
                     break;
                 }
                 cursor = Some(next_cursor(&info, cursor.as_deref())?);
@@ -2118,8 +2232,11 @@ impl<E: ProcessExecutor> GitHubService<E> {
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitHubError> {
         repository.validate()?;
-        let output = self.execute(command, cancellation)?;
-        self.checked_output(output, repository)
+        let result = self
+            .execute(command, cancellation)
+            .map_err(GitHubError::from)
+            .and_then(|output| self.checked_output(output, repository));
+        charge_host(repository, result)
     }
 
     fn checked_output(
@@ -2127,6 +2244,18 @@ impl<E: ProcessExecutor> GitHubService<E> {
         output: ProcessOutput,
         repository: &GitHubRepoKey,
     ) -> Result<ProcessOutput, GitHubError> {
+        if !output.success
+            && let Some(limit) = polling::RateLimit::classify(
+                &format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                polling::now(),
+            )
+        {
+            return Err(GitHubError::RateLimited { limit });
+        }
         if output.success {
             Ok(output)
         } else if output.exit_code == Some(4) {
@@ -2339,6 +2468,16 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
     ) -> Result<PullRequest, GitHubError> {
         self.view(key, cancellation)
     }
+    fn search_pull_requests(
+        &self,
+        repository: &GitHubRepoKey,
+        query: &str,
+        cursor: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestPage, GitHubError> {
+        self.search_pull_request_page(repository, query, cursor, cancellation)
+    }
+
     fn pull_request_page(
         &self,
         repository: &GitHubRepoKey,
@@ -2347,7 +2486,9 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
     ) -> Result<PullRequestPage, GitHubError> {
         // Creation order is stable while checks and review state change.
         // Updated-order cursors can skip rows as older PRs receive activity.
-        let query = "query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){pullRequests(first:50,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:DESC}){nodes{id number title state isDraft headRefName headRefOid baseRefName baseRefOid author{login} updatedAt url reviewDecision commits(last:1){nodes{commit{statusCheckRollup{state}}}}} pageInfo{hasNextPage endCursor}}}}";
+        let query = format!(
+            "query($owner:String!,$name:String!,$cursor:String){{repository(owner:$owner,name:$name){{pullRequests(first:50,after:$cursor,states:OPEN,orderBy:{{field:CREATED_AT,direction:DESC}}){{nodes{{{BROWSER_PULL_REQUEST_FIELDS}}} pageInfo{{hasNextPage endCursor}}}}}}}}"
+        );
         let mut variables = vec![
             ("owner", repository.owner.as_str().into()),
             ("name", repository.name.as_str().into()),
@@ -2355,7 +2496,7 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
         if let Some(cursor) = cursor {
             variables.push(("cursor", cursor.into()));
         }
-        let data = self.graphql(repository, query, variables, cancellation)?;
+        let data = self.graphql(repository, &query, variables, cancellation)?;
         let connection: Connection<serde_json::Value> =
             decode_value(data.pointer("/repository/pullRequests").ok_or_else(|| {
                 GitHubError::Inspection("GitHub returned no pull request page.".into())
@@ -2365,18 +2506,11 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
         } else {
             None
         };
-        let pull_requests = connection.nodes.into_iter().map(|mut value| {
-            // The aggregate state is enough for the browser filter; the
-            // detailed review header loads individual checks on demand.
-            if let Some(state) = value.pointer("/commits/nodes/0/commit/statusCheckRollup/state").and_then(serde_json::Value::as_str).map(str::to_owned) {
-                value["statusCheckRollup"] = serde_json::json!([{
-                    "__typename":"StatusContext", "context":"All checks", "state":state, "targetUrl":null
-                }]);
-            }
-            let pull_request: PullRequest = decode_value(&value)?;
-            validate_pull_request(&pull_request, repository)?;
-            Ok(pull_request)
-        }).collect::<Result<Vec<_>, GitHubError>>()?;
+        let pull_requests = connection
+            .nodes
+            .into_iter()
+            .map(|value| decode_browser_pull_request(value, repository))
+            .collect::<Result<Vec<_>, GitHubError>>()?;
         Ok(PullRequestPage {
             pull_requests,
             next_cursor: next,
@@ -2836,6 +2970,38 @@ pub fn parse_pull_request(
     Ok(pull_request)
 }
 
+/// GraphQL selection for one browser row. Every source of browser rows (open
+/// pages, repository search, exact number) selects the same fields so a row's
+/// check summary and filter membership do not depend on how it was found.
+pub(crate) const BROWSER_PULL_REQUEST_FIELDS: &str = "id number title state isDraft headRefName headRefOid baseRefName baseRefOid author{login} updatedAt url reviewDecision headRepository{name owner{login}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}";
+
+/// Decode a row selected with [`BROWSER_PULL_REQUEST_FIELDS`].
+pub(crate) fn decode_browser_pull_request(
+    mut value: serde_json::Value,
+    repository: &GitHubRepoKey,
+) -> Result<PullRequest, GitHubError> {
+    // The aggregate state is enough for the browser filter; the detailed
+    // review header loads individual checks on demand.
+    if let Some(state) = value
+        .pointer("/commits/nodes/0/commit/statusCheckRollup/state")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    {
+        value["statusCheckRollup"] = serde_json::json!([{
+            "__typename": "StatusContext",
+            "context": "All checks",
+            "state": state,
+            "targetUrl": null
+        }]);
+    }
+    if let Some(owner) = value.pointer("/headRepository/owner").cloned() {
+        value["headRepositoryOwner"] = owner;
+    }
+    let pull_request: PullRequest = decode_value(&value)?;
+    validate_pull_request(&pull_request, repository)?;
+    Ok(pull_request)
+}
+
 fn validate_pull_request(
     pull_request: &PullRequest,
     repository: &GitHubRepoKey,
@@ -2894,8 +3060,8 @@ pub fn pull_request_number(
         .ok_or_else(|| GitHubValidationError::InvalidPullRequestUrl(url.to_string()))?
         .collect();
     if segments.len() != 4
-        || segments[0] != repository.owner
-        || segments[1] != repository.name
+        || !segments[0].eq_ignore_ascii_case(&repository.owner)
+        || !segments[1].eq_ignore_ascii_case(&repository.name)
         || segments[2] != "pull"
     {
         return Err(GitHubValidationError::InvalidPullRequestUrl(
@@ -2953,8 +3119,61 @@ fn decode_value<T: DeserializeOwned>(value: &serde_json::Value) -> Result<T, Git
     })
 }
 
+/// Every gh call shares the host budget, so any completed request is evidence
+/// the host recovered, not only the surface that backed off.
+fn charge_host<T>(
+    repository: &GitHubRepoKey,
+    result: Result<T, GitHubError>,
+) -> Result<T, GitHubError> {
+    match &result {
+        Ok(_) => polling::succeeded(&repository.host),
+        Err(error) => polling::failed(&repository.host, error),
+    }
+    result
+}
+
+/// The data of a GraphQL envelope whose errors all say a nested object is
+/// missing: each is `NOT_FOUND` at a path whose parent object was found. A
+/// missing top-level object, such as a renamed or inaccessible repository,
+/// stays a failure.
+fn not_found_data(output: &[u8]) -> Option<serde_json::Value> {
+    let mut envelope: serde_json::Value = serde_json::from_slice(output).ok()?;
+    let data = envelope.as_object_mut()?.remove("data")?;
+    let errors = envelope.get("errors")?.as_array()?;
+    let nested_not_found = |error: &serde_json::Value| {
+        error.get("type").and_then(serde_json::Value::as_str) == Some("NOT_FOUND")
+            && error
+                .get("path")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|path| path.split_last())
+                .is_some_and(|(_, parent)| {
+                    !parent.is_empty()
+                        && parent
+                            .iter()
+                            .try_fold(&data, |value, segment| match segment {
+                                serde_json::Value::String(key) => value.get(key.as_str()),
+                                serde_json::Value::Number(index) => {
+                                    value.get(usize::try_from(index.as_u64()?).ok()?)
+                                }
+                                _ => None,
+                            })
+                            .is_some_and(serde_json::Value::is_object)
+                })
+    };
+    (data.is_object() && !errors.is_empty() && errors.iter().all(nested_not_found)).then_some(data)
+}
+
 fn parse_graphql(output: &[u8]) -> Result<serde_json::Value, GitHubError> {
     let mut envelope: serde_json::Value = parse_json(output)?;
+    if let Some(limit) = polling::RateLimit::classify(
+        &envelope
+            .get("errors")
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        polling::now(),
+    ) {
+        return Err(GitHubError::RateLimited { limit });
+    }
     if let Some(errors) = envelope.get("errors").and_then(serde_json::Value::as_array)
         && !errors.is_empty()
     {
@@ -3324,7 +3543,12 @@ mod tests {
             ]
         );
         assert!(!cheap.last().unwrap().contains("statusCheckRollup"));
-        assert!(arguments(true).last().unwrap().contains("statusCheckRollup"));
+        assert!(
+            arguments(true)
+                .last()
+                .unwrap()
+                .contains("statusCheckRollup")
+        );
     }
 
     #[test]
@@ -4487,3 +4711,6 @@ mod tests {
         assert!(argument_strings(&commands[0]).contains(&"path=src/lib.rs".to_owned()));
     }
 }
+
+#[cfg(test)]
+mod channel_work_tests;

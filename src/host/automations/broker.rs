@@ -11,6 +11,7 @@ use std::{
 use uuid::Uuid;
 
 use super::{
+    notification_event, notifications,
     precheck::worker::{Request, Status, Worker},
     schedule::Compiled,
     service,
@@ -64,6 +65,8 @@ struct Inner {
     // The journal is bounded. Polling must not resurrect a blocked run after
     // newer unrelated events evict its durable replay identity.
     attention: Mutex<BTreeMap<crate::model::RunId, crate::notifications::Evidence>>,
+    // Only the scheduler advances the one in-flight durable journal transfer.
+    notifications: Mutex<notifications::Transfer>,
 }
 
 #[derive(Clone)]
@@ -87,6 +90,7 @@ impl Broker {
             workers: Mutex::new(BTreeMap::new()),
             cleanup: Mutex::new(Some(cleanup)),
             attention: Mutex::new(attention),
+            notifications: Mutex::default(),
         }));
         let owner = handle.clone();
         let thread = std::thread::Builder::new()
@@ -317,6 +321,38 @@ impl Handle {
     }
 
     fn tick(&self, host: &SharedHost) -> Result<Duration, String> {
+        // Receipt polling must remain possible while shutdown owns control.
+        // Neither the HostState guard nor the control gate reaches advance().
+        let notification_delay = self.advance_notifications(host);
+        self.tick_under_control(host)
+            .map(|delay| delay.min(notification_delay))
+    }
+
+    fn advance_notifications(&self, host: &SharedHost) -> Duration {
+        let notifications = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notifications
+            .clone();
+        let Some(notifications) = notifications else {
+            return notifications::RETRY;
+        };
+        match self
+            .0
+            .notifications
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .advance(&self.0.registry, &notifications, notification_event::build)
+        {
+            Ok(delay) => delay,
+            Err(error) => {
+                tracing::warn!(%error, "automation attention transfer is temporarily unavailable");
+                notifications::RETRY
+            }
+        }
+    }
+
+    fn tick_under_control(&self, host: &SharedHost) -> Result<Duration, String> {
         let control = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -745,6 +781,228 @@ mod tests {
     use crate::host::state::HostState;
 
     #[test]
+    fn proposal_inspection_does_not_wake_scheduler_but_a_new_decline_does() {
+        use crate::{
+            agent::Provider,
+            agent_execution::{Authority, Lineage, Origin, Spec, Surface, Target},
+            automations::{
+                Definition, DirectoryIdentity, ProposalState, ProposalSummary, Request, Response,
+                Schedule, SchedulePattern,
+            },
+            host::model::Registry,
+            model::{ProjectKind, TerminalId},
+            workspace_model::ModelEdit,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().to_path_buf();
+        let foreign_repository = directory.path().join("other-project");
+        let mut model = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        for path in [&repository, &foreign_repository] {
+            model
+                .apply(&ModelEdit::OpenProject {
+                    repository: path.clone(),
+                    name: "Read wake fixture".into(),
+                    kind: ProjectKind::Folder,
+                })
+                .unwrap();
+        }
+        let host = crate::host::service::test_host();
+        host.lock().unwrap().install_model(model);
+        let registry = agent_execution::registry(&host).unwrap();
+        // No coordinator thread, worker, provider, or timer is started. Inspect
+        // the actual wake generation the scheduler's Condvar observes.
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: registry.clone(),
+            root: directory.path().into(),
+            wake: Wake::default(),
+            workers: Mutex::default(),
+            cleanup: Mutex::new(None),
+            attention: Mutex::default(),
+            notifications: Mutex::default(),
+        }));
+        host.lock().unwrap().automations = Some(handle.clone());
+        let control = host.lock().unwrap().control_gate.clone();
+        let _admission = control.read().unwrap();
+        let without_wake = |request: Request| {
+            let before = handle.0.wake.state.lock().unwrap().generation;
+            let description = format!("{request:?}");
+            let result = service::process_under_control(&host, Authority::default(), request);
+            assert_eq!(
+                handle.0.wake.state.lock().unwrap().generation,
+                before,
+                "read-only request woke the scheduler: {description}"
+            );
+            result
+        };
+        assert_eq!(
+            without_wake(Request::PendingProposals {
+                repository: repository.clone(),
+                after: None,
+                limit: 1,
+            })
+            .unwrap(),
+            Response::Proposals(Vec::new())
+        );
+        let owner = Origin::Child {
+            parent: Lineage(TerminalId::new()),
+        };
+        let mut proposals = Vec::new();
+        for (id, path) in [(1, &repository), (2, &repository), (3, &foreign_repository)] {
+            let definition = Definition {
+                name: format!("Read fixture {id}"),
+                prompt: "A saved fixture, never dispatched".into(),
+                agent: Spec {
+                    provider: Provider::Claude,
+                    account: None,
+                    target: Target {
+                        repository: path.clone(),
+                        directory: path.clone(),
+                        placement: None,
+                    },
+                    surface: Surface::Chat,
+                    model: None,
+                    reasoning_effort: None,
+                    permission_mode: None,
+                },
+                schedule: Schedule {
+                    pattern: SchedulePattern::Hourly { minute: 0 },
+                    timezone: "UTC".into(),
+                },
+                session_mode: SessionMode::Fresh,
+                precheck: None,
+            };
+            proposals.push(
+                registry
+                    .lock()
+                    .unwrap()
+                    .propose_automation(
+                        Uuid::from_u128(id),
+                        owner.clone(),
+                        definition.clone(),
+                        definition,
+                        DirectoryIdentity {
+                            device: 1,
+                            inode: id as u64,
+                        },
+                        None,
+                        100,
+                    )
+                    .unwrap(),
+            );
+        }
+        let before_model = registry.lock().unwrap().model().unwrap();
+        assert_eq!(
+            without_wake(Request::PendingProposals {
+                repository: repository.clone(),
+                after: None,
+                limit: 1,
+            })
+            .unwrap(),
+            Response::Proposals(vec![ProposalSummary::from(&proposals[0])])
+        );
+        assert_eq!(
+            without_wake(Request::PendingProposals {
+                repository: repository.clone(),
+                after: Some(proposals[0].id),
+                limit: 100,
+            })
+            .unwrap(),
+            Response::Proposals(vec![ProposalSummary::from(&proposals[1])])
+        );
+        assert_eq!(
+            without_wake(Request::PendingProposals {
+                repository: foreign_repository,
+                after: None,
+                limit: 100,
+            })
+            .unwrap(),
+            Response::Proposals(vec![ProposalSummary::from(&proposals[2])])
+        );
+        assert_eq!(
+            without_wake(Request::Proposal {
+                id: proposals[0].id
+            })
+            .unwrap(),
+            Response::Proposal(Box::new(proposals[0].clone()))
+        );
+        assert_eq!(
+            without_wake(Request::Proposal {
+                id: Uuid::from_u128(4)
+            })
+            .unwrap_err(),
+            "The automation proposal is unavailable"
+        );
+        {
+            let registry = registry.lock().unwrap();
+            assert_eq!(registry.model().unwrap(), before_model);
+            for proposal in &proposals {
+                assert_eq!(
+                    registry
+                        .automation_proposal(proposal.id, None)
+                        .unwrap()
+                        .as_ref(),
+                    Some(proposal)
+                );
+            }
+            assert!(registry.automations(None, 100).unwrap().is_empty());
+        }
+        let before = handle.0.wake.state.lock().unwrap().generation;
+        let decision = Request::ResolveProposal {
+            id: proposals[0].id,
+            revision: proposals[0].revision,
+            approved: false,
+        };
+        let mut declined = proposals[0].clone();
+        declined.state = ProposalState::Declined;
+        assert_eq!(
+            service::process_under_control(&host, Authority::default(), decision.clone()).unwrap(),
+            Response::Proposal(Box::new(declined.clone()))
+        );
+        assert_eq!(
+            handle.0.wake.state.lock().unwrap().generation,
+            before.wrapping_add(1),
+            "a newly committed decision must still wake scheduling"
+        );
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .automation_proposal(declined.id, None)
+                .unwrap(),
+            Some(declined.clone())
+        );
+        assert_eq!(
+            without_wake(Request::Proposal { id: declined.id }).unwrap(),
+            Response::Proposal(Box::new(declined.clone()))
+        );
+        assert_eq!(
+            without_wake(decision).unwrap(),
+            Response::Proposal(Box::new(declined)),
+            "terminal decision replay does not commit another change"
+        );
+        assert_eq!(
+            without_wake(Request::PendingProposals {
+                repository,
+                after: None,
+                limit: 100
+            })
+            .unwrap(),
+            Response::Proposals(vec![ProposalSummary::from(&proposals[1])])
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .automations(None, 100)
+                .unwrap()
+                .is_empty(),
+            "inspection and decline never create a schedule"
+        );
+        assert!(handle.0.workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn busy_cleanup_preserves_schedule_and_never_reenables_explicit_pause() {
         use crate::{
             agent_execution::{Destination, State, Update},
@@ -770,6 +1028,7 @@ mod tests {
             workers: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            notifications: Mutex::default(),
         }));
         // Exercise both retire-on-idle and retain-for-reuse policies. Each uses
         // a real offline native actor held busy beyond the cleanup grace.
@@ -1007,6 +1266,7 @@ mod tests {
             workers: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            notifications: Mutex::default(),
         }));
         let (reported, received) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
@@ -1090,6 +1350,7 @@ mod tests {
             workers: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            notifications: Mutex::default(),
         }));
         let gate = host.lock().unwrap().control_gate.clone();
         let exclusive = gate.write().unwrap();
@@ -1220,6 +1481,113 @@ mod tests {
         assert_eq!(
             initial_attention(&registry).unwrap()[&run.id],
             finished.evidence
+        );
+    }
+
+    #[test]
+    fn stopped_notification_journal_keeps_no_run_receipt_and_scheduler_control_progress() {
+        use crate::{
+            automations::DirectoryIdentity, host::model::Registry, model::ProjectKind,
+            workspace_model::ModelEdit,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().to_owned();
+        let mut model = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        model
+            .apply(&ModelEdit::OpenProject {
+                repository: repository.clone(),
+                name: "Fixture".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        let definition = serde_json::from_value(serde_json::json!({
+            "name":"Private fixture", "prompt":"Private fixture prompt",
+            "agent":{"provider":"Codex","account":null,"target":{"repository":repository,"directory":repository,"placement":null},"surface":"Chat","model":null,"permission_mode":null,"reasoning_effort":null},
+            "schedule":{"pattern":{"daily":{"hour":9,"minute":0}},"timezone":"UTC"},
+            "session_mode":"fresh","precheck":null
+        })).unwrap();
+        let automation = model
+            .create_automation(
+                definition,
+                100,
+                DirectoryIdentity {
+                    device: 1,
+                    inode: 1,
+                },
+            )
+            .unwrap();
+        model
+            .set_automation_enabled(
+                automation.id,
+                automation.revision,
+                Some(crate::automations::Occurrence {
+                    due_ms: 60_000,
+                    local: "fixture".into(),
+                }),
+                true,
+                200,
+            )
+            .unwrap();
+        model
+            .apply(&ModelEdit::CloseProject { repository })
+            .unwrap();
+        let before = model.pending_automation_notifications(100).unwrap();
+        assert_eq!(before.len(), 1);
+        let host = crate::host::service::test_host();
+        // This is the actual stopped-enqueue behavior, not a fake successful
+        // journal receipt. No notification thread/portal/provider is started.
+        let (notifications, _) = crate::host::notifications::Handle::inert_for_test();
+        host.lock().unwrap().notifications = Some(notifications);
+        let registry = Arc::new(Mutex::new(model));
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: registry.clone(),
+            root: directory.path().join("prechecks"),
+            wake: Wake::default(),
+            workers: Mutex::default(),
+            cleanup: Mutex::new(None),
+            attention: Mutex::default(),
+            notifications: Mutex::default(),
+        }));
+        let control = host.lock().unwrap().control_gate.clone();
+        let exclusive = control.write().unwrap();
+        assert_eq!(handle.tick(&host).unwrap(), Duration::from_millis(250));
+        drop(exclusive);
+        let delay = handle.tick(&host).unwrap();
+        assert!(delay > Duration::ZERO && delay <= notifications::RETRY);
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .pending_automation_notifications(100)
+                .unwrap(),
+            before
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .active_automation_firings()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .due_automations(service::now().unwrap(), 4)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(handle.0.workers.lock().unwrap().is_empty());
+        assert_eq!(
+            handle.0.wake.state.lock().unwrap().generation,
+            0,
+            "journal progress uses the existing finite wait, not read-triggered wakes"
+        );
+        assert!(
+            handle.0.attention.lock().unwrap().is_empty(),
+            "a no-run event cannot invent AgentRun attention"
         );
     }
 }

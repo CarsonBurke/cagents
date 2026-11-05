@@ -14,6 +14,12 @@ use std::{
 pub enum Action {
     Snapshot(Snapshot),
     Activated(Target),
+    OpenNotice(NoticeActivation),
+    HostBound(HostSessionProof),
+    LifecycleResolved {
+        generation: u64,
+        result: Result<crate::automations::LifecyclePage, ()>,
+    },
     SessionActivationExpired {
         session: TerminalId,
         generation: u64,
@@ -27,6 +33,89 @@ pub enum Action {
     Test,
     Tested(Result<TestOutcome, String>),
     Failed(String),
+}
+
+/// A rendered incident, not permission to replay an arbitrary target.
+#[derive(Debug, Clone)]
+pub struct NoticeActivation {
+    notice: uuid::Uuid,
+    target: Target,
+    host: Option<HostSessionProof>,
+    registry: uuid::Uuid,
+    backend: Option<(String, String, String)>,
+    workspace: Weak<WorkspaceState>,
+}
+
+impl PartialEq for NoticeActivation {
+    fn eq(&self, other: &Self) -> bool {
+        self.notice == other.notice
+            && self.target == other.target
+            && self.host == other.host
+            && self.registry == other.registry
+            && self.backend == other.backend
+            && self.workspace.ptr_eq(&other.workspace)
+    }
+}
+impl Eq for NoticeActivation {}
+
+#[derive(Clone)]
+struct LifecycleActivation {
+    id: uuid::Uuid,
+    sequence: u64,
+    generation: u64,
+    registry: uuid::Uuid,
+    host: HostSessionProof,
+    backend: Option<(String, String, String)>,
+    workspace: Weak<WorkspaceState>,
+}
+
+fn lifecycle_backend() -> Option<(String, String, String)> {
+    crate::device::selected().map(|device| {
+        (
+            device.name.clone(),
+            device.host.clone(),
+            device.executable.clone(),
+        )
+    })
+}
+
+fn read_lifecycle(
+    activation: &LifecycleActivation,
+) -> Result<crate::automations::LifecyclePage, ()> {
+    if lifecycle_backend() != activation.backend {
+        return Err(());
+    }
+    let mut client = connect().map_err(|_| ())?;
+    if client.proof() != &activation.host {
+        return Err(());
+    }
+    if client.read_workspace_model().map_err(|_| ())?.identity != activation.registry {
+        return Err(());
+    }
+    // At SQLite's maximum sequence there cannot be a later receipt. The
+    // receiver still requires exact equality; it never substitutes the latest.
+    let before = activation
+        .sequence
+        .checked_add(1)
+        .filter(|value| *value <= i64::MAX as u64);
+    let page = match client
+        .automation(
+            crate::agent_execution::Authority::default(),
+            crate::automations::Request::Audit {
+                id: activation.id,
+                before,
+                limit: 1,
+            },
+        )
+        .map_err(|_| ())?
+    {
+        crate::automations::Response::Audit(page) => page,
+        _ => return Err(()),
+    };
+    if client.read_workspace_model().map_err(|_| ())?.identity != activation.registry {
+        return Err(());
+    }
+    Ok(page)
 }
 
 struct ManagedActivation {
@@ -69,6 +158,13 @@ pub(super) struct State {
     acknowledged: BTreeSet<uuid::Uuid>,
     /// Whether a test notification is waiting on the desktop's answer.
     pub testing: bool,
+    lifecycle_activation: Option<LifecycleActivation>,
+    lifecycle_read: Option<u64>,
+    host: Option<HostSessionProof>,
+    // HostBound precedes its Snapshot on the one observer FIFO. Retained old
+    // snapshots may still inform existing chrome, but cannot authorize a click.
+    snapshot_host: Option<HostSessionProof>,
+    snapshot_backend: Option<(String, String, String)>,
     inbox_activation: Option<(crate::agent_execution::Lineage, uuid::Uuid)>,
     session_activation: Option<TerminalId>,
     activation_generation: u64,
@@ -94,6 +190,11 @@ impl Default for State {
             visible_acknowledged: false,
             acknowledged: BTreeSet::new(),
             testing: false,
+            lifecycle_activation: None,
+            lifecycle_read: None,
+            host: None,
+            snapshot_host: None,
+            snapshot_backend: None,
             inbox_activation: None,
             session_activation: None,
             activation_generation: 0,
@@ -215,6 +316,9 @@ fn observe(
     presence: &Mutex<Presence>,
 ) -> Result<(), String> {
     let mut client = connect()?;
+    sender
+        .send_blocking(Action::HostBound(client.proof().clone()))
+        .map_err(|error| error.to_string())?;
     let presence = presence.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let snapshot = client
         .watch_notifications(presence)
@@ -476,19 +580,224 @@ impl Cagents {
         self.sync_notification_presence();
     }
 
+    /// Stable notice IDs are rendered once. Conflicting coalesced targets for
+    /// one ID fail closed rather than choosing whichever row arrived last.
+    pub(super) fn attention_notices(&self) -> Vec<&crate::notifications::Notice> {
+        let mut seen = HashMap::new();
+        let mut conflicts = BTreeSet::new();
+        for notice in &self.notification_ui.snapshot.notices {
+            if let Some(target) =
+                seen.insert(notice.id, (&notice.event.target, notice.acknowledged))
+                && target != (&notice.event.target, notice.acknowledged)
+            {
+                conflicts.insert(notice.id);
+            }
+        }
+        let mut ids = BTreeSet::new();
+        self.notification_ui
+            .snapshot
+            .notices
+            .iter()
+            .filter(|notice| {
+                !notice.acknowledged
+                    && !self.notification_ui.acknowledged.contains(&notice.id)
+                    && !conflicts.contains(&notice.id)
+                    && ids.insert(notice.id)
+            })
+            .collect()
+    }
+
+    pub(super) fn attention_backend_current(&self) -> bool {
+        self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
+            && self
+                .notification_ui
+                .snapshot_host
+                .as_ref()
+                .is_some_and(|proof| proof.is_complete())
+            && self.notification_ui.snapshot_host == self.notification_ui.host
+            && self.notification_ui.snapshot_backend == lifecycle_backend()
+    }
+
+    pub(super) fn attention_notice_owner(
+        &self,
+        notice: &crate::notifications::Notice,
+    ) -> NoticeActivation {
+        NoticeActivation {
+            notice: notice.id,
+            target: notice.event.target.clone(),
+            host: self.notification_ui.snapshot_host.clone(),
+            registry: self.workspace_model.identity,
+            backend: self.notification_ui.snapshot_backend.clone(),
+            workspace: Arc::downgrade(&self.durable),
+        }
+    }
+
+    pub(super) fn attention_notice_action(&self, notice: &crate::notifications::Notice) -> Message {
+        Message::NotificationUi(Action::OpenNotice(self.attention_notice_owner(notice)))
+    }
+
+    fn can_open_lifecycle_notice(&self) -> bool {
+        !self.workspace_inputs_blocked()
+            && !self.focused_repository_is_saving()
+            && self.exit.is_none()
+            && self.workspace.pending_close().is_none()
+            && !self.update_prepared
+            && self.automation_ui.can_open_lifecycle()
+    }
+
     pub(super) fn update_notifications(&mut self, action: Action) -> Task<Message> {
         if matches!(&action, Action::Activated(target) if !matches!(target, Target::SessionInbox(_)))
         {
             self.notification_ui.inbox_activation = None;
         }
         if matches!(&action, Action::Activated(_)) {
+            self.notification_ui.lifecycle_activation = None;
             self.notification_ui.session_activation = None;
             self.notification_ui.activation_attempt = None;
             self.notification_ui.activation_generation =
                 self.notification_ui.activation_generation.wrapping_add(1);
         }
         match action {
+            Action::OpenNotice(clicked) => {
+                let current = self.attention_notices().into_iter().any(|notice| {
+                    notice.id == clicked.notice && notice.event.target == clicked.target
+                });
+                if !self.attention_is_open()
+                    || !current
+                    || clicked.notice.is_nil()
+                    || clicked.registry == crate::workspace_model::NO_REGISTRY
+                    || clicked.registry != self.workspace_model.identity
+                    || clicked.backend != lifecycle_backend()
+                    || clicked.backend != self.notification_ui.snapshot_backend
+                    || clicked.workspace.as_ptr() != Arc::as_ptr(&self.durable)
+                    || clicked
+                        .host
+                        .as_ref()
+                        .is_none_or(|proof| !proof.is_complete())
+                    || clicked.host != self.notification_ui.host
+                    || clicked.host != self.notification_ui.snapshot_host
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "This attention entry changed or its backend is unavailable. Open Attention again to choose a current entry.",
+                    ));
+                    return Task::none();
+                }
+                if !self.with_attention_dismissed(|app| app.can_open_lifecycle_notice())
+                    || (matches!(clicked.target, Target::Automation { .. })
+                        && self.notification_ui.lifecycle_read.is_some())
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "Finish the current edit or request and return to the workspace, then choose this attention entry again.",
+                    ));
+                    return Task::none();
+                }
+                // Merely listing/reading Attention never acknowledges a notice.
+                // Explicit session actions keep their established semantics;
+                // historical automation activation remains read-only/no-ACK.
+                self.close_attention();
+                self.update_notifications(Action::Activated(clicked.target))
+            }
+            Action::HostBound(proof) => {
+                self.notification_ui.snapshot_host = None;
+                if self.notification_ui.host.as_ref() != Some(&proof) {
+                    self.notification_ui.lifecycle_activation = None;
+                }
+                self.notification_ui.host = Some(proof);
+                Task::none()
+            }
+            Action::Activated(Target::Automation { id, sequence }) => {
+                // Invalidating the desired target does not cancel blocking I/O.
+                // Keep one real read outstanding, including across host changes.
+                if self.notification_ui.lifecycle_read.is_some() {
+                    self.status = Some(TransientNotice::warning(
+                        "A lifecycle receipt is still being read. Open this notice again after that read finishes.",
+                    ));
+                    return self.activate_main_window(None);
+                }
+                if !self.can_open_lifecycle_notice() {
+                    self.status = Some(TransientNotice::warning(
+                        "Return to the workspace and finish any open edit or request, then open this lifecycle notice again.",
+                    ));
+                    return self.activate_main_window(None);
+                }
+                let Some(host) = self
+                    .notification_ui
+                    .host
+                    .clone()
+                    .filter(|proof| proof.is_complete())
+                else {
+                    self.status = Some(TransientNotice::warning(
+                        "The notification backend is not connected. The original notice remains in Attention.",
+                    ));
+                    return self.activate_main_window(None);
+                };
+                if id.is_nil()
+                    || sequence == 0
+                    || sequence > i64::MAX as u64
+                    || self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "This lifecycle notice is not available on the current workspace. The original notice remains in Attention.",
+                    ));
+                    return self.activate_main_window(None);
+                }
+                let activation = LifecycleActivation {
+                    id,
+                    sequence,
+                    generation: self.notification_ui.activation_generation,
+                    registry: self.workspace_model.identity,
+                    host,
+                    backend: lifecycle_backend(),
+                    workspace: Arc::downgrade(&self.durable),
+                };
+                self.notification_ui.lifecycle_read = Some(activation.generation);
+                self.notification_ui.lifecycle_activation = Some(activation.clone());
+                cosmic::task::future(async move {
+                    let generation = activation.generation;
+                    let result = tokio::task::spawn_blocking(move || read_lifecycle(&activation))
+                        .await
+                        .unwrap_or(Err(()));
+                    Message::NotificationUi(Action::LifecycleResolved { generation, result })
+                })
+            }
+            Action::LifecycleResolved { generation, result } => {
+                if self.notification_ui.lifecycle_read != Some(generation) {
+                    return Task::none();
+                }
+                self.notification_ui.lifecycle_read = None;
+                let Some(activation) = self
+                    .notification_ui
+                    .lifecycle_activation
+                    .as_ref()
+                    .filter(|current| current.generation == generation)
+                    .cloned()
+                else {
+                    return Task::none();
+                };
+                self.notification_ui.lifecycle_activation = None;
+                if activation.registry != self.workspace_model.identity
+                    || self.notification_ui.host.as_ref() != Some(&activation.host)
+                    || lifecycle_backend() != activation.backend
+                    || activation.workspace.as_ptr() != Arc::as_ptr(&self.durable)
+                    || !self.can_open_lifecycle_notice()
+                {
+                    return Task::none();
+                }
+                if !self.automation_ui.show_lifecycle_receipt(
+                    activation.id,
+                    activation.sequence,
+                    result,
+                ) {
+                    return Task::none();
+                }
+                // Reading a historical receipt is not run attention retirement
+                // or a claim that this system condition still holds now.
+                let open = self.open_utility_card(CardKind::Automations);
+                Task::batch([open, self.activate_main_window(None)])
+            }
             Action::Snapshot(snapshot) => {
+                self.notification_ui.snapshot_host = self.notification_ui.host.clone();
+                self.notification_ui.snapshot_backend = lifecycle_backend();
                 if snapshot.diagnostic != self.notification_ui.snapshot.diagnostic
                     && let Some(diagnostic) = &snapshot.diagnostic
                 {
@@ -500,7 +809,9 @@ impl Cagents {
                         .iter()
                         .any(|notice| notice.id == *id && !notice.acknowledged)
                 });
-                for card in self.notification_unread_cards(&snapshot) {
+                let (unread, failed) = self.notification_attention_updates(&snapshot);
+                self.sidebar_state.set_failed_updates(failed);
+                for card in unread {
                     self.observe_agent_update_for_card(card);
                 }
                 self.notification_ui.preview_generation =
@@ -832,30 +1143,42 @@ impl Cagents {
         Task::batch([adopted, focus])
     }
 
-    fn notification_unread_cards(&self, snapshot: &Snapshot) -> BTreeSet<CardId> {
+    fn notification_attention_updates(
+        &self,
+        snapshot: &Snapshot,
+    ) -> (BTreeSet<CardId>, BTreeSet<CardId>) {
+        let mut unread = BTreeSet::new();
+        let mut failed = BTreeSet::new();
         if snapshot.notices.is_empty() {
-            return BTreeSet::new();
+            return (unread, failed);
         }
         let cards = self.notification_attention_cards();
-        snapshot
-            .notices
-            .iter()
-            .filter_map(|notice| {
-                if notice.acknowledged || self.notification_ui.acknowledged.contains(&notice.id) {
-                    return None;
-                }
-                let session = notice.event.source_session()?;
-                cards.get(&session).copied().flatten()
-            })
-            .collect()
+        for notice in &snapshot.notices {
+            if notice.acknowledged || self.notification_ui.acknowledged.contains(&notice.id) {
+                continue;
+            }
+            let Some(card) = notice
+                .event
+                .source_session()
+                .and_then(|session| cards.get(&session).copied().flatten())
+            else {
+                continue;
+            };
+            unread.insert(card);
+            if notice.event.evidence.kind == crate::notifications::Kind::Failed {
+                failed.insert(card);
+            }
+        }
+        (unread, failed)
     }
 
     /// Journal and workspace-model watches are independent. Reconsider retained
     /// unread evidence after canonical pane/scope reconciliation, without
     /// waiting for a second journal snapshot or adopting/reading a pane.
     pub(super) fn reproject_notification_unread(&mut self) {
-        let cards = self.notification_unread_cards(&self.notification_ui.snapshot);
-        if cards.is_empty() {
+        let (cards, failed) = self.notification_attention_updates(&self.notification_ui.snapshot);
+        let failed_changed = self.sidebar_state.set_failed_updates(failed);
+        if cards.is_empty() && !failed_changed {
             return;
         }
         for card in cards {
@@ -2617,103 +2940,340 @@ mod tests {
     }
 
     #[test]
+    fn compact_attention_failed_news_is_distinct_from_working_and_unconfirmed_loss() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.refresh_ui.focused = false;
+        let card = app.durable.cards[0].id;
+        let session = card_session(&app.durable.cards[0]).unwrap();
+        let project = ProjectId::new();
+        let channel = ChannelId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "Attention".into(),
+            "/repo".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                title_source: Default::default(),
+                id: channel,
+                project_id: project,
+                title: "Agent".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        app.sidebar_state.set_card_activity(
+            card,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Codex,
+                state: crate::agent::ActivityState::Working,
+            },
+        );
+        let notice = |kind, key: &str| crate::notifications::Notice {
+            id: uuid::Uuid::new_v4(),
+            acknowledged: false,
+            delivered: true,
+            window: None,
+            event: crate::notifications::Event::session(
+                session,
+                crate::agent::Provider::Codex,
+                "/repo".into(),
+                crate::notifications::Evidence {
+                    key: key.into(),
+                    kind,
+                },
+            ),
+        };
+        let failed = notice(crate::notifications::Kind::Failed, "known-failed-turn");
+        let loss = notice(crate::notifications::Kind::Interrupted, "observation-ended");
+        let cancelled = notice(
+            crate::notifications::Kind::Cancelled,
+            "known-cancelled-turn",
+        );
+        drop(
+            app.update(Message::NotificationUi(Action::Snapshot(Snapshot {
+                notices: vec![failed.clone(), loss.clone(), cancelled.clone()],
+                diagnostic: None,
+            }))),
+        );
+        let summary = app.sidebar_state.project_attention(project);
+        assert_eq!(
+            summary.unread, 1,
+            "three journal events still name one conversation"
+        );
+        assert_eq!(summary.failed, 1);
+        assert_eq!(
+            summary.working, 1,
+            "historical failure does not stop live work"
+        );
+        assert_eq!(summary.state(), Some(sidebar::AttentionState::Failed));
+        assert_eq!(app.sidebar_model.projects[0].channels[0].attention, summary);
+        let mut read_failed = failed;
+        read_failed.acknowledged = true;
+        drop(
+            app.update(Message::NotificationUi(Action::Snapshot(Snapshot {
+                notices: vec![read_failed, loss, cancelled],
+                diagnostic: None,
+            }))),
+        );
+        let summary = app.sidebar_state.project_attention(project);
+        assert_eq!(
+            summary.failed, 0,
+            "an empty failed projection replaces the old one"
+        );
+        assert_eq!(summary.unread, 1);
+        assert_eq!(summary.state(), Some(sidebar::AttentionState::Working));
+        assert_eq!(
+            app.sidebar_state.card_activity(card).unwrap().state,
+            crate::agent::ActivityState::Working
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        assert_eq!(app.sidebar_state.project_attention(project).unread, 0);
+        assert_eq!(app.sidebar_state.card_attention(card).failed, 0);
+    }
+
+    #[test]
+    fn compact_attention_empty_foreign_draft_alias_cannot_erase_canonical_failed_news() {
+        use crate::workspace_model::views::{Pane, View};
+        let (mut app, agent) = scheduled_attention_fixture();
+        let session = agent.console.as_ref().unwrap().id;
+        let canonical = CardId::from_uuid(agent.id.as_uuid());
+        let channel = match &agent.placement {
+            crate::agent_execution::Placement::Channel(channel) => *channel,
+            _ => unreachable!(),
+        };
+        let project = app.durable.channels[0].project_id;
+        app.workspace_model.agents.push(agent.clone());
+        drop(app.adopt_execution_agent(&agent).unwrap());
+        let card = app.card_state(canonical).unwrap().clone();
+        app.workspace_model.views = vec![View {
+            scope: agent.placement.clone(),
+            revision: 1,
+            panes: vec![Pane::from_card(&card, Some(agent.spec.target.directory.clone())).unwrap()],
+            retired: vec![],
+        }];
+        let mut alias = card.clone();
+        alias.id = CardId::new();
+        let alias_id = alias.id;
+        let foreign = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            foreign,
+            RepositoryId::new(),
+            "Legacy inventory".into(),
+            "/foreign".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        let mut foreign_channel = app.durable.channels[0].clone();
+        foreign_channel.id = ChannelId::new();
+        foreign_channel.project_id = foreign;
+        foreign_channel.shared = false;
+        foreign_channel.cards = vec![alias_id];
+        foreign_channel.focused = None;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.insert(0, alias);
+        durable.channels.push(foreign_channel);
+        app.chat_ui = chat_ui::State::with_drafts(HashMap::from([
+            (alias_id, "Keep alias draft".into()),
+            (canonical, "Keep canonical draft".into()),
+        ]));
+        app.acknowledge_view_edit(agent.placement.clone(), None);
+        drop(app.reconcile_shared_views());
+        assert!(app.shared_views.blocked.contains(&agent.placement));
+        assert!(app.card_state(alias_id).unwrap().existence.is_open());
+        assert_eq!(
+            app.sidebar_state.card_attention(alias_id),
+            sidebar::AttentionSummary::default()
+        );
+        app.refresh_ui.focused = false;
+        let mut snapshot = attention_snapshot(session);
+        snapshot.notices[0].event.evidence.kind = crate::notifications::Kind::Failed;
+        let notice = snapshot.notices[0].id;
+        drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
+        assert_eq!(app.sidebar_state.project_attention(project).unread, 1);
+        assert_eq!(app.sidebar_state.project_attention(project).failed, 1);
+        assert_eq!(
+            app.sidebar_state.project_attention(foreign),
+            sidebar::AttentionSummary::default()
+        );
+        assert!(!app.sidebar_state.has_card_update(alias_id));
+        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        drop(app.update_notifications(Action::Snapshot(snapshot)));
+        assert_eq!(app.sidebar_state.project_attention(project).unread, 0);
+        assert_eq!(app.sidebar_state.project_attention(project).failed, 0);
+        assert!(app.notification_ui.acknowledged_for_test(notice));
+        assert!(app.card_state(alias_id).unwrap().existence.is_open());
+        let saved = app.persistent_workspace();
+        let drafts = &saved.chat_drafts;
+        assert_eq!(
+            drafts.get(&alias_id).map(String::as_str),
+            Some("Keep alias draft")
+        );
+        assert_eq!(
+            drafts.get(&canonical).map(String::as_str),
+            Some("Keep canonical draft")
+        );
+    }
+
+    #[test]
+    fn model_only_attention_reprojection_clears_failed_news_without_an_unread_target() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.refresh_ui.focused = false;
+        let card = app.durable.cards[0].clone();
+        let session = card_session(&card).unwrap();
+        let mut snapshot = attention_snapshot(session);
+        snapshot.notices[0].event.evidence.kind = crate::notifications::Kind::Failed;
+        drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
+        assert_eq!(app.sidebar_state.card_attention(card.id).failed, 1);
+
+        // A new open alias makes an unmanaged session ambiguous. No second
+        // journal Snapshot arrives, and attribution must not choose an alias.
+        let mut alias = card.clone();
+        alias.id = CardId::new();
+        let alias_id = alias.id;
+        Arc::make_mut(&mut app.durable).cards.push(alias);
+        let (unread, failed) = app.notification_attention_updates(&snapshot);
+        assert!(unread.is_empty());
+        assert!(failed.is_empty());
+        app.reproject_notification_unread();
+        assert_eq!(app.sidebar_state.card_attention(card.id).failed, 0);
+        assert_eq!(app.sidebar_state.card_attention(alias_id).failed, 0);
+        assert_eq!(app.notification_ui.snapshot, snapshot);
+        assert_eq!(
+            app.durable.cards.len(),
+            2,
+            "projection neither adopts nor removes"
+        );
+
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .retain(|known| known.id != alias_id);
+        app.reproject_notification_unread();
+        assert_eq!(app.sidebar_state.card_attention(card.id).failed, 1);
+        assert_eq!(app.notification_ui.snapshot, snapshot);
+    }
+
+    #[test]
     fn notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot() {
         use super::super::workspace_model_sync::ModelUpdate;
         use crate::workspace_model::views::{Pane, View};
-        for connected in [false, true] {
-            for control in ["valid", "locally-acknowledged", "replaced-proof"] {
-                let (mut app, agent) = scheduled_attention_fixture();
-                let session = agent.console.as_ref().unwrap().id;
-                let canonical = CardId::from_uuid(agent.id.as_uuid());
-                app.workspace_model.agents.push(agent.clone());
-                drop(app.adopt_execution_agent(&agent).unwrap());
-                let card = app.card_state(canonical).unwrap().clone();
-                app.workspace_model.views = vec![View {
-                    scope: agent.placement.clone(),
-                    revision: 1,
-                    panes: vec![
-                        Pane::from_card(&card, Some(agent.spec.target.directory.clone())).unwrap(),
-                    ],
-                    retired: vec![],
-                }];
-                let mut alias = card.clone();
-                alias.id = CardId::new();
-                let alias_id = alias.id;
-                Arc::make_mut(&mut app.durable).cards.insert(0, alias);
-                app.chat_ui = crate::app::chat_ui::State::with_drafts(HashMap::from([
-                    (alias_id, "Preserved alias draft".into()),
-                    (canonical, "Preserved canonical draft".into()),
-                ]));
-                // Establish the actual initialized shared-view blocker. These
-                // two live aliases cannot be made unique by discarding a draft.
-                app.acknowledge_view_edit(agent.placement.clone(), None);
-                drop(app.reconcile_shared_views());
-                assert!(app.shared_views.blocked.contains(&agent.placement));
-                app.refresh_ui.focused = false;
-                let focus = app.workspace.focused();
-                Arc::make_mut(&mut app.durable).workspace_model_identity =
-                    Some(app.workspace_model.identity);
-                let mut model = std::mem::take(&mut app.workspace_model);
-                let mut snapshot = attention_snapshot(session);
-                // A cold, already-completed source need not emit another runtime
-                // activity transition or another identical broker snapshot.
-                snapshot.notices[0].event.evidence.kind = crate::notifications::Kind::Succeeded;
-                let notice = snapshot.notices[0].id;
-                drop(app.update(Message::NotificationUi(Action::Snapshot(snapshot.clone()))));
-                assert!(!app.sidebar_state.has_card_update(canonical));
-                assert!(!app.sidebar_state.has_card_update(alias_id));
-                if control == "locally-acknowledged" {
-                    app.notification_ui.acknowledge(notice);
-                }
-                if control == "replaced-proof" {
-                    let CardKind::Terminal(replaced) = &mut model.views[0].panes[0].kind else {
-                        unreachable!()
-                    };
-                    replaced.continuity = TerminalContinuity::Live {
-                        host_session_id: crate::model::HostSessionId::new("replacement-host"),
-                        boot_id: crate::model::BootId::new("replacement-boot"),
-                        host_incarnation: crate::model::HostIncarnation::new(
-                            "replacement-incarnation",
-                        ),
-                    };
-                }
-                let update = if connected {
-                    ModelUpdate::Connected(model)
-                } else {
-                    ModelUpdate::Read(model)
-                };
-                drop(app.update(Message::WorkspaceModelObserved(update)));
-                assert_eq!(
-                    app.sidebar_state.has_card_update(canonical),
-                    control == "valid"
-                );
-                assert!(!app.sidebar_state.has_card_update(alias_id));
-                assert!(app.shared_views.blocked.contains(&agent.placement));
-                assert!(app.card_state(alias_id).unwrap().existence.is_open());
-                assert_eq!(app.card_state(canonical).unwrap().kind, card.kind);
-                assert_eq!(
-                    app.workspace.focused(),
-                    focus,
-                    "unread projection cannot focus or activate"
-                );
-                assert_eq!(
-                    app.notification_ui.snapshot, snapshot,
-                    "no second Snapshot was delivered"
-                );
-                assert_eq!(
-                    app.notification_ui.acknowledged_for_test(notice),
-                    control == "locally-acknowledged"
-                );
-                assert!(app.notification_ui.session_activation.is_none());
-                assert!(!app.chat_start_pending(canonical));
-                // The exact local ACK must also survive a later model replay.
-                if control == "valid" {
-                    drop(app.mark_cards_read(vec![canonical]));
-                    let replay = app.workspace_model.clone();
-                    drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(replay))));
+        for kind in [
+            crate::notifications::Kind::Succeeded,
+            crate::notifications::Kind::Failed,
+        ] {
+            for connected in [false, true] {
+                for control in ["valid", "locally-acknowledged", "replaced-proof"] {
+                    let (mut app, agent) = scheduled_attention_fixture();
+                    let session = agent.console.as_ref().unwrap().id;
+                    let canonical = CardId::from_uuid(agent.id.as_uuid());
+                    app.workspace_model.agents.push(agent.clone());
+                    drop(app.adopt_execution_agent(&agent).unwrap());
+                    let card = app.card_state(canonical).unwrap().clone();
+                    app.workspace_model.views = vec![View {
+                        scope: agent.placement.clone(),
+                        revision: 1,
+                        panes: vec![
+                            Pane::from_card(&card, Some(agent.spec.target.directory.clone()))
+                                .unwrap(),
+                        ],
+                        retired: vec![],
+                    }];
+                    let mut alias = card.clone();
+                    alias.id = CardId::new();
+                    let alias_id = alias.id;
+                    Arc::make_mut(&mut app.durable).cards.insert(0, alias);
+                    app.chat_ui = crate::app::chat_ui::State::with_drafts(HashMap::from([
+                        (alias_id, "Preserved alias draft".into()),
+                        (canonical, "Preserved canonical draft".into()),
+                    ]));
+                    // Establish the actual initialized shared-view blocker. These
+                    // two live aliases cannot be made unique by discarding a draft.
+                    app.acknowledge_view_edit(agent.placement.clone(), None);
+                    drop(app.reconcile_shared_views());
+                    assert!(app.shared_views.blocked.contains(&agent.placement));
+                    app.refresh_ui.focused = false;
+                    let focus = app.workspace.focused();
+                    Arc::make_mut(&mut app.durable).workspace_model_identity =
+                        Some(app.workspace_model.identity);
+                    let mut model = std::mem::take(&mut app.workspace_model);
+                    let mut snapshot = attention_snapshot(session);
+                    // A cold, already-completed source need not emit another runtime
+                    // activity transition or another identical broker snapshot.
+                    snapshot.notices[0].event.evidence.kind = kind;
+                    let notice = snapshot.notices[0].id;
+                    drop(app.update(Message::NotificationUi(Action::Snapshot(snapshot.clone()))));
                     assert!(!app.sidebar_state.has_card_update(canonical));
                     assert!(!app.sidebar_state.has_card_update(alias_id));
-                    assert!(app.notification_ui.acknowledged_for_test(notice));
+                    if control == "locally-acknowledged" {
+                        app.notification_ui.acknowledge(notice);
+                    }
+                    if control == "replaced-proof" {
+                        let CardKind::Terminal(replaced) = &mut model.views[0].panes[0].kind else {
+                            unreachable!()
+                        };
+                        replaced.continuity = TerminalContinuity::Live {
+                            host_session_id: crate::model::HostSessionId::new("replacement-host"),
+                            boot_id: crate::model::BootId::new("replacement-boot"),
+                            host_incarnation: crate::model::HostIncarnation::new(
+                                "replacement-incarnation",
+                            ),
+                        };
+                    }
+                    let update = if connected {
+                        ModelUpdate::Connected(model)
+                    } else {
+                        ModelUpdate::Read(model)
+                    };
+                    drop(app.update(Message::WorkspaceModelObserved(update)));
+                    assert_eq!(
+                        app.sidebar_state.has_card_update(canonical),
+                        control == "valid"
+                    );
+                    assert!(!app.sidebar_state.has_card_update(alias_id));
+                    assert_eq!(
+                        app.sidebar_state.card_attention(canonical).failed,
+                        usize::from(
+                            control == "valid" && kind == crate::notifications::Kind::Failed
+                        )
+                    );
+                    assert_eq!(
+                        app.sidebar_state.card_attention(alias_id),
+                        sidebar::AttentionSummary::default()
+                    );
+                    assert!(app.shared_views.blocked.contains(&agent.placement));
+                    assert!(app.card_state(alias_id).unwrap().existence.is_open());
+                    assert_eq!(app.card_state(canonical).unwrap().kind, card.kind);
+                    assert_eq!(
+                        app.workspace.focused(),
+                        focus,
+                        "unread projection cannot focus or activate"
+                    );
+                    assert_eq!(
+                        app.notification_ui.snapshot, snapshot,
+                        "no second Snapshot was delivered"
+                    );
+                    assert_eq!(
+                        app.notification_ui.acknowledged_for_test(notice),
+                        control == "locally-acknowledged"
+                    );
+                    assert!(app.notification_ui.session_activation.is_none());
+                    assert!(!app.chat_start_pending(canonical));
+                    // The exact local ACK must also survive a later model replay.
+                    if control == "valid" {
+                        drop(app.mark_cards_read(vec![canonical]));
+                        let replay = app.workspace_model.clone();
+                        drop(
+                            app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(replay))),
+                        );
+                        assert!(!app.sidebar_state.has_card_update(canonical));
+                        assert!(!app.sidebar_state.has_card_update(alias_id));
+                        assert!(app.notification_ui.acknowledged_for_test(notice));
+                    }
                 }
             }
         }
@@ -2926,6 +3486,272 @@ mod tests {
             "missing targets cannot invent replacement sessions"
         );
     }
+    fn lifecycle_notice_fixture() -> (Cagents, uuid::Uuid, u64, uuid::Uuid) {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("lifecycle-fixture"),
+            boot_id: crate::model::BootId::new("lifecycle-fixture"),
+            host_incarnation: crate::model::HostIncarnation::new("lifecycle-fixture"),
+        };
+        drop(app.update_notifications(Action::HostBound(proof)));
+        let id = uuid::Uuid::new_v4();
+        let sequence = 42;
+        let notice = uuid::Uuid::new_v4();
+        app.notification_ui
+            .snapshot
+            .notices
+            .push(crate::notifications::Notice {
+                id: notice,
+                delivered: true,
+                acknowledged: false,
+                window: None,
+                event: crate::notifications::Event {
+                    target: Target::Automation { id, sequence },
+                    source_session: None,
+                    provider: None,
+                    directory: None,
+                    destination: None,
+                    content: None,
+                    evidence: crate::notifications::Evidence {
+                        key: format!("automation:{id}:lifecycle:{sequence}"),
+                        kind: crate::notifications::Kind::AutomationBlocked,
+                    },
+                },
+            });
+        (app, id, sequence, notice)
+    }
+
+    fn exact_notice_page(id: uuid::Uuid, sequence: u64) -> crate::automations::LifecyclePage {
+        crate::automations::LifecyclePage {
+            events: vec![crate::automations::LifecycleEvent {
+                automation: id,
+                sequence,
+                revision: 3,
+                occurred_ms: 600,
+                cause: crate::automations::LifecycleCause::PrecheckInterrupted,
+                actor: crate::automations::LifecycleActor::System,
+                enabled: false,
+                blocked: true,
+                firing: None,
+            }],
+            next: None,
+            earlier_events_unavailable: false,
+        }
+    }
+
+    #[test]
+    fn no_run_notice_opens_only_exact_read_only_receipt_and_keeps_unavailable_attention() {
+        for available in [true, false] {
+            let (mut app, id, sequence, notice) = lifecycle_notice_fixture();
+            let original = app.durable.cards.clone();
+            // Drop, never poll, the real Task: these are typed completion and
+            // routing tests, not daemon/RPC/native execution evidence.
+            drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+            assert_eq!(
+                app.durable.cards, original,
+                "read happens before utility/state opening"
+            );
+            let generation = app
+                .notification_ui
+                .lifecycle_activation
+                .as_ref()
+                .unwrap()
+                .generation;
+            drop(app.update_notifications(Action::LifecycleResolved {
+                generation,
+                result: if available {
+                    Ok(exact_notice_page(id, sequence))
+                } else {
+                    Err(())
+                },
+            }));
+            assert!(
+                app.durable
+                    .cards
+                    .iter()
+                    .any(|card| card.kind == CardKind::Automations && card.existence.is_open())
+            );
+            assert!(matches!(
+                app.card_state(app.workspace.focused().unwrap())
+                    .unwrap()
+                    .kind,
+                CardKind::Automations
+            ));
+            assert!(app.notification_ui.lifecycle_activation.is_none());
+            assert!(!app.notification_ui.acknowledged_for_test(notice));
+            assert_eq!(app.notification_ui.snapshot.notices.len(), 1);
+            assert!(!app.notification_ui.snapshot.notices[0].acknowledged);
+            assert_eq!(
+                app.durable
+                    .cards
+                    .iter()
+                    .filter(|c| matches!(c.kind, CardKind::Chat(_) | CardKind::Terminal(_)))
+                    .count(),
+                original
+                    .iter()
+                    .filter(|c| matches!(c.kind, CardKind::Chat(_) | CardKind::Terminal(_)))
+                    .count()
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_notice_does_not_open_over_dirty_modal_or_changed_backend_and_old_generation() {
+        for changed in [
+            "modal",
+            "draft",
+            "registry",
+            "host",
+            "workspace",
+            "update",
+            "close",
+        ] {
+            let (mut app, id, sequence, notice) = lifecycle_notice_fixture();
+            drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+            let generation = app
+                .notification_ui
+                .lifecycle_activation
+                .as_ref()
+                .unwrap()
+                .generation;
+            match changed {
+                "modal" => app.settings_reset_confirm = true,
+                "draft" => {
+                    drop(app.update_automation_ui(crate::automation_ui::Action::New));
+                }
+                "registry" => app.workspace_model.identity = uuid::Uuid::new_v4(),
+                "host" => {
+                    let mut proof = app.notification_ui.host.clone().unwrap();
+                    proof.host_incarnation = crate::model::HostIncarnation::new("replacement");
+                    drop(app.update_notifications(Action::HostBound(proof)));
+                }
+                "workspace" => {
+                    let mut workspace = (*app.durable).clone();
+                    workspace.generation += 1;
+                    app.durable = Arc::new(workspace);
+                }
+                "update" => app.update_prepared = true,
+                "close" => {
+                    app.workspace
+                        .request_close(app.workspace.focused().unwrap())
+                        .unwrap();
+                    assert!(app.workspace.pending_close().is_some());
+                }
+                _ => unreachable!(),
+            }
+            let cards = app.durable.cards.clone();
+            let focused = app.workspace.focused();
+            drop(app.update_notifications(Action::LifecycleResolved {
+                generation,
+                result: Ok(exact_notice_page(id, sequence)),
+            }));
+            assert_eq!(
+                app.durable.cards, cards,
+                "late reply mounted a utility after {changed}"
+            );
+            assert_eq!(app.workspace.focused(), focused);
+            assert!(!app.notification_ui.acknowledged_for_test(notice));
+            if changed == "draft" {
+                assert!(app.automation_ui.has_draft());
+            }
+        }
+        let (mut app, id, sequence, notice) = lifecycle_notice_fixture();
+        app.settings_reset_confirm = true;
+        let cards = app.durable.cards.clone();
+        drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+        assert!(app.notification_ui.lifecycle_activation.is_none());
+        assert_eq!(app.durable.cards, cards);
+        app.settings_reset_confirm = false;
+        drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+        let first = app
+            .notification_ui
+            .lifecycle_activation
+            .as_ref()
+            .unwrap()
+            .generation;
+        drop(
+            app.update_notifications(Action::Activated(Target::Automation {
+                id,
+                sequence: sequence + 1,
+            })),
+        );
+        assert!(app.notification_ui.lifecycle_activation.is_none());
+        assert_eq!(app.notification_ui.lifecycle_read, Some(first));
+        drop(app.update_notifications(Action::LifecycleResolved {
+            generation: first,
+            result: Ok(exact_notice_page(id, sequence)),
+        }));
+        assert!(app.notification_ui.lifecycle_activation.is_none());
+        assert!(app.notification_ui.lifecycle_read.is_none());
+        assert_eq!(app.durable.cards, cards);
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+    }
+    #[test]
+    fn lifecycle_activation_churn_keeps_one_actual_read_until_its_matching_completion() {
+        let (mut app, id, sequence, notice) = lifecycle_notice_fixture();
+        let cards = app.durable.cards.clone();
+        drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+        let first = app.notification_ui.lifecycle_read.unwrap();
+        for offset in 0..64 {
+            drop(
+                app.update_notifications(Action::Activated(Target::Automation {
+                    id: if offset % 2 == 0 {
+                        id
+                    } else {
+                        uuid::Uuid::new_v4()
+                    },
+                    sequence: sequence + offset,
+                })),
+            );
+            assert_eq!(app.notification_ui.lifecycle_read, Some(first));
+            assert!(app.notification_ui.lifecycle_activation.is_none());
+        }
+        let mut replacement = app.notification_ui.host.clone().unwrap();
+        replacement.host_incarnation = crate::model::HostIncarnation::new("new backend");
+        drop(app.update_notifications(Action::HostBound(replacement)));
+        assert_eq!(app.notification_ui.lifecycle_read, Some(first));
+        drop(app.update_notifications(Action::LifecycleResolved {
+            generation: first + 1,
+            result: Err(()),
+        }));
+        assert_eq!(app.notification_ui.lifecycle_read, Some(first));
+        drop(app.update_notifications(Action::LifecycleResolved {
+            generation: first,
+            result: Ok(exact_notice_page(id, sequence)),
+        }));
+        assert!(app.notification_ui.lifecycle_read.is_none());
+        assert_eq!(app.durable.cards, cards);
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+        drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+        let retry = app.notification_ui.lifecycle_read.unwrap();
+        assert_ne!(retry, first);
+        assert_eq!(
+            app.notification_ui
+                .lifecycle_activation
+                .as_ref()
+                .unwrap()
+                .generation,
+            retry
+        );
+        drop(app.update_notifications(Action::LifecycleResolved {
+            generation: first,
+            result: Err(()),
+        }));
+        assert_eq!(app.notification_ui.lifecycle_read, Some(retry));
+        drop(app.update_notifications(Action::LifecycleResolved {
+            generation: retry,
+            result: Ok(exact_notice_page(id, sequence)),
+        }));
+        assert!(app.notification_ui.lifecycle_read.is_none());
+        assert!(
+            app.durable
+                .cards
+                .iter()
+                .any(|card| card.kind == CardKind::Automations)
+        );
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+    }
 }
 
 #[derive(Clone)]
@@ -2947,3 +3773,6 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = Action> +
         |receiver| async move { receiver.recv().await.ok().map(|action| (action, receiver)) },
     ))
 }
+
+#[cfg(test)]
+mod journal_tests;

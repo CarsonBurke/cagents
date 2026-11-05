@@ -206,7 +206,12 @@ mod tests {
         page(&mut scan, &work, vec![entry(1, None)], Some("page2"));
         assert!(!scan.settled());
         let work = scan.next();
-        page(&mut scan, &work, vec![entry(2, Some(request("active")))], None);
+        page(
+            &mut scan,
+            &work,
+            vec![entry(2, Some(request("active")))],
+            None,
+        );
         assert!(!scan.settled(), "the new request's history is unread");
         let history = scan.next();
         scan.history(

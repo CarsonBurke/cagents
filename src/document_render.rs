@@ -1064,8 +1064,20 @@ mod tests {
         let document = root.path().join("report.pdf");
         std::fs::write(&document, one_page_pdf()).unwrap();
         // Holding stdout open with nothing on it is the shape a blocking read
-        // would never return from.
-        let silent = helper(root.path(), "silent", "sleep 120");
+        // would never return from. Exec makes the silent process the actual
+        // Child being reaped, rather than an unowned grandchild left behind
+        // when its shell dies. On Linux, shell builtins also record the exact
+        // original epoch before exec so the test can prove it was reaped.
+        #[cfg(target_os = "linux")]
+        let identity = root.path().join("silent.identity");
+        #[cfg(target_os = "linux")]
+        let body = format!(
+            "read -r original < /proc/self/stat\nprintf '%s\\n' \"$original\" > '{}'\nexec sleep 120",
+            identity.display()
+        );
+        #[cfg(not(target_os = "linux"))]
+        let body = "exec sleep 120".to_owned();
+        let silent = helper(root.path(), "silent", &body);
         let started = Instant::now();
         assert_eq!(
             render_with_helper(
@@ -1082,5 +1094,26 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the timeout must not wait on the helper it gave up on"
         );
+        #[cfg(target_os = "linux")]
+        {
+            let original = std::fs::read(&identity).unwrap();
+            let pid: i32 = std::str::from_utf8(&original)
+                .unwrap()
+                .split_once(' ')
+                .unwrap()
+                .0
+                .parse()
+                .unwrap();
+            let (_, start) = crate::model::agent_recovery::process_identity(&original).unwrap();
+            assert!(pid > 0 && start > 0);
+            // render_with_helper returned only after kill_and_reap waited on this
+            // exact original. A zombie with the same epoch is still a failure.
+            match crate::daemon::holder_registry::Process::read(pid) {
+                Ok(current) => {
+                    assert_ne!(current.start, start, "the original helper was not reaped")
+                }
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+            }
+        }
     }
 }

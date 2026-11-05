@@ -262,13 +262,11 @@ impl Tracked {
                     .iter()
                     .flat_map(|snapshot| &snapshot.pull_requests)
                     .filter(|pull_request| pull_request.head_ref_name == branch);
-                let (in_flight, finished) = pull_requests.fold(
-                    (false, false),
-                    |(in_flight, finished), pull_request| {
+                let (in_flight, finished) =
+                    pull_requests.fold((false, false), |(in_flight, finished), pull_request| {
                         let live = forge::in_flight(pull_request);
                         (in_flight || live, finished || !live)
-                    },
-                );
+                    });
                 in_flight
                     || local
                         .worktrees
@@ -276,10 +274,9 @@ impl Tracked {
                         .any(|worktree| worktree.branch.as_ref() == Some(&branch))
                     || (local.branch_names.contains(&branch) && !finished)
             }
-            Some(crate::work::ItemKey::Worktree(path)) => local
-                .worktrees
-                .iter()
-                .any(|worktree| worktree.path == path),
+            Some(crate::work::ItemKey::Worktree(path)) => {
+                local.worktrees.iter().any(|worktree| worktree.path == path)
+            }
             None => true,
         }
     }
@@ -315,7 +312,11 @@ impl Shared {
     fn wanted_tickets(&self) -> BTreeSet<tickets::Reference> {
         let mut wanted = BTreeSet::new();
         for tracked in self.projects.values() {
-            for worktree in tracked.local.iter().flat_map(|local| local.worktrees.iter()) {
+            for worktree in tracked
+                .local
+                .iter()
+                .flat_map(|local| local.worktrees.iter())
+            {
                 let reference = match &worktree.link {
                     Some(link) => Some(tickets::Reference::linked(link)),
                     None => worktree
@@ -411,7 +412,12 @@ impl Publication {
         }
         self.sent = Some(comparable);
         self.revision += 1;
-        let proof = Arc::new(host.lock().unwrap_or_else(|p| p.into_inner()).proof().clone());
+        let proof = Arc::new(
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .proof()
+                .clone(),
+        );
         let revision = self.revision;
         self.watchers.retain(|client, delivery| {
             if Some(*client) == except {
@@ -469,10 +475,7 @@ impl Service {
         Self::start_with(host, store::Store::open(&path))
     }
 
-    fn start_with(
-        host: &SharedHost,
-        store: Result<store::Store, String>,
-    ) -> Result<Self, String> {
+    fn start_with(host: &SharedHost, store: Result<store::Store, String>) -> Result<Self, String> {
         let mut store = store
             .inspect_err(|error| {
                 tracing::warn!(%error, "Work board pins and session history will not persist");
@@ -630,9 +633,7 @@ impl Handle {
 
     pub(super) fn process(&self, host: &SharedHost, request: Request) -> Result<Response, String> {
         match request {
-            Request::Board { scope, fresh } => {
-                self.board(host, &scope, fresh).map(Response::Board)
-            }
+            Request::Board { scope, fresh } => self.board(host, &scope, fresh).map(Response::Board),
             Request::Pin {
                 scope,
                 item,
@@ -646,9 +647,7 @@ impl Handle {
             Request::Remove(removal) => self
                 .remove(host, &removal)
                 .map(|removed| Response::Removed(Box::new(removed))),
-            Request::Snapshots { scope } => {
-                self.snapshots(host, &scope).map(Response::Snapshots)
-            }
+            Request::Snapshots { scope } => self.snapshots(host, &scope).map(Response::Snapshots),
         }
     }
 
@@ -665,11 +664,7 @@ impl Handle {
     }
 
     /// The repositories `scope` covers, read from the shared workspace model.
-    fn resolve(
-        &self,
-        host: &SharedHost,
-        scope: &Scope,
-    ) -> Result<Vec<(PathBuf, String)>, String> {
+    fn resolve(&self, host: &SharedHost, scope: &Scope) -> Result<Vec<(PathBuf, String)>, String> {
         let model = agent_execution::registry(host)?
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -739,13 +734,12 @@ impl Handle {
                         tracked.scans + 1
                     }
                 });
-                let poll = (fresh
-                    && tracked.forge != Forge::NotGitHub
-                    && !recent(tracked.last_poll))
-                .then(|| {
-                    tracked.poll_requested = true;
-                    tracked.polls_started + 1
-                });
+                let poll =
+                    (fresh && tracked.forge != Forge::NotGitHub && !recent(tracked.last_poll))
+                        .then(|| {
+                            tracked.poll_requested = true;
+                            tracked.polls_started + 1
+                        });
                 // Unread, listings go stale for minutes; the first read in a
                 // while refreshes them without waiting for the answer.
                 if tracked.forge != Forge::NotGitHub
@@ -882,13 +876,12 @@ impl Handle {
                 break;
             };
             let started = Instant::now();
-            let watched = super::service::attempt("Work board publishing", || {
-                Ok(self.republish(&host))
-            })
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "Work board publishing is temporarily unavailable");
-                true
-            });
+            let watched =
+                super::service::attempt("Work board publishing", || Ok(self.republish(&host)))
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "Work board publishing is temporarily unavailable");
+                        true
+                    });
             drop(host);
             // Unwatched, only a new watcher's notification wakes this thread.
             self.0
@@ -956,7 +949,8 @@ impl Handle {
                     || item.worktree.as_ref().is_some_and(|worktree| {
                         worktree.path == Path::new(name)
                             || path.as_ref().is_some_and(|path| {
-                                std::fs::canonicalize(&worktree.path).is_ok_and(|card| card == *path)
+                                std::fs::canonicalize(&worktree.path)
+                                    .is_ok_and(|card| card == *path)
                             })
                     })
             })
@@ -1109,13 +1103,12 @@ impl Handle {
                 break;
             };
             let started = Instant::now();
-            let delay = super::service::attempt("Work board scanning", || {
-                Ok(scanner.tick(self, &host))
-            })
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "Work board scanning is temporarily unavailable");
-                Duration::from_secs(5)
-            });
+            let delay =
+                super::service::attempt("Work board scanning", || Ok(scanner.tick(self, &host)))
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "Work board scanning is temporarily unavailable");
+                        Duration::from_secs(5)
+                    });
             drop(host);
             self.0.scanner.wait(observed, delay);
             // The watcher wakes this thread per event batch; a build writing
@@ -1152,7 +1145,10 @@ impl Handle {
                     let target = forge::Target {
                         repository: repository.clone(),
                         root: local.root.clone().or_else(|| {
-                            local.worktrees.first().map(|worktree| worktree.path.clone())
+                            local
+                                .worktrees
+                                .first()
+                                .map(|worktree| worktree.path.clone())
                         }),
                         checked_out: local
                             .worktrees
@@ -1227,9 +1223,7 @@ impl Handle {
                     // they belong to are right.
                     if *tracked.hints != hints {
                         tracked.hints = Arc::new(hints);
-                        tracked
-                            .pending
-                            .get_or_insert_with(Default::default);
+                        tracked.pending.get_or_insert_with(Default::default);
                         self.0.scanner.notify();
                     }
                 }
@@ -1418,10 +1412,12 @@ impl Scanner {
             .flat_map(|local| local.worktrees.iter().map(|worktree| worktree.path.clone()))
             .collect::<Vec<_>>();
         let mut stamps = Vec::new();
-        for session in sessions
-            .iter()
-            .filter(|session| matches!(session.state, ActivityState::Working | ActivityState::Waiting))
-        {
+        for session in sessions.iter().filter(|session| {
+            matches!(
+                session.state,
+                ActivityState::Working | ActivityState::Waiting
+            )
+        }) {
             let Some(worktree) = worktrees
                 .iter()
                 .filter(|worktree| session.directory.starts_with(worktree))
@@ -1439,9 +1435,8 @@ impl Scanner {
                 stamps.push((worktree.clone(), now));
             }
         }
-        let horizon = now.saturating_sub(
-            u64::from(crate::work::MAX_STALE_AFTER_DAYS) * crate::work::DAY_MS,
-        );
+        let horizon =
+            now.saturating_sub(u64::from(crate::work::MAX_STALE_AFTER_DAYS) * crate::work::DAY_MS);
         shared.session_activity.retain(|_, at| *at >= horizon);
         drop(shared);
         self.stamped
@@ -1543,10 +1538,12 @@ impl Scanner {
             self.sampled
                 .map_or(Duration::ZERO, |sampled| sampled.elapsed()),
         );
-        next = next.min(MODEL_REFRESH.saturating_sub(
-            self.refreshed
-                .map_or(Duration::ZERO, |refreshed| refreshed.elapsed()),
-        ));
+        next = next.min(
+            MODEL_REFRESH.saturating_sub(
+                self.refreshed
+                    .map_or(Duration::ZERO, |refreshed| refreshed.elapsed()),
+            ),
+        );
         for tracked in shared.projects.values() {
             let since = tracked
                 .last_scan
@@ -1580,7 +1577,7 @@ mod tests {
     }
 
     #[test]
-    fn watchers_are_sent_each_new_board_once_in_revision_order() {
+    fn watchers_keep_only_the_latest_pending_board_revision() {
         let host = super::super::service::test_host();
         let board = |generated_at_unix_ms, stale_after_days| Board {
             generated_at_unix_ms,
@@ -1618,7 +1615,7 @@ mod tests {
         publication.offer(&host, &board(3, 14), Some(1));
         assert_eq!(publication.revision, 2);
         assert_eq!(received(&first), [(1, 7)]);
-        assert_eq!(received(&second), [(1, 7), (2, 14)]);
+        assert_eq!(received(&second), [(2, 14)]);
     }
 
     #[test]

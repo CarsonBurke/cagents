@@ -14,7 +14,7 @@ impl Watch {
         root: File,
         released: std::io::PipeReader,
         exits: Sender<ChildExit>,
-        acknowledge: Sender<Result<(), String>>,
+        acknowledge: Sender<Result<Acknowledgement, String>>,
         reported: bool,
     ) -> Result<Self, String> {
         let runtime = crate::terminal::reactor::runtime()?;
@@ -49,7 +49,7 @@ async fn observe(
     root: AsyncFd<File>,
     released: AsyncFd<std::io::PipeReader>,
     exits: Sender<ChildExit>,
-    acknowledge: Sender<Result<(), String>>,
+    acknowledge: Sender<Result<Acknowledgement, String>>,
     mut reported: bool,
 ) {
     loop {
@@ -64,11 +64,14 @@ async fn observe(
                 let _ = exits.try_send(Ok(exit_status(wait_status)));
             }
             Ok(Some(Report::Detached)) => {
-                let _ = acknowledge.try_send(Ok(()));
+                let _ = acknowledge.try_send(Ok(Acknowledgement::Detached));
                 return;
             }
-            Ok(Some(Report::ScreenCached | Report::AdoptionCommitted)) => {
-                let _ = acknowledge.try_send(Ok(()));
+            Ok(Some(Report::ScreenCached)) => {
+                let _ = acknowledge.try_send(Ok(Acknowledgement::ScreenCached));
+            }
+            Ok(Some(Report::AdoptionCommitted)) => {
+                let _ = acknowledge.try_send(Ok(Acknowledgement::AdoptionCommitted));
             }
             Ok(Some(Report::Failed(message))) => {
                 let _ = acknowledge.try_send(Err(message));

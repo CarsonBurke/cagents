@@ -20,6 +20,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+mod child_diagnostics;
 mod child_text_copy;
 #[cfg(test)]
 pub(crate) mod courier_tests;
@@ -40,6 +41,9 @@ const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
 const QUEUE_LIMIT: usize = 64 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long provider frames can keep extending an unfinished initialization.
+/// Hooks, MCP servers and a large resume can legitimately outlast `IO_TIMEOUT`.
+const STARTUP_LIMIT: Duration = Duration::from_secs(300);
 // Pipe EOF may precede the kernel's child-exit publication. Do not turn that
 // short interval into an uncertain provider owner, or wait for a live writer.
 const PROTOCOL_EXIT_GRACE: Duration = Duration::from_millis(100);
@@ -73,6 +77,17 @@ enum ActorCommand {
         closed: crossbeam_channel::Sender<bool>,
     },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
+    PinnedLaunchDirectory(
+        crossbeam_channel::Sender<
+            Result<
+                (
+                    crate::agent_execution::DirectoryIdentity,
+                    Arc<std::fs::File>,
+                ),
+                String,
+            >,
+        >,
+    ),
     Interrupt {
         run: Option<crate::model::RunId>,
         including_subagents: bool,
@@ -501,6 +516,7 @@ impl LocalHandle {
                     waiting_fingerprint: None,
                     last_present: Instant::now(),
                     first_frame: false,
+                    stdout_noise: spec.stdout_noise,
                     started: Instant::now(),
                     write_started: None,
                 };
@@ -668,6 +684,21 @@ impl LocalHandle {
             Err(_) => {} // The host publishes the still-owned interactive actor.
         }
         Ok(handle)
+    }
+    pub(super) fn pinned_launch_directory(
+        &self,
+    ) -> Result<
+        (
+            crate::agent_execution::DirectoryIdentity,
+            Arc<std::fs::File>,
+        ),
+        String,
+    > {
+        let (reply, response) = crossbeam_channel::bounded(1);
+        let _acknowledgement = self.enqueue_actor(ActorCommand::PinnedLaunchDirectory(reply))?;
+        response
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "Provider launch-directory owner did not respond".to_owned())?
     }
     pub(super) fn provider_process(&self) -> Option<crate::daemon::holder_registry::Process> {
         self.0
@@ -950,11 +981,43 @@ impl LocalHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .text_copy(source, offset),
-            super::TextCopyScope::Subagent { .. } => child_text_copy::read(
-                &self.0.state.lock().unwrap_or_else(|p| p.into_inner()),
-                source,
-                offset,
-            ),
+            super::TextCopyScope::Subagent { id } => {
+                // Keep the existing store-before-state lock order. Resident
+                // authority is checked before disk IO; no database read holds
+                // the state lock, and guessed child/item IDs grant no access.
+                let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+                let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+                let item = state
+                    .text_copy_sources
+                    .children
+                    .get(id)
+                    .and_then(|sources| {
+                        sources
+                            .iter()
+                            .position(|current| current.as_ref() == Some(source))
+                    })
+                    .and_then(|index| {
+                        state
+                            .subagents
+                            .iter()
+                            .find(|agent| agent.id == *id)
+                            .and_then(|agent| agent.items.get(index))
+                    })
+                    .filter(|item| child_diagnostics::marked(item))
+                    .map(|item| item.id.clone());
+                if let Some(item) = item {
+                    drop(state);
+                    let result = store.diagnostics.read(id, &item, source, offset);
+                    if result.is_err() && store.diagnostics.is_empty() {
+                        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+                        store.diagnostics.publish(&mut state);
+                        state.generation = state.generation.saturating_add(1);
+                    }
+                    result
+                } else {
+                    child_text_copy::read(&state, source, offset)
+                }
+            }
         }
     }
     /// Resident provider usage only: never opens the transcript store.
@@ -1519,6 +1582,10 @@ impl Drop for Inner {
             .get_mut()
             .unwrap_or_else(|p| p.into_inner())
             .take()
+            // The worker's own final notification can release the last
+            // handle, for example when the host retires its record. That
+            // thread is already finishing, and joining itself panics.
+            && worker.thread().id() != thread::current().id()
         {
             let _ = worker.join();
         }
@@ -1571,11 +1638,35 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
         .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
         .process_group(0);
     crate::host::descriptor_limit::inherit(&mut process);
-    if let Some(directory) = spec
+    let original = spec
         .execution
         .as_ref()
-        .and_then(|context| context.directory.clone())
+        .map(|context| {
+            let descriptor = context.directory_descriptor();
+            if descriptor.is_none() && context.directory_identity()?.is_some() {
+                return Err(
+                    "Admitted provider context has no original directory descriptor".to_owned(),
+                );
+            }
+            Ok(descriptor)
+        })
+        .transpose()?
+        .flatten();
+    let directory = match original {
+        Some(directory) => directory,
+        None => {
+            use std::os::unix::fs::OpenOptionsExt;
+            Arc::new(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                    .open(&spec.working_directory)
+                    .map_err(|error| error.to_string())?,
+            )
+        }
+    };
     {
+        let directory = directory.clone();
         // SAFETY: fchdir is async-signal-safe; the captured File remains open
         // across fork until the provider execs.
         unsafe {
@@ -1593,11 +1684,13 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
     if stop.load(Ordering::Acquire) {
         return Err("Provider startup was cancelled before process creation".into());
     }
-    let child = process
-        .spawn()
+    // A retained actor sweeps its unregistered exited children; this
+    // registration keeps the provider's status for its ChildGuard.
+    let (child, registration) = crate::daemon::adopted_orphans::spawn_owned(&mut process)
         .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
-    let child = ChildGuard::new(child)
+    let mut child = ChildGuard::new(child, registration)
         .map_err(|e| format!("Cannot retain {} process identity: {e}", spec.program))?;
+    child.directory = Some(directory);
     // Scope enrollment happens before this child is handed to the actor and
     // therefore before any prompt/tool request. Keep the original Child, pipes,
     // process group and account lease: systemd only relocates its cgroup.
@@ -1615,6 +1708,9 @@ struct ChildGuard {
     child: Child,
     identity: OwnedFd,
     terminated: bool,
+    directory: Option<Arc<std::fs::File>>,
+    // Dropped after `Drop::drop` has run the final reap in `terminate`.
+    _registration: crate::daemon::adopted_orphans::Registration,
 }
 impl ChildGuard {
     /// Wait on the original child capability without reaping it or releasing
@@ -1657,7 +1753,10 @@ impl ChildGuard {
     }
 
     /// Capture immediately after spawn, before any code can reap this child.
-    fn new(mut child: Child) -> std::io::Result<Self> {
+    fn new(
+        mut child: Child,
+        registration: crate::daemon::adopted_orphans::Registration,
+    ) -> std::io::Result<Self> {
         // SAFETY: pidfd_open obtains a capability for our freshly spawned,
         // unreaped child. Its PID remains reserved even if it has exited.
         let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
@@ -1696,7 +1795,16 @@ impl ChildGuard {
             child,
             identity,
             terminated: false,
+            directory: None,
+            _registration: registration,
         })
+    }
+
+    /// Test fixtures spawn through the same ownership registration.
+    #[cfg(test)]
+    fn spawn(command: &mut Process) -> Self {
+        let (child, registration) = crate::daemon::adopted_orphans::spawn_owned(command).unwrap();
+        Self::new(child, registration).unwrap()
     }
 
     fn observed_exit_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -1852,8 +1960,22 @@ struct Actor {
     waiting_fingerprint: Option<String>,
     last_present: Instant,
     first_frame: bool,
+    stdout_noise: Option<fn(&[u8]) -> bool>,
     started: Instant,
     write_started: Option<Instant>,
+}
+
+/// Each valid frame earns a fresh `IO_TIMEOUT`, up to `STARTUP_LIMIT` overall.
+fn startup_expired(started: Instant, last_progress: Instant, now: Instant) -> bool {
+    now.duration_since(last_progress) > IO_TIMEOUT || now.duration_since(started) > STARTUP_LIMIT
+}
+
+/// Append the most recent skipped stdout line, which often names the real cause.
+fn with_ignored_output(message: &str, ignored: &Option<String>) -> String {
+    match ignored {
+        Some(preview) => format!("{message}. Last ignored output: {preview}"),
+        None => message.to_owned(),
+    }
 }
 
 struct TurnAttention {
@@ -1987,10 +2109,17 @@ impl Actor {
         self.step(initial)?;
         let mut stdout_eof = false;
         let mut stderr_eof = false;
+        // A provider that exits closes its stdin before its exit is observable.
+        // Keep the write error only as a fallback: the exit explains the failure.
+        let mut stdin_closed: Option<String> = None;
         let mut closing = None;
         let mut partial_started = None;
         let mut interrupt_sent = false;
         let mut interrupt_error = String::new();
+        let mut garbage_lines = 0usize;
+        let mut garbage_total = 0u64;
+        let mut last_ignored = None;
+        let mut startup_progress = self.started;
         loop {
             if self.stop.load(Ordering::Acquire) {
                 if closing.is_none() {
@@ -2039,16 +2168,53 @@ impl Actor {
                     frames_ready = true;
                     break;
                 }
-                let frame = serde_json::from_slice(&self.output[..newline]).map_err(|error| {
-                    format!("Unsupported provider stdout (expected JSON-lines): {error}")
-                })?;
+                let frame = match serde_json::from_slice(&self.output[..newline]) {
+                    Ok(frame) => {
+                        garbage_lines = 0;
+                        Some(frame)
+                    }
+                    Err(error) => {
+                        let Some(hides_frame) = self.stdout_noise else {
+                            return Err(format!(
+                                "Unsupported provider stdout (expected JSON-lines): {error}"
+                            ));
+                        };
+                        let preview =
+                            super::protocol::diagnostic_preview(&self.output[..newline], 200);
+                        if hides_frame(&self.output[..newline]) {
+                            return Err(format!(
+                                "The agent printed other text inside one of its conversation messages, so the conversation could not continue. This usually comes from a wrapper script or shell startup file. Output: {preview}"
+                            ));
+                        }
+                        garbage_lines += 1;
+                        garbage_total = garbage_total.saturating_add(1);
+                        if garbage_total <= 3 || garbage_total.is_power_of_two() {
+                            tracing::warn!(
+                                consecutive = garbage_lines,
+                                ignored_total = garbage_total,
+                                "Skipping non-JSON provider stdout line"
+                            );
+                        }
+                        if garbage_lines >= 8 {
+                            return Err(format!(
+                                "The agent printed 8 lines in a row that are not part of the conversation, so it was stopped. This usually comes from a wrapper script or shell startup file. Last output: {preview}"
+                            ));
+                        }
+                        last_ignored = Some(preview);
+                        None
+                    }
+                };
                 self.output.drain(..=newline);
                 self.scanned = 0;
                 partial_started = None;
                 parsed += 1;
+                let Some(frame) = frame else {
+                    continue;
+                };
                 self.first_frame = true;
                 let step = self.adapter.receive(frame)?;
                 self.provider_step(step)?;
+                startup_progress = Instant::now();
             }
             if self.output.len() > FRAME_LIMIT {
                 return Err("Provider stdout frame exceeds 32 MiB".into());
@@ -2059,14 +2225,21 @@ impl Actor {
             } else {
                 let since = partial_started.get_or_insert_with(Instant::now);
                 if since.elapsed() > IO_TIMEOUT {
-                    return Err(
-                        "Provider JSON frame remained incomplete or blocked for 30 seconds".into(),
-                    );
+                    return Err(with_ignored_output(
+                        "Provider JSON frame remained incomplete or blocked for 30 seconds",
+                        &last_ignored,
+                    ));
                 }
             }
-            if stdout_eof && self.pending.is_empty() {
+            // A parsing budget can leave complete lines queued even after
+            // the pipe closes. Keep fair poll passes until those drain. Input
+            // the provider stopped reading no longer holds the actor open.
+            if stdout_eof && (self.pending.is_empty() || stdin_closed.is_some()) && !frames_ready {
                 if !self.output.is_empty() {
-                    return Err("Provider ended with an incomplete JSON line".into());
+                    return Err(with_ignored_output(
+                        "Provider ended with an incomplete JSON line",
+                        &last_ignored,
+                    ));
                 }
                 if let Some(status) = self
                     .child
@@ -2076,22 +2249,44 @@ impl Actor {
                     .map_err(|error| error.to_string())?
                 {
                     if status.success() {
-                        return Ok(());
+                        if closing.is_none() && self.adapter.initialization_pending() {
+                            return Err(with_ignored_output(
+                                "Provider exited before completing initialization",
+                                &last_ignored,
+                            ));
+                        }
+                        // A clean exit still lost any input it never read.
+                        return stdin_closed.map_or(Ok(()), Err);
                     }
-                    return Err(format!("Provider exited with {status}"));
+                    return Err(with_ignored_output(
+                        &format!("Provider exited with {status}"),
+                        &last_ignored,
+                    ));
                 }
-                return Err("Provider closed its protocol stream; process terminated to avoid an unobservable writer".into());
+                return Err(with_ignored_output(
+                    "Provider closed its protocol stream; process terminated to avoid an unobservable writer",
+                    &last_ignored,
+                ));
             }
-            if !self.first_frame && self.started.elapsed() > IO_TIMEOUT {
-                return Err(
-                    "Provider initialization timed out without a JSON protocol frame".into(),
-                );
+            if (!self.first_frame || self.adapter.initialization_pending())
+                && startup_expired(self.started, startup_progress, Instant::now())
+            {
+                return Err(with_ignored_output(
+                    if self.first_frame {
+                        "Provider initialization timed out before the provider reported it was ready"
+                    } else {
+                        "Provider initialization timed out without a JSON protocol frame"
+                    },
+                    &last_ignored,
+                ));
             }
             if self
                 .write_started
                 .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
             {
-                return Err("Provider stdin stalled for 30 seconds".into());
+                return Err(
+                    stdin_closed.unwrap_or_else(|| "Provider stdin stalled for 30 seconds".into())
+                );
             }
             if self.dirty
                 && self.visible.load(Ordering::Acquire)
@@ -2122,7 +2317,7 @@ impl Actor {
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: if self.pending.is_empty() {
+                    fd: if self.pending.is_empty() || stdin_closed.is_some() {
                         -1
                     } else {
                         stdin.as_raw_fd()
@@ -2138,6 +2333,7 @@ impl Actor {
             } else if self.dirty && self.visible.load(Ordering::Acquire) {
                 50
             } else if !self.first_frame
+                || self.adapter.initialization_pending()
                 || !self.output.is_empty()
                 || self.write_started.is_some()
                 || closing.is_some()
@@ -2174,6 +2370,12 @@ impl Actor {
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        // The provider closed its input, ordinarily by exiting.
+                        // Drain its output to EOF so its exit status, and any
+                        // final frames, explain the failure instead of EPIPE.
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                            stdin_closed = Some(format!("Provider stdin: {e}"));
+                        }
                         Err(e) => return Err(format!("Provider stdin: {e}")),
                     }
                 }
@@ -2243,6 +2445,42 @@ impl Actor {
             let (run, command) = match command {
                 ActorCommand::RetainedProvider { .. } => {
                     unreachable!("retained inputs normalized above")
+                }
+                ActorCommand::PinnedLaunchDirectory(response) => {
+                    let result = if let Some(holder) = self.native_holder.as_mut() {
+                        holder.pinned_launch_directory()
+                    } else if let Some(child) = self.child.as_ref() {
+                        match child.observed_exit_status() {
+                            Ok(None) => child
+                                .directory
+                                .as_ref()
+                                .ok_or(
+                                    "This provider has no original launch-directory descriptor"
+                                        .to_owned(),
+                                )
+                                .and_then(|directory| {
+                                    let identity =
+                                        crate::agent_execution::DirectoryIdentity::from_metadata(
+                                            &directory
+                                                .metadata()
+                                                .map_err(|error| error.to_string())?,
+                                        );
+                                    super::protocol::validate_launch_directory(
+                                        directory, identity,
+                                    )?;
+                                    Ok((identity, directory.clone()))
+                                }),
+                            Ok(Some(_)) => Err("Original provider process has exited".into()),
+                            Err(error) => {
+                                Err(format!("Cannot prove original provider is live: {error}"))
+                            }
+                        }
+                    } else {
+                        Err("This provider has no live owned launch-directory descriptor".into())
+                    };
+                    let _ = response.send(result);
+                    let _ = reply.send(Ok(()));
+                    continue;
                 }
                 ActorCommand::Provider {
                     run,
@@ -2792,6 +3030,15 @@ impl Actor {
         content: Option<crate::notifications::Content>,
         preview_observed: bool,
     ) {
+        let child_changed = matches!(
+            &event,
+            Event::Subagent { .. }
+                | Event::SubagentItem { .. }
+                | Event::SubagentTextDelta { .. }
+                | Event::SubagentOutputDelta { .. }
+                | Event::SubagentItemsRemoved { .. }
+                | Event::Reset { .. }
+        );
         if matches!(
             event,
             Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
@@ -2810,10 +3057,22 @@ impl Actor {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = None;
         }
+        let mut diagnostic_store =
+            child_changed.then(|| self.store.lock().unwrap_or_else(|p| p.into_inner()));
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         recover_login_error(&mut state.error, &mut self.login_recovery, &event);
         recover_history_error(&mut state.error, &mut self.history_error, &event);
         apply_projected_event(&mut state, &mut self.indices, event, preview_observed);
+        if let Some(store) = &mut diagnostic_store {
+            let owners = store.diagnostics.owners(&state);
+            drop(state);
+            // Keep the store lock across projection and source publication so
+            // no snapshot caches this generation without its final authority.
+            // Disk pruning itself never holds the resident-state lock.
+            store.diagnostics.retain(&owners);
+            state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            store.diagnostics.publish(&mut state);
+        }
         // Only metadata is resident independently of the disk-backed window.
         let items = std::mem::take(&mut state.items);
         let child_items: Vec<_> = state
@@ -3527,6 +3786,12 @@ fn trim_subagent(agent: &mut Subagent) {
     const MAX_ITEMS: usize = 64;
     if let Some(last) = agent.items.last_mut()
         && last.content.byte_len() > MAX_BYTES
+        && child_diagnostics::marked(last)
+    {
+        child_diagnostics::project(Arc::make_mut(last));
+    }
+    if let Some(last) = agent.items.last_mut()
+        && last.content.byte_len() > MAX_BYTES
     {
         Arc::make_mut(last).content = ItemContent::Text {
             text: "[This large item is available in the provider transcript.]".into(),
@@ -3587,11 +3852,34 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
     )>,
     Snapshot,
 ) {
+    let (receipts, snapshot, ()) =
+        notification_frames_with_probe_for_test(adapter, frames, fail_store, |_, _| ());
+    (receipts, snapshot)
+}
+
+#[cfg(test)]
+pub(crate) fn notification_frames_with_probe_for_test<R>(
+    adapter: Box<dyn Adapter>,
+    frames: Vec<serde_json::Value>,
+    fail_store: bool,
+    probe: impl FnOnce(
+        &Snapshot,
+        &dyn Fn(&super::TextCopySource, u64) -> Result<super::TextCopyPage, String>,
+    ) -> R,
+) -> (
+    Vec<(
+        crate::notifications::Evidence,
+        crate::notifications::Content,
+    )>,
+    Snapshot,
+    R,
+) {
     assert!(!frames.is_empty() && frames.len() <= 32);
     let count = frames.len();
     struct Frame {
         adapter: Box<dyn Adapter>,
         frames: std::collections::VecDeque<serde_json::Value>,
+        interrupted: Arc<AtomicBool>,
     }
     impl Adapter for Frame {
         fn initialize(&mut self) -> Result<Step, String> {
@@ -3600,9 +3888,26 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
                 ..Default::default()
             })
         }
-        fn command(&mut self, _: Command) -> Result<Step, String> {
-            self.adapter
-                .receive(self.frames.pop_front().ok_or("fixture frames consumed")?)
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            match command {
+                Command::Refresh => self
+                    .adapter
+                    .receive(self.frames.pop_front().ok_or("fixture frames consumed")?),
+                Command::Interrupt if self.frames.is_empty() => {
+                    // The script has no live provider work. A busy captured
+                    // snapshot still needs an explicit fixture teardown ACK;
+                    // never consume another provider frame or emit an outcome.
+                    self.interrupted.store(true, Ordering::Release);
+                    Ok(Step {
+                        events: vec![Event::Status {
+                            busy: false,
+                            detail: "Fixture interruption acknowledged".into(),
+                        }],
+                        ..Step::default()
+                    })
+                }
+                _ => Err("fixture accepts scripted Refresh and final Interrupt only".into()),
+            }
         }
         fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
             Ok(Step::default())
@@ -3610,6 +3915,7 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
     }
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
+        stdout_noise: None,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3619,9 +3925,11 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
         working_directory: directory.path().into(),
         environment: BTreeMap::new(),
     };
+    let interrupted = Arc::new(AtomicBool::new(false));
     let mut adapter: Box<dyn Adapter> = Box::new(Frame {
         adapter,
         frames: frames.into(),
+        interrupted: interrupted.clone(),
     });
     let mut initial = adapter.initialize().unwrap();
     let store = preflight(&spec, &mut initial).unwrap();
@@ -3644,7 +3952,15 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
         .collect();
     let first = receive.recv_timeout(Duration::from_secs(2));
     let later: Vec<_> = receive.try_iter().collect();
-    let snapshot = handle.0.state.lock().unwrap().clone();
+    // Parent items belong to the transcript Store, so the resident metadata
+    // alone is not a client snapshot. Hydrate through the normal read boundary
+    // before probing original-copy sources and capturing pre-teardown state.
+    let snapshot = handle.snapshot(None).unwrap();
+    // Collect observations before teardown; callers assert them only after
+    // the existing process cleanup/completion guards below have succeeded.
+    let probed = probe(&snapshot, &|source, offset| {
+        handle.text_copy(source, offset)
+    });
     // Retire the actual process before asserting any result, including the
     // missing-callback/error paths, just as the one-frame fixture did.
     let closed = handle.close();
@@ -3661,17 +3977,287 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
         }
     }
     closed.unwrap();
+    if snapshot.busy && !snapshot.exited && snapshot.error.is_none() && !fail_store {
+        assert!(
+            interrupted.load(Ordering::Acquire),
+            "a healthy busy fixture must acknowledge teardown explicitly"
+        );
+        assert!(
+            handle.failure().is_none(),
+            "fixture teardown must not wait for an interruption timeout: {:?}",
+            handle.failure()
+        );
+        let teardown_receipts: Vec<_> = receive.try_iter().collect();
+        assert!(
+            teardown_receipts.is_empty(),
+            "fixture teardown cannot invent provider attention: {teardown_receipts:?}"
+        );
+    }
     assert!(
         handle.is_completed(),
         "real fixture process teardown must still be proved"
     );
     let mut receipts = vec![first.expect("real adapter must publish an outcome through the actor")];
     receipts.extend(later);
-    (receipts, snapshot)
+    (receipts, snapshot, probed)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notification_frame_fixture_preserves_busy_capture_and_acknowledges_teardown() {
+        struct Waiting;
+        impl Adapter for Waiting {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture commands must not reach the decoder".into())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step {
+                    // TurnStarted establishes identity, not busy state. This
+                    // fixture must report work as well as its input wait.
+                    events: vec![
+                        Event::Status {
+                            busy: true,
+                            detail: "Fixture work waiting for input".into(),
+                        },
+                        Event::Waiting(true),
+                    ],
+                    ..Step::default()
+                })
+            }
+        }
+        let (receipts, snapshot) = notification_frames_with_snapshot_for_test(
+            Box::new(Waiting),
+            vec![serde_json::Value::Null],
+            false,
+        );
+        assert!(
+            snapshot.busy && snapshot.waiting && !snapshot.exited,
+            "captured busy={}, waiting={}, exited={}, error_present={}",
+            snapshot.busy,
+            snapshot.waiting,
+            snapshot.exited,
+            snapshot.error.is_some(),
+        );
+        assert!(snapshot.error.is_none());
+        assert_eq!(
+            receipts.len(),
+            1,
+            "teardown must not publish a turn outcome"
+        );
+        assert_eq!(receipts[0].0.kind, crate::notifications::Kind::Waiting);
+        assert_eq!(receipts[0].1.request, None);
+    }
+
+    #[test]
+    fn typed_provider_error_items_keep_full_provenance_and_ids_through_store_hydration() {
+        let mut store = Store::new().unwrap();
+        let raw =
+            "You've hit your limit · resets 1:30pm (America/Los_Angeles)\noriginal diagnostics";
+        for (prompt, failure) in [("prompt-one", "failure-one"), ("prompt-two", "failure-two")] {
+            store
+                .apply(Event::Item(Item {
+                    id: prompt.into(),
+                    role: Role::User,
+                    content: ItemContent::Text {
+                        text: "Explain the limit notice".into(),
+                        thinking: false,
+                        phase: Phase::Final,
+                    },
+                    at: None,
+                    started_at: None,
+                }))
+                .unwrap();
+            let mut item = Item {
+                id: failure.into(),
+                role: Role::Assistant,
+                content: ItemContent::Text {
+                    text: raw.into(),
+                    thinking: false,
+                    phase: Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            };
+            assert!(super::super::failure::mark_provider_error(
+                crate::agent::Provider::Claude,
+                &mut item
+            ));
+            store.apply(Event::Item(item)).unwrap();
+        }
+        let window = store.window().unwrap();
+        let failures: Vec<_> = window
+            .items
+            .iter()
+            .filter_map(|item| {
+                super::super::failure::provider_error_text(crate::agent::Provider::Claude, item)
+                    .map(|body| (item.id.as_str(), body))
+            })
+            .collect();
+        assert_eq!(failures, [("failure-one", raw), ("failure-two", raw)]);
+        assert_eq!(
+            window
+                .items
+                .iter()
+                .filter(|item| item.role == Role::User)
+                .count(),
+            2
+        );
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let quote = Item {
+            id: "child-user-quotation".into(),
+            role: Role::System,
+            content: ItemContent::Text {
+                text: raw.into(),
+                thinking: false,
+                phase: Phase::Final,
+            },
+            at: None,
+            started_at: None,
+        };
+        for event in store
+            .apply(Event::SubagentItem {
+                id: "child".into(),
+                item: quote,
+            })
+            .unwrap()
+        {
+            apply_event(&mut state, &mut indices, event);
+        }
+        let quoted = &state.subagents[0].items[0];
+        assert_eq!(quoted.role, Role::System);
+        assert!(
+            super::super::failure::provider_error_text(crate::agent::Provider::Claude, quoted)
+                .is_none()
+        );
+        assert!(matches!(&quoted.content, ItemContent::Text { text, .. } if text==raw));
+    }
+
+    #[test]
+    fn mixed_child_failure_and_background_notice_preserve_real_activity_through_store() {
+        let mut store = Store::new().unwrap();
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let mut apply = |state: &mut Snapshot, event| {
+            for event in store.apply(event).unwrap() {
+                apply_event(state, &mut indices, event);
+            }
+        };
+        let child = |id: &str, status, waiting, detail: &str| Event::Subagent {
+            id: id.into(),
+            kind: "Review".into(),
+            description: id.into(),
+            status: Some(status),
+            background: Some(true),
+            model: None,
+            waiting: Some(waiting),
+            detail: Some(detail.into()),
+        };
+        apply(&mut state, Event::Ready(true));
+        apply(
+            &mut state,
+            Event::Status {
+                busy: false,
+                detail: "Parent turn ended".into(),
+            },
+        );
+        apply(
+            &mut state,
+            Event::Error {
+                message: "You've hit your limit · resets 1:30pm".into(),
+                fatal: false,
+            },
+        );
+        apply(
+            &mut state,
+            child(
+                "failed",
+                ToolStatus::Failed,
+                false,
+                "connection reset by peer",
+            ),
+        );
+        apply(&mut state, child("live", ToolStatus::Running, false, ""));
+        apply(
+            &mut state,
+            child("blocked", ToolStatus::Running, true, "quota exceeded"),
+        );
+        assert_eq!(state.activity(), ActivityState::Waiting);
+        assert!(state.is_working());
+        let error = state.error.clone();
+        apply(
+            &mut state,
+            Event::Item(Item {
+                id: "actual-background-completion".into(),
+                role: Role::User,
+                content: ItemContent::Delivery {
+                    kind: super::super::DeliveryKind::Notice,
+                    from: String::new(),
+                    sender: "bash-task".into(),
+                    summary: "Background command completed (exit code 0)".into(),
+                    body: String::new(),
+                },
+                at: None,
+                started_at: None,
+            }),
+        );
+        assert!(!state.busy);
+        assert_eq!(state.error, error);
+        assert_eq!(state.activity(), ActivityState::Waiting);
+        assert_eq!(
+            state
+                .subagents
+                .iter()
+                .filter(|child| child.status == ToolStatus::Running)
+                .count(),
+            2
+        );
+        apply(
+            &mut state,
+            child("blocked", ToolStatus::Failed, false, "quota exceeded"),
+        );
+        assert_eq!(
+            state.activity(),
+            ActivityState::Working,
+            "A distinct live child still owns work"
+        );
+        // A replayed failed child's diagnostic is not a new launch or a parent
+        // status update. Its terminal status and the live sibling survive.
+        apply(
+            &mut state,
+            Event::Subagent {
+                id: "failed".into(),
+                kind: String::new(),
+                description: String::new(),
+                status: None,
+                background: None,
+                model: None,
+                waiting: Some(true),
+                detail: Some("connection reset by peer".into()),
+            },
+        );
+        assert_eq!(state.activity(), ActivityState::Working);
+        assert_eq!(
+            state
+                .subagents
+                .iter()
+                .find(|child| child.id == "failed")
+                .unwrap()
+                .status,
+            ToolStatus::Failed
+        );
+        apply(&mut state, child("live", ToolStatus::Succeeded, false, ""));
+        assert_eq!(state.activity(), ActivityState::Idle);
+        assert_eq!(
+            state.error, error,
+            "An unrelated completion cannot clear the parent's limit"
+        );
+    }
+
     #[test]
     fn parent_prompt_availability_tracks_whole_steps_independently_of_children() {
         struct Frames(VecDeque<Vec<Event>>);
@@ -3749,6 +4335,7 @@ mod tests {
         ]));
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -3929,6 +4516,7 @@ mod tests {
         for known_failure in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let spec = ProcessSpec {
+                stdout_noise: None,
                 execution: None,
                 messages: None,
                 unset_environment: Default::default(),
@@ -4080,6 +4668,7 @@ mod tests {
         }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -4189,6 +4778,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             transport: TransportSpec::History,
@@ -4411,6 +5001,7 @@ mod tests {
         let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -4503,6 +5094,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let context = Arc::new(ExecutionContext::default());
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: Some(context.clone()),
             messages: None,
             unset_environment: Default::default(),
@@ -4725,6 +5317,7 @@ mod tests {
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -5520,6 +6113,152 @@ mod tests {
         assert!(state.reasoning.is_none());
     }
 
+    #[test]
+    fn original_launch_directory_survives_rename_and_replacement_without_recapture() {
+        use std::os::unix::fs::PermissionsExt;
+        for (admitted, relative_path, symlinked, cleanup_only, traverse_only) in [
+            (true, false, false, false, false),
+            (false, false, false, false, false),
+            (false, true, false, false, false),
+            (false, true, true, false, false),
+            (false, true, true, true, false),
+            (false, true, false, false, true),
+            (false, true, true, true, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let original = root.path().join("original");
+            let moved = root.path().join("moved");
+            std::fs::create_dir(&original).unwrap();
+            std::fs::write(original.join("marker"), b"{\"text\":\"original cwd\"}\n").unwrap();
+            std::fs::write(
+                original.join("provider"),
+                "#!/bin/sh\n/bin/cat marker\nexec /bin/cat\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                original.join("provider"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            struct RestorePermissions([std::path::PathBuf; 2]);
+            impl Drop for RestorePermissions {
+                fn drop(&mut self) {
+                    for path in &self.0 {
+                        let _ =
+                            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+                    }
+                }
+            }
+            let _permissions = RestorePermissions([original.clone(), moved.clone()]);
+            if traverse_only {
+                std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o111))
+                    .unwrap();
+            }
+            let selected = if symlinked {
+                let link = root.path().join("selected");
+                std::os::unix::fs::symlink(&original, &link).unwrap();
+                link
+            } else {
+                original.clone()
+            };
+            let expected = crate::agent_execution::DirectoryIdentity::from_metadata(
+                &std::fs::metadata(&original).unwrap(),
+            );
+            let spec = ProcessSpec {
+                stdout_noise: None,
+                execution: if cleanup_only {
+                    Some(Arc::new(super::super::protocol::ExecutionContext::default()))
+                } else {
+                    admitted.then(|| {
+                        Arc::new(
+                            super::super::protocol::ExecutionContext::capture(&selected).unwrap(),
+                        )
+                    })
+                },
+                messages: None,
+                transport: TransportSpec::JsonLines,
+                program: if relative_path {
+                    "provider"
+                } else {
+                    "./provider"
+                }
+                .into(),
+                arguments: Vec::new(),
+                working_directory: selected,
+                environment: BTreeMap::from([("PATH".into(), ".".into())]),
+                unset_environment: Default::default(),
+            };
+            let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+            let initial = adapter.initialize().unwrap();
+            let handle =
+                LocalHandle::start(spec, adapter, initial, Store::new().unwrap(), None, |_| {})
+                    .unwrap();
+            until(&handle, |snapshot| {
+                snapshot.items.iter().any(|item|
+                matches!(&item.content, ItemContent::Text { text, .. } if text.contains("original cwd")))
+            });
+            std::fs::rename(&original, &moved).unwrap();
+            std::fs::create_dir(&original).unwrap();
+            std::fs::write(original.join("marker"), "replacement").unwrap();
+            let (identity, pin) = handle.pinned_launch_directory().unwrap();
+            assert_eq!(identity, expected);
+            if !admitted {
+                assert_ne!(
+                    unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH,
+                    0,
+                    "ordinary launch pins require traversal, not directory-list permission"
+                );
+            }
+
+            let fd = unsafe {
+                libc::openat(
+                    pin.as_raw_fd(),
+                    c"marker".as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(fd >= 0);
+            let mut contents = String::new();
+            unsafe { std::fs::File::from_raw_fd(fd) }
+                .read_to_string(&mut contents)
+                .unwrap();
+            assert_eq!(contents, "{\"text\":\"original cwd\"}\n");
+            assert_eq!(
+                std::fs::read_to_string(original.join("marker")).unwrap(),
+                "replacement"
+            );
+            handle.command(Command::Refresh).unwrap();
+            until(&handle, |snapshot| {
+                snapshot.items.iter().any(|item|
+                matches!(&item.content, ItemContent::Text { text, .. } if text.contains(" world")))
+            });
+            handle.close().unwrap();
+            assert!(handle.pinned_launch_directory().is_err());
+        }
+    }
+
+    #[test]
+    fn identity_only_context_never_recaptures_a_replacement_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let expected = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &std::fs::metadata(root.path()).unwrap(),
+        );
+        let context = Arc::new(super::super::protocol::ExecutionContext::restored(expected));
+        assert!(context.pinned_launch_directory().is_err());
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: Some(context),
+            messages: None,
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: root.path().into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        assert!(spawn_provider(&spec, &AtomicBool::new(false)).is_err());
+    }
+
     struct Echo;
     #[test]
     fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
@@ -5573,6 +6312,7 @@ mod tests {
         }
         for unrelated in [None, Some("different failure"), Some("page failed")] {
             let spec = ProcessSpec {
+                stdout_noise: None,
                 execution: None,
                 messages: None,
                 unset_environment: Default::default(),
@@ -5711,6 +6451,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -5844,6 +6585,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -5959,6 +6701,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6034,6 +6777,7 @@ mod tests {
             }
         }
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6103,6 +6847,7 @@ mod tests {
             ("LC_ALL".into(), "C.UTF-8".into()),
         ]);
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6129,6 +6874,7 @@ mod tests {
     #[test]
     fn selected_account_removals_win_at_the_native_child_boundary() {
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             transport: TransportSpec::JsonLines,
@@ -6232,6 +6978,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("server").join("control.sock");
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6290,6 +7037,7 @@ mod tests {
             })
         }
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6373,6 +7121,7 @@ mod tests {
             }
         }
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6411,6 +7160,7 @@ mod tests {
     #[test]
     fn real_json_lines_pipe_keeps_hidden_state_without_presentation() {
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6542,6 +7292,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6675,6 +7426,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6726,15 +7478,426 @@ mod tests {
         server.join().unwrap();
     }
 
+    // Use the real Claude adapter with a private synthetic executable. The
+    // production launcher supplies its explicit child environment; this test
+    // never changes caller authority or performs discovery or authentication.
+    fn claude_initialization_pipe(body: &str) -> (tempfile::TempDir, LocalHandle) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("claude");
+        std::fs::write(&provider, format!(
+            "#!/usr/bin/python3\nimport json, sys\nrequest = json.loads(sys.stdin.readline())\nassert request['type'] == 'control_request'\nassert request['request']['subtype'] == 'initialize'\n{body}"
+        )).unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe: crate::model::LaunchRecipe {
+                program: provider.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+        };
+        let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        (directory, handle)
+    }
+
+    fn finish_initialization_pipe(handle: &LocalHandle, timeout: Duration) -> Snapshot {
+        let deadline = Instant::now() + timeout;
+        while !handle.is_completed() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let completed = handle.is_completed();
+        let snapshot = handle.snapshot(None).unwrap();
+        // Retire/reap the exact fixture before an assertion can fail.
+        handle.close().unwrap();
+        assert!(completed, "initialization fixture timed out: {snapshot:?}");
+        snapshot
+    }
+
+    #[test]
+    fn claude_advisories_do_not_disable_the_real_pipe_initialization_deadline() {
+        let (_directory, handle) = claude_initialization_pipe(
+            "print(json.dumps({'type': 'keep_alive'}), flush=True)\n\
+             print(json.dumps({'type': 'future_advisory'}), flush=True)\n\
+             sys.stdin.read()\n",
+        );
+        let snapshot = finish_initialization_pipe(&handle, IO_TIMEOUT + Duration::from_secs(5));
+        assert!(!snapshot.ready);
+        assert!(
+            snapshot.error.as_deref().is_some_and(|error| error
+                .contains("initialization timed out before the provider reported it was ready")),
+            "{snapshot:?}"
+        );
+        assert!(handle.failure().is_some());
+    }
+
+    #[test]
+    fn claude_clean_pipe_eof_requires_initialization_but_requested_close_does_not() {
+        for advisory in [false, true] {
+            for noise in [0, 1, 7] {
+                let body = format!(
+                    "if {advisory}:\n    print(json.dumps({{'type': 'future_advisory'}}), flush=True)\n\
+                     for _ in range({noise}):\n    print('wrapper diagnostic', flush=True)\n",
+                    advisory = if advisory { "True" } else { "False" },
+                );
+                let (_directory, handle) = claude_initialization_pipe(&body);
+                let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+                assert!(!snapshot.ready);
+                assert!(
+                    snapshot.error.as_deref().is_some_and(
+                        |error| error.contains("exited before completing initialization")
+                    ),
+                    "{snapshot:?}"
+                );
+            }
+        }
+
+        let (_directory, handle) = claude_initialization_pipe(
+            "print(json.dumps({'type': 'future_advisory'}), flush=True)\n\
+             for _ in range(7):\n    print('wrapper diagnostic', flush=True)\n\
+             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n",
+        );
+        let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+        assert!(snapshot.error.is_none(), "{snapshot:?}");
+        assert!(handle.failure().is_none());
+
+        let (_directory, handle) = claude_initialization_pipe("sys.stdin.read()\n");
+        handle.close().unwrap();
+        let snapshot = handle.snapshot(None).unwrap();
+        assert!(!snapshot.ready);
+        assert!(snapshot.error.is_none(), "{snapshot:?}");
+        assert!(handle.failure().is_none());
+    }
+
+    #[test]
+    fn json_line_noise_and_unknown_claude_frames_finish_through_the_real_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("claude");
+        std::fs::write(
+            &provider,
+            include_str!("../../tests/fixtures/claude-unknown-frames.py"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe: crate::model::LaunchRecipe {
+                program: provider.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+        };
+        let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        handle
+            .command(Command::Prompt {
+                text: "Exercise unknown frames".into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        let snapshot = until(&handle, |snapshot| {
+            !snapshot.busy
+                && snapshot.items.iter().any(|item| {
+                    matches!(&item.content, ItemContent::Text { text, .. }
+                        if text == "Fixture answer arrived after unknown frames and wrapper output.")
+                })
+        });
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert!(!snapshot.exited);
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .all(|item| { !format!("{:?}", item.content).contains("fixture-private-payload") })
+        );
+        // Claude Code 2.1.296 sends `post_turn_summary` before each result.
+        handle
+            .command(Command::Prompt {
+                text: "post-turn-summary check".into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        let snapshot = until(&handle, |snapshot| {
+            !snapshot.busy
+                && snapshot.items.iter().any(|item| {
+                    matches!(&item.content, ItemContent::Text { text, .. } if text == "ready")
+                })
+        });
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert!(!snapshot.exited);
+        handle.close().unwrap();
+        assert!(handle.failure().is_none());
+    }
+
+    fn json_lines_spec(arguments: Vec<String>, program: &str) -> ProcessSpec {
+        ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: program.into(),
+            arguments,
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        }
+    }
+
+    // Providers that did not opt in keep the immediate failure on non-JSON
+    // output, both when the process exits cleanly and while it stays alive.
     #[test]
     fn non_json_stdout_fails_visibly_instead_of_scraping_ansi() {
+        for spec in [
+            json_lines_spec(vec!["not-json\\n".into()], "/usr/bin/printf"),
+            json_lines_spec(
+                vec!["-c".into(), "echo not-json; exec sleep 60".into()],
+                "/bin/sh",
+            ),
+        ] {
+            let mut initial = Step::default();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle =
+                LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+            let snapshot = until(&handle, |snapshot| snapshot.error.is_some());
+            assert!(
+                snapshot
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Unsupported provider stdout"),
+                "{snapshot:?}"
+            );
+            handle
+                .close()
+                .expect("failed provider can be explicitly retired");
+        }
+    }
+
+    #[test]
+    fn claude_is_the_only_provider_whose_spec_tolerates_stdout_noise() {
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/false".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        assert!(ProcessSpec::from(&recipe).stdout_noise.is_none());
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe,
+            session_id: None,
+        };
+        let (spec, _) = super::super::protocol::claude::create(&launch).unwrap();
+        assert!(spec.stdout_noise.is_some());
+    }
+
+    #[test]
+    fn a_backlog_beyond_the_frame_budget_drains_after_eof() {
+        // Larger than one bounded parse pass and one read, so EOF is observed
+        // while complete frames are still queued.
+        let frames = 3_000;
+        let spec = json_lines_spec(
+            vec![
+                "%s".into(),
+                format!("{}\n", json!({"text":"x"})).repeat(frames),
+            ],
+            "/usr/bin/printf",
+        );
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert_eq!(
+            unstamped(&snapshot.items),
+            vec![text("echo", &"x".repeat(frames))]
+        );
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn startup_frames_extend_the_deadline_only_within_the_overall_limit() {
+        let started = Instant::now();
+        let at = |seconds| started + Duration::from_secs(seconds);
+        // No progress: the original 30 seconds.
+        assert!(!startup_expired(started, started, at(30)));
+        assert!(startup_expired(started, started, at(31)));
+        // A frame earns another 30 seconds from when it arrived.
+        assert!(!startup_expired(started, at(29), at(59)));
+        assert!(startup_expired(started, at(29), at(60)));
+        // Frames forever cannot outlast the overall limit.
+        assert!(!startup_expired(started, at(299), at(300)));
+        assert!(startup_expired(started, at(300), at(301)));
+    }
+
+    #[test]
+    fn claude_frames_keep_a_slow_startup_alive_through_the_real_pipe() {
+        let (_directory, handle) = claude_initialization_pipe(
+            "import time\n\
+             time.sleep(20)\n\
+             print(json.dumps({'type': 'future_advisory'}), flush=True)\n\
+             time.sleep(20)\n\
+             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n\
+             sys.stdin.read()\n",
+        );
+        let deadline = Instant::now() + Duration::from_secs(50);
+        let snapshot = loop {
+            let snapshot = handle.snapshot(None).unwrap();
+            if snapshot.ready || snapshot.error.is_some() || Instant::now() > deadline {
+                break snapshot;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        handle.close().unwrap();
+        assert!(snapshot.ready && snapshot.error.is_none(), "{snapshot:?}");
+    }
+
+    #[test]
+    fn claude_garbage_only_startup_still_fails_at_the_first_deadline_with_its_preview() {
+        let started = Instant::now();
+        let (_directory, handle) = claude_initialization_pipe(
+            "import time\n\
+             for _ in range(5):\n    print('wrapper diagnostic', flush=True)\n    time.sleep(7)\n\
+             print('wrapper diagnostic', flush=True)\n\
+             sys.stdin.read()\n",
+        );
+        let snapshot = finish_initialization_pipe(&handle, IO_TIMEOUT + Duration::from_secs(5));
+        let error = snapshot.error.as_deref().unwrap();
+        assert!(
+            error.contains("timed out without a JSON protocol frame"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Last ignored output: wrapper diagnostic"),
+            "{error}"
+        );
+        assert!(started.elapsed() < IO_TIMEOUT + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn claude_exit_errors_include_the_last_ignored_output() {
+        for (body, expected) in [
+            (
+                "print('wrapper diagnostic', flush=True)\n",
+                "exited before completing initialization",
+            ),
+            (
+                "print('wrapper diagnostic', flush=True)\nsys.exit(3)\n",
+                "Provider exited with",
+            ),
+            (
+                "print('wrapper diagnostic', flush=True)\nsys.stdout.write('unterminated')\n",
+                "incomplete JSON line",
+            ),
+        ] {
+            let (_directory, handle) = claude_initialization_pipe(body);
+            let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+            let error = snapshot.error.as_deref().unwrap();
+            assert!(error.contains(expected), "{error}");
+            assert!(
+                error.contains("Last ignored output: wrapper diagnostic"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_frame_glued_to_wrapper_text_fails_immediately_with_a_preview() {
+        for line in [
+            "'wrapper diag' + json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False})",
+            "json.dumps({'type': 'control_request', 'request_id': 'r', 'request': {}}) + ' wrapper tail'",
+        ] {
+            let started = Instant::now();
+            let (_directory, handle) = claude_initialization_pipe(&format!(
+                "print({line}, flush=True)\nsys.stdin.read()\n"
+            ));
+            let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+            let error = snapshot.error.as_deref().unwrap();
+            assert!(
+                error.contains("inside one of its conversation messages"),
+                "{error}"
+            );
+            assert!(error.contains("type"), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+    }
+
+    #[test]
+    fn claude_fixture_noise_limit_fails_a_turn_visibly_through_the_real_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("claude");
+        std::fs::write(
+            &provider,
+            include_str!("../../tests/fixtures/claude-unknown-frames.py"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe: crate::model::LaunchRecipe {
+                program: provider.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+        };
+        let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        handle
+            .command(Command::Prompt {
+                text: "noise-limit".into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.error.is_some());
+        handle.close().unwrap();
+        let error = snapshot.error.as_deref().unwrap();
+        assert!(
+            error.contains("8 lines in a row that are not part of the conversation"),
+            "{error}"
+        );
+        assert!(error.contains("offline wrapper diagnostic 7"), "{error}");
+    }
+
+    #[test]
+    fn json_line_noise_resets_its_failure_streak_after_each_valid_frame() {
+        let mut output = String::new();
+        for text in ["hello", " world"] {
+            output.push_str(&"wrapper diagnostic\n".repeat(7));
+            output.push_str(&format!("{}\n", json!({"text":text})));
+        }
         let spec = ProcessSpec {
+            stdout_noise: Some(super::super::protocol::claude::embedded_protocol_frame),
             execution: None,
             messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/printf".into(),
-            arguments: vec!["not-json\\n".into()],
+            arguments: vec!["%s".into(), output],
             working_directory: std::env::temp_dir(),
             environment: BTreeMap::new(),
         };
@@ -6743,13 +7906,44 @@ mod tests {
         let handle =
             LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
-        assert!(
-            snapshot
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("Unsupported provider stdout")
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert_eq!(
+            unstamped(&snapshot.items),
+            vec![text("echo", "hello world")]
         );
+        handle.close().unwrap();
+        assert!(handle.failure().is_none());
+    }
+
+    #[test]
+    fn json_line_noise_fails_after_eight_lines_with_a_bounded_escaped_preview() {
+        let output = format!(
+            "{}\u{1b}[31m🦀{}\n",
+            "not-json\n".repeat(7),
+            "x".repeat(10_000)
+        );
+        let spec = ProcessSpec {
+            stdout_noise: Some(super::super::protocol::claude::embedded_protocol_frame),
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/printf".into(),
+            arguments: vec!["%s".into(), output],
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        let error = snapshot.error.as_deref().unwrap();
+        assert!(error.contains("8 lines in a row that are not part of the conversation"));
+        assert!(error.contains("\\u{1b}[31m🦀"));
+        assert!(error.len() < 512);
+        assert!(!error.chars().any(char::is_control));
+        assert!(snapshot.items.is_empty());
         handle
             .close()
             .expect("failed provider can be explicitly retired");
@@ -6761,8 +7955,32 @@ mod tests {
     }
 
     #[test]
+    fn json_line_noise_does_not_swallow_a_valid_frames_adapter_error() {
+        let spec = ProcessSpec {
+            stdout_noise: Some(super::super::protocol::claude::embedded_protocol_frame),
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/printf".into(),
+            arguments: vec!["%s".into(), "wrapper noise\n{}\n".into()],
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        assert_eq!(snapshot.error.as_deref(), Some("missing echo text"));
+        handle.close().unwrap();
+        assert!(handle.failure().is_some());
+    }
+
+    #[test]
     fn a_panicked_join_cannot_be_retired_even_after_a_completion_publication() {
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -6834,7 +8052,7 @@ mod tests {
                 Ok(())
             });
         }
-        let mut provider = ChildGuard::new(original.spawn().unwrap()).unwrap();
+        let mut provider = ChildGuard::spawn(&mut original);
         let pid = provider.child.id();
         assert_eq!(pid, 200);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -6965,18 +8183,17 @@ mod tests {
         for already_reaped in [false, true] {
             use std::io::{BufRead, BufReader};
             let script = "import os,signal,sys,time\npid=os.fork()\nif pid==0:\n signal.signal(signal.SIGTERM,signal.SIG_DFL if sys.argv[1]=='default' else signal.SIG_IGN)\n print(os.getpid(),flush=True)\n time.sleep(30)\n os._exit(0)\nsys.stdin.readline()\nos._exit(7)\n";
-            let child = Process::new("/usr/bin/python3")
-                .args([
-                    "-c",
-                    script,
-                    if already_reaped { "default" } else { "ignore" },
-                ])
-                .process_group(0)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let mut provider = ChildGuard::new(child).unwrap();
+            let mut provider = ChildGuard::spawn(
+                Process::new("/usr/bin/python3")
+                    .args([
+                        "-c",
+                        script,
+                        if already_reaped { "default" } else { "ignore" },
+                    ])
+                    .process_group(0)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped()),
+            );
             let mut line = String::new();
             BufReader::new(provider.child.stdout.take().unwrap())
                 .read_line(&mut line)
@@ -7086,6 +8303,7 @@ mod tests {
         ] {
             let directory = tempfile::tempdir().unwrap();
             let spec = ProcessSpec {
+                stdout_noise: None,
                 execution: None,
                 messages: None,
                 unset_environment: Default::default(),
@@ -7130,14 +8348,56 @@ mod tests {
     }
 
     #[test]
+    fn provider_exit_during_a_write_reports_its_exit_status_not_the_broken_pipe() {
+        let directory = tempfile::tempdir().unwrap();
+        let release = directory.path().join("release");
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            // Close stdin before announcing it, so the next host write
+            // always meets EPIPE; exit only after that write is queued.
+            arguments: vec![
+                "-c".into(),
+                format!(
+                    "read -r init; exec 0<&-; printf '%s\\n' '{{\"text\":\"closed\"}}'; \
+                     until [ -e '{}' ]; do sleep 0.01; done; exit 75",
+                    release.display()
+                ),
+            ],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| !snapshot.items.is_empty());
+        handle.command(Command::Refresh).unwrap();
+        std::fs::write(&release, b"").unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        let failure = handle.failure();
+        handle.close().unwrap();
+        assert!(
+            failure
+                .as_deref()
+                .is_some_and(|error| error.contains("Provider exited with exit status: 75")),
+            "{failure:?} {:?}",
+            snapshot.error
+        );
+    }
+
+    #[test]
     fn direct_provider_non_reaping_observation_preserves_exit_status() {
         for script in ["exit 7", "kill -TERM $$"] {
-            let child = Process::new("/bin/sh")
-                .args(["-c", script])
-                .process_group(0)
-                .spawn()
-                .unwrap();
-            let mut provider = ChildGuard::new(child).unwrap();
+            let mut provider = ChildGuard::spawn(
+                Process::new("/bin/sh")
+                    .args(["-c", script])
+                    .process_group(0),
+            );
             let deadline = Instant::now() + Duration::from_secs(5);
             let observed = loop {
                 if let Some(status) = provider.observed_exit_status().unwrap() {
@@ -7159,6 +8419,7 @@ mod tests {
     fn direct_provider_scope_preserves_pipes_and_process_group() {
         use std::io::{BufRead, Write};
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             transport: TransportSpec::JsonLines,
@@ -7219,6 +8480,7 @@ mod tests {
             }
         }
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -7341,6 +8603,7 @@ mod tests {
             }
         }
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
