@@ -653,7 +653,7 @@ class ScriptContractsApplicability(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines(), [
             f"Not applicable: {name} (source and fixture both absent at this head)"
             for name, _, _ in self.pairs
-        ])
+        ] + ["Not applicable: build directory seeding (source and fixture both absent at this head)"])
         self.assertEqual(self.calls(root), [])
         self.assertEqual(list(root.iterdir()), [])
 
@@ -663,7 +663,8 @@ class ScriptContractsApplicability(unittest.TestCase):
         self.pair(root, 1)
         result = self.invoke_block(root)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [f"Checking: {name}" for name, _, _ in self.pairs])
+        self.assertEqual(result.stdout.splitlines(), [f"Checking: {name}" for name, _, _ in self.pairs]
+                         + ["Not applicable: build directory seeding (source and fixture both absent at this head)"])
         self.assertEqual(self.calls(root), self.expected_calls(0, 1))
 
     def test_each_partial_pair_fails_instead_of_being_skipped(self):

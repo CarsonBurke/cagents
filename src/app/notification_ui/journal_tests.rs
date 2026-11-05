@@ -688,16 +688,18 @@ fn focused_original_save_refuses_queued_attention_and_popup_close_has_no_focus_e
     };
     let mut runtime = RepositoryRuntime::new_directory(descriptor.clone());
     runtime.set_auto_save(false);
-    let loaded = super::super::tests::task_app_message(repository_task(runtime.update(
-        RepositoryAction::OpenFile {
-            card,
-            path: "file.txt".into(),
-        },
-    )));
-    let Message::Repository(loaded) = loaded else {
-        panic!("actual original file-read completion")
-    };
-    drop(runtime.update(loaded));
+    let load = runtime.update(RepositoryAction::OpenFile {
+        card,
+        path: "file.txt".into(),
+    });
+    assert!(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(runtime.settle_document_read(load)),
+        "actual original file-read completion"
+    );
     assert_eq!(runtime.editor_text().as_deref(), Some("baseline"));
     drop(runtime.update(RepositoryAction::EditorAction {
         card,

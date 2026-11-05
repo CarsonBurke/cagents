@@ -604,10 +604,7 @@ pub(super) fn availability_stream() -> impl iced::futures::Stream<Item = Message
     )
 }
 fn admit() -> Option<Slot> {
-    static WORKER: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    WORKER
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone()
+    application_capacity!(1)
         .try_acquire_owned()
         .ok()
         .map(|permit| Slot(Some(permit)))
@@ -711,6 +708,8 @@ struct RawInput {
     query: String,
     groups: Vec<(String, Vec<RawItem>)>,
     provider: Provider,
+    // Captured on the UI thread; the scan charges it from a worker.
+    metadata: MetadataCapacity,
 }
 struct RawItem {
     item: Arc<chat::Item>,
@@ -1259,8 +1258,10 @@ fn raw_scan_inner(
             groups.push((key.clone(), plans.into()));
         }
     }
-    let attempt = metadata_epoch();
-    let metadata = metadata_capacity()
+    let attempt = input.metadata.epoch.load(Ordering::Acquire);
+    let metadata = input
+        .metadata
+        .permits
         .clone()
         .try_acquire_many_owned(cost.max(1) as u32)
         .ok()
@@ -1268,7 +1269,15 @@ fn raw_scan_inner(
             failure.set(RawFailure::Pressure(attempt));
             None
         })?;
-    Some((groups, uncap, MetadataBudget(Some(metadata)), pattern))
+    Some((
+        groups,
+        uncap,
+        MetadataBudget {
+            permit: Some(metadata),
+            epoch: input.metadata.epoch,
+        },
+        pattern,
+    ))
 }
 fn matches_checked(
     text: &str,
@@ -1623,11 +1632,7 @@ impl Cagents {
         if !entry.borrow_mut().needs_find_highlights(target) {
             return Task::none();
         }
-        static BUDGET: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
-            std::sync::OnceLock::new();
-        let budget = BUDGET
-            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(16 * 1024 * 1024)))
-            .clone();
+        let budget = application_capacity!(16 * 1024 * 1024);
         let bytes = entry
             .borrow()
             .prepared()
@@ -1816,6 +1821,7 @@ fn capture_raw(runtime: &Runtime) -> RawInput {
         query: runtime.find.clone().unwrap_or_default(),
         groups,
         provider: runtime.session.launch.provider,
+        metadata: metadata_capacity(),
     }
 }
 /// Aggregate source AND repeated query work, decided from lengths and bounded
@@ -1978,11 +1984,15 @@ fn plan_in_group(runtime: &Runtime, key: &str, plan: &ItemPlan) -> bool {
         })
 }
 
-struct MetadataBudget(Option<tokio::sync::OwnedSemaphorePermit>);
+struct MetadataBudget {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    // The release count of the permit's own capacity, wherever this drops.
+    epoch: &'static AtomicU64,
+}
 impl Drop for MetadataBudget {
     fn drop(&mut self) {
-        drop(self.0.take());
-        METADATA_EPOCH.fetch_add(1, Ordering::AcqRel);
+        drop(self.permit.take());
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         available().send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 }
@@ -2535,6 +2545,7 @@ mod tests {
         let input = RawInput {
             query: query.into(),
             provider: Provider::Claude,
+            metadata: metadata_capacity(),
             groups: vec![(
                 "group".into(),
                 vec![RawItem {
@@ -3030,17 +3041,22 @@ mod tests {
             .as_ref()
             .unwrap()
             ._metadata
-            .0
+            .permit
             .as_ref()
             .unwrap()
             .num_permits();
-        let before = metadata_capacity().available_permits();
-        let blocker = MetadataBudget(Some(
-            metadata_capacity()
-                .clone()
-                .try_acquire_many_owned(before as u32)
-                .unwrap(),
-        ));
+        let capacity = metadata_capacity();
+        let before = capacity.permits.available_permits();
+        let blocker = MetadataBudget {
+            permit: Some(
+                capacity
+                    .permits
+                    .clone()
+                    .try_acquire_many_owned(before as u32)
+                    .unwrap(),
+            ),
+            epoch: capacity.epoch,
+        };
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.generation += 1;
         let old = snapshot.items[0].clone();
@@ -3077,7 +3093,7 @@ mod tests {
         assert!(runtime.find_navigation.raw.failed.is_none());
         assert!(runtime.find_searching());
         assert_eq!(
-            metadata_capacity().available_permits(),
+            metadata_capacity().permits.available_permits(),
             before,
             "old actual plan remains reserved behind stalled FIFO"
         );
@@ -3107,7 +3123,7 @@ mod tests {
         held.send(()).unwrap();
         preparation::retirement_barrier();
         assert_eq!(
-            metadata_capacity().available_permits(),
+            metadata_capacity().permits.available_permits(),
             before + own,
             "own metadata capacity returns only after real old plan destruction"
         );
@@ -3264,13 +3280,22 @@ fn finish_raw_find_for_test(
     panic!("Find group preparation did not settle")
 }
 
-static METADATA_EPOCH: AtomicU64 = AtomicU64::new(0);
-fn metadata_epoch() -> u64 {
-    METADATA_EPOCH.load(Ordering::Acquire)
+// Find's metadata allowance, and how many times any of it has been released:
+// a search deferred for pressure retries only after a release.
+#[derive(Clone)]
+struct MetadataCapacity {
+    permits: Arc<tokio::sync::Semaphore>,
+    epoch: &'static AtomicU64,
 }
-fn metadata_capacity() -> &'static Arc<tokio::sync::Semaphore> {
-    static METADATA: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    METADATA.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32 * 1024 * 1024)))
+application_atomic!(fn metadata_releases() -> AtomicU64);
+fn metadata_epoch() -> u64 {
+    metadata_releases().load(Ordering::Acquire)
+}
+fn metadata_capacity() -> MetadataCapacity {
+    MetadataCapacity {
+        permits: application_capacity!(32 * 1024 * 1024),
+        epoch: metadata_releases(),
+    }
 }
 impl Runtime {
     fn fail_find(&mut self, failure: RawFailure) {
