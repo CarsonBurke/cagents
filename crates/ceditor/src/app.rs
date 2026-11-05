@@ -366,25 +366,60 @@ impl Editor {
             }
         })
     }
-    fn shortcut_pressed(&self, action: EditorShortcut, event: &keyboard::Event) -> bool {
-        cagents::settings::parse_shortcut(self.shortcuts.value(action))
-            .is_ok_and(|binding| workspace_widget::shortcut_event_matches(binding, event))
+    fn pressed_shortcut(&self, event: &keyboard::Event) -> Option<EditorShortcut> {
+        // Preserve the editor's existing action order for unmodified/physical
+        // matches before considering a shifted symbol for any action.
+        for modified in [false, true] {
+            if let Some(action) = [
+                EditorShortcut::NewTab,
+                EditorShortcut::OpenFile,
+                EditorShortcut::OpenFolder,
+                EditorShortcut::SaveFile,
+                EditorShortcut::CloseTab,
+                EditorShortcut::FindInFile,
+                EditorShortcut::FilterFiles,
+                EditorShortcut::QuickOpen,
+                EditorShortcut::ToggleSidebar,
+                EditorShortcut::ReviewToggleViewed,
+                EditorShortcut::ReviewNextFile,
+                EditorShortcut::ReviewPreviousFile,
+                EditorShortcut::ReviewNextUnviewed,
+                EditorShortcut::ReviewNextChange,
+                EditorShortcut::ReviewPreviousChange,
+            ]
+            .into_iter()
+            .find(|action| {
+                cagents::settings::parse_shortcut(self.shortcuts.value(*action)).is_ok_and(
+                    |binding| {
+                        if modified {
+                            workspace_widget::shortcut_event_matches(binding, event)
+                        } else {
+                            workspace_widget::shortcut_event_matches_unmodified(binding, event)
+                        }
+                    },
+                )
+            }) {
+                return Some(action);
+            }
+        }
+        None
     }
 
     fn handle_shortcut(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         if self.modal_open() {
             return None;
         }
-        if self.shortcut_pressed(EditorShortcut::NewTab, event) {
+        let pressed = self.pressed_shortcut(event);
+        if pressed == Some(EditorShortcut::NewTab) {
             return Some(self.update(Message::NewTab));
         }
-        if self.shortcut_pressed(EditorShortcut::OpenFile, event) {
+        if pressed == Some(EditorShortcut::OpenFile) {
             return Some(self.update(Message::Choose(false)));
         }
-        if self.shortcut_pressed(EditorShortcut::OpenFolder, event) {
+        if pressed == Some(EditorShortcut::OpenFolder) {
             return Some(self.update(Message::Choose(true)));
         }
-        if self.shortcut_pressed(EditorShortcut::SaveFile, event) {
+        if pressed == Some(EditorShortcut::SaveFile) {
             return self.active.map(|card| {
                 self.update(Message::Repository(RepositoryAction::Save {
                     card,
@@ -392,13 +427,13 @@ impl Editor {
                 }))
             });
         }
-        if self.shortcut_pressed(EditorShortcut::CloseTab, event) {
+        if pressed == Some(EditorShortcut::CloseTab) {
             return self.active.map(|card| self.update(Message::CloseTab(card)));
         }
-        if self.shortcut_pressed(EditorShortcut::FindInFile, event) {
+        if pressed == Some(EditorShortcut::FindInFile) {
             return self.active.map(|_| self.update(Message::FindInFile));
         }
-        if self.shortcut_pressed(EditorShortcut::FilterFiles, event) {
+        if pressed == Some(EditorShortcut::FilterFiles) {
             return self.active.and_then(|card| {
                 self.tab(card)
                     .and_then(|tab| tab.navigation.active_worktree().cloned())
@@ -407,10 +442,10 @@ impl Editor {
                     })
             });
         }
-        if self.shortcut_pressed(EditorShortcut::QuickOpen, event) {
+        if pressed == Some(EditorShortcut::QuickOpen) {
             return Some(self.update(Message::QuickOpen));
         }
-        if self.shortcut_pressed(EditorShortcut::ToggleSidebar, event) {
+        if pressed == Some(EditorShortcut::ToggleSidebar) {
             return Some(self.update(Message::ToggleSidebar));
         }
         for (shortcut, action) in [
@@ -439,7 +474,7 @@ impl Editor {
                 pull_request_review::Action::PreviousChange,
             ),
         ] {
-            if self.shortcut_pressed(shortcut, event) {
+            if pressed == Some(shortcut) {
                 // The chords mean something only with a review on screen;
                 // otherwise they stay with the editor, where an arrow chord
                 // may be a line move.
@@ -8645,6 +8680,38 @@ mod tests {
         app.sidebar_panel = WorktreePanel::PullRequests;
         app.sidebar_open = false;
         assert!(app.handle_shortcut(&next).is_none(), "sidebar closed");
+    }
+
+    #[test]
+    fn shifted_symbols_do_not_shadow_existing_physical_editor_shortcuts() {
+        let mut app = editor();
+        app.shortcuts.new_tab = "Ctrl+Shift+!".into();
+        app.shortcuts.toggle_sidebar = "Ctrl+Shift+1".into();
+        let event = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("1".into()),
+            modified_key: keyboard::Key::Character("!".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit1),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            text: None,
+            repeat: false,
+        };
+        assert!(app.sidebar_open);
+        drop(app.handle_shortcut(&event));
+        assert!(
+            !app.sidebar_open,
+            "the existing physical action takes precedence over earlier NewTab"
+        );
+        assert!(app.tabs.is_empty());
+
+        app.shortcuts.new_tab = "Ctrl+T".into();
+        app.shortcuts.toggle_sidebar = "Ctrl+Shift+!".into();
+        drop(app.handle_shortcut(&event));
+        assert!(
+            app.sidebar_open,
+            "a symbol-only binding uses the modified native key"
+        );
+        assert!(app.tabs.is_empty());
     }
 
     #[test]
