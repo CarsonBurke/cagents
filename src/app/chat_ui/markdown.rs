@@ -113,18 +113,11 @@ impl Content {
         // A syntax-free single-line paragraph cannot change interpretation
         // while more ordinary text arrives. Delimiters/newlines return to the
         // CommonMark path, including markers split across provider deltas.
-        // A colon in the word being written can make it a bare reference
-        // that `linked` turns into a link, so that word is parsed again.
+        // A colon can make the word being written a bare reference that
+        // `linked` turns into a link, so that word is parsed again.
         if self.open_plain
             && markdown.chars().all(plain_character)
             && !markdown.contains(':')
-            && !(markdown.starts_with(|ch: char| ch != ' ')
-                && self
-                    .state
-                    .leftover
-                    .rsplit(' ')
-                    .next()
-                    .is_some_and(|word| word.contains(':')))
             && let Some(Item::Paragraph(text)) = self.items.last_mut()
         {
             let suffix = visible_suffix(markdown, &mut self.pending_spaces);
@@ -250,6 +243,12 @@ impl Content {
             .next()
             .is_some_and(char::is_alphabetic)
             && self.state.leftover.chars().all(plain_character)
+            && !self
+                .state
+                .leftover
+                .rsplit(' ')
+                .next()
+                .is_some_and(|word| word.contains(':'))
             && matches!(self.items.last(), Some(Item::Paragraph(text)) if text.is_plain_source(rendered_source));
 
         // A reference destination/title may grow, disappear, or be shadowed
