@@ -136,10 +136,11 @@ impl Detached {
         }
         match self.release_through_holder(retain) {
             Ok(()) => Ok(()),
+            Err(ReleaseError::Authority(error)) => Err(error),
             // A holder releasing itself retires its listener just before it
             // publishes the receipt, so a refused or reset connection may only
             // mean that cleanup is already finishing.
-            Err(error) => {
+            Err(ReleaseError::Transport(error)) => {
                 let deadline = std::time::Instant::now() + RETIREMENT_GRACE;
                 loop {
                     if self.receipt(retain)? {
@@ -154,15 +155,19 @@ impl Detached {
         }
     }
 
-    fn release_through_holder(&self, retain: bool) -> Result<(), String> {
-        let (recovery, _) = super::transport::inspect(&self.record, &self.proof)?;
+    fn release_through_holder(&self, retain: bool) -> Result<(), ReleaseError> {
+        let (recovery, _) = super::transport::inspect(&self.record, &self.proof)
+            .map_err(ReleaseError::Transport)?;
         // A retained source is lineage evidence, not authority over a new
         // daemon owner. Adoption may not silently rotate a successor backwards.
         if recovery.source.proof.as_ref() != Some(&self.proof) {
-            return Err("Native cleanup belongs to a different daemon owner".into());
+            return Err(ReleaseError::Authority(
+                "Native cleanup belongs to a different daemon owner".into(),
+            ));
         }
-        let (mut holder, _) = super::transport::adopt(&self.record, &self.source, &self.proof)?;
-        holder.close_inner(retain)
+        let (mut holder, _) = super::transport::adopt(&self.record, &self.source, &self.proof)
+            .map_err(ReleaseError::Transport)?;
+        holder.close_inner(retain).map_err(ReleaseError::Transport)
     }
 
     pub fn consume_receipt(&self) -> Result<bool, String> {
@@ -214,6 +219,13 @@ impl Startup {
 
 /// Bounds how long a published receipt may wait for its holder to retire
 /// discovery. A holder that died in that window leaves the record behind.
+/// Why releasing through a live holder failed. Only a transport failure can
+/// be the holder retiring on its own, so only that one waits for a receipt.
+enum ReleaseError {
+    Authority(String),
+    Transport(String),
+}
+
 const RETIREMENT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn consume(
