@@ -327,8 +327,11 @@ impl KeyboardFocus {
                     .rev()
                     .find_map(|(candidate, inherited)| {
                         let region = self.region_for(candidate, regions, *inherited);
-                        (region.pane == FocusedPane::TextInput || self.is_text_input(candidate))
-                            .then_some((candidate, region))
+                        (matches!(
+                            region.pane,
+                            FocusedPane::TextInput | FocusedPane::PaneTextInput
+                        ) || self.is_text_input(candidate))
+                        .then_some((candidate, region))
                     })
             })
             .or_else(|| {
@@ -415,7 +418,11 @@ impl KeyboardFocus {
             .any(|(candidate, rectangle)| candidate == id && rectangle == bounds)
         {
             KeyboardRegion {
-                pane: FocusedPane::TextInput,
+                pane: if container.card.is_some() {
+                    FocusedPane::PaneTextInput
+                } else {
+                    FocusedPane::TextInput
+                },
                 ..container
             }
         } else {
@@ -1596,7 +1603,7 @@ mod tests {
         assert_eq!(
             ancestry.region(&[]),
             KeyboardRegion {
-                pane: FocusedPane::TextInput,
+                pane: FocusedPane::PaneTextInput,
                 ..owner
             }
         );

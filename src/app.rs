@@ -19345,7 +19345,7 @@ impl Application for Cagents {
                     ));
                     regions.push((
                         chrome.browser_address_id.clone(),
-                        region(workspace_widget::FocusedPane::TextInput),
+                        region(workspace_widget::FocusedPane::PaneTextInput),
                     ));
                 }
                 if matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_))) {

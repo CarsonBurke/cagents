@@ -139,8 +139,13 @@ pub enum FocusedPane {
     Browser,
     /// The native code editor.
     Editor,
-    /// A native text field, including fields inside a pane.
+    /// A native text field outside every pane, such as the sidebar's or the
+    /// inspector's. Commands for the focused pane leave its keys alone.
     TextInput,
+    /// A native text field inside a pane, such as Settings search or a
+    /// browser address. It keeps its editing keys, and the pane's own
+    /// commands, such as Close, still apply.
+    PaneTextInput,
     /// A native control outside registered workspace content.
     OutsideWorkspace,
     /// Any other pane, or none.
@@ -160,7 +165,7 @@ impl FocusedPane {
     pub fn is_text_editing(self) -> bool {
         matches!(
             self,
-            Self::Editor | Self::Chat | Self::TextInput | Self::Browser
+            Self::Editor | Self::Chat | Self::TextInput | Self::PaneTextInput | Self::Browser
         )
     }
 }
@@ -5177,6 +5182,141 @@ mod tests {
         moved.offset = moved_offset;
         assert_eq!(positions, expected_overlay_positions(&moved, VIEWPORT));
     }
+    #[test]
+    fn a_field_inside_the_focused_pane_keeps_editing_keys_and_its_pane_commands() {
+        use keyboard::key::Code;
+        let shortcuts = KeyboardShortcuts::default();
+        let close = key_press(
+            "w",
+            Code::KeyW,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            false,
+        );
+        let clone = key_press(
+            "d",
+            Code::KeyD,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            false,
+        );
+        // Settings search or a browser address: the pane's commands apply.
+        assert_eq!(
+            global_shortcut(&close, &shortcuts, FocusedPane::PaneTextInput),
+            Some(GlobalShortcut::CloseFocusedCard)
+        );
+        assert_eq!(
+            global_shortcut(&clone, &shortcuts, FocusedPane::PaneTextInput),
+            Some(GlobalShortcut::ClonePane)
+        );
+        // A sidebar or inspector field is not in the pane they would act on.
+        for focused in [FocusedPane::TextInput, FocusedPane::OutsideWorkspace] {
+            assert_eq!(global_shortcut(&close, &shortcuts, focused), None);
+        }
+        // Either kind of field keeps native editing chords.
+        let redo = key_press(
+            "z",
+            Code::KeyZ,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            false,
+        );
+        for focused in [FocusedPane::PaneTextInput, FocusedPane::TextInput] {
+            assert_eq!(global_shortcut(&redo, &shortcuts, focused), None);
+            assert!(!is_global_shortcut_chord(
+                &keyboard::Key::Named(keyboard::key::Named::ArrowLeft),
+                keyboard::key::Physical::Code(Code::ArrowLeft),
+                keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT,
+                &shortcuts,
+                focused
+            ));
+        }
+    }
+
+    /// Settings marks exactly the bindable chords that a focused text control
+    /// keeps, so a row never claims a key works in a field when it does not.
+    #[test]
+    fn the_editing_advisory_names_every_bindable_chord_a_text_control_keeps() {
+        use crate::settings::{ShortcutBinding, ShortcutKey};
+        use keyboard::key::{Code, Named, Physical};
+        let mut keys: Vec<(ShortcutKey, keyboard::Key, Physical)> = ('a'..='z')
+            .zip([
+                Code::KeyA,
+                Code::KeyB,
+                Code::KeyC,
+                Code::KeyD,
+                Code::KeyE,
+                Code::KeyF,
+                Code::KeyG,
+                Code::KeyH,
+                Code::KeyI,
+                Code::KeyJ,
+                Code::KeyK,
+                Code::KeyL,
+                Code::KeyM,
+                Code::KeyN,
+                Code::KeyO,
+                Code::KeyP,
+                Code::KeyQ,
+                Code::KeyR,
+                Code::KeyS,
+                Code::KeyT,
+                Code::KeyU,
+                Code::KeyV,
+                Code::KeyW,
+                Code::KeyX,
+                Code::KeyY,
+                Code::KeyZ,
+            ])
+            .map(|(ch, code)| {
+                (
+                    ShortcutKey::Character(ch),
+                    keyboard::Key::Character(ch.to_string().into()),
+                    Physical::Code(code),
+                )
+            })
+            .collect();
+        for (key, named, code) in [
+            (ShortcutKey::ArrowLeft, Named::ArrowLeft, Code::ArrowLeft),
+            (ShortcutKey::ArrowRight, Named::ArrowRight, Code::ArrowRight),
+            (ShortcutKey::ArrowUp, Named::ArrowUp, Code::ArrowUp),
+            (ShortcutKey::ArrowDown, Named::ArrowDown, Code::ArrowDown),
+            (ShortcutKey::Tab, Named::Tab, Code::Tab),
+            (ShortcutKey::PageUp, Named::PageUp, Code::PageUp),
+            (ShortcutKey::PageDown, Named::PageDown, Code::PageDown),
+        ] {
+            keys.push((key, keyboard::Key::Named(named), Physical::Code(code)));
+        }
+        for (key, event_key, physical) in &keys {
+            for bits in 0..16u8 {
+                let binding = ShortcutBinding {
+                    control: bits & 1 != 0,
+                    alt: bits & 2 != 0,
+                    shift: bits & 4 != 0,
+                    logo: bits & 8 != 0,
+                    key: *key,
+                };
+                let mut modifiers = keyboard::Modifiers::empty();
+                modifiers.set(keyboard::Modifiers::CTRL, binding.control);
+                modifiers.set(keyboard::Modifiers::ALT, binding.alt);
+                modifiers.set(keyboard::Modifiers::SHIFT, binding.shift);
+                modifiers.set(keyboard::Modifiers::LOGO, binding.logo);
+                for action in [GlobalShortcut::FindInPane, GlobalShortcut::MovePaneLeft] {
+                    let reserved = text_editing_chord(event_key, *physical, modifiers)
+                        || (action != GlobalShortcut::FindInPane
+                            && binding.control
+                            && !binding.shift
+                            && !binding.alt
+                            && !binding.logo
+                            && latin_key(event_key, *physical) == Some('f'));
+                    assert_eq!(
+                        crate::settings::native_text_editing_advisory(action.id(), binding)
+                            .is_some(),
+                        reserved,
+                        "{action:?} {binding:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn native_text_history_and_external_fields_never_dispatch_background_pane_commands() {
         use keyboard::key::Code;
