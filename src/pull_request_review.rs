@@ -162,6 +162,56 @@ pub enum ViewedOutcome {
     Unknown(String),
 }
 
+/// What a viewed change across several files couldn't do, kept apart by
+/// kind: a refused mark reverted, an unconfirmed one may have landed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ViewedShortfall {
+    refused: usize,
+    unconfirmed: usize,
+    refused_reason: Option<String>,
+    unconfirmed_reason: Option<String>,
+}
+
+impl ViewedShortfall {
+    fn record(&mut self, outcome: &ViewedOutcome) {
+        match outcome {
+            ViewedOutcome::Applied => {}
+            ViewedOutcome::NotApplied(reason) => {
+                self.refused += 1;
+                self.refused_reason.get_or_insert_with(|| reason.clone());
+            }
+            ViewedOutcome::Unknown(reason) => {
+                self.unconfirmed += 1;
+                self.unconfirmed_reason
+                    .get_or_insert_with(|| reason.clone());
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.refused == 0 && self.unconfirmed == 0
+    }
+
+    fn summary(&self, total: usize) -> String {
+        let mut sentences = Vec::new();
+        if self.refused > 0 {
+            sentences.push(format!(
+                "{} of {total} files could not be marked. {}",
+                self.refused,
+                self.refused_reason.as_deref().unwrap_or_default()
+            ));
+        }
+        if self.unconfirmed > 0 {
+            sentences.push(format!(
+                "{} of {total} marks could not be confirmed; refresh to check. {}",
+                self.unconfirmed,
+                self.unconfirmed_reason.as_deref().unwrap_or_default()
+            ));
+        }
+        sentences.join(" ").trim_end().to_owned()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     BrowserViewport {
@@ -244,7 +294,7 @@ pub enum Action {
     ViewedBatchSummary {
         generation: u64,
         authority_revision: u64,
-        failed: usize,
+        shortfall: ViewedShortfall,
         total: usize,
     },
     OpenUrl(Url),
@@ -540,7 +590,6 @@ pub struct State {
     notice_survives_load: Option<u64>,
     /// Why the latest viewed mark failed, for the summary of the operation
     /// it belonged to.
-    viewed_failure: Option<String>,
     effects: Vec<Effect>,
 }
 
@@ -754,7 +803,6 @@ impl State {
             selected: None,
             notice: None,
             notice_survives_load: None,
-            viewed_failure: None,
             effects: Vec::new(),
         }
     }
@@ -1231,10 +1279,10 @@ impl State {
                 if generation != self.generation || authority_revision != self.authority_revision {
                     return ActionTask::none();
                 }
-                let failures = results
-                    .iter()
-                    .filter(|(_, _, outcome)| !matches!(outcome, ViewedOutcome::Applied))
-                    .count();
+                let mut shortfall = ViewedShortfall::default();
+                for (_, _, outcome) in &results {
+                    shortfall.record(outcome);
+                }
                 let total = results.len();
                 for (path, viewed, outcome) in results {
                     let Some(index) = self.file_index(&path) else {
@@ -1258,7 +1306,6 @@ impl State {
                                 path.display(),
                                 if viewed { "viewed" } else { "not viewed" }
                             ));
-                            self.viewed_failure = Some(message);
                         }
                         ViewedOutcome::Unknown(message) => {
                             file.sync = ViewedSync::Unverified;
@@ -1266,17 +1313,11 @@ impl State {
                                 "Could not confirm the viewed mark on {}; refresh to check. {message}",
                                 path.display()
                             ));
-                            self.viewed_failure = Some(format!(
-                                "Some marks are unconfirmed; refresh to check. {message}"
-                            ));
                         }
                     }
                 }
-                if failures > 0 && total > 1 {
-                    self.notice = Some(format!(
-                        "{failures} of {total} files could not be marked. {}",
-                        self.viewed_failure.as_deref().unwrap_or_default()
-                    ));
+                if total > 1 && !shortfall.is_empty() {
+                    self.notice = Some(shortfall.summary(total));
                 }
                 self.cache_dirty = true;
                 ActionTask::none()
@@ -1284,19 +1325,16 @@ impl State {
             Action::ViewedBatchSummary {
                 generation,
                 authority_revision,
-                failed,
+                shortfall,
                 total,
             } => {
                 if generation == self.generation
                     && authority_revision == self.authority_revision
-                    && failed > 0
+                    && !shortfall.is_empty()
                 {
-                    // One sentence for the whole operation, replacing the
+                    // One summary for the whole operation, replacing the
                     // notices of its batches.
-                    self.notice = Some(format!(
-                        "{failed} of {total} files could not be marked. {}",
-                        self.viewed_failure.take().unwrap_or_default()
-                    ));
+                    self.notice = Some(shortfall.summary(total));
                 }
                 ActionTask::none()
             }
@@ -1642,7 +1680,6 @@ impl State {
         self.generation = self.generation.wrapping_add(1);
         self.load_generation = 0;
         self.notice_survives_load = None;
-        self.viewed_failure = None;
         self.viewed_after_load.clear();
         self.last_refresh = None;
         self.target = None;
@@ -2069,8 +2106,13 @@ impl State {
             .map(<[RepoPath]>::to_vec)
             .collect();
         let stream = iced::futures::stream::unfold(
-            (chunks.into_iter(), None::<String>, 0usize, false),
-            move |(mut chunks, refused, failed, finished)| {
+            (
+                chunks.into_iter(),
+                None::<String>,
+                ViewedShortfall::default(),
+                false,
+            ),
+            move |(mut chunks, refused, mut shortfall, finished)| {
                 let api = api.clone();
                 let git = git.clone();
                 let authority = authority.clone();
@@ -2080,15 +2122,16 @@ impl State {
                 async move {
                     let paths = match chunks.next() {
                         Some(paths) => paths,
-                        None if failed > 0 && !finished => {
+                        // A single file's own notice already says it all.
+                        None if total > 1 && !shortfall.is_empty() && !finished => {
                             return Some((
                                 Action::ViewedBatchSummary {
                                     generation,
                                     authority_revision,
-                                    failed,
+                                    shortfall: shortfall.clone(),
                                     total,
                                 },
-                                (chunks, refused, failed, true),
+                                (chunks, refused, shortfall, true),
                             ));
                         }
                         None => return None,
@@ -2130,18 +2173,16 @@ impl State {
                             Some(message),
                         )
                     });
-                    let failed = failed
-                        + results
-                            .iter()
-                            .filter(|(_, _, outcome)| !matches!(outcome, ViewedOutcome::Applied))
-                            .count();
+                    for (_, _, outcome) in &results {
+                        shortfall.record(outcome);
+                    }
                     Some((
                         Action::ViewedApplied {
                             generation,
                             authority_revision,
                             results,
                         },
-                        (chunks, refused, failed, false),
+                        (chunks, refused, shortfall, false),
                     ))
                 }
             },
@@ -4261,8 +4302,13 @@ pub(crate) mod tests {
                                 *api.context.lock().unwrap() = Some(original_context.clone());
                             }
                         }
-                        Action::ViewedBatchSummary { failed, total, .. } => {
-                            assert_eq!((*failed, *total), (150, 200));
+                        Action::ViewedBatchSummary {
+                            shortfall, total, ..
+                        } => {
+                            assert_eq!(
+                                (shortfall.refused, shortfall.unconfirmed, *total),
+                                (150, 0, 200)
+                            );
                             summaries += 1;
                             drop(state.update(action));
                         }
@@ -5249,9 +5295,13 @@ pub(crate) mod tests {
                 (
                     path("a.rs"),
                     true,
-                    ViewedOutcome::NotApplied("refused".into()),
+                    ViewedOutcome::NotApplied("GitHub refused.".into()),
                 ),
-                (path("b.rs"), true, ViewedOutcome::Unknown("lost".into())),
+                (
+                    path("b.rs"),
+                    true,
+                    ViewedOutcome::Unknown("Connection lost.".into()),
+                ),
             ],
         }));
         assert!(!state.files[0].viewed);
@@ -5261,7 +5311,7 @@ pub(crate) mod tests {
         assert_eq!(
             state.notice.as_deref(),
             Some(
-                "2 of 2 files could not be marked. Some marks are unconfirmed; refresh to check. lost"
+                "1 of 2 files could not be marked. GitHub refused. 1 of 2 marks could not be confirmed; refresh to check. Connection lost."
             )
         );
         // A refresh that reports GitHub's truth reconciles the unverified mark.
