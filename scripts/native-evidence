@@ -584,8 +584,10 @@ run_app() {
     write_session_cargo "$side" "$checkout"
     session_path=$state/session-bin:
     # The runner still calls scripts/cargo-gate, which must not join the shared queue.
+    # Its builds replay the recorded ones through the session's cargo, here.
     local status=0
     fixture_env env CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
+        CAGENTS_BUILD_REMOTE=local \
         scripts/run-development --browserless --debug --log-file "$logs/ui-$side.log" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then

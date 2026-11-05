@@ -72,6 +72,7 @@ exit 83
             SHIM_CALLS=str(self.shim_calls), CARGO_CALLS=str(self.cargo_calls),
             # The runner builds through the gate; keep it off the host's locks.
             CAGENTS_BUILD_LOCK=str(self.root / "cargo.lock"),
+            CAGENTS_BUILD_INSTALLED_GATE="",
         )
         self.env.pop("CAGENTS_BUILD_SLOT_HELD", None)
         self.env.pop("MISE_DATA_DIR", None)

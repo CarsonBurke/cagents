@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shutil
 import signal
@@ -195,6 +196,48 @@ class CargoGateApplicability(unittest.TestCase):
                     self.assertFalse((root / "calls.json").exists())
 
 
+class InstalledGateDeferral(unittest.TestCase):
+    """A checkout whose gate has fallen behind the installed one runs that."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-deferral-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.gate = self.root / "checkout" / "cargo-gate"
+        self.gate.parent.mkdir()
+        shutil.copy2(ROOT / "scripts/cargo-gate", self.gate)
+        shutil.copy2(ROOT / "scripts/cargo-gate-command.py", self.gate.parent)
+        self.version = int(re.search(r"^gate_version=(\d+)$", self.gate.read_text(), re.M)[1])
+        self.installed = self.root / "cagents-cargo-gate"
+        self.env = os.environ | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
+                                 "CAGENTS_BUILD_REMOTE": "local",
+                                 "CAGENTS_BUILD_INSTALLED_GATE": str(self.installed)}
+        self.env.pop("CAGENTS_BUILD_SLOT_HELD", None)
+
+    def install(self, version):
+        self.installed.write_text(f"#!/bin/sh\ngate_version={version}\necho installed \"$@\"\n")
+        self.installed.chmod(0o755)
+
+    def run_gate(self, env=None):
+        return subprocess.run([str(self.gate), "exec", "echo", "checkout"], env=env or self.env,
+                              cwd=self.root, capture_output=True, text=True, timeout=30)
+
+    def test_a_newer_installed_gate_runs_instead(self):
+        self.install(self.version + 1)
+        self.assertEqual(self.run_gate().stdout, "installed exec echo checkout\n")
+
+    def test_an_installed_gate_no_newer_than_this_one_does_not(self):
+        for version in (self.version, self.version - 1):
+            with self.subTest(version=version):
+                self.install(version)
+                self.assertEqual(self.run_gate().stdout, "checkout\n")
+
+    def test_an_empty_setting_runs_this_gate_always(self):
+        self.install(self.version + 1)
+        self.assertEqual(self.run_gate(self.env | {"CAGENTS_BUILD_INSTALLED_GATE": ""}).stdout,
+                         "checkout\n")
+
+
 class HeldCommand(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -226,6 +269,8 @@ class HeldCommand(unittest.TestCase):
             "CAGENTS_BUILD_LOCK": str(self.lock),
             "CAGENTS_BUILD_SLOTS": "1",
             "CARGO_BUILD_JOBS": "1",
+            # This copy of the gate, not a newer installed one.
+            "CAGENTS_BUILD_INSTALLED_GATE": "",
         }
         self.env.pop("CAGENTS_BUILD_SLOT_HELD", None)
         self.children = []

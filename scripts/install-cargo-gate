@@ -62,12 +62,23 @@ done
 smoke() {
     lock=$(mktemp -d "$stage/smoke.XXXXXX")
     output=$( (cd "$lock" && CAGENTS_BUILD_LOCK="$lock/lock" CAGENTS_BUILD_SLOT_HELD= \
+        CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_INSTALLED_GATE= \
         "$1" exec sh -c 'printf admitted') 2>&1) ||
         fail "$1 did not run a command: $output"
     [ "$output" = admitted ] || fail "$1 did not run a command: $output"
     rm -rf -- "$lock"
 }
 smoke "$stage/cagents-cargo-gate"
+
+# Checkouts defer to the installed gate when it is newer than theirs, so an
+# older one installed over it would hold every checkout back.
+version() {
+    sed -n 's/^gate_version=\([0-9][0-9]*\)$/\1/p' "$1" 2>/dev/null | head -n 1
+}
+staged=$(version "$stage/cagents-cargo-gate")
+current=$(version "$destination/cagents-cargo-gate")
+[ "${staged:-0}" -ge "${current:-0}" ] ||
+    fail "the installed gate is version $current, newer than this checkout's ${staged:-0}; install from a checkout that has it"
 
 printf '%s\n' "$files" | while IFS=: read -r installed file; do
     mv -f -- "$stage/$installed" "$destination/$installed"

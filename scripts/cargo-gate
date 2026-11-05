@@ -10,6 +10,19 @@
 # further build only slows the running ones and every other workload.
 set -eu
 
+# Raise this whenever the gate or a helper beside it changes what it does. A
+# checkout whose gate is older than the installed one runs the installed one,
+# so a worktree that has fallen behind main does not keep main's fixes from its
+# builds.
+gate_version=2
+installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
+if [ -n "$installed" ] && [ -x "$installed" ] && ! [ "$installed" -ef "$0" ]; then
+    theirs=$(sed -n 's/^gate_version=\([0-9][0-9]*\)$/\1/p' "$installed" 2>/dev/null | head -n 1)
+    if [ "${theirs:-0}" -gt "$gate_version" ]; then
+        exec "$installed" "$@"
+    fi
+fi
+
 program=cargo-gate
 fail() {
     printf '%s: %s\n' "$program" "$*" >&2
@@ -21,21 +34,30 @@ usage() {
 Usage: scripts/cargo-gate [cargo] SUBCOMMAND [ARGS...]
        scripts/cargo-gate exec COMMAND [ARGS...]
 
-`build`, `check`, `clippy`, `test` and `doc` run on the build host in
-CAGENTS_BUILD_REMOTE with scripts/cargo-offload: in one of its build slots,
-with this checkout's sources, streaming their output; `build` copies the
-executables it made back into this checkout's target directory. When that
-host is unreachable, low on disk, or the command names paths on this host,
-the command runs here instead, after one line saying why.
+Rust compiles only on the build host in CAGENTS_BUILD_REMOTE, through
+scripts/cargo-offload: in one of its build slots, with this checkout's
+sources, streaming the output. What callers here use comes back: executables,
+documentation, timing reports and fixes, and Cargo's messages name this
+host's paths. `run` builds there and runs the program here. While that host is
+unreachable, does not answer or is low on disk, the command waits for it,
+saying so once a minute, within the admission budget; then it fails. It never
+builds here instead. Subcommands that compile nothing, such as `metadata`, run
+here at once; one that compiles but cannot run there faithfully is refused,
+with the reason.
 
-Otherwise, runs `cargo SUBCOMMAND ARGS...` once a build slot is free. For `test`,
-`bench` and `run`, only the build (`--no-run`, or `build`) holds the slot; the
-tests or program run afterwards without it.
+`exec` runs any command, such as a script of several Cargo builds, with a
+`cargo` first on PATH that leads back to this gate, so every Cargo command in
+it builds on that host.
 
-`exec` runs any command, such as a script of several Cargo builds, in one
-slot held until it exits: a drop-in for `flock /var/tmp/cagents-cargo.lock
-COMMAND`. Gated commands inside it run in that slot without waiting. Prefer
-gating each Cargo command, so tests run outside the slot.
+With CAGENTS_BUILD_REMOTE=local, or on the build host itself, commands build
+here, each once a build slot is free. For `test`, `bench` and `run`, only the
+build (`--no-run`, or `build`) holds the slot; the tests or program run
+afterwards without it. `exec` holds one slot until COMMAND exits: a drop-in
+for `flock /var/tmp/cagents-cargo.lock COMMAND`, whose gated commands run in
+that slot without waiting.
+
+A checkout's gate defers to the installed one, /var/tmp/cagents-cargo-gate,
+when that is newer.
 
 A checkout whose Cargo build directory has never been built is first seeded
 from the main checkout's with scripts/seed-build-dir. When the file system
@@ -43,21 +65,25 @@ holding build directories runs low, scripts/build-disk-guard first reclaims
 removed worktrees' build directories, and refuses the build below a floor.
 
 Environment:
-  CAGENTS_BUILD_REMOTE   Host that runs `build`, `check`, `clippy`, `test` and
-                         `doc` (default fw16); `local` builds here
+  CAGENTS_BUILD_REMOTE   Host that compiles (default fw16); `local` builds here
   CAGENTS_BUILD_REMOTE_SLOTS, CAGENTS_BUILD_REMOTE_JOBS,
   CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB
                          Builds at once on that host (default 3), Cargo jobs
                          for each (6), and the free space below which it
                          builds nothing (40 GiB)
+  CAGENTS_BUILD_INSTALLED_GATE
+                         The installed gate a checkout's older gate defers
+                         to (default /var/tmp/cagents-cargo-gate); empty
+                         runs this checkout's gate always
   CAGENTS_BUILD_SEED=0   Do not seed a new build directory
   CAGENTS_BUILD_FREE_FLOOR_GIB
                          Free space below which builds are refused; default
                          5% of the file system, at most 64; 0 disables
   CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS
                          Optional positive integer budget for preflight and
-                         admission waits; expiry exits 124 after cleanup.
-                         Admitted builds are not timed out; default unbounded
+                         admission waits, including the wait for the build
+                         host; expiry exits 124 after cleanup. Admitted
+                         builds are not timed out; default unbounded
   CAGENTS_BUILD_SLOTS    Concurrent builds; default: one per 4 GiB of RAM
                          after an 8 GiB reserve, at most one per 4 CPUs
                          and at most 4
@@ -525,9 +551,9 @@ build_phase() {
         [ "$ended" = true ] || set -- "$@" "$argument"
     done
     if [ "$subcommand" = run ]; then
-        held cargo build "$@"
+        held "$cargo" build "$@"
     else
-        held cargo "$subcommand" --no-run "$@"
+        held "$cargo" "$subcommand" --no-run "$@"
     fi
 }
 
@@ -615,8 +641,51 @@ started_by_flock() {
     done
     return 1
 }
+# Rust compiles on the build host when there is one, whether or not this
+# command is inside a slot here; scripts/cargo-offload exits 75 when this is
+# the build host, or CAGENTS_BUILD_REMOTE is `local`. Its wait for that host
+# spends the admission budget; the build there does not.
+cargo=${CAGENTS_BUILD_CARGO:-cargo}
+offload=$(dirname "$0")/cargo-offload
+if [ -x "$offload" ]; then
+    deadline=
+    if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
+        deadline=$(python3 "$(dirname "$0")/cargo-gate-command.py" \
+            --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
+    fi
+    admission_deadline=
+    if [ "$mode" = cargo ]; then
+        status=0
+        # The build host admits the build by the memory it is expected to
+        # need, as this host would.
+        supervised '' env CAGENTS_BUILD_ADMISSION_DEADLINE="$deadline" \
+            CAGENTS_BUILD_EXPECTED_KIB="$(expected_cost "$@")" "$offload" "$@" || status=$?
+        [ "$status" -eq 75 ] || exit "$status"
+    elif "$offload" --host >/dev/null 2>&1; then
+        # Each Cargo command in COMMAND goes through this gate: nothing here
+        # holds a slot while they build there. The shim reaches this gate by
+        # its own path, and the gate reaches this host's Cargo, not the shim.
+        self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+        CAGENTS_BUILD_CARGO=${CAGENTS_BUILD_CARGO:-$(command -v cargo)} ||
+            fail 'cannot find cargo'
+        export CAGENTS_BUILD_CARGO
+        shims=$(mktemp -d "${TMPDIR:-/tmp}/cagents-cargo-shim.XXXXXX")
+        quoted=$(printf '%s' "$self" | sed "s/'/'\\\\''/g")
+        printf "#!/bin/sh\nexec '%s' \"\$@\"\n" "$quoted" >"$shims/cargo"
+        chmod 755 "$shims/cargo"
+        PATH=$shims:$PATH
+        export PATH
+        status=0
+        supervised '' "$@" || status=$?
+        rm -rf -- "$shims"
+        exit "$status"
+    fi
+fi
+
+# Building here. Already inside a slot: a gated command running Cargo again,
+# or a caller that took the lock itself.
 if inside_gate || inherits_slot || started_by_flock; then
-    [ "$mode" = exec ] || set -- cargo "$@"
+    [ "$mode" = exec ] || set -- "$cargo" "$@"
     exec "$@"
 fi
 
@@ -624,19 +693,6 @@ admission_deadline=
 if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
     admission_deadline=$(python3 "$(dirname "$0")/cargo-gate-command.py" \
         --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
-fi
-
-# Builds run on the build host when it can take them, without a slot here;
-# scripts/cargo-offload says when one builds here instead, and why. Its wait
-# for a slot there spends the admission budget; the build there does not.
-offload=$(dirname "$0")/cargo-offload
-if [ "$mode" = cargo ] && [ -x "$offload" ]; then
-    deadline=$admission_deadline
-    admission_deadline=
-    status=0
-    supervised '' env CAGENTS_BUILD_ADMISSION_DEADLINE="$deadline" "$offload" "$@" || status=$?
-    admission_deadline=$deadline
-    [ "$status" -eq 75 ] || exit "$status"
 fi
 
 # A new worktree's build directory starts from the main checkout's compiled
@@ -653,7 +709,7 @@ if [ -x "$guard" ] || [ -x "$seed" ]; then
     supervised '' /bin/sh -c '
         guard=$1
         seed=$2
-        build_dir=$(cargo metadata --format-version 1 --no-deps 2>/dev/null |
+        build_dir=$("${CAGENTS_BUILD_CARGO:-cargo}" metadata --format-version 1 --no-deps 2>/dev/null |
             sed -n '\''s/.*"build_directory":"\([^"]*\)".*/\1/p'\'') || build_dir=
         if [ -n "$build_dir" ]; then
             [ ! -x "$guard" ] || "$guard" "$build_dir" || exit "$?"
@@ -694,8 +750,8 @@ if [ "$runs_separately" = true ]; then
     build_phase "$@" || status=$?
     release
     [ "$status" -eq 0 ] || exit "$status"
-    exec cargo "$subcommand" "$@"
+    exec "$cargo" "$subcommand" "$@"
 fi
-held cargo "$subcommand" "$@" || status=$?
+held "$cargo" "$subcommand" "$@" || status=$?
 release
 exit "$status"

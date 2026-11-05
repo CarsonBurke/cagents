@@ -25,6 +25,7 @@ class BuildDiskGuard(unittest.TestCase):
             if not key.startswith("CAGENTS_BUILD_")
         }
         self.env["CAGENTS_BUILD_LOCK"] = str(self.root / "cargo.lock")
+        self.env["CAGENTS_BUILD_INSTALLED_GATE"] = ""
         self.env["CAGENTS_BUILD_PRUNE"] = f"echo pruned >> {self.pruned}"
 
     def guard(self, floor, directory=None):
