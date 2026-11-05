@@ -142,6 +142,13 @@ fast_fixture=0
 if fixture_switch "${CAGENTS_FIXTURE_FAST_MODE:-0}" fixture-fast-mode; then fast_fixture=1; fi
 verbosity=0
 if fixture_switch "${CAGENTS_FIXTURE_VERBOSITY:-0}" fixture-verbosity; then verbosity=1; fi
+# The switch file may hold the delay between deltas in seconds.
+stream_reply=0
+stream_delay=0.25
+if fixture_switch "${CAGENTS_FIXTURE_STREAM_REPLY:-0}" fixture-stream-reply; then
+    stream_reply=1
+    if [ -s "$config/fixture-stream-reply" ]; then stream_delay=$(head -n 1 "$config/fixture-stream-reply"); fi
+fi
 
 busy=false
 fast=off
@@ -221,10 +228,25 @@ while IFS= read -r frame; do
                 # A Markdown file in the config directory can stand in for the
                 # answer, so rendering and long-transcript checks need no live
                 # provider.
-                reply="I’m checking the submission logs and comparing the failed run with the last successful version."
-                if [ -f "$config/fixture-reply.md" ]; then reply=$(cat "$config/fixture-reply.md"); fi
-                assistant=$(jq -cn --arg turn "$turn" --arg text "$reply" \
-                    '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:$text}],usage:{input_tokens:4200,output_tokens:180}}}')
+                # jq reads the file itself: an answer over 128 KiB exceeds the
+                # kernel's limit for a single command-line argument.
+                reply=$config/fixture-reply.md
+                [ -f "$reply" ] || reply=/dev/null
+                # Optionally stream the answer as Claude does, in text deltas
+                # before the final record, so a long answer grows across cuts.
+                if [ "$stream_reply" = 1 ] && [ -s "$reply" ]; then
+                    jq -cn --arg id "fixture-message-$turn" '{type:"stream_event",event:{type:"message_start",message:{id:$id,role:"assistant"}}}'
+                    jq -cn '{type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"text",text:""}}}'
+                    jq -cn --rawfile text "$reply" '$text | range(0; length; 16384) as $at | .[$at:$at + 16384]' |
+                        while IFS= read -r delta; do
+                            jq -cn --argjson delta "$delta" '{type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"text_delta",text:$delta}}}'
+                            sleep "$stream_delay"
+                        done
+                    jq -cn '{type:"stream_event",event:{type:"content_block_stop",index:0}}'
+                fi
+                assistant=$(jq -cn --arg turn "$turn" --rawfile text "$reply" \
+                    --arg default "I’m checking the submission logs and comparing the failed run with the last successful version." \
+                    '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:(if $text == "" then $default else $text end)}],usage:{input_tokens:4200,output_tokens:180}}}')
                 persist_record "$assistant"
                 printf '%s\n' "$assistant"
                 if [ "$turn" -eq 1 ]; then
