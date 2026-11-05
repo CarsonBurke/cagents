@@ -384,17 +384,13 @@ impl Cagents {
                 && !explicit_retry)
     }
 
-    /// Whether another window may host this terminal, so this one only
-    /// attaches to it. A restored window marks every saved terminal as
-    /// possibly shared until the registry answers; one the registry lists in
-    /// no view belongs to this window alone and recovers like any other.
-    pub(super) fn terminal_shared_in_registry(&self, card: CardId) -> bool {
-        self.shared_views.attached.contains(&card)
-            && self
-                .workspace_model
-                .views
-                .iter()
-                .any(|view| view.panes.iter().any(|pane| pane.id == card))
+    /// Whether the registry shows this card in any view, so another window
+    /// may host it.
+    fn listed_in_registry(&self, card: CardId) -> bool {
+        self.workspace_model
+            .views
+            .iter()
+            .any(|view| view.panes.iter().any(|pane| pane.id == card))
     }
 
     /// Admits again the hydration of a restored terminal whose start was held
@@ -410,12 +406,20 @@ impl Cagents {
         }
     }
 
-    /// Projecting a view admits its own held terminals again, but a terminal
-    /// can have no projection to do that: the registry lists a window-local
-    /// one in no view, and a view can stay unprojected while its scope is
-    /// still loading. Once the registry has answered, every terminal still
-    /// held is admitted here, so none waits on a projection that never comes.
-    fn readmit_held_terminals(&mut self) -> Task<Message> {
+    /// A restored window holds every saved terminal as possibly shared until
+    /// the registry answers. Projecting a view releases that view's own held
+    /// terminals, but some terminals have no projection to do it: the
+    /// registry lists a window-local terminal in no view, and a listed one's
+    /// view can stay unprojected while its scope loads. Once the registry has
+    /// answered, every terminal still held is released here, so none waits on
+    /// a projection that never comes.
+    ///
+    /// A terminal the registry lists in no view belongs to this window alone.
+    /// It stops counting as shared and restores the way an unshared window
+    /// restores it: a saved recipe is inspected without being run, attaching
+    /// only to its exact existing terminal. A listed terminal is admitted to
+    /// hydrate again and only attaches, since another window may host it.
+    fn release_held_terminals(&mut self) -> Task<Message> {
         if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
             return Task::none();
         }
@@ -423,26 +427,40 @@ impl Cagents {
             .durable
             .cards
             .iter()
-            .filter(|card| {
-                matches!(&card.kind, CardKind::Terminal(session) if !terminal_ended(session))
-                    && card.existence.is_open()
-                    && matches!(card.residency, Residency::Hydrating { .. })
-                    && matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
-                    && self.shared_views.attached.contains(&card.id)
-                    && !self.terminal_start_held(card.id, false)
-                    && !self.terminal_start_in_flight(card.id)
-                    && !self.terminal_retry_pending(card.id)
-                    && !self.pane_close_owned(card.id)
+            .filter_map(|card| match &card.kind {
+                CardKind::Terminal(session)
+                    if !terminal_ended(session)
+                        && card.existence.is_open()
+                        && matches!(card.residency, Residency::Hydrating { .. })
+                        && matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
+                        && self.shared_views.attached.contains(&card.id)
+                        && !self.terminal_start_held(card.id, false)
+                        && !self.terminal_start_in_flight(card.id)
+                        && !self.terminal_retry_pending(card.id)
+                        && !self.pane_close_owned(card.id) =>
+                {
+                    Some((card.id, card.exposure, session.clone()))
+                }
+                _ => None,
             })
-            .map(|card| (card.id, card.exposure))
             .collect::<Vec<_>>();
-        if held.is_empty() {
-            return Task::none();
-        }
-        for (card, exposure) in held {
+        let mut tasks = Vec::new();
+        let mut hydrate = false;
+        for (card, exposure, session) in held {
+            if !self.listed_in_registry(card) {
+                self.shared_views.attached.remove(&card);
+                if self.prepare_saved_terminal(card, &session) {
+                    tasks.push(self.inspect_saved_terminal(card));
+                    continue;
+                }
+            }
             self.readmit_held_terminal(card, exposure);
+            hydrate = true;
         }
-        cosmic::task::message(Message::LifecycleSweep)
+        if hydrate {
+            tasks.push(cosmic::task::message(Message::LifecycleSweep));
+        }
+        Task::batch(tasks)
     }
 
     pub(super) fn worktree_view_scope(&self, path: &Path) -> Option<Scope> {
@@ -1533,7 +1551,7 @@ impl Cagents {
             }
         }
         self.reproject_notification_unread();
-        tasks.push(self.readmit_held_terminals());
+        tasks.push(self.release_held_terminals());
         Task::batch(tasks)
     }
 
@@ -5316,10 +5334,11 @@ mod tests {
     /// #2104: a window restored while its registry is still connecting holds
     /// every saved terminal it may share. Projecting a view admits its own held
     /// terminals again once the registry answers; a terminal the registry lists
-    /// in no view has no projection, so it must be admitted too, and recovers
-    /// as this window's own rather than waiting for another window to host it.
+    /// in no view has no projection, so it must be released too. It restores
+    /// as this window's own saved terminal rather than spinning forever or
+    /// waiting for another window to host it.
     #[test]
-    fn restored_terminal_held_for_registry_starts_once_it_answers() {
+    fn restored_window_local_terminal_held_for_registry_restores_as_saved_once_it_answers() {
         let (mut app, _, _, _) = fixture();
         let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
         drop(app.insert_terminal_card(session, None));
@@ -5355,25 +5374,35 @@ mod tests {
         drop(app.apply_workspace_model_update(
             super::super::workspace_model_sync::ModelUpdate::Connected(model),
         ));
+        assert!(
+            !app.shared_views.attached.contains(&id),
+            "a terminal the registry lists in no view is this window's own"
+        );
+        assert!(
+            app.saved_terminal_current(id).is_some(),
+            "it restores as a saved terminal, as an unshared window restores it"
+        );
+        // The one start in flight is the saved terminal's metadata-only
+        // inspection, which attaches only an exact existing terminal.
+        assert_eq!(app.terminal_starts.lock().unwrap().get(&id), Some(&1));
+        // Neither the lifecycle nor a later reconciliation starts the saved
+        // command alongside it.
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        drop(app.reconcile_shared_views());
         drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
         assert_eq!(
             app.terminal_starts.lock().unwrap().get(&id),
             Some(&1),
-            "the registry answering admits the held start again"
+            "a saved recipe is not run without the user asking"
         );
-        assert!(
-            !app.terminal_shared_in_registry(id),
-            "a terminal in no shared view recovers as this window's own"
-        );
-        // A later reconciliation leaves the start in flight alone.
-        drop(app.reconcile_shared_views());
-        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
-        assert_eq!(app.terminal_starts.lock().unwrap().get(&id), Some(&1));
+        assert!(app.saved_terminal_current(id).is_some());
+        assert!(!app.shared_views.attached.contains(&id));
     }
 
     /// The shared counterpart: a held terminal the registry lists in a view
-    /// starts too, through the attach-only path, since another window may
-    /// host it.
+    /// this window does not project (here the fixture's channels are absent
+    /// from the registry) is admitted to hydrate again and stays shared, so it
+    /// only attaches, since another window may host it.
     #[test]
     fn restored_shared_terminal_held_for_registry_attaches_once_it_answers() {
         let (mut app, a, _, _) = fixture();
@@ -5405,7 +5434,8 @@ mod tests {
         ));
         drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
         assert_eq!(app.terminal_starts.lock().unwrap().get(&id), Some(&1));
-        assert!(app.terminal_shared_in_registry(id));
+        assert!(app.shared_views.attached.contains(&id));
+        assert!(app.saved_terminal_current(id).is_none());
     }
 
     #[test]

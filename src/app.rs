@@ -5868,7 +5868,7 @@ impl Cagents {
         let config = self.terminal_config(visible);
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
-        let shared = self.terminal_shared_in_registry(card);
+        let shared = self.shared_views.attached.contains(&card);
         let reserved = self
             .workspace_model
             .views
