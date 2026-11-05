@@ -6,6 +6,9 @@ use crate::{
     model::WorktreeId,
 };
 
+/// Bound a deferred reopen's wait without assuming the retirement was refused.
+pub(super) const RETIREMENT_ANSWERED: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Surface {
     Conversations,
@@ -23,6 +26,11 @@ pub(super) struct Navigation {
 pub(super) struct State {
     pub(super) view: ui::State,
     pub(super) retire_candidates: HashSet<Home>,
+    /// Retirements sent to the registry, with the view revision each expects
+    /// and when it was sent. The registry applies edits in order, so a pane
+    /// published into one of these channels before the answer arrives would
+    /// land after it retired.
+    pub(super) retiring: HashMap<crate::model::ChannelId, (u64, std::time::Instant)>,
     routes: HashMap<Home, Route>,
     main: bool,
     title: String,
@@ -37,6 +45,7 @@ impl Default for State {
         Self {
             view: ui::State::default(),
             retire_candidates: HashSet::new(),
+            retiring: HashMap::new(),
             routes: HashMap::new(),
             main: false,
             title: String::new(),
@@ -792,6 +801,9 @@ impl Cagents {
             };
             if self.workspace_model_tx.try_send(edit).is_ok() {
                 self.channel_work.retire_candidates.remove(&captured);
+                self.channel_work
+                    .retiring
+                    .insert(channel, (view.revision, std::time::Instant::now()));
             }
         }
     }
