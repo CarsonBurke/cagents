@@ -364,7 +364,22 @@ built_executables() {
 build_record() {
     printf '%s/.run-development-%s' "$products" "$ui_feature"
 }
+# Whether the gate builds on this host, as it decides. Builds on the build
+# host leave Cargo's dependency lists and build-script outputs there, so only
+# Cargo there can tell whether the products are current, and a launch always
+# asks it.
+builds_here() {
+    offload=$root/scripts/cargo-offload
+    if [ -x "$offload" ]; then
+        where=0
+        "$offload" --host >/dev/null 2>&1 || where=$?
+        [ "$where" -eq 75 ]
+    else
+        [ "${CAGENTS_BUILD_REMOTE-}" = local ]
+    fi
+}
 products_current() {
+    builds_here || return 1
     locate_products || return 1
     record=$(build_record)
     [ -f "$record" ] || return 1

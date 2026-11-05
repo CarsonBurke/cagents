@@ -194,7 +194,8 @@ cmd_build() {
     [ ! -e "${zig%/*}/cargo" ] ||
         die "$zig has a cargo beside it, which a session would run while holding the native lock; set CAGENTS_ZIG to a Zig installed apart from Cargo"
     cargo_path=$(cd -- "$checkout" && rustup which cargo)
-    # One slot for all three builds; other checkouts' builds run beside it.
+    # Each of the three builds goes through the gate's `cargo`: to the build
+    # host, or with CAGENTS_BUILD_REMOTE=local into one slot here for all three.
     "$tool_root/scripts/cargo-gate" exec "$self" --task "$task" \
         __build "$side" "$checkout" "$seed_target" "$zig" "${cargo_path%/*}"
 }
@@ -218,7 +219,9 @@ run_build() {
     (
         cd -- "$checkout"
         export CARGO_TARGET_DIR=$target
-        export PATH=${zig%/*}:$cargo_bin:$PATH
+        # The gate's `cargo` stays first among Cargos: the toolchain's own,
+        # ahead of it, would compile here.
+        export PATH=${zig%/*}:$PATH
         local arguments
         while IFS= read -r arguments; do
             # shellcheck disable=SC2086 # Deliberately one word per argument.

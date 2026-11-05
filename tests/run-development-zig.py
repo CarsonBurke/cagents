@@ -237,6 +237,16 @@ exit 83
         self.assert_skipped("--browserless")
         self.assert_skipped("--browserless")
 
+    def test_a_launch_building_on_the_build_host_always_asks_it(self):
+        # Cargo's dependency lists stay there, so nothing here can say the
+        # products are current.
+        offload = self.runner.with_name("cargo-offload")
+        offload.write_text('#!/bin/sh\n[ "$1" != --host ] || { echo build-host; exit 0; }\n'
+                           'exec cargo "$@"\n')
+        offload.chmod(0o755)
+        self.assert_built("--browserless")
+        self.assert_built("--browserless")
+
     def test_identity_records_hide_environment_values_and_stay_private(self):
         # Build tools are inert; these are synthetic values, including an
         # arbitrary variable that Cargo asks the runner to watch.
