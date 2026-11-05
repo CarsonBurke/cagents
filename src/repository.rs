@@ -3187,6 +3187,10 @@ pub struct CreateWorktreeRequest {
     /// Exact setup choice retained through uncertain creation and restart.
     #[serde(default)]
     pub setup_intent: Option<WorktreeSetupIntent>,
+    /// What resolution could not confirm, such as an unreachable remote while
+    /// checking for an existing branch; reported with the created worktree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolution_warnings: Vec<ProcessFailure>,
 }
 
 /// User intent, resolved without creating directories or changing Git refs.
@@ -5823,14 +5827,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .local
             .iter()
             .find(|local| local.name.as_str() == branch.full_ref());
+        let mut resolution_warnings = Vec::new();
         let selected_remote = if let Some((remote, name)) = explicit {
             Some((remote, name))
         } else if local.is_some() {
             None
         } else {
-            // A plain branch name is local intent. Cached remote-tracking refs
-            // can identify an existing remote branch; unknown names create a
-            // local branch without a speculative network lookup.
+            // Cached remote-tracking refs identify an existing remote branch
+            // without the network. Only a name no cache knows asks each remote,
+            // each lookup bounded by `remote_ref_oid`'s timeout, so a colleague's
+            // unfetched branch is still tracked rather than shadowed by a new
+            // unrelated one. An unreachable remote does not block creating a
+            // new local branch; the user is told it could not be checked.
             let mut candidates: Vec<_> = refs
                 .remote
                 .iter()
@@ -5838,6 +5846,28 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .filter(|(_, name)| *name == branch.as_str())
                 .map(|(remote, name)| (remote.to_owned(), name.to_owned()))
                 .collect();
+            if candidates.is_empty() {
+                let remote_side = RemoteSideRef::parse(branch.full_ref())?;
+                for remote in &remotes {
+                    match self.remote_ref_oid(&repository, &remote.name, &remote_side, cancellation)
+                    {
+                        Ok(Some(_)) => {
+                            candidates.push((remote.name.clone(), branch.as_str().to_owned()));
+                        }
+                        Ok(None) => {}
+                        Err(error) if cancellation.is_cancelled() => return Err(error),
+                        Err(error) => {
+                            let mut warning = repository_warning(&self.git, error);
+                            warning.message = format!(
+                                "Could not check {} for an existing {}; created a new local branch",
+                                remote.name,
+                                branch.as_str()
+                            );
+                            resolution_warnings.push(warning);
+                        }
+                    }
+                }
+            }
             if candidates.len() > 1 {
                 return Err(ValidationError::InvalidBranch(format!(
                     "{} exists on multiple remotes; enter one of: {}",
@@ -5946,6 +5976,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             base,
             track,
             operation_id: input.operation_id,
+            resolution_warnings,
         })
     }
 
@@ -8214,6 +8245,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("feature; echo nope");
         let request = CreateWorktreeRequest {
+            resolution_warnings: Vec::new(),
             setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
@@ -8246,6 +8278,7 @@ mod tests {
     fn tracking_is_configured_after_creation_from_the_validated_ref() {
         let root = tempfile::tempdir().unwrap();
         let request = CreateWorktreeRequest {
+            resolution_warnings: Vec::new(),
             setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
@@ -10175,6 +10208,7 @@ mod tests {
         let managed = tempfile::tempdir().unwrap();
         let plan = service
             .plan_worktree_creation(&CreateWorktreeRequest {
+                resolution_warnings: Vec::new(),
                 setup_intent: None,
                 repository: PathBuf::from("/repo"),
                 managed_root: managed.path().to_path_buf(),
@@ -12534,6 +12568,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 cancellation,
             )?
             .map(|oid| oid.to_string());
+        let warnings = request.resolution_warnings.clone();
         Ok(WorktreeJournal {
             version: 1,
             request,
@@ -12549,7 +12584,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             pr_checkout: None,
             admin_dir: None,
             outcome: None,
-            warnings: Vec::new(),
+            warnings,
             detail: "Prepared durable worktree request".into(),
         })
     }
@@ -13001,6 +13036,7 @@ mod worktree_journal_tests {
             .unwrap();
             let root = directory.path().join("managed");
             let request = CreateWorktreeRequest {
+                resolution_warnings: Vec::new(),
                 setup_intent: None,
                 repository,
                 managed_root: root.clone(),
@@ -13369,6 +13405,50 @@ mod worktree_journal_tests {
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
         assert_eq!(fixture.git(&["rev-parse", "offline/new"]), cached);
         assert!(fixture.git(&["status", "--porcelain", "-uall"]).is_empty());
+    }
+
+    #[test]
+    fn plain_name_tracks_an_unfetched_remote_branch_and_reports_an_unreachable_remote() {
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
+        remote.git(&["switch", "-c", "colleague"]);
+        remote.git(&["commit", "--allow-empty", "-m", "colleague work"]);
+        // Never fetched: no remote-tracking ref names `colleague`.
+        fixture.add_remote("origin", &remote);
+        fixture.resolve(fixture.input("colleague"));
+        assert!(fixture.request.track, "{:?}", fixture.request);
+        assert!(fixture.request.resolution_warnings.is_empty());
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(
+            fixture.git(&["rev-parse", "colleague"]),
+            remote.git(&["rev-parse", "colleague"])
+        );
+        assert_eq!(
+            fixture.git(&["config", "branch.colleague.remote"]),
+            "origin"
+        );
+
+        let mut offline = Fixture::new();
+        offline.git(&[
+            "remote",
+            "add",
+            "origin",
+            "/nonexistent/cagents-offline-remote.git",
+        ]);
+        let head = offline.git(&["rev-parse", "HEAD"]);
+        offline.resolve(offline.input("solo"));
+        assert!(!offline.request.track);
+        let report = offline.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(offline.git(&["rev-parse", "solo"]), head);
+        assert!(
+            matches!(&report.outcome, Some(WorktreeCreationOutcome::Created { warnings, .. })
+                if warnings.len() == 1
+                    && warnings[0].message
+                        == "Could not check origin for an existing solo; created a new local branch"),
+            "{report:?}"
+        );
     }
 
     #[test]

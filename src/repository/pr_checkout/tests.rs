@@ -2982,6 +2982,7 @@ fn creation_request(
     )
     .unwrap();
     let request = CreateWorktreeRequest {
+        resolution_warnings: Vec::new(),
         repository: fixture.root.clone(),
         managed_root: root.clone(),
         managed_ignore_root: None,

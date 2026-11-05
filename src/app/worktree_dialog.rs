@@ -816,6 +816,7 @@ mod tests {
                 id = resolution(&app);
             }
             let request = CreateWorktreeRequest {
+                resolution_warnings: Vec::new(),
                 repository: "/repo".into(),
                 managed_root: "/worktrees".into(),
                 managed_ignore_root: None,
@@ -1079,6 +1080,7 @@ mod tests {
 
     fn request(id: OperationId) -> CreateWorktreeRequest {
         CreateWorktreeRequest {
+            resolution_warnings: Vec::new(),
             setup_intent: None,
             repository: "/repo".into(),
             managed_root: "/".into(),
@@ -1220,6 +1222,7 @@ mod tests {
         let _ = app.start_worktree_operation(
             project,
             CreateWorktreeRequest {
+                resolution_warnings: Vec::new(),
                 repository: checkout.clone(),
                 ..request(id)
             },
