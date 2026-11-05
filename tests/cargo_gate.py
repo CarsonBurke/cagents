@@ -644,9 +644,14 @@ exec sleep 60
         gate.wait(timeout=5)
         self.wait_for(lambda: not self.is_locked(queue), "the queue to free")
         # Its request is still waiting for the slot, without the caller's streams.
+        # Read to EOF without blocking: anything the gate wrote first also reads ready.
         for stream in (gate.stdout, gate.stderr):
-            self.assertTrue(select.select([stream], [], [], 5)[0], "a stream stayed open")
-            stream.read()
+            deadline = time.monotonic() + 5
+            while select.select([stream], [], [], max(0, deadline - time.monotonic()))[0]:
+                if not os.read(stream.fileno(), 4096):
+                    break
+            else:
+                self.fail("a stream stayed open")
 
     def end_group(self, group):
         with contextlib.suppress(ProcessLookupError):
