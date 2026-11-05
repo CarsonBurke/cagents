@@ -21,7 +21,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             let query = format!(
                 "query($owner:String!,$name:String!,$number:Int!){{repository(owner:$owner,name:$name){{pullRequest(number:$number){{{BROWSER_PULL_REQUEST_FIELDS}}}}}}}"
             );
-            let data = self.graphql(
+            let data = self.graphql_allowing_not_found(
                 repository,
                 &query,
                 vec![
@@ -77,8 +77,10 @@ impl<E: ProcessExecutor> GitHubService<E> {
     }
 }
 
+/// Only an explicit `#123` names a pull request; a bare number such as a year
+/// is ordinary title text.
 fn exact_number(text: &str) -> Option<u64> {
-    let number = text.trim().strip_prefix('#').unwrap_or(text.trim());
+    let number = text.trim().strip_prefix('#')?;
     (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
         .then(|| number.parse::<u64>().ok())
         .flatten()
@@ -89,8 +91,10 @@ fn exact_number(text: &str) -> Option<u64> {
 /// remain variables; user text cannot change the repository/open constraints.
 fn search_query(repository: &GitHubRepoKey, text: &str) -> String {
     let text = text.trim();
+    // Creation order matches the open list, so a refreshed search keeps its
+    // rows and pages in place instead of reordering by relevance.
     let scope = format!(
-        "repo:{}/{} is:pr is:open",
+        "repo:{}/{} is:pr is:open sort:created-desc",
         repository.owner, repository.name
     );
     let author = text.strip_prefix('@').filter(|author| {
@@ -102,8 +106,10 @@ fn search_query(repository: &GitHubRepoKey, text: &str) -> String {
     if let Some(author) = author {
         return format!("{scope} author:{author}");
     }
-    let quoted = text.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("{scope} \"{quoted}\" in:title")
+    // GitHub search has no escape for a quote inside a phrase. Dropping
+    // quotes keeps all user text inside the one title phrase.
+    let phrase = text.replace('"', " ");
+    format!("{scope} \"{}\" in:title", phrase.trim())
 }
 
 #[cfg(test)]
@@ -146,12 +152,8 @@ mod tests {
         let calls = executor.0.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].arguments.iter().any(|arg| arg == "cursor=page2"));
-        assert!(
-            calls[0]
-                .arguments
-                .iter()
-                .any(|arg| arg == "searchText=repo:owner/repo is:pr is:open \"needle\" in:title")
-        );
+        assert!(calls[0].arguments.iter().any(|arg| arg
+            == "searchText=repo:owner/repo is:pr is:open sort:created-desc \"needle\" in:title"));
     }
 
     #[test]
@@ -215,20 +217,65 @@ mod tests {
     }
 
     #[test]
+    fn missing_pull_request_number_is_an_empty_result_not_a_host_failure() {
+        struct Missing;
+        impl ProcessExecutor for Missing {
+            fn execute(
+                &self,
+                _: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                // gh exits non-zero, but GitHub answered: no such pull request.
+                let response = serde_json::json!({
+                    "data": {"repository": {"pullRequest": null}},
+                    "errors": [{
+                        "type": "NOT_FOUND",
+                        "path": ["repository", "pullRequest"],
+                        "message": "Could not resolve to a PullRequest with the number of 2."
+                    }]
+                });
+                Ok(ProcessOutput {
+                    success: false,
+                    exit_code: Some(1),
+                    signal: None,
+                    stdout: response.to_string().into_bytes(),
+                    stderr: b"gh: Could not resolve to a PullRequest with the number of 2."
+                        .to_vec(),
+                })
+            }
+        }
+        let repo = GitHubRepoKey::new("missing-number.invalid", None, "owner", "repo").unwrap();
+        let service = GitHubService::new("gh", Arc::new(Missing));
+        let result = service
+            .search_pull_request_page(&repo, "#2", None, &CancellationToken::new())
+            .unwrap();
+        assert!(result.pull_requests.is_empty());
+        assert!(result.next_cursor.is_none());
+        assert!(
+            crate::github::polling::ready(&repo.host, false),
+            "an answered lookup must not pause polling for the host"
+        );
+    }
+
+    #[test]
     fn search_scope_and_search_modes_are_explicit() {
         let repo = GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap();
         assert_eq!(
             search_query(&repo, "@alice"),
-            "repo:owner/repo is:pr is:open author:alice"
+            "repo:owner/repo is:pr is:open sort:created-desc author:alice"
         );
         assert_eq!(exact_number("#1234"), Some(1234));
-        assert_eq!(exact_number("1234"), Some(1234));
+        assert_eq!(exact_number("1234"), None, "a bare number is title text");
         assert_eq!(exact_number("##1234"), None);
-        assert_eq!(exact_number("0"), None);
+        assert_eq!(exact_number("#0"), None);
         assert_eq!(
             search_query(&repo, "fix sidebar"),
-            "repo:owner/repo is:pr is:open \"fix sidebar\" in:title"
+            "repo:owner/repo is:pr is:open sort:created-desc \"fix sidebar\" in:title"
         );
-        assert!(!search_query(&repo, "fix repo:other/other").contains(" OR "));
+        assert_eq!(
+            search_query(&repo, "say \"hi\" repo:other/other"),
+            "repo:owner/repo is:pr is:open sort:created-desc \"say  hi  repo:other/other\" in:title",
+            "user text cannot close the phrase and add qualifiers"
+        );
     }
 }

@@ -1901,6 +1901,38 @@ impl<E: ProcessExecutor> GitHubService<E> {
         result
     }
 
+    /// Like [`Self::graphql`], but a response whose only errors are
+    /// `NOT_FOUND` is an answer: the missing objects are `null` in its data.
+    pub(crate) fn graphql_allowing_not_found(
+        &self,
+        repository: &GitHubRepoKey,
+        query: &str,
+        variables: Vec<(&str, GraphQlValue)>,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, GitHubError> {
+        repository.validate()?;
+        let command = self.graphql_command(repository, query, variables);
+        let output = self
+            .execute(&command, cancellation)
+            .map_err(GitHubError::from);
+        if let Ok(output) = &output
+            && !output.success
+            && let Some(data) = not_found_data(&output.stdout)
+        {
+            polling::succeeded(&repository.host);
+            return Ok(data);
+        }
+        let output = charge_host(
+            repository,
+            output.and_then(|output| self.checked_output(output, repository)),
+        )?;
+        let result = attach_process(parse_graphql(&output.stdout), &output);
+        if let Err(error) = &result {
+            polling::failed(&repository.host, error);
+        }
+        result
+    }
+
     fn pull_request_variables(key: &PullRequestKey) -> Vec<(&'static str, GraphQlValue)> {
         vec![
             ("owner", key.repository.owner.as_str().into()),
@@ -3098,6 +3130,20 @@ fn charge_host<T>(
         Err(error) => polling::failed(&repository.host, error),
     }
     result
+}
+
+/// The data of a GraphQL envelope whose errors are all `NOT_FOUND`.
+fn not_found_data(output: &[u8]) -> Option<serde_json::Value> {
+    let mut envelope: serde_json::Value = serde_json::from_slice(output).ok()?;
+    let errors = envelope.get("errors")?.as_array()?;
+    let all_not_found = !errors.is_empty()
+        && errors.iter().all(|error| {
+            error.get("type").and_then(serde_json::Value::as_str) == Some("NOT_FOUND")
+        });
+    all_not_found
+        .then(|| envelope.as_object_mut()?.remove("data"))
+        .flatten()
+        .filter(serde_json::Value::is_object)
 }
 
 fn parse_graphql(output: &[u8]) -> Result<serde_json::Value, GitHubError> {
