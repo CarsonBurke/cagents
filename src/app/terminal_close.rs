@@ -80,18 +80,6 @@ fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> boo
 }
 
 impl Cagents {
-    /// Brings the pane a close dialog is about into view, since a tab or group
-    /// close can be about one no one is looking at. Dismiss goes back to where
-    /// the person was. The dialog keeps the keyboard, so the pane's own focus
-    /// request is dropped rather than left for the next frame to act on.
-    fn show_close_subject(&mut self, card: CardId) -> Task<Message> {
-        let Ok(update) = self.workspace.focus(card) else {
-            return Task::none();
-        };
-        self.workspace.take_widget_focus_request();
-        self.apply_viewport(update, true, false)
-    }
-
     pub(super) fn next_queued_card_close(&mut self) -> Task<Message> {
         // The dialog blocks workspace messages, so the panes behind it would be
         // dropped unasked. Dismissing it carries on with them.
@@ -348,7 +336,7 @@ impl Cagents {
             });
             if self.terminal_close.as_ref().unwrap().detail.is_some() {
                 self.core.set_keyboard_nav(false);
-                return Task::batch([self.show_close_subject(card), close_focus(0)]);
+                return close_focus(0);
             }
             return self.start_terminal_close(allow_active);
         }
@@ -398,7 +386,7 @@ impl Cagents {
                     focus: 0,
                 });
                 self.core.set_keyboard_nav(false);
-                Task::batch([self.show_close_subject(card), close_focus(0)])
+                close_focus(0)
             }
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -760,7 +748,7 @@ impl Cagents {
                 intent.active = true;
                 intent.focus = 0;
                 self.core.set_keyboard_nav(false);
-                Task::batch([self.show_close_subject(card), close_focus(0)])
+                close_focus(0)
             }
             outcome => {
                 // `Stale` and a mismatched identity both mean the request was
@@ -791,7 +779,7 @@ impl Cagents {
                     }
                 });
                 self.core.set_keyboard_nav(false);
-                Task::batch([self.show_close_subject(card), close_focus(0)])
+                close_focus(0)
             }
         }
     }
@@ -1302,13 +1290,15 @@ mod tests {
         assert!(app.pane_close_owned(next));
     }
 
-    /// A tab or group close can be about a pane no one is looking at, so the
-    /// refusal shows the pane it means and Dismiss goes back.
+    /// The dialog's popover keeps widget operations from the strip behind it, so
+    /// moving focus there would highlight one tab over another pane's contents.
+    /// The dialog names the pane instead, and the keyboard goes back on Dismiss.
     #[test]
-    fn a_refusal_shows_the_pane_it_is_about() {
+    fn a_refusal_leaves_the_view_where_it_is() {
         let (mut app, first) = retry_close_fixture();
         let other = queued_terminal(&mut app, first);
         let _ = app.workspace.focus(first);
+        app.workspace.take_widget_focus_request();
         let state = app.card_state_mut(other).unwrap();
         state.residency = Residency::Hot;
         let CardKind::Terminal(session) = &mut state.kind else {
@@ -1330,7 +1320,8 @@ mod tests {
             generation: intent.generation,
             outcome: CloseOutcome::Kept("The pane was kept.".into()),
         }));
-        assert_eq!(app.workspace.focused(), Some(other));
+        assert!(app.terminal_close_dialog_visible());
+        assert_eq!(app.workspace.focused(), Some(first));
         assert_eq!(
             app.workspace.take_widget_focus_request(),
             None,
