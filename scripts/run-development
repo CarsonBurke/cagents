@@ -269,42 +269,27 @@ find_products() {
 products=
 build_dir=
 
-# Builds the matched set in one build slot, so an up-to-date checkout waits
-# for a slot once rather than three times. Each product is a separate Cargo
-# invocation: features are package-wide, so a single --bins invocation would
-# reunify the UI and host graphs and make the UI compile Ghostty while making
-# the daemon compile libcosmic.
+# Builds the matched set, each product through the gate: on the build host
+# each takes its own slot there and its executable comes back; with
+# CAGENTS_BUILD_REMOTE=local, or on the build host itself, each takes a slot
+# here. Each product is a separate Cargo invocation: features are
+# package-wide, so a single --bins invocation would reunify the UI and host
+# graphs and make the UI compile Ghostty while making the daemon compile
+# libcosmic.
 build_products() {
-    # On a build host each build takes its own slot there and copies its
-    # executable back; one local slot for all three would only hold this
-    # host's queue while they build elsewhere.
-    if "$root/scripts/cargo-offload" --host >/dev/null 2>&1; then
-        # shellcheck disable=SC2016 # expanded by the inner shell
-        "$@" sh -ec '
-            gate=$1
-            shift
-            "$gate" build --locked --profile dev-runtime $1 --features development --bin cagents
-            "$gate" build --locked --profile dev-runtime $1 --features development,host --bin cagentsd
-            "$gate" build --locked --profile dev-runtime $1 --features "development,$2" --bin cagents-ui
-            if [ -n "$3" ]; then
-                for executable in cagents cagentsd cagents-ui; do
-                    stat -c "%n %i %s %.9Y" "$4/$executable"
-                done >"$3"
-            fi
-        ' build-products "$root/scripts/cargo-gate" "$default_features" "$ui_feature" "${built:-}" "$products"
-        return
-    fi
     # shellcheck disable=SC2016 # expanded by the inner shell
-    "$root/scripts/cargo-gate" exec "$@" sh -ec '
-        cargo build --locked --profile dev-runtime $1 --features development --bin cagents
-        cargo build --locked --profile dev-runtime $1 --features development,host --bin cagentsd
-        cargo build --locked --profile dev-runtime $1 --features "development,$2" --bin cagents-ui
+    "$@" sh -ec '
+        gate=$1
+        shift
+        "$gate" build --locked --profile dev-runtime $1 --features development --bin cagents
+        "$gate" build --locked --profile dev-runtime $1 --features development,host --bin cagentsd
+        "$gate" build --locked --profile dev-runtime $1 --features "development,$2" --bin cagents-ui
         if [ -n "$3" ]; then
             for executable in cagents cagentsd cagents-ui; do
                 stat -c "%n %i %s %.9Y" "$4/$executable"
             done >"$3"
         fi
-    ' build-products "$default_features" "$ui_feature" "${built:-}" "$products"
+    ' build-products "$root/scripts/cargo-gate" "$default_features" "$ui_feature" "${built:-}" "$products"
 }
 
 # A launch with nothing to build skips the build gate, whose queue can be long
@@ -379,7 +364,22 @@ built_executables() {
 build_record() {
     printf '%s/.run-development-%s' "$products" "$ui_feature"
 }
+# Whether the gate builds on this host, as it decides. Builds on the build
+# host leave Cargo's dependency lists and build-script outputs there, so only
+# Cargo there can tell whether the products are current, and a launch always
+# asks it.
+builds_here() {
+    offload=$root/scripts/cargo-offload
+    if [ -x "$offload" ]; then
+        where=0
+        "$offload" --host >/dev/null 2>&1 || where=$?
+        [ "$where" -eq 75 ]
+    else
+        [ "${CAGENTS_BUILD_REMOTE-}" = local ]
+    fi
+}
 products_current() {
+    builds_here || return 1
     locate_products || return 1
     record=$(build_record)
     [ -f "$record" ] || return 1

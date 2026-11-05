@@ -127,7 +127,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let mut request = self.resolve_worktree_request(&input, cancellation)?;
         if !consent.track && !request.track {
-            let existing = self.resolve_optional_revision(
+            let existing = self.resolve_optional_ref(
                 &request.repository,
                 &request.branch.full_ref(),
                 cancellation,

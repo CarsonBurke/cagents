@@ -1012,7 +1012,12 @@ pub(super) fn process_request(
             ensure_control_open(host)?;
             super::agent_execution::terminals::admit(host, client_id, &request)?;
         }
-        let reservation = super::account_lifecycle::Reservation::for_operation(host, operation)?;
+        let reservation = match operation {
+            crate::account::remote::Operation::Restore { .. } => {
+                super::account_lifecycle::reserve_restore(host, operation)?
+            }
+            _ => super::account_lifecycle::Reservation::for_operation(host, operation)?,
+        };
         let value = crate::account::remote::execute_reserved(operation.clone(), &reservation)
             .map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)

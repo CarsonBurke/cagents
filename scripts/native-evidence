@@ -194,7 +194,8 @@ cmd_build() {
     [ ! -e "${zig%/*}/cargo" ] ||
         die "$zig has a cargo beside it, which a session would run while holding the native lock; set CAGENTS_ZIG to a Zig installed apart from Cargo"
     cargo_path=$(cd -- "$checkout" && rustup which cargo)
-    # One slot for all three builds; other checkouts' builds run beside it.
+    # Each of the three builds goes through the gate's `cargo`: to the build
+    # host, or with CAGENTS_BUILD_REMOTE=local into one slot here for all three.
     "$tool_root/scripts/cargo-gate" exec "$self" --task "$task" \
         __build "$side" "$checkout" "$seed_target" "$zig" "${cargo_path%/*}"
 }
@@ -218,7 +219,9 @@ run_build() {
     (
         cd -- "$checkout"
         export CARGO_TARGET_DIR=$target
-        export PATH=${zig%/*}:$cargo_bin:$PATH
+        # The gate's `cargo` stays first among Cargos: the toolchain's own,
+        # ahead of it, would compile here.
+        export PATH=${zig%/*}:$PATH
         local arguments
         while IFS= read -r arguments; do
             # shellcheck disable=SC2086 # Deliberately one word per argument.
@@ -584,8 +587,10 @@ run_app() {
     write_session_cargo "$side" "$checkout"
     session_path=$state/session-bin:
     # The runner still calls scripts/cargo-gate, which must not join the shared queue.
+    # Its builds replay the recorded ones through the session's cargo, here.
     local status=0
     fixture_env env CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
+        CAGENTS_BUILD_REMOTE=local \
         scripts/run-development --browserless --debug --log-file "$logs/ui-$side.log" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then

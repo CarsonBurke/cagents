@@ -81,6 +81,7 @@ mod hover;
 pub(super) mod images;
 mod layout;
 mod literal_content;
+mod logical_prose;
 mod markdown;
 mod markdown_source;
 mod monospace;
@@ -224,6 +225,10 @@ pub enum Action {
     /// Points a draft at another account of its provider.
     ChooseAccount(Target, AccountId),
     RecoverAccount(CardId, AccountId),
+    /// Asks the device to list a conversation's account again: its home is
+    /// still there, but the account list lost it.
+    RestoreAccount(CardId),
+    AccountRestored(CardId, Result<account::remote::RestoredHome, String>),
     /// Installed skills read without starting the draft's provider.
     DraftSkills(Target, chat::Launch, Vec<chat::Skill>),
     /// Opens or closes the account choice.
@@ -327,6 +332,8 @@ pub enum Action {
     Copy(Target, String, CopyPart),
     CopyMessage(Target, String, Option<chat::TextCopySource>),
     MessageCopied(Target, String, text_copy::Request, Result<String, String>),
+    /// A complete message read for a window that shows only part of it.
+    LogicalProseRead(Target, chat::TextCopySource, Result<String, String>),
     MarkdownPrepared(Target, String, u64, preparation::Ready),
     LocalPromptPrepared(Target, u64, preparation::Ready),
     RetryMarkdown(Target),
@@ -363,6 +370,13 @@ pub enum Action {
     TakeBackQueued(Target, Option<QueueEntry>),
     RemoveQueued(Target, QueueEntry),
     ComposerActions(Target, bool),
+    /// What the reader has typed into the `+` menu's search.
+    ComposerActionsQuery(Target, String),
+    /// Enter in the `+` menu's search: its first row that can be pressed.
+    ComposerActionsSubmit(Target),
+    /// A command or skill chosen from the `+` menu, by the text slash
+    /// completion would put in the draft for it.
+    ComposerName(Target, String),
     BranchPicker(Target, bool),
     ChangesPicker(Target, bool),
     ChangeFiles(Target, Option<chat::FileChangeKey>),
@@ -490,6 +504,7 @@ impl Action {
                 | Self::ChangesLoaded(..)
                 | Self::ChangedFileResolved(..)
                 | Self::MessageCopied(..)
+                | Self::LogicalProseRead(..)
                 | Self::Attached(..)
                 | Self::PastedImage(..)
                 | Self::PastedText(..)
@@ -666,6 +681,54 @@ fn draft_start_backend() -> Option<(String, String, String)> {
     })
 }
 
+/// The account home `session` launches its provider in, as its launch names it.
+fn chat_account_home(session: &chat::Session) -> Option<&str> {
+    let variable = account::home_variable(session.launch.provider)?;
+    session
+        .launch
+        .recipe
+        .environment
+        .get(variable)
+        .map(String::as_str)
+}
+
+/// The account a refused start was on, which the account list lost but whose
+/// home the device kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestorableAccount {
+    provider: Provider,
+    key: uuid::Uuid,
+    /// The home the refused start used, as its launch named it.
+    home: String,
+    /// While the device is restoring it.
+    restoring: bool,
+    /// Why the last restore left it unlisted.
+    failure: Option<String>,
+    /// A draft's message the refusal returned to its composer, sent once the
+    /// account is back.
+    resend: Option<Resend>,
+}
+
+/// What a refused draft was about to send. Once the reader edits the message
+/// or chooses another account, it is no longer what they asked to send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Resend {
+    text: String,
+    /// The home the draft's account choice names; `None` while it lets the
+    /// router choose.
+    account: Option<String>,
+}
+
+impl Resend {
+    fn of(runtime: &Runtime) -> Option<Self> {
+        let text = runtime.composer.text();
+        (runtime.is_draft() && !text.trim().is_empty()).then(|| Self {
+            text,
+            account: chat_account_home(&runtime.session).map(str::to_owned),
+        })
+    }
+}
+
 pub(super) struct State {
     channel_names: HashMap<Target, ChannelNameObservation>,
     pub(super) image_viewer: Option<images::Gallery>,
@@ -708,6 +771,9 @@ pub(super) struct State {
     /// Capacity failures before a chat runtime exists (saved-pane hydration).
     capacity_offers: HashSet<CardId>,
     removed_accounts: HashSet<CardId>,
+    /// Cards refused because the account list does not name their account,
+    /// whose home is still on the device and can be restored.
+    restorable_accounts: HashMap<CardId, RestorableAccount>,
     /// The model last chosen for each provider, and its effort, which a new
     /// conversation of that provider starts on.
     last_models: HashMap<Provider, (String, Option<String>)>,
@@ -734,6 +800,7 @@ impl Default for State {
             fresh_offers: HashSet::new(),
             capacity_offers: HashSet::new(),
             removed_accounts: HashSet::new(),
+            restorable_accounts: HashMap::new(),
             last_models: HashMap::new(),
         }
     }
@@ -1371,7 +1438,7 @@ impl CachedItem {
             + self
                 .blocks
                 .values()
-                .map(prose::CodeBlock::retained_span_bytes)
+                .map(prose::CodeBlock::retained_bytes)
                 .sum::<usize>()
             + self.preview.retained_bytes()
             + self
@@ -1970,6 +2037,48 @@ impl ChannelNameObservation {
     }
 }
 
+/// A row of the composer's `+` menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ComposerRow {
+    Attach,
+    Plan,
+    Steering,
+    Fork,
+    Compact,
+}
+
+impl ComposerRow {
+    /// The row's control id within its card.
+    pub(super) fn id(self) -> &'static str {
+        match self {
+            Self::Attach => "chat-attach",
+            Self::Plan => "chat-actions-plan",
+            Self::Steering => "chat-actions-steering",
+            Self::Fork => "chat-actions-fork",
+            Self::Compact => "chat-actions-compact",
+        }
+    }
+
+    /// The words the menu's search finds the row by, which include its
+    /// label in each state it can show.
+    fn keywords(self) -> &'static str {
+        match self {
+            Self::Attach => "attach files images add upload attachment",
+            Self::Plan => "plan mode leave permissions explore",
+            Self::Steering => "steering steer after turn tools interrupt",
+            Self::Fork => "fork conversation branch",
+            Self::Compact => "compact conversation summarize context",
+        }
+    }
+}
+
+/// One entry of the `+` menu: an action of the composer's own, or a command
+/// or skill it names into the draft exactly as slash completion would.
+pub(super) enum MenuEntry<'a> {
+    Row(ComposerRow),
+    Named(completion::Candidate<'a>),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HistoryNavigation {
     EarlierEdge,
@@ -2147,8 +2256,14 @@ pub(super) struct Runtime {
     /// sending it again queues it unless the reader chooses otherwise.
     resend: Option<PromptMode>,
     composer_actions: bool,
+    /// The `+` menu's search, cleared each time the menu opens.
+    composer_actions_query: String,
+    /// The permission mode plan mode replaced, which leaving it restores.
+    mode_before_plan: Option<String>,
     branch_picker: bool,
     changes: changes::State,
+    /// Joins the parts of a long message back into one before presentation.
+    logical_prose: logical_prose::State,
     fork_requested: bool,
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
@@ -2291,6 +2406,10 @@ impl Drop for Runtime {
 /// The name the composer accepts for compaction where the provider offers it
 /// as a capability rather than as one of its listed commands.
 pub(super) const COMPACT_COMMAND: &str = "compact";
+/// The `+` menu's search field.
+pub(super) const COMPOSER_SEARCH: &str = "chat-actions-search";
+/// The permission mode in which a provider plans before it changes anything.
+pub(super) const PLAN_MODE: &str = "plan";
 pub(super) const PERMISSIONS_COMMAND: &str = "permissions";
 
 fn permissions_available(snapshot: &Snapshot) -> bool {
@@ -2400,6 +2519,19 @@ fn submission(
     }
 }
 
+/// Whether `current` only appends to `previous`. The client's wire lineage
+/// proves it for provider items; a long message presented as one is a new
+/// item on each publication, so its source's append-only revision proves it.
+fn known_append(
+    handle: Option<&Arc<ClientHandle>>,
+    prose: &logical_prose::State,
+    previous: &Arc<chat::Item>,
+    current: &Arc<chat::Item>,
+) -> bool {
+    handle.is_some_and(|handle| handle.known_append(previous, current))
+        || prose.proves(previous, current)
+}
+
 impl Runtime {
     /// The word the caret is naming something with and the rows offered for
     /// it, or `None` while there is nothing to offer.
@@ -2458,17 +2590,30 @@ impl Runtime {
         }) else {
             return false;
         };
+        self.apply_completion(&token, insertion);
+        true
+    }
+
+    /// Puts `insertion` over `token` as one edit of the draft, which ends any
+    /// history browsing and invalidates attachment positions read before it.
+    fn apply_completion(&mut self, token: &completion::Token, insertion: &str) {
+        completion::apply(&mut self.composer, token, insertion);
+        self.named_in_draft();
+    }
+
+    /// Settles the draft after a name was put in it: the edit moved text
+    /// under any attachment placed by position, and ends the completion and
+    /// history walk it came from.
+    fn named_in_draft(&mut self) {
         for bookmark in self.attachment_bookmarks.values_mut() {
             bookmark.valid = false;
         }
         self.attachment_jobs.clear();
-        completion::apply(&mut self.composer, &token, insertion);
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
         self.history_cursor = None;
         self.history_stash = None;
         self.history_attachment_stash = None;
-        true
     }
 
     /// Retain exact receipt metadata across take-back, queue edits and retry.
@@ -3096,8 +3241,11 @@ impl Runtime {
             taken_back: Vec::new(),
             resend: None,
             composer_actions: false,
+            composer_actions_query: String::new(),
+            mode_before_plan: None,
             branch_picker: false,
             changes: changes::State::default(),
+            logical_prose: logical_prose::State::default(),
             fork_requested: false,
             fork_seen: None,
             files: None,
@@ -3383,6 +3531,268 @@ impl Runtime {
     /// resume. Do not turn this into a provider capability or send permission.
     fn accepts_draft_attachments(&self) -> bool {
         self.snapshot.capabilities.attachments || self.has_connected_saved_history(&self.snapshot)
+    }
+
+    /// Whether the composer takes a message now. A first or queued message
+    /// still waiting goes before anything else is sent.
+    pub(super) fn composer_available(&self, transitioning: bool) -> bool {
+        !transitioning
+            && !self.closed_elsewhere
+            && !self.disconnected
+            && !self.snapshot.exited
+            && self.pending.is_none()
+            && self.queued.is_none()
+    }
+
+    /// The `+` menu's rows in the order it lists them, each with whether it
+    /// can be pressed now. Attaching stays listed while a draft cannot take
+    /// one, as the paperclip it replaced stayed visible but disabled.
+    pub(super) fn composer_action_rows(&self, transitioning: bool) -> Vec<(ComposerRow, bool)> {
+        let snapshot = &self.snapshot;
+        let available = self.composer_available(transitioning);
+        let commands =
+            available && snapshot.ready && !snapshot.busy && snapshot.read_only_reason.is_none();
+        let attach = !transitioning
+            && (!snapshot.exited || self.has_connected_saved_history(snapshot))
+            && !self.closed_elsewhere
+            && !self.disconnected
+            && self.pending.is_none()
+            && self.queued.is_none()
+            && self.attachment_chooser_pending.is_none();
+        [
+            (
+                self.accepts_draft_attachments(),
+                ComposerRow::Attach,
+                attach,
+            ),
+            (
+                self.plan_toggle().is_some(),
+                ComposerRow::Plan,
+                // The footer's mode control is offered on the same terms.
+                !transitioning
+                    && !(self.session.launch.provider == Provider::Codex && snapshot.busy),
+            ),
+            (
+                !snapshot.capabilities.interrupt_modes.is_empty(),
+                ComposerRow::Steering,
+                available,
+            ),
+            (snapshot.capabilities.branch, ComposerRow::Fork, commands),
+            (
+                snapshot.capabilities.compact,
+                ComposerRow::Compact,
+                commands,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(listed, row, enabled)| listed.then_some((row, enabled)))
+        .collect()
+    }
+
+    /// The permission mode the `+` menu's plan row switches to: plan mode,
+    /// or out of it to the mode it replaced. `None` where the provider has no
+    /// plan mode, or nothing else to return to.
+    pub(super) fn plan_toggle(&self) -> Option<&str> {
+        let modes = &self.snapshot.capabilities.permission_modes;
+        modes.iter().any(|mode| mode == PLAN_MODE).then_some(())?;
+        if self.snapshot.permission_mode.as_deref() != Some(PLAN_MODE) {
+            return Some(PLAN_MODE);
+        }
+        let other = |mode: &&String| mode.as_str() != PLAN_MODE;
+        self.mode_before_plan
+            .as_ref()
+            .filter(|mode| modes.contains(mode))
+            .filter(other)
+            .or_else(|| {
+                modes
+                    .iter()
+                    .find(|mode| matches!(mode.as_str(), "default" | "manual"))
+            })
+            .or_else(|| modes.iter().find(other))
+            .map(String::as_str)
+    }
+
+    /// What pressing a row of the `+` menu does: the action the control it
+    /// stands for has always sent.
+    pub(super) fn composer_row_action(&self, row: ComposerRow) -> Action {
+        let target = self.target;
+        match row {
+            ComposerRow::Attach => Action::Attach(target),
+            ComposerRow::Plan => {
+                Action::PermissionMode(target, self.plan_toggle().unwrap_or(PLAN_MODE).to_owned())
+            }
+            ComposerRow::Steering => {
+                let wait = self.snapshot.interrupt_mode.as_deref() == Some("wait");
+                Action::Command(
+                    target,
+                    Command::SetInterruptMode {
+                        mode: if wait { "immediate" } else { "wait" }.into(),
+                    },
+                )
+            }
+            ComposerRow::Fork => Action::BranchPicker(target, true),
+            ComposerRow::Compact => Action::Command(target, Command::Compact),
+        }
+    }
+
+    /// The commands and skills the `+` menu names into the draft: the ones
+    /// slash completion offers for a `/` at the caret, matching the menu's
+    /// search. Commands are offered only for an empty draft, the one place
+    /// the provider reads them as commands, as completion offers them only
+    /// at the head of a message. Compaction has a row of its own.
+    pub(super) fn composer_menu_names(&self) -> Vec<completion::Candidate<'_>> {
+        let blank = self.attachments.is_empty()
+            && self
+                .composer
+                .lines()
+                .all(|line| line.text.trim().is_empty());
+        self.names_matching(&self.composer_actions_search(), blank)
+    }
+
+    /// The menu's search as it is matched: a slash or skill sigil typed out
+    /// of habit is not part of any name.
+    fn composer_actions_search(&self) -> String {
+        self.composer_actions_query
+            .trim()
+            .trim_start_matches([completion::COMMAND_SIGIL, '$'])
+            .to_lowercase()
+    }
+
+    /// Whether the `+` menu has commands or skills to search among, which
+    /// with the composer's own `/resume` is every chat it is offered in. It
+    /// does not depend on the draft, so the search keeps its place while
+    /// words typed into the draft set the commands aside, and while a query
+    /// narrows the list to nothing, so it can be undone.
+    pub(super) fn composer_menu_searchable(&self) -> bool {
+        !self.names_matching("", true).is_empty()
+    }
+
+    fn names_matching(&self, query: &str, blank: bool) -> Vec<completion::Candidate<'_>> {
+        completion::candidates(
+            &self.snapshot,
+            &completion::Token {
+                line: 0,
+                start: 0,
+                end: 0,
+                sigil: completion::COMMAND_SIGIL,
+                query: query.to_owned(),
+                tail: String::new(),
+                leading: blank,
+            },
+        )
+        .into_iter()
+        .filter(|row| !(row.kind == completion::Kind::Command && row.name == COMPACT_COMMAND))
+        .collect()
+    }
+
+    /// The `+` menu in the order it lists its entries, narrowed by its
+    /// search, each with whether it can be pressed now.
+    pub(super) fn composer_menu(&self, transitioning: bool) -> Vec<(MenuEntry<'_>, bool)> {
+        let query = self.composer_actions_search();
+        // Every word searched for starts a word of what the row does.
+        let found = |row: ComposerRow| {
+            query.split_whitespace().all(|word| {
+                row.keywords()
+                    .split_whitespace()
+                    .any(|keyword| keyword.starts_with(word))
+            })
+        };
+        // Naming something changes only the draft, which stays editable
+        // while a turn runs and while a message waits to go.
+        let names = !transitioning && !self.closed_elsewhere && !self.disconnected;
+        self.composer_action_rows(transitioning)
+            .into_iter()
+            .filter(|(row, _)| found(*row))
+            .map(|(row, enabled)| (MenuEntry::Row(row), enabled))
+            .chain(
+                self.composer_menu_names()
+                    .into_iter()
+                    .map(|name| (MenuEntry::Named(name), names)),
+            )
+            .collect()
+    }
+
+    /// Names `insertion` in the draft as a word of its own, through the same
+    /// edit completion makes: at the caret, or at the head of the message for
+    /// a skill the provider would not load from the caret, as Claude Code
+    /// loads only a skill the message opens with. The caret stays with the
+    /// words it was among.
+    fn name_in_draft(&mut self, insertion: &str, kind: completion::Kind) {
+        let caret = self.composer.cursor().position;
+        let at_caret = self.spaced_name(caret, insertion);
+        // A message that opens with a command or a shell escape is read as
+        // that, so a skill is never put ahead of it.
+        let opened = self
+            .composer
+            .text()
+            .trim_start()
+            .starts_with([completion::COMMAND_SIGIL, '!']);
+        let lead = kind == completion::Kind::Skill && !opened && {
+            let offset = self
+                .composer
+                .lines()
+                .take(caret.line)
+                .map(|line| line.text.len() + line.ending.as_str().len())
+                .sum::<usize>()
+                + caret.column;
+            let mut message = self.composer.text();
+            message.insert_str(offset.min(message.len()), &at_caret);
+            completion::unloaded(
+                &message,
+                &self.snapshot.skills,
+                self.snapshot.capabilities.skill_reach,
+            )
+            .contains(&insertion)
+        };
+        let at = if lead {
+            text_editor::Position { line: 0, column: 0 }
+        } else {
+            caret
+        };
+        let named = if lead {
+            self.spaced_name(at, insertion)
+        } else {
+            at_caret
+        };
+        self.composer.move_to(text_editor::Cursor {
+            position: at,
+            selection: None,
+        });
+        self.composer
+            .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                Arc::new(named.clone()),
+            )));
+        self.named_in_draft();
+        if lead {
+            let column = caret.column + if caret.line == 0 { named.len() } else { 0 };
+            self.composer.move_to(text_editor::Cursor {
+                position: text_editor::Position { column, ..caret },
+                selection: None,
+            });
+        }
+    }
+
+    /// `insertion` as it is put in the draft at `at`: set apart by a space
+    /// from a word before it and from what follows, unless that is a space
+    /// already or punctuation that closes a phrase, and followed by one at
+    /// the end of a line, ready for the rest of the sentence.
+    fn spaced_name(&self, at: text_editor::Position, insertion: &str) -> String {
+        let line = self.composer.line(at.line);
+        let text = line.as_ref().map_or("", |line| &line.text);
+        let before = text
+            .get(..at.column)
+            .and_then(|text| text.chars().next_back());
+        let after = text.get(at.column..).and_then(|text| text.chars().next());
+        let lead = if before.is_some_and(|before| !before.is_whitespace()) {
+            " "
+        } else {
+            ""
+        };
+        let trail = match after {
+            Some(after) if after.is_whitespace() || ",.;!?)]}".contains(after) => "",
+            _ => " ",
+        };
+        format!("{lead}{insertion}{trail}")
     }
 
     pub(super) fn parent_transcript_selected(&self) -> bool {
@@ -3778,9 +4188,7 @@ impl Runtime {
                             (ItemContent::Text { text: old, thinking: a, phase: x },
                              ItemContent::Text { text: next, thinking: b, phase: y })
                             if old.len() == next.len() && a == b && x == y)
-                        && handle
-                            .as_ref()
-                            .is_some_and(|handle| handle.known_append(previous, item))
+                        && known_append(handle.as_ref(), &self.logical_prose, previous, item)
                 });
                 let metadata_reused = metadata_proven
                     && self.preparation.retarget_metadata(
@@ -3813,9 +4221,7 @@ impl Runtime {
                         previous.role == item.role
                             && ChangeToken::of(&previous.content).shape
                                 == ChangeToken::of(&item.content).shape
-                            && handle
-                                .as_ref()
-                                .is_some_and(|handle| handle.known_append(previous, item))
+                            && known_append(handle.as_ref(), &self.logical_prose, previous, item)
                     });
                 // Bytes alone do not bound rich-block parsing or thousands
                 // of tiny fences. Every changed prose publication goes to the
@@ -3825,13 +4231,17 @@ impl Runtime {
                         item,
                         growing && (!reader_only || coordinated),
                         theme,
-                        |old, new| {
-                            handle
-                                .as_ref()
-                                .is_some_and(|handle| handle.known_append(old, new))
-                        },
+                        |old, new| known_append(handle.as_ref(), &self.logical_prose, old, new),
                     );
-                    if replaced && !exact && !proven_from_cache {
+                    // A presentation that reaches further into the same
+                    // revision of a long message is not an append when its
+                    // window starts elsewhere, but what is shown stays true
+                    // of it until the worker finishes.
+                    let superseded = current
+                        .filter(|cached| !cached.placeholder)
+                        .and_then(|cached| cached.item.as_ref())
+                        .is_some_and(|previous| self.logical_prose.supersedes(previous, item));
+                    if replaced && !exact && !proven_from_cache && !superseded {
                         let replacement = CachedItem::preparing_replacement(
                             item,
                             theme,
@@ -3875,9 +4285,7 @@ impl Runtime {
                 .and_then(|cached| cached.item.as_ref())
                 .filter(|previous| !Arc::ptr_eq(previous, item))
                 .is_some_and(|previous| {
-                    handle
-                        .as_ref()
-                        .is_some_and(|handle| handle.known_append(previous, item))
+                    known_append(handle.as_ref(), &self.logical_prose, previous, item)
                 });
             if let Some(cached) = cache.get_mut(&item.id) {
                 cached.reader_memory = self.scroll_memory.clone();
@@ -4071,6 +4479,7 @@ impl Runtime {
             self.source_clock = source_clock;
             return;
         }
+        let mut snapshot = self.logical_prose.project(snapshot);
         self.scroll_memory.latest_source(
             self.page_request
                 .filter(|(page, _)| *page == view::Page::Latest)
@@ -4651,6 +5060,7 @@ impl Runtime {
         let bytes = self.snapshot.transcript_bytes();
         let cache_entries = self.cache.len();
         self.release_transcript_caches();
+        self.logical_prose.release();
         Arc::make_mut(&mut self.snapshot).evict_transcript();
         if self.history_cursor.is_none() {
             self.history = Vec::new();
@@ -5792,6 +6202,184 @@ impl Cagents {
         self.load_draft_skills(target)
     }
 
+    /// The managed account `session` was recorded on, when the account list
+    /// lost it but its home may still be on the device, and that home.
+    fn restorable_chat_account(
+        &self,
+        session: &chat::Session,
+    ) -> Option<(Provider, uuid::Uuid, String)> {
+        let home = chat_account_home(session)?;
+        self.account_ui
+            .restorable_home(Path::new(home))
+            .filter(|(provider, _)| *provider == session.launch.provider)
+            .map(|(provider, key)| (provider, key, home.to_owned()))
+    }
+
+    /// Offers to restore `own`'s account after the daemon refused `card`
+    /// because its account list does not name it, and asks for that at once.
+    ///
+    /// Restoring is what the daemon does by itself for such a home, so the
+    /// refusal asks for it rather than waiting on a click or the daemon's next
+    /// look. Unless `again`, a later refusal for the same account keeps its
+    /// reason on screen and leaves retrying, or another account, to the
+    /// reader. A draft's message, back in its composer, is remembered to be
+    /// sent once the account is restored.
+    fn offer_chat_account_restore(
+        &mut self,
+        card: CardId,
+        own: &chat::Session,
+        again: bool,
+    ) -> Task<Message> {
+        let Some((provider, key, home)) = self.restorable_chat_account(own) else {
+            self.chat_ui.restorable_accounts.remove(&card);
+            return Task::none();
+        };
+        let resend = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Resend::of(runtime),
+            _ => None,
+        };
+        let offered = self
+            .chat_ui
+            .restorable_accounts
+            .get(&card)
+            .filter(|offered| (offered.provider, offered.key) == (provider, key));
+        if offered.is_some() && !again {
+            return Task::none();
+        }
+        let restoring = offered.is_some_and(|offered| offered.restoring);
+        self.chat_ui.restorable_accounts.insert(
+            card,
+            RestorableAccount {
+                provider,
+                key,
+                home,
+                restoring,
+                failure: None,
+                resend,
+            },
+        );
+        self.restore_chat_account(card)
+    }
+
+    /// Lists the conversation's own account again, on the device that keeps
+    /// its home, so the conversation continues where its history is.
+    fn restore_chat_account(&mut self, card: CardId) -> Task<Message> {
+        if self.chat_start_pending(card) {
+            return Task::none();
+        }
+        let Some(restorable) = self.chat_ui.restorable_accounts.get_mut(&card) else {
+            return Task::none();
+        };
+        if restorable.restoring {
+            return Task::none();
+        }
+        restorable.restoring = true;
+        restorable.failure = None;
+        let operation = account::remote::Operation::Restore {
+            provider: restorable.provider,
+            key: restorable.key,
+        };
+        // A draft has no recovery controls; its refusal says what is under way.
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card)
+            && runtime.is_draft()
+        {
+            runtime.error = Some(
+                "This account isn't in the account list, but its files were kept. Checking its sign-in to restore it…"
+                    .into(),
+            );
+        }
+        cosmic::task::future(async move {
+            let result =
+                tokio::task::spawn_blocking(
+                    move || match crate::device_service::request_for_reader(
+                        crate::device_service::Operation::AccountLifecycle { operation },
+                    )? {
+                        crate::device_service::Reply::AccountLifecycle(value) => {
+                            serde_json::from_value(value).map_err(|error| error.to_string())
+                        }
+                        _ => Err("The device did not restore the account".into()),
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            Message::ChatUi(Action::AccountRestored(card, result))
+        })
+    }
+
+    fn chat_account_restored(
+        &mut self,
+        card: CardId,
+        result: Result<account::remote::RestoredHome, String>,
+    ) -> Task<Message> {
+        let Some(restorable) = self.chat_ui.restorable_accounts.get_mut(&card) else {
+            if let Ok(restored) = result {
+                self.account_ui.set_registry(restored.registry);
+            }
+            return Task::none();
+        };
+        restorable.restoring = false;
+        let restored = match result {
+            Ok(restored) => restored,
+            Err(error) => {
+                // The card shows why, in place of the promise that the account
+                // could be restored: a draft in place of the conversation it
+                // has not started, where sending again asks again.
+                if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card)
+                    && runtime.is_draft()
+                {
+                    runtime.error = Some(format!("{error} Choose another account, or send again."));
+                }
+                restorable.failure = Some(error);
+                return Task::none();
+            }
+        };
+        let restorable = self
+            .chat_ui
+            .restorable_accounts
+            .remove(&card)
+            .expect("checked above");
+        self.chat_ui.removed_accounts.remove(&card);
+        let email = restored
+            .registry
+            .find(restorable.key)
+            .and_then(|account| account.email.clone());
+        self.account_ui.set_registry(restored.registry);
+        let Some(CardKind::Chat(source)) = self.card_state(card).map(|state| &state.kind) else {
+            return Task::none();
+        };
+        let session = source.clone();
+        let name =
+            email.unwrap_or_else(|| format!("The {} account", session.launch.provider.label()));
+        let notice = match restored.restored {
+            account::registry::Restored::Archived { .. } => format!(
+                "{name} was restored and archived, because another account uses the same login."
+            ),
+            _ => format!("{name} was restored."),
+        };
+        self.status = Some(TransientNotice::success(notice).with_key(NoticeKey::ChatAttach(card)));
+        // A draft has no conversation to reopen: the refusal answered its
+        // first send, whose message is back in the composer. Sending it again
+        // finishes what the reader asked for - if it is still what they
+        // asked, on the account that was restored.
+        if session.launch.session_id.is_none() {
+            let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+                return Task::none();
+            };
+            if !runtime.is_draft() {
+                return Task::none();
+            }
+            runtime.error = None;
+            if restorable.resend.is_none() || restorable.resend != Resend::of(runtime) {
+                return Task::none();
+            }
+            let target = runtime.target;
+            return self.handle_chat_ui(Action::Submit(target, PromptMode::Send));
+        }
+        let intent = self.chat_retry_intent(card, &session);
+        self.start_chat(card, session, intent, None, false)
+    }
+
     fn recover_chat_account(&mut self, card: CardId, id: AccountId) -> Task<Message> {
         self.change_chat_account(card, id, None, None)
     }
@@ -5858,6 +6446,11 @@ impl Cagents {
     ) -> Task<Message> {
         if (generation.is_none() && !self.chat_ui.removed_accounts.contains(&card))
             || self.chat_start_pending(card)
+            || self
+                .chat_ui
+                .restorable_accounts
+                .get(&card)
+                .is_some_and(|restorable| restorable.restoring)
         {
             return Task::none();
         }
@@ -5970,10 +6563,50 @@ impl Cagents {
             .filter(|choice| !choice.selected)
             .collect::<Vec<_>>();
         let pending = self.chat_start_pending(card);
-        let mut content: Vec<Element<'_, Message>> = vec![design::caption(if pending {
-            "Checking the saved conversation on the selected account…"
-        } else { "Continue this saved conversation on another account. Its identity stays unchanged until the provider confirms it." }).into()];
-        if choices.is_empty() && !pending {
+        let restorable = self.chat_ui.restorable_accounts.get(&card);
+        let restoring = restorable.map(|restorable| restorable.restoring);
+        // Choosing another account while the conversation's own is being
+        // restored would start it twice.
+        let busy = pending || restoring == Some(true);
+        let mut content: Vec<Element<'_, Message>> = Vec::new();
+        if let Some(restorable) = restorable {
+            // The conversation's own account is the one that holds its
+            // history, so getting it back comes before moving elsewhere.
+            content.push(
+                design::caption(match (&restorable.failure, restorable.restoring) {
+                    (_, true) => "Checking the account's sign-in…".into(),
+                    (Some(failure), false) => failure.clone(),
+                    (None, false) => {
+                        "Restore the account to continue this conversation where its history is."
+                            .to_owned()
+                    }
+                })
+                .into(),
+            );
+            // Once a restore has failed, asking again is one way forward
+            // among the other accounts, not the obvious next step.
+            let restore = Message::ChatUi(Action::RestoreAccount(card));
+            content.push(if restorable.failure.is_some() {
+                crate::ui_controls::button::secondary("Try again")
+                    .on_press_maybe((!busy).then_some(restore))
+                    .into()
+            } else {
+                crate::ui_controls::button::primary("Restore account")
+                    .on_press_maybe((!busy).then_some(restore))
+                    .into()
+            });
+        }
+        content.push(
+            design::caption(if pending {
+                "Checking the saved conversation on the selected account…"
+            } else if restoring.is_some() {
+                "Or continue on another account. The conversation's identity stays unchanged until the provider confirms it."
+            } else {
+                "Continue this saved conversation on another account. Its identity stays unchanged until the provider confirms it."
+            })
+            .into(),
+        );
+        if choices.is_empty() && !pending && restoring.is_none() {
             content.push(
                 design::caption("Add or sign in to another account in Accounts to continue.")
                     .into(),
@@ -5991,7 +6624,7 @@ impl Cagents {
                     }
                 ))
                 .on_press_maybe(
-                    (!pending).then_some(Message::ChatUi(Action::RecoverAccount(card, choice.id))),
+                    (!busy).then_some(Message::ChatUi(Action::RecoverAccount(card, choice.id))),
                 )
                 .into(),
             );
@@ -6508,6 +7141,14 @@ impl Cagents {
         removed
     }
 
+    /// Closes one conversation's `+` menu, including its fork choices.
+    pub(super) fn close_composer_actions(&mut self, target: Target) {
+        if let Some(runtime) = self.chat_runtime_mut(target) {
+            runtime.composer_actions = false;
+            runtime.branch_picker = false;
+        }
+    }
+
     pub(super) fn dismiss_chat_picker(&mut self) -> bool {
         let Some(card) = self.workspace.focused() else {
             return false;
@@ -6812,6 +7453,7 @@ impl Cagents {
             if let CardRuntime::Chat(runtime) = card {
                 subscriptions.extend(images::subscriptions(runtime));
                 if runtime.visible.load(Ordering::Relaxed) {
+                    subscriptions.extend(logical_prose::subscriptions(runtime));
                     subscriptions.extend(runtime.preparation.subscriptions(runtime.target));
                     subscriptions.extend(runtime.thumbnails.subscriptions(runtime.target));
                 }
@@ -7064,6 +7706,7 @@ impl Cagents {
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
         self.chat_ui.removed_accounts.remove(&card);
+        self.chat_ui.restorable_accounts.remove(&card);
     }
     pub(super) fn chat_capacity_guidance(&self, card: CardId) -> Option<&'static str> {
         (self.chat_ui.capacity_offers.contains(&card)
@@ -8963,6 +9606,10 @@ impl Cagents {
                 return self.choose_chat_account(target, id);
             }
             Action::RecoverAccount(card, id) => return self.recover_chat_account(card, id),
+            Action::RestoreAccount(card) => return self.restore_chat_account(card),
+            Action::AccountRestored(card, result) => {
+                return self.chat_account_restored(card, result);
+            }
             Action::DraftSkills(target, launch, skills) => {
                 if let Some(runtime) = self.chat_card_runtime_mut(target)
                     && runtime.is_draft()
@@ -9440,6 +10087,7 @@ impl Cagents {
                         }
                         self.chat_ui.fresh_offers.remove(&target.card);
                         self.chat_ui.removed_accounts.remove(&target.card);
+                        self.chat_ui.restorable_accounts.remove(&target.card);
                         let mut session = handle.session();
                         session.proof = handle.proof();
                         let snapshot = handle.snapshot();
@@ -9577,12 +10225,22 @@ impl Cagents {
                         // given up, since a lost answer is not proof it
                         // started nothing; the next send starts afresh under
                         // an identity of its own.
+                        // Each refusal follows the reader's own send, so
+                        // each one asks for its account to be restored.
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.unqueue();
                             runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
                             runtime.error = Some(failure.message);
                         }
-                        return self.retire_chat(target.card, None, Some(attempt.session));
+                        let restore = if failure.recovery == chat::Recovery::Account {
+                            self.offer_chat_account_restore(target.card, &attempt.session, true)
+                        } else {
+                            Task::none()
+                        };
+                        return Task::batch([
+                            self.retire_chat(target.card, None, Some(attempt.session)),
+                            restore,
+                        ]);
                     }
                     Err(failure)
                         if failure.recovery == chat::Recovery::Fresh
@@ -9622,8 +10280,13 @@ impl Cagents {
                         );
                         let account_removed =
                             failure.recovery == chat::Recovery::Account || account_source.is_some();
+                        let mut restore = Task::none();
                         if account_removed {
                             self.chat_ui.removed_accounts.insert(target.card);
+                            // The conversation's own account, also while
+                            // another one was being tried for it.
+                            let own = account_source.as_ref().unwrap_or(&attempt.session);
+                            restore = self.offer_chat_account_restore(target.card, own, false);
                         }
                         // A card that cannot resume has to say what refused it
                         // and offer the action that answers that refusal, so
@@ -9704,6 +10367,7 @@ impl Cagents {
                             } else {
                                 Task::none()
                             },
+                            restore,
                         ]);
                     }
                 }
@@ -10911,7 +11575,112 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = open;
                     runtime.branch_picker = false;
+                    if open {
+                        runtime.composer_actions_query.clear();
+                    }
                 }
+                // The menu draws over the timeline, after everything the
+                // keyboard already walks through, so opening it starts there:
+                // in its search when it has commands or skills to find, or
+                // else on its first row that can be pressed, so Tab and Enter
+                // work from where it opened. Closing leaves focus alone: a
+                // press elsewhere has already put it where the person meant,
+                // and Escape returns it to the draft on its own.
+                let transitioning = self.chat_ui.phases.contains_key(&target.card);
+                let first = match self.cards.get(&target.card) {
+                    Some(CardRuntime::Chat(runtime)) if open => {
+                        if runtime.composer_menu_searchable() {
+                            Some(COMPOSER_SEARCH)
+                        } else {
+                            runtime
+                                .composer_action_rows(transitioning)
+                                .into_iter()
+                                .find_map(|(row, enabled)| enabled.then(|| row.id()))
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(id) = first {
+                    return iced::widget::operation::focus(card_control_id(target.card, id))
+                        .map(cosmic::Action::App);
+                }
+            }
+            Action::ComposerActionsQuery(target, query) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.composer_actions_query = query;
+                }
+            }
+            Action::ComposerActionsSubmit(target) => {
+                let transitioning = self.chat_ui.phases.contains_key(&target.card);
+                let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) else {
+                    return Task::none();
+                };
+                if runtime.target != target || !runtime.composer_actions {
+                    return Task::none();
+                }
+                let Some((chosen, refocus)) = runtime
+                    .composer_menu(transitioning)
+                    .into_iter()
+                    .find(|(_, enabled)| *enabled)
+                    .map(|(entry, _)| match entry {
+                        MenuEntry::Row(row) => (
+                            runtime.composer_row_action(row),
+                            // A row that closes the menu takes the search
+                            // with it, so typing returns to the draft; a
+                            // chooser or the fork picker takes focus itself,
+                            // and steering leaves the menu open.
+                            matches!(row, ComposerRow::Plan | ComposerRow::Compact),
+                        ),
+                        MenuEntry::Named(name) => (
+                            Action::ComposerName(target, name.insertion.into_owned()),
+                            false,
+                        ),
+                    })
+                else {
+                    return Task::none();
+                };
+                // Through the app's own dispatch, so every guard a pressed row
+                // passes, such as a remote device refusing local files, holds
+                // for Enter too.
+                let task = self.update(Message::ChatUi(chosen));
+                if !refocus {
+                    return task;
+                }
+                // Not after the action's reply: typing meanwhile belongs in
+                // the draft too.
+                return Task::batch([
+                    task,
+                    iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
+                        .map(cosmic::Action::App),
+                ]);
+            }
+            Action::ComposerName(target, insertion) => {
+                let transitioning = self.chat_ui.phases.contains_key(&target.card);
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                // Only a name the menu still offers, and still lets be
+                // pressed, is put in the draft: a command offered for an
+                // empty draft is not one once the draft has words in it.
+                let offered = runtime.composer_menu(transitioning).into_iter().find_map(
+                    |(entry, enabled)| match entry {
+                        MenuEntry::Named(name) if enabled && name.insertion == insertion => {
+                            Some(name.kind)
+                        }
+                        _ => None,
+                    },
+                );
+                let Some(kind) = offered else {
+                    return Task::none();
+                };
+                runtime.composer_actions = false;
+                runtime.branch_picker = false;
+                runtime.name_in_draft(&insertion, kind);
+                return iced::widget::operation::focus(card_control_id(
+                    target.card,
+                    "chat-composer",
+                ))
+                .map(cosmic::Action::App);
             }
             Action::BranchPicker(target, open) => {
                 if open && self.chat_fork_target(target.card) != Some(target) {
@@ -11254,6 +12023,16 @@ impl Cagents {
             Action::MessageCopied(target, id, request, result) => {
                 return self.finish_message_copy(target, id, request, result);
             }
+            Action::LogicalProseRead(target, source, result) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && runtime.logical_prose.complete(&source, result)
+                    && runtime.visible.load(Ordering::Relaxed)
+                    && let Some(raw) = runtime.logical_prose.raw()
+                {
+                    let clock = runtime.source_clock;
+                    runtime.install_snapshot(raw, clock);
+                }
+            }
             Action::Copy(target, id, part) => {
                 text_copy::invalidate();
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -11588,6 +12367,10 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.attachment_chooser_pending = Some(id.id);
+                // The chooser answers the `+` menu's choice; the menu has
+                // nothing left to offer while it is open.
+                runtime.composer_actions = false;
+                runtime.branch_picker = false;
                 let directory = runtime.session.launch.recipe.working_directory.clone();
                 return cosmic::task::future(async move {
                     let result = match file_chooser::open::Dialog::new()
@@ -11802,6 +12585,7 @@ impl Cagents {
                 };
                 runtime.permission_picker = false;
                 runtime.footer_picker = false;
+                runtime.composer_actions = false;
                 if !runtime
                     .snapshot
                     .capabilities
@@ -11809,6 +12593,17 @@ impl Cagents {
                     .contains(&mode)
                 {
                     return Task::none();
+                }
+                // Leaving plan mode from the `+` menu returns to the mode it
+                // replaced, whichever control entered it.
+                if mode == PLAN_MODE
+                    && let Some(current) = runtime
+                        .snapshot
+                        .permission_mode
+                        .clone()
+                        .filter(|current| current != PLAN_MODE)
+                {
+                    runtime.mode_before_plan = Some(current);
                 }
                 if runtime.is_draft() {
                     if !runtime.choosing() {
@@ -14417,10 +15212,7 @@ mod tests {
         assert_eq!(parsed_codes(cached), parsed_codes(&expected));
         for (key, block) in &expected.blocks {
             for dark in [false, true] {
-                assert_eq!(
-                    cached.blocks[key].spans(dark).as_ref(),
-                    block.spans(dark).as_ref()
-                );
+                assert_eq!(cached.blocks[key].highlight(dark), block.highlight(dark));
             }
         }
         // A new child item ends the previous item's continuation, even while
@@ -14477,10 +15269,7 @@ mod tests {
             assert_eq!(parsed_codes(cached), parsed_codes(&expected));
             for (key, block) in &expected.blocks {
                 for dark in [false, true] {
-                    assert_eq!(
-                        cached.blocks[key].spans(dark).as_ref(),
-                        block.spans(dark).as_ref()
-                    );
+                    assert_eq!(cached.blocks[key].highlight(dark), block.highlight(dark));
                 }
             }
         }
@@ -15886,13 +16675,22 @@ mod tests {
             ),
             (alternate.clone(), account::UsageStatus::Ok),
         ] {
+            let (owner, ticket) = app.account_ui.begin_probe_for_test(
+                &id,
+                crate::account::schedule::Trigger::Focus,
+                now,
+            );
             let _ = app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
-                owner: app.account_ui.probe_owner(&id).unwrap(),
+                owner,
+                ticket,
                 id,
                 outcome: account::probe::Outcome::Answered {
                     identity: None,
                     catalog: None,
-                    snapshot: account::UsageSnapshot::state(status, "", now),
+                    snapshot: account::codex::parse_rate_limits(
+                        &serde_json::json!({"ordinaryUsageAllowed": status == account::UsageStatus::Ok}),
+                        now,
+                    ),
                 },
             }));
         }
@@ -21213,8 +22011,14 @@ mod tests {
         };
         let now = crate::chat::now_ms().unwrap();
         // Live figures refine a reading the account already has.
+        let (owner, ticket) = app.account_ui.begin_probe_for_test(
+            &account,
+            crate::account::schedule::Trigger::Focus,
+            now,
+        );
         let _ = app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
-            owner: app.account_ui.probe_owner(&account).unwrap(),
+            owner,
+            ticket,
             id: account.clone(),
             outcome: crate::account::probe::Outcome::Answered {
                 catalog: None,
@@ -23560,6 +24364,359 @@ mod tests {
     }
 
     #[test]
+    fn a_conversation_whose_account_list_lost_its_kept_home_offers_to_restore_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let directory = tempfile::tempdir().unwrap();
+        let homes = crate::account::home::Homes::at(directory.path().join("accounts"));
+        let (key, home) = homes.create(Provider::Codex, None).unwrap();
+        app.account_ui.use_homes(homes.clone());
+        let refuse = |app: &mut Cagents, source: &chat::Session| {
+            app.install_chat_session(card, source.clone());
+            app.chat_forget(card);
+            app.cards.insert(card, CardRuntime::Loading);
+            let _ = app.open_chat(card, source.clone(), chat::Intent::Restore);
+            let target = chat_runtime_attempt(app, card);
+            answer_start(
+                app,
+                target,
+                Err(chat::StartFailure {
+                    message: "This Codex account isn't in the account list".into(),
+                    recovery: chat::Recovery::Account,
+                }),
+            );
+        };
+
+        // A home whose files are gone is plainly removed: no restore offer.
+        let mut gone = chat_runtime(&app, card).session.clone();
+        gone.launch.recipe.environment.insert(
+            "CODEX_HOME".into(),
+            homes
+                .path(Provider::Codex, uuid::Uuid::new_v4())
+                .to_str()
+                .unwrap()
+                .into(),
+        );
+        refuse(&mut app, &gone);
+        assert!(app.chat_ui.removed_accounts.contains(&card));
+        assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
+
+        let restored = || {
+            let mut registry = crate::account::registry::Registry::default();
+            assert!(
+                registry
+                    .restore(
+                        crate::account::registry::Registered {
+                            key,
+                            provider: Provider::Codex,
+                            linked_home: None,
+                            label: None,
+                            email: Some("plan@example.com".into()),
+                            organization: None,
+                            added_at: 1,
+                        },
+                        &[],
+                        &homes,
+                    )
+                    .is_none()
+            );
+            registry
+        };
+        // This window's copy of the list still names the account: the list
+        // was reset under it. The daemon's refusal is the current answer.
+        app.account_ui.set_registry(restored());
+        let mut source = gone.clone();
+        source
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+        refuse(&mut app, &source);
+        assert_eq!(
+            app.chat_ui.restorable_accounts.get(&card).map(|offer| (
+                offer.provider,
+                offer.key,
+                offer.restoring
+            )),
+            Some((Provider::Codex, key, true)),
+            "the first refusal asks the device to restore the account at once"
+        );
+        assert!(app.account_recovery_controls(card).is_some());
+        let _ = app.update(Message::ChatUi(Action::RestoreAccount(card)));
+        // The device refuses - its provider reports no sign-in, say. The
+        // offer stays, with what refused it.
+        let _ = app.update(Message::ChatUi(Action::AccountRestored(
+            card,
+            Err("Codex reports no sign-in for this account, so it was not restored.".into()),
+        )));
+        assert_eq!(
+            app.chat_ui.restorable_accounts.get(&card).map(|offer| (
+                offer.provider,
+                offer.key,
+                offer.restoring
+            )),
+            Some((Provider::Codex, key, false))
+        );
+        assert_eq!(
+            app.chat_ui.restorable_accounts[&card].failure.as_deref(),
+            Some("Codex reports no sign-in for this account, so it was not restored."),
+            "the card says why, in place of the offer"
+        );
+        assert!(app.chat_ui.removed_accounts.contains(&card));
+        assert!(
+            app.chat_ui.attempt(card).is_none(),
+            "nothing starts on a refusal"
+        );
+
+        let _ = app.update(Message::ChatUi(Action::RestoreAccount(card)));
+        assert_eq!(
+            app.chat_ui.restorable_accounts.get(&card).map(|offer| (
+                offer.provider,
+                offer.key,
+                offer.restoring
+            )),
+            Some((Provider::Codex, key, true)),
+            "asking again shows the check under way"
+        );
+        let _ = app.update(Message::ChatUi(Action::AccountRestored(
+            card,
+            Ok(crate::account::remote::RestoredHome {
+                registry: restored(),
+                restored: crate::account::registry::Restored::Listed,
+            }),
+        )));
+        assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
+        assert!(!app.chat_ui.removed_accounts.contains(&card));
+        assert_eq!(
+            app.chat_ui
+                .attempt(card)
+                .unwrap()
+                .session
+                .launch
+                .recipe
+                .environment
+                .get("CODEX_HOME"),
+            Some(&home.to_str().unwrap().to_owned()),
+            "the conversation starts again on its own account"
+        );
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source));
+    }
+
+    #[test]
+    fn a_draft_whose_account_list_lost_its_kept_home_restores_it_and_sends() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        let homes = crate::account::home::Homes::at(directory.path().join("accounts"));
+        let (key, home) = homes.create(Provider::Codex, None).unwrap();
+        app.account_ui.use_homes(homes);
+        let (card, target) = starting_chat(&mut app);
+        let Some(Phase::Starting(attempt)) = app.chat_ui.phases.get_mut(&card) else {
+            panic!("the draft is starting");
+        };
+        let failed = attempt.session.id;
+        // The refusal reads its account from the attempt, so naming the kept
+        // home there stands for the draft having chosen it.
+        attempt
+            .session
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+        let refuse = |app: &mut Cagents, target| {
+            answer_start(
+                app,
+                target,
+                Err(chat::StartFailure {
+                    message: "This Codex account isn't in the account list".into(),
+                    recovery: chat::Recovery::Account,
+                }),
+            );
+        };
+        refuse(&mut app, target);
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.choosing(), "the card is a draft again");
+        assert_eq!(runtime.composer.text().trim(), "hello");
+        assert_eq!(
+            app.chat_ui.restorable_accounts.get(&card).map(|offer| (
+                offer.provider,
+                offer.key,
+                offer.restoring
+            )),
+            Some((Provider::Codex, key, true)),
+            "the refusal asks the device to restore the account at once"
+        );
+        let retirement = retired(&mut app, card);
+        let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
+        let reason = "Codex reports no sign-in for this account, so it was not restored.";
+        let _ = app.update(Message::ChatUi(Action::AccountRestored(
+            card,
+            Err(reason.into()),
+        )));
+        assert!(
+            chat_runtime(&app, card)
+                .error
+                .as_deref()
+                .is_some_and(
+                    |error| error.starts_with(reason) && error.contains("Choose another account")
+                ),
+            "the draft says why it was not restored, and what to do instead"
+        );
+        assert!(!app.chat_start_pending(card), "and sends nothing");
+        let _ = app.update(Message::ChatUi(Action::RestoreAccount(card)));
+        // Sending saves the draft first; give it somewhere to.
+        let storage = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            storage.path().join("restored-draft.sqlite3"),
+            crate::model::BootId::new("restored-draft-test"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        let task = app.update(Message::ChatUi(Action::AccountRestored(
+            card,
+            Ok(crate::account::remote::RestoredHome {
+                registry: crate::account::registry::Registry::default(),
+                restored: crate::account::registry::Restored::AlreadyRegistered,
+            }),
+        )));
+        settle_first_start_checkpoint(&mut app, card, task);
+        assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
+        assert_eq!(
+            chat_runtime(&app, card).error,
+            None,
+            "the refusal no longer applies"
+        );
+        let attempt = app
+            .chat_ui
+            .attempt(card)
+            .expect("the message the refusal answered is sent again");
+        assert_ne!(attempt.session.id, failed, "under an identity of its own");
+        assert_eq!(
+            attempt.session.launch.recipe.environment,
+            chat_runtime(&app, card).session.launch.recipe.environment,
+            "on the account the draft names"
+        );
+        drop(app.session.take());
+    }
+
+    #[test]
+    fn a_draft_restored_before_its_refused_start_retires_still_sends_once() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        let homes = crate::account::home::Homes::at(directory.path().join("accounts"));
+        let (_, home) = homes.create(Provider::Codex, None).unwrap();
+        app.account_ui.use_homes(homes);
+        let (card, target) = starting_chat(&mut app);
+        let Some(Phase::Starting(attempt)) = app.chat_ui.phases.get_mut(&card) else {
+            panic!("the draft is starting");
+        };
+        let failed = attempt.session.id;
+        attempt
+            .session
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: "This Codex account isn't in the account list".into(),
+                recovery: chat::Recovery::Account,
+            }),
+        );
+        let retirement = retired(&mut app, card);
+        let storage = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            storage.path().join("restored-draft.sqlite3"),
+            crate::model::BootId::new("restored-draft-order-test"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        // The device answers the restore before the refused start's cleanup.
+        let task = app.update(Message::ChatUi(Action::AccountRestored(
+            card,
+            Ok(crate::account::remote::RestoredHome {
+                registry: crate::account::registry::Registry::default(),
+                restored: crate::account::registry::Restored::Listed,
+            }),
+        )));
+        settle_first_start_checkpoint(&mut app, card, task);
+        let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
+        let attempt = app
+            .chat_ui
+            .attempt(card)
+            .expect("the message is sent once the account is back");
+        assert_ne!(attempt.session.id, failed, "under an identity of its own");
+        assert!(chat_runtime(&app, card).composer.text().trim().is_empty());
+        drop(app.session.take());
+    }
+
+    #[test]
+    fn a_refused_draft_the_reader_changed_is_not_sent_when_its_account_is_restored() {
+        type Change = fn(&mut Runtime, &std::path::Path);
+        let changes: [(&str, Change); 2] = [
+            ("edited message", |runtime, _| {
+                runtime.replace_draft(text_editor::Content::with_text("hello, but different"));
+            }),
+            ("other account", |runtime, other| {
+                runtime
+                    .session
+                    .launch
+                    .recipe
+                    .environment
+                    .insert("CODEX_HOME".into(), other.to_str().unwrap().into());
+            }),
+        ];
+        for (change, apply) in changes {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let directory = tempfile::tempdir().unwrap();
+            let homes = crate::account::home::Homes::at(directory.path().join("accounts"));
+            let (_, home) = homes.create(Provider::Codex, None).unwrap();
+            let (_, other) = homes.create(Provider::Codex, None).unwrap();
+            app.account_ui.use_homes(homes);
+            let (card, target) = starting_chat(&mut app);
+            let Some(Phase::Starting(attempt)) = app.chat_ui.phases.get_mut(&card) else {
+                panic!("the draft is starting");
+            };
+            attempt
+                .session
+                .launch
+                .recipe
+                .environment
+                .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+            answer_start(
+                &mut app,
+                target,
+                Err(chat::StartFailure {
+                    message: "This Codex account isn't in the account list".into(),
+                    recovery: chat::Recovery::Account,
+                }),
+            );
+            assert!(app.chat_ui.restorable_accounts[&card].resend.is_some());
+            let retirement = retired(&mut app, card);
+            let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                panic!("the card is a draft");
+            };
+            apply(runtime, &other);
+            let _ = app.update(Message::ChatUi(Action::AccountRestored(
+                card,
+                Ok(crate::account::remote::RestoredHome {
+                    registry: crate::account::registry::Registry::default(),
+                    restored: crate::account::registry::Restored::Listed,
+                }),
+            )));
+            assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
+            assert!(
+                !app.chat_start_pending(card),
+                "{change}: nothing is sent the reader did not ask for"
+            );
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.choosing() && runtime.error.is_none(), "{change}");
+        }
+    }
+
+    #[test]
     fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
         for (
             stale_reply,
@@ -25110,14 +26267,20 @@ mod tests {
         let spans: Vec<_> = cached
             .blocks
             .iter()
-            .map(|(key, block)| (*key, block.spans(false).clone(), block.spans(true).clone()))
+            .map(|(key, block)| {
+                (
+                    *key,
+                    block.highlight(false).clone(),
+                    block.highlight(true).clone(),
+                )
+            })
             .collect();
         cached.suspend_continuations();
         assert_eq!(cached.revision, revision);
         assert_eq!(shown(&cached), displayed);
         for (key, light, dark) in spans {
-            assert!(Arc::ptr_eq(&light, cached.blocks[&key].spans(false)));
-            assert!(Arc::ptr_eq(&dark, cached.blocks[&key].spans(true)));
+            assert!(light.ptr_eq(cached.blocks[&key].highlight(false)));
+            assert!(dark.ptr_eq(cached.blocks[&key].highlight(true)));
         }
         cached.extend(&body, false, theme);
         let fresh = CachedItem::new(&text(&body), theme);
@@ -25272,8 +26435,8 @@ mod tests {
                 let streamed = streamed.blocks.get(key).expect("the same fence");
                 for dark in [false, true] {
                     assert_eq!(
-                        streamed.spans(dark).as_ref(),
-                        block.spans(dark).as_ref(),
+                        streamed.highlight(dark),
+                        block.highlight(dark),
                         "in pieces of {step}"
                     );
                 }
@@ -25299,12 +26462,13 @@ mod tests {
                 .map(|span| span.text.as_ref())
                 .collect::<String>()
         };
+        let code = "fn main() {}\nlet x = 1;\n";
         let block = cached
-            .block(Some("rust"), "fn main() {}\nlet x = 1;\n")
+            .block(Some("rust"), code)
             .expect("the Rust fence is cached");
         for dark in [false, true] {
-            let spans = block.spans(dark);
-            assert_eq!(text_of(spans), "fn main() {}\nlet x = 1;\n");
+            let spans = block.highlight(dark).all(code);
+            assert_eq!(text_of(&spans), code);
             assert!(
                 spans.iter().any(|span| span.color.is_some()),
                 "a keyword takes a color"
@@ -25313,8 +26477,9 @@ mod tests {
         let plain = cached
             .block(None, "plain\n")
             .expect("an unnamed fence is cached too");
-        assert_eq!(text_of(plain.spans(true)), "plain\n");
-        assert!(plain.spans(true).iter().all(|span| span.color.is_none()));
+        let spans = plain.highlight(true).all("plain\n");
+        assert_eq!(text_of(&spans), "plain\n");
+        assert!(spans.iter().all(|span| span.color.is_none()));
         assert!(cached.block(Some("rust"), "fn other() {}\n").is_none());
     }
 
@@ -25577,7 +26742,11 @@ mod tests {
             .block(Some("rust,ignore"), "fn main() {}\n")
             .expect("the fence is cached under the info string the parser hands over");
         assert!(
-            block.spans(true).iter().any(|span| span.color.is_some()),
+            block
+                .highlight(true)
+                .all("fn main() {}\n")
+                .iter()
+                .any(|span| span.color.is_some()),
             "a keyword takes a color"
         );
     }
@@ -25862,6 +27031,36 @@ mod tests {
         snapshot.ready = true;
         snapshot.capabilities.branch = true;
         snapshot.capabilities.compact = true;
+        // The menu lists its rows in a fixed order; opening it focuses the
+        // first one that can be pressed.
+        let rows = |app: &Cagents| chat_runtime(app, card).composer_action_rows(false);
+        assert_eq!(
+            rows(&app),
+            [(ComposerRow::Fork, true), (ComposerRow::Compact, true)]
+        );
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot)
+            .capabilities
+            .interrupt_modes = vec!["immediate".into(), "wait".into()];
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        // While a turn runs only steering can be pressed, so focus skips the
+        // disabled fork and compact rows rather than landing where nothing
+        // shows it.
+        assert_eq!(
+            rows(&app),
+            [
+                (ComposerRow::Steering, true),
+                (ComposerRow::Fork, false),
+                (ComposerRow::Compact, false),
+            ]
+        );
+        assert!(
+            chat_runtime(&app, card)
+                .composer_action_rows(true)
+                .iter()
+                .all(|(_, enabled)| !enabled)
+        );
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = false;
 
         drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
         assert!(chat_runtime(&app, card).composer_actions);
@@ -25907,6 +27106,211 @@ mod tests {
         drop(app.handle_chat_ui(Action::Command(target, Command::Compact)));
         assert!(!chat_runtime(&app, card).composer_actions);
         assert!(!chat_runtime(&app, card).branch_picker);
+    }
+
+    #[test]
+    fn composer_menu_names_commands_and_skills_into_the_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Claude, Some("composer-menu"));
+        app.workspace.focus(card).unwrap();
+        let target = chat_runtime(&app, card).target;
+        let snapshot = Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot);
+        snapshot.ready = true;
+        snapshot.capabilities.compact = true;
+        snapshot.commands = vec![
+            chat::SlashCommand {
+                name: "/review".into(),
+                description: "Review the working tree".into(),
+            },
+            chat::SlashCommand {
+                name: "/compact".into(),
+                description: "Provider compaction".into(),
+            },
+        ];
+        snapshot.skills = vec![chat::Skill {
+            name: "release-notes".into(),
+            description: "Draft release notes".into(),
+            invocation: "/release-notes".into(),
+        }];
+        let entries = |app: &Cagents| {
+            chat_runtime(app, card)
+                .composer_menu(false)
+                .into_iter()
+                .map(|(entry, enabled)| {
+                    let label = match entry {
+                        MenuEntry::Row(row) => row.id().to_owned(),
+                        MenuEntry::Named(name) => name.insertion.into_owned(),
+                    };
+                    (label, enabled)
+                })
+                .collect::<Vec<_>>()
+        };
+        // The menu's own rows come first; then what slash completion offers
+        // an empty draft, without a second compaction entry beside the row.
+        assert_eq!(
+            entries(&app),
+            [
+                (ComposerRow::Compact.id().to_owned(), true),
+                ("/review".to_owned(), true),
+                ("/resume".to_owned(), true),
+                ("/release-notes".to_owned(), true),
+            ]
+        );
+        assert!(chat_runtime(&app, card).composer_menu_searchable());
+
+        // The search narrows rows by what they do and names by their name.
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        drop(app.handle_chat_ui(Action::ComposerActionsQuery(target, " SUMMARIZE ".into())));
+        assert_eq!(
+            entries(&app),
+            [(ComposerRow::Compact.id().to_owned(), true)]
+        );
+        drop(app.handle_chat_ui(Action::ComposerActionsQuery(target, "re".into())));
+        assert_eq!(entries(&app)[0].0, "/review");
+        // A slash typed out of habit is not part of the name searched for.
+        drop(app.handle_chat_ui(Action::ComposerActionsQuery(target, "/Rev".into())));
+        assert_eq!(entries(&app), [("/review".to_owned(), true)]);
+        // Reopening starts a new search.
+        drop(app.handle_chat_ui(Action::ComposerActions(target, false)));
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        assert_eq!(chat_runtime(&app, card).composer_actions_query, "");
+
+        // Enter in the search chooses the first entry it lists: an empty
+        // draft takes the command at its head.
+        drop(app.handle_chat_ui(Action::ComposerActionsQuery(target, "rev".into())));
+        drop(app.handle_chat_ui(Action::ComposerActionsSubmit(target)));
+        assert!(!chat_runtime(&app, card).composer_actions);
+        assert_eq!(chat_runtime(&app, card).composer.text(), "/review ");
+
+        // Once the draft has words, a command would be sent as words, so the
+        // menu offers only skills, named after the caret's word with a space.
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text("summarize the change"));
+        runtime.composer_action(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        assert_eq!(
+            entries(&app),
+            [
+                (ComposerRow::Compact.id().to_owned(), true),
+                ("/release-notes".to_owned(), true),
+            ]
+        );
+        assert!(chat_runtime(&app, card).composer_menu_searchable());
+        drop(app.handle_chat_ui(Action::ComposerName(target, "/review".into())));
+        assert!(chat_runtime(&app, card).composer_actions);
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "summarize the change"
+        );
+        drop(app.handle_chat_ui(Action::ComposerName(target, "/release-notes".into())));
+        assert!(!chat_runtime(&app, card).composer_actions);
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "summarize the change /release-notes "
+        );
+
+        // A provider that loads only the skill a message opens with gets it
+        // at the head instead, and the caret stays where the writing was.
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot)
+            .capabilities
+            .skill_reach = chat::SkillReach::Leading;
+        runtime.replace_draft(text_editor::Content::with_text("summarize\nthe change"));
+        runtime.composer_action(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        drop(app.handle_chat_ui(Action::ComposerName(target, "/release-notes".into())));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(
+            runtime.composer.text(),
+            "/release-notes summarize\nthe change"
+        );
+        runtime.composer_action(text_editor::Action::Edit(text_editor::Edit::Insert('.')));
+        assert_eq!(
+            runtime.composer.text(),
+            "/release-notes summarize\nthe change."
+        );
+        // A message opening with a command stays one: the skill goes at the
+        // caret, where the hint says it is sent as words.
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text("/review the change"));
+        runtime.composer_action(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        drop(app.handle_chat_ui(Action::ComposerName(target, "/release-notes".into())));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "/review the change /release-notes "
+        );
+        // Punctuation the draft opens with is set apart from the name.
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text("(quick) notes"));
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        drop(app.handle_chat_ui(Action::ComposerName(target, "/release-notes".into())));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "/release-notes (quick) notes"
+        );
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot)
+            .capabilities
+            .skill_reach = chat::SkillReach::Anywhere;
+        runtime.replace_draft(text_editor::Content::with_text(
+            "summarize the change /release-notes ",
+        ));
+
+        // Naming changes only the draft, so it stays open during a turn;
+        // a stale chat names nothing.
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
+        assert!(entries(&app).contains(&("/release-notes".to_owned(), true)));
+        let stale = Target {
+            generation: target.generation + 1,
+            ..target
+        };
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        drop(app.handle_chat_ui(Action::ComposerName(stale, "/release-notes".into())));
+        drop(app.handle_chat_ui(Action::ComposerActionsSubmit(stale)));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "summarize the change /release-notes "
+        );
+    }
+
+    #[test]
+    fn composer_menu_plan_row_enters_and_leaves_plan_mode() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Claude, Some("composer-plan"));
+        let target = chat_runtime(&app, card).target;
+        let rows = |app: &Cagents| chat_runtime(app, card).composer_action_rows(false);
+        // Providers without a plan mode have no row for it.
+        assert!(!rows(&app).iter().any(|(row, _)| *row == ComposerRow::Plan));
+
+        let snapshot = Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot);
+        snapshot.ready = true;
+        snapshot.capabilities.permission_modes = ["default", "acceptEdits", "plan"]
+            .map(String::from)
+            .to_vec();
+        snapshot.permission_mode = Some("acceptEdits".into());
+        assert!(rows(&app).contains(&(ComposerRow::Plan, true)));
+        let toggle = |app: &Cagents| chat_runtime(app, card).plan_toggle().map(str::to_owned);
+        assert_eq!(toggle(&app).as_deref(), Some(PLAN_MODE));
+
+        // Choosing the row closes the menu and asks for plan mode through
+        // the footer's own action; leaving returns to the replaced mode.
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        drop(app.handle_chat_ui(Action::ComposerActionsQuery(target, "plan".into())));
+        drop(app.handle_chat_ui(Action::ComposerActionsSubmit(target)));
+        assert!(!chat_runtime(&app, card).composer_actions);
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).permission_mode =
+            Some(PLAN_MODE.into());
+        assert_eq!(toggle(&app).as_deref(), Some("acceptEdits"));
+        // Choosing plan again while in it keeps the mode to return to.
+        drop(app.handle_chat_ui(Action::PermissionMode(target, PLAN_MODE.into())));
+        assert_eq!(toggle(&app).as_deref(), Some("acceptEdits"));
+
+        // A mode the provider no longer offers falls back to its default.
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot)
+            .capabilities
+            .permission_modes = ["default", "plan"].map(String::from).to_vec();
+        assert_eq!(toggle(&app).as_deref(), Some("default"));
     }
 
     #[test]
@@ -26102,8 +27506,14 @@ mod tests {
                 false,
             ),
         ] {
+            let (owner, ticket) = app.account_ui.begin_probe_for_test(
+                &id,
+                crate::account::schedule::Trigger::Focus,
+                now,
+            );
             drop(app.update(Message::AccountUi(account_ui::Action::Probed {
-                owner: app.account_ui.probe_owner(&id).unwrap(),
+                owner,
+                ticket,
                 id: id.clone(),
                 outcome: account::probe::Outcome::Answered {
                     identity: Some(account::Identity {
@@ -27162,6 +28572,195 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+    #[test]
+    fn a_long_answer_is_presented_and_copied_as_one_logical_message() {
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let part = chat::TRANSCRIPT_PART_BYTES;
+        let mut message = "Intro paragraph.\n\n```rust\n".to_owned();
+        message.push_str(&"let crab = \"🦀\";\n".repeat(part / 12));
+        message.push_str("```\n\nAfter the fence.\n");
+        let source = chat::TextCopySource {
+            cache: uuid::Uuid::new_v4(),
+            scope: chat::TextCopyScope::Conversation,
+            token: 7,
+            revision: 1,
+            bytes: message.len() as u64,
+        };
+        let publish = |window: std::ops::Range<usize>| {
+            let mut snapshot = (*handle.snapshot()).clone();
+            let items = logical_prose::parts("answer", &message, window);
+            snapshot.text_copy_sources.conversation = vec![Some(source.clone()); items.len()];
+            snapshot.items = items;
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+        };
+        // The window holds every part: they are joined with no read.
+        publish(0..usize::MAX);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.snapshot.items.len(), 1);
+        let joined = runtime.snapshot.items[0].clone();
+        assert_eq!(joined.id, "answer");
+        assert!(matches!(&joined.content, ItemContent::Text { text, .. } if *text == message));
+        assert_eq!(runtime.message_copy_source(&joined), Some(source.clone()));
+        assert!(runtime.logical_prose.request().is_none());
+        // The window holds only the tail: the whole message is read, then shown.
+        publish(1..usize::MAX);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime
+                .logical_prose
+                .request()
+                .map(|(read, _)| read.clone()),
+            Some(source.clone())
+        );
+        drop(app.handle_chat_ui(Action::LogicalProseRead(
+            target,
+            source.clone(),
+            Ok(message.clone()),
+        )));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.snapshot.items.len(), 1);
+        assert!(matches!(
+            &runtime.snapshot.items[0].content,
+            ItemContent::Text { text, .. } if *text == message
+        ));
+        assert!(runtime.logical_prose.request().is_none());
+        // Hiding the pane releases the complete text with the presentation.
+        app.chat_runtime_mut(target).unwrap().show(false);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert!(chat_runtime(&app, card).logical_prose.raw().is_none());
+    }
+    #[test]
+    fn a_long_answer_keeps_its_prepared_text_while_parts_are_appended() {
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (_card, target, handle) = history_fixture(&mut app);
+        let part = chat::TRANSCRIPT_PART_BYTES;
+        let message = "- list item that streams in\n".repeat(4 * part / 28);
+        let source = |bytes: usize, revision: u64| chat::TextCopySource {
+            cache: uuid::Uuid::from_u128(766),
+            scope: chat::TextCopyScope::Conversation,
+            token: 7,
+            revision,
+            bytes: bytes as u64,
+        };
+        let publish = |end: usize, revision: u64| {
+            let body = &message[..end];
+            let mut snapshot = (*handle.snapshot()).clone();
+            let items = logical_prose::parts("answer", body, 0..usize::MAX);
+            snapshot.text_copy_sources.conversation =
+                vec![Some(source(body.len(), revision)); items.len()];
+            snapshot.items = items;
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+        };
+        publish(part / 2, 1);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        preparation::drain_fixture(runtime);
+        assert!(!runtime.cache["answer"].placeholder);
+        // Each append crosses into another part, so every publication joins
+        // into a new item; the prepared text stays shown until the next is ready.
+        for end in [part + part / 2, 2 * part + part / 2, message.len()] {
+            publish(end, 1);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.refresh();
+            assert!(
+                !runtime.cache["answer"].placeholder,
+                "an append to {end} bytes blanked the answer"
+            );
+            preparation::drain_fixture(runtime);
+            assert!(!runtime.cache["answer"].placeholder);
+        }
+        // A rewrite is not an append and waits for its own preparation.
+        publish(message.len() - 1, 2);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        assert!(runtime.cache["answer"].placeholder);
+    }
+    #[test]
+    fn a_long_answer_streaming_past_its_window_never_blanks() {
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let part = chat::TRANSCRIPT_PART_BYTES;
+        let message = "- list item that streams in\n".repeat(12 * part / 28);
+        let source = |bytes: usize| chat::TextCopySource {
+            cache: uuid::Uuid::from_u128(767),
+            scope: chat::TextCopyScope::Conversation,
+            token: 7,
+            revision: 1,
+            bytes: bytes as u64,
+        };
+        // The store's window holds the last three parts of what has arrived.
+        let publish = |end: usize| {
+            let body = &message[..end];
+            let count = body.len().div_ceil(part);
+            let mut snapshot = (*handle.snapshot()).clone();
+            let items = logical_prose::parts("answer", body, count.saturating_sub(3)..count);
+            snapshot.text_copy_sources.conversation = vec![Some(source(end)); items.len()];
+            snapshot.items = items;
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+        };
+        let deliver = |app: &mut Cagents| {
+            let read = chat_runtime(app, card)
+                .logical_prose
+                .request()
+                .map(|(read, _)| read.clone());
+            if let Some(read) = read {
+                let text = message[..read.bytes as usize].to_owned();
+                drop(app.handle_chat_ui(Action::LogicalProseRead(target, read, Ok(text))));
+            }
+        };
+        let shown = |app: &Cagents| {
+            let runtime = chat_runtime(app, card);
+            assert_eq!(runtime.snapshot.items.len(), 1);
+            match &runtime.snapshot.items[0].content {
+                ItemContent::Text { text, .. } => text.clone(),
+                _ => unreachable!(),
+            }
+        };
+        publish(4 * part);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        preparation::drain_fixture(runtime);
+        // Steps of half a part. Reads arrive promptly at first, then stall for
+        // long enough that the window moves past the last one.
+        let mut end = 4 * part;
+        let mut step = 0;
+        while end < message.len() {
+            end = (end + part / 2).min(message.len());
+            step += 1;
+            publish(end);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.refresh();
+            assert!(
+                !runtime.cache["answer"].placeholder,
+                "growth to {end} bytes blanked the answer"
+            );
+            if !(8..14).contains(&step) {
+                deliver(&mut app);
+                assert!(
+                    !chat_runtime(&app, card).cache["answer"].placeholder,
+                    "the complete read at {end} bytes blanked the answer"
+                );
+            }
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            assert!(!chat_runtime(&app, card).cache["answer"].placeholder);
+            if step < 8 {
+                // Reads made before the window outran them show the whole answer.
+                assert_eq!(shown(&app), message[..end]);
+            }
+        }
+        deliver(&mut app);
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert_eq!(shown(&app), message);
     }
     struct LiveSharedRecovery {
         app: Cagents,

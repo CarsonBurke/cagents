@@ -338,6 +338,10 @@ impl Record {
         directory.join(format!("{}.json", self.terminal))
     }
 
+    /// Writes without fsync: the record carries its boot ID, so no reader
+    /// accepts it after an OS crash, and the page cache serves every reader in
+    /// this boot. An fsync on a disk-backed runtime directory can instead hold
+    /// a holder's launch for seconds under write load (#2180).
     pub fn create(&self, directory: &Path) -> io::Result<()> {
         let path = self.path(directory);
         let mut file = OpenOptions::new()
@@ -349,8 +353,7 @@ impl Record {
         let identity = file.metadata()?;
         let result = (|| {
             serde_json::to_writer(&mut file, self).map_err(io::Error::other)?;
-            file.flush()?;
-            file.sync_all()
+            file.flush()
         })();
         if result.is_err()
             && fs::symlink_metadata(&path).is_ok_and(|actual| {

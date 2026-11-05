@@ -27,7 +27,11 @@ pub mod avatar;
 pub mod checkout;
 pub mod polling;
 pub mod review_actions;
+mod review_batches;
+mod review_refresh;
 pub mod review_requests;
+pub use review_batches::VIEWED_BATCH_SIZE;
+pub use review_refresh::ReviewRefresh;
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
 /// The Work board's view of the user's own pull requests: identity and state
@@ -1087,6 +1091,32 @@ pub trait GitHubReviewApi: Send + Sync {
         cancellation: &CancellationToken,
     ) -> Result<ReviewContext, GitHubError>;
 
+    /// A transport may fuse these reads into one inexpensive refresh query.
+    fn review_refresh(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewRefresh, GitHubError> {
+        Ok(ReviewRefresh {
+            context: self.review_context(key, cancellation)?,
+            files: self.pull_request_file_page(key, None, cancellation)?,
+            metadata: None,
+        })
+    }
+
+    /// Left-side anchors use the merge base, not the moving base branch tip.
+    fn review_merge_base(
+        &self,
+        _key: &PullRequestKey,
+        _base: &str,
+        _head: &str,
+        _cancellation: &CancellationToken,
+    ) -> Result<String, GitHubError> {
+        Err(GitHubError::Inspection(
+            "Refresh this diff to verify its left-side anchor".into(),
+        ))
+    }
+
     fn pull_request_file_page(
         &self,
         key: &PullRequestKey,
@@ -1121,6 +1151,18 @@ pub trait GitHubReviewApi: Send + Sync {
         request: &AddReviewThreadRequest,
         cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<PullRequestReviewThread>, GitHubError>;
+
+    fn add_single_review_thread(
+        &self,
+        _key: &PullRequestKey,
+        _commit: &str,
+        _request: &AddReviewThreadRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        Err(GitHubError::Inspection(
+            "Single comments are unavailable with this review service".into(),
+        ))
+    }
 
     fn reply_to_thread(
         &self,
@@ -1175,6 +1217,25 @@ pub trait GitHubReviewApi: Send + Sync {
         viewed: bool,
         cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<()>, GitHubError>;
+
+    fn set_files_viewed(
+        &self,
+        repository: &GitHubRepoKey,
+        pr: &str,
+        paths: &[String],
+        viewed: bool,
+        cancellation: &CancellationToken,
+    ) -> Vec<(String, Result<ReviewMutationOutcome<()>, GitHubError>)> {
+        paths
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    self.set_file_viewed(repository, pr, path, viewed, cancellation),
+                )
+            })
+            .collect()
+    }
 
     /// The pull requests a review surface offers to open.
     fn list_pull_requests(
@@ -1324,6 +1385,10 @@ pub enum GitHubAvailability {
 }
 
 impl GitHubAvailability {
+    pub(crate) fn refresh_succeeded(&self) -> bool {
+        !matches!(self, Self::Failed { .. } | Self::RateLimited { .. })
+    }
+
     pub fn guidance(&self) -> String {
         match self {
             Self::MissingCli => "GitHub CLI was not found on PATH. Install it from https://cli.github.com, then refresh.".into(),
@@ -1445,6 +1510,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .filter_map(|remote| remote.fetch_url.as_deref())
             .filter_map(remote_repository_key)
             .collect();
+        Self::check_remote_rate_limits(remotes)?;
         if keys.iter().any(|key| key.host == "github.com") {
             return Ok(true);
         }
@@ -1455,6 +1521,22 @@ impl<E: ProcessExecutor> GitHubService<E> {
             &self.gh_command(["auth", "status", "--json", "hosts"]),
             cancellation,
         )?;
+        if !output.success
+            && let Some(limit) = polling::RateLimit::classify(
+                &format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                polling::now(),
+            )
+        {
+            let error = GitHubError::RateLimited { limit };
+            for key in &keys {
+                polling::failed(&key.host, &error);
+            }
+            return Err(error);
+        }
         require_auth_status_json(&output, &self.gh)?;
         // gh can return a failing auth exit status while still reporting known
         // accounts as JSON; those hosts remain associated but cannot authorize.
@@ -1462,6 +1544,23 @@ impl<E: ProcessExecutor> GitHubService<E> {
         Ok(keys
             .iter()
             .any(|key| envelope.hosts.contains_key(&key.authority())))
+    }
+
+    // Discovery has not selected a repository yet. Conservatively pause it if
+    // any candidate fetch host is limited, before gh can choose that host.
+    fn check_remote_rate_limits(
+        remotes: &[crate::repository::RemoteRecord],
+    ) -> Result<(), GitHubError> {
+        if let Some(limit) = remotes
+            .iter()
+            .filter_map(|remote| remote.fetch_url.as_deref())
+            .filter_map(remote_repository_key)
+            .filter_map(|key| polling::rate_limit(&key.host))
+            .max_by_key(|limit| limit.retry_at)
+        {
+            return Err(GitHubError::RateLimited { limit });
+        }
+        Ok(())
     }
 }
 
@@ -1628,6 +1727,26 @@ impl<E: ProcessExecutor> GitHubService<E> {
     pub fn resolve_repository(
         &self,
         repository: &Path,
+        remotes: &[crate::repository::RemoteRecord],
+        cancellation: &CancellationToken,
+    ) -> Result<GitHubRepoKey, GitHubError> {
+        Self::check_remote_rate_limits(remotes)?;
+        let result = self.resolve_repository_inner(repository, cancellation);
+        if let Err(error) = &result {
+            for key in remotes
+                .iter()
+                .filter_map(|remote| remote.fetch_url.as_deref())
+                .filter_map(remote_repository_key)
+            {
+                polling::failed(&key.host, error);
+            }
+        }
+        result
+    }
+
+    fn resolve_repository_inner(
+        &self,
+        repository: &Path,
         cancellation: &CancellationToken,
     ) -> Result<GitHubRepoKey, GitHubError> {
         let command = self.resolve_repository_command(repository);
@@ -1664,13 +1783,22 @@ impl<E: ProcessExecutor> GitHubService<E> {
     ) -> Result<GhAuthStatus, GitHubError> {
         let command = self.auth_status_command(repository);
         repository.validate()?;
-        let output = self.execute(&command, cancellation)?;
-        require_auth_status_json(&output, &self.gh)?;
-        let output = self.checked_output(output, repository)?;
-        attach_process(
-            parse_auth_status(&output.stdout, &repository.authority()),
-            &output,
-        )
+        if let Some(limit) = polling::rate_limit(&repository.host) {
+            return Err(GitHubError::RateLimited { limit });
+        }
+        let result = (|| {
+            let output = self.execute(&command, cancellation)?;
+            require_auth_status_json(&output, &self.gh)?;
+            let output = self.checked_output(output, repository)?;
+            attach_process(
+                parse_auth_status(&output.stdout, &repository.authority()),
+                &output,
+            )
+        })();
+        if let Err(error) = &result {
+            polling::failed(&repository.host, error);
+        }
+        result
     }
 
     pub fn list(
@@ -1865,6 +1993,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         let mut command = self.gh_command([
             OsString::from("api"),
             "graphql".into(),
+            "--include".into(),
             "--hostname".into(),
             repository.authority().into(),
             "-f".into(),
@@ -1911,15 +2040,27 @@ impl<E: ProcessExecutor> GitHubService<E> {
         cancellation: &CancellationToken,
     ) -> Result<serde_json::Value, GitHubError> {
         repository.validate()?;
+        if let Some(limit) = polling::rate_limit(&repository.host) {
+            return Err(GitHubError::RateLimited { limit });
+        }
         let command = self.graphql_command(repository, query, variables);
         let output = self
             .execute(&command, cancellation)
             .map_err(GitHubError::from);
         if let Ok(output) = &output
             && !output.success
-            && let Some(data) = not_found_data(&output.stdout)
+            && let Some(data) = not_found_data(graphql_body(&output.stdout))
         {
-            polling::succeeded(&repository.host);
+            // The answer is complete, but its headers can still exhaust the
+            // host's quota, exactly as for a successful request.
+            let headers =
+                &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
+            match polling::RateLimit::classify(&String::from_utf8_lossy(headers), polling::now()) {
+                Some(limit) => {
+                    polling::failed(&repository.host, &GitHubError::RateLimited { limit })
+                }
+                None => polling::succeeded(&repository.host),
+            }
             return Ok(data);
         }
         let output = charge_host(
@@ -2232,6 +2373,9 @@ impl<E: ProcessExecutor> GitHubService<E> {
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitHubError> {
         repository.validate()?;
+        if let Some(limit) = polling::rate_limit(&repository.host) {
+            return Err(GitHubError::RateLimited { limit });
+        }
         let result = self
             .execute(command, cancellation)
             .map_err(GitHubError::from)
@@ -2257,6 +2401,13 @@ impl<E: ProcessExecutor> GitHubService<E> {
             return Err(GitHubError::RateLimited { limit });
         }
         if output.success {
+            let headers =
+                &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
+            if let Some(limit) =
+                polling::RateLimit::classify(&String::from_utf8_lossy(headers), polling::now())
+            {
+                polling::failed(&repository.host, &GitHubError::RateLimited { limit });
+            }
             Ok(output)
         } else if output.exit_code == Some(4) {
             Err(GitHubError::AuthenticationRequired {
@@ -2348,7 +2499,25 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 failure: Box::new(output.require_success(&self.gh).unwrap_err()),
             });
         }
-        let body: Option<serde_json::Value> = serde_json::from_slice(&output.stdout).ok();
+        let body: Option<serde_json::Value> =
+            serde_json::from_slice(graphql_body(&output.stdout)).ok();
+        let headers = &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
+        let error_text = body
+            .as_ref()
+            .and_then(|body| body.get("errors"))
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        if let Some(limit) = polling::RateLimit::classify(
+            &format!(
+                "{}\n{}\n{}",
+                String::from_utf8_lossy(headers),
+                error_text,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            polling::now(),
+        ) {
+            polling::failed(&repository.host, &GitHubError::RateLimited { limit });
+        }
         let applied = body
             .as_ref()
             .and_then(|body| body.pointer(&format!("/data{payload}")))
@@ -2516,6 +2685,47 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
             next_cursor: next,
         })
     }
+    fn review_refresh(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewRefresh, GitHubError> {
+        self.review_refresh_snapshot(key, cancellation)
+    }
+
+    fn review_merge_base(
+        &self,
+        key: &PullRequestKey,
+        base: &str,
+        head: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<String, GitHubError> {
+        key.validate()?;
+        validate_review_oid(base)?;
+        validate_review_oid(head)?;
+        let endpoint = format!(
+            "repos/{}/{}/compare/{base}...{head}",
+            key.repository.owner, key.repository.name
+        );
+        let command = self.gh_command([
+            "api",
+            "--include",
+            "--hostname",
+            &key.repository.authority(),
+            &endpoint,
+        ]);
+        let output = self.run_checked(&command, &key.repository, cancellation)?;
+        let data: serde_json::Value = parse_json(graphql_body(&output.stdout))?;
+        let oid = data
+            .pointer("/merge_base_commit/sha")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                GitHubError::Inspection("GitHub returned no merge base for this anchor".into())
+            })?;
+        validate_review_oid(oid)?;
+        Ok(oid.into())
+    }
+
     fn review_context(
         &self,
         key: &PullRequestKey,
@@ -2715,6 +2925,27 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
                 let comments = std::mem::take(&mut page.comments.nodes);
                 page.into_thread(comments, truncated)
             }))
+    }
+
+    fn add_single_review_thread(
+        &self,
+        key: &PullRequestKey,
+        commit: &str,
+        request: &AddReviewThreadRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        self.post_single_review_comment(key, commit, request, cancellation)
+    }
+
+    fn set_files_viewed(
+        &self,
+        repository: &GitHubRepoKey,
+        pr: &str,
+        paths: &[String],
+        viewed: bool,
+        cancellation: &CancellationToken,
+    ) -> Vec<(String, Result<ReviewMutationOutcome<()>, GitHubError>)> {
+        self.viewed_batch(repository, pr, paths, viewed, cancellation)
     }
 
     fn reply_to_thread(
@@ -3119,6 +3350,27 @@ fn decode_value<T: DeserializeOwned>(value: &serde_json::Value) -> Result<T, Git
     })
 }
 
+/// `gh api --include` exposes reset headers even on a successful final request.
+fn graphql_body(mut bytes: &[u8]) -> &[u8] {
+    while bytes.starts_with(b"HTTP/") {
+        let boundary = bytes
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .map(|i| i + 4)
+            .or_else(|| {
+                bytes
+                    .windows(2)
+                    .position(|part| part == b"\n\n")
+                    .map(|i| i + 2)
+            });
+        let Some(boundary) = boundary else {
+            return bytes;
+        };
+        bytes = &bytes[boundary..];
+    }
+    bytes
+}
+
 /// Every gh call shares the host budget, so any completed request is evidence
 /// the host recovered, not only the surface that backed off.
 fn charge_host<T>(
@@ -3164,14 +3416,23 @@ fn not_found_data(output: &[u8]) -> Option<serde_json::Value> {
 }
 
 fn parse_graphql(output: &[u8]) -> Result<serde_json::Value, GitHubError> {
-    let mut envelope: serde_json::Value = parse_json(output)?;
-    if let Some(limit) = polling::RateLimit::classify(
-        &envelope
-            .get("errors")
-            .map(ToString::to_string)
-            .unwrap_or_default(),
-        polling::now(),
-    ) {
+    let mut envelope: serde_json::Value = parse_json(graphql_body(output))?;
+    if envelope
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+        && let Some(limit) = polling::RateLimit::classify(
+            &format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output[..output.len() - graphql_body(output).len()]),
+                envelope
+                    .get("errors")
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            ),
+            polling::now(),
+        )
+    {
         return Err(GitHubError::RateLimited { limit });
     }
     if let Some(errors) = envelope.get("errors").and_then(serde_json::Value::as_array)
@@ -3255,6 +3516,105 @@ mod tests {
             assert!(Instant::now() < deadline, "permit waiter did not register");
             thread::yield_now();
         }
+    }
+
+    #[test]
+    fn successful_last_budget_response_is_read_then_future_calls_pause_until_reset() {
+        let host = "headers-budget-test.invalid";
+        let reset = polling::now() + 120;
+        let output = format!(
+            "HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {reset}\r\n\r\n{{\"data\":{{\"ok\":true}}}}"
+        );
+        let executor = Arc::new(FakeExecutor::with_outputs(vec![success(output.as_bytes())]));
+        let service = GitHubService::new("gh", executor.clone());
+        let repository = GitHubRepoKey::new(host, None, "o", "r").unwrap();
+        assert_eq!(
+            service
+                .graphql(
+                    &repository,
+                    "query{viewer{login}}",
+                    vec![],
+                    &CancellationToken::new()
+                )
+                .unwrap()["ok"],
+            true
+        );
+        assert_eq!(polling::rate_limit(host).unwrap().retry_at, reset);
+        assert!(matches!(
+            service.graphql(
+                &repository,
+                "query{viewer{login}}",
+                vec![],
+                &CancellationToken::new()
+            ),
+            Err(GitHubError::RateLimited { .. })
+        ));
+        assert_eq!(
+            executor.commands.lock().unwrap().len(),
+            1,
+            "a paused read never launches gh"
+        );
+        let availability = GitHubAvailability::from_error(GitHubError::RateLimited {
+            limit: polling::RateLimit { retry_at: reset },
+        });
+        assert!(availability.guidance().contains("Retrying at"));
+        assert!(!availability.guidance().contains("Could not connect"));
+    }
+
+    #[test]
+    fn review_discovery_and_auth_pause_before_launching_gh_on_a_limited_remote() {
+        let host = "review-discovery-pause.invalid";
+        let repository = GitHubRepoKey::new(host, None, "o", "r").unwrap();
+        let remotes = [remote("origin", &format!("https://{host}/o/r"))];
+        let executor = Arc::new(FakeExecutor::default());
+        let service = GitHubService::new("gh", executor.clone());
+        let cancellation = CancellationToken::new();
+        polling::failed(
+            host,
+            &GitHubError::RateLimited {
+                limit: polling::RateLimit {
+                    retry_at: polling::now() + 120,
+                },
+            },
+        );
+        assert!(matches!(
+            service.has_associated_remote(&remotes, &cancellation),
+            Err(GitHubError::RateLimited { .. })
+        ));
+        assert!(matches!(
+            service.resolve_repository(Path::new("/repo"), &remotes, &cancellation),
+            Err(GitHubError::RateLimited { .. })
+        ));
+        assert!(matches!(
+            service.auth_status(&repository, &cancellation),
+            Err(GitHubError::RateLimited { .. })
+        ));
+        assert!(executor.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn review_discovery_failure_shares_its_reset_with_the_next_project_read() {
+        let host = "review-discovery-observed-limit.invalid";
+        let remotes = [remote("origin", &format!("https://{host}/o/r"))];
+        let executor = Arc::new(FakeExecutor::with_outputs(vec![Ok(ProcessOutput {
+            exit_code: Some(1),
+            signal: None,
+            success: false,
+            stdout: Vec::new(),
+            stderr: b"secondary rate limit\nRetry-After: 120".to_vec(),
+        })]));
+        let service = GitHubService::new("gh", executor.clone());
+        let cancellation = CancellationToken::new();
+        assert!(matches!(
+            service.resolve_repository(Path::new("/repo"), &remotes, &cancellation),
+            Err(GitHubError::Process(_))
+        ));
+        assert!(polling::rate_limit(host).is_some());
+        assert!(matches!(
+            service.resolve_repository(Path::new("/repo"), &remotes, &cancellation),
+            Err(GitHubError::RateLimited { .. })
+        ));
+        assert_eq!(executor.commands.lock().unwrap().len(), 1);
     }
 
     #[test]
