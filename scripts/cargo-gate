@@ -41,13 +41,13 @@ Environment:
   CAGENTS_BUILD_SLOTS    Concurrent builds; default: one per 4 GiB of RAM
                          after an 8 GiB reserve, at most one per 4 CPUs
   CAGENTS_BUILD_COST_GIB Memory this build is expected to need at its peak;
-                         default by kind, from 3 GiB for a check of the CLI
-                         to 8 GiB for a UI build or a script of builds
+                         default by kind, from 3 GiB for the CLI lane to
+                         9 GiB for a UI build
   CAGENTS_BUILD_LOCK     First slot's lock file; the others add .1, .2, ...
                          (default /var/tmp/cagents-cargo.lock)
   CARGO_BUILD_JOBS       With several slots, set or capped to the CPUs divided
                          by the builds running once this one starts, between
-                         4 and half the CPUs
+                         4 and 8
 
 Slot 0 is the plain lock file, so a command still run under
 `flock /var/tmp/cagents-cargo.lock` occupies exactly one slot.
@@ -131,7 +131,7 @@ expected_cost() {
         check:*|clippy:*|doc:*) printf '%s' $((4 * gib)) ;;
         *:cli) printf '%s' $((3 * gib)) ;;
         *:host) printf '%s' $((7 * gib)) ;;
-        *) printf '%s' $((8 * gib)) ;;
+        *) printf '%s' $((9 * gib)) ;;
     esac
 }
 
@@ -168,13 +168,13 @@ fits() {
             exec 7>>"$path"
             if ! flock -n 7; then
                 running=$((running + 1))
-                claim=
-                read -r holder claimed <"$path.cost" 2>/dev/null || :
+                claim= holder= claimed=
+                { read -r holder claimed <"$path.cost"; } 2>/dev/null || :
                 case $holder:$claimed in
                     *[!0-9:]*|:*|*:) ;;
                     *) [ ! -d "/proc/$holder" ] || claim="$holder:$claimed" ;;
                 esac
-                claims="$claims ${claim:-0:$((8 * gib))}"
+                claims="$claims ${claim:-0:$((9 * gib))}"
             fi
             exec 7>&-
         fi
@@ -200,7 +200,7 @@ fits() {
             for (i = 1; i <= count; i++) if (cost[i] > held[i]) total += cost[i] - held[i]
             print total
         }') || outstanding=
-    [ -n "$outstanding" ] || outstanding=$((running * 8 * gib))
+    [ -n "$outstanding" ] || outstanding=$((running * 9 * gib))
     [ $(($(available_kib) - outstanding)) -ge "$cost" ]
 }
 
@@ -265,6 +265,8 @@ acquire() {
             exec 6>&-
             continue
         fi
+        # Every free slot sees the same other builds, so price them once.
+        fit=
         index=$slots
         while [ "$index" -gt 1 ]; do
             index=$((index - 1))
@@ -272,7 +274,10 @@ acquire() {
             if flock -n 9; then
                 # Start beside other builds only when the memory this build
                 # needs is free; a lone build always starts.
-                if fits "$index"; then
+                if [ -z "$fit" ]; then
+                    if fits "$index"; then fit=yes; else fit=no; fi
+                fi
+                if [ "$fit" = yes ]; then
                     withdraw
                     trap - INT TERM HUP
                     admitted
@@ -305,16 +310,19 @@ waiter_gone() {
 }
 
 admitted() {
-    exec 8>&-
-    # Prices this build for the builds that start after it.
+    # Prices this build for the builds that start after it, before the next
+    # waiter can look.
     printf '%s %s\n' "$$" "$cost" >"$(slot_path "$index").cost" 2>/dev/null || :
+    exec 8>&-
     # Each build gets a share of the CPUs among the builds running once it
     # starts, replacing the repository's two-job default and capping a larger
     # CARGO_BUILD_JOBS. A lone slot keeps Cargo's configured jobs. `-j` on the
     # command still wins.
     if [ "$slots" -gt 1 ]; then
+        # At most 8, the jobs the expected costs were measured with.
         share=$((cpus / (running + 1)))
         [ "$share" -le $((cpus / 2)) ] || share=$((cpus / 2))
+        [ "$share" -le 8 ] || share=8
         [ "$share" -ge 4 ] || share=4
         case ${CARGO_BUILD_JOBS:-} in
             ''|*[!0-9]*|0*) CARGO_BUILD_JOBS=$share ;;
@@ -329,6 +337,8 @@ admitted() {
 }
 
 release() {
+    # While the slot is still held, so no later holder is priced as this one.
+    rm -f -- "$(slot_path "$index").cost"
     exec 9>&-
 }
 

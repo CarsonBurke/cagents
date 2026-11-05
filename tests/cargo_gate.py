@@ -510,6 +510,7 @@ class MemoryAdmission(unittest.TestCase):
             stderr=subprocess.DEVNULL,
         )
         self.addCleanup(holder.wait, 10)
+        self.holder = holder
         self.addCleanup((self.root / "release").touch)
         deadline = time.monotonic() + 10
         while not (self.root / "held").exists():
@@ -530,7 +531,11 @@ class MemoryAdmission(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("waiting", result.stderr)
         cpus = os.cpu_count()
-        self.assertEqual(int(result.stdout), max(4, cpus // 2))
+        self.assertEqual(int(result.stdout), max(4, min(8, cpus // 2)))
+        # Released, the slot no longer prices its last holder.
+        (self.root / "release").touch()
+        self.holder.wait(timeout=10)
+        self.assertFalse(any(self.root.glob("slot.lock*.cost")))
 
     def test_a_build_that_does_not_fit_waits_for_the_running_one(self):
         self.hold(1)
@@ -550,7 +555,30 @@ class MemoryAdmission(unittest.TestCase):
     def test_a_lone_build_gets_half_the_cpus(self):
         result = self.build(1, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(int(result.stdout), max(4, os.cpu_count() // 2))
+        self.assertEqual(int(result.stdout), max(4, min(8, os.cpu_count() // 2)))
+
+    def test_a_slot_held_by_a_plain_flock_is_priced_not_fatal(self):
+        holder = subprocess.Popen(
+            ["flock", self.root / "slot.lock", "sh", "-c",
+             f"touch {self.root}/held; while [ ! -e {self.root}/release ]; do sleep 0.05; done"])
+        self.addCleanup(holder.wait, 10)
+        self.addCleanup((self.root / "release").touch)
+        while not (self.root / "held").exists():
+            time.sleep(0.02)
+        # Priced as the largest build, so whether a small build fits depends
+        # on this host; either way the gate admits or keeps waiting.
+        waiter = subprocess.Popen(
+            [str(self.gate), "exec", "true"], env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"},
+            cwd=self.root, stderr=subprocess.PIPE, text=True)
+        try:
+            status = waiter.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            waiter.kill()
+            status = waiter.wait()
+            self.assertNotIn("unbound", waiter.stderr.read())
+        else:
+            self.assertEqual(status, 0, waiter.stderr.read())
+        waiter.stderr.close()
 
     def test_an_invalid_cost_is_refused(self):
         result = self.build("08", timeout=10)
