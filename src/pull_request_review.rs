@@ -535,6 +535,9 @@ pub struct State {
     collapsed_directories: BTreeSet<RepoPath>,
     selected: Option<RepoPath>,
     notice: Option<String>,
+    /// The load whose adoption keeps `notice`: the reload a review write
+    /// starts must not erase the write's own outcome.
+    notice_survives_load: Option<u64>,
     effects: Vec<Effect>,
 }
 
@@ -747,6 +750,7 @@ impl State {
             collapsed_directories: BTreeSet::new(),
             selected: None,
             notice: None,
+            notice_survives_load: None,
             effects: Vec::new(),
         }
     }
@@ -1625,6 +1629,7 @@ impl State {
         self.viewed_cancellation = CancellationToken::new();
         self.generation = self.generation.wrapping_add(1);
         self.load_generation = 0;
+        self.notice_survives_load = None;
         self.viewed_after_load.clear();
         self.last_refresh = None;
         self.target = None;
@@ -1743,7 +1748,9 @@ impl State {
         }
         self.cache_loading = false;
         self.cached_viewer = None;
-        self.notice = None;
+        if self.notice_survives_load.take() != Some(self.load_generation) {
+            self.notice = None;
+        }
         let entries_changed = self
             .files
             .iter()

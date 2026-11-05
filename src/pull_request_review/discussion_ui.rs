@@ -499,7 +499,9 @@ impl State {
                     crate::github::polling::ready(&target.repository.host, false)
                 }) {
                     self.refreshing = true;
-                    return self.start_load();
+                    let load = self.start_load();
+                    self.notice_survives_load = Some(self.load_generation);
+                    return load;
                 }
                 self.refreshing = false;
             }
@@ -2607,6 +2609,37 @@ mod tests {
             state.notice.is_none(),
             "the refusal belongs in the popover, not under it"
         );
+    }
+
+    #[test]
+    fn a_refused_comment_keeps_its_notice_through_the_reload_it_starts() {
+        let mut state = ready();
+        // A private host, so no other test's polling budget can block the reload.
+        state.target.as_mut().unwrap().repository =
+            GitHubRepoKey::new("refused-notice-reload.invalid", None, "o", "r").unwrap();
+        state.discussion.busy = true;
+        drop(state.update_discussion(Action::Finished {
+            generation: state.generation,
+            outcome: Outcome::Refused("pending review belongs to another commit".into()),
+        }));
+        assert!(state.refreshing, "the outcome reloads the review");
+        let reload = Arc::new(loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]));
+        drop(state.update(super::super::Action::Loaded {
+            generation: state.generation,
+            load: state.load_generation,
+            result: Ok(Arc::clone(&reload)),
+        }));
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("pending review belongs to another commit"),
+            "the reload must not erase why nothing was posted"
+        );
+        drop(state.update(super::super::Action::Loaded {
+            generation: state.generation,
+            load: state.load_generation,
+            result: Ok(reload),
+        }));
+        assert!(state.notice.is_none(), "only that one reload keeps it");
     }
 
     #[test]
