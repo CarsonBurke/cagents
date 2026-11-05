@@ -15,6 +15,14 @@ struct AutomaticAttempt {
     retained: bool,
 }
 
+/// What only an explicitly confirmed deletion of a merged worktree would discard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedWorktreeContents {
+    pub uncommitted: bool,
+    /// Ignored user files, excluding disposable build directories.
+    pub ignored: Vec<String>,
+}
+
 /// Captured before the effect; an old path result cannot acquire new editor owners.
 #[derive(Debug, Clone)]
 pub struct WorktreeRemovalCapture {
@@ -230,15 +238,13 @@ pub enum Action {
     /// Runs a failed deletion again. The user confirmed it once already.
     RetryDelete(WorktreeId),
     AwaitSessions(Target, WorktreeRemovalCapture),
-    /// A merged worktree was inventoried for its notice; it is always kept.
-    /// `ignored` names the user files that only an explicitly confirmed
-    /// deletion would discard, or is `None` when the inventory was incomplete.
+    /// A merged worktree was inspected for its notice; it is always kept.
+    /// `contents` is `None` when the inspection could not finish.
     MergedWorktreeKept {
         target: Target,
         generation: u64,
         request: crate::worktree_cleanup::RemovalRequest,
-        ignored: Option<Vec<String>>,
-        uncommitted: bool,
+        contents: Option<MergedWorktreeContents>,
     },
     Deleted {
         target: Target,
@@ -389,7 +395,7 @@ impl Cagents {
             .retain(|id, attempt| attempt.project != project_id || current_ids.contains(id));
         let candidate = records
             .iter()
-            .filter_map(|(record, status)| {
+            .filter_map(|(record, _)| {
                 let source = self
                     .sidebar_model
                     .project(project_id)?
@@ -439,14 +445,11 @@ impl Cagents {
                 {
                     return None;
                 }
-                let uncommitted = status
-                    .as_ref()
-                    .is_some_and(|status| status.dirty.is_dirty());
-                Some((target, request, uncommitted))
+                Some((target, request))
             })
             // A refused candidate must not monopolize every later refresh. Prefer
             // unseen candidates, then those whose last attempt is oldest.
-            .min_by_key(|(target, _, _)| {
+            .min_by_key(|(target, _)| {
                 target.worktree.and_then(|id| {
                     self.project_ui
                         .automatic_attempts
@@ -454,7 +457,7 @@ impl Cagents {
                         .map(|attempt| attempt.at)
                 })
             });
-        let Some((target, request, uncommitted)) = candidate else {
+        let Some((target, request)) = candidate else {
             return Task::none();
         };
         let Some(generation) = self.project_ui.next_automatic_attempt.checked_add(1) else {
@@ -475,21 +478,18 @@ impl Cagents {
         );
         let path = request.path.clone();
         cosmic::task::future(async move {
-            let inventory = tokio::task::spawn_blocking(move || {
-                crate::repository::RepositoryService::system("git")
-                    .notable_ignored_files(&path, &crate::process::CancellationToken::new())
-            })
-            .await;
-            // The notice is still useful without the inventory, but must say
+            let inspection =
+                tokio::task::spawn_blocking(move || inspect_merged_worktree(&path)).await;
+            // The notice is still useful without the inspection, but must say
             // the check did not finish; deletion keeps its own confirmation.
-            let ignored = match inventory {
-                Ok(Ok(files)) => Some(files.iter().map(ToString::to_string).collect()),
+            let contents = match inspection {
+                Ok(Ok(contents)) => Some(contents),
                 Ok(Err(error)) => {
-                    tracing::warn!(%error, "could not list ignored files in merged worktree");
+                    tracing::warn!(%error, "could not inspect merged worktree");
                     None
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "ignored-file inventory task failed");
+                    tracing::warn!(%error, "merged worktree inspection task failed");
                     None
                 }
             };
@@ -497,8 +497,7 @@ impl Cagents {
                 target,
                 generation,
                 request,
-                ignored,
-                uncommitted,
+                contents,
             })
         })
     }
@@ -1482,8 +1481,7 @@ impl Cagents {
                 target,
                 generation,
                 request,
-                ignored,
-                uncommitted,
+                contents,
             } => {
                 let Some(id) = target.worktree else {
                     return Task::none();
@@ -1526,11 +1524,7 @@ impl Cagents {
                 // Automatic cleanup has no user confirmation to reuse. Keep
                 // this out of Deletion.failure: its RetryDelete action is an
                 // already-confirmed destructive operation.
-                self.status = Some(merged_worktree_notice(
-                    &target.label,
-                    ignored.as_deref(),
-                    uncommitted,
-                ));
+                self.status = Some(merged_worktree_notice(&target.label, contents.as_ref()));
                 return Task::none();
             }
             Action::Deleted {
@@ -2032,23 +2026,40 @@ impl Cagents {
     }
 }
 
+/// Reads, without changing anything, what deleting a merged worktree would
+/// discard. Runs Git, so callers keep it off the UI thread.
+fn inspect_merged_worktree(
+    path: &Path,
+) -> Result<MergedWorktreeContents, crate::repository::RepositoryError> {
+    let repository = crate::repository::RepositoryService::system("git");
+    let cancellation = crate::process::CancellationToken::new();
+    let uncommitted = repository.status(path, &cancellation)?.dirty.is_dirty();
+    let ignored = repository
+        .notable_ignored_files(path, &cancellation)?
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    Ok(MergedWorktreeContents {
+        uncommitted,
+        ignored,
+    })
+}
+
 /// Says what deleting a merged worktree would discard. A few ignored files are
 /// named inline; when more remain, the details list a bounded number of them.
 fn merged_worktree_notice(
     label: &str,
-    ignored: Option<&[String]>,
-    uncommitted: bool,
+    contents: Option<&MergedWorktreeContents>,
 ) -> TransientNotice {
     const INLINE: usize = 3;
     const DETAILED: usize = 50;
-    let Some(files) = ignored else {
-        let changes = if uncommitted {
-            ", and it has uncommitted changes"
-        } else {
-            ""
-        };
+    let Some(MergedWorktreeContents {
+        uncommitted,
+        ignored: files,
+    }) = contents
+    else {
         return TransientNotice::warning(format!(
-            "{label} is merged. Its ignored files could not be checked{changes}; review the worktree before deleting it."
+            "{label} is merged. Its worktree could not be checked for uncommitted changes or ignored files; review it before deleting it."
         ));
     };
     if files.is_empty() && !uncommitted {
@@ -2057,7 +2068,7 @@ fn merged_worktree_notice(
         ));
     }
     let mut held = Vec::new();
-    if uncommitted {
+    if *uncommitted {
         held.push("uncommitted changes".to_owned());
     }
     if !files.is_empty() {
@@ -2759,8 +2770,45 @@ mod tests {
     }
 
     #[test]
+    fn merged_worktree_inspection_reads_real_changes_and_ignored_user_files() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path();
+        git(repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), ".env\ntarget/\n.next/\n").unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(repository, &["add", "."]);
+        git(repository, &["commit", "-q", "-m", "init"]);
+        assert_eq!(
+            inspect_merged_worktree(repository).unwrap(),
+            MergedWorktreeContents {
+                uncommitted: false,
+                ignored: Vec::new(),
+            }
+        );
+
+        std::fs::write(repository.join(".env"), "SECRET=1\n").unwrap();
+        for cache in ["target/debug", ".next"] {
+            std::fs::create_dir_all(repository.join(cache)).unwrap();
+            std::fs::write(repository.join(cache).join("artifact"), "x").unwrap();
+        }
+        std::fs::write(repository.join("README.md"), "edited\n").unwrap();
+        assert_eq!(
+            inspect_merged_worktree(repository).unwrap(),
+            MergedWorktreeContents {
+                uncommitted: true,
+                ignored: vec![".env".into()],
+            }
+        );
+        assert!(inspect_merged_worktree(&repository.join("missing")).is_err());
+    }
+
+    #[test]
     fn merged_worktree_notice_names_what_deletion_would_discard() {
-        let clean = merged_worktree_notice("feature", Some(&[]), false);
+        let contents = |uncommitted, ignored: Vec<String>| MergedWorktreeContents {
+            uncommitted,
+            ignored,
+        };
+        let clean = merged_worktree_notice("feature", Some(&contents(false, Vec::new())));
         assert!(
             clean
                 .message
@@ -2769,20 +2817,19 @@ mod tests {
         assert!(!clean.message.contains("kept"));
         assert_eq!(clean.details, None);
 
-        let dirty = merged_worktree_notice("feature", Some(&[]), true);
+        let dirty = merged_worktree_notice("feature", Some(&contents(true, Vec::new())));
         assert!(
             dirty
                 .message
                 .contains("still has uncommitted changes, which deleting it")
         );
 
-        let unknown = merged_worktree_notice("feature", None, true);
+        let unknown = merged_worktree_notice("feature", None);
         assert!(unknown.message.contains("could not be checked"));
-        assert!(unknown.message.contains("uncommitted changes"));
         assert!(!unknown.message.contains("delete its worktree from"));
 
         let files: Vec<String> = (0..60).map(|index| format!("file-{index}.db")).collect();
-        let many = merged_worktree_notice("feature", Some(&files), true);
+        let many = merged_worktree_notice("feature", Some(&contents(true, files)));
         assert!(many.message.contains(
             "uncommitted changes and ignored files (file-0.db, file-1.db, file-2.db and 57 more)"
         ));
@@ -2832,8 +2879,10 @@ mod tests {
                 target: target.clone(),
                 generation: 1,
                 request,
-                ignored: Some(vec![".env".into()]),
-                uncommitted: false,
+                contents: Some(MergedWorktreeContents {
+                    uncommitted: false,
+                    ignored: vec![".env".into()],
+                }),
             })));
             assert!(app.project_ui.automatic_attempts[&target.worktree.unwrap()].retained);
             assert!(app.project_ui.deletions.is_empty());
@@ -3103,8 +3152,10 @@ mod tests {
             target: target.clone(),
             generation,
             request: request.clone(),
-            ignored: Some(Vec::new()),
-            uncommitted: false,
+            contents: Some(MergedWorktreeContents {
+                uncommitted: false,
+                ignored: Vec::new(),
+            }),
         }));
         assert!(!app.project_ui.automatic_attempts[&linked.id].retained);
         assert_eq!(
@@ -3121,8 +3172,10 @@ mod tests {
             target: target.clone(),
             generation,
             request: request.clone(),
-            ignored: Some(vec![".env".into(), "data.db".into()]),
-            uncommitted: false,
+            contents: Some(MergedWorktreeContents {
+                uncommitted: false,
+                ignored: vec![".env".into(), "data.db".into()],
+            }),
         }));
         assert_eq!(row(&app, linked.id).unwrap().path, linked.path);
         assert_eq!(row(&app, linked.id).unwrap().deletion, None);
@@ -3196,8 +3249,10 @@ mod tests {
             target: other_target,
             generation: other_generation,
             request: other_request,
-            ignored: Some(vec![".env".into(), "data.db".into()]),
-            uncommitted: false,
+            contents: Some(MergedWorktreeContents {
+                uncommitted: false,
+                ignored: vec![".env".into(), "data.db".into()],
+            }),
         }));
         assert!(app.project_ui.deletions.is_empty());
 
@@ -3243,8 +3298,10 @@ mod tests {
                 target: target.clone(),
                 generation,
                 request: request.clone(),
-                ignored: Some(Vec::new()),
-                uncommitted: false,
+                contents: Some(MergedWorktreeContents {
+                    uncommitted: false,
+                    ignored: Vec::new(),
+                }),
             }));
             assert!(app.project_ui.deletions.is_empty());
             assert_eq!(app.project_ui.automatic_attempts[&linked.id].at, pending_at);
@@ -3259,8 +3316,10 @@ mod tests {
             target: target.clone(),
             generation: fresh_generation,
             request: fresh_request,
-            ignored: Some(vec![".env".into(), "data.db".into()]),
-            uncommitted: false,
+            contents: Some(MergedWorktreeContents {
+                uncommitted: false,
+                ignored: vec![".env".into(), "data.db".into()],
+            }),
         }));
         assert!(app.project_ui.deletions.is_empty());
 
@@ -3285,8 +3344,10 @@ mod tests {
             target,
             generation: queued.generation,
             request: queued.request,
-            ignored: Some(Vec::new()),
-            uncommitted: false,
+            contents: Some(MergedWorktreeContents {
+                uncommitted: false,
+                ignored: Vec::new(),
+            }),
         }));
         assert_eq!(app.project_ui.deletions[&linked.id].started_at, manual_at);
         assert!(app.project_ui.deletions[&linked.id].failure.is_none());
