@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise held-command lifetime with private locks and owned processes only."""
 
+import contextlib
 import ctypes
 import errno
 import fcntl
@@ -461,6 +462,199 @@ while True:
                 self.assertTrue(self.slot_is_free())
                 ready.unlink()
                 calls.unlink()
+
+    def leftover_daemon_fixture(self):
+        # A Cargo that leaves a daemon behind, in the build phase or the test run,
+        # as a fixture cagentsd did when its `cargo test` was killed.
+        binary = self.root / "bin"
+        binary.mkdir()
+        cargo = binary / "cargo"
+        cargo.write_text(f"""#!/bin/sh
+root={str(self.root)!r}
+case " $* " in
+    *" --no-run "*) [ -e "$root/in-build" ] || exit 0 ;;
+esac
+setsid sleep 60 &
+printf '%s %s' "$!" "$$" > "$root/ready.new"
+mv "$root/ready.new" "$root/ready"
+exec sleep 60
+""")
+        cargo.chmod(0o755)
+        self.env["PATH"] = f"{binary}:{self.env['PATH']}"
+
+    def kill_gate_and_check_the_daemon(self, child):
+        self.wait_for((self.root / "ready").exists, "the leftover daemon")
+        daemon, stub = map(int, (self.root / "ready").read_text().split())
+        for pid in (daemon, stub):
+            with contextlib.suppress(ProcessLookupError):
+                self.descendants.append((pid, os.pidfd_open(pid)))
+        child.kill()
+        child.wait(timeout=5)
+        os.kill(daemon, 0)
+        open_files = [os.readlink(entry) for entry in Path(f"/proc/{daemon}/fd").iterdir()]
+        self.assertNotIn(str(self.lock), open_files)
+        self.wait_for(self.slot_is_free, "the slot of a killed gate")
+        os.kill(daemon, 0)
+
+    def test_a_daemon_from_a_killed_test_run_does_not_keep_the_slot(self):
+        self.leftover_daemon_fixture()
+        child = subprocess.Popen(
+            [str(self.gate), "test", "--locked"], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        self.children.append(child)
+        self.kill_gate_and_check_the_daemon(child)
+
+    def test_a_daemon_from_a_killed_build_does_not_keep_the_slot(self):
+        self.leftover_daemon_fixture()
+        (self.root / "in-build").touch()
+        child = subprocess.Popen(
+            [str(self.gate), "test", "--locked"], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        self.children.append(child)
+        self.kill_gate_and_check_the_daemon(child)
+
+    def test_under_flock_close_a_gated_command_uses_the_callers_slot(self):
+        result = subprocess.run(
+            ["flock", "--close", str(self.lock), str(self.gate), "exec", "true"],
+            env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting", result.stderr)
+
+    def under_flock(self, slot, *inner, env=None):
+        """A gated `exec true` under `flock --close slot`, through `inner`, without waiting long."""
+        return subprocess.run(
+            ["flock", "--close", str(slot), *inner, str(self.gate), "exec", "true"],
+            env=env or self.env, capture_output=True, text=True, timeout=10,
+        )
+
+    def hold_slot_elsewhere(self, slot=None):
+        holder = subprocess.Popen(["flock", "--close", str(slot or self.lock), "sleep", "60"],
+                                  start_new_session=True)
+        self.children.append(holder)
+        self.addCleanup(self.end_group, holder.pid)
+        self.wait_for(lambda: self.is_locked(slot or self.lock), "the other holder")
+
+    def is_locked(self, path):
+        with Path(path).open("a") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+        return False
+
+    def assert_gate_queues(self, *command, env=None):
+        child = subprocess.Popen(
+            [*command, str(self.gate), "exec", "true"], env=env or self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        self.children.append(child)
+        self.addCleanup(self.end_group, child.pid)
+        time.sleep(1)
+        self.assertIsNone(child.poll(), "the gate must queue")
+
+    def test_a_flock_further_up_still_counts_as_the_callers_slot(self):
+        script = f'"{self.gate}" exec true; :'
+        result = subprocess.run(
+            ["flock", "--close", str(self.lock), "sh", "-c", f"sh -c '{script}'; :"],
+            env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting", result.stderr)
+
+    def test_flock_on_a_numbered_slot_counts_only_if_that_slot_exists(self):
+        second = Path(f"{self.lock}.1")
+        result = self.under_flock(second, env=self.env | {"CAGENTS_BUILD_SLOTS": "2"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Run in that slot, not admitted to a free one: an admitted command gets the marker.
+        result = subprocess.run(
+            ["flock", "--close", f"{self.lock}.10", str(self.gate), "exec",
+             "sh", "-c", 'test -z "${CAGENTS_BUILD_SLOT_HELD+x}"'],
+            env=self.env | {"CAGENTS_BUILD_SLOTS": "12"}, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.hold_slot_elsewhere()
+        self.assert_gate_queues("flock", "--close", str(second))
+
+    def test_flock_on_the_queue_or_cost_file_is_not_a_slot(self):
+        self.hold_slot_elsewhere()
+        for name in (".queue", ".cost", ".1.queue", ".00"):
+            self.assert_gate_queues("flock", "--close", f"{self.lock}{name}")
+
+    def test_flock_through_a_symlink_counts_as_the_callers_slot(self):
+        link = self.root / "link.lock"
+        link.symlink_to(self.lock)
+        result = self.under_flock(self.lock, env=self.env | {"CAGENTS_BUILD_LOCK": str(link)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting", result.stderr)
+
+    def test_a_flock_with_a_slot_open_but_not_locked_is_not_holding_it(self):
+        # flock --close closes only the lock it took, so this one keeps the slot open.
+        other = self.root / "other.lock"
+        self.hold_slot_elsewhere()
+        with self.lock.open("a") as opened:
+            child = subprocess.Popen(
+                ["flock", "--close", str(other), str(self.gate), "exec", "true"],
+                env=self.env, pass_fds=(opened.fileno(),),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+            )
+        self.children.append(child)
+        self.addCleanup(self.end_group, child.pid)
+        time.sleep(1)
+        self.assertIsNone(child.poll(), "an open descriptor is not a held slot")
+
+    def test_a_leftover_that_is_not_flock_does_not_admit_what_it_starts(self):
+        # A held slot on an ancestor that isn't flock, and that closes it for its children.
+        script = f'exec 7>>"{self.lock}"; flock 7; "{self.gate}" exec true 7>&-; :'
+        self.assert_gate_queues_script(script)
+
+    def assert_gate_queues_script(self, script):
+        ready = self.root / "started"
+        child = subprocess.Popen(
+            ["sh", "-c", f': > "{ready}"; {script}'], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        self.children.append(child)
+        self.addCleanup(self.end_group, child.pid)
+        self.wait_for(ready.exists, "the holder")
+        time.sleep(1)
+        self.assertIsNone(child.poll(), "only a running flock's slot counts")
+
+    def test_a_killed_gate_leaves_nobody_holding_the_queue(self):
+        self.hold_slot_elsewhere()
+        gate = subprocess.Popen(
+            [str(self.gate), "exec", "true"], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        self.children.append(gate)
+        self.addCleanup(self.end_group, gate.pid)
+        queue = Path(f"{self.lock}.queue")
+        self.wait_for(lambda: self.is_locked(queue), "the gate at the head of the queue")
+        children = Path(f"/proc/{gate.pid}/task/{gate.pid}/children")
+        def requesting():
+            return any(
+                Path(f"/proc/{pid}/comm").read_text().strip() == "flock"
+                for pid in children.read_text().split()
+                if Path(f"/proc/{pid}/comm").exists()
+            )
+        self.wait_for(requesting, "the gate's request for the slot")
+        gate.kill()
+        gate.wait(timeout=5)
+        self.wait_for(lambda: not self.is_locked(queue), "the queue to free")
+        # Its request is still waiting for the slot, without the caller's streams.
+        for stream in (gate.stdout, gate.stderr):
+            self.assertTrue(select.select([stream], [], [], 5)[0], "a stream stayed open")
+            stream.read()
+
+    def end_group(self, group):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(group, signal.SIGKILL)
+
+    def test_an_unrelated_holder_is_still_waited_for(self):
+        self.hold_slot_elsewhere()
+        self.assert_gate_queues()
 
     def test_successful_split_preserves_cargo_and_program_arguments(self):
         binary = self.root / "bin"
@@ -979,9 +1173,10 @@ class AdmissionTimeout(unittest.TestCase):
                 self.fixture.assert_preflight_unslotted(self.fixture.calls())
 
     def test_one_budget_covers_cumulative_hooks_and_seed_is_not_fail_soft_on_expiry(self):
-        self.reset(delays={"metadata":0.35, "guard":0.35, "seed":0.6})
-        process = self.fixture.start()
-        _stdout, stderr = process.communicate("", timeout=5)
+        # Two seconds, so a loaded host still reaches the seed hook within the budget.
+        self.reset(delays={"metadata":0.7, "guard":0.7, "seed":1.2})
+        process = self.fixture.start(environment=self.fixture.env | {self.setting:"2"})
+        _stdout, stderr = process.communicate("", timeout=8)
         self.assert_timeout(process, stderr)
         self.assertEqual([event["phase"] for event in self.fixture.calls()], ["metadata", "guard", "seed"])
 
