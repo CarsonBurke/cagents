@@ -1,5 +1,5 @@
 //! What one window does when a pane holding a session reaches it, given the
-//! cards it already has for that session: closed, idle, or holding unsent text.
+//! cards it already has for that session: closed, idle, or with work on it.
 //! These start from that card state rather than replaying how it arose, and they
 //! drop the tasks a reconcile returns, so neither a provider nor the daemon's
 //! `cagents channel move` runs here.
@@ -197,33 +197,14 @@ fn attaching_a_session_with_an_idle_local_card_replaces_that_card() {
     assert!(!app.card_state(card).unwrap().existence.is_open());
 }
 
+/// Closing a card a pane holds the session of lets go of it and its draft, and
+/// the pane shows.
 #[test]
-fn unsent_text_holds_an_attached_session_until_it_clears_then_moves_it() {
+fn closing_a_held_card_shows_the_attached_pane_without_its_draft() {
     let (mut app, mut view, attached, _directory) = local_only_chat();
     let card = app.workspace.focused().unwrap();
     app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(card, "unsent".into())]));
-    publish_attached(&mut app, &mut view, &attached);
-    assert!(app.shared_views.blocked.contains(&view.scope));
-    assert_eq!(open_panes_of(&app, &attached.kind), [card]);
-    assert!(app.shared_views.blocked_aliases.contains(&card));
-
-    // Nothing has changed yet, so a reconcile is not due.
-    drop(app.reconcile_cleared_blocked_aliases());
-    assert_eq!(open_panes_of(&app, &attached.kind), [card]);
-
-    app.chat_ui = chat_ui::State::with_drafts(HashMap::new());
-    drop(app.reconcile_cleared_blocked_aliases());
-    assert!(app.shared_views.blocked.is_empty());
-    assert_eq!(open_panes_of(&app, &attached.kind), [attached.id]);
-}
-
-/// Closing the held card lets go of it and its draft, so the pane can show.
-#[test]
-fn closing_a_blocked_card_shows_the_attached_pane() {
-    let (mut app, mut view, attached, _directory) = local_only_chat();
-    let card = app.workspace.focused().unwrap();
-    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(card, "unsent".into())]));
-    publish_attached(&mut app, &mut view, &attached);
+    hold_in_view(&mut app, &mut view, &attached);
     assert!(app.another_pane_holds_session(card));
 
     drop(app.begin_chat_close(card));
@@ -231,6 +212,107 @@ fn closing_a_blocked_card_shows_the_attached_pane() {
     assert_eq!(open_panes_of(&app, &attached.kind), [attached.id]);
     assert!(app.shared_views.blocked.is_empty());
     assert!(!app.shared_chat_has_local_work(card));
+}
+
+/// `pane` is in the daemon's view, whether or not this window has acted on it.
+fn hold_in_view(app: &mut Cagents, view: &mut View, pane: &Pane) {
+    view.revision += 1;
+    view.panes = vec![pane.clone()];
+    let scope = view.scope.clone();
+    *app.workspace_model
+        .views
+        .iter_mut()
+        .find(|candidate| candidate.scope == scope)
+        .unwrap() = view.clone();
+}
+
+fn channel_holding(app: &Cagents, card: CardId) -> ChannelId {
+    app.durable
+        .channels
+        .iter()
+        .find(|channel| channel.cards.contains(&card))
+        .unwrap()
+        .id
+}
+
+/// A channel deletion waits on its sessions' close and removes the channel when
+/// that answers; with nothing of its own to close it finishes at once.
+#[test]
+fn deleting_a_channel_only_closes_sessions_no_other_pane_holds() {
+    for held_elsewhere in [true, false] {
+        let (mut app, mut view, attached, _directory) = local_only_chat();
+        let card = app.workspace.focused().unwrap();
+        let old = channel_holding(&app, card);
+        if held_elsewhere {
+            hold_in_view(&mut app, &mut view, &attached);
+        }
+        drop(app.delete_channel(old));
+        let remains = app.durable.channels.iter().any(|channel| channel.id == old);
+        assert_eq!(
+            remains, !held_elsewhere,
+            "the close is awaited only if it was asked for"
+        );
+        if held_elsewhere {
+            assert!(!app.card_state(card).unwrap().existence.is_open());
+            assert_eq!(app.workspace_model.views[1].panes[0].id, attached.id);
+        }
+    }
+}
+
+#[test]
+fn closing_a_terminal_card_only_ends_its_session_when_no_other_pane_holds_it() {
+    for held_elsewhere in [true, false] {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let state = app.card_state_mut(card).unwrap();
+        state.residency = Residency::Hot;
+        let CardKind::Terminal(session) = &mut state.kind else {
+            unreachable!();
+        };
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("host"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+        };
+        if held_elsewhere {
+            let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+            pane.id = CardId::new();
+            let mut view = View::empty(ChannelId::new());
+            view.panes.push(pane);
+            app.workspace_model.views = vec![view];
+        }
+        drop(app.update(Message::CloseCardUnasked(card)));
+        assert_eq!(app.terminal_close_pending(card), !held_elsewhere);
+        assert_eq!(
+            app.card_state(card).unwrap().existence.is_open(),
+            !held_elsewhere
+        );
+    }
+}
+
+/// Letting go of a held card is an ordinary close of that card: it says so in
+/// the saved record, and a channel it empties retires as usual.
+#[test]
+fn releasing_a_held_card_records_a_close_and_retires_the_channel_it_empties() {
+    let (mut app, mut view, attached, _directory) = local_only_chat();
+    let card = app.workspace.focused().unwrap();
+    let old = channel_holding(&app, card);
+    app.workspace_model
+        .channels
+        .push(crate::workspace_model::ModelChannel {
+            id: old,
+            repository: "/workspace/chat-fixture".into(),
+            title: "view".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+        });
+    hold_in_view(&mut app, &mut view, &attached);
+    drop(app.begin_chat_close(card));
+    let Existence::Closed { tombstone } = &app.card_state(card).unwrap().existence else {
+        panic!("the card closed");
+    };
+    assert_eq!(tombstone.reason.as_deref(), Some("closed by user"));
+    assert_eq!(app.channel_work.retire_candidates.len(), 1);
 }
 
 #[test]

@@ -2496,6 +2496,7 @@ mod tests {
         let channel = ChannelId::new();
         let explicit = ChannelId::new();
         let mut caller = Entry {
+            history_only: false,
             id: crate::model::TerminalId::new(),
             surface: Surface::Chat,
             provider: Some(Provider::Claude),

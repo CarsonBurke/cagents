@@ -6846,14 +6846,57 @@ impl Cagents {
                 }))
     }
 
-    pub(super) fn can_rekey_shared_terminal_draft(&self, alias: CardId, canonical: CardId) -> bool {
+    /// Whether a chat card can give way to the pane holding its conversation.
+    /// Text and attachments go with it. What is mid-flight or queued belongs to
+    /// this card's runtime, as does a card closed elsewhere with a draft to
+    /// rescue, so it stays until that clears.
+    pub(super) fn can_move_chat_to_pane(&self, alias: CardId, canonical: CardId) -> bool {
+        let runtime = match self.cards.get(&alias) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&alias).map(Box::as_ref),
+        };
+        if runtime.is_some_and(|runtime| {
+            runtime.closed_elsewhere || runtime.transition_blocker().is_some()
+        }) {
+            return false;
+        }
+        !self.shared_chat_has_local_work(alias)
+            // An open pane has already read its saved draft and would not see this one.
+            || (self.can_rekey_shared_draft(alias, canonical)
+                && !self.cards.contains_key(&canonical))
+    }
+
+    /// Hands what `alias` has not sent to `canonical`, which shows it when it
+    /// opens. Returns whether there was anything to hand over.
+    pub(super) fn carry_chat_draft_to_pane(&mut self, alias: CardId, canonical: CardId) -> bool {
+        self.chat_forget(alias);
+        let carried = self
+            .chat_ui
+            .drafts
+            .get(&alias)
+            .is_some_and(|draft| !draft.is_empty())
+            || self
+                .chat_ui
+                .draft_attachments
+                .get(&alias)
+                .is_some_and(|images| !images.is_empty());
+        carried && self.rekey_shared_draft(alias, canonical)
+    }
+
+    /// A released card's text and attachments go with it.
+    pub(super) fn chat_discard_local_work(&mut self, card: CardId) {
+        self.chat_ui.drafts.remove(&card);
+        self.chat_ui.draft_attachments.remove(&card);
+    }
+
+    pub(super) fn can_rekey_shared_draft(&self, alias: CardId, canonical: CardId) -> bool {
         !self.chat_ui.phases.contains_key(&alias)
             && !self.chat_ui.parked.contains_key(&alias)
             && !self.shared_chat_has_local_work(canonical)
     }
 
-    pub(super) fn rekey_shared_terminal_draft(&mut self, alias: CardId, canonical: CardId) -> bool {
-        if !self.can_rekey_shared_terminal_draft(alias, canonical) {
+    pub(super) fn rekey_shared_draft(&mut self, alias: CardId, canonical: CardId) -> bool {
+        if !self.can_rekey_shared_draft(alias, canonical) {
             return false;
         }
         if let Some(images) = self.chat_ui.draft_attachments.remove(&alias) {
@@ -7006,10 +7049,12 @@ impl Cagents {
         if self.chat_start_pending(card) {
             return false;
         }
-        match self.cards.get(&card) {
+        let offered = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => runtime.offers_fresh_conversation(),
             _ => self.chat_ui.fresh_offers.contains(&card),
-        }
+        };
+        // Replacing the conversation here would end it in the pane that holds it.
+        offered && !self.another_pane_holds_session(card)
     }
     pub(super) fn chat_fork_target(&self, card: CardId) -> Option<Target> {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
@@ -7081,6 +7126,10 @@ impl Cagents {
             return Some(Cow::Borrowed(
                 "This pane is moving to a channel. Wait for the move to finish before changing views.",
             ));
+        }
+        // Either direction ends the session here, and the pane holding it with it.
+        if let Some(reason) = self.session_held_elsewhere_reason(card) {
+            return Some(Cow::Owned(reason));
         }
         if let Some(phase) = self.chat_ui.phases.get(&card) {
             return Some(Cow::Borrowed(match phase {
@@ -7234,8 +7283,6 @@ impl Cagents {
         }
         // The session is that pane's now, and closing this card must not end it.
         if self.another_pane_holds_session(card) {
-            self.chat_ui.drafts.remove(&card);
-            self.chat_ui.draft_attachments.remove(&card);
             return self.release_card_held_elsewhere(card);
         }
         // Only a live conversation is ever parked behind its terminal.
@@ -7321,6 +7368,15 @@ impl Cagents {
         handle: Option<Arc<ClientHandle>>,
         session: Option<chat::Session>,
     ) -> Task<Message> {
+        // Dropping the handle only disconnects this card; the pane keeps the session.
+        let handle_session = handle.as_ref().map(|handle| handle.session().id);
+        if handle_session
+            .into_iter()
+            .chain(session.as_ref().map(|session| session.id))
+            .any(|id| self.another_pane_holds(card, id))
+        {
+            return Task::none();
+        }
         let target = self.chat_ui.next_target(card);
         self.chat_ui.retiring.insert(target);
         cosmic::task::future(async move {
@@ -18919,7 +18975,7 @@ mod tests {
                 .draft_attachments
                 .insert(canonical, vec![image.clone()]);
             assert!(app.shared_chat_has_local_work(canonical));
-            assert!(!app.rekey_shared_terminal_draft(alias, canonical));
+            assert!(!app.rekey_shared_draft(alias, canonical));
             assert_eq!(app.chat_ui.draft_attachments[&canonical], [image]);
         });
     }
@@ -20875,6 +20931,177 @@ mod tests {
     /// `cagents channel move` can give a session a shared pane while this window
     /// still shows it from a local card. That card's close button is not a request
     /// to end the session.
+    /// A daemon view lists `card`'s session under a pane of its own.
+    fn hold_elsewhere(app: &mut Cagents, card: CardId) -> CardId {
+        use crate::{
+            model::ChannelId,
+            workspace_model::views::{Pane, View},
+        };
+        let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        pane.id = CardId::new();
+        let held = pane.id;
+        let mut view = View::empty(ChannelId::new());
+        view.panes.push(pane);
+        app.workspace_model.views = vec![view];
+        held
+    }
+
+    /// `card`'s session is attached to a new shared channel while this window
+    /// shows it from a card that view does not list.
+    fn attach_to_new_channel(app: &mut Cagents, card: CardId) -> CardId {
+        use crate::{
+            model::{ChannelId, ProjectChannel, ProjectId},
+            workspace_model::views::{Pane, Scope, View},
+        };
+        app.retain_local_pane(card);
+        let destination = ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                id: destination,
+                project_id: ProjectId::new(),
+                title: "destination".into(),
+                title_source: Default::default(),
+                ordinal: 2,
+                shared: true,
+                cards: vec![],
+                focused: None,
+            });
+        app.mark_view_ready_for_test(Scope::Channel(destination));
+        let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        pane.id = CardId::new();
+        let held = pane.id;
+        let mut view = View::empty(destination);
+        view.revision = 1;
+        view.panes.push(pane);
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        held
+    }
+
+    fn notice(app: &Cagents) -> &str {
+        app.status
+            .as_ref()
+            .map_or("", |notice| notice.message.as_str())
+    }
+
+    #[test]
+    fn unsent_text_goes_with_an_attached_session_to_its_pane() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        write(&mut app, card, "still typing");
+        let held = attach_to_new_channel(&mut app, card);
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(app.card_state(held).unwrap().existence.is_open());
+        assert_eq!(
+            app.chat_ui.drafts.get(&held).map(String::as_str),
+            Some("still typing")
+        );
+        assert!(notice(&app).contains("destination"), "{}", notice(&app));
+    }
+
+    #[test]
+    fn a_queued_followup_keeps_an_attached_session_here_until_a_chat_action_clears_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.followups.push(followup(0, "waiting", &[]));
+        }
+        let held = attach_to_new_channel(&mut app, card);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(
+            app.card_state(held)
+                .is_none_or(|state| !state.existence.is_open())
+        );
+        let raised = notice(&app).to_owned();
+        assert!(raised.contains("destination"), "{raised}");
+        assert!(
+            raised.contains("keeps the conversation running"),
+            "{raised}"
+        );
+
+        // Still held: said once, not again on every reconcile.
+        app.status = None;
+        drop(app.reconcile_shared_views());
+        assert_eq!(notice(&app), "");
+        assert!(app.card_state(card).unwrap().existence.is_open());
+
+        // No direct reconcile: the chat action itself has to get it moving.
+        let _ = app.update(Message::ChatUi(Action::TakeBackQueued(target, None)));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(app.card_state(held).unwrap().existence.is_open());
+        assert_eq!(
+            app.chat_ui.drafts.get(&held).map(String::as_str),
+            Some("waiting")
+        );
+    }
+
+    #[test]
+    fn returning_to_the_terminal_leaves_a_session_another_pane_holds_alone() {
+        for session in [Some(KNOWN_THREAD), None] {
+            for held_elsewhere in [true, false] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = live_chat(&mut app, session);
+                if held_elsewhere {
+                    hold_elsewhere(&mut app, card);
+                }
+                let _ = app.update(Message::ChatUi(Action::Switch(card)));
+                assert_eq!(
+                    app.chat_ui.phases.contains_key(&card),
+                    !held_elsewhere,
+                    "{session:?}: {}",
+                    notice(&app)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn starting_fresh_leaves_a_session_another_pane_holds_alone() {
+        for held_elsewhere in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            app.chat_ui.fresh_offers.insert(card);
+            if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+                let mut snapshot = (*runtime.snapshot).clone();
+                snapshot.exited = true;
+                snapshot.session_id = Some("another".into());
+                runtime.snapshot = Arc::new(snapshot);
+            }
+            if held_elsewhere {
+                hold_elsewhere(&mut app, card);
+            }
+            assert_eq!(app.chat_offers_fresh_conversation(card), !held_elsewhere);
+            let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
+            assert_eq!(app.chat_ui.phases.contains_key(&card), !held_elsewhere);
+        }
+    }
+
+    /// Every start failure, abandoned start and replaced conversation gives its
+    /// session up through this one call.
+    #[test]
+    fn retiring_a_chat_leaves_a_session_another_pane_holds_alone() {
+        for held_elsewhere in [true, false] {
+            for with_handle in [true, false] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = live_chat(&mut app, Some(KNOWN_THREAD));
+                if held_elsewhere {
+                    hold_elsewhere(&mut app, card);
+                }
+                let handle = chat_runtime(&app, card).handle().cloned();
+                let session = app.chat_return_session(card);
+                let task = if with_handle {
+                    app.retire_chat(card, handle, None)
+                } else {
+                    app.retire_chat(card, None, session)
+                };
+                drop(task);
+                assert_eq!(app.chat_ui.retiring.is_empty(), held_elsewhere);
+            }
+        }
+    }
+
     #[test]
     fn closing_a_card_only_ends_its_session_when_no_other_pane_holds_it() {
         use crate::{

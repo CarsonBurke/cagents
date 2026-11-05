@@ -65,6 +65,7 @@ impl Listing {
                 let sessions = if populated {
                     let id = "00000000-0000-4000-8000-000000000001".parse().unwrap();
                     vec![agent_execution::directory::Entry {
+                        history_only: false,
                         id,
                         surface: agent_execution::directory::Surface::Chat,
                         provider: Some(Provider::Claude),

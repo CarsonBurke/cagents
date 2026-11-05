@@ -235,8 +235,7 @@ fn placement_error(error: ControlError) -> AppError {
     let mut error = protocol_error(error);
     if denied {
         error.message = "A session running inside cagents, including a shell in this app, can't \
-            place panes. Run this from a terminal outside cagents, or reopen the conversation \
-            with Resume conversation in the app."
+            place panes. Run this from a terminal outside cagents."
             .to_owned();
     }
     error
@@ -291,6 +290,12 @@ fn attach_session(
                 format!("No shared pane or live session matches {id}"),
             )
         })?;
+    if entry.history_only {
+        return Err(AppError::new(
+            "invalid_target",
+            "This is a saved transcript open for reading; nothing is running to attach. Reopen the conversation with Resume conversation in the app.",
+        ));
+    }
     if entry.delegation.is_some() {
         return Err(AppError::new(
             "invalid_target",
@@ -363,11 +368,12 @@ fn attach_session(
             Some((view, placed)) if view.scope == destination => {
                 let channel = placed_channel(&result, to)?;
                 let title = match channel.title.as_str() {
-                    "" => "Untitled channel",
+                    // The sidebar's label for a channel its first prompt has not named.
+                    "" => "New channel",
                     title => title,
                 };
                 let human = format!(
-                    "Attached session {id} to channel \"{title}\" in {}. Open that channel to see it. A window holding unsent text in this conversation keeps it until that text is sent or cleared.",
+                    "Attached session {id} to channel \"{title}\" in {}. Open that channel to see it. A window with something still queued in this conversation moves it there once that finishes.",
                     entry.project_name.as_deref().unwrap_or("its project"),
                 );
                 placed_output(&result, placed, to, true, human)
@@ -955,6 +961,7 @@ mod tests {
 
     fn unplaced_entry(id: TerminalId, surface: directory::Surface) -> Entry {
         Entry {
+            history_only: false,
             id,
             surface,
             provider: Some(Provider::Claude),
@@ -1133,7 +1140,7 @@ mod tests {
         assert_eq!(
             output.human,
             format!(
-                "Attached session {} to channel \"channel\" in repo. Open that channel to see it. A window holding unsent text in this conversation keeps it until that text is sent or cleared.",
+                "Attached session {} to channel \"channel\" in repo. Open that channel to see it. A window with something still queued in this conversation moves it there once that finishes.",
                 match &expected.kind {
                     CardKind::Chat(session) => session.id,
                     _ => unreachable!(),
@@ -1345,6 +1352,35 @@ mod tests {
             serde_json::to_value(&theirs).unwrap(),
             "the reported pane is the one the channel holds, not the one offered"
         );
+    }
+
+    #[test]
+    fn channel_move_refuses_a_saved_transcript_with_nothing_running() {
+        let (model, _, to) = fixture();
+        let chat = unplaced_chat();
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let mut reader = unplaced_entry(chat.id, directory::Surface::Chat);
+        reader.history_only = true;
+        let server = FakeDaemon {
+            models: vec![model],
+            sessions: vec![reader],
+            chats: vec![chat.clone()],
+            terminals: vec![],
+            edits: vec![],
+        }
+        .serve(server_stream);
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let error = move_pane(&mut client, &chat.id.to_string(), to)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, "invalid_target");
+        assert!(
+            error.message.contains("saved transcript"),
+            "{}",
+            error.message
+        );
+        drop(client);
+        server.join().unwrap();
     }
 
     #[test]

@@ -1475,10 +1475,10 @@ mod tests {
                 assert!(!reader.observations.contains_key(&0));
             }
             assert!(
-                !crate::host::agent_execution::live_sessions(&host)
+                crate::host::agent_execution::live_sessions(&host)
                     .iter()
-                    .any(|live| live.id == source.id),
-                "a reader has no provider process, so it is not offered as a running session"
+                    .any(|live| live.id == source.id && live.history_only),
+                "a reader stays addressable and says it has no provider process"
             );
             assert!(!marker.exists(), "automatic restore launched a provider");
             if index == 0 {

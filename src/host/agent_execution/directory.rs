@@ -24,6 +24,8 @@ pub(in crate::host) struct Live {
     pub(in crate::host) title: Option<String>,
     pub(in crate::host) state: ActivityState,
     pub(in crate::host) directory: PathBuf,
+    /// A reader of a saved transcript, with no provider process behind it.
+    pub(in crate::host) history_only: bool,
 }
 
 pub(super) fn read(
@@ -154,6 +156,7 @@ pub(super) fn read(
                     .map(|channel| channel.title.clone())
             }),
             state: live.state,
+            history_only: live.history_only,
             directory: Some(live.directory),
             worktree,
             project_name: project
@@ -231,8 +234,7 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let mut live = Vec::new();
     for (id, record) in &state.chats {
-        // A reader of a saved transcript has no provider process to reach.
-        if record.handle.is_completed() || record.handle.is_read_only_history() {
+        if record.handle.is_completed() {
             continue;
         }
         live.push(Live {
@@ -243,6 +245,7 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
             title: record.handle.title(),
             state: record.handle.activity(),
             directory: record.session.launch.recipe.working_directory.clone(),
+            history_only: record.handle.is_read_only_history(),
         });
     }
     for (id, record) in &state.terminals {
@@ -262,6 +265,7 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
             title: record.conversation_title().map(str::to_owned),
             state: activity.map_or(ActivityState::Unknown, |activity| activity.state),
             directory: record.current_directory().to_path_buf(),
+            history_only: false,
         });
     }
     live

@@ -103,10 +103,12 @@ fn no_shared_pane_guidance(directory: &Directory) -> String {
             "\nA session outside every open project can't go in a channel until its project is open: `cagents project open PATH`.",
         );
     }
-    if directory.caller.is_some() && !attachable.is_empty() {
-        guidance.push_str(
-            "\nRun that from a terminal outside cagents, or reopen the conversation with Resume conversation in the app. Sessions inside cagents can't place panes.",
-        );
+    if directory.caller.is_some() {
+        guidance.push_str(if attachable.len() < unplaced.len() {
+            "\nSessions inside cagents can't open projects or place panes, so run that from a terminal outside cagents."
+        } else {
+            "\nSessions inside cagents can't place panes, so run that from a terminal outside cagents."
+        });
     }
     guidance
 }
@@ -133,6 +135,9 @@ fn list_human<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> String {
                     &entry.view_scope
                 {
                     context.push(format!("worktree view {}", path.display()));
+                }
+                if entry.history_only {
+                    context.push("saved transcript".to_owned());
                 }
                 if entry.has_no_shared_pane() {
                     context.push("no shared pane".to_owned());
@@ -209,6 +214,7 @@ mod tests {
     fn entry() -> Entry {
         let id = "00000000-0000-4000-8000-000000000001".parse().unwrap();
         Entry {
+            history_only: false,
             id,
             surface: Surface::Chat,
             provider: Some(crate::agent::Provider::Claude),
@@ -302,8 +308,25 @@ mod tests {
         me.view_scope = Some(crate::agent_execution::Placement::Channel(
             crate::model::ChannelId::new(),
         ));
-        let inside = no_shared_pane_guidance(&directory(Some(me), vec![entry.clone()]));
+        let inside = no_shared_pane_guidance(&directory(Some(me.clone()), vec![entry.clone()]));
+        assert!(inside.contains("can't place panes"));
         assert!(inside.contains("from a terminal outside cagents"));
+        assert!(!inside.contains("open projects"));
+
+        // Opening its project is refused in there too, so that gets the same warning.
+        let mut closed = entry.clone();
+        closed.project = None;
+        let hosted = no_shared_pane_guidance(&directory(Some(me), vec![closed]));
+        assert!(hosted.contains("`cagents project open"));
+        assert!(hosted.contains("can't open projects"));
+
+        // A saved transcript open for reading has nothing running to place.
+        let mut reader = entry.clone();
+        reader.history_only = true;
+        let row = list_human(std::iter::once(&reader));
+        assert!(row.contains("saved transcript"));
+        assert!(!row.contains("no shared pane"));
+        assert_eq!(no_shared_pane_guidance(&directory(None, vec![reader])), "");
 
         // A channel only accepts sessions of its own project.
         entry.project = None;

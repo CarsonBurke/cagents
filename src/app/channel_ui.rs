@@ -703,11 +703,17 @@ impl Cagents {
             });
             return Task::batch([leave, retry]);
         }
+        // A session another pane holds is not this channel's to end; its card
+        // leaves with the channel and the session stays with that pane.
         let sessions: Vec<_> = self
             .durable
             .cards
             .iter()
-            .filter(|card| cards.contains(&card.id) && card.existence.is_open())
+            .filter(|card| {
+                cards.contains(&card.id)
+                    && card.existence.is_open()
+                    && !self.another_pane_holds_session(card.id)
+            })
             .map(|card| card.kind.clone())
             .collect();
         if !sessions
