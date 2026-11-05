@@ -1237,6 +1237,7 @@ mod tests {
         entry.session.native_continuity =
             chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
         let mut prepared = entry.session.clone();
+        prepared.reset_owned_codex_listener();
         prepared.id = TerminalId::new();
         prepared.proof = None;
         prepared.terminal = None;
