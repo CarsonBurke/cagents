@@ -8148,6 +8148,37 @@ mod tests {
     }
 
     #[test]
+    fn claude_initialization_write_failure_retains_exit_and_diagnostics() {
+        // The real adapter retries an unsupported optional initialize setting.
+        // Closing stdin before that response guarantees the retry cannot be
+        // delivered; the diagnostic tail also requires continued stderr reads.
+        let (_directory, handle) = claude_initialization_pipe(
+            "import os\n\
+             os.close(0)\n\
+             print('wrapper diagnostic', flush=True)\n\
+             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'error', 'request_id': request['request_id'], 'error': 'Unsupported initialize option'}}), flush=True)\n\
+             sys.stderr.write('z' * 20000 + 'Claude fixture exit diagnostic\\n')\n\
+             sys.stderr.flush()\n\
+             sys.exit(75)\n",
+        );
+        let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(3));
+        let failure = handle.failure().unwrap();
+        assert!(
+            failure.starts_with("Provider exited with exit status: 75"),
+            "{failure}"
+        );
+        assert!(failure.contains("Provider stdin: Broken pipe"), "{failure}");
+        let error = snapshot.error.as_deref().unwrap();
+        assert!(error.contains("Claude fixture exit diagnostic"), "{error}");
+        assert!(
+            error.contains("Last ignored output: wrapper diagnostic"),
+            "{error}"
+        );
+        assert!(error.len() < 17000);
+        assert!(!snapshot.ready);
+    }
+
+    #[test]
     fn closed_stdin_uses_exact_exit_without_losing_readable_diagnostics() {
         for (tail, expected) in [
             ("os._exit(75)", "exit status: 75"),
