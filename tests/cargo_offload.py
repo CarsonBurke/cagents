@@ -385,9 +385,12 @@ class Sweep(unittest.TestCase):
             names = {
                 # An older gate's names, judged by age.
                 "old": "cof-ssh-old", "fresh": "cof-ssh-fresh",
-                # A build that ended, however recently, and one still
-                # waiting for the host, however long, which never connected.
+                # A build that ended a while ago, and one still waiting for
+                # the host, however long, which never connected.
                 "ended": f"cof-ssh-{ended.pid}-abc", "waiting": f"cof-ssh-{os.getpid()}-abc",
+                # One that looks ended but used its directory just now, as a
+                # build in another PID namespace does while it waits.
+                "renewed": f"cof-ssh-{ended.pid}-ghi",
                 # A connection that outlives its ended build for a while.
                 "listening": f"cof-ssh-{ended.pid}-def",
             }
@@ -400,12 +403,12 @@ class Sweep(unittest.TestCase):
             listener.bind(str(paths["listening"] / "m"))
             listener.listen()
             ancient = time.time() - 3600
-            for key in ("old", "waiting", "listening"):
+            for key in ("old", "ended", "waiting", "listening"):
                 os.utime(paths[key], (ancient, ancient))
             offload.sweep_connections(root)
             self.assertEqual(sorted(path.name for path in Path(root).iterdir()),
-                             sorted([names["fresh"], names["waiting"], names["listening"],
-                                     "unrelated"]))
+                             sorted([names["fresh"], names["waiting"], names["renewed"],
+                                     names["listening"], "unrelated"]))
 
 
 class ThisHost(unittest.TestCase):
