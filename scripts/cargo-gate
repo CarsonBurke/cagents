@@ -27,7 +27,11 @@ slot held until it exits: a drop-in for `flock /var/tmp/cagents-cargo.lock
 COMMAND`. Gated commands inside it run in that slot without waiting. Prefer
 gating each Cargo command, so tests run outside the slot.
 
+A checkout whose Cargo build directory has never been built is first seeded
+from the main checkout's with scripts/seed-build-dir.
+
 Environment:
+  CAGENTS_BUILD_SEED=0   Do not seed a new build directory
   CAGENTS_BUILD_SLOTS    Concurrent builds; default: one per 8 GiB of RAM
                          after an 8 GiB reserve, at most one per 8 CPUs
   CAGENTS_BUILD_LOCK     First slot's lock file; the others add .1, .2, ...
@@ -324,6 +328,12 @@ if inside_gate || inherits_slot; then
     [ "$mode" = exec ] || set -- cargo "$@"
     exec "$@"
 fi
+
+# A new worktree's build directory starts from the main checkout's compiled
+# dependencies instead of empty, so it neither builds them all again nor
+# shares a build directory with another worktree. Copying needs no slot.
+seed=$(dirname "$0")/seed-build-dir
+[ ! -x "$seed" ] || "$seed" || :
 
 if [ "$mode" = exec ]; then
     acquire
