@@ -5987,7 +5987,9 @@ for line in sys.stdin:
                 "an idle resumed conversation was never confirmed",
             );
         }
-        ended_handle.command(Command::Interrupt).unwrap();
+        // The fixture provider ends instead of acknowledging the interrupt.
+        let refused = ended_handle.command(Command::Interrupt).unwrap_err();
+        assert!(refused.contains("exited before acknowledging"), "{refused}");
         wait(
             &|| ended_handle.is_completed() && ended_handle.failure().is_some(),
             "the provider did not end with a failure",

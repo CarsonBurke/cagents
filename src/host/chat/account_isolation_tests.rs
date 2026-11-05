@@ -172,6 +172,28 @@ fn native_codex_starts_keep_each_account_on_its_own_home() {
             assert!(result.is_ok(), "round {round}: {:?}", result.err());
             started(&record, home, round + 1, &expected);
         }
+        // A restarted daemon follows a finished one. Let this daemon's
+        // actors release their exited providers' holders first, so the next
+        // round never inspects a holder that is mid-release.
+        drop(host);
+        let holders =
+            crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native)
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::read_dir(&holders).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "round {round} left a native holder running"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
     // Each home holds only its own login, renewed by the starts on it, and
     // each provider was told which home cagents selected for it - except
