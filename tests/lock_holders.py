@@ -91,7 +91,7 @@ class LockHolders(unittest.TestCase):
         report = self.report()
         self.assertIn(f"holder {holder.pid} flock", report)
         self.assertIn("idle", report)
-        self.assertNotIn("isn't a recognized", report)
+        self.assertNotIn("no holder is a recognized", report)
         self.assertIn("note: nothing holding this used CPU during the one-second sample", report)
         self.assertIn("Run this again", report)
         self.assertNotIn("leftover", self.notes(report))
@@ -153,7 +153,8 @@ class LockHolders(unittest.TestCase):
         notes = self.notes(report)
         self.assertIn(f"idle during the sample. {holder.pid} took this lock; any process that inherited",
                       notes)
-        self.assertNotIn("could have inherited", notes)
+        self.assertIn("inherited it keeps it after the taker exits.", notes)
+        self.assertNotIn("can't tell which", notes)
         self.assertNotRegex(notes, "(?i)kill|leftover")
 
     def test_several_takers_of_a_shared_lock_are_all_named(self):
@@ -173,7 +174,7 @@ class LockHolders(unittest.TestCase):
         notes = self.notes(self.report())
         first, second = sorted(taker.pid for taker in takers)
         self.assertIn(f"{first} and {second} took this lock; any process that inherited it", notes)
-        self.assertNotIn("another holder", notes)
+        self.assertNotIn("can't tell which", notes)
 
     def test_a_taker_does_not_speak_for_a_holder_that_inherited_from_it(self):
         pid_file = self.root / "child"
@@ -193,6 +194,9 @@ class LockHolders(unittest.TestCase):
         self.assertNotRegex(report, rf"holder {child} .*at most that long ago")
         notes = self.notes(report)
         self.assertIn(f"{taker.pid} took this lock; any process that inherited it", notes)
+        # It may be a script between its steps, which holds a lock the same way.
+        self.assertIn("working through its own steps", notes)
+        self.assertIn("can't tell which", notes)
 
     def test_a_busy_unrecognized_holder_is_said_to_be_busy(self):
         self.python_holder("while True: pass")
@@ -251,7 +255,7 @@ class LockHolders(unittest.TestCase):
         self.start(str(wrapper_with_child))
         self.wait_for(self.holds, "holder")
         self.wait_for(lambda: "outer.sh" in self.report(), "the report")
-        self.assertNotIn("isn't a recognized", self.report())
+        self.assertNotIn("no holder is a recognized", self.report())
 
     def test_a_holder_with_a_busy_child_gets_no_idle_note(self):
         self.start("flock", "--close", str(self.lock), "sh", "-c", "while :; do :; done")
@@ -283,7 +287,7 @@ class LockHolders(unittest.TestCase):
                 program.chmod(0o755)
                 self.start(str(program))
                 self.wait_for(self.holds, "holder")
-                self.assertNotIn("isn't a recognized", self.report())
+                self.assertNotIn("no holder is a recognized", self.report())
                 self.end_processes()
                 self.pids.clear()
                 self.processes.clear()
