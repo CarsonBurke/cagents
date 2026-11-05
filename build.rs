@@ -73,7 +73,11 @@ fn valid_metadata(metadata: &str) -> bool {
 }
 
 fn git(manifest: &Path, arguments: &[&str]) -> Option<String> {
+    // `git status` otherwise refreshes the index it reads. The index is a
+    // watched input, so rewriting it would make Cargo rebuild this crate
+    // again at its next invocation with no change to the checkout.
     let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(manifest)
         .args(arguments)
@@ -95,30 +99,30 @@ fn git_metadata(base: &str) -> Option<String> {
     } else {
         manifest.join(head)
     };
-    // Rebuild when the checkout moves: the HEAD file itself, the ref it points
-    // at when it is symbolic, and the index, which every commit rewrites. That
-    // covers a commit on a packed branch, whose new loose ref leaves
-    // packed-refs alone; a ref move that keeps the index, such as `update-ref`,
-    // leaves a stale short SHA until the next rebuild.
+    // Rerun when the stamp could change, and not otherwise: each rerun
+    // recompiles this crate.
+    //
+    // The commit moves with the HEAD file itself and this checkout's HEAD
+    // reflog, which records every commit, checkout and reset here, including a
+    // commit on a packed branch. Without a reflog, watch the branch's loose ref
+    // instead. packed-refs is not watched: every worktree shares it, and
+    // pruning or deleting any branch rewrites it. A ref move without a reflog
+    // entry, such as `update-ref`, leaves a stale short SHA until the next
+    // rerun.
     println!("cargo:rerun-if-changed={}", head.display());
-    if let Some(reference) = git(&manifest, &["symbolic-ref", "-q", "HEAD"]) {
-        // Cargo treats a watched path that does not exist as always changed,
-        // so watching a packed branch's loose file would rebuild this crate
-        // on every invocation. Watch the file the ref actually lives in.
-        let path = git(&manifest, &["rev-parse", "--git-path", &reference])
+    // Cargo treats a watched path that does not exist as always changed, so
+    // watch only the files that are there.
+    let existing = |path: &str| {
+        git(&manifest, &["rev-parse", "--git-path", path])
             .map(|path| manifest.join(path))
             .filter(|path| path.exists())
-            .or_else(|| {
-                git(&manifest, &["rev-parse", "--git-path", "packed-refs"])
-                    .map(|path| manifest.join(path))
-                    .filter(|path| path.exists())
-            });
-        if let Some(path) = path {
-            println!("cargo:rerun-if-changed={}", path.display());
-        }
-    }
-    if let Some(index) = git(&manifest, &["rev-parse", "--git-path", "index"]) {
-        println!("cargo:rerun-if-changed={index}");
+    };
+    if let Some(reflog) = existing("logs/HEAD") {
+        println!("cargo:rerun-if-changed={}", reflog.display());
+    } else if let Some(reference) = git(&manifest, &["symbolic-ref", "-q", "HEAD"])
+        && let Some(path) = existing(&reference)
+    {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
     let sha = git(&manifest, &["rev-parse", "--short", "HEAD"])?;
     let dirty = git(
@@ -126,6 +130,34 @@ fn git_metadata(base: &str) -> Option<String> {
         &["status", "--porcelain", "--untracked-files=no"],
     )
     .is_some_and(|status| !status.is_empty());
+    // A clean checkout becomes dirty by an edit, so watch the sources that
+    // compile into these executables; edits elsewhere show at the next rerun.
+    // A dirty checkout becomes clean by a commit, which moves HEAD, or by
+    // restoring or stashing, which rewrites the index. Watching the index
+    // while clean, or the sources while dirty, would only recompile this
+    // crate with the same stamp: git rewrites the index whenever it refreshes
+    // stale file times, and every edit touches the sources.
+    if dirty {
+        if let Some(index) = existing("index") {
+            println!("cargo:rerun-if-changed={}", index.display());
+        }
+    } else {
+        for source in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "build.rs",
+            "src",
+            "crates",
+            "vendor",
+            "assets",
+            "packaging",
+        ] {
+            let path = manifest.join(source);
+            if path.exists() {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
     let release_tag = format!("v{base}");
     let at_release = git(&manifest, &["tag", "--points-at", "HEAD"])
         .is_some_and(|tags| tags.lines().any(|tag| tag == release_tag));
