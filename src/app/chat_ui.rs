@@ -3441,6 +3441,23 @@ impl Runtime {
         self.snapshot.capabilities.attachments || self.has_connected_saved_history(&self.snapshot)
     }
 
+    /// The control id of the `+` menu's first row, in the order the menu
+    /// lists them. Disabled rows stay in the keyboard order, as elsewhere.
+    pub(super) fn first_composer_action(&self) -> Option<&'static str> {
+        let capabilities = &self.snapshot.capabilities;
+        [
+            (self.accepts_draft_attachments(), "chat-attach"),
+            (
+                !capabilities.interrupt_modes.is_empty(),
+                "chat-actions-steering",
+            ),
+            (capabilities.branch, "chat-actions-fork"),
+            (capabilities.compact, "chat-actions-compact"),
+        ]
+        .into_iter()
+        .find_map(|(listed, id)| listed.then_some(id))
+    }
+
     pub(super) fn parent_transcript_selected(&self) -> bool {
         self.selected_subagent.is_none()
     }
@@ -11212,6 +11229,13 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = open;
                     runtime.branch_picker = false;
+                    // The menu draws over the timeline, after everything the
+                    // keyboard already walks through; start on its first row
+                    // so Tab and Enter work from where it opened.
+                    if open && let Some(first) = runtime.first_composer_action() {
+                        return iced::widget::operation::focus(card_control_id(target.card, first))
+                            .map(cosmic::Action::App);
+                    }
                 }
             }
             Action::BranchPicker(target, open) => {
@@ -11889,6 +11913,10 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.attachment_chooser_pending = Some(id.id);
+                // The chooser answers the `+` menu's choice; the menu has
+                // nothing left to offer while it is open.
+                runtime.composer_actions = false;
+                runtime.branch_picker = false;
                 let directory = runtime.session.launch.recipe.working_directory.clone();
                 return cosmic::task::future(async move {
                     let result = match file_chooser::open::Dialog::new()
@@ -26522,6 +26550,18 @@ mod tests {
         snapshot.ready = true;
         snapshot.capabilities.branch = true;
         snapshot.capabilities.compact = true;
+        // Opening the menu focuses its first row, in the order it lists them.
+        assert_eq!(
+            chat_runtime(&app, card).first_composer_action(),
+            Some("chat-actions-fork")
+        );
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot)
+            .capabilities
+            .interrupt_modes = vec!["immediate".into(), "wait".into()];
+        assert_eq!(
+            chat_runtime(&app, card).first_composer_action(),
+            Some("chat-actions-steering")
+        );
 
         drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
         assert!(chat_runtime(&app, card).composer_actions);
