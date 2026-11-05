@@ -80,7 +80,24 @@ fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> boo
 }
 
 impl Cagents {
+    /// Brings the pane a close dialog is about into view, since a tab or group
+    /// close can be about one no one is looking at. Dismiss goes back to where
+    /// the person was. The dialog keeps the keyboard, so the pane's own focus
+    /// request is dropped rather than left for the next frame to act on.
+    fn show_close_subject(&mut self, card: CardId) -> Task<Message> {
+        let Ok(update) = self.workspace.focus(card) else {
+            return Task::none();
+        };
+        self.workspace.take_widget_focus_request();
+        self.apply_viewport(update, true, false)
+    }
+
     pub(super) fn next_queued_card_close(&mut self) -> Task<Message> {
+        // The dialog blocks workspace messages, so the panes behind it would be
+        // dropped unasked. Dismissing it carries on with them.
+        if self.terminal_close_dialog_visible() {
+            return Task::none();
+        }
         let mut tasks = Vec::new();
         let (mut explained, mut unexplained) = (0, 0);
         while let Some(QueuedCardClose { card, unasked }) = self.queued_card_closes.pop_front() {
@@ -107,7 +124,7 @@ impl Cagents {
             // One that was turned away never will, so the rest would wait on it
             // forever, each still showing that its close is being checked.
             if self.pane_close_owned(card) {
-                return Task::batch(tasks);
+                break;
             }
             if !self
                 .card_state(card)
@@ -123,7 +140,7 @@ impl Cagents {
         }
         if unexplained > 0 || explained > 1 {
             self.status = Some(TransientNotice::warning(
-                "Some panes were kept because they were busy. Close them again.",
+                "Some panes were kept. Close them again.",
             ));
         }
         Task::batch(tasks)
@@ -330,9 +347,8 @@ impl Cagents {
                 restore_keyboard_nav: self.core.keyboard_nav(),
             });
             if self.terminal_close.as_ref().unwrap().detail.is_some() {
-                let _ = self.workspace.focus(card);
                 self.core.set_keyboard_nav(false);
-                return close_focus(0);
+                return Task::batch([self.show_close_subject(card), close_focus(0)]);
             }
             return self.start_terminal_close(allow_active);
         }
@@ -381,9 +397,8 @@ impl Cagents {
                     detail: None,
                     focus: 0,
                 });
-                let _ = self.workspace.focus(card);
                 self.core.set_keyboard_nav(false);
-                close_focus(0)
+                Task::batch([self.show_close_subject(card), close_focus(0)])
             }
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -411,7 +426,10 @@ impl Cagents {
             Err(error) => {
                 self.closed_terminal_cards.remove(&card);
                 self.proven_gone_cards.remove(&card);
-                self.status = Some(TransientNotice::error(error.to_string()));
+                tracing::warn!(%error, "pane removal was refused");
+                self.status = Some(TransientNotice::error(
+                    "This pane couldn't be removed right now, so it was kept. Close it again.",
+                ));
                 // Nothing will settle this close, so unless another removal is
                 // on its way, nothing else would advance the queue.
                 if self.workspace.pending_close().is_some() {
@@ -741,10 +759,8 @@ impl Cagents {
                 intent.pending = false;
                 intent.active = true;
                 intent.focus = 0;
-                // A tab or group close can be about a pane no one is looking at.
-                let _ = self.workspace.focus(card);
                 self.core.set_keyboard_nav(false);
-                close_focus(0)
+                Task::batch([self.show_close_subject(card), close_focus(0)])
             }
             outcome => {
                 // `Stale` and a mismatched identity both mean the request was
@@ -774,10 +790,8 @@ impl Cagents {
                         "Cagents couldn't confirm this terminal closed, so it may still be running. The pane was kept and Cagents won't retry on its own. Try Close again in a moment. If this keeps happening, leave the pane in place.".into()
                     }
                 });
-                // Dismiss returns to the pane this replaces.
-                let _ = self.workspace.focus(card);
                 self.core.set_keyboard_nav(false);
-                close_focus(0)
+                Task::batch([self.show_close_subject(card), close_focus(0)])
             }
         }
     }
@@ -1169,6 +1183,61 @@ mod tests {
     }
 
     #[test]
+    fn panes_turned_away_before_one_that_closes_are_still_reported() {
+        let (mut app, first) = retry_close_fixture();
+        let moving = [
+            queued_terminal(&mut app, first),
+            queued_terminal(&mut app, first),
+        ];
+        let next = queued_terminal(&mut app, first);
+        for card in moving {
+            app.mark_pane_moving(card);
+            app.queued_card_closes.push_back(QueuedCardClose {
+                card,
+                unasked: true,
+            });
+        }
+        app.queued_card_closes.push_back(QueuedCardClose {
+            card: next,
+            unasked: true,
+        });
+        drop(app.next_queued_card_close());
+        assert!(app.pane_close_owned(next));
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|notice| notice.message.starts_with("Some panes"))
+        );
+    }
+
+    /// Another pane settling behind a refusal mustn't use up the group: the
+    /// dialog blocks workspace messages, so each pane would be dropped unasked.
+    #[test]
+    fn a_visible_dialog_holds_the_queue_until_it_is_dismissed() {
+        let (mut app, first) = retry_close_fixture();
+        let next = queued_terminal(&mut app, first);
+        drop(app.update(Message::CloseCardUnasked(first)));
+        let intent = app.terminal_close.as_ref().unwrap().clone();
+        drop(app.update(Message::TerminalCloseFinished {
+            card: first,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: CloseOutcome::Kept("The pane was kept.".into()),
+        }));
+        app.queued_card_closes.push_back(QueuedCardClose {
+            card: next,
+            unasked: true,
+        });
+        drop(app.next_queued_card_close());
+        assert_eq!(app.queued_card_closes.len(), 1);
+        assert!(app.status.is_none());
+        drop(app.update(Message::CancelTerminalClose));
+        assert!(app.queued_card_closes.is_empty());
+        assert!(app.pane_close_owned(next));
+    }
+
+    #[test]
     fn a_close_with_nothing_to_settle_still_advances_the_queue() {
         let (mut app, first) = retry_close_fixture();
         let next = queued_terminal(&mut app, first);
@@ -1198,6 +1267,7 @@ mod tests {
             replaced.clone(),
             Ok(CompletedCloseOutcome::Closed),
         ));
+        assert!(app.queued_card_closes.is_empty(), "the queue moved on");
         assert!(app.pane_close_owned(next));
 
         // A release the daemon couldn't complete keeps its pane, and the rest go on.
@@ -1211,6 +1281,7 @@ mod tests {
         drop(app.completed_terminal_closed(first, current, Err("daemon went away".into())));
         assert!(app.card_state(first).unwrap().existence.is_open());
         assert!(app.status.is_some());
+        assert!(app.queued_card_closes.is_empty(), "the queue moved on");
         assert!(app.pane_close_owned(next));
     }
 
@@ -1227,6 +1298,7 @@ mod tests {
         drop(app.update(Message::CommitClose(first)));
         assert!(app.card_state(first).unwrap().existence.is_open());
         assert!(!app.closed_terminal_cards.contains(&first));
+        assert!(app.queued_card_closes.is_empty(), "the queue moved on");
         assert!(app.pane_close_owned(next));
     }
 
@@ -1259,6 +1331,11 @@ mod tests {
             outcome: CloseOutcome::Kept("The pane was kept.".into()),
         }));
         assert_eq!(app.workspace.focused(), Some(other));
+        assert_eq!(
+            app.workspace.take_widget_focus_request(),
+            None,
+            "the next frame would take the keyboard from the dialog"
+        );
         drop(app.update(Message::CancelTerminalClose));
         assert_eq!(app.workspace.focused(), Some(first));
     }

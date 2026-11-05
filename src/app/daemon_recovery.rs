@@ -310,7 +310,7 @@ pub(super) fn prove_not_hosted(session: &TerminalSession) -> Result<(), String> 
 const UNREACHABLE: &str = "Cagents can't reach its daemon, so this terminal may still be running. The pane was kept. Close it again once the daemon is back.";
 const STILL_HOSTED: &str = "The daemon still has this terminal, so the pane was kept. Use Retry or Reconnect on the pane to use it.";
 const CONTINUED: &str = "A running terminal continues this one, so the pane was kept. Use Retry or Reconnect on the pane if it offers them, or stop that terminal and close the pane again.";
-const UNADOPTED: &str = "This terminal may still be running: its process holder is alive but the daemon isn't showing it. The pane was kept. Use Retry or Reconnect on the pane if it offers them. Otherwise leave the pane in place.";
+const UNADOPTED: &str = "This terminal may still be running: a process behind it is alive but the daemon isn't showing it. The pane was kept. Use Retry or Reconnect on the pane if it offers them. Otherwise leave the pane in place.";
 /// Retry holds the lease through attachment, so waiting longer than this would
 /// leave the pane looking unresponsive to a click on Close.
 const LEASE_WAIT: Duration = if cfg!(test) {
