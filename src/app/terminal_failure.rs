@@ -58,8 +58,192 @@ pub(super) struct Details {
     /// Why the last Retry started nothing, in place of what Retry would do.
     retry_refusal: Option<String>,
 }
+/// The daemon answered and does not host this terminal, as after a restart.
+/// Reattaching cannot work, so the failure must not promise it.
+pub(super) const TERMINAL_NOT_HOSTED: &str = "the daemon no longer hosts this shared terminal";
+/// The daemon that started this terminal is still running and has no record of
+/// it. Recovery treats that as unsafe to replace while that daemon runs.
+pub(super) const TERMINAL_RETIRED: &str = "the daemon that started this shared terminal retired it";
+/// Another daemon replaced the one that started this terminal on the same boot,
+/// so its process can have survived. Retry replaces it only if it has not.
+pub(super) const TERMINAL_DAEMON_RESTARTED: &str =
+    "the daemon that started this shared terminal restarted";
+/// A proven lineage names a live terminal that carries on this work under
+/// another identity. Retry attaches to it rather than starting anything.
+pub(super) const TERMINAL_MOVED: &str = "this shared terminal continues under another identity";
+/// A live terminal has a conflicting claim on this terminal's lineage or
+/// conversation. Recovery preserves that terminal, so Retry cannot help.
+pub(super) const TERMINAL_SUPERSEDED: &str =
+    "another live terminal holds this shared terminal's work";
+/// What applies to a terminal the daemon does not list. This asks the questions
+/// Retry's reconciliation asks, so what the pane says is what Retry will do.
+pub(super) fn missing_terminal_message(
+    session: &TerminalSession,
+    daemon: &crate::model::HostSessionProof,
+    terminals: &[crate::terminal::ipc::TerminalDescriptor],
+) -> &'static str {
+    // Without a live proof Retry only checks that no live terminal holds the
+    // saved conversation, then launches again.
+    let Some(saved) = session.continuity.live_proof() else {
+        return if daemon_recovery::conversation_hosted_elsewhere(session, daemon, terminals) {
+            TERMINAL_SUPERSEDED
+        } else {
+            TERMINAL_NOT_HOSTED
+        };
+    };
+    match daemon_recovery::adoptable_lineage(session, &saved, daemon, terminals) {
+        Ok(Some(_)) => TERMINAL_MOVED,
+        Err(_) => TERMINAL_SUPERSEDED,
+        Ok(None) if saved == *daemon => TERMINAL_RETIRED,
+        Ok(None) if daemon_recovery::conversation_hosted_elsewhere(session, daemon, terminals) => {
+            TERMINAL_SUPERSEDED
+        }
+        Ok(None) if saved.boot_id == daemon.boot_id => TERMINAL_DAEMON_RESTARTED,
+        Ok(None) => TERMINAL_NOT_HOSTED,
+    }
+}
+fn missing_terminal_code(message: &str) -> Option<&'static str> {
+    match message {
+        TERMINAL_NOT_HOSTED => Some("terminal_not_hosted"),
+        TERMINAL_RETIRED => Some("terminal_retired"),
+        TERMINAL_DAEMON_RESTARTED => Some("terminal_daemon_restarted"),
+        TERMINAL_MOVED => Some("terminal_moved"),
+        TERMINAL_SUPERSEDED => Some("terminal_superseded"),
+        _ => None,
+    }
+}
+pub(super) fn runtime_error_code(message: &str, default: &'static str) -> &'static str {
+    missing_terminal_code(message).unwrap_or(default)
+}
+const RECONNECT: &str = "Reconnect to the existing terminal.";
+const RETRY_REFUSED: &str = "Retry didn't start anything. Open a new terminal to keep working.";
+// A failure isn't re-evaluated, and either obstacle can go away, so these keep
+// the Retry button and say when it can work.
+const RETRY_BLOCKED_RETIRED: &str =
+    "Retry can't restore it while this daemon is running. Open a new terminal to keep working.";
+const RETRY_BLOCKED_RESUME: &str = "That terminal keeps its work. Once it has stopped, Retry resumes the saved conversation in this pane.";
+const RETRY_BLOCKED_PICKER: &str = "That terminal keeps its work. Once it has stopped, Retry opens the agent's conversation picker in this pane.";
+const RETRY_BLOCKED_SHELL: &str =
+    "That terminal keeps its work. Once it has stopped, Retry starts a new shell in this pane.";
+const RETRY_BLOCKED_FRESH: &str = "That terminal keeps its work. Once it has stopped, Retry runs the saved command again from the beginning in this pane.";
+const RETRY_REFUSED_AFTER_CHECK: &str = "Retry didn't start anything. If its process is still running, stop it and press Retry again, or open a new terminal.";
+pub(super) const NATIVE_OWNER: &str = "Open the existing conversation in the chat view.";
+const OUTPUT_GOES_WITH_RETRY: &str = "Retry replaces this terminal. Its saved output is deleted the next time Cagents starts, so copy it from the transcript folder first if you need it.";
+const OUTPUT_MAY_GO_WITH_RETRY: &str = "If Retry replaces this terminal, its saved output is deleted the next time Cagents starts, so copy it from the transcript folder first if you need it.";
+const RETRY_FRESH: &str = "Retry runs the saved command again from the beginning in this pane.";
+const RETRY_RESUME: &str = "Retry resumes the saved conversation in this pane.";
+const RETRY_PICKER: &str = "Retry opens the agent's conversation picker in this pane.";
+const RETRY_SHELL: &str = "Retry starts a new shell in this pane.";
+/// What Retry launches for a terminal with no live process to reconcile.
+fn new_terminal_consequence(session: &TerminalSession) -> &'static str {
+    if session.agent_resume_recipe().is_some() {
+        RETRY_RESUME
+    } else if matches!(
+        crate::upgrade::recovery_plan(session),
+        Ok((_, crate::upgrade::RecoveryKind::Shell))
+    ) {
+        RETRY_SHELL
+    } else {
+        RETRY_FRESH
+    }
+}
+/// What Retry does for a terminal whose daemon is gone: the plan recovery will
+/// actually follow, which is not always the saved command.
+fn replacement_consequence(session: &TerminalSession) -> &'static str {
+    match crate::upgrade::recovery_plan(session) {
+        Ok((_, crate::upgrade::RecoveryKind::Exact)) => RETRY_RESUME,
+        Ok((_, crate::upgrade::RecoveryKind::Picker)) => RETRY_PICKER,
+        Ok((_, crate::upgrade::RecoveryKind::Shell)) => RETRY_SHELL,
+        Err(_) => RETRY_FRESH,
+    }
+}
+/// The same plan, once Retry has established that the process is gone.
+fn after_check_consequence(session: &TerminalSession) -> &'static str {
+    match replacement_consequence(session) {
+        RETRY_RESUME => {
+            "Retry checks that it has stopped, then resumes the saved conversation in this pane."
+        }
+        RETRY_PICKER => {
+            "Retry checks that it has stopped, then opens the agent's conversation picker in this pane."
+        }
+        RETRY_SHELL => "Retry checks that it has stopped, then starts a new shell in this pane.",
+        _ => {
+            "Retry checks that it has stopped, then runs the saved command again from the beginning in this pane."
+        }
+    }
+}
+/// What Retry will do once the terminal holding this work has stopped.
+fn blocked_consequence(session: &TerminalSession) -> &'static str {
+    match replacement_consequence(session) {
+        RETRY_RESUME => RETRY_BLOCKED_RESUME,
+        RETRY_PICKER => RETRY_BLOCKED_PICKER,
+        RETRY_SHELL => RETRY_BLOCKED_SHELL,
+        _ => RETRY_BLOCKED_FRESH,
+    }
+}
+/// What a pane says once Retry was refused for this missing terminal, when
+/// recovery gave no sentence of its own. The state it explained still applies.
+fn refused_text(code: &str, consequence: &str) -> String {
+    match code {
+        "terminal_retired" | "terminal_superseded" => {
+            format!("Retry didn't start anything. {consequence}")
+        }
+        "terminal_daemon_restarted" => RETRY_REFUSED_AFTER_CHECK.to_owned(),
+        _ => RETRY_REFUSED.to_owned(),
+    }
+}
+/// The warning a pane in this state carries, before any press.
+#[cfg(test)]
+pub(super) fn missing_terminal_warning(
+    message: &str,
+    session: &TerminalSession,
+) -> Option<&'static str> {
+    let code = missing_terminal_code(message)?;
+    Details {
+        code,
+        message: known_failure(code).1,
+        terminal: session.id,
+        cwd: String::new(),
+        worktree: None,
+        exit: None,
+        consequence: missing_terminal_consequence(code, session),
+        retry_refusal: None,
+    }
+    .output_warning()
+}
+fn is_missing_terminal(code: &str) -> bool {
+    matches!(
+        code,
+        "terminal_not_hosted"
+            | "terminal_retired"
+            | "terminal_daemon_restarted"
+            | "terminal_moved"
+            | "terminal_superseded"
+    )
+}
+fn missing_terminal_consequence(code: &str, session: &TerminalSession) -> &'static str {
+    match code {
+        "terminal_moved" => RECONNECT,
+        "terminal_retired" => RETRY_BLOCKED_RETIRED,
+        "terminal_superseded" => blocked_consequence(session),
+        "terminal_daemon_restarted" => after_check_consequence(session),
+        _ if session.continuity.live_proof().is_none() => new_terminal_consequence(session),
+        _ => replacement_consequence(session),
+    }
+}
 fn known_failure(code: &str) -> (&'static str, &'static str) {
     match code {
+        "terminal_not_hosted" => ("terminal_not_hosted", "This terminal is no longer running."),
+        "terminal_retired" => ("terminal_retired", "This terminal is no longer running."),
+        "terminal_daemon_restarted" => (
+            "terminal_daemon_restarted",
+            "This terminal's daemon restarted. Its process may still be running.",
+        ),
+        "terminal_moved" => ("terminal_moved", "This terminal needs to reconnect."),
+        "terminal_superseded" => (
+            "terminal_superseded",
+            "Another running terminal already holds this terminal's work.",
+        ),
         "start_failed" => ("start_failed", "The terminal could not be started."),
         "runtime_hydration_failed" => (
             "runtime_hydration_failed",
@@ -86,6 +270,50 @@ fn bounded_path(path: &Path) -> String {
     text.chars().filter(|c| !c.is_control() && !matches!(*c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')).take(240).collect()
 }
 impl Details {
+    /// Whether what the pane said rules out a launch from this press, or only
+    /// explained the last attempt.
+    fn expects_no_launch(&self) -> bool {
+        self.retry_refusal.is_some()
+            || matches!(
+                self.consequence,
+                RETRY_REFUSED
+                    | RETRY_BLOCKED_RETIRED
+                    | RETRY_BLOCKED_RESUME
+                    | RETRY_BLOCKED_PICKER
+                    | RETRY_BLOCKED_SHELL
+                    | RETRY_BLOCKED_FRESH
+            )
+    }
+    fn attempt_title(&self) -> &'static str {
+        if self.expects_no_launch() {
+            "Checking terminal…"
+        } else {
+            "Launching terminal…"
+        }
+    }
+    fn attempt_caption(&self) -> &'static str {
+        if self.expects_no_launch() {
+            "Trying again."
+        } else {
+            self.consequence
+        }
+    }
+    /// A press that replaces the terminal leaves only its next launch's prune
+    /// between that and the output it saved. See #2142. A refusal or a blocked
+    /// state doesn't remove the risk, because a later press can still replace it.
+    fn output_warning(&self) -> Option<&'static str> {
+        if self.consequence == NATIVE_OWNER {
+            return None;
+        }
+        match self.code {
+            "terminal_not_hosted" if !self.expects_no_launch() => Some(OUTPUT_GOES_WITH_RETRY),
+            "terminal_not_hosted"
+            | "terminal_daemon_restarted"
+            | "terminal_retired"
+            | "terminal_superseded" => Some(OUTPUT_MAY_GO_WITH_RETRY),
+            _ => None,
+        }
+    }
     fn capture(session: &TerminalSession, residency: Option<&Residency>) -> Self {
         Self::capture_context(session, residency, false)
     }
@@ -119,12 +347,12 @@ impl Details {
         } else {
             known_failure(typed.unwrap_or(""))
         };
-        let consequence = if session.continuity.live_proof().is_some() {
-            "Reconnect to the existing terminal."
-        } else if session.agent_resume_recipe().is_some() {
-            "Resume the saved conversation in a new terminal."
+        let consequence = if is_missing_terminal(code) {
+            missing_terminal_consequence(code, session)
+        } else if session.continuity.live_proof().is_some() {
+            RECONNECT
         } else {
-            "Run the saved command from the beginning in a new terminal."
+            new_terminal_consequence(session)
         };
         Self {
             code,
@@ -139,7 +367,7 @@ impl Details {
     }
     fn copy_text(&self) -> String {
         let mut text = format!(
-            "Code: {}\nMessage: {}\nTerminal: {}\nDirectory: {}\nRetry: {}",
+            "Code: {}\nMessage: {}\nTerminal: {}\nDirectory: {}\nNext: {}",
             self.code,
             self.message,
             self.terminal,
@@ -290,6 +518,29 @@ fn probe_retry_timer(at: Instant) -> Task<Message> {
         Message::TerminalFailure(Action::ProbeRetryDue)
     })
 }
+/// The receipt to open a terminal's transcript with. `None` means the daemon
+/// answered and lists no such identity, whether it restarted or the work moved
+/// to a new one, so the only transcript left is that identity's own file. A
+/// listed identity keeps its receipt requirement.
+fn listed_transcript(
+    session: &TerminalSession,
+    descriptors: Vec<crate::terminal::ipc::TerminalDescriptor>,
+) -> Result<Option<TranscriptMetadata>, transcript_location::Unavailable> {
+    if !descriptors
+        .iter()
+        .any(|descriptor| descriptor.session.id == session.id)
+    {
+        return Ok(None);
+    }
+    descriptors
+        .into_iter()
+        .find(|descriptor| {
+            descriptor.session.id == session.id && descriptor.session.launch == session.launch
+        })
+        .and_then(|descriptor| descriptor.transcript)
+        .map(Some)
+        .ok_or(transcript_location::Unavailable::MetadataMissing)
+}
 fn fresh_transcript(
     session: &TerminalSession,
     saved_socket: Option<&Path>,
@@ -302,16 +553,16 @@ fn fresh_transcript(
             crate::terminal::ipc::daemon_socket_path().map_err(|_| Unavailable::MetadataMissing)?
         }
     };
-    let mut client = ControlClient::connect(&socket).map_err(|_| Unavailable::MetadataMissing)?;
-    let descriptors = client.list().map_err(|_| Unavailable::MetadataMissing)?;
-    let metadata: TranscriptMetadata = descriptors
-        .into_iter()
-        .find(|descriptor| {
-            descriptor.session.id == session.id && descriptor.session.launch == session.launch
-        })
-        .and_then(|descriptor| descriptor.transcript)
-        .ok_or(Unavailable::MetadataMissing)?;
-    transcript_location::open(session.id, &metadata)
+    // With no daemon answering, nothing can vouch for another location, and a
+    // file named for this identity is what its terminal left behind.
+    let descriptors = ControlClient::connect(&socket).and_then(|mut client| client.list());
+    let Ok(descriptors) = descriptors else {
+        return transcript_location::open_without_host(session.id);
+    };
+    match listed_transcript(session, descriptors)? {
+        Some(metadata) => transcript_location::open(session.id, &metadata),
+        None => transcript_location::open_without_host(session.id),
+    }
 }
 impl Cagents {
     pub(super) fn terminal_details(&self, card: CardId) -> Option<Details> {
@@ -342,7 +593,7 @@ impl Cagents {
             Details::capture(session, Some(&state.residency))
         };
         if self.completed_terminal_has_native_owner(card) {
-            details.consequence = "Open the existing conversation in the chat view.";
+            details.consequence = NATIVE_OWNER;
         }
         // An explicitly filed card can name its known worktree. A launch
         // directory alone does not invent ownership or a diagnostic identity.
@@ -360,6 +611,17 @@ impl Cagents {
         let Some(mut details) = self.capture_terminal_details(card, true) else {
             return generic.into();
         };
+        // Captured before the residency records this failure, so the capture
+        // above cannot have seen the code and promises a reconnect.
+        if let Some(code) = missing_terminal_code(&generic) {
+            (details.code, details.message) = known_failure(code);
+            if let Some(CardKind::Terminal(session)) =
+                self.card_state(card).map(|state| &state.kind)
+                && !self.completed_terminal_has_native_owner(card)
+            {
+                details.consequence = missing_terminal_consequence(code, session);
+            }
+        }
         if self.card_state(card).is_some_and(|state| matches!(&state.kind, CardKind::Terminal(session) if account::login::is_codex_browser(&session.launch)))
             && account::login::callback_failed(&generic)
         {
@@ -489,22 +751,26 @@ impl Cagents {
         let Some(details) = self.terminal_details(card) else {
             return iced::widget::Space::new().into();
         };
-        let mut rows = vec![
-            design::caption(format!("Code: {}", details.code)).into(),
-            design::caption(format!("Terminal: {}", details.terminal)).into(),
-            design::caption(format!("Directory: {}", details.cwd)).into(),
-        ];
+        let warning = details.output_warning().filter(|_| {
+            self.terminal_failure
+                .probes
+                .get(&card)
+                .is_some_and(|probe| probe.available && !probe.pending)
+        });
+        let next = details
+            .retry_refusal
+            .clone()
+            .unwrap_or_else(|| details.consequence.to_owned());
+        let mut rows: Vec<Element<'_, Message>> = vec![design::body(next).into()];
+        if let Some(warning) = warning {
+            rows.push(design::body(warning).into());
+        }
+        rows.push(design::caption(format!("Code: {}", details.code)).into());
+        rows.push(design::caption(format!("Terminal: {}", details.terminal)).into());
+        rows.push(design::caption(format!("Directory: {}", details.cwd)).into());
         if let Some(worktree) = details.worktree {
             rows.push(design::caption(format!("Worktree: {worktree}")).into());
         }
-        rows.push(
-            design::caption(
-                details
-                    .retry_refusal
-                    .unwrap_or_else(|| details.consequence.to_owned()),
-            )
-            .into(),
-        );
         widget::column::with_children(rows)
             .spacing(space::XS)
             .into()
@@ -561,6 +827,26 @@ impl Cagents {
             _ => false,
         })
     }
+    /// A missing terminal's notice reads as its pane does, not as the reason
+    /// recovery recorded.
+    pub(super) fn missing_terminal_notice(&self, card: CardId) -> Option<&'static str> {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Failed(Failure::Terminal(details)))
+                if is_missing_terminal(details.code) =>
+            {
+                Some(details.message)
+            }
+            _ => None,
+        }
+    }
+    /// Retry can't help until something else changes, so it isn't the main action.
+    pub(super) fn terminal_retry_is_blocked(&self, card: CardId) -> bool {
+        matches!(
+            self.cards.get(&card),
+            Some(CardRuntime::Failed(Failure::Terminal(details)))
+                if matches!(details.code, "terminal_retired" | "terminal_superseded")
+        )
+    }
     pub(super) fn terminal_retry_pending(&self, card: CardId) -> bool {
         self.terminal_failure.attempts.contains_key(&card)
     }
@@ -570,8 +856,8 @@ impl Cagents {
             widget::container(
                 widget::column::with_children(vec![
                     crate::ui_controls::activity_spinner(24.0, design::accent_color).into(),
-                    design::title("Launching terminal…").into(),
-                    design::caption(attempt.details.consequence).into(),
+                    design::title(attempt.details.attempt_title()).into(),
+                    design::caption(attempt.details.attempt_caption()).into(),
                     widget::row::with_children(vec![
                         crate::ui_controls::button::primary("Retrying…").into(),
                         crate::ui_controls::button::secondary("Close")
@@ -761,27 +1047,48 @@ impl Cagents {
                     .attempts
                     .get(&card)
                     .is_some_and(|attempt| attempt.operation == operation);
-                if current_operation {
-                    self.terminal_failure.attempts.remove(&card);
-                }
+                let prior = current_operation
+                    .then(|| self.terminal_failure.attempts.remove(&card))
+                    .flatten()
+                    .map(|attempt| attempt.details);
                 // Existing identity/close checks retire stale spawned handles
                 // and decrement the actual start count even after presentation
                 // was replaced or its card was closed.
-                let refusal = result
-                    .as_ref()
-                    .err()
-                    .filter(|error| {
-                        current_operation && super::daemon_recovery::is_retry_refusal(error)
-                    })
-                    .cloned();
+                let refusal = result.as_ref().err().cloned();
                 let task =
                     self.terminal_started_for_operation(card, terminal, result, current_operation);
-                // A notice alone leaves the pane offering the Retry that just
-                // refused, with nothing on it to say why.
-                if let Some(CardRuntime::Failed(Failure::Terminal(details))) =
+                let (Some(prior), Some(refusal)) = (prior, refusal) else {
+                    return task;
+                };
+                let Some(CardRuntime::Failed(Failure::Terminal(details))) =
                     self.cards.get_mut(&card)
-                {
-                    details.retry_refusal = refusal;
+                else {
+                    return task;
+                };
+                // Recovery's own sentence is written for the reader and can name
+                // the process in the way. Any other error stays out of the pane.
+                let readable =
+                    super::daemon_recovery::is_retry_refusal(&refusal).then(|| refusal.clone());
+                if is_missing_terminal(prior.code) {
+                    // The refusal doesn't change what the pane knew about this
+                    // terminal, so it keeps saying so, and adds what this press did.
+                    details.code = prior.code;
+                    details.message = prior.message;
+                    details.consequence = prior.consequence;
+                    details.retry_refusal = Some(
+                        readable.unwrap_or_else(|| refused_text(prior.code, prior.consequence)),
+                    );
+                    self.status = Some(
+                        TransientNotice::error(prior.message)
+                            .with_details(refusal)
+                            .with_key(NoticeKey::TerminalStart(card)),
+                    );
+                } else {
+                    if details.consequence == RECONNECT {
+                        // Having just failed to reattach, it must not suggest doing so.
+                        details.consequence = RETRY_REFUSED;
+                    }
+                    details.retry_refusal = readable;
                 }
                 task
             }
@@ -877,6 +1184,382 @@ mod tests {
         assert_eq!(details.message, "The terminal could not be restored.");
         assert!(!details.copy_text().contains("secret"));
         assert!(details.exit.is_none());
+    }
+    #[test]
+    fn a_terminal_the_daemon_lost_does_not_promise_reconnecting() {
+        let (mut app, card, _) = app_and_session();
+        // The saved proof from before the restart is what made this misleading.
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("old-host"),
+            boot_id: crate::model::BootId::new("old-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("old"),
+        };
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
+        let details = app.terminal_details(card).unwrap();
+        assert_eq!(details.code, "terminal_not_hosted");
+        assert_eq!(details.message, "This terminal is no longer running.");
+        assert_eq!(details.consequence, RETRY_FRESH);
+    }
+    #[test]
+    fn a_lost_terminal_names_what_retry_will_actually_do() {
+        let (_, _, session) = app_and_session();
+        let live = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("old-host"),
+            boot_id: crate::model::BootId::new("old-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("old"),
+        };
+        let lost = |launch: LaunchRecipe| TerminalSession {
+            continuity: live.clone(),
+            launch,
+            ..session.clone()
+        };
+        let cwd = session.launch.working_directory.clone();
+        let agent = |arguments: &[&str]| {
+            let mut launch = LaunchRecipe::shell(cwd.clone()).unwrap();
+            launch.program = "claude".into();
+            launch.arguments = arguments.iter().map(|&argument| argument.into()).collect();
+            launch
+        };
+        for (launch, expected) in [
+            (
+                agent(&["--resume", "12345678-1234-4234-8234-123456789abc"]),
+                RETRY_RESUME,
+            ),
+            (
+                agent(&[]),
+                "Retry opens the agent's conversation picker in this pane.",
+            ),
+            (
+                LaunchRecipe::shell(cwd.clone()).unwrap(),
+                "Retry starts a new shell in this pane.",
+            ),
+            (
+                LaunchRecipe {
+                    program: "fixture-build".into(),
+                    ..LaunchRecipe::shell(cwd.clone()).unwrap()
+                },
+                RETRY_FRESH,
+            ),
+        ] {
+            assert_eq!(replacement_consequence(&lost(launch)), expected);
+        }
+    }
+    #[test]
+    fn a_terminal_its_own_daemon_retired_does_not_promise_a_replacement() {
+        let (mut app, card, _) = app_and_session();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("host"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("same"),
+        };
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let mut other = proof.clone();
+        other.host_incarnation = crate::model::HostIncarnation::new("later");
+        assert_eq!(
+            missing_terminal_message(session, &other, &[]),
+            TERMINAL_DAEMON_RESTARTED
+        );
+        other.boot_id = crate::model::BootId::new("later-boot");
+        assert_eq!(
+            missing_terminal_message(session, &other, &[]),
+            TERMINAL_NOT_HOSTED
+        );
+        let message = missing_terminal_message(session, &proof, &[]);
+        assert_eq!(message, TERMINAL_RETIRED);
+        app.fail_runtime(card, message.into());
+        let details = app.terminal_details(card).unwrap();
+        assert_eq!(details.code, "terminal_retired");
+        assert_eq!(details.message, "This terminal is no longer running.");
+        assert_eq!(details.consequence, RETRY_BLOCKED_RETIRED);
+    }
+    #[test]
+    fn a_terminal_with_no_live_proof_promises_the_launch_it_will_get() {
+        let (mut app, card, session) = app_and_session();
+        let mut launch = session.launch.clone();
+        launch.program = "claude".into();
+        launch.arguments.clear();
+        // The recovery plan would open a picker, but with no live proof Retry
+        // takes the fresh launch and never reaches that plan.
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: launch.clone(),
+            last_exit: None,
+        };
+        session.launch = launch;
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
+        let details = app.terminal_details(card).unwrap();
+        assert_eq!(details.code, "terminal_not_hosted");
+        assert_eq!(details.consequence, RETRY_FRESH);
+    }
+    #[test]
+    fn each_missing_terminal_says_what_applies_to_it() {
+        let (_, _, restarted) = app_and_session();
+        for (message, code, consequence) in [
+            (TERMINAL_MOVED, "terminal_moved", RECONNECT),
+            (
+                TERMINAL_DAEMON_RESTARTED,
+                "terminal_daemon_restarted",
+                after_check_consequence(&restarted),
+            ),
+            (
+                TERMINAL_SUPERSEDED,
+                "terminal_superseded",
+                blocked_consequence(&restarted),
+            ),
+        ] {
+            let (mut app, card, _) = app_and_session();
+            app.fail_runtime(card, message.into());
+            let details = app.terminal_details(card).unwrap();
+            assert_eq!(details.code, code);
+            assert_eq!(details.consequence, consequence);
+            assert_eq!(app.missing_terminal_notice(card), Some(details.message));
+        }
+    }
+    #[test]
+    fn an_unlisted_identity_opens_its_own_transcript_and_a_listed_one_needs_its_receipt() {
+        let (_, _, session) = app_and_session();
+        let listed = |launch: LaunchRecipe| {
+            let mut descriptor =
+                crate::terminal::ipc::TerminalDescriptor::relaunchable(session.id, launch, None);
+            descriptor.session.id = session.id;
+            descriptor
+        };
+        assert!(matches!(listed_transcript(&session, Vec::new()), Ok(None)));
+        let other = crate::terminal::ipc::TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            session.launch.clone(),
+            None,
+        );
+        assert!(matches!(listed_transcript(&session, vec![other]), Ok(None)));
+        // Listed with no receipt, or under another command: never by path alone.
+        let mut changed = session.launch.clone();
+        changed.program = "fixture-other".into();
+        for descriptor in [listed(session.launch.clone()), listed(changed)] {
+            assert!(matches!(
+                listed_transcript(&session, vec![descriptor]),
+                Err(transcript_location::Unavailable::MetadataMissing)
+            ));
+        }
+    }
+    #[test]
+    fn a_repeated_retry_does_not_show_the_last_refusal_as_its_progress() {
+        let (_, _, session) = app_and_session();
+        let mut details = Details::capture(&session, None);
+        details.consequence = RETRY_REFUSED;
+        assert_eq!(details.attempt_caption(), "Trying again.");
+        details.consequence = RETRY_RESUME;
+        assert_eq!(details.attempt_caption(), RETRY_RESUME);
+    }
+    #[test]
+    fn a_refused_retry_keeps_what_the_pane_knew_and_says_this_press_did_nothing() {
+        for (message, code) in [
+            (TERMINAL_NOT_HOSTED, "terminal_not_hosted"),
+            (TERMINAL_DAEMON_RESTARTED, "terminal_daemon_restarted"),
+            (TERMINAL_RETIRED, "terminal_retired"),
+            (TERMINAL_SUPERSEDED, "terminal_superseded"),
+        ] {
+            let (mut app, card, _) = app_and_session();
+            let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+                unreachable!()
+            };
+            session.continuity = TerminalContinuity::Live {
+                host_session_id: crate::model::HostSessionId::new("old-host"),
+                boot_id: crate::model::BootId::new("old-boot"),
+                host_incarnation: crate::model::HostIncarnation::new("old"),
+            };
+            let terminal = session.id;
+            app.fail_runtime(card, message.into());
+            let before = app.terminal_details(card).unwrap();
+            assert_eq!(before.code, code);
+            drop(app.retry_card(card));
+            let attempt = &app.terminal_failure.attempts[&card];
+            let operation = attempt.operation;
+            assert_eq!(
+                attempt.details.attempt_title() == "Checking terminal…",
+                matches!(code, "terminal_retired" | "terminal_superseded"),
+                "{code} shows no launch it can rule out"
+            );
+            drop(app.update_terminal_failure(Action::RetryFinished {
+                card,
+                operation,
+                terminal,
+                result: Err("terminal fixture still has a live process (42); preserving it".into()),
+            }));
+            let after = app.terminal_details(card).unwrap();
+            assert_eq!(after.code, code);
+            assert_eq!(after.message, before.message);
+            // Every missing terminal says the same thing about this press.
+            assert_eq!(after.consequence, before.consequence);
+            let said = after.retry_refusal.as_deref().unwrap();
+            assert!(said.starts_with("Retry didn't start anything."), "{said}");
+            assert!(after.copy_text().contains(said));
+            let notice = app.status.as_ref().unwrap();
+            assert_eq!(notice.message, before.message);
+            assert_eq!(
+                notice.details.as_deref(),
+                Some("terminal fixture still has a live process (42); preserving it"),
+            );
+            assert_eq!(notice.key, Some(NoticeKey::TerminalStart(card)));
+            // Pressing again doesn't present the refusal as progress.
+            assert_eq!(after.attempt_caption(), "Trying again.");
+            assert_eq!(after.attempt_title(), "Checking terminal…");
+            // A later press can still replace it, so the warning stays.
+            assert_eq!(after.output_warning(), Some(OUTPUT_MAY_GO_WITH_RETRY));
+        }
+    }
+    #[test]
+    fn a_refusal_recovery_wrote_for_the_reader_is_what_the_pane_shows() {
+        let (mut app, card, _) = app_and_session();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("old-host"),
+            boot_id: crate::model::BootId::new("old-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("old"),
+        };
+        let terminal = session.id;
+        app.fail_runtime(card, TERMINAL_DAEMON_RESTARTED.into());
+        drop(app.retry_card(card));
+        let operation = app.terminal_failure.attempts[&card].operation;
+        let sentence = "sleep (PID 42) is still running, so nothing was started.";
+        drop(app.update_terminal_failure(Action::RetryFinished {
+            card,
+            operation,
+            terminal,
+            result: Err(sentence.into()),
+        }));
+        let after = app.terminal_details(card).unwrap();
+        assert_eq!(after.code, "terminal_daemon_restarted");
+        assert_eq!(after.retry_refusal.as_deref(), Some(sentence));
+    }
+    #[test]
+    fn the_output_warning_follows_what_a_press_could_do() {
+        let (_, _, session) = app_and_session();
+        for (message, warning) in [
+            (TERMINAL_NOT_HOSTED, Some(OUTPUT_GOES_WITH_RETRY)),
+            (TERMINAL_DAEMON_RESTARTED, Some(OUTPUT_MAY_GO_WITH_RETRY)),
+            (TERMINAL_RETIRED, Some(OUTPUT_MAY_GO_WITH_RETRY)),
+            (TERMINAL_SUPERSEDED, Some(OUTPUT_MAY_GO_WITH_RETRY)),
+            (TERMINAL_MOVED, None),
+        ] {
+            assert_eq!(
+                missing_terminal_warning(message, &session),
+                warning,
+                "{message}"
+            );
+        }
+        // Retry only switches to the chat view here, so nothing is replaced.
+        let (mut app, card, _) = app_and_session();
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
+        let mut details = app.terminal_details(card).unwrap();
+        details.consequence = NATIVE_OWNER;
+        assert_eq!(details.output_warning(), None);
+    }
+    #[test]
+    fn a_pane_that_retry_cant_help_does_not_make_it_the_main_action() {
+        for (message, blocked) in [
+            (TERMINAL_RETIRED, true),
+            (TERMINAL_SUPERSEDED, true),
+            (TERMINAL_NOT_HOSTED, false),
+            (TERMINAL_DAEMON_RESTARTED, false),
+        ] {
+            let (mut app, card, _) = app_and_session();
+            app.fail_runtime(card, message.into());
+            assert_eq!(app.terminal_retry_is_blocked(card), blocked, "{message}");
+        }
+    }
+    #[test]
+    fn a_conversation_a_live_terminal_holds_reads_as_held_without_a_proof() {
+        let (_, _, mut session) = app_and_session();
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        session.launch.program = "claude".into();
+        session.launch.arguments = vec!["--resume".into(), id.into()];
+        session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: session.launch.clone(),
+            last_exit: None,
+        };
+        let daemon = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("host"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("current"),
+        };
+        assert_eq!(
+            missing_terminal_message(&session, &daemon, &[]),
+            TERMINAL_NOT_HOSTED
+        );
+        let mut live = session.clone();
+        live.id = crate::model::TerminalId::new();
+        live.continuity = TerminalContinuity::Live {
+            host_session_id: daemon.host_session_id.clone(),
+            boot_id: daemon.boot_id.clone(),
+            host_incarnation: daemon.host_incarnation.clone(),
+        };
+        let mut descriptor = crate::terminal::ipc::TerminalDescriptor::relaunchable(
+            live.id,
+            live.launch.clone(),
+            None,
+        );
+        descriptor.session = live;
+        assert_eq!(
+            missing_terminal_message(&session, &daemon, &[descriptor]),
+            TERMINAL_SUPERSEDED
+        );
+    }
+    #[test]
+    fn with_no_daemon_answering_a_terminal_still_reaches_its_own_saved_output() {
+        let (_, _, session) = app_and_session();
+        let directory = tempfile::tempdir().unwrap();
+        let unanswered = directory.path().join("no-daemon.sock");
+        assert!(!matches!(
+            fresh_transcript(&session, Some(&unanswered)),
+            Err(transcript_location::Unavailable::MetadataMissing)
+        ));
+    }
+    #[test]
+    fn what_a_retry_will_do_follows_the_recovery_plan_after_its_check() {
+        let (_, _, mut session) = app_and_session();
+        session.launch = LaunchRecipe::shell(session.launch.working_directory.clone()).unwrap();
+        assert!(after_check_consequence(&session).contains("starts a new shell"));
+        assert_eq!(new_terminal_consequence(&session), RETRY_SHELL);
+    }
+    #[test]
+    fn a_refused_retry_does_not_suggest_reconnecting() {
+        let (mut app, card, _) = app_and_session();
+        let live = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("old-host"),
+            boot_id: crate::model::BootId::new("old-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("old"),
+        };
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.continuity = live;
+        let terminal = session.id;
+        drop(app.retry_card(card));
+        let operation = app.terminal_failure.attempts[&card].operation;
+        drop(app.update_terminal_failure(Action::RetryFinished {
+            card,
+            operation,
+            terminal,
+            result: Err("cannot serialize terminal recovery".into()),
+        }));
+        assert_eq!(
+            app.terminal_details(card).unwrap().consequence,
+            RETRY_REFUSED
+        );
     }
     #[test]
     fn new_failure_on_same_identity_captures_current_typed_state() {
@@ -1121,6 +1804,15 @@ mod tests {
         assert_eq!(
             app.terminal_details(card).unwrap().consequence,
             "Open the existing conversation in the chat view."
+        );
+        let Failure::Terminal(failed) =
+            app.terminal_failure_payload(card, TERMINAL_NOT_HOSTED.to_string())
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            failed.consequence, "Open the existing conversation in the chat view.",
+            "Retry switches to the chat, whatever the daemon no longer lists"
         );
         drop(app.retry_card(card));
         assert!(app.chat_start_pending(card));
