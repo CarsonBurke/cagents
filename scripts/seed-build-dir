@@ -66,8 +66,9 @@ built() {
 }
 
 # Cargo tags only a build directory it creates, and prune-cargo-build-dirs
-# reclaims only tagged ones, so tag those Cargo found already there, including
-# ones seeded before seeding tagged them.
+# reclaims only tagged ones, so tag those this script created, including ones
+# seeded before seeding tagged them. Never others: the main checkout's build
+# directory, which seeds the rest, must not become prunable.
 tag() {
     [ -e "$1/CACHEDIR.TAG" ] || printf '%s\n' \
         'Signature: 8a477f597d28d172789f06886806bc55' \
@@ -81,7 +82,7 @@ if [ -z "$to" ]; then
     [ -n "$to" ] || exit 0
 fi
 if built "$to"; then
-    tag "$to"
+    [ ! -e "$to/.seed-lock" ] || tag "$to"
     exit 0
 fi
 if [ -z "$from" ]; then

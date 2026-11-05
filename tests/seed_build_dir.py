@@ -286,12 +286,20 @@ class SeedBuildDir(unittest.TestCase):
 
     def test_a_built_directory_is_left_alone(self):
         (self.destination / "debug/.fingerprint").mkdir(parents=True)
+        (self.destination / ".seed-lock").touch()
         result = self.seed()
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         self.assertFalse((self.destination / "debug/deps").exists())
         self.assertFalse((self.destination / "dev-runtime").exists())
-        # Built before seeding tagged directories, it still gets the tag.
+        # Seeded before seeding tagged directories, it still gets the tag.
         self.assertEqual((self.destination / "CACHEDIR.TAG").read_text(), CARGO_TAG)
+        # A directory Cargo built itself, such as the main checkout's, is not
+        # made prunable.
+        (self.destination / "CACHEDIR.TAG").unlink()
+        (self.destination / ".seed-lock").unlink()
+        result = self.seed()
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertFalse((self.destination / "CACHEDIR.TAG").exists())
 
     def test_nothing_to_copy_or_opted_out_does_nothing(self):
         for name, run in (

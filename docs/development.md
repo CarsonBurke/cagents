@@ -413,10 +413,10 @@ Build directories share one disk. When the file system holding them has less
 than twice a floor free (5% of its size, at most 64 GiB), `scripts/cargo-gate`
 runs `scripts/build-disk-guard`, which reclaims removed worktrees' build
 directories at once with `prune-cargo-build-dirs`, at most every ten minutes
-across the host; idle live worktrees' are left to the pruner's own schedule. Below the floor it refuses the build
-and says why. Remove worktrees you no longer need; their build directories
-follow. Set `CAGENTS_BUILD_FREE_FLOOR_GIB` to change the floor, or `0` to
-disable the guard.
+across the host; idle live worktrees' are left to the pruner's own schedule.
+Below the floor it refuses the build and says why. Remove worktrees you no
+longer need; their build directories follow. Set `CAGENTS_BUILD_FREE_FLOOR_GIB`
+to change the floor, or `0` to disable the guard.
 
 The build script that stamps `--version` reruns only when the stamp could
 change, because each rerun recompiles `cagents`. It watches this checkout's
