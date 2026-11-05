@@ -634,6 +634,9 @@ pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Resu
     }
 }
 
+/// How long a window waits for the device to answer one device operation.
+pub const DEVICE_OPERATION_DEADLINE: Duration = Duration::from_secs(120);
+
 impl ControlClient {
     /// Connect and complete a proof-pinning handshake with no expected proof.
     pub fn connect(socket_path: &Path) -> Result<Self, ControlError> {
@@ -1599,7 +1602,7 @@ impl ControlClient {
     ) -> Result<crate::device_service::Reply, ControlError> {
         match self.request_with_deadline(
             ClientRequest::DeviceOperation { operation },
-            Instant::now() + Duration::from_secs(120),
+            Instant::now() + DEVICE_OPERATION_DEADLINE,
         )? {
             ServerResponse::DeviceOperation { reply } => Ok(reply),
             response => Err(unexpected_response("device operation", &response)),

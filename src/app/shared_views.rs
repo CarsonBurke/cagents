@@ -1835,13 +1835,29 @@ impl Cagents {
             }
 
             if let CardKind::Repository(repository) = &mut projected.kind {
-                if let Some(project) =
-                    self.project_for_repository(&repository.repository)
-                        .or_else(|| {
-                            self.sidebar_model
-                                .worktree_at(&repository.worktree)
-                                .map(|key| key.project_id)
-                        })
+                // A pane's project is window-local and never shared. When the
+                // echo describes this window's own pane, its project stands:
+                // a file pane's folder is rarely a project root, and a
+                // different project would replace the live viewer, losing
+                // the line a link asked it to open at.
+                let local = self
+                    .card_state(projected.id)
+                    .and_then(|card| match &card.kind {
+                        CardKind::Repository(local)
+                            if views::shared_kind(&card.kind)
+                                == views::shared_kind(&shared.kind) =>
+                        {
+                            Some(local.project)
+                        }
+                        _ => None,
+                    });
+                if let Some(project) = local
+                    .or_else(|| self.project_for_repository(&repository.repository))
+                    .or_else(|| {
+                        self.sidebar_model
+                            .worktree_at(&repository.worktree)
+                            .map(|key| key.project_id)
+                    })
                 {
                     repository.project = project;
                 }
@@ -4423,6 +4439,43 @@ mod tests {
             Some(Path::new("first.rs")),
             "remapping a window-local project identity must not recreate its live viewer"
         );
+    }
+
+    /// A chat link to `src/lib.rs:12` opens a pane on `src`, which is no
+    /// project's root. Its own echo must keep the viewer that holds the line.
+    #[test]
+    fn a_file_pane_outside_a_project_root_keeps_its_viewer_through_its_echo() {
+        let (mut app, channel, _, mut pane) = fixture();
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("src");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("lib.rs"), "fn a() {}\n").unwrap();
+        let descriptor = RepositoryView {
+            project: ProjectId::new(),
+            repository: folder.clone(),
+            worktree: folder,
+            selected_file: Some("lib.rs".into()),
+        };
+        pane.kind = CardKind::Repository(descriptor.clone());
+        let mut view = View::empty(channel);
+        view.panes.push(pane.clone());
+        drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
+        let mut runtime = RepositoryRuntime::new_directory(descriptor.clone());
+        drop(runtime.initial_load(pane.id));
+        drop(runtime.preview_fragment(pane.id, "L12"));
+        let runtime = Box::new(runtime);
+        let viewer = std::ptr::from_ref::<RepositoryRuntime>(&runtime);
+        app.cards.insert(pane.id, CardRuntime::Repository(runtime));
+        view.panes[0].kind = views::shared_kind(&pane.kind);
+        drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+            panic!("the file pane must stay attached");
+        };
+        assert!(
+            std::ptr::eq(viewer, &**runtime),
+            "the pane's own echo must not replace the viewer waiting to open line 12"
+        );
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
     }
 
     #[test]

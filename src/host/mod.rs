@@ -1,4 +1,6 @@
 mod account_lifecycle;
+#[cfg(test)]
+mod account_restore_tests;
 pub(crate) use account_lifecycle::Reservation as AccountReservation;
 mod activity;
 mod agent_execution;
@@ -352,6 +354,15 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         .unwrap_or_else(|p| p.into_inner())
         .startup_recovery()
         .is_some();
+    if !recovery_only {
+        let restore_host = Arc::downgrade(&host);
+        if let Err(error) = std::thread::Builder::new()
+            .name("cagents-account-restore".into())
+            .spawn(move || account_lifecycle::restore_unregistered_homes(restore_host))
+        {
+            tracing::warn!(%error, "lost accounts will not be restored automatically");
+        }
+    }
     let mut automation_broker = if recovery_only {
         None
     } else {
