@@ -46,13 +46,15 @@ fn registration(provider: Provider, key: Uuid) -> Registered {
 #[test]
 fn a_missing_namespace_is_not_created_or_privatized() {
     let directory = tempfile::tempdir().unwrap();
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o751)).unwrap();
-    let sentinel = directory.path().join("history.fixture");
+    let parent = directory.path().join("private-fixture-parent");
+    fs::create_dir(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o751)).unwrap();
+    let sentinel = parent.join("history.fixture");
     fs::write(&sentinel, b"synthetic conversation\n").unwrap();
     fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o640)).unwrap();
-    let parent_before = metadata_identity(directory.path());
+    let parent_before = metadata_identity(&parent);
     let sentinel_before = metadata_identity(&sentinel);
-    let root = directory.path().join("absent-accounts");
+    let root = parent.join("absent-accounts");
     let homes = Homes::at(&root);
     let registry = Registry::default();
 
@@ -66,7 +68,7 @@ fn a_missing_namespace_is_not_created_or_privatized() {
         fs::symlink_metadata(&root).unwrap_err().kind(),
         io::ErrorKind::NotFound
     );
-    assert_eq!(metadata_identity(directory.path()), parent_before);
+    assert_eq!(metadata_identity(&parent), parent_before);
     assert_eq!(metadata_identity(&sentinel), sentinel_before);
     assert_eq!(fs::read(&sentinel).unwrap(), b"synthetic conversation\n");
 }
