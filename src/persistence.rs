@@ -1389,6 +1389,30 @@ impl StateStore {
         Ok(())
     }
 
+    /// Atomically puts the conversation a chat card's shared view holds in
+    /// place of the one this store last saved for it.
+    ///
+    /// Another client changed the card's conversation, whether by starting
+    /// the draft it showed or by giving it another one, and that client's own
+    /// store recorded the replacement. This store only follows the canonical
+    /// view, so the conversation may already have begun; it is accepted on
+    /// the same evidence a snapshot accepts for a card it has never held.
+    pub fn adopt_chat_identity(
+        &self,
+        card_id: CardId,
+        expected_id: TerminalId,
+        canonical: &crate::chat::Session,
+    ) -> Result<()> {
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let transaction = inner
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        adopt_chat_identity_transaction(&transaction, card_id, expected_id, canonical)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// A provider-confirmed account recovery retains the external conversation
     /// and changes only its account and runtime identity. Compare the complete
     /// source descriptor so a stale recovery cannot overwrite newer ownership.
@@ -4962,6 +4986,56 @@ fn replace_chat_identity_transaction(
     )?;
     // As with a terminal relaunch, the payload changed behind the snapshot
     // lane's back, so the next snapshot must take the full write path.
+    transaction.execute(INVALIDATE_CARD_HASH, [card_id.to_string()])?;
+    Ok(())
+}
+
+fn adopt_chat_identity_transaction(
+    transaction: &Transaction<'_>,
+    card_id: CardId,
+    expected_id: TerminalId,
+    canonical: &crate::chat::Session,
+) -> Result<()> {
+    let Some((kind, content)) = transaction
+        .query_row(
+            "SELECT kind_tag, content_json FROM cards WHERE card_id = ?1",
+            [card_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+    else {
+        // The snapshot following this operation stores the card as it is.
+        return Ok(());
+    };
+    if kind != PersistedCardKind::Chat.as_str() {
+        return Err(StoreError::InvalidState(format!(
+            "card {card_id} is not a chat card"
+        )));
+    }
+    let content = content.ok_or_else(|| {
+        StoreError::corrupt_row("chat payload", format!("card {card_id} has no payload"))
+    })?;
+    let stored: crate::chat::Session = from_json("chat card", &content)?;
+    if &stored == canonical {
+        return Ok(());
+    }
+    if stored.id == canonical.id {
+        // This window's own writes already reached that conversation. Within
+        // one conversation, the snapshot that follows decides what may change.
+        return Ok(());
+    }
+    if stored.id != expected_id {
+        return Err(StoreError::InvalidState(format!(
+            "chat card {card_id} expected conversation {expected_id}, found {}",
+            stored.id
+        )));
+    }
+    // The canonical conversation carries the same evidence a new card would.
+    validate_chat_identity(transaction, card_id, canonical, None)?;
+    transaction.execute(
+        "UPDATE cards SET content_json = ?1, updated_at_unix_ms = ?2 WHERE card_id = ?3",
+        params![to_json(canonical)?, now_unix_ms(), card_id.to_string()],
+    )?;
     transaction.execute(INVALIDATE_CARD_HASH, [card_id.to_string()])?;
     Ok(())
 }
@@ -9524,6 +9598,67 @@ mod tests {
         assert_eq!(
             reopened.load_card(card, None).unwrap().unwrap().kind,
             CardKind::Chat(replacement)
+        );
+    }
+
+    /// A window that follows a shared view takes the conversation another
+    /// client started in a chat card's place, begun or not, through an
+    /// explicit adoption of exactly the conversation it last saved (#2176).
+    #[test]
+    fn a_chat_card_adopts_the_conversation_its_shared_view_started() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, begun) = agent_workspace(crate::agent::Provider::Claude);
+        let draft = crate::chat::Session {
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                session_id: None,
+                ..begun.launch.clone()
+            },
+            proof: None,
+            terminal: None,
+        };
+        assert!(draft.is_unstarted());
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(draft.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+
+        let started = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+                ..draft.launch.clone()
+            },
+            ..draft.clone()
+        };
+        workspace.cards[0].kind = CardKind::Chat(started.clone());
+        // On its own, the snapshot showing it is a re-pointed card.
+        assert!(matches!(
+            card_refusal(lane.save(&store, &workspace), card),
+            StoreError::InvalidState(_)
+        ));
+        // Only from the conversation this store holds.
+        assert!(matches!(
+            store.adopt_chat_identity(card, TerminalId::new(), &started),
+            Err(StoreError::InvalidState(_))
+        ));
+        let mut invalid = started.clone();
+        invalid.terminal = begun.terminal.clone();
+        assert!(matches!(
+            store.adopt_chat_identity(card, draft.id, &invalid),
+            Err(StoreError::InvalidState(_))
+        ));
+        store.adopt_chat_identity(card, draft.id, &started).unwrap();
+        // Retried, or already reached through this window's own writes.
+        store.adopt_chat_identity(card, draft.id, &started).unwrap();
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(started)
         );
     }
 
