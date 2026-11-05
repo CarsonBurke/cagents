@@ -3889,7 +3889,7 @@ pub(super) fn close_terminal_actor(
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::host) mod tests {
     use super::*;
     use crate::{
         chat::{
@@ -4683,7 +4683,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("omp");
-        std::fs::write(&executable, r#"#!/usr/bin/env python3
+        std::fs::write(&executable, r#"#!/usr/bin/python3
 import json, os, sys
 identity = sys.argv[sys.argv.index("--resume") + 1]
 print(json.dumps({"type": "ready"}), flush=True)
@@ -4923,11 +4923,15 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence() {
+    pub(in crate::host) fn standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence()
+     {
+        if !super::super::state::tests::upgrade_fixture_in_fresh_process() {
+            return;
+        }
         let (directory, host, saved) = upgrade_fixture();
         std::fs::write(
             directory.path().join("omp"),
-            r#"#!/usr/bin/env python3
+            r#"#!/usr/bin/python3
 import json, os, pathlib, sys, time
 assert os.environ["ANTHROPIC_API_KEY"] == "gui-only-key"
 assert os.environ["HTTPS_PROXY"] == "http://user:password@proxy.invalid:8080"
@@ -5201,17 +5205,20 @@ for line in sys.stdin:
         };
         assert_eq!(repeated, terminal);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !directory.path().join("terminal-starts").exists() {
+        // The fixture creates this file before its buffered write reaches it.
+        let terminal_starts = loop {
+            let starts = std::fs::read_to_string(directory.path().join("terminal-starts"))
+                .unwrap_or_default();
+            if !starts.is_empty() {
+                break starts;
+            }
             assert!(
                 Instant::now() < deadline,
                 "CLI did not receive the native execution environment"
             );
             thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            std::fs::read_to_string(directory.path().join("terminal-starts")).unwrap(),
-            "ok\n"
-        );
+        };
+        assert_eq!(terminal_starts, "ok\n");
         for durable in [
             serde_json::to_string(&attached).unwrap(),
             serde_json::to_string(&terminal).unwrap(),

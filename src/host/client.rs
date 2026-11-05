@@ -1683,7 +1683,7 @@ fn write_failure(error: &FrameError) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::host) mod tests {
     use super::*;
     use crate::model::TerminalId;
 
@@ -2103,7 +2103,10 @@ mod tests {
     }
 
     #[test]
-    fn slow_chat_close_allows_list_but_fences_upgrade_and_shutdown() {
+    pub(in crate::host) fn slow_chat_close_allows_list_but_fences_upgrade_and_shutdown() {
+        if !super::super::state::tests::upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{
