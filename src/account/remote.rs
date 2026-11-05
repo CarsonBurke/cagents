@@ -50,7 +50,15 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
                 return Ok(None);
             }
             if !pending {
-                return Err("The pending sign-in changed on the device".into());
+                if !matches!(operation, Operation::Register { .. })
+                    || !matches!(
+                        super::recovery::inspect(&homes, &registry, *provider, *key)
+                            .map_err(|error| error.to_string())?,
+                        super::recovery::HomeStatus::Available(_)
+                    )
+                {
+                    return Err("The pending sign-in changed on the device".into());
+                }
             }
             Ok(Some(Account::managed(
                 *provider,
@@ -136,12 +144,28 @@ pub(crate) fn execute(_operation: Operation) -> Result<serde_json::Value, String
 #[cfg(feature = "host")]
 pub(crate) fn execute_reserved(
     operation: Operation,
-    reservation: &crate::host::AccountReservation,
+    reservation: std::sync::Arc<crate::host::AccountReservation>,
 ) -> Result<serde_json::Value, String> {
     use super::{home::Homes, registry::Store};
     let homes = Homes::installation().ok_or("The device has no account data directory")?;
     let store = Store::installation().ok_or("The device has no account registry")?;
-    execute_at(operation, reservation, homes, store)
+    if let Operation::Register { provider, key } = &operation {
+        let registry = store.try_load().map_err(|error| error.to_string())?;
+        if registry.find(*key).is_none()
+            && !registry.pending().iter().any(|pending| pending.key == *key)
+        {
+            let settled = super::recovery::restore_reserved(
+                reservation,
+                homes,
+                super::recovery::Candidate {
+                    provider: *provider,
+                    key: *key,
+                },
+            )?;
+            return serde_json::to_value(settled).map_err(|error| error.to_string());
+        }
+    }
+    execute_at(operation, &reservation, homes, store)
 }
 
 #[cfg(feature = "host")]

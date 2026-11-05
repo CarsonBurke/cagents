@@ -12,6 +12,11 @@ use uuid::Uuid;
 use super::{Account, home::Homes, registry::Registry};
 use crate::agent::Provider;
 
+#[cfg(feature = "host")]
+mod restore;
+#[cfg(feature = "host")]
+pub(crate) use restore::restore_reserved;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Candidate {
     pub provider: Provider,

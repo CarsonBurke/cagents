@@ -37,6 +37,8 @@ const VERSION: u32 = 5;
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
 
+pub(crate) mod recovery;
+
 /// One account cagents added, as the registry records it. An account with
 /// `linked_home` belongs to another application or the reader, not cagents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
