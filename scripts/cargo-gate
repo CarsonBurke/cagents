@@ -14,66 +14,35 @@ set -eu
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=2
+gate_version=3
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
+# The helpers this gate runs are the ones beside the file it is, so an
+# installed gate keeps its own while a newer installation takes its name.
+here=$(dirname -- "$(readlink -f -- "$0")")
+synced=${CAGENTS_BUILD_SYNCED-}
+unset CAGENTS_BUILD_SYNCED
 
-# A gate change merged into main is live without anyone installing it: the
-# installer records the commit it installed from, and when this checkout's
-# origin/main has gone past it and changed the gate or a helper, main's are
-# installed. An installation main has not reached, such as a branch's under
-# test, stays until main has it.
-gate_files='scripts/cargo-gate scripts/cargo-gate-command.py scripts/cargo-offload scripts/seed-build-dir scripts/build-disk-guard scripts/install-cargo-gate'
-sync_installed() {
-    [ "$(basename -- "$installed")" = cagents-cargo-gate ] || return 1
-    main=$(git rev-parse -q --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null) || return 1
-    record=$installed.source
-    recorded=$(cat -- "$record" 2>/dev/null) || recorded=
-    [ "$recorded" != "$main" ] || return 1
-    # Not this repository's main, or one without the gate.
-    git cat-file -e "$main:scripts/install-cargo-gate" 2>/dev/null || return 1
-    if [ -n "$recorded" ]; then
-        git merge-base --is-ancestor "$recorded" "$main" 2>/dev/null || return 1
-        if git diff --quiet "$recorded" "$main" -- $gate_files 2>/dev/null; then
-            printf '%s\n' "$main" >"$record.$$" && mv -f -- "$record.$$" "$record" || rm -f -- "$record.$$"
-            return 1
+# A gate change merged into main is live without anyone installing it. When
+# this checkout's origin/main differs from the last one judged, the sync
+# helper installs main's gate if main changed it since the installed one, and
+# then the new one runs. An installation main has not reached, such as a
+# branch's under test, stays until main changes the gate again.
+if [ -z "$synced" ] && [ "${CAGENTS_BUILD_INSTALL_SYNC-1}" != 0 ] &&
+    case $installed in /*/cagents-cargo-gate) true ;; *) false ;; esac &&
+    [ -w "$(dirname -- "$installed")" ] && [ -f "$here/cargo-gate-sync.py" ] &&
+    main=$(git rev-parse -q --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null) &&
+    [ "$(cat -- "$installed.checked" 2>/dev/null)" != "$main" ]; then
+    was=$(readlink -f -- "$installed" 2>/dev/null) || was=
+    if python3 "$here/cargo-gate-sync.py" "$installed" "$main"; then
+        # This gate was the installed one, so main's runs in its place.
+        case $here/ in
+            "$(readlink -f -- "$(dirname -- "$installed")")/cagents-cargo-gate.d/"*)
+                CAGENTS_BUILD_SYNCED=1 exec "$installed" "$@" ;;
+        esac
+        if [ "$was" = "$(readlink -f -- "$0")" ]; then
+            CAGENTS_BUILD_SYNCED=1 exec "$installed" "$@"
         fi
     fi
-    failed=$(cat -- "$installed.sync-failed" 2>/dev/null) || failed=
-    if [ "$failed" = "$main" ]; then
-        printf 'cargo-gate: %s is not origin/main'\''s gate, which could not be installed; run scripts/install-cargo-gate from main\n' \
-            "$installed" >&2
-        return 1
-    fi
-    (
-        # One gate installs; the others go on with what is there.
-        exec 8>>"$installed.sync.lock"
-        flock -n 8 || exit 1
-        [ "$(cat -- "$record" 2>/dev/null)" != "$main" ] || exit 0
-        stage=$(mktemp -d "${TMPDIR:-/tmp}/cagents-gate-sync.XXXXXX") || exit 2
-        trap 'rm -rf -- "$stage"' EXIT
-        if output=$(git archive "$main" $gate_files 2>&1 | tar -x -C "$stage" 2>&1 &&
-            CAGENTS_BUILD_INSTALL_REVISION=$main \
-                "$stage/scripts/install-cargo-gate" "$(dirname -- "$installed")" 2>&1) &&
-            # An installer from before this records nothing, and would be run
-            # again by every gate.
-            [ "$(cat -- "$record" 2>/dev/null)" = "$main" ] ||
-            { output="${output:+$output
-}main's installer did not record what it installed"; false; }; then
-            rm -f -- "$installed.sync-failed"
-            printf 'cargo-gate: installed origin/main'\''s gate (%s) as %s\n' \
-                "$(printf '%s' "$main" | cut -c1-12)" "$installed" >&2
-        else
-            printf '%s\n' "$main" >"$installed.sync-failed"
-            printf 'cargo-gate: could not install origin/main'\''s gate as %s; run scripts/install-cargo-gate from main:\n%s\n' \
-                "$installed" "$output" >&2
-            exit 2
-        fi
-    )
-}
-if [ -n "$installed" ] && [ "${CAGENTS_BUILD_INSTALL_SYNC-1}" != 0 ] && sync_installed &&
-    [ "$(readlink -f -- "$installed")" = "$(readlink -f -- "$0")" ]; then
-    # Once is enough, should the new installation not record its commit.
-    CAGENTS_BUILD_INSTALL_SYNC=0 exec "$installed" "$@"
 fi
 
 if [ -n "$installed" ] && [ -x "$installed" ] &&
@@ -505,7 +474,7 @@ acquire() {
 check_admission() {
     [ -n "$admission_deadline" ] || return 0
     admission_status=0
-    python3 "$(dirname "$0")/cargo-gate-command.py" \
+    python3 "$here/cargo-gate-command.py" \
         --admission-check "$admission_deadline" 6>&- 8>&- 9>&- || admission_status=$?
     if [ "$admission_status" -ne 0 ]; then
         withdraw
@@ -594,7 +563,7 @@ supervised() {
     if [ -z "$slot_marker" ] && [ -n "${admission_deadline:-}" ]; then
         set -- --admission-until "$admission_deadline" "$@"
     fi
-    CAGENTS_BUILD_SLOT_HELD=$slot_marker python3 "$(dirname "$0")/cargo-gate-command.py" \
+    CAGENTS_BUILD_SLOT_HELD=$slot_marker python3 "$here/cargo-gate-command.py" \
         "$@" 0<&8 8>&- 9>&- &
     child=$!
     exec 8<&-
@@ -730,7 +699,7 @@ started_by_flock() {
 # `local`; anything else is a failure, never a reason to build here. Its wait
 # for that host spends the admission budget; the build there does not.
 cargo=${CAGENTS_BUILD_CARGO:-cargo}
-offload=$(dirname "$0")/cargo-offload
+offload=$here/cargo-offload
 if [ -x "$offload" ]; then
     where=0
     build_host=$("$offload" --host) || where=$?
@@ -747,7 +716,7 @@ esac
 if [ "$where" -eq 0 ]; then
     deadline=
     if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
-        deadline=$(python3 "$(dirname "$0")/cargo-gate-command.py" \
+        deadline=$(python3 "$here/cargo-gate-command.py" \
             --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
     fi
     admission_deadline=
@@ -767,7 +736,7 @@ if [ "$where" -eq 0 ]; then
     # The shim reaches this gate by its own path, naming Cargo so that
     # `cargo --help` is Cargo's; the gate takes the shim off PATH again, so
     # it reaches this host's Cargo.
-    self=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)/$(basename "$0")
+    self=$(readlink -f -- "$0")
     shims=$(mktemp -d "${TMPDIR:-/tmp}/cagents-cargo-shim.XXXXXX")
     quoted=$(printf '%s' "$self" | sed "s/'/'\\\\''/g")
     printf "#!/bin/sh\nexec '%s' cargo \"\$@\"\n" "$quoted" >"$shims/cargo"
@@ -790,7 +759,7 @@ fi
 
 admission_deadline=
 if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
-    admission_deadline=$(python3 "$(dirname "$0")/cargo-gate-command.py" \
+    admission_deadline=$(python3 "$here/cargo-gate-command.py" \
         --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
 fi
 
@@ -799,8 +768,8 @@ fi
 # shares a build directory with another worktree. Copying needs no slot.
 # Before either, a file system running out of room for build directories
 # reclaims removed worktrees' or refuses the build.
-guard=$(dirname "$0")/build-disk-guard
-seed=$(dirname "$0")/seed-build-dir
+guard=$here/build-disk-guard
+seed=$here/seed-build-dir
 if [ -x "$guard" ] || [ -x "$seed" ]; then
     # Keep ownership in the original gate shell: supervising only the metadata
     # command substitution would leave the outer gate unable to cancel it.

@@ -148,17 +148,35 @@ class InstallCargoGate(unittest.TestCase):
             env=self.env, capture_output=True, text=True, timeout=60,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        names = ["build-disk-guard", "cagents-cargo-gate", "cargo-gate-command.py",
+                 "cargo-gate-sync.py", "cargo-offload", "seed-build-dir"]
         self.assertEqual(
             sorted(path.name for path in self.root.iterdir()),
-            ["build-disk-guard", "cagents-cargo-gate", "cargo-gate-command.py", "cargo-offload",
-             "seed-build-dir"],
+            sorted(names + ["cagents-cargo-gate.d", "cagents-cargo-gate.install.lock",
+                            "cagents-cargo-gate.installation", "cagents-cargo-gate.source"]),
         )
+        # Every name leads into one installation of its own, which has the
+        # installer that made it.
+        (installation,) = (self.root / "cagents-cargo-gate.d").iterdir()
+        for name in names:
+            self.assertEqual((self.root / name).resolve(), installation / name)
+        self.assertTrue((installation / "install-cargo-gate").is_file())
+
+    def test_an_installation_leaves_the_running_one_whole(self):
+        install = [str(ROOT / "scripts/install-cargo-gate"), str(self.root)]
+        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=60)
+        (first,) = (self.root / "cagents-cargo-gate.d").iterdir()
+        contents = {path.name: path.read_bytes() for path in first.iterdir()}
+        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=60)
+        self.assertEqual({path.name: path.read_bytes() for path in first.iterdir()}, contents)
+        self.assertNotEqual((self.root / "cagents-cargo-gate").resolve().parent, first)
 
     def test_a_gate_that_cannot_run_is_not_installed(self):
         scripts = self.root / "checkout/scripts"
         scripts.mkdir(parents=True)
         for name in ("install-cargo-gate", "cargo-gate", "cargo-gate-command.py",
-                     "cargo-offload", "seed-build-dir", "build-disk-guard"):
+                     "cargo-gate-sync.py", "cargo-offload", "seed-build-dir",
+                     "build-disk-guard"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         (scripts / "cargo-gate-command.py").write_text("import sys\nsys.exit(3)\n")
         installed = self.root / "installed"
@@ -170,7 +188,10 @@ class InstallCargoGate(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("did not run a command", result.stderr)
-        self.assertEqual(sorted(path.name for path in installed.iterdir()), ["cagents-cargo-gate"])
+        self.assertEqual(sorted(path.name for path in installed.iterdir()),
+                         ["cagents-cargo-gate", "cagents-cargo-gate.d",
+                          "cagents-cargo-gate.install.lock"])
+        self.assertEqual(list((installed / "cagents-cargo-gate.d").iterdir()), [])
         self.assertEqual((installed / "cagents-cargo-gate").read_text(), "previous\n")
 
 

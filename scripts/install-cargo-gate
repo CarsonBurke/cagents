@@ -2,11 +2,14 @@
 # Install this checkout's cargo gate as the host's shared one.
 #
 # Agents in every checkout run the installed gate, so it must never be seen
-# half-updated: the gate runs its helpers from its own directory, and a gate
-# beside an older or missing helper fails every build it admits. This stages
-# the gate with all of its helpers, checks that the staged set admits and runs
-# a command, and only then renames each file into place, helpers before the
-# gate that uses them. It checks the installed set the same way.
+# half-updated, and a running gate must never find another installation's
+# helpers beside it. Each installation is a directory of its own under
+# DIRECTORY/cagents-cargo-gate.d, holding the gate and every helper; the gate
+# finds its helpers beside the file it really is. This checks that the new
+# directory's gate admits and runs a command, and only then points each name
+# in DIRECTORY at it, helpers before the gate, each replaced at once. It checks
+# the installed gate the same way, and records what it installed, from which
+# repository and when, by which gates later install main's newer gate.
 set -eu
 
 program=install-cargo-gate
@@ -20,9 +23,8 @@ usage() {
 Usage: scripts/install-cargo-gate [DIRECTORY]
 
 Installs scripts/cargo-gate as DIRECTORY/cagents-cargo-gate, with
-cargo-gate-command.py, cargo-offload, seed-build-dir and build-disk-guard
-beside it
-(default DIRECTORY: /var/tmp).
+cargo-gate-command.py, cargo-gate-sync.py, cargo-offload, seed-build-dir and
+build-disk-guard beside it (default DIRECTORY: /var/tmp).
 EOF
 }
 
@@ -36,13 +38,27 @@ source=$(cd "$(dirname "$0")" && pwd -P)
 
 # Installed name, then this checkout's file. The gate goes last.
 files='cargo-gate-command.py:cargo-gate-command.py
+cargo-gate-sync.py:cargo-gate-sync.py
 cargo-offload:cargo-offload
 seed-build-dir:seed-build-dir
 build-disk-guard:build-disk-guard
 cagents-cargo-gate:cargo-gate'
 
-stage=$(mktemp -d "$destination/.cagents-cargo-gate.XXXXXX")
-trap 'rm -rf -- "$stage"' EXIT
+# One installation at a time, by hand or by a gate installing main's: a gate
+# that installs holds this already. Gates of version 2 install under a lock of
+# their own, so this one must not be theirs, which they hold while this runs.
+if [ "${CAGENTS_BUILD_INSTALL_LOCK_HELD-}" != 1 ]; then
+    exec 9>>"$destination/cagents-cargo-gate.install.lock"
+    flock 9 || fail "cannot lock $destination/cagents-cargo-gate.install.lock"
+fi
+unset CAGENTS_BUILD_INSTALL_LOCK_HELD
+
+versions=$destination/cagents-cargo-gate.d
+mkdir -p -- "$versions"
+stage=$(mktemp -d "$versions/v.XXXXXX")
+chmod 755 -- "$stage"
+committed=false
+trap '[ "$committed" = true ] || rm -rf -- "$stage"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -55,18 +71,21 @@ printf '%s\n' "$files" | while IFS=: read -r installed file; do
         *) sh -n "$stage/$installed" ;;
     esac
 done
+cp -- "$source/install-cargo-gate" "$stage/install-cargo-gate"
 
 # Admits and runs a command through the gate at $1, on a private lock so the
 # check neither waits behind real builds nor holds a slot they need. It runs
 # outside any Cargo workspace, so it neither seeds nor checks free space.
 smoke() {
-    lock=$(mktemp -d "$stage/smoke.XXXXXX")
-    output=$( (cd "$lock" && CAGENTS_BUILD_LOCK="$lock/lock" CAGENTS_BUILD_SLOT_HELD= \
+    lock=$(mktemp -d "${TMPDIR:-/tmp}/cagents-gate-smoke.XXXXXX")
+    status=0
+    output=$(cd "$lock" && CAGENTS_BUILD_LOCK="$lock/lock" CAGENTS_BUILD_SLOT_HELD= \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_INSTALLED_GATE= \
-        "$1" exec sh -c 'printf admitted') 2>&1) ||
-        fail "$1 did not run a command: $output"
-    [ "$output" = admitted ] || fail "$1 did not run a command: $output"
+        "$1" exec sh -c 'printf admitted' 2>"$lock/errors") || status=$?
+    errors=$(cat -- "$lock/errors")
     rm -rf -- "$lock"
+    [ "$status" = 0 ] && [ "$output" = admitted ] ||
+        fail "$1 did not run a command (exit $status): $output$errors"
 }
 smoke "$stage/cagents-cargo-gate"
 
@@ -80,25 +99,51 @@ current=$(version "$destination/cagents-cargo-gate")
 [ "${staged:-0}" -ge "${current:-0}" ] ||
     fail "the installed gate is version $current, newer than this checkout's ${staged:-0}; install from a checkout that has it"
 
-# The commit installed from, by which gates later install main's newer gate
-# themselves. Files that differ from their commit match none: then nothing
-# is recorded, and the next gate run in a checkout of main installs main's.
-revision=${CAGENTS_BUILD_INSTALL_REVISION:-}
-if [ -z "$revision" ] && revision=$(git -C "$source" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null) &&
-    ! git -C "$source" diff --quiet HEAD -- $(printf '%s\n' "$files" | sed 's/^[^:]*://') install-cargo-gate 2>/dev/null; then
-    printf '%s: scripts differ from %s, so the next gate run in a checkout of main replaces this installation with main'\''s\n' \
-        "$program" "$(printf '%s' "$revision" | cut -c1-12)" >&2
-    revision=
-fi
-rm -f -- "$destination/cagents-cargo-gate.source"
+# What was installed, file by file, from which commit of which repository,
+# and when.
+python3 - "$destination/cagents-cargo-gate.installation" "$source" "$stage" "$files" <<'PY'
+import json, os, subprocess, sys, time
+record, source, stage, files = sys.argv[1:]
+def git(*arguments):
+    result = subprocess.run(["git", "-C", source, *arguments], capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+names = [line.split(":", 1) for line in files.splitlines()] + [["install-cargo-gate", "install-cargo-gate"]]
+blobs = {}
+for installed, file in names:
+    blob = git("hash-object", "--no-filters", os.path.join(stage, installed))
+    if blob is None:
+        blobs = None
+        break
+    blobs[f"scripts/{file}"] = blob
+# CAGENTS_BUILD_INSTALL_REVISION is how gates of version 2 name main.
+commit = os.environ.get("CAGENTS_BUILD_INSTALL_COMMIT") or \
+    os.environ.get("CAGENTS_BUILD_INSTALL_REVISION") or git("rev-parse", "-q", "--verify", "HEAD^{commit}")
+repository = os.environ.get("CAGENTS_BUILD_INSTALL_REPOSITORY") or git(
+    "rev-parse", "--path-format=absolute", "--git-common-dir")
+with open(record + ".new", "w") as file:
+    json.dump({"files": blobs, "commit": commit, "repository": repository,
+               "installed_at": time.time(), "directory": os.path.basename(stage)}, file, indent=1)
+    file.write("\n")
+# Gates of version 2 judge main by the commit alone.
+with open(record.removesuffix(".installation") + ".source.new", "w") as file:
+    file.write(f"{commit or ''}\n")
+PY
 
+# Each name in the destination now leads into the new installation: helpers
+# first, for a gate from before installations had directories of their own,
+# which finds them by name beside it.
 printf '%s\n' "$files" | while IFS=: read -r installed file; do
-    mv -f -- "$stage/$installed" "$destination/$installed"
+    ln -s -- "cagents-cargo-gate.d/${stage##*/}/$installed" "$destination/.$installed.new"
+    mv -f -- "$destination/.$installed.new" "$destination/$installed"
 done
+committed=true
+mv -f -- "$destination/cagents-cargo-gate.installation.new" "$destination/cagents-cargo-gate.installation"
+mv -f -- "$destination/cagents-cargo-gate.source.new" "$destination/cagents-cargo-gate.source"
+# Gates judge main afresh against this installation.
+rm -f -- "$destination/cagents-cargo-gate.checked" "$destination/cagents-cargo-gate.install-failed"
 smoke "$destination/cagents-cargo-gate"
-if [ -n "$revision" ]; then
-    printf '%s\n' "$revision" >"$stage/source"
-    mv -f -- "$stage/source" "$destination/cagents-cargo-gate.source"
-fi
-printf '%s: installed %s/cagents-cargo-gate from %s\n' \
-    "$program" "$destination" "${revision:+$(printf '%s' "$revision" | cut -c1-12)}${revision:-this checkout}"
+# Earlier installations a running build may still be using stay a week.
+find "$versions" -mindepth 1 -maxdepth 1 -type d -name 'v.*' ! -name "${stage##*/}" -mtime +7 \
+    -exec rm -rf -- {} + 2>/dev/null || true
+printf '%s: installed %s/cagents-cargo-gate from %s\n' "$program" "$destination" \
+    "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print((r.get("commit") or "this checkout")[:12])' "$destination/cagents-cargo-gate.installation")"

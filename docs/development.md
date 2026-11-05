@@ -489,16 +489,23 @@ builds the way `main` does. Raise `gate_version` in `scripts/cargo-gate` with
 any change to the gate or its helpers. `scripts/install-cargo-gate`
 installs a checkout's gate and refuses an older version over a newer one.
 
-Merged gate changes install themselves. The installer records the commit it
-installed from in `/var/tmp/cagents-cargo-gate.source`. Every gate run
-inside a checkout compares it with that checkout's `origin/main`. When main
-has moved past it and changed the gate or a helper, the gate installs main's
-versions, says so, and continues. Otherwise only the record moves. An
-installation main has not reached, such as a branch under test, stays until
-main contains it. An installation from files that differ from their commit
-records nothing, so the next run replaces it with main's. When main's gate
-cannot be installed, every run says so, and it is tried again only once main
-moves. `CAGENTS_BUILD_INSTALL_SYNC=0` turns this off.
+Merged gate changes install themselves. Each installation is its own
+directory under `/var/tmp/cagents-cargo-gate.d`, and the installed names are
+links into it, so a running gate keeps its own helpers while a newer one
+takes over. `/var/tmp/cagents-cargo-gate.installation` records each file's
+Git blob, the repository and commit it came from, and when. When a gate runs
+in a checkout whose `origin/main` it has not yet judged,
+`scripts/cargo-gate-sync.py` compares main's files with that record. It
+installs main's gate when they differ and main changed the gate after the
+installation; then main's gate runs the command, and the run says so. An
+installation made later, such as a branch under test, stays until main
+changes the gate again. A branch that main squashed or rebased has the same
+files, so nothing happens. Checkouts of another clone or fork leave the
+installation alone. When main's gate cannot be installed, every run says
+so, with the reason in `/var/tmp/cagents-cargo-gate.install-failed`, and it
+is tried again only once main moves. The installation waits for a fetch of
+main, and it runs main's installer, so fetched main code installs itself.
+`CAGENTS_BUILD_INSTALL_SYNC=0` turns this off.
 
 Only settings that change what Cargo, rustc or the tests do reach the host:
 `RUST_*`, `RUSTFLAGS`, `RUSTDOCFLAGS`, `CARGO_TERM_*`, `CARGO_PROFILE_*`,
