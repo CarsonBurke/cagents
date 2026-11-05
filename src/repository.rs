@@ -12262,7 +12262,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                             "Remote refresh failed; using cached {reference}: {}",
                             failure.reported_detail()
                         ));
-                        journal.warnings.push(failure);
+                        // The outcome's warnings are what the app shows, so
+                        // say which ref the worktree was created from.
+                        let mut warning = failure;
+                        warning.message = format!(
+                            "Could not refresh {reference}; created from its last fetched commit"
+                        );
+                        journal.warnings.push(warning);
                     }
                 }
             }
@@ -13457,7 +13463,10 @@ mod worktree_journal_tests {
         );
         assert_eq!(fixture.git(&["rev-parse", "topic"]), cached);
         assert!(
-            matches!(&report.outcome, Some(WorktreeCreationOutcome::Created {warnings, ..}) if !warnings.is_empty())
+            matches!(&report.outcome, Some(WorktreeCreationOutcome::Created {warnings, ..})
+                if warnings.len() == 1
+                    && warnings[0].message
+                        == "Could not refresh refs/remotes/origin/topic; created from its last fetched commit")
         );
     }
 

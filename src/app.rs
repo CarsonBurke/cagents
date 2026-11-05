@@ -17037,7 +17037,7 @@ impl Application for Cagents {
                 result,
             } => {
                 match result {
-                    Ok(WorktreeCreationOutcome::Created { worktree, .. }) => {
+                    Ok(WorktreeCreationOutcome::Created { worktree, warnings }) => {
                         if let Some(session) = &self.session {
                             session.save_worktrees([WorktreeState {
                                 id: worktree.id,
@@ -17053,10 +17053,10 @@ impl Application for Cagents {
                                 existence: Existence::Open,
                             }]);
                         }
-                        self.status = Some(TransientNotice::success(format!(
-                            "Created worktree {}",
-                            worktree.path.display()
-                        )));
+                        self.status = Some(worktree_operations::created_worktree_notice(
+                            &worktree.path,
+                            &warnings,
+                        ));
                         if let Some(project) = self
                             .sidebar_model
                             .projects
