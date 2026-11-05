@@ -19788,7 +19788,11 @@ mod tests {
             })
     }
 
-    pub(super) fn fixture_handle(app: &Cagents, card: CardId, session_id: Option<&str>) -> Arc<ClientHandle> {
+    pub(super) fn fixture_handle(
+        app: &Cagents,
+        card: CardId,
+        session_id: Option<&str>,
+    ) -> Arc<ClientHandle> {
         let mut session = app.chat_ui.attempt(card).unwrap().session.clone();
         // The daemon starts a new Codex thread on a listener of its own and
         // hands the thread back naming it.
