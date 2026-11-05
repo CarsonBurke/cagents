@@ -34,6 +34,14 @@ pub(super) struct PlaceholderPolicy {
     pub visit: bool,
 }
 
+/// An anchor measurement may retain the native descriptor route separately
+/// from selectable anchors, including horizontal cells that are not anchors.
+pub(super) enum RowScope {
+    Probe(bool),
+    Enter(u64),
+    Exit,
+}
+
 #[derive(Clone)]
 pub(super) struct LogicalRange {
     pub identity: u64,
@@ -559,13 +567,19 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 }
             }
         }
+        let mut scope = RowScope::Probe(false);
+        operation.custom(None, layout.bounds(), &mut scope);
+        let scoped = matches!(scope, RowScope::Probe(true));
         operation.traverse(&mut |operation| {
-            for (((index, _), child), child_layout) in state
+            for (((index, key), child), child_layout) in state
                 .mounted
                 .iter()
                 .zip(&mut tree.children)
                 .zip(layout.children())
             {
+                if scoped {
+                    operation.custom(None, child_layout.bounds(), &mut RowScope::Enter(*key));
+                }
                 self.rows[*index]
                     .content
                     .as_mut()
@@ -577,6 +591,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                         renderer,
                         operation,
                     );
+                if scoped {
+                    operation.custom(None, child_layout.bounds(), &mut RowScope::Exit);
+                }
             }
         });
     }
@@ -794,7 +811,7 @@ pub(super) fn anchor_points(
     state: &mut dyn std::any::Any,
     bounds: Rectangle,
     wanted: &HashSet<u64>,
-) -> Vec<(u64, Rectangle)> {
+) -> Vec<(u64, Rectangle, bool)> {
     let Some(state) = state.downcast_ref::<State>() else {
         return vec![];
     };
@@ -828,7 +845,23 @@ pub(super) fn anchor_points(
                     height: bounds.height,
                 },
             };
-            Some((key, rectangle))
+            Some((key, rectangle, state.realized.contains(&index)))
+        })
+        .collect()
+}
+
+/// Query only retained route keys; this never builds offscreen row widgets.
+pub(super) fn row_status(state: &dyn std::any::Any, wanted: &HashSet<u64>) -> Vec<(u64, bool)> {
+    let Some(state) = state.downcast_ref::<State>() else {
+        return vec![];
+    };
+    wanted
+        .iter()
+        .filter_map(|key| {
+            state
+                .positions
+                .get(key)
+                .map(|index| (*key, state.realized.contains(index)))
         })
         .collect()
 }
@@ -920,6 +953,180 @@ impl Operation for UpdateViewport {
 mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn row_scopes_include_non_anchor_cells_without_building_offscreen_descriptors() {
+        const CELL: u64 = 101;
+        const FINE: u64 = 102;
+        const HIDDEN: u64 = 103;
+        const UNKNOWN: u64 = 104;
+
+        struct Read {
+            scoped: bool,
+            wanted: HashSet<u64>,
+            path: Vec<u64>,
+            fine_sources: Vec<Vec<u64>>,
+            fine_leaves: Vec<Vec<u64>>,
+            candidates: HashSet<u64>,
+            guards: HashMap<u64, bool>,
+            entered: usize,
+            exited: usize,
+        }
+        impl Read {
+            fn new(scoped: bool) -> Self {
+                Self {
+                    scoped,
+                    wanted: [CELL, FINE, HIDDEN, UNKNOWN].into_iter().collect(),
+                    path: vec![],
+                    fine_sources: vec![],
+                    fine_leaves: vec![],
+                    candidates: HashSet::new(),
+                    guards: HashMap::new(),
+                    entered: 0,
+                    exited: 0,
+                }
+            }
+        }
+        impl Operation for Read {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+                if let Some(scope) = state.downcast_mut::<RowScope>() {
+                    match scope {
+                        RowScope::Probe(enabled) => *enabled = self.scoped,
+                        RowScope::Enter(key) => {
+                            self.entered += 1;
+                            self.path.push(*key);
+                        }
+                        RowScope::Exit => {
+                            self.exited += 1;
+                            self.path.pop().expect("balanced descriptor route");
+                        }
+                    }
+                    return;
+                }
+                self.guards.extend(row_status(state, &self.wanted));
+                for (key, _, mounted) in anchor_points(state, bounds, &self.wanted) {
+                    self.candidates.insert(key);
+                    if key == FINE {
+                        assert!(mounted, "the actual fine paragraph is mounted");
+                        self.fine_sources.push(self.path.clone());
+                    }
+                }
+                if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+                    && prose
+                        .logical
+                        .as_ref()
+                        .is_some_and(|logical| logical.identity == FINE)
+                {
+                    assert_eq!(
+                        prose.plain.as_ref(),
+                        "Fine paragraph inside the table cell."
+                    );
+                    self.fine_leaves.push(self.path.clone());
+                }
+            }
+        }
+
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let hidden_builds = Rc::new(Cell::new(0));
+        let cell = Row::new(CELL, 0, 320.0, None, move || {
+            let mut paragraph = Row::new(FINE, 0, 80.0, None, move || {
+                selectable_prose::logical_text(
+                    vec![iced::widget::text::Span::new(
+                        "Fine paragraph inside the table cell.",
+                    )]
+                    .into(),
+                    iced::Pixels(14.0),
+                    iced::Font::default(),
+                    target,
+                    None,
+                    selectable_prose::Logical {
+                        identity: FINE,
+                        start: 0,
+                    },
+                )
+            });
+            paragraph.anchor = true;
+            widget::container(column(vec![paragraph], Default::default()))
+                .width(320.0)
+                .into()
+        });
+        assert!(
+            !cell.anchor,
+            "horizontal cells are route guards, not anchors"
+        );
+        let hidden_counter = hidden_builds.clone();
+        let mut element: Element<'_, Message> = widget::scrollable(row(
+            vec![
+                cell,
+                Row::new(105, 0, 4_000.0, None, || {
+                    widget::Space::new().width(4_000.0).height(80.0).into()
+                }),
+                Row::new(HIDDEN, 0, 320.0, None, move || {
+                    hidden_counter.set(hidden_counter.get() + 1);
+                    widget::Space::new().width(320.0).height(80.0).into()
+                }),
+            ],
+            100.0,
+            Rc::new(Cell::new(Some(Viewport {
+                top: 0.0,
+                height: 240.0,
+                bottom: false,
+            }))),
+        ))
+        .direction(iced::widget::scrollable::Direction::Horizontal(
+            iced::widget::scrollable::Scrollbar::new(),
+        ))
+        .width(240.0)
+        .height(100.0)
+        .into();
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(240.0, 100.0)),
+        );
+        assert_eq!(hidden_builds.get(), 0);
+        let constructed = constructed_rows();
+        let mut scoped = Read::new(true);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut scoped);
+        assert_eq!(scoped.fine_sources, vec![vec![CELL]]);
+        assert_eq!(scoped.fine_leaves, vec![vec![CELL, FINE]]);
+        assert_eq!(scoped.candidates, HashSet::from([FINE]));
+        assert_eq!(
+            scoped.guards,
+            HashMap::from([(CELL, true), (FINE, true), (HIDDEN, false)]),
+            "offscreen route descriptors stay known without claiming to be mounted"
+        );
+        assert!(scoped.entered > 0);
+        assert_eq!(scoped.entered, scoped.exited);
+        assert!(scoped.path.is_empty());
+        assert_eq!(
+            hidden_builds.get(),
+            0,
+            "guard queries never build hidden cells"
+        );
+        assert_eq!(constructed_rows(), constructed);
+
+        let mut ordinary = Read::new(false);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut ordinary);
+        assert_eq!((ordinary.entered, ordinary.exited), (0, 0));
+        assert_eq!(ordinary.fine_sources, vec![Vec::<u64>::new()]);
+        assert_eq!(ordinary.candidates, scoped.candidates);
+        assert_eq!(ordinary.guards, scoped.guards);
+        assert_eq!(hidden_builds.get(), 0);
+        assert_eq!(constructed_rows(), constructed);
+    }
 
     #[test]
     fn measured_shrink_keeps_mounted_flow_until_parent_refresh_and_offscreen_evicts() {

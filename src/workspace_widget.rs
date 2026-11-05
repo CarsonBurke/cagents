@@ -577,14 +577,62 @@ where
         .map(map)
 }
 
+// Only internal workspace-camera and tab-strip maintenance can opt into the
+// painted background of a modal. Keep this marker private so ordinary widget
+// operations cannot accidentally acquire that traversal.
+struct WorkspaceScrollMaintenance(bool);
+
+pub(crate) fn is_workspace_scroll_maintenance(operation: &mut dyn Operation) -> bool {
+    let mut maintenance = WorkspaceScrollMaintenance(false);
+    operation.custom(None, Rectangle::default(), &mut maintenance);
+    maintenance.0
+}
+
+/// Synchronizes an internal workspace camera or tab strip horizontally,
+/// including while its native widgets remain painted behind a modal.
 pub fn scroll_to<Message: 'static>(id: widget::Id, offset: f32) -> Task<Message> {
-    widget::scrollable::scroll_to(
-        id,
-        widget::scrollable::AbsoluteOffset {
-            x: Some(offset.max(0.0)),
-            y: None,
-        },
-    )
+    struct ScrollTo {
+        target: widget::Id,
+        offset: f32,
+    }
+
+    impl Operation for ScrollTo {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+
+        fn custom(
+            &mut self,
+            _id: Option<&widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            if let Some(maintenance) = state.downcast_mut::<WorkspaceScrollMaintenance>() {
+                maintenance.0 = true;
+            }
+        }
+
+        fn scrollable(
+            &mut self,
+            id: Option<&widget::Id>,
+            _bounds: Rectangle,
+            _content_bounds: Rectangle,
+            _translation: Vector,
+            state: &mut dyn cosmic::iced::advanced::widget::operation::Scrollable,
+        ) {
+            if Some(&self.target) == id {
+                state.scroll_to(widget::scrollable::AbsoluteOffset {
+                    x: Some(self.offset),
+                    y: None,
+                });
+            }
+        }
+    }
+
+    cosmic::iced::runtime::task::effect(cosmic::iced::runtime::Action::widget(ScrollTo {
+        target: id,
+        offset: offset.max(0.0),
+    }))
 }
 
 pub fn focus_card<Message: 'static>(id: CardId) -> Task<Message> {
@@ -2255,6 +2303,95 @@ mod tests {
     use crate::settings::parse_chords;
     use crate::workspace::{CardWidth, WorkspaceCard};
     use std::collections::HashSet;
+
+    #[test]
+    fn workspace_scroll_maintenance_is_private_and_horizontal() {
+        use cosmic::iced::advanced::widget::operation::{self, Scrollable, scrollable};
+        use cosmic::iced::futures::{StreamExt, executor::block_on};
+
+        #[derive(Default)]
+        struct Scroll(Vec<scrollable::AbsoluteOffset<Option<f32>>>);
+        impl Scrollable for Scroll {
+            fn snap_to(&mut self, _: scrollable::RelativeOffset<Option<f32>>) {
+                panic!("workspace maintenance must not snap the viewport");
+            }
+            fn scroll_to(&mut self, offset: scrollable::AbsoluteOffset<Option<f32>>) {
+                self.0.push(offset);
+            }
+            fn scroll_by(&mut self, _: scrollable::AbsoluteOffset, _: Rectangle, _: Rectangle) {
+                panic!("workspace maintenance must not apply relative navigation");
+            }
+        }
+
+        struct Custom;
+        impl Operation for Custom {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(flag) = state.downcast_mut::<bool>() {
+                    *flag = true;
+                }
+            }
+        }
+
+        let target = widget::Id::new("workspace-maintenance-target");
+        let unrelated = widget::Id::new("workspace-maintenance-unrelated");
+        for offset in [900.0_f32, -20.0] {
+            // The App maps these Tasks into its own message type. The marker
+            // must survive that normal effect path without producing output.
+            let mut stream = cosmic::iced::runtime::task::into_stream(
+                scroll_to::<()>(target.clone(), offset).map(|()| 7_u8),
+            )
+            .unwrap();
+            let cosmic::iced::runtime::Action::Widget(mut operation) =
+                block_on(stream.next()).unwrap()
+            else {
+                panic!("workspace camera maintenance must be a widget effect");
+            };
+            assert!(is_workspace_scroll_maintenance(operation.as_mut()));
+            let mut scroll = Scroll::default();
+            for id in [Some(&unrelated), None, Some(&target)] {
+                operation.scrollable(
+                    id,
+                    Rectangle::default(),
+                    Rectangle::default(),
+                    Vector::ZERO,
+                    &mut scroll,
+                );
+            }
+            assert_eq!(
+                scroll.0,
+                [scrollable::AbsoluteOffset {
+                    x: Some(offset.max(0.0)),
+                    y: None,
+                }]
+            );
+            assert!(block_on(stream.next()).is_none());
+        }
+
+        let mut stock_scroll = scrollable::scroll_to::<()>(
+            target.clone(),
+            scrollable::AbsoluteOffset {
+                x: Some(200.0),
+                y: Some(300.0),
+            },
+        );
+        assert!(!is_workspace_scroll_maintenance(&mut stock_scroll));
+        assert!(!is_workspace_scroll_maintenance(
+            &mut operation::focusable::focus::<()>(target)
+        ));
+        let mut focused = operation::focusable::find_focused();
+        assert!(!is_workspace_scroll_maintenance(
+            &mut operation::black_box::<_, ()>(&mut focused)
+        ));
+        assert!(!is_workspace_scroll_maintenance(&mut Custom));
+    }
 
     #[test]
     fn drop_targets_end_at_the_edges_of_the_strip() {

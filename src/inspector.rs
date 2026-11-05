@@ -41,7 +41,8 @@ pub fn close_focus_id() -> widget::Id {
 }
 
 /// A modal layer that keeps its background painted while exposing and
-/// operating only the foreground subtree. Unlike an ordinary stack or
+/// operating only the foreground subtree, apart from internal workspace-camera
+/// and tab-strip maintenance. Unlike an ordinary stack or
 /// popover, this makes the overlay—not the obscured workbench—the root of the
 /// accessibility and focus-operation tree.
 pub struct ModalOverlay<'a, Message> {
@@ -100,6 +101,16 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
         renderer: &Renderer,
         operation: &mut dyn cosmic::iced::advanced::widget::Operation,
     ) {
+        if crate::workspace_widget::is_workspace_scroll_maintenance(operation)
+            && let Some(background) = layout.children().next()
+        {
+            self.background.as_widget_mut().operate(
+                &mut tree.children[0],
+                background,
+                renderer,
+                operation,
+            );
+        }
         if let Some(foreground) = layout.children().nth(1) {
             self.foreground.as_widget_mut().operate(
                 &mut tree.children[1],
@@ -121,6 +132,44 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        // The obscured workspace still paints. Keep its resize measurements,
+        // virtual viewport and text-shaping requests progressing, without
+        // delivering input or adopting an obscured editor's IME/capture state.
+        if matches!(
+            event,
+            Event::Window(cosmic::iced::window::Event::RedrawRequested(_))
+        ) && let Some(background) = layout.children().next()
+        {
+            let mut messages = Vec::new();
+            let (layout_invalid, widgets_invalid, redraw) = {
+                let mut rendering = Shell::new(&mut messages);
+                self.background.as_widget_mut().update(
+                    &mut tree.children[0],
+                    event,
+                    background,
+                    mouse::Cursor::Unavailable,
+                    renderer,
+                    clipboard,
+                    &mut rendering,
+                    viewport,
+                );
+                (
+                    rendering.is_layout_invalid(),
+                    rendering.are_widgets_invalid(),
+                    rendering.redraw_request(),
+                )
+            };
+            for message in messages {
+                shell.publish(message);
+            }
+            if layout_invalid {
+                shell.invalidate_layout();
+            }
+            if widgets_invalid {
+                shell.invalidate_widgets();
+            }
+            shell.request_redraw_at(redraw);
+        }
         if let Some(foreground) = layout.children().nth(1) {
             self.foreground.as_widget_mut().update(
                 &mut tree.children[1],
@@ -206,8 +255,8 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
         let (background_tree, foreground_tree) = tree.children.split_at_mut(1);
         // The background is painted, so whatever it raises has to be painted
         // too: dropping its overlay drew a card's dropdown as a closed button
-        // with no menu. It stays inert, because this layer withholds events and
-        // operations from the background and an overlay that took them would
+        // with no menu. It stays inert, because this layer withholds input and
+        // general widget operations and an overlay that took them would
         // hand a frozen subtree the clicks aimed at the modal. The foreground's
         // overlay is grouped last so it composites above it.
         let background = self
@@ -261,8 +310,8 @@ impl<'a, Message: 'a> From<ModalOverlay<'a, Message>> for Element<'a, Message> {
 
 /// An overlay that is drawn but never operated.
 ///
-/// [`ModalOverlay`] paints its background while withholding every event and
-/// operation from it. This wrapper extends that same split to the overlays the
+/// [`ModalOverlay`] keeps background rendering live while withholding input
+/// and widget operations. This wrapper also shields the overlays the
 /// background raises, so a control that was already open keeps its painted
 /// shape without stealing input from the modal in front of it.
 struct Inert<'a, Message> {
@@ -2332,6 +2381,221 @@ mod tests {
     }
 
     #[test]
+    fn modal_overlay_only_admits_internal_horizontal_scroll_maintenance() {
+        use cosmic::iced::Vector;
+        use cosmic::iced::advanced::{
+            renderer::Headless,
+            widget::{Operation, operation},
+        };
+        use cosmic::iced::futures::{StreamExt, executor::block_on};
+        use std::collections::HashMap;
+
+        #[derive(Default)]
+        struct Probe {
+            scrolls: HashMap<widget::Id, Vector>,
+            focused: Vec<widget::Id>,
+            inputs: Vec<widget::Id>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if let Some(id) = id {
+                    self.scrolls.insert(id.clone(), translation);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused()
+                    && let Some(id) = id
+                {
+                    self.focused.push(id.clone());
+                }
+            }
+            fn text_input(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                _: &mut dyn operation::TextInput,
+            ) {
+                if let Some(id) = id {
+                    self.inputs.push(id.clone());
+                }
+            }
+        }
+
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let strip = widget::Id::new("modal-workspace-strip");
+        let other = widget::Id::new("modal-unrelated-scroll");
+        let foreground = widget::Id::new("modal-foreground-scroll");
+        let editor = widget::Id::new("modal-background-editor");
+        let foreground_editor = widget::Id::new("modal-foreground-editor");
+        let pane = |scroll, editor| -> Element<'static, ()> {
+            widget::scrollable(
+                widget::column::with_children(vec![
+                    cosmic::iced::widget::text_input("", "retained draft")
+                        .id(editor)
+                        .on_input(|_| ())
+                        .into(),
+                    cosmic::iced::widget::Space::new()
+                        .width(2000.0)
+                        .height(1500.0)
+                        .into(),
+                ])
+                .width(2000.0),
+            )
+            .id(scroll)
+            .direction(cosmic::iced::widget::scrollable::Direction::Both {
+                horizontal: design::scrollbar(),
+                vertical: design::scrollbar(),
+            })
+            .width(Length::Fill)
+            .height(150.0)
+            .into()
+        };
+        let mut modal = ModalOverlay::new(
+            widget::column::with_children(vec![
+                pane(strip.clone(), editor.clone()),
+                pane(other.clone(), widget::Id::new("modal-other-editor")),
+            ])
+            .width(Length::Fill),
+            pane(foreground.clone(), foreground_editor.clone()),
+        );
+        let mut tree = Tree::new(&modal as &dyn Widget<(), Theme, Renderer>);
+        let node = modal.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(400.0, 300.0)),
+        );
+        let snapshot = |element: &mut Element<'_, ()>, state: &mut Tree, layout: Layout<'_>| {
+            let mut probe = Probe::default();
+            element
+                .as_widget_mut()
+                .operate(state, layout, &renderer, &mut probe);
+            probe
+        };
+        for (id, offset) in [
+            (strip.clone(), Vector::new(50.0, 70.0)),
+            (other.clone(), Vector::new(33.0, 44.0)),
+        ] {
+            modal.background.as_widget_mut().operate(
+                &mut tree.children[0],
+                Layout::new(&node).children().next().unwrap(),
+                &renderer,
+                &mut operation::scrollable::scroll_to::<()>(
+                    id,
+                    cosmic::iced::widget::scrollable::AbsoluteOffset {
+                        x: Some(offset.x),
+                        y: Some(offset.y),
+                    },
+                ),
+            );
+        }
+        modal.operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::scrollable::scroll_to::<()>(
+                foreground.clone(),
+                cosmic::iced::widget::scrollable::AbsoluteOffset {
+                    x: Some(21.0),
+                    y: Some(32.0),
+                },
+            ),
+        );
+        modal.operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::scrollable::scroll_to::<()>(
+                strip.clone(),
+                cosmic::iced::widget::scrollable::AbsoluteOffset {
+                    x: Some(999.0),
+                    y: Some(999.0),
+                },
+            ),
+        );
+        modal.operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(editor.clone()),
+        );
+        let obscured = snapshot(
+            &mut modal.background,
+            &mut tree.children[0],
+            Layout::new(&node).children().next().unwrap(),
+        );
+        assert_eq!(obscured.scrolls[&strip], Vector::new(50.0, 70.0));
+        assert_eq!(obscured.scrolls[&other], Vector::new(33.0, 44.0));
+        assert!(
+            obscured.focused.is_empty(),
+            "a generic focus operation cannot reach the obscured editor"
+        );
+        // Opening a modal can retain the obscured editor's native focus state
+        // while its own foreground takes keyboard ownership.
+        modal.background.as_widget_mut().operate(
+            &mut tree.children[0],
+            Layout::new(&node).children().next().unwrap(),
+            &renderer,
+            &mut operation::focusable::focus::<()>(editor.clone()),
+        );
+        modal.operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(foreground_editor.clone()),
+        );
+
+        let mut task = cosmic::iced::runtime::task::into_stream(
+            crate::workspace_widget::scroll_to::<()>(strip.clone(), 900.0),
+        )
+        .unwrap();
+        let cosmic::iced::runtime::Action::Widget(mut operation) = block_on(task.next()).unwrap()
+        else {
+            panic!("workspace synchronization must carry its internal widget operation");
+        };
+        modal.operate(&mut tree, Layout::new(&node), &renderer, operation.as_mut());
+        let obscured = snapshot(
+            &mut modal.background,
+            &mut tree.children[0],
+            Layout::new(&node).children().next().unwrap(),
+        );
+        assert_eq!(obscured.scrolls[&strip], Vector::new(900.0, 70.0));
+        assert_eq!(obscured.scrolls[&other], Vector::new(33.0, 44.0));
+        assert_eq!(obscured.focused, [editor]);
+        let mut exposed = Probe::default();
+        modal.operate(&mut tree, Layout::new(&node), &renderer, &mut exposed);
+        assert_eq!(
+            exposed.scrolls,
+            HashMap::from([(foreground, Vector::new(21.0, 32.0))])
+        );
+        assert_eq!(exposed.focused, [foreground_editor.clone()]);
+        assert_eq!(exposed.inputs, [foreground_editor]);
+    }
+
+    #[test]
     fn modal_overlay_exposes_only_its_foreground_accessibility_tree() {
         let splitter = |id, label| -> Element<'static, InspectorAction> {
             Splitter::new(
@@ -2395,6 +2659,40 @@ mod tests {
             _cursor: mouse::Cursor,
             _viewport: &Rectangle,
         ) {
+        }
+        fn update(
+            &mut self,
+            _tree: &mut Tree,
+            event: &Event,
+            _layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            _renderer: &Renderer,
+            _clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, &'static str>,
+            _viewport: &Rectangle,
+        ) {
+            if matches!(
+                event,
+                Event::Window(cosmic::iced::window::Event::RedrawRequested(_))
+            ) {
+                assert_eq!(cursor, mouse::Cursor::Unavailable);
+                shell.publish("background rendering completion");
+                shell.invalidate_layout();
+                shell.invalidate_widgets();
+                shell.request_redraw();
+                // A focused obscured editor can request IME during redraw.
+                // Its rendering must progress without taking modal input.
+                let input_method: cosmic::iced::advanced::InputMethod =
+                    cosmic::iced::advanced::InputMethod::Enabled {
+                        cursor: Rectangle::with_size(Size::UNIT),
+                        purpose: cosmic::iced::advanced::input_method::Purpose::Normal,
+                        preedit: None,
+                    };
+                shell.request_input_method(&input_method);
+                shell.capture_event();
+            } else {
+                shell.publish("background took input");
+            }
         }
         fn overlay<'a>(
             &'a mut self,
@@ -2487,6 +2785,85 @@ mod tests {
             messages.is_empty(),
             "the obscured background must not answer input aimed at the modal"
         );
+    }
+
+    #[test]
+    fn modal_overlay_keeps_background_rendering_live_without_input_or_ime() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut element: Element<'_, &'static str> = ModalOverlay::new(
+            Element::new(Talkative),
+            widget::container(cosmic::iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .into();
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let redraw = Event::Window(cosmic::iced::window::Event::RedrawRequested(
+            cosmic::iced::time::Instant::now(),
+        ));
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            &redraw,
+            Layout::new(&node),
+            mouse::Cursor::Available(cosmic::iced::Point::new(8.0, 8.0)),
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &viewport,
+        );
+        assert!(shell.is_layout_invalid());
+        assert!(shell.are_widgets_invalid());
+        assert_eq!(
+            shell.redraw_request(),
+            cosmic::iced::window::RedrawRequest::NextFrame
+        );
+        assert!(!shell.is_event_captured());
+        assert_eq!(
+            shell.input_method(),
+            &cosmic::iced::advanced::InputMethod::Disabled
+        );
+        drop(shell);
+        assert_eq!(messages, ["background rendering completion"]);
+
+        for event in [
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Event::Keyboard(cosmic::iced::keyboard::Event::ModifiersChanged(
+                cosmic::iced::keyboard::Modifiers::CTRL,
+            )),
+            Event::Window(cosmic::iced::window::Event::Resized(viewport.size())),
+            Event::Window(cosmic::iced::window::Event::Focused),
+        ] {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(cosmic::iced::Point::new(8.0, 8.0)),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            assert!(messages.is_empty(), "background received {event:?}");
+        }
     }
 
     fn source_context() -> RepositoryInspectorContext {

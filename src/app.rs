@@ -8980,6 +8980,7 @@ impl Cagents {
                 .iter()
                 .find(|card| card.id == transition.id)
                 .is_some_and(|card| matches!(&card.kind, CardKind::Browser(_)));
+            let chat_painted = self.chat_card_is_painted(transition.id);
             match self.cards.get_mut(&transition.id) {
                 Some(CardRuntime::Terminal(handle)) => {
                     if transition.to == VisibilityClass::Visible && surfaces_visible {
@@ -8989,8 +8990,7 @@ impl Cagents {
                     }
                 }
                 Some(CardRuntime::Chat(runtime)) => {
-                    let _ = runtime
-                        .set_visible(transition.to == VisibilityClass::Visible && surfaces_visible);
+                    let _ = runtime.set_visible(chat_painted);
                 }
                 #[cfg(feature = "integrated-browser")]
                 Some(CardRuntime::Browser(browser)) => {
@@ -12268,16 +12268,26 @@ impl Cagents {
     }
 
     fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
+        let native_visible = workspace_visible && self.workspace_surfaces_visible();
+        let chats_painted = workspace_visible && !self.channel_work_is_main();
         let visible_cards = self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| card.existence.is_open() && card.exposure == Exposure::Visible)
-            .map(|card| card.id)
+            .workspace
+            .order()
+            .filter(|&card| {
+                self.workspace.visibility(card) == Some(VisibilityClass::Visible)
+                    && self
+                        .card_state(card)
+                        .is_some_and(|state| state.existence.is_open())
+            })
             .collect::<HashSet<_>>();
         let mut failures = Vec::new();
         for (id, runtime) in &mut self.cards {
-            let visible = workspace_visible && visible_cards.contains(id);
+            let visible = visible_cards.contains(id)
+                && if matches!(runtime, CardRuntime::Chat(_)) {
+                    chats_painted
+                } else {
+                    native_visible
+                };
             let result = match runtime {
                 // A terminal whose daemon connection has ended for good
                 // already says so in its pane, and the next attachment
@@ -12595,6 +12605,17 @@ impl Cagents {
         !self.channel_work_is_main() && !self.context_inspector_is_overlay()
     }
 
+    /// Chat widgets remain painted behind the Inspector overlay, unlike native
+    /// terminal/browser surfaces. Only panes in this viewport retain a body;
+    /// main Work, other workspaces and closed/offscreen panes remain hidden.
+    fn chat_card_is_painted(&self, card: CardId) -> bool {
+        !self.channel_work_is_main()
+            && self.workspace.visibility(card) == Some(VisibilityClass::Visible)
+            && self
+                .card_state(card)
+                .is_some_and(|state| state.existence.is_open())
+    }
+
     fn enter_context_overlay(&mut self) -> Task<Message> {
         // The header toggle belongs to the docked tree we are leaving and is
         // guaranteed to return when the modal closes. Recording it before the
@@ -12613,8 +12634,7 @@ impl Cagents {
         let is_overlay = self.context_inspector_is_overlay();
         self.context_inspector_overlay_active = is_overlay;
         if was_overlay != is_overlay {
-            let visible = self.workspace_surfaces_visible();
-            self.set_workspace_surfaces_visible(visible);
+            self.set_workspace_surfaces_visible(true);
         }
         match context_overlay_change(was_overlay, is_overlay) {
             ContextOverlayChange::Entered => self.enter_context_overlay(),
@@ -14592,6 +14612,14 @@ impl Application for Cagents {
             return Task::none();
         }
         if self.modal_is_open() && user_workspace_message_blocked_while_modal(&message) {
+            return Task::none();
+        }
+        // An Inspector overlay blocks newly delivered background chat input,
+        // including callbacks emitted by the preceding widget tree. Keep its
+        // lifecycle, preparation, acknowledgement and paste completions flowing.
+        if self.context_inspector_is_overlay()
+            && matches!(&message, Message::ChatUi(action) if !action.allowed_while_modal())
+        {
             return Task::none();
         }
         if self.focused_repository_is_saving() && workspace_navigation_blocked_during_save(&message)
