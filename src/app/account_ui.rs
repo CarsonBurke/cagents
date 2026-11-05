@@ -2471,6 +2471,7 @@ impl Cagents {
                     self.account_ui.installed = loaded.installed;
                 }
                 let owners_before = self.account_ui.discovery_owners();
+                let was_ready = self.account_ui.registry_ready;
                 let mut migration = Task::none();
                 match loaded.registry {
                     Ok(mut registry) => {
@@ -2505,7 +2506,9 @@ impl Cagents {
                 let changed = owners_before != self.account_ui.discovery_owners();
                 let follow_up = if (current_discovery && loaded.provisional) || changed {
                     self.locate_accounts()
-                } else if current_discovery {
+                } else if current_discovery || !was_ready {
+                    // A newer discovery may already have answered while
+                    // policy was unknown, so first readiness releases probes.
                     self.probe_accounts(Trigger::Focus)
                 } else {
                     Task::none()
@@ -5725,6 +5728,44 @@ mod tests {
         assert!(
             account.schedule.in_flight(now_ms()),
             "readiness does not relax stale-owner fencing"
+        );
+    }
+
+    #[test]
+    fn a_startup_read_finishing_after_newer_discovery_still_releases_probes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path());
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = State::new(None, Some(store.clone()), None);
+        app.settings.show_status_bar = false;
+        let startup = app.account_ui.discovery_generation;
+        app.refresh_ui.focused = true;
+        // Focus rediscovers before the startup read answers; that newer
+        // discovery completes while registry policy is still unknown.
+        drop(app.accounts_focus_changed(true, true));
+        assert_ne!(app.account_ui.discovery_generation, startup);
+        app.settle_discovery_for_test();
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| !state.schedule.in_flight(now_ms()))
+        );
+        drop(app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: startup,
+            registry: Ok(store.load().unwrap()),
+            restored: Vec::new(),
+            catalogs: BTreeMap::new(),
+            installed: BTreeMap::new(),
+            provisional: false,
+        }))));
+        assert!(app.account_ui.registry_ready);
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| state.schedule.in_flight(now_ms())),
+            "the stale startup read still admits the probes discovery held back"
         );
     }
 
