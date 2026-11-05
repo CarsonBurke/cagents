@@ -1357,7 +1357,8 @@ fn effect_layout(kind: Kind, layout: Layout<'_>) -> Layout<'_> {
     }
 }
 
-/// Where a press hid a tooltip, and whether the pointer has since been
+/// Where the pointer last was on a control whose press hid its tooltip, and
+/// whether the pointer has since been
 /// hidden from the control. A menu the press opened, or an ancestor gating
 /// the cursor to its own region, reports no position without saying where
 /// the pointer went; seeing it again anywhere but the press point means it
@@ -1376,9 +1377,13 @@ impl PressSuppression {
                 self.obscured = true;
                 false
             }
+            Some(position) if !bounds.is_some_and(|bounds| bounds.contains(position)) => true,
+            Some(position) if self.obscured => self.at != Some(position),
+            // Follow the pointer until it is hidden: a context menu opens on
+            // the release, which may land a pixel away from the press.
             Some(position) => {
-                !bounds.is_some_and(|bounds| bounds.contains(position))
-                    || (self.obscured && self.at != Some(position))
+                self.at = Some(position);
+                false
             }
         }
     }
@@ -2147,6 +2152,32 @@ mod tests {
         assert!(
             tree.state.downcast_ref::<State>().tip_open,
             "a fresh hover can show the tooltip again"
+        );
+    }
+
+    #[test]
+    fn press_suppression_compares_against_the_last_position_before_it_was_hidden() {
+        let control = Rectangle::new(Point::new(10.0, 10.0), Size::new(100.0, 20.0));
+        let pressed = Point::new(20.0, 20.0);
+        let released = Point::new(21.0, 20.0);
+        let mut suppression = PressSuppression {
+            at: Some(pressed),
+            obscured: false,
+        };
+        // The right button is released a pixel away, then its menu opens.
+        assert!(!suppression.released_by(mouse::Cursor::Available(released), Some(control)));
+        assert!(!suppression.released_by(mouse::Cursor::Unavailable, Some(control)));
+        assert!(
+            !suppression.released_by(mouse::Cursor::Available(released), Some(control)),
+            "a menu closing under the unmoved pointer keeps the tooltip hidden"
+        );
+        assert!(!suppression.released_by(mouse::Cursor::Unavailable, Some(control)));
+        assert!(
+            suppression.released_by(
+                mouse::Cursor::Available(Point::new(90.0, 20.0)),
+                Some(control)
+            ),
+            "returning elsewhere on the control after being hidden is a re-entry"
         );
     }
 
