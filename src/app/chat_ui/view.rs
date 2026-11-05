@@ -718,6 +718,28 @@ fn completion_kind(kind: completion::Kind) -> &'static str {
 
 /// A one-line row of a composer list: an optional icon, a name, what it
 /// does in muted text cut to the room left, and what kind of thing it is.
+/// The row that closes a working transcript: a small muted spinner, or the
+/// waiting glyph, beside what the agent is doing.
+fn activity_row<'a>(glyph: Icon, label: String) -> Element<'a, Message> {
+    let glyph = if glyph == Icon::AgentWorking {
+        crate::ui_controls::activity_spinner(
+            f32::from(design::COMPACT_ICON_SIZE),
+            design::muted_icon_color,
+        )
+    } else {
+        crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
+    };
+    widget::row::with_children(vec![
+        glyph,
+        design::caption(label)
+            .class(cosmic::theme::Text::Custom(design::muted_text))
+            .into(),
+    ])
+    .spacing(step::GAP_XS)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 fn menu_row<'a>(
     icon: Option<Icon>,
     label: impl Into<Cow<'a, str>> + 'a,
@@ -1143,8 +1165,12 @@ fn activity_label(snapshot: &chat::Snapshot) -> &'static str {
     if snapshot.has_later {
         return "Working";
     }
-    match snapshot
-        .items
+    items_activity(&snapshot.items)
+}
+
+/// What the newest of `items` says an agent is doing.
+fn items_activity(items: &[Arc<chat::Item>]) -> &'static str {
+    match items
         .last()
         .filter(|item| item.role == chat::Role::Assistant)
         .map(|item| &item.content)
@@ -1336,14 +1362,21 @@ impl Runtime {
             || snapshot.subagents.len() > 1
             || ((snapshot.waiting || !snapshot.requests.is_empty()) && working > 0)
         {
+            let subagents = |count: usize| {
+                if count == 1 {
+                    "1 subagent".to_owned()
+                } else {
+                    format!("{count} subagents")
+                }
+            };
             if working > 0 {
-                parts.push(format!("{working} working"));
+                parts.push(format!("{} working", subagents(working)));
             }
             if waiting > 0 {
-                parts.push(format!("{waiting} waiting"));
+                parts.push(format!("{} waiting", subagents(waiting)));
             }
             if failed > 0 {
-                parts.push(format!("{failed} failed"));
+                parts.push(format!("{} failed", subagents(failed)));
             }
             if !parts.is_empty() {
                 return (
@@ -1359,6 +1392,83 @@ impl Runtime {
             }
         }
         (glyph, Self::short_description(label, 100))
+    }
+
+    /// What the agent is doing now, for the row that closes the transcript:
+    /// the parent's work and its subagents', or the selected subagent's own.
+    /// `None` once nothing runs, so the row settles into the finished stamp,
+    /// and wherever the transcript already says what is happening: a first
+    /// message starting shows it on the message, and switching, closing, a
+    /// lost connection or a stopped agent each say so with their controls.
+    pub(super) fn timeline_activity(
+        &self,
+        transitioning: bool,
+        selected: Option<&chat::Subagent>,
+    ) -> Option<(Icon, String)> {
+        let snapshot = &self.snapshot;
+        if self.closed_elsewhere
+            || transitioning
+            || self.queued.is_some()
+            || self.attachment_chooser_pending.is_some()
+            || self.disconnected
+            || snapshot.exited
+        {
+            return None;
+        }
+        if let Some(agent) = selected {
+            return (agent.status == chat::ToolStatus::Running).then(|| {
+                if agent.waiting {
+                    (Icon::AgentWaiting, "Waiting for you".to_owned())
+                } else {
+                    let activity = items_activity(&agent.items);
+                    let label = if activity == "Working" && !agent.detail.trim().is_empty() {
+                        Self::short_description(agent.detail.trim(), 100)
+                    } else {
+                        activity.to_owned()
+                    };
+                    (Icon::AgentWorking, label)
+                }
+            });
+        }
+        // Newer turns are not shown, so the end of this page is not now.
+        if snapshot.has_later {
+            return None;
+        }
+        let (glyph, label) = self.conversation_status(transitioning);
+        match glyph {
+            Some(glyph @ (Icon::AgentWorking | Icon::AgentWaiting)) => Some((glyph, label)),
+            // A failure stands in the transcript on its own; a subagent still
+            // waiting on the reader is not settled by it.
+            Some(Icon::Warning)
+                if snapshot
+                    .subagents
+                    .iter()
+                    .any(|agent| agent.waiting && agent.status == chat::ToolStatus::Running) =>
+            {
+                Some((Icon::AgentWaiting, label))
+            }
+            _ => None,
+        }
+    }
+
+    /// How the last turn ended, for the stamp that closes a settled
+    /// transcript.
+    pub(super) fn finished_label(&self) -> &'static str {
+        match self.snapshot.detail.as_str() {
+            "Turn interrupted" => "Interrupted",
+            "Turn failed" => "Failed",
+            // The closing of a card moved elsewhere is not the agent's error;
+            // the closed card says what happened.
+            _ if self
+                .error
+                .iter()
+                .chain(&self.snapshot.error)
+                .any(|error| !self.expected_remote_close_error(error)) =>
+            {
+                "Finished with error"
+            }
+            _ => "Finished",
+        }
     }
 
     fn conversation_status_base(&self, transitioning: bool) -> (Option<Icon>, &str) {
@@ -1411,14 +1521,15 @@ impl Runtime {
                 },
             )
         } else if snapshot.finished_at.is_some() {
-            match snapshot.detail.as_str() {
-                "Turn interrupted" => (Some(Icon::Cancel), "Interrupted"),
-                "Turn failed" => (Some(Icon::Warning), "Failed"),
-                _ if self.error.is_some() || snapshot.error.is_some() => {
-                    (Some(Icon::Warning), "Finished with error")
-                }
-                _ => (Some(Icon::Check), "Finished"),
-            }
+            let label = self.finished_label();
+            (
+                Some(match label {
+                    "Interrupted" => Icon::Cancel,
+                    "Finished" => Icon::Check,
+                    _ => Icon::Warning,
+                }),
+                label,
+            )
         } else if self.error.is_some() || snapshot.error.is_some() {
             (Some(Icon::Warning), "Error")
         } else if self.is_draft() {
@@ -2068,11 +2179,11 @@ impl Runtime {
                 && self.queued.is_none()
                 && self.followups.is_empty()
                 && self.pending.is_none()
-                && let Some((_, label, full)) = &self.finished_stamp
+                && let Some((_, clock, full)) = &self.finished_stamp
             {
                 transcript.push(
                     widget::tooltip(
-                        design::caption(label.clone())
+                        design::caption(format!("{} at {clock}", self.finished_label()))
                             .class(cosmic::theme::Text::Custom(design::muted_text)),
                         design::caption(full.clone()),
                         widget::tooltip::Position::Top,
@@ -2091,6 +2202,13 @@ impl Runtime {
             if let Some(queued) = &self.queued {
                 transcript.push(self.queued_view(queued));
             }
+        }
+        // What the agent is doing now closes the transcript, so it scrolls
+        // away with the turns it follows rather than holding a row above the
+        // composer, and each change redraws this one row rather than adding
+        // another.
+        if let Some((glyph, label)) = self.timeline_activity(transitioning, selected) {
+            transcript.push(activity_row(glyph, label));
         }
         // A chat's heading is the conversation's own name or nothing at all.
         //
@@ -2966,51 +3084,11 @@ impl Runtime {
             action(Action::ComposerActions(target, false)),
         ));
         let usage = &snapshot.usage;
-        // Prefer a wider chat over hiding its status and settings behind a
-        // scrollbar. Narrow panes keep the primary status on one line and move
-        // secondary details into the overflow control.
-        // The line always says what the conversation is doing, idle
-        // included: a reader glancing at a card should never have to infer
-        // its state from the absence of a word. The order is the order of
-        // what a reader most needs to know first - that the card is between
-        // sessions, that something is being sent, that the agent has stopped
-        // or failed, that it is waiting on them, that it is working.
+        // Prefer a wider chat over hiding its settings behind a scrollbar.
+        // Narrow panes move them into the overflow control. What the agent is
+        // doing is not repeated here: it closes the transcript, where it
+        // scrolls with the turns it belongs to.
         let mut status: Vec<Element<'_, Message>> = Vec::new();
-        let (glyph, state) = if matches!(transition, ViewTransition::FirstStart) {
-            (Some(Icon::AgentWorking), "Starting".to_owned())
-        } else {
-            self.conversation_status(transitioning)
-        };
-        if let Some(glyph) = glyph {
-            status.push(if glyph == Icon::AgentWorking {
-                crate::ui_controls::activity_spinner(
-                    f32::from(design::ROW_ICON_SIZE),
-                    design::accent_color,
-                )
-            } else {
-                crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
-            });
-        }
-        if !state.is_empty() {
-            status.push(
-                design::heading(if selected.is_some() {
-                    format!("Main: {state}")
-                } else {
-                    state.to_owned()
-                })
-                .size(design::TEXT_CAPTION)
-                .class(
-                    if glyph == Some(Icon::Warning) && !transitioning && self.pending.is_none() {
-                        cosmic::theme::Text::Custom(design::warning_text)
-                    } else {
-                        cosmic::theme::Text::default()
-                    },
-                )
-                .width(Length::Shrink)
-                .into(),
-            );
-        }
-        let primary_status_count = status.len();
         if let Some(channel) = &place.channel {
             status.push(
                 crate::interaction::tooltip(
@@ -3095,7 +3173,7 @@ impl Runtime {
         }
         let compact_footer = content_width < 600.0;
         let mut secondary = if compact_footer {
-            status.split_off(primary_status_count)
+            std::mem::take(&mut status)
         } else {
             Vec::new()
         };
@@ -7030,6 +7108,90 @@ mod tests {
         );
         runtime.disconnected = true;
         assert_eq!(runtime.conversation_status(false).1, "Disconnected");
+    }
+
+    #[test]
+    fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let activity = |runtime: &Runtime| runtime.timeline_activity(false, None);
+        // Nothing runs, so nothing is said.
+        assert_eq!(activity(&runtime), None);
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.ready = true;
+        snapshot.busy = true;
+        snapshot.detail = "Reviewing changes".into();
+        let items = runtime.snapshot.items.len();
+        assert_eq!(
+            activity(&runtime),
+            Some((Icon::AgentWorking, "Reviewing changes".into()))
+        );
+        // Subagents are counted beside the parent's own work, and the row is
+        // derived, never appended to the conversation.
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.subagents = vec![native_child_fixture(), native_child_fixture()];
+        snapshot.subagents[1].id = "second-child".into();
+        assert_eq!(
+            activity(&runtime),
+            Some((
+                Icon::AgentWorking,
+                "Reviewing changes · 2 subagents working".into()
+            ))
+        );
+        assert_eq!(runtime.snapshot.items.len(), items);
+        Arc::make_mut(&mut runtime.snapshot).busy = false;
+        assert_eq!(
+            activity(&runtime),
+            Some((Icon::AgentWorking, "2 subagents working".into()))
+        );
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.subagents[0].waiting = true;
+        snapshot.subagents[1].status = chat::ToolStatus::Succeeded;
+        assert_eq!(
+            activity(&runtime),
+            Some((Icon::AgentWaiting, "1 subagent waiting".into()))
+        );
+        Arc::make_mut(&mut runtime.snapshot).waiting = true;
+        assert_eq!(
+            activity(&runtime).map(|(glyph, _)| glyph),
+            Some(Icon::AgentWaiting)
+        );
+
+        // The selected subagent's own work closes its transcript.
+        let mut child = native_child_fixture();
+        child.detail = "Reading the parser".into();
+        assert_eq!(
+            runtime.timeline_activity(false, Some(&child)),
+            Some((Icon::AgentWorking, "Reading the parser".into()))
+        );
+        child.status = chat::ToolStatus::Succeeded;
+        assert_eq!(runtime.timeline_activity(false, Some(&child)), None);
+
+        // Where the transcript already says what is happening, or the end of
+        // the conversation is not shown, there is no row.
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.waiting = false;
+        snapshot.busy = true;
+        assert!(activity(&runtime).is_some());
+        assert_eq!(runtime.timeline_activity(true, None), None);
+        Arc::make_mut(&mut runtime.snapshot).has_later = true;
+        assert_eq!(activity(&runtime), None);
+        Arc::make_mut(&mut runtime.snapshot).has_later = false;
+        runtime.disconnected = true;
+        assert_eq!(activity(&runtime), None);
+        runtime.disconnected = false;
+
+        // Once work ends the row goes, and the stamp says how the turn ended.
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = false;
+        snapshot.subagents.clear();
+        snapshot.finished_at = Some(42);
+        snapshot.detail = "Turn interrupted".into();
+        assert_eq!(activity(&runtime), None);
+        assert_eq!(runtime.finished_label(), "Interrupted");
+        Arc::make_mut(&mut runtime.snapshot).detail.clear();
+        assert_eq!(runtime.finished_label(), "Finished");
+        Arc::make_mut(&mut runtime.snapshot).error = Some("Provider failed".into());
+        assert_eq!(runtime.finished_label(), "Finished with error");
     }
 
     #[test]

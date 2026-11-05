@@ -4523,7 +4523,7 @@ impl Runtime {
                     time.day,
                     time.clock()
                 );
-                Some((at, format!("Finished at {}", time.clock()), full))
+                Some((at, time.clock(), full))
             });
         }
         self.subagent_scroll
