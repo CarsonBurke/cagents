@@ -1224,6 +1224,311 @@ mod tests {
     }
 
     #[test]
+    fn terminal_find_native_enter_stays_with_the_focused_field_or_open_menu() {
+        use cosmic::iced::{
+            Event, Point, Size,
+            advanced::{clipboard, widget::operation},
+            event::Status,
+            mouse,
+            runtime::{UserInterface, user_interface::Cache},
+        };
+
+        const WINDOW: Size = Size::new(600.0, 300.0);
+        const ANCHOR: Point = Point::new(20.0, 16.0);
+
+        struct Frames {
+            cache: Cache,
+            cursor: Point,
+            find_bounds: Option<iced::Rectangle>,
+        }
+
+        impl Default for Frames {
+            fn default() -> Self {
+                Self {
+                    cache: Cache::new(),
+                    cursor: ANCHOR,
+                    find_bounds: None,
+                }
+            }
+        }
+
+        fn frame(
+            app: &Cagents,
+            card: CardId,
+            renderer: &mut cosmic::Renderer,
+            frames: &mut Frames,
+            events: &[Event],
+            focus_find: bool,
+        ) -> (Vec<Status>, Vec<Message>) {
+            // Use the actual pane tab and terminal find strip. The native
+            // runtime dispatches the menu overlay before its focused field.
+            let content = widget::column::with_children(vec![
+                app.column_header(card, true, WINDOW.width),
+                app.terminal_find_view(card).unwrap(),
+            ]);
+            let mut ui = UserInterface::build(
+                content.into(),
+                WINDOW,
+                std::mem::replace(&mut frames.cache, Cache::new()),
+                renderer,
+            );
+            struct FindBounds {
+                id: widget::Id,
+                bounds: Option<iced::Rectangle>,
+            }
+            impl iced::advanced::widget::Operation for FindBounds {
+                fn traverse(
+                    &mut self,
+                    visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+                ) {
+                    visit(self);
+                }
+                fn focusable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    bounds: iced::Rectangle,
+                    _: &mut dyn operation::Focusable,
+                ) {
+                    if id == Some(&self.id) {
+                        self.bounds = Some(bounds);
+                    }
+                }
+            }
+            let mut find = FindBounds {
+                id: widget::Id::from(format!("terminal-find-{card}")),
+                bounds: None,
+            };
+            ui.operate(renderer, &mut find);
+            frames.find_bounds = find.bounds;
+            if focus_find {
+                ui.operate(
+                    renderer,
+                    &mut operation::focusable::focus::<()>(widget::Id::from(format!(
+                        "terminal-find-{card}"
+                    ))),
+                );
+            }
+            let mut messages = Vec::new();
+            let cursor = mouse::Cursor::Available(frames.cursor);
+            let (_, statuses) = ui.update(
+                events,
+                cursor,
+                renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            frames.cache = ui.into_cache();
+            (statuses, messages)
+        }
+
+        let key = |named, modifiers| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(named),
+            modified_key: keyboard::Key::Named(named),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        };
+        enum Menu {
+            Closed,
+            Pane(usize),
+            Find,
+        }
+        let mut renderer = super::super::tests::headless_renderer();
+        for (native_focus, remembered_focus, backwards, menu) in [
+            (false, false, false, Menu::Find),
+            (true, true, false, Menu::Pane(3)),
+            (true, true, false, Menu::Pane(1)),
+            (true, false, false, Menu::Closed),
+            (true, false, true, Menu::Closed),
+            (true, true, false, Menu::Closed),
+            (true, true, true, Menu::Closed),
+            (false, true, false, Menu::Closed),
+        ] {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            app.context_inspector_open = false;
+            let card = app.workspace.focused().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            app.cards.insert(
+                card,
+                CardRuntime::Terminal(super::super::tests::unconnected_surface(
+                    directory.path(),
+                    TerminalId::new(),
+                )),
+            );
+            drop(app.handle_terminal_find(terminal_ui::Action::Query(card, "needle".into())));
+            let find = app.terminal_find.entry(card).or_default();
+            find.open = true;
+            find.focused = remembered_focus;
+            find.matches = (0..3)
+                .map(|row| crate::terminal::SearchMatch {
+                    start_row: row,
+                    start_column: 0,
+                    end_row: row,
+                    end_column: 6,
+                })
+                .collect::<Vec<_>>()
+                .into();
+            let mut frames = Frames::default();
+            let _ = frame(&app, card, &mut renderer, &mut frames, &[], native_focus);
+            assert_eq!(
+                app.terminal_find[&card].focused, remembered_focus,
+                "programmatic native focus does not update the remembered flag"
+            );
+            let find_menu = matches!(menu, Menu::Find);
+            let menu_steps = match menu {
+                Menu::Closed => 0,
+                Menu::Pane(steps) => steps,
+                Menu::Find => 2,
+            };
+            if find_menu {
+                // Exercise the real text field's in-window context-menu
+                // fallback. Native Wayland popup dispatch needs app evidence.
+                frames.cursor = frames.find_bounds.expect("native find field").center();
+                for event in [
+                    Event::Mouse(mouse::Event::CursorMoved {
+                        position: frames.cursor,
+                    }),
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL)),
+                    Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Character("a".into()),
+                        modified_key: keyboard::Key::Character("a".into()),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyA),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::CTRL,
+                        text: None,
+                        repeat: false,
+                    }),
+                    Event::Keyboard(keyboard::Event::ModifiersChanged(
+                        keyboard::Modifiers::empty(),
+                    )),
+                ] {
+                    let (statuses, messages) = frame(
+                        &app,
+                        card,
+                        &mut renderer,
+                        &mut frames,
+                        std::slice::from_ref(&event),
+                        false,
+                    );
+                    for message in messages {
+                        drop(app.update(message));
+                    }
+                    if let Event::Keyboard(event) = event {
+                        drop(app.update(Message::KeyEvent {
+                            event,
+                            captured: statuses == [Status::Captured],
+                        }));
+                    }
+                }
+                assert!(
+                    app.terminal_find[&card].focused,
+                    "ordinary click focused find"
+                );
+            }
+            if menu_steps > 0 {
+                for event in [
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                    Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+                ] {
+                    let (_, messages) =
+                        frame(&app, card, &mut renderer, &mut frames, &[event], false);
+                    for message in messages {
+                        drop(app.update(message));
+                    }
+                }
+                for _ in 0..menu_steps {
+                    let event = key(
+                        keyboard::key::Named::ArrowDown,
+                        keyboard::Modifiers::empty(),
+                    );
+                    let (statuses, messages) = frame(
+                        &app,
+                        card,
+                        &mut renderer,
+                        &mut frames,
+                        &[Event::Keyboard(event.clone())],
+                        false,
+                    );
+                    assert_eq!(statuses, [Status::Captured]);
+                    assert!(messages.is_empty(), "menu navigation emits no find command");
+                    drop(app.update(Message::KeyEvent {
+                        event,
+                        captured: true,
+                    }));
+                }
+            }
+            let event = key(
+                keyboard::key::Named::Enter,
+                if backwards {
+                    keyboard::Modifiers::SHIFT
+                } else {
+                    keyboard::Modifiers::empty()
+                },
+            );
+            let (statuses, messages) = frame(
+                &app,
+                card,
+                &mut renderer,
+                &mut frames,
+                &[Event::Keyboard(event.clone())],
+                false,
+            );
+            if find_menu {
+                assert_eq!(statuses, [Status::Captured]);
+                // Text-menu actions currently lack keyboard activation
+                // metadata. Its captured Enter still cannot also step find.
+                assert!(messages.is_empty(), "the text menu owns Enter");
+                assert!(app.terminal_find[&card].focused);
+            } else if menu_steps > 0 {
+                assert_eq!(statuses, [Status::Captured]);
+                assert_eq!(messages.len(), 1, "Enter activates only one menu action");
+                assert!(matches!(
+                    (&messages[0], menu_steps),
+                    (Message::ChromeUi(Action::Rename(target)), 1)
+                        | (Message::ChromeUi(Action::CopyPath(target)), 3) if *target == card
+                ));
+            } else if native_focus {
+                assert_eq!(statuses, [Status::Captured]);
+                assert_eq!(messages.len(), 1, "Enter emits one find command");
+                assert!(matches!(
+                    &messages[0],
+                    Message::TerminalFind(terminal_ui::Action::Next(target, previous))
+                        if *target == card && *previous == backwards
+                ));
+            } else {
+                assert!(messages.is_empty(), "remembered focus cannot claim Enter");
+            }
+            for message in messages {
+                drop(app.update(message));
+            }
+            // Include the real subscription after widget messages. Copy path
+            // checks menu isolation without Rename's modal shielding it.
+            drop(app.update(Message::KeyEvent {
+                event,
+                captured: statuses == [Status::Captured],
+            }));
+            assert_eq!(
+                app.terminal_find[&card].selected,
+                if menu_steps > 0 || !native_focus {
+                    0
+                } else if backwards {
+                    2
+                } else {
+                    1
+                },
+                "only the field with native focus may step, exactly once"
+            );
+        }
+    }
+
+    #[test]
     fn terminal_activation_leaves_enter_for_the_input_surface() {
         use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
         use cosmic::iced::{Event, Rectangle, Size};

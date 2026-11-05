@@ -17525,23 +17525,11 @@ impl Application for Cagents {
                     && self.terminal_find.get(&card).is_some_and(|find| find.open)
                     && let keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(key),
-                        modifiers,
                         ..
                     } = &event
                 {
                     if *key == keyboard::key::Named::Escape && !captured {
                         return self.handle_terminal_find(terminal_ui::Action::Close(card));
-                    }
-                    if *key == keyboard::key::Named::Enter
-                        && self
-                            .terminal_find
-                            .get(&card)
-                            .is_some_and(|find| find.focused)
-                    {
-                        return self.handle_terminal_find(terminal_ui::Action::Next(
-                            card,
-                            modifiers.shift(),
-                        ));
                     }
                 }
                 if let keyboard::Event::KeyPressed {
