@@ -41,7 +41,8 @@ pub fn close_focus_id() -> widget::Id {
 }
 
 /// A modal layer that keeps its background painted while exposing and
-/// operating only the foreground subtree. Unlike an ordinary stack or
+/// operating only the foreground subtree, apart from internal workspace-camera
+/// and tab-strip maintenance. Unlike an ordinary stack or
 /// popover, this makes the overlay—not the obscured workbench—the root of the
 /// accessibility and focus-operation tree.
 pub struct ModalOverlay<'a, Message> {
@@ -100,6 +101,16 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
         renderer: &Renderer,
         operation: &mut dyn cosmic::iced::advanced::widget::Operation,
     ) {
+        if crate::workspace_widget::is_workspace_scroll_maintenance(operation)
+            && let Some(background) = layout.children().next()
+        {
+            self.background.as_widget_mut().operate(
+                &mut tree.children[0],
+                background,
+                renderer,
+                operation,
+            );
+        }
         if let Some(foreground) = layout.children().nth(1) {
             self.foreground.as_widget_mut().operate(
                 &mut tree.children[1],
@@ -245,7 +256,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
         // The background is painted, so whatever it raises has to be painted
         // too: dropping its overlay drew a card's dropdown as a closed button
         // with no menu. It stays inert, because this layer withholds input and
-        // operations from the background and an overlay that took them would
+        // general widget operations and an overlay that took them would
         // hand a frozen subtree the clicks aimed at the modal. The foreground's
         // overlay is grouped last so it composites above it.
         let background = self
@@ -2367,6 +2378,221 @@ mod tests {
         );
         assert_eq!(mount_for_width(design::WIDE_BREAKPOINT, false, true), None);
         assert_eq!(mount_for_width(design::WIDE_BREAKPOINT, true, false), None);
+    }
+
+    #[test]
+    fn modal_overlay_only_admits_internal_horizontal_scroll_maintenance() {
+        use cosmic::iced::Vector;
+        use cosmic::iced::advanced::{
+            renderer::Headless,
+            widget::{Operation, operation},
+        };
+        use cosmic::iced::futures::{StreamExt, executor::block_on};
+        use std::collections::HashMap;
+
+        #[derive(Default)]
+        struct Probe {
+            scrolls: HashMap<widget::Id, Vector>,
+            focused: Vec<widget::Id>,
+            inputs: Vec<widget::Id>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if let Some(id) = id {
+                    self.scrolls.insert(id.clone(), translation);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused()
+                    && let Some(id) = id
+                {
+                    self.focused.push(id.clone());
+                }
+            }
+            fn text_input(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                _: &mut dyn operation::TextInput,
+            ) {
+                if let Some(id) = id {
+                    self.inputs.push(id.clone());
+                }
+            }
+        }
+
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let strip = widget::Id::new("modal-workspace-strip");
+        let other = widget::Id::new("modal-unrelated-scroll");
+        let foreground = widget::Id::new("modal-foreground-scroll");
+        let editor = widget::Id::new("modal-background-editor");
+        let foreground_editor = widget::Id::new("modal-foreground-editor");
+        let pane = |scroll, editor| -> Element<'static, ()> {
+            widget::scrollable(
+                widget::column::with_children(vec![
+                    cosmic::iced::widget::text_input("", "retained draft")
+                        .id(editor)
+                        .on_input(|_| ())
+                        .into(),
+                    cosmic::iced::widget::Space::new()
+                        .width(2000.0)
+                        .height(1500.0)
+                        .into(),
+                ])
+                .width(2000.0),
+            )
+            .id(scroll)
+            .direction(cosmic::iced::widget::scrollable::Direction::Both {
+                horizontal: design::scrollbar(),
+                vertical: design::scrollbar(),
+            })
+            .width(Length::Fill)
+            .height(150.0)
+            .into()
+        };
+        let mut modal = ModalOverlay::new(
+            widget::column::with_children(vec![
+                pane(strip.clone(), editor.clone()),
+                pane(other.clone(), widget::Id::new("modal-other-editor")),
+            ])
+            .width(Length::Fill),
+            pane(foreground.clone(), foreground_editor.clone()),
+        );
+        let mut tree = Tree::new(&modal as &dyn Widget<(), Theme, Renderer>);
+        let node = modal.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(400.0, 300.0)),
+        );
+        let snapshot = |element: &mut Element<'_, ()>, state: &mut Tree, layout: Layout<'_>| {
+            let mut probe = Probe::default();
+            element
+                .as_widget_mut()
+                .operate(state, layout, &renderer, &mut probe);
+            probe
+        };
+        for (id, offset) in [
+            (strip.clone(), Vector::new(50.0, 70.0)),
+            (other.clone(), Vector::new(33.0, 44.0)),
+        ] {
+            modal.background.as_widget_mut().operate(
+                &mut tree.children[0],
+                Layout::new(&node).children().next().unwrap(),
+                &renderer,
+                &mut operation::scrollable::scroll_to::<()>(
+                    id,
+                    widget::scrollable::AbsoluteOffset {
+                        x: Some(offset.x),
+                        y: Some(offset.y),
+                    },
+                ),
+            );
+        }
+        modal.operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::scrollable::scroll_to::<()>(
+                foreground.clone(),
+                widget::scrollable::AbsoluteOffset {
+                    x: Some(21.0),
+                    y: Some(32.0),
+                },
+            ),
+        );
+        modal.operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::scrollable::scroll_to::<()>(
+                strip.clone(),
+                widget::scrollable::AbsoluteOffset {
+                    x: Some(999.0),
+                    y: Some(999.0),
+                },
+            ),
+        );
+        modal.operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(editor.clone()),
+        );
+        let obscured = snapshot(
+            &mut modal.background,
+            &mut tree.children[0],
+            Layout::new(&node).children().next().unwrap(),
+        );
+        assert_eq!(obscured.scrolls[&strip], Vector::new(50.0, 70.0));
+        assert_eq!(obscured.scrolls[&other], Vector::new(33.0, 44.0));
+        assert!(
+            obscured.focused.is_empty(),
+            "a generic focus operation cannot reach the obscured editor"
+        );
+        // Opening a modal can retain the obscured editor's native focus state
+        // while its own foreground takes keyboard ownership.
+        modal.background.as_widget_mut().operate(
+            &mut tree.children[0],
+            Layout::new(&node).children().next().unwrap(),
+            &renderer,
+            &mut operation::focusable::focus::<()>(editor.clone()),
+        );
+        modal.operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(foreground_editor.clone()),
+        );
+
+        let mut task = cosmic::iced::runtime::task::into_stream(
+            crate::workspace_widget::scroll_to::<()>(strip.clone(), 900.0),
+        )
+        .unwrap();
+        let cosmic::iced::runtime::Action::Widget(mut operation) = block_on(task.next()).unwrap()
+        else {
+            panic!("workspace synchronization must carry its internal widget operation");
+        };
+        modal.operate(&mut tree, Layout::new(&node), &renderer, operation.as_mut());
+        let obscured = snapshot(
+            &mut modal.background,
+            &mut tree.children[0],
+            Layout::new(&node).children().next().unwrap(),
+        );
+        assert_eq!(obscured.scrolls[&strip], Vector::new(900.0, 70.0));
+        assert_eq!(obscured.scrolls[&other], Vector::new(33.0, 44.0));
+        assert_eq!(obscured.focused, [editor]);
+        let mut exposed = Probe::default();
+        modal.operate(&mut tree, Layout::new(&node), &renderer, &mut exposed);
+        assert_eq!(
+            exposed.scrolls,
+            HashMap::from([(foreground, Vector::new(21.0, 32.0))])
+        );
+        assert_eq!(exposed.focused, [foreground_editor.clone()]);
+        assert_eq!(exposed.inputs, [foreground_editor]);
     }
 
     #[test]
