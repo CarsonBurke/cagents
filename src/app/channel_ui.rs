@@ -1633,6 +1633,9 @@ impl Cagents {
             registry: self.workspace_model.identity,
             project: channel.project_id,
             members: channel.cards.clone(),
+            // Members that are not open, and the panes this window has closed
+            // that the registry still places in the channel: closing prunes
+            // membership at once, but the registry learns of it later.
             inactive: channel
                 .cards
                 .iter()
@@ -1641,6 +1644,7 @@ impl Cagents {
                     self.card_state(*card)
                         .is_none_or(|state| !state.existence.is_open())
                 })
+                .chain(self.closed_here_in_channel_view(id))
                 .collect(),
             panes: self
                 .durable
@@ -1659,6 +1663,22 @@ impl Cagents {
                 })
                 .collect(),
         })
+    }
+
+    /// Panes the registry still places in `id`'s channel that this window
+    /// has already closed.
+    fn closed_here_in_channel_view(&self, id: ChannelId) -> impl Iterator<Item = CardId> + '_ {
+        let scope = crate::workspace_model::views::Scope::Channel(id);
+        self.workspace_model
+            .views
+            .iter()
+            .filter(move |view| view.scope == scope)
+            .flat_map(|view| &view.panes)
+            .map(|pane| pane.id)
+            .filter(|card| {
+                self.card_state(*card)
+                    .is_some_and(|state| !state.existence.is_open())
+            })
     }
 
     pub(super) fn channel_deletion_blocker(&self, id: ChannelId) -> Option<String> {
@@ -1737,7 +1757,9 @@ impl Cagents {
                 .iter()
                 .filter(|view| view.scope == scope)
                 .flat_map(|view| &view.panes)
-                .any(|pane| !attempt.members.contains(&pane.id))
+                .any(|pane| {
+                    !attempt.members.contains(&pane.id) && !attempt.inactive.contains(&pane.id)
+                })
         {
             return false;
         }
