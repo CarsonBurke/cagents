@@ -481,7 +481,7 @@ impl ConnectionContext {
             return Ok(bridge.transport.directory.join("daemon.sock"));
         }
         let runtime =
-            crate::instance::runtime_directory()?.join(crate::instance::RUNTIME_SUBDIRECTORY);
+            crate::instance::runtime_directory()?.join(crate::instance::runtime_subdirectory());
         crate::secure_file::prepare_private_directory(&runtime)?;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let directory = runtime.join(format!("device-{}", &token[..12]));
