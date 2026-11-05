@@ -236,6 +236,70 @@ exit 83
         self.assert_skipped("--browserless")
         self.assert_skipped("--browserless")
 
+    def test_identity_records_hide_environment_values_and_stay_private(self):
+        # Build tools are inert; these are synthetic values, including an
+        # arbitrary variable that Cargo asks the runner to watch.
+        values = {
+            "CARGO_REGISTRIES_SYNTHETIC_TOKEN": "synthetic-registry-credential-2138",
+            "RUSTFLAGS": "synthetic-compiler-option-2138",
+            "FAKE_WATCHED": "synthetic-watched-credential-2138",
+            "FAKE_COMPILED": "synthetic-compiled-credential-2138",
+        }
+        previous_umask = os.umask(0)
+        try:
+            self.assert_built("--browserless", **values)
+        finally:
+            os.umask(previous_umask)
+        record = self.target / "dev-runtime/.run-development-ui"
+        content = record.read_text()
+        for value in values.values():
+            self.assertNotIn(value, content)
+        self.assertRegex(content.splitlines()[0], r"^identity-sha256 [0-9a-f]{64}$")
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        self.assert_skipped("--browserless", **values)
+        for name in values:
+            with self.subTest(variable=name):
+                changed = {**values, name: values[name] + "-changed"}
+                self.assert_built("--browserless", **changed)
+                self.assert_skipped("--browserless", **changed)
+                self.assert_built("--browserless", **values)
+        self.assertEqual(
+            sorted(path.name for path in record.parent.glob(".run-development-*")),
+            [".run-development-ui"],
+        )
+
+    def test_legacy_plaintext_record_is_replaced_privately(self):
+        self.assert_built("--browserless")
+        record = self.target / "dev-runtime/.run-development-ui"
+        record.write_text("legacy plaintext identity\n")
+        record.chmod(0o644)
+        self.assert_built("--browserless")
+        self.assertRegex(record.read_text().splitlines()[0], r"^identity-sha256 [0-9a-f]{64}$")
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        self.assert_skipped("--browserless")
+
+    def test_identity_producer_and_hasher_fail_closed(self):
+        self.assert_built("--browserless")
+        fake_bin = self.root / "bin"
+        for command in ("rustc", "sha256sum"):
+            with self.subTest(command=command):
+                tool = fake_bin / command
+                original = tool.read_bytes() if tool.exists() else None
+                tool.write_text("#!/bin/sh\nprintf 'incomplete identity\\n'\nexit 77\n")
+                tool.chmod(0o755)
+                try:
+                    self.assert_built("--browserless")
+                    self.assertFalse((self.target / "dev-runtime/.run-development-ui").exists())
+                    self.assertEqual(list(self.target.glob("dev-runtime/.run-development-started*")), [])
+                    self.assertEqual(list(self.target.glob("dev-runtime/.run-development-record*")), [])
+                finally:
+                    if original is None:
+                        tool.unlink()
+                    else:
+                        tool.write_bytes(original)
+                self.assert_built("--browserless")
+                self.assert_skipped("--browserless")
+
     def test_changes_send_the_launch_through_the_build(self):
         self.assert_built("--browserless")
         for name, change in (
@@ -311,7 +375,7 @@ exit 83
         self.cargo_calls.unlink()
         self.assert_built("--browserless")
         leftovers = [path.name for path in (self.target / "dev-runtime").iterdir()
-                     if path.name.startswith(".run-development-started")]
+                     if path.name.startswith((".run-development-started", ".run-development-record"))]
         self.assertEqual(leftovers, [])
 
     def test_nested_only_refuses_the_callers_desktop_before_building(self):
@@ -352,7 +416,7 @@ exit 83
         launch.send_signal(signal.SIGTERM)
         self.assertEqual(launch.wait(timeout=10), 143)
         leftovers = [path.name for path in (self.target / "dev-runtime").iterdir()
-                     if path.name.startswith(".run-development-started")]
+                     if path.name.startswith((".run-development-started", ".run-development-record"))]
         self.assertEqual(leftovers, [])
 
     def test_the_other_lane_rebuilds_and_invalidates_this_one(self):
