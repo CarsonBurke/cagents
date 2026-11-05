@@ -251,6 +251,9 @@ class SeedBuildDir(unittest.TestCase):
             self.assertTrue((self.destination / profile / ".fingerprint/zstd-sys-1/lib-zstd").is_file())
             # Incremental caches belong to the checkout's own crates.
             self.assertFalse((self.destination / profile / "incremental").exists())
+        # Cargo tags only directories it creates; the pruner needs the tag.
+        self.assertIn("Signature: 8a477f597d28d172789f06886806bc55",
+                      (self.destination / "CACHEDIR.TAG").read_text())
         leftovers = [path.name for path in self.destination.iterdir() if path.name.startswith(".seeding")]
         self.assertEqual(leftovers, [])
         # Seeded once, it is a build directory like any other.
@@ -310,7 +313,9 @@ class SeedBuildDir(unittest.TestCase):
             result = self.seed()
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("cannot reflink", result.stderr)
-            self.assertEqual(sorted(path.name for path in self.destination.iterdir()), [".seed-lock"])
+            # Unbuilt, but tagged: Cargo will not tag a directory it did not create.
+            self.assertEqual(sorted(path.name for path in self.destination.iterdir()),
+                             [".seed-lock", "CACHEDIR.TAG"])
 
 
 if __name__ == "__main__":

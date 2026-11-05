@@ -399,7 +399,18 @@ checkout path, and the crates that depend on them. Incremental caches are not
 copied. Seeding does nothing on a file system without reflinks, when the main
 checkout has no build, for a directory that has been built in, or with
 `CAGENTS_BUILD_SEED=0`; run `scripts/seed-build-dir` by hand to seed a
-directory a plain `cargo` would create.
+directory a plain `cargo` would create. Seeded directories carry Cargo's
+`CACHEDIR.TAG`, so `prune-cargo-build-dirs` reclaims them after their worktree
+is removed.
+
+Build directories share one disk. When the file system holding them has less
+than twice a floor free (5% of its size, at most 64 GiB), `scripts/cargo-gate`
+runs `scripts/build-disk-guard`, which reclaims removed worktrees' build
+directories at once with `prune-cargo-build-dirs --apply --orphan-grace 0`, at
+most every ten minutes across the host. Below the floor it refuses the build
+and says why. Remove worktrees you no longer need; their build directories
+follow. Set `CAGENTS_BUILD_FREE_FLOOR_GIB` to change the floor, or `0` to
+disable the guard.
 
 The build script that stamps `--version` reruns only when the stamp could
 change, because each rerun recompiles `cagents`. It watches this checkout's

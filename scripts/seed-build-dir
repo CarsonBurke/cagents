@@ -83,6 +83,13 @@ fi
 built "$from" || exit 0
 
 mkdir -p -- "$to"
+# Cargo tags only a build directory it creates, and prune-cargo-build-dirs
+# reclaims only tagged ones.
+[ -e "$to/CACHEDIR.TAG" ] || printf '%s\n' \
+    'Signature: 8a477f597d28d172789f06886806bc55' \
+    '# This file is a cache directory tag created by cargo.' \
+    '# For information about cache directory tags see https://bford.info/cachedir/' \
+    >"$to/CACHEDIR.TAG"
 # One seeder per destination; a second waits, then finds it seeded.
 exec 9>>"$to/.seed-lock"
 flock 9
