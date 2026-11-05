@@ -6762,6 +6762,7 @@ mod tests {
         crossbeam_channel::Receiver<Value>,
     ) {
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),

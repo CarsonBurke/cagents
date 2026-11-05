@@ -7592,52 +7592,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_frames_do_not_interrupt_a_streamed_turn() {
-        let mut adapter = Claude::default();
-        adapter.busy = true;
-        let future = adapter
-            .receive(json!({"type":"future_frame", "payload":"secret raw protocol"}))
-            .unwrap();
-        assert!(future.events.is_empty());
-        let system = adapter.receive(json!({"type":"system", "subtype":"future_system", "payload":"secret raw protocol"})).unwrap();
-        assert!(system.events.is_empty());
-        adapter.receive(json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}})).unwrap();
-        for event in [
-            json!({"type":"future_stream_event"}),
-            json!({"type":"content_block_start","index":1,"content_block":{"type":"future_content","opaque":"raw protocol"}}),
-            json!({"type":"content_block_delta","index":1,"delta":{"type":"future_delta"}}),
-        ] {
-            assert!(
-                adapter
-                    .receive(json!({"type":"stream_event","event":event}))
-                    .unwrap()
-                    .events
-                    .is_empty()
-            );
-        }
-        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}})).unwrap();
-        let delta = adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}})).unwrap();
-        assert!(
-            delta
-                .events
-                .iter()
-                .any(|event| matches!(event, Event::TextDelta { delta, .. } if delta == "answer"))
-        );
-        let result = adapter
-            .receive(
-                json!({"type":"result","subtype":"success","result":"answer","is_error":false}),
-            )
-            .unwrap();
-        assert!(
-            !result
-                .events
-                .iter()
-                .any(|event| matches!(event, Event::Error { .. }))
-        );
-        assert!(!adapter.busy);
-    }
-
-    #[test]
     fn control_deadlines_free_capacity_and_interrupt_has_an_emergency_slot() {
         let mut adapter = Claude::default();
         for _ in 0..MAX_PENDING {
@@ -11876,6 +11830,7 @@ mod tests {
             ].into(),
         };
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),

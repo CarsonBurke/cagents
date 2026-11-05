@@ -2075,6 +2075,7 @@ mod tests {
             .allocator
             .boot_id = boot;
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
