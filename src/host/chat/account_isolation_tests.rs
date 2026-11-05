@@ -172,9 +172,9 @@ fn native_codex_starts_keep_each_account_on_its_own_home() {
             assert!(result.is_ok(), "round {round}: {:?}", result.err());
             started(&record, home, round + 1, &expected);
         }
-        // A restarted daemon follows a finished one. Let this daemon's
-        // actors release their exited providers' holders first, so the next
-        // round never inspects a holder that is mid-release.
+        // This test checks which home each start uses, not restart timing.
+        // Let this daemon's actors release their exited providers' holders
+        // before the next round, so it never inspects one mid-release.
         drop(host);
         let holders =
             crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native)

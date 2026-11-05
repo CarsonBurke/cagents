@@ -3189,7 +3189,7 @@ done
     // settled; the caller hears that answer rather than timing out.
     let interrupted = format!("{:?}", interrupting.join().unwrap());
     assert!(
-        !interrupted.contains("did not answer"),
+        interrupted.contains("already settled"),
         "the interrupt must receive its own acknowledgement: {interrupted}"
     );
     assert_eq!(settled(&host, followup.run.id).state, State::Succeeded);
