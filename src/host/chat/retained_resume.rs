@@ -186,7 +186,7 @@ const SURVIVOR: &str = "A process from this conversation's earlier Claude sessio
 
 /// Also the answer for a pane whose conversation had an open CLI view, since
 /// that view's terminal could still hold the conversation.
-const UNMATCHED: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place";
+const UNMATCHED: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place. It can be resumed after this computer restarts";
 
 /// An actor that ended without retirement grants disk resume only when no
 /// writer of it can survive: its exact helper and provider are gone in this
@@ -366,6 +366,8 @@ pub(super) enum Unstarted {
     Unrecorded,
 }
 
+const STARTED_HERE: &str = "This pane's earlier Claude process may still be running, so nothing was started in its place. Retry once it has exited";
+
 const OPEN_ELSEWHERE: &str = "Another pane may still be writing to this Claude conversation, so nothing was started. Close that pane, then resume this conversation again";
 
 /// Whether `source` is a resume successor that never started, and how it
@@ -410,14 +412,12 @@ pub(super) fn unstarted(host: &SharedHost, source: &Session) -> Result<Option<Un
         }
         for ownership in page {
             after = Some(ownership.actor());
-            if ownership.source().id == source.id {
-                return Err(
-                    "This conversation already started in its pane; reopen that pane to continue it. Nothing was started"
-                        .into(),
-                );
-            }
-            // A kernel boot change ended every process of an earlier boot.
-            if !super::same_conversation(&ownership.source().launch, &source.launch)
+            // An owner registered for this very pane started it before the
+            // card saved its proof, possibly before naming the conversation,
+            // so it counts whatever conversation it records. A kernel boot
+            // change ended every process of an earlier boot.
+            let this_pane = ownership.source().id == source.id;
+            if !(this_pane || super::same_conversation(&ownership.source().launch, &source.launch))
                 || ownership.owner().boot != proof.boot_id
             {
                 continue;
@@ -434,7 +434,12 @@ pub(super) fn unstarted(host: &SharedHost, source: &Session) -> Result<Option<Un
                 }
             };
             if !ended {
-                return Err(OPEN_ELSEWHERE.into());
+                return Err(if this_pane {
+                    STARTED_HERE
+                } else {
+                    OPEN_ELSEWHERE
+                }
+                .into());
             }
         }
     }

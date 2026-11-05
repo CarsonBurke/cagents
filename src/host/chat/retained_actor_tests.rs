@@ -4629,4 +4629,28 @@ fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
         ClientRequest::ChatClose { chat_id: running },
     )
     .unwrap();
+    let ended = live.actor_identity().unwrap().record;
+    wait_until(
+        || !ended.holder.is_current() && !ended.root.is_current(),
+        "the closed conversation never exited",
+    );
+    // A card that started, but closed before it saved its proof, resumes
+    // once its own retired actor is proved ended. It is not sent back to
+    // the pane being reopened.
+    let mut closed_early = unrecorded.clone();
+    closed_early.id = running;
+    closed_early.launch.session_id = live.confirmed_session_id();
+    let ServerResponse::ChatResumePrepared { session: reopened } = process_inner(
+        &successor,
+        23,
+        ClientRequest::ChatPrepareResume {
+            source: closed_early.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("a pane whose own actor retired resumes");
+    };
+    assert_ne!(reopened.id, running);
+    assert_eq!(reopened.launch.session_id, closed_early.launch.session_id);
+    assert!(successor.lock().unwrap().chats.is_empty());
 }
