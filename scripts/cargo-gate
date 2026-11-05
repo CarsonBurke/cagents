@@ -795,8 +795,12 @@ if [ -x "$guard" ] || [ -x "$seed" ]; then
     supervised '' /bin/sh -c '
         guard=$1
         seed=$2
-        build_dir=$("${CAGENTS_BUILD_CARGO:-cargo}" metadata --format-version 1 --no-deps 2>/dev/null |
-            sed -n '\''s/.*"build_directory":"\([^"]*\)".*/\1/p'\'') || build_dir=
+        metadata=$("${CAGENTS_BUILD_CARGO:-cargo}" metadata --format-version 1 --no-deps 2>/dev/null) || metadata=
+        build_dir=$(printf "%s\n" "$metadata" |
+            sed -n '\''s/.*"build_directory":"\([^"]*\)".*/\1/p'\'')
+        # A Cargo that reports no build directory builds in the target.
+        [ -n "$build_dir" ] || build_dir=$(printf "%s\n" "$metadata" |
+            sed -n '\''s/.*"target_directory":"\([^"]*\)".*/\1/p'\'')
         if [ -n "$build_dir" ]; then
             [ ! -x "$guard" ] || "$guard" "$build_dir" || exit "$?"
             [ ! -x "$seed" ] || "$seed" --to "$build_dir" || :
