@@ -2899,11 +2899,9 @@ impl Adapter for Claude {
                         });
                     }
                 } else if string(response, "subtype") != "success" {
-                    self.warn_unknown("control response", string(response, "subtype"));
-                    acknowledged=Err("Claude returned an unrecognized control response; the requested change is unconfirmed".into());
-                    if string(&request, "subtype") == "initialize" {
-                        step.events.push(Event::Error {message:"Claude could not confirm initialization; restart the session after updating the provider".into(),fatal:true});
-                    }
+                    // A reply to a request this adapter sent is a known frame,
+                    // so an unrecognized outcome is a protocol error.
+                    return Err("Unsupported Claude control response subtype".into());
                 } else {
                     match string(&request, "subtype") {
                         "initialize" => {
@@ -4809,8 +4807,7 @@ impl Claude {
                     if stream.truncated {
                         return Ok(());
                     }
-                    self.warn_unknown("untracked block delta", string(delta, "type"));
-                    return Ok(());
+                    return Err("Claude delta arrived without its content block".into());
                 };
                 if matches!(&item.content, ItemContent::Tool { .. })
                     && self
@@ -6782,11 +6779,8 @@ mod tests {
                         assert!(step.events.is_empty());
                     } else {
                         assert!(step.events.iter().any(|event| match event {
-                            Event::TextDelta { delta, .. } => delta == payload,
-                            Event::Item(Item {
-                                content: ItemContent::Tool { input, .. },
-                                ..
-                            }) => input == payload,
+                            Event::TextDelta { delta, .. } | Event::InputDelta { delta, .. } =>
+                                delta == payload,
                             _ => false,
                         }));
                     }
