@@ -809,6 +809,7 @@ impl Cagents {
         if let Some(task) = self.defer_retiring_conversation(&entry, prepared) {
             return task;
         }
+        let user_title = self.chrome_ui.user_titles.get(&entry.card).cloned();
         let mut session = entry.session;
         if !session.launch.recipe.working_directory.is_dir()
             && !session.launch.needs_read_only_history()
@@ -837,10 +838,9 @@ impl Cagents {
         let replace = replace.filter(|card| {
             self.chat_is_unused(*card) && self.workspace.order().any(|id| id == *card)
         });
-        let insert = self.insert_chat_card(session, replace, None);
-        // The new card is published under its provider's generic name, and
-        // the shared view would name it that again unless its own name is
-        // published too.
+        let insert = self.insert_resumed_chat_card(session, replace, user_title);
+        // Manual names were installed before insertion. Otherwise publish
+        // the saved automatic title instead of the provider's generic name.
         if let Some(card) = self.durable.focused
             && self.apply_reported_title(card, entry.title)
         {
@@ -1216,6 +1216,82 @@ mod tests {
         assert_eq!(card.kind, CardKind::Chat(prepared));
         assert_eq!(card.title, "Review peripheral Rust modules");
         assert!(!app.resume_ui.loading);
+    }
+
+    #[test]
+    fn prepared_resume_transfers_a_manual_title_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        let mut entry = saved(directory.path());
+        entry.title = "Parser recovery".into();
+        app.chrome_ui
+            .user_titles
+            .insert(entry.card, entry.title.clone());
+        entry.session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "saved-owner".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "saved-incarnation".into(),
+        });
+        entry.session.native_continuity =
+            chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        let mut prepared = entry.session.clone();
+        prepared.id = TerminalId::new();
+        prepared.proof = None;
+        prepared.terminal = None;
+        drop(app.resume_saved_conversation(entry.clone()));
+        assert!(app.resume_ui.loading);
+        let generation = app.resume_ui.generation;
+        let before_settings = app.settings_save_generation;
+        drop(app.update_resume(Action::Prepared(generation, entry, Ok(prepared.clone()))));
+
+        let card = app
+            .card_state(app.workspace.focused().unwrap())
+            .unwrap()
+            .clone();
+        assert_eq!(card.kind, CardKind::Chat(prepared));
+        assert_eq!(card.title, "Parser recovery");
+        assert_eq!(app.chrome_ui.user_titles[&card.id], "Parser recovery");
+        assert!(app.settings_save_generation > before_settings);
+        assert!(!app.apply_reported_title(card.id, "Original provider prompt".into()));
+        assert_eq!(app.card_state(card.id).unwrap().title, "Parser recovery");
+        assert_eq!(
+            app.capture_settings_save().unwrap().view.user_titles[&card.id],
+            "Parser recovery"
+        );
+
+        // The saved list uses the resumed card's title, and later provider
+        // indexing must not replace the manual name on that new identity.
+        let current = app.card_state(card.id).unwrap();
+        let CardKind::Chat(session) = &current.kind else {
+            panic!("a resumed chat");
+        };
+        let saved = SavedConversation {
+            card: card.id,
+            title: current.title.clone(),
+            session: session.clone(),
+            open: false,
+            updated_at_unix_ms: 2,
+        };
+        app.resume_ui.open = true;
+        list(&mut app, generation, vec![saved]);
+        drop(app.update_resume(Action::Indexed(
+            generation,
+            Progress::Found {
+                conversations: Vec::new(),
+                titles: vec![(card.id, "Original provider prompt".into())],
+                read: 1,
+            },
+        )));
+        let row = app
+            .resume_ui
+            .rows
+            .iter()
+            .find(|row| row.card == card.id)
+            .unwrap();
+        assert_eq!(row.title, "Parser recovery");
+        assert!(matches!(&row.source, Source::Saved(saved) if saved.title == "Parser recovery"));
     }
 
     #[test]

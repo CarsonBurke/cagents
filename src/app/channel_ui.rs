@@ -293,6 +293,11 @@ pub struct State {
     /// channel straight back. An identity is never reused, so remembering it
     /// for the life of the window is exact.
     deleted: HashSet<ChannelId>,
+    /// Open panes discarded with a deleted channel have no normal close
+    /// history, and the registry also removes their channel view. Keep their
+    /// known destination so the saved picker cannot file them into whichever
+    /// channel happens to be selected later. Pane identities are not reused.
+    deleted_cards: HashSet<CardId>,
     /// Channels this window closed the last card of, as they were then, so a
     /// card reopened from one can bring it back after it retires. Explicit
     /// deletion forgets the channel; only automatic retirement is undone.
@@ -537,7 +542,20 @@ impl Cagents {
                 })
             });
             return match result {
-                Ok(()) => self.finish_delete_channel(id),
+                Ok(()) => {
+                    // Managed teardown can remove these captured-open panes
+                    // from the channel before its validated receipt arrives.
+                    // Remember their deleted origin while the exact capture
+                    // still names them; they are not ordinary undo history.
+                    self.channel_ui.deleted_cards.extend(
+                        attempt
+                            .panes
+                            .iter()
+                            .filter(|(_, kind, _)| !kind.is_utility())
+                            .map(|(card, _, _)| *card),
+                    );
+                    self.finish_delete_channel(id)
+                }
                 Err(error) => {
                     let title = self
                         .durable
@@ -679,9 +697,13 @@ impl Cagents {
 
     /// Where `card` was when it closed, when this window can tell: the scope
     /// it was closed from, or else the one shared view that records removing
-    /// it. A pane moved between views is retired from each view it left, so
-    /// more than one such view is no answer.
+    /// it. A deleted origin or more than one such view identifies no surviving
+    /// channel, so the card returns to its worktree. Only an unknown origin
+    /// leaves placement to the channel where the picker was opened.
     pub(super) fn closed_card_home(&self, card: CardId) -> Option<ClosedCardHome> {
+        if self.channel_ui.deleted_cards.contains(&card) {
+            return Some(ClosedCardHome::Strip);
+        }
         let closed_from = self
             .recently_closed
             .iter()
@@ -701,7 +723,7 @@ impl Cagents {
                     .filter(|view| view.retired.contains(&card));
                 let view = views.next()?;
                 if views.next().is_some() {
-                    return None;
+                    return Some(ClosedCardHome::Strip);
                 }
                 match view.scope {
                     crate::workspace_model::views::Scope::Channel(id) => id,
@@ -1499,6 +1521,13 @@ impl Cagents {
                     }
                 }
                 continue;
+            }
+            if !own_retirement
+                && self
+                    .card_state(card)
+                    .is_some_and(|state| state.existence.is_open())
+            {
+                self.channel_ui.deleted_cards.insert(card);
             }
             self.retire_lsp_card(card);
             self.sidebar_state.forget_card_attention(card);

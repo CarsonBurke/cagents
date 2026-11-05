@@ -5608,6 +5608,17 @@ mod tests {
                     1,
                     "one successful close deletes its channel once"
                 );
+                // The registry deletes this view with the channel. A close
+                // whose projection beat its receipt must still have a known
+                // deleted origin after that last canonical record is gone.
+                app.workspace_model
+                    .views
+                    .retain(|view| view.scope != Scope::Channel(source));
+                assert_eq!(
+                    app.closed_card_home(pane.id),
+                    Some(super::super::channel_ui::ClosedCardHome::Strip),
+                    "watcher_first={watcher_first}, sibling={sibling}"
+                );
                 drop(close); // No provider request is polled by this ordering fixture.
             }
         }

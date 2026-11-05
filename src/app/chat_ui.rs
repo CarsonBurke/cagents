@@ -6441,7 +6441,7 @@ impl Cagents {
         };
         Task::batch([
             scope,
-            self.insert_chat_card_with_lifetime(session, None, ephemeral, None),
+            self.insert_chat_card_with_lifetime(session, None, ephemeral, None, None),
         ])
     }
 
@@ -6455,7 +6455,18 @@ impl Cagents {
         beside: Option<CardId>,
         draft_from: Option<CardId>,
     ) -> Task<Message> {
-        self.insert_chat_card_with_lifetime(session, beside, false, draft_from)
+        self.insert_chat_card_with_lifetime(session, beside, false, draft_from, None)
+    }
+
+    /// Restore an existing conversation's manual pane name before its first
+    /// shared publication or provider attachment can report another title.
+    pub(super) fn insert_resumed_chat_card(
+        &mut self,
+        session: chat::Session,
+        beside: Option<CardId>,
+        user_title: Option<String>,
+    ) -> Task<Message> {
+        self.insert_chat_card_with_lifetime(session, beside, false, None, user_title)
     }
 
     fn insert_chat_card_with_lifetime(
@@ -6464,6 +6475,7 @@ impl Cagents {
         beside: Option<CardId>,
         ephemeral: bool,
         draft_from: Option<CardId>,
+        user_title: Option<String>,
     ) -> Task<Message> {
         let beside = beside.and_then(|source| {
             let index = self.workspace.order().position(|id| id == source)?;
@@ -6491,10 +6503,14 @@ impl Cagents {
         if ephemeral {
             self.chat_ui.default_chats.insert(card_id);
         }
+        let save_title = user_title.is_some();
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
-            title: chat_card_title(session.launch.provider).into(),
+            title: user_title
+                .as_deref()
+                .unwrap_or_else(|| chat_card_title(session.launch.provider))
+                .into(),
             width_fraction: self.new_pane_fraction(
                 beside
                     .and_then(|(source, _)| self.card_state(source))
@@ -6522,6 +6538,9 @@ impl Cagents {
         }
         durable.focused = Some(card_id);
         durable.cards.insert(durable_index, card.clone());
+        if let Some(title) = user_title {
+            self.chrome_ui.user_titles.insert(card_id, title);
+        }
         self.register_channel_card(card_id);
         let update = self
             .workspace
@@ -6550,11 +6569,17 @@ impl Cagents {
             self.open_chat(card_id, session, intent)
         };
         self.persist();
+        let title = if save_title {
+            self.save_settings_task(false)
+        } else {
+            Task::none()
+        };
         Task::batch([
             skills,
             self.apply_viewport(update, true, false),
             iced::widget::operation::focus(card_control_id(card_id, "chat-composer"))
                 .map(cosmic::Action::App),
+            title,
         ])
     }
 

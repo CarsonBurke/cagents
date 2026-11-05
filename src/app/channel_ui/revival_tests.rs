@@ -311,6 +311,101 @@ fn reopening_the_last_card_of_a_retired_channel_brings_the_channel_back() {
     assert_eq!(fixture.app.durable.focused, Some(resumed.id));
 }
 
+/// A manual pane name belongs to the conversation that returns, even when its
+/// channel has a different name and its provider reports a title after resume.
+#[test]
+fn shortcut_and_picker_preserve_manual_pane_names_after_retirement() {
+    for picker in [false, true] {
+        for manual in [false, true] {
+            let mut fixture = fixture();
+            fixture.app.settings_path = Some(fixture.directory.path().join("settings.toml"));
+            fixture.app.settings_write_blocked = false;
+            if manual {
+                drop(
+                    fixture
+                        .app
+                        .update_chrome(chrome_ui::Action::Rename(fixture.card)),
+                );
+                drop(
+                    fixture
+                        .app
+                        .update_chrome(chrome_ui::Action::RenameChanged("Parser recovery".into())),
+                );
+                drop(fixture.app.update_chrome(chrome_ui::Action::RenameSubmit));
+            }
+            let saved = fixture.saved();
+            fixture.close_card();
+            fixture.retire();
+            let before_settings = fixture.app.settings_save_generation;
+            if picker {
+                drop(fixture.app.resume_saved_conversation(saved));
+            } else {
+                fixture.reopen_pane();
+            }
+
+            let resumed = fixture.resumed().clone();
+            let channel = fixture.active_channel().clone();
+            assert_ne!(channel.id, fixture.channel);
+            assert_eq!(channel.title, "Investigation");
+            assert_eq!(channel.cards, vec![resumed.id]);
+            // The successor's empty view is acknowledged before its first
+            // pane publication; exercise the production projection of it.
+            fixture
+                .app
+                .shared_views
+                .initialize(Scope::Channel(channel.id), Vec::new());
+            fixture.app.publish_view_changes();
+            let inserted = fixture
+                .app
+                .shared_views
+                .pending_changes()
+                .find_map(|(scope, change)| match change {
+                    Change::Insert { pane, .. }
+                        if *scope == Scope::Channel(channel.id) && pane.id == resumed.id =>
+                    {
+                        Some(pane.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the first shared publication holds the resumed pane");
+            assert_eq!(
+                inserted.user_title.as_deref(),
+                manual.then_some("Parser recovery")
+            );
+            if manual {
+                assert_eq!(inserted.title, "Parser recovery");
+                assert!(fixture.app.settings_save_generation > before_settings);
+                assert_eq!(
+                    fixture
+                        .app
+                        .capture_settings_save()
+                        .unwrap()
+                        .view
+                        .user_titles[&resumed.id],
+                    "Parser recovery"
+                );
+            }
+
+            let changed = fixture
+                .app
+                .apply_reported_title(resumed.id, "Original provider prompt".into());
+            assert_eq!(changed, !manual, "automatic titles remain provider-owned");
+            let current = fixture.app.card_state(resumed.id).unwrap();
+            if manual {
+                assert_eq!(
+                    fixture.app.chrome_ui.user_titles[&resumed.id],
+                    "Parser recovery"
+                );
+                assert_eq!(current.title, "Parser recovery");
+                assert_eq!(fixture.app.card_display_title(current), "Parser recovery");
+            } else {
+                assert!(!fixture.app.chrome_ui.user_titles.contains_key(&resumed.id));
+                assert_eq!(current.title, "Original provider prompt");
+            }
+        }
+    }
+}
+
 /// The resume picker returns a conversation to the channel it was closed in,
 /// and a second conversation closed in the same retired channel follows the
 /// first to its revival instead of making another.
@@ -388,6 +483,108 @@ fn a_deleted_channel_is_not_revived() {
         Some(fixture.directory.path())
     );
     assert_eq!(fixture.resumed().title, TITLE);
+}
+
+/// A local deletion's close can tombstone its open pane before the receipt
+/// removes the channel. Even after the registry forgets its retired view,
+/// the saved picker must not place that conversation in another channel.
+#[test]
+fn a_conversation_deleted_while_open_resumes_in_its_worktree() {
+    let mut fixture = fixture();
+    let saved = fixture.saved();
+    let boundary = fixture
+        .app
+        .create_channel(fixture.project, "Boundary".into(), Default::default())
+        .unwrap();
+    drop(
+        fixture
+            .app
+            .handle_channel_ui(Action::Delete(fixture.channel)),
+    );
+    assert!(fixture.app.channel_ui.modal_open());
+    drop(fixture.app.handle_channel_ui(Action::ConfirmDelete));
+    let operation = fixture.app.channel_ui.close_operation(fixture.channel);
+    assert!(!operation.is_nil());
+    let view = &mut fixture.app.workspace_model.views[0];
+    view.apply(&Change::Remove { id: fixture.card }).unwrap();
+    view.revision += 1;
+    drop(fixture.app.reconcile_shared_views());
+    assert!(
+        !fixture
+            .app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == fixture.channel)
+            .unwrap()
+            .cards
+            .contains(&fixture.card)
+    );
+    assert!(
+        !fixture
+            .app
+            .card_state(fixture.card)
+            .unwrap()
+            .existence
+            .is_open()
+    );
+    drop(
+        fixture
+            .app
+            .handle_channel_ui(Action::SessionsClosed(fixture.channel, operation, Ok(()))),
+    );
+    assert!(fixture.app.channel_ui.was_deleted(fixture.channel));
+    // The complete registry snapshot also forgets its view, including any
+    // possible retired origin. No provider close task is polled in this test.
+    let mut model = fixture.app.workspace_model.clone();
+    model
+        .channels
+        .retain(|channel| channel.id != fixture.channel);
+    model
+        .views
+        .retain(|view| view.scope != Scope::Channel(fixture.channel));
+    model.sequence += 1;
+    drop(fixture.app.apply_workspace_model_update(
+        super::super::workspace_model_sync::ModelUpdate::Read(model),
+    ));
+    assert!(
+        !fixture
+            .app
+            .card_state(fixture.card)
+            .unwrap()
+            .existence
+            .is_open()
+    );
+    assert!(fixture.app.recently_closed.is_empty());
+    assert!(
+        fixture
+            .app
+            .workspace_model
+            .views
+            .iter()
+            .all(|view| view.scope != Scope::Channel(fixture.channel))
+    );
+    assert_eq!(
+        fixture.app.closed_card_home(fixture.card),
+        Some(ClosedCardHome::Strip)
+    );
+    drop(fixture.app.select_channel(boundary));
+    let other = fixture.active_channel().clone();
+    let cards = fixture.app.durable.cards.len();
+
+    fixture.reopen_pane();
+
+    assert_eq!(fixture.app.durable.cards.len(), cards);
+    assert_eq!(fixture.active_channel(), &other);
+    drop(fixture.app.resume_saved_conversation(saved));
+    assert_eq!(fixture.app.durable.active_channel, None);
+    assert_eq!(
+        fixture.app.active_workspace.as_deref(),
+        Some(fixture.directory.path())
+    );
+    assert_eq!(fixture.app.durable.channels, vec![other]);
+    assert_eq!(fixture.resumed().title, TITLE);
+    assert!(fixture.app.recently_closed.is_empty());
 }
 
 /// Reopened before the channel retires, the card returns to the same channel,
@@ -814,7 +1011,8 @@ fn a_shared_view_names_the_channel_a_card_was_removed_from() {
     assert_eq!(fixture.app.durable.active_channel, Some(fixture.channel));
 
     // A pane that moved between views was removed from each it left, which
-    // names no single one; the conversation then opens in its worktree.
+    // names no single one; even from another channel in the same project,
+    // the conversation then opens in its worktree.
     let mut fixture = self::fixture();
     let saved = SavedConversation {
         card: fixture.card,
@@ -834,10 +1032,30 @@ fn a_shared_view_names_the_channel_a_card_was_removed_from() {
         panes: vec![],
         retired: vec![fixture.card],
     });
-    let path = fixture.directory.path().to_path_buf();
-    drop(fixture.app.select_worktree(path, false));
+    let boundary = fixture
+        .app
+        .create_channel(fixture.project, "Boundary".into(), Default::default())
+        .unwrap();
+    drop(fixture.app.select_channel(boundary));
+    let other = fixture.active_channel().clone();
+    assert_eq!(
+        fixture.app.closed_card_home(fixture.card),
+        Some(ClosedCardHome::Strip)
+    );
     drop(fixture.app.resume_saved_conversation(saved));
     assert_eq!(fixture.app.durable.active_channel, None);
+    assert_eq!(
+        fixture.app.active_workspace.as_deref(),
+        Some(fixture.directory.path())
+    );
+    assert!(
+        fixture
+            .app
+            .durable
+            .channels
+            .iter()
+            .any(|channel| channel == &other)
+    );
 }
 
 /// A conversation this window never saw close, resumed from a channel in its
