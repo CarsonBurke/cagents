@@ -327,8 +327,6 @@ class InstalledGateSync(unittest.TestCase):
         # Main's gate ran this command, not the one it replaced.
         self.assertIn("main gate", result.stderr)
         self.assertEqual(self.recorded(), merged)
-        self.assertEqual((self.destination / "cagents-cargo-gate.source").read_text(),
-                         merged + "\n")
         # Once installed, the next run has nothing to do.
         again = self.run_installed()
         self.assertEqual((again.returncode, again.stdout, again.stderr), (0, "ran", "main gate\n"))

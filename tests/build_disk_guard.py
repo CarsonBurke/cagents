@@ -153,7 +153,7 @@ class InstallCargoGate(unittest.TestCase):
         self.assertEqual(
             sorted(path.name for path in self.root.iterdir()),
             sorted(names + ["cagents-cargo-gate.d", "cagents-cargo-gate.install.lock",
-                            "cagents-cargo-gate.installation", "cagents-cargo-gate.source"]),
+                            "cagents-cargo-gate.installation"]),
         )
         # Every name leads into one installation of its own, which has the
         # installer that made it.

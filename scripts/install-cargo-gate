@@ -45,8 +45,7 @@ build-disk-guard:build-disk-guard
 cagents-cargo-gate:cargo-gate'
 
 # One installation at a time, by hand or by a gate installing main's: a gate
-# that installs holds this already. Gates of version 2 install under a lock of
-# their own, so this one must not be theirs, which they hold while this runs.
+# that installs holds this already.
 if [ "${CAGENTS_BUILD_INSTALL_LOCK_HELD-}" != 1 ]; then
     exec 9>>"$destination/cagents-cargo-gate.install.lock"
     flock 9 || fail "cannot lock $destination/cagents-cargo-gate.install.lock"
@@ -115,18 +114,13 @@ for installed, file in names:
         blobs = None
         break
     blobs[f"scripts/{file}"] = blob
-# CAGENTS_BUILD_INSTALL_REVISION is how gates of version 2 name main.
-commit = os.environ.get("CAGENTS_BUILD_INSTALL_COMMIT") or \
-    os.environ.get("CAGENTS_BUILD_INSTALL_REVISION") or git("rev-parse", "-q", "--verify", "HEAD^{commit}")
+commit = os.environ.get("CAGENTS_BUILD_INSTALL_COMMIT") or git("rev-parse", "-q", "--verify", "HEAD^{commit}")
 repository = os.environ.get("CAGENTS_BUILD_INSTALL_REPOSITORY") or git(
     "rev-parse", "--path-format=absolute", "--git-common-dir")
 with open(record + ".new", "w") as file:
     json.dump({"files": blobs, "commit": commit, "repository": repository,
                "installed_at": time.time(), "directory": os.path.basename(stage)}, file, indent=1)
     file.write("\n")
-# Gates of version 2 judge main by the commit alone.
-with open(record.removesuffix(".installation") + ".source.new", "w") as file:
-    file.write(f"{commit or ''}\n")
 PY
 
 # Each name in the destination now leads into the new installation: helpers
@@ -138,7 +132,6 @@ printf '%s\n' "$files" | while IFS=: read -r installed file; do
 done
 committed=true
 mv -f -- "$destination/cagents-cargo-gate.installation.new" "$destination/cagents-cargo-gate.installation"
-mv -f -- "$destination/cagents-cargo-gate.source.new" "$destination/cagents-cargo-gate.source"
 # Gates judge main afresh against this installation.
 rm -f -- "$destination/cagents-cargo-gate.checked" "$destination/cagents-cargo-gate.install-failed"
 smoke "$destination/cagents-cargo-gate"
