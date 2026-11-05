@@ -287,13 +287,21 @@ impl State {
                     }
                     needed.insert(key.clone());
                 }
-                Some(hydrated)
+                Some((hydrated, readable))
             });
             let mut unjoined = index + 1;
             // Joining never makes a message larger than preparation accepts,
             // and never presents one message twice: such a run's parts all
-            // stay separate.
-            let run = run.zip(hydrated).filter(|(run, hydrated)| {
+            // stay separate. Nor does it join a run that starts inside a
+            // message that will never be read whole: parsed from a cut, one
+            // structure misread at the start would run through the whole
+            // window, and each slide of the window would prepare it all again.
+            // Its parts stay separate, each preparing on its own.
+            let run = run.zip(hydrated).filter(|(run, (hydrated, readable))| {
+                if run.start > 0 && hydrated.is_none() && !readable {
+                    unjoined = run.parts.end;
+                    return false;
+                }
                 let joined = hydrated
                     .as_ref()
                     .map_or(run.end - run.start, |text| text.len().max(run.end));
@@ -308,7 +316,7 @@ impl State {
                 }
                 joins
             });
-            let Some((run, hydrated)) = run else {
+            let Some((run, (hydrated, _))) = run else {
                 for (offset, item) in raw.items[index..unjoined].iter().enumerate() {
                     let key = aligned_sources
                         .and_then(|sources| sources[index + offset].as_ref())
@@ -976,16 +984,19 @@ mod tests {
     fn a_message_larger_than_a_window_is_paged_not_read_whole() {
         let message = "word ".repeat((READ_BYTES + PART) / 5);
         let count = message.len().div_ceil(PART);
-        let tail = parts("answer", &message, count - 4..count);
-        let raw = snapshot(tail, Some(source(message.len())));
-        let mut state = State::default();
-        let projected = state.project(raw);
-        assert_eq!(projected.items.len(), 1);
-        assert_eq!(
-            body(&projected.items[0]),
-            &message[(count - 4) * PART..],
-            "the parts the window holds are joined"
+        // A window that starts inside it keeps its parts as they are.
+        let tail = snapshot(
+            parts("answer", &message, count - 4..count),
+            Some(source(message.len())),
         );
+        let mut state = State::default();
+        assert!(Arc::ptr_eq(&state.project(tail.clone()), &tail));
+        assert!(state.request().is_none());
+        // A window holding its start joins what it holds.
+        let head = snapshot(parts("answer", &message, 0..4), Some(source(message.len())));
+        let projected = state.project(head);
+        assert_eq!(projected.items.len(), 1);
+        assert_eq!(body(&projected.items[0]), &message[..4 * PART]);
         assert!(state.request().is_none());
     }
 
