@@ -2621,7 +2621,7 @@ impl Actor {
                         if status.success() {
                             return Ok(());
                         }
-                        return Err(format!("Provider exited with {status}"));
+                        return Err(execution::exit_reason(Some(status), None));
                     }
                     return Err("Provider closed its protocol stream; process terminated to avoid an unobservable writer".into());
                 }

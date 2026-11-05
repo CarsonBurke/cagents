@@ -319,6 +319,19 @@ mod tests {
     }
 
     #[test]
+    fn exit_summary_that_names_its_status_is_not_repeated() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = Some(std::process::ExitStatus::from_raw(3 << 8));
+        let summary = format!(
+            "{}.\nAPI Error: 401\nSign in again, then restart the session.",
+            exit_reason(status, None)
+        );
+        let reason = exit_reason(status, Some(&summary));
+        assert_eq!(reason, summary);
+        assert_eq!(reason.matches("exited").count(), 1, "{reason}");
+    }
+
+    #[test]
     fn missing_exact_exit_status_keeps_diagnostics_without_inventing_failure() {
         let mut tracker = Tracker::default();
         let run = RunId::new();
