@@ -86,6 +86,7 @@ pub(super) struct State {
     pub blocked: HashSet<Scope>,
     pub adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
     pub restorations: Vec<crate::persistence::TerminalPaneRestoration>,
+    pub chat_replacements: Vec<(CardId, TerminalId, crate::chat::Session)>,
     restoration_requests: HashMap<CardId, TerminalId>,
 }
 
@@ -1600,6 +1601,23 @@ impl Cagents {
         self.project_shared_view_with_cards(view, owned, current)
     }
 
+    pub(super) fn is_canonical_shared_chat(
+        &self,
+        scope: &Scope,
+        id: CardId,
+        kind: &CardKind,
+    ) -> bool {
+        let mut owners = self.workspace_model.views.iter().flat_map(|view| {
+            view.panes
+                .iter()
+                .filter(move |pane| pane.id == id)
+                .map(move |pane| (view, pane))
+        });
+        owners.next().is_some_and(|(view, pane)| {
+            &view.scope == scope && !view.retired.contains(&id) && &pane.kind == kind
+        }) && owners.next().is_none()
+    }
+
     fn project_shared_view_with_cards(
         &mut self,
         view: &View,
@@ -1775,6 +1793,27 @@ impl Cagents {
                 current.extend(saved_copy);
             }
             self.prepare_shared_chat_upgrade(pane);
+            if self.chat_awaiting_admission(pane.id)
+                && self.card_state(pane.id).is_some_and(
+                    |card| matches!(&card.kind, CardKind::Chat(source) if source.is_unstarted()),
+                )
+                && let CardKind::Chat(canonical) = &pane.kind
+            {
+                // Restored empty shared drafts use the same draft-adoption
+                // path as an open window. They have no old actor or upgrade
+                // lineage to preserve in the generic admission path below.
+                if !self.is_canonical_shared_chat(&view.scope, pane.id, &pane.kind)
+                    || (!canonical.is_unstarted()
+                        && !self.prepare_shared_draft_attachment(pane.id, &view.scope, canonical))
+                {
+                    continue;
+                }
+                self.capture_chat_draft(pane.id);
+                self.cards.remove(&pane.id);
+                Arc::make_mut(&mut self.durable)
+                    .pending_chat_admissions
+                    .remove(&pane.id);
+            }
             if self.chat_awaiting_admission(pane.id) {
                 let (task, saved_copy) = self.admit_shared_chat(pane);
                 tasks.push(task);
@@ -1790,6 +1829,9 @@ impl Cagents {
                 None => {
                     self.chrome_ui.user_titles.remove(&pane.id);
                 }
+            }
+            if !self.refresh_shared_draft_attachment(pane.id, &view.scope, &pane.kind) {
+                continue;
             }
             let existing = self.card_state(pane.id).cloned();
             // A restored shared terminal may have waited for the registry
@@ -1820,6 +1862,36 @@ impl Cagents {
             }
             match existing {
                 Some(card) if card.existence.is_open() => {
+                    let starts_shared_draft = matches!(
+                        (&card.kind, &pane.kind),
+                        (CardKind::Chat(previous), CardKind::Chat(canonical))
+                            if previous.is_unstarted() && !canonical.is_unstarted()
+                    );
+                    if starts_shared_draft
+                        && let CardKind::Chat(canonical) = &pane.kind
+                        && (!self.is_canonical_shared_chat(&view.scope, pane.id, &pane.kind)
+                            || !self.prepare_shared_draft_attachment(
+                                pane.id,
+                                &view.scope,
+                                canonical,
+                            ))
+                    {
+                        continue;
+                    }
+                    let replaces_draft = matches!(
+                        (&card.kind, &pane.kind),
+                        (CardKind::Chat(previous), CardKind::Chat(replacement))
+                            if previous.is_unstarted()
+                                && replacement.is_unstarted()
+                                && (previous.id != replacement.id
+                                    || previous.launch.provider != replacement.launch.provider)
+                    );
+                    if replaces_draft
+                        && (!self.is_canonical_shared_chat(&view.scope, pane.id, &pane.kind)
+                            || !self.prepare_shared_draft_replacement(pane.id))
+                    {
+                        continue;
+                    }
                     if card.kind != pane.kind
                         && matches!(self.cards.get(&pane.id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving())
                     {
@@ -1833,10 +1905,18 @@ impl Cagents {
                         // remains attached unless the session identity changes.
                         let same_session = match (&card.kind, &pane.kind) {
                             (CardKind::Terminal(a), CardKind::Terminal(b)) => a.id == b.id,
-                            (CardKind::Chat(a), CardKind::Chat(b)) => a.id == b.id,
+                            (CardKind::Chat(a), CardKind::Chat(b)) => {
+                                a.id == b.id && !starts_shared_draft
+                            }
                             (a, b) => a == b,
                         };
                         if !same_session {
+                            if matches!(
+                                (&card.kind, &pane.kind),
+                                (CardKind::Chat(_), CardKind::Chat(_))
+                            ) {
+                                self.capture_chat_draft(pane.id);
+                            }
                             // A held title belongs to the replaced session.
                             self.reported_title_save.cards.remove(&pane.id);
                             self.cards.remove(&pane.id);
@@ -1858,6 +1938,19 @@ impl Cagents {
                         }
                         current.width_fraction = pane.width_fraction;
                         current.kind = kind;
+                    }
+                    if replaces_draft
+                        && let (CardKind::Chat(previous), CardKind::Chat(replacement)) =
+                            (&card.kind, &pane.kind)
+                    {
+                        // A peer's accepted draft edit is an explicit identity
+                        // replacement here too. An ordinary snapshot correctly
+                        // refuses to silently change a card's provider or id.
+                        self.shared_views.chat_replacements.push((
+                            pane.id,
+                            previous.id,
+                            replacement.clone(),
+                        ));
                     }
                     // Publishing a locally opened chat can echo its pane
                     // before the provider handshake creates a runtime. Its

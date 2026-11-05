@@ -1,4 +1,4 @@
-//! Session layout before protocol129, used only by qualified source inspectors.
+//! Frozen Session layout for explicitly qualified legacy source protocols.
 //! Keep the launch fields frozen: postcard does not delimit nested structs.
 use crate::{
     agent::Provider,

@@ -634,6 +634,19 @@ impl SessionRuntime {
         adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
         restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     ) {
+        self.snapshot_shared_panes(state, adoptions, restorations, Vec::new());
+    }
+
+    /// Records explicit shared draft replacements before saving the completed
+    /// projection. Queue them with terminal migrations under one lock so no
+    /// snapshot can overtake the identity operations it requires.
+    pub(crate) fn snapshot_shared_panes(
+        &self,
+        state: Arc<WorkspaceState>,
+        adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
+        restorations: Vec<crate::persistence::TerminalPaneRestoration>,
+        chats: Vec<(CardId, TerminalId, crate::chat::Session)>,
+    ) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
@@ -648,6 +661,17 @@ impl SessionRuntime {
                 queue
                     .conversions
                     .push_back(ConversionCheckpoint::Snapshot(previous));
+            }
+            for (card_id, expected_terminal_id, replacement) in chats {
+                queue
+                    .conversions
+                    .push_back(ConversionCheckpoint::IdentityReplacement(
+                        IdentityReplacement {
+                            card_id,
+                            expected_terminal_id,
+                            replacement: Replacement::Chat(replacement),
+                        },
+                    ));
             }
             queue
                 .conversions

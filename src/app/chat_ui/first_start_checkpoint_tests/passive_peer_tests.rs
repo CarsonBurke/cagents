@@ -153,19 +153,21 @@ fn request(stream: &mut UnixStream) -> ClientEnvelope {
     assert_eq!(request.proof, Some(proof()));
     request
 }
-fn handshake(stream: &mut UnixStream) {
+fn handshake(stream: &mut UnixStream) -> Option<HostSessionProof> {
     stream.set_read_timeout(Some(WAIT)).unwrap();
     stream.set_write_timeout(Some(WAIT)).unwrap();
     let request: ClientEnvelope = crate::terminal_ipc::read_frame(stream).unwrap().unwrap();
     assert_eq!(request.version, PROTOCOL_VERSION);
     assert_eq!(request.proof, None);
-    assert!(matches!(
-        request.request,
-        ClientRequest::Connect {
-            expected_host: None,
-            ..
-        }
-    ));
+    let ClientRequest::Connect {
+        expected_host,
+        resume,
+    } = request.request
+    else {
+        panic!("the private endpoint requires a Connect handshake");
+    };
+    assert!(resume.is_empty());
+    assert!(expected_host.is_none() || expected_host == Some(proof()));
     respond(
         stream,
         request.request_id,
@@ -174,10 +176,12 @@ fn handshake(stream: &mut UnixStream) {
             resumed: vec![],
         },
     );
+    expected_host
 }
 
 #[derive(Default)]
 struct Observed {
+    connects: Vec<Option<HostSessionProof>>,
     lists: usize,
     chat_lists: usize,
     attaches: Vec<chat::Session>,
@@ -194,8 +198,40 @@ fn cleanup_peer(
     listener.set_nonblocking(true).unwrap();
     let sockets = Arc::new(Mutex::new(Vec::new()));
     let owned = sockets.clone();
+    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping_worker = stopping.clone();
     let (stop, stopped) = mpsc::channel();
     let worker = std::thread::spawn(move || {
+        macro_rules! send {
+            ($stream:expr, $id:expr, $response:expr) => {{
+                let result = crate::terminal_ipc::write_frame(
+                    $stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some($id),
+                        proof: proof(),
+                        message: ServerMessage::Response {
+                            response: $response,
+                        },
+                    },
+                );
+                match result {
+                    Ok(()) => {}
+                    Err(crate::terminal_ipc::FrameError::Io(error))
+                        if stopping_worker.load(std::sync::atomic::Ordering::Acquire)
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::NotConnected
+                            ) =>
+                    {
+                        return;
+                    }
+                    Err(error) => panic!("private passive response failed: {error}"),
+                }
+            }};
+        }
         for _ in 0..8_000 {
             if stopped.try_recv().is_ok() {
                 return;
@@ -211,9 +247,30 @@ fn cleanup_peer(
                 Err(error) => panic!("private accept failed: {error}"),
             };
             owned.lock().unwrap().push(stream.try_clone().unwrap());
-            handshake(&mut stream);
+            let expected = handshake(&mut stream);
+            observed.lock().unwrap().connects.push(expected.clone());
             for _ in 0..8 {
-                let request = request(&mut stream);
+                // Protocol verification uses a handshake-only connection.
+                // EOF there is normal; attachment requests below still pass
+                // through the production client and exact proof checks.
+                let request: ClientEnvelope = match crate::terminal_ipc::read_frame(&mut stream) {
+                    Ok(Some(request)) => request,
+                    Ok(None) => break,
+                    Err(crate::terminal_ipc::FrameError::Io(error))
+                        if stopping_worker.load(std::sync::atomic::Ordering::Acquire)
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::NotConnected
+                            ) =>
+                    {
+                        return;
+                    }
+                    Err(error) => panic!("private passive request failed: {error}"),
+                };
+                assert_eq!(request.version, PROTOCOL_VERSION);
+                assert_eq!(request.proof, Some(proof()));
                 let response = match request.request {
                     ClientRequest::List => {
                         observed.lock().unwrap().lists += 1;
@@ -233,35 +290,55 @@ fn cleanup_peer(
                         }
                     }
                     ClientRequest::ChatAttach { session } => {
-                        let (expected, snapshot) = live.lock().unwrap().clone().unwrap();
+                        let (canonical, snapshot) = live.lock().unwrap().clone().unwrap();
                         assert_eq!(
-                            session, expected,
+                            session, canonical,
                             "cleanup attaches the live inventory's exact descriptor"
                         );
+                        if expected.is_some() {
+                            assert_eq!(expected, canonical.proof);
+                        }
                         observed.lock().unwrap().attaches.push(session.clone());
                         ServerResponse::ChatAttached { session, snapshot }
+                    }
+                    ClientRequest::ChatVisibility { chat_id, .. } => {
+                        assert_eq!(chat_id, live.lock().unwrap().as_ref().unwrap().0.id);
+                        ServerResponse::Accepted
+                    }
+                    ClientRequest::ChatRead { chat_id, .. } => {
+                        let (session, snapshot) = live.lock().unwrap().clone().unwrap();
+                        assert_eq!(chat_id, session.id);
+                        ServerResponse::ChatSnapshot {
+                            chat_id,
+                            snapshot: Some(snapshot),
+                        }
+                    }
+                    ClientRequest::ChatDetach { chat_id } => {
+                        assert_eq!(chat_id, live.lock().unwrap().as_ref().unwrap().0.id);
+                        send!(&mut stream, request.request_id, ServerResponse::Detached);
+                        break;
                     }
                     ClientRequest::ChatClose { chat_id } => {
                         let (session, snapshot) = live.lock().unwrap().clone().unwrap();
                         assert_eq!(chat_id, session.id);
                         assert_eq!(observed.lock().unwrap().attaches.last(), Some(&session));
                         observed.lock().unwrap().closes.push(chat_id);
-                        respond(
+                        send!(
                             &mut stream,
                             request.request_id,
-                            ServerResponse::ChatClosed { chat_id, snapshot },
+                            ServerResponse::ChatClosed { chat_id, snapshot }
                         );
                         break;
                     }
                     other => panic!("unexpected cleanup request: {other:?}"),
                 };
-                respond(&mut stream, request.request_id, response);
+                send!(&mut stream, request.request_id, response);
             }
         }
         panic!("private accept loop exhausted its 40-second/count bound");
     });
     WirePeer {
-        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stopping,
         stop: Some(stop),
         sockets,
         worker: Some(worker),
@@ -277,7 +354,7 @@ fn creator_peer(
     let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stopping_worker = stopping.clone();
     let worker = std::thread::spawn(move || {
-        handshake(&mut server);
+        assert_eq!(handshake(&mut server), None);
         server
             .set_read_timeout(Some(Duration::from_secs(15)))
             .unwrap();
@@ -492,6 +569,56 @@ fn outputs(task: Task<Message>, stop_at_command: bool) -> Vec<Message> {
 }
 
 fn run(initialized: bool) {
+    chat::attachment_assets::with_test_image(|first| {
+        let second = chat::attachment_assets::test_image("passive peer second image.png");
+        run_with_peer_draft(initialized, vec![first, second]);
+    });
+}
+
+fn reopen_peer_writer(
+    peer: &mut Cagents,
+    database: &std::path::Path,
+    card: CardId,
+    expected: &chat::Session,
+    draft: &str,
+    images: &[Attachment],
+) {
+    let writer = peer.session.as_ref().unwrap();
+    writer.flush(WAIT).unwrap();
+    assert_eq!(writer.last_error(), None);
+    assert_eq!(stored(peer, card), *expected);
+    let mut writer = peer.session.take().unwrap();
+    writer.shutdown();
+    drop(writer);
+    let (writer, restored) = crate::session::SessionRuntime::open(
+        database,
+        crate::model::BootId::new("passive-peer-save"),
+    )
+    .unwrap();
+    assert!(writer.restore_warnings().is_empty());
+    assert_eq!(writer.last_error(), None);
+    let restored = restored.expect("the passive window has a saved workspace");
+    assert_eq!(restored.id, peer.durable.id);
+    assert_eq!(restored.cards.len(), 1);
+    assert_eq!(restored.cards[0].id, card);
+    assert!(restored.cards[0].existence.is_open());
+    assert_eq!(restored.cards[0].kind, CardKind::Chat(expected.clone()));
+    assert_eq!(
+        restored.chat_drafts.get(&card).map(String::as_str),
+        Some(draft)
+    );
+    assert_eq!(
+        restored
+            .chat_draft_attachments
+            .get(&card)
+            .map(Vec::as_slice),
+        Some(images)
+    );
+    assert!(restored.pending_chat_admissions.is_empty());
+    peer.session = Some(writer);
+}
+
+fn run_with_peer_draft(initialized: bool, images: Vec<Attachment>) {
     let runtime_root = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
     let socket = crate::terminal::ipc::daemon_socket_path().unwrap();
     assert!(
@@ -589,6 +716,13 @@ fn run(initialized: bool) {
     // A passive peer already shows A in the same canonical pane. Its scope is
     // offscreen, avoiding window/lifecycle tasks while retaining real projection.
     let mut peer = crate::app::tests::context_inspector_test_app(false);
+    let peer_database = directory.path().join("peer.sqlite3");
+    let (writer, _) = crate::session::SessionRuntime::open(
+        &peer_database,
+        crate::model::BootId::new("passive-peer-save"),
+    )
+    .unwrap();
+    peer.session = Some(writer);
     peer.durable = creator.durable.clone();
     Arc::make_mut(&mut peer.durable).active_channel = None;
     peer.workspace_model = creator.workspace_model.clone();
@@ -597,6 +731,26 @@ fn run(initialized: bool) {
     peer.acknowledge_view_edit(scope.clone(), None);
     drop(peer.reconcile_shared_views());
     assert!(peer.chat_ui.retiring.is_empty());
+    let peer_draft = format!(
+        "Unsent peer text stays here  \n{} {}\n  Unicode λ and trailing spaces  ",
+        images[0].reference.as_ref().unwrap().token(),
+        images[1].reference.as_ref().unwrap().token(),
+    );
+    if let Some(CardRuntime::Chat(runtime)) = peer.cards.get_mut(&card) {
+        runtime.replace_draft(text_editor::Content::with_text(&peer_draft));
+        runtime.replace_attachments(images.clone());
+    }
+    peer.persist();
+    // A must be on disk before B appears. Otherwise an initial coalesced
+    // snapshot would hide the ordinary identity-save refusal on this peer.
+    reopen_peer_writer(
+        &mut peer,
+        &peer_database,
+        card,
+        &source,
+        &peer_draft,
+        &images,
+    );
 
     drop(creator.handle_chat_ui(Action::Composer(
         target,
@@ -746,10 +900,32 @@ fn run(initialized: bool) {
         accepted.launch.session_id
     );
 
-    if initialized {
-        // Actual creator publication now supplies initialized B. A passive peer
-        // receiving this descriptor goes to ordinary Restore/Starting, never
-        // auto-retirement. Do not poll that guarded daemon-discovery task.
+    if let Some(delayed) = delayed {
+        for message in outputs(delayed, false) {
+            assert!(
+                matches!(
+                    &message,
+                    Message::ChatUi(Action::Retired(_, Ok(())) | Action::DraftSkills(..))
+                ),
+                "unexpected peer task output: {message:?}"
+            );
+            // Apply discovery replies, dropping follow-on work before another
+            // connection could run. This first projection remains a draft.
+            drop(peer.update(message));
+        }
+        let writer = peer.session.as_ref().unwrap();
+        writer.flush(WAIT).unwrap();
+        assert_eq!(writer.last_error(), None);
+        assert_eq!(stored(&peer, card), candidate);
+        assert_eq!(runtime(&peer, card).composer.text(), peer_draft);
+        assert_eq!(runtime(&peer, card).attachments, images);
+        assert!(!peer.chat_start_pending(card));
+    }
+    {
+        // Both watcher orders must attach actual initialized B: direct A -> B
+        // and A -> unstarted B -> initialized B with the same session id.
+        // Keep whichever unstarted source reached disk until exact Ready.
+        let saved_source = if initialized { &source } else { &candidate };
         let initialized_pane = std::iter::from_fn(|| published.try_recv().ok())
             .filter_map(|edit| match edit {
                 ModelEdit::ChangeView {
@@ -763,6 +939,7 @@ fn run(initialized: bool) {
             .last()
             .expect("creator must really publish initialized B");
         view.panes = vec![initialized_pane];
+        view.revision += 1;
         peer.workspace_model.views = vec![view];
         let attach = peer.reconcile_shared_views();
         assert!(
@@ -770,20 +947,147 @@ fn run(initialized: bool) {
             "initialized peer Restore must not schedule retirement"
         );
         assert!(peer.chat_start_matches(card, &accepted));
-        drop(attach);
-    } else {
-        for message in outputs(delayed.unwrap(), false) {
-            assert!(
-                matches!(
-                    &message,
-                    Message::ChatUi(Action::Retired(_, Ok(())) | Action::DraftSkills(..))
-                ),
-                "unexpected peer task output: {message:?}"
+        assert!(peer.chat_ui.explicit_starts.is_empty());
+        assert!(peer.chat_ui.draft_checkpoints.is_empty());
+        let writer = peer.session.as_ref().unwrap();
+        writer.flush(WAIT).unwrap();
+        assert_eq!(writer.last_error(), None);
+        assert_eq!(&stored(&peer, card), saved_source);
+        // A repeated watcher and ordinary autosave must not commit B before
+        // the held attachment completes, or create another passive attempt.
+        let attachment_target = peer.chat_ui.attempt(card).unwrap().target;
+        drop(peer.reconcile_shared_views());
+        peer.persist();
+        peer.session.as_ref().unwrap().flush(WAIT).unwrap();
+        assert_eq!(peer.session.as_ref().unwrap().last_error(), None);
+        assert_eq!(&stored(&peer, card), saved_source);
+        let held = peer
+            .session
+            .as_ref()
+            .unwrap()
+            .operation_store()
+            .load_workspace(peer.durable.id, None)
+            .unwrap()
+            .unwrap();
+        assert!(held.pending_chat_admissions.is_empty());
+        assert_eq!(
+            peer.persistent_workspace().pending_chat_admissions,
+            held.pending_chat_admissions
+        );
+        if initialized {
+            // A cold window reconstructs from ordinary saved A, not the old
+            // map or its weak writer identity. It must prove canonical B anew.
+            let cold_database = directory.path().join("peer-cold.sqlite3");
+            crate::persistence::StateStore::copy_snapshot(&peer_database, &cold_database).unwrap();
+            let (writer, restored) = crate::session::SessionRuntime::open(
+                &cold_database,
+                crate::model::BootId::new("passive-peer-save"),
+            )
+            .unwrap();
+            assert!(writer.restore_warnings().is_empty());
+            let restored = restored.unwrap();
+            assert!(restored.pending_chat_admissions.is_empty());
+            assert_eq!(restored.cards[0].kind, CardKind::Chat(source.clone()));
+            let mut cold = crate::app::tests::context_inspector_test_app(false);
+            cold.chat_ui = crate::app::chat_ui::State::with_draft_attachments(
+                restored.chat_drafts.clone(),
+                restored.chat_draft_attachments.clone(),
             );
-            // Apply task replies, dropping any follow-on work before another
-            // discovery path could run. The actual cleanup already completed.
+            cold.durable = Arc::new(restored);
+            cold.workspace = Cagents::rebuild_workspace(&cold.durable);
+            cold.workspace_model = peer.workspace_model.clone();
+            cold.shared_views = crate::app::shared_views::State::for_workspace(&cold.durable);
+            cold.session = Some(writer);
+            assert!(cold.shared_views.attached.contains(&card));
+            // Match application restoration: a saved shared pane first shows
+            // its local bytes behind the ordinary shared-admission barrier.
+            cold.await_shared_chat_admission(card, source.clone());
+            assert!(cold.chat_awaiting_admission(card));
+            assert_eq!(runtime(&cold, card).composer.text(), peer_draft);
+            assert_eq!(runtime(&cold, card).attachments, images);
+            cold.publish_view_changes();
+            cold.acknowledge_view_edit(scope.clone(), None);
+            let attach = cold.reconcile_shared_views();
+            let attempt = cold.chat_ui.attempt(card).unwrap();
+            assert_eq!(attempt.intent, chat::Intent::Restore);
+            assert_eq!(attempt.session, accepted);
+            assert!(attempt.recovery.is_none() && attempt.upgrade_admission.is_none());
+            let pending = &cold.chat_ui.shared_draft_attachments[&card];
+            assert_eq!(pending.source, source);
+            assert_eq!(pending.canonical, accepted);
+            assert!(!cold.chat_awaiting_admission(card));
+            assert_eq!(cold.durable.cards.len(), 1, "no retained source copy");
+            assert!(cold.durable.local_only_cards.is_empty());
+            assert!(cold.chat_ui.explicit_starts.is_empty());
+            assert!(cold.chat_ui.draft_checkpoints.is_empty());
+            assert!(cold.chat_ui.retiring.is_empty() && cold.chat_ui.abandoned.is_empty());
+            assert!(
+                cold.persistent_workspace()
+                    .pending_chat_admissions
+                    .is_empty()
+            );
+            cold.session.as_ref().unwrap().flush(WAIT).unwrap();
+            assert_eq!(cold.session.as_ref().unwrap().last_error(), None);
+            assert_eq!(stored(&cold, card), source);
+            drop(attach); // reserve only; never poll another connection
+        }
+        assert_eq!(
+            peer.chat_ui.attempt(card).unwrap().target,
+            attachment_target
+        );
+        let replies = outputs(attach, false);
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|message| matches!(message, Message::ChatUi(Action::Ready(..))))
+                .count(),
+            1,
+            "the actual framed attachment must return one Ready"
+        );
+        for message in replies {
+            let Message::ChatUi(Action::Ready(target, ready)) = &message else {
+                panic!("only the shared attachment's Ready is expected");
+            };
+            assert_eq!(*target, attachment_target);
+            {
+                let reply = ready.0.lock().unwrap();
+                let handle = reply.as_ref().unwrap().as_ref().unwrap();
+                assert_eq!(handle.session(), accepted);
+                assert_eq!(handle.proof(), accepted.proof);
+                assert!(handle.has_observed_user_item());
+            }
             drop(peer.update(message));
         }
+        let shown = runtime(&peer, card);
+        assert_eq!(shown.session, accepted);
+        assert!(shown.handle().is_some());
+        assert_eq!(shown.composer.text(), peer_draft);
+        assert_eq!(shown.attachments, images);
+        assert!(shown.queued.is_none() && shown.pending.is_none());
+        assert!(shown.followups.is_empty());
+        assert!(!peer.chat_start_pending(card));
+        assert!(peer.chat_ui.retiring.is_empty() && peer.chat_ui.abandoned.is_empty());
+        assert!(peer.chat_ui.explicit_starts.is_empty());
+        assert!(peer.chat_ui.draft_checkpoints.is_empty());
+        peer.persist();
+        reopen_peer_writer(
+            &mut peer,
+            &peer_database,
+            card,
+            &accepted,
+            &peer_draft,
+            &images,
+        );
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.attaches, vec![accepted.clone()]);
+        assert_eq!(
+            seen.connects
+                .iter()
+                .filter(|expected| expected.is_some())
+                .collect::<Vec<_>>(),
+            vec![&Some(proof())],
+            "the shared Restore pins the complete canonical daemon proof"
+        );
     }
     cleanup.finish();
     creator_wire.finish();
@@ -800,9 +1104,194 @@ fn run(initialized: bool) {
     );
 }
 
+/// Isolate draft projection from the writer. An unstarted replacement can
+/// carry the editor locally; an initialized replacement must wait for storage.
+/// Neither path may acquire provider or retirement authority.
+fn peer_replacement_without_writer(initialized: bool) {
+    chat::attachment_assets::with_test_image(|first| {
+        let second = chat::attachment_assets::test_image("second peer image.png");
+        let images = vec![first, second];
+        let draft = format!(
+            "Keep this peer draft  \n{} {}\n  Unicode λ and trailing spaces  ",
+            images[0].reference.as_ref().unwrap().token(),
+            images[1].reference.as_ref().unwrap().token(),
+        );
+        let (mut app, _directory, card, target) = fixture_for_provider(Provider::Claude);
+        // The fixture's source is valid and saved. Isolate the subsequent
+        // in-memory projection from unrelated identity-save quarantine.
+        drop(app.session.take());
+        let source = runtime(&app, card).session.clone();
+        assert!(source.is_unstarted());
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.replace_draft(text_editor::Content::with_text(&draft));
+            runtime.replace_attachments(images.clone());
+        }
+        let channel = crate::model::ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(crate::model::ProjectChannel {
+                id: channel,
+                project_id: crate::model::ProjectId::new(),
+                title: "Peer composer projection".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+                shared: true,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        let scope = Scope::Channel(channel);
+        let mut view = View::empty(channel);
+        view.revision = 1;
+        view.panes
+            .push(Pane::from_card(app.card_state(card).unwrap(), None).unwrap());
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.views = vec![view.clone()];
+        // Establish the actual local baseline before the peer changes its
+        // existing pane; this is neither an alias nor a recovery admission.
+        app.publish_view_changes();
+        app.acknowledge_view_edit(scope.clone(), None);
+        drop(app.reconcile_shared_views());
+        assert_eq!(runtime(&app, card).target, target);
+        assert_eq!(runtime(&app, card).composer.text(), draft);
+        assert_eq!(runtime(&app, card).attachments, images);
+        assert!(app.chat_ui.retiring.is_empty());
+
+        let mut canonical = source.clone();
+        canonical.id = TerminalId::new();
+        if initialized {
+            canonical.proof = Some(proof());
+            canonical.launch.session_id = Some("17570000-0000-4000-8000-000000000003".into());
+        }
+        assert_ne!(canonical.id, source.id);
+        assert_eq!(canonical.is_unstarted(), !initialized);
+        view.revision += 1;
+        view.panes[0].kind = CardKind::Chat(canonical.clone());
+        app.workspace_model.views = vec![view];
+        let projection = app.reconcile_shared_views();
+        let expected = if initialized { source } else { canonical };
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(expected.clone())
+        );
+        assert!(
+            app.chat_ui.retiring.is_empty(),
+            "replacement grants no retirement authority"
+        );
+        assert!(
+            app.chat_ui.abandoned.is_empty(),
+            "no creator start was abandoned here"
+        );
+        assert!(
+            app.chat_ui.draft_checkpoints.is_empty(),
+            "no local Send was requested"
+        );
+        assert!(app.chat_ui.explicit_starts.is_empty());
+        // A complete host proof still cannot confirm a replacement without
+        // its writer. Keep A and the editor, reserving no passive attempt.
+        if initialized {
+            assert_eq!(runtime(&app, card).target, target);
+        }
+        drop(projection); // never connect to a daemon or provider
+        assert!(!app.chat_start_pending(card));
+        assert!(app.chat_ui.shared_draft_attachments.is_empty());
+        let shown = runtime(&app, card);
+        assert_eq!(shown.session, expected);
+        assert_eq!(shown.composer.text(), draft, "initialized: {initialized}");
+        assert_eq!(shown.attachments, images, "initialized: {initialized}");
+        assert!(shown.queued.is_none() && shown.pending.is_none());
+        assert!(shown.followups.is_empty() && shown.history.is_empty());
+        assert!(!shown.closed_elsewhere);
+        assert!(app.chat_ui.retiring.is_empty() && app.chat_ui.abandoned.is_empty());
+        assert!(!app.chat_start_pending(card));
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.chat_drafts.get(&card), Some(&draft));
+        assert_eq!(saved.chat_draft_attachments.get(&card), Some(&images));
+        assert!(!saved.local_only_cards.contains(&card));
+        assert!(
+            matches!(&saved.cards.iter().find(|state| state.id == card).unwrap().kind,
+                CardKind::Chat(session) if session == &expected)
+        );
+    });
+}
+
+#[test]
+fn passive_session_replacement_keeps_the_local_unsent_text_and_images() {
+    peer_replacement_without_writer(false);
+}
+
+#[test]
+fn initialized_peer_without_storage_keeps_its_draft_without_attaching() {
+    peer_replacement_without_writer(true);
+}
+
 #[test]
 fn passive_unstarted_peer_restore_cannot_close_creator_accepted_first_prompt() {
     isolated(false);
+}
+
+#[test]
+fn initialized_peer_without_complete_canonical_proof_keeps_its_saved_draft() {
+    let mut incomplete = proof();
+    incomplete.host_incarnation = crate::model::HostIncarnation::new("");
+    assert!(!incomplete.is_complete());
+    for canonical_proof in [None, Some(incomplete)] {
+        let (mut app, _directory, card, _target) = fixture_for_provider(Provider::Claude);
+        let source = runtime(&app, card).session.clone();
+        let draft = runtime(&app, card).composer.text();
+        let images = runtime(&app, card).attachments.clone();
+        let channel = crate::model::ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(crate::model::ProjectChannel {
+                id: channel,
+                project_id: ProjectId::new(),
+                title: "Waiting for peer proof".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+                shared: true,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        let scope = Scope::Channel(channel);
+        let mut view = View::empty(channel);
+        view.revision = 1;
+        view.panes
+            .push(Pane::from_card(app.card_state(card).unwrap(), None).unwrap());
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.views = vec![view.clone()];
+        app.publish_view_changes();
+        app.acknowledge_view_edit(scope.clone(), None);
+        drop(app.reconcile_shared_views());
+        app.session.as_ref().unwrap().flush(WAIT).unwrap();
+        assert_eq!(app.session.as_ref().unwrap().last_error(), None);
+        assert_eq!(stored(&app, card), source);
+
+        let mut canonical = source.clone();
+        canonical.id = TerminalId::new();
+        canonical.launch.session_id = Some("17570000-0000-4000-8000-000000000004".into());
+        canonical.proof = canonical_proof;
+        assert!(!canonical.is_unstarted());
+        view.revision += 1;
+        view.panes[0].kind = CardKind::Chat(canonical);
+        app.workspace_model.views = vec![view];
+        // Even the unpolled task may not reserve a Start/Restore attempt:
+        // this descriptor has not established its authoritative host.
+        drop(app.reconcile_shared_views());
+        assert!(!app.chat_start_pending(card));
+        assert!(app.chat_ui.shared_draft_attachments.is_empty());
+        assert!(app.chat_ui.draft_checkpoints.is_empty());
+        assert!(app.chat_ui.explicit_starts.is_empty());
+        assert!(app.chat_ui.retiring.is_empty() && app.chat_ui.abandoned.is_empty());
+        let shown = runtime(&app, card);
+        assert_eq!(shown.session, source);
+        assert_eq!(shown.composer.text(), draft);
+        assert_eq!(shown.attachments, images);
+        assert!(shown.queued.is_none() && shown.pending.is_none());
+        app.persist();
+        app.session.as_ref().unwrap().flush(WAIT).unwrap();
+        assert_eq!(app.session.as_ref().unwrap().last_error(), None);
+        assert_eq!(stored(&app, card), source);
+    }
 }
 
 #[test]

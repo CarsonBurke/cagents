@@ -7573,10 +7573,11 @@ impl Cagents {
         if let Some(session) = &self.session {
             let adoptions = std::mem::take(&mut self.shared_views.adoptions);
             let restorations = std::mem::take(&mut self.shared_views.restorations);
-            if adoptions.is_empty() && restorations.is_empty() {
+            let chats = std::mem::take(&mut self.shared_views.chat_replacements);
+            if adoptions.is_empty() && restorations.is_empty() && chats.is_empty() {
                 session.snapshot(saved);
             } else {
-                session.snapshot_terminal_panes(saved, adoptions, restorations);
+                session.snapshot_shared_panes(saved, adoptions, restorations, chats);
             }
         }
     }

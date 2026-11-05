@@ -223,6 +223,332 @@ fn listed_model(id: &str) -> crate::chat::Model {
     }
 }
 
+struct StoredDraftWindow {
+    app: Cagents,
+    directory: tempfile::TempDir,
+    published: async_channel::Receiver<ModelEdit>,
+    draft: &'static str,
+}
+
+impl StoredDraftWindow {
+    fn assert_draft(&mut self, card: CardId, expected: &crate::chat::Session) {
+        assert!(expected.is_unstarted());
+        assert_eq!(chat_session(&self.app, card), *expected);
+        // This helper also requires a draft connection with no queued send.
+        assert_eq!(
+            crate::app::chat_ui::draft_launch_for_test(&self.app, card).1,
+            *expected
+        );
+        assert_eq!(
+            crate::app::chat_ui::draft_model_for_test(&self.app, card),
+            expected.launch.draft_model
+        );
+        assert!(!self.app.chat_start_pending(card));
+        assert!(!self.app.chat_ui.transition_pending());
+        assert!(self.app.durable.pending_chat_admissions.is_empty());
+        assert!(self.app.shared_views.closed_chats.is_empty());
+        assert_eq!(
+            self.app.persistent_workspace().chat_drafts.get(&card),
+            Some(&self.draft.to_owned())
+        );
+    }
+
+    fn assert_quiet(&self) {
+        assert!(self.app.shared_views.pending.is_empty());
+        assert!(
+            self.published.try_recv().is_err(),
+            "adopting or acknowledging a shared choice must not publish another edit"
+        );
+    }
+
+    fn reopen(&mut self, card: CardId, expected: &crate::chat::Session) {
+        // Finish the real writer before reopening its database. In particular,
+        // the original source must have landed before testing a provider move;
+        // coalescing it with the replacement would conceal storage's refusal.
+        assert_eq!(
+            stored(&self.app, card).kind,
+            CardKind::Chat(expected.clone())
+        );
+        let mut writer = self.app.session.take().unwrap();
+        writer.shutdown();
+        drop(writer);
+        let (writer, restored) = crate::session::SessionRuntime::open(
+            self.directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot-test"),
+        )
+        .unwrap();
+        assert!(writer.restore_warnings().is_empty());
+        assert_eq!(writer.last_error(), None);
+        let restored = restored.expect("the shared draft workspace was saved");
+        assert_eq!(restored.id, self.app.durable.id);
+        assert_eq!(restored.cards.len(), 1);
+        assert_eq!(restored.cards[0].id, card);
+        assert_eq!(restored.cards[0].kind, CardKind::Chat(expected.clone()));
+        assert!(restored.cards[0].existence.is_open());
+        assert_eq!(
+            restored.chat_drafts.get(&card),
+            Some(&self.draft.to_owned())
+        );
+        assert!(restored.pending_chat_admissions.is_empty());
+        self.app.session = Some(writer);
+        self.assert_draft(card, expected);
+    }
+}
+
+/// Two windows start from the same valid descriptor but own independent
+/// databases, writers and unsent text. No provider or daemon task is polled.
+fn stored_draft_windows() -> ([StoredDraftWindow; 2], Scope, View, CardId) {
+    let (mut author, scope, author_directory) = shared_channel_app();
+    let (mut peer, _, peer_directory) = shared_channel_app();
+    let project = author_directory.path().join("project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    drop(author.new_native_chat(Provider::Claude, Some(project)));
+    let card = author.workspace.focused().unwrap();
+    let original = chat_session(&author, card);
+    let view = accept_local_view(&mut author, &scope);
+    assert_eq!(view.panes.len(), 1);
+
+    peer.durable = author.persistent_workspace();
+    peer.workspace = Cagents::rebuild_workspace(&peer.durable);
+    peer.workspace_model = author.workspace_model.clone();
+    peer.shared_views = State::for_workspace(&peer.durable);
+    peer.shared_views.initialized.insert(scope.clone());
+    drop(peer.reconcile_shared_views());
+
+    let mut windows = [
+        (
+            author,
+            author_directory,
+            "Window A keeps this unsent draft.",
+        ),
+        (
+            peer,
+            peer_directory,
+            "Window B keeps a different unsent draft.",
+        ),
+    ]
+    .map(|(mut app, directory, draft)| {
+        for provider in [Provider::Claude, Provider::Omp] {
+            drop(app.observe_listed_models(
+                provider,
+                vec![listed_model("model-a"), listed_model("model-b")],
+            ));
+        }
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            panic!("the shared pane opens as a draft");
+        };
+        let target = runtime.target;
+        drop(app.handle_chat_ui(Action::Composer(
+            target,
+            cosmic::widget::text_editor::Action::Edit(cosmic::widget::text_editor::Edit::Paste(
+                Arc::new(draft.into()),
+            )),
+        )));
+        app.persist();
+        let (sender, published) = async_channel::unbounded();
+        app.workspace_model_tx = sender;
+        StoredDraftWindow {
+            app,
+            directory,
+            published,
+            draft,
+        }
+    });
+    for window in &mut windows {
+        window.reopen(card, &original);
+        window.assert_quiet();
+    }
+    (windows, scope, view, card)
+}
+
+/// Accept the actual typed edits the choosing window published, rather than
+/// constructing a descriptor that bypasses its model/effort reducer.
+fn accept_draft_choice(window: &mut StoredDraftWindow, view: &mut View, card: CardId) {
+    let changes = window.app.shared_views.pending.clone();
+    assert!(!changes.is_empty(), "the local choice must be published");
+    let mut published = Vec::new();
+    while let Ok(edit) = window.published.try_recv() {
+        let ModelEdit::ChangeView {
+            operation,
+            scope,
+            change,
+            ..
+        } = edit
+        else {
+            panic!("a draft choice publishes only its pane update");
+        };
+        published.push((operation, scope, change));
+    }
+    assert_eq!(published, changes);
+    for (operation, scope, change) in published {
+        assert_eq!(scope, view.scope);
+        assert!(matches!(&change, Change::Update { pane, .. } if pane.id == card));
+        assert!(view.apply(&change).unwrap());
+        view.revision += 1;
+        window.app.acknowledge_view_edit(scope, Some(operation));
+    }
+    assert!(window.app.shared_views.pending.is_empty());
+}
+
+#[test]
+fn shared_draft_choices_survive_independent_writers_and_reopen_without_republishing() {
+    let (mut windows, _scope, mut view, card) = stored_draft_windows();
+    let original = chat_session(&windows[0].app, card);
+    // Alternate the choosing window: both writers must accept a passive
+    // provider move, as well as model, effort and provider-default updates.
+    for (owner, provider, model, reasoning) in [
+        (0, Provider::Claude, Some("model-a"), Some("high")),
+        (1, Provider::Claude, Some("model-b"), Some("high")),
+        (0, Provider::Claude, Some("model-b"), Some("low")),
+        (1, Provider::Omp, Some("model-b"), Some("high")),
+        (0, Provider::Claude, Some("model-a"), Some("high")),
+        (1, Provider::Claude, None, None),
+    ] {
+        let app = &mut windows[owner].app;
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            panic!("the pane remains a draft");
+        };
+        let target = runtime.target;
+        drop(app.handle_chat_ui(Action::DraftModel(
+            target,
+            provider,
+            model.map(str::to_owned),
+        )));
+        if let (Some(model), Some(reasoning)) = (model, reasoning) {
+            drop(app.handle_chat_ui(Action::Reasoning(target, model.into(), reasoning.into())));
+        }
+        let chosen = chat_session(app, card);
+        assert_eq!(chosen.id, original.id);
+        assert_eq!(chosen.launch.provider, provider);
+        assert_eq!(
+            chosen.launch.draft_model,
+            model.map(|model| crate::chat::DraftModel {
+                model: model.into(),
+                reasoning: reasoning.map(str::to_owned),
+            })
+        );
+        accept_draft_choice(&mut windows[owner], &mut view, card);
+        assert_eq!(view.panes[0].kind, CardKind::Chat(chosen.clone()));
+
+        for window in &mut windows {
+            window.app.workspace_model.views = vec![view.clone()];
+            drop(window.app.reconcile_shared_views());
+            window.assert_draft(card, &chosen);
+            window.assert_quiet();
+            window.reopen(card, &chosen);
+            // Repeating the same watcher snapshot and a later ordinary save
+            // neither quarantines the writer nor echoes the accepted choice.
+            drop(window.app.reconcile_shared_views());
+            window.app.persist();
+            assert_eq!(
+                stored(&window.app, card).kind,
+                CardKind::Chat(chosen.clone())
+            );
+            window.assert_draft(card, &chosen);
+            window.assert_quiet();
+        }
+    }
+}
+
+/// Poll only the real writer's receipt, never a provider-start task. Keep its
+/// reducer message undelivered so a peer projection can supersede the save.
+fn saved_draft_receipt(task: Task<Message>) -> Message {
+    use cosmic::iced::futures::StreamExt;
+
+    std::thread::spawn(move || {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let mut stream = cosmic::iced::runtime::task::into_stream(task).expect("save task");
+            while let Some(action) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                    .await
+                    .expect("the real writer must settle")
+            {
+                if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                    message @ Message::ChatUi(Action::DraftStartCheckpointed(..)),
+                )) = action
+                {
+                    return message;
+                }
+            }
+            panic!("save task did not return its checkpoint receipt")
+        })
+    })
+    .join()
+    .expect("the save-only executor must finish")
+}
+
+#[test]
+fn a_peer_provider_choice_supersedes_a_saved_first_send_without_replaying_its_receipt() {
+    let ([mut saving, mut peer], _scope, mut view, card) = stored_draft_windows();
+    let original = chat_session(&saving.app, card);
+    let Some(CardRuntime::Chat(runtime)) = saving.app.cards.get(&card) else {
+        panic!("the pane opens as a draft");
+    };
+    let target = runtime.target;
+    let save = saving
+        .app
+        .handle_chat_ui(Action::Submit(target, crate::chat::PromptMode::Send));
+    assert!(saving.app.chat_start_pending(card));
+    let receipt = saved_draft_receipt(save);
+    assert!(matches!(
+        &receipt,
+        Message::ChatUi(Action::DraftStartCheckpointed(_, _, Ok(())))
+    ));
+    let CardKind::Chat(candidate) = stored(&saving.app, card).kind else {
+        panic!("the first-send checkpoint saved a chat");
+    };
+    assert_ne!(candidate.id, original.id);
+    assert_eq!(candidate.launch, original.launch);
+    assert!(candidate.is_unstarted());
+    assert_eq!(chat_session(&saving.app, card), original);
+    saving.assert_quiet();
+
+    // The peer still sees source A. Its ordinary provider selection publishes
+    // C while the first window has saved B but not accepted B's receipt.
+    let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get(&card) else {
+        panic!("the peer still shows the original draft");
+    };
+    let peer_target = runtime.target;
+    drop(peer.app.handle_chat_ui(Action::DraftModel(
+        peer_target,
+        Provider::Omp,
+        Some("model-b".into()),
+    )));
+    drop(peer.app.handle_chat_ui(Action::Reasoning(
+        peer_target,
+        "model-b".into(),
+        "high".into(),
+    )));
+    let chosen = chat_session(&peer.app, card);
+    assert_eq!(chosen.id, original.id);
+    assert_eq!(chosen.launch.provider, Provider::Omp);
+    accept_draft_choice(&mut peer, &mut view, card);
+    for window in [&mut peer, &mut saving] {
+        window.app.workspace_model.views = vec![view.clone()];
+        drop(window.app.reconcile_shared_views());
+        window.assert_draft(card, &chosen);
+        window.assert_quiet();
+        assert_eq!(
+            stored(&window.app, card).kind,
+            CardKind::Chat(chosen.clone())
+        );
+    }
+
+    // The superseded success carries no remaining permission to start B or
+    // publish it over C, even though its real save had already succeeded.
+    drop(saving.app.update(receipt));
+    for window in [&mut saving, &mut peer] {
+        window.app.persist();
+        window.assert_draft(card, &chosen);
+        window.assert_quiet();
+        window.reopen(card, &chosen);
+    }
+}
+
 #[test]
 fn a_draft_model_and_effort_choice_survive_the_next_shared_projection() {
     let (mut app, scope, _directory) = shared_channel_app();

@@ -446,9 +446,11 @@ impl Client {
 // methods admit full snapshots only for qualified119/127/128/current layouts.
 // Versions 102 (Copy sidecars), 103 (retained Claude continuity) and 104 (the
 // appended Work board request) preserve this subset, including the existing
-// continuity enum discriminants. Protocol127 was the previous matched version;
-// installed128 adds only StartupState request/response variants. Their Session
-// layout is still frozen;129 adds draft_model and uses the current Session.
+// continuity enum discriminants. Protocol127 was the previous matched version.
+// Qualified installed128 (c68275e94) appends StartupState without changing the
+// consumed layouts. A separate private128 appends Provider::Antigravity; unknown
+// provider variants remain rejected. Current148 adds draft_model and uses the
+// current Session. Other private versions have no qualified source mapping.
 pub(super) fn supports_protocol(protocol: u16) -> bool {
     [99, 100, 101, 102, 103, 119, 127, 128, ipc::PROTOCOL_VERSION].contains(&protocol)
 }
@@ -1184,9 +1186,37 @@ mod tests {
     }
 
     #[test]
+    fn installed_128_inventory_rejects_an_unqualified_provider_variant() {
+        let frozen =
+            include_bytes!("../../../tests/fixtures/upgrade-inspection-v100/chat_listed.bin");
+        let mut frame = source_frame_version(frozen, 128);
+        let mut remaining = &frame[4..];
+        assert_eq!(take::<u16>(&mut remaining), 128);
+        assert_eq!(take::<Option<u64>>(&mut remaining), Some(7));
+        assert_eq!(take::<HostSessionProof>(&mut remaining), proof());
+        assert_eq!(take::<u32>(&mut remaining), 0); // ServerMessage::Response.
+        assert_eq!(take::<u32>(&mut remaining), 13); // ChatListed.
+        assert_eq!(take::<usize>(&mut remaining), 1);
+        let _: crate::model::TerminalId = take(&mut remaining);
+        let provider_offset = frame.len() - remaining.len();
+        assert_eq!(
+            take::<crate::agent::Provider>(&mut remaining),
+            crate::agent::Provider::Codex
+        );
+        // The separate Antigravity draft also labels its source128, but its
+        // appended Provider index3 is outside the installed source's schema.
+        frame[provider_offset] = 3;
+        assert!(read_response(&mut frame.as_slice(), 128, false).is_err());
+    }
+
+    #[test]
     fn frozen_inventory_subset_accepts_qualified_legacy_and_current_versions() {
         assert!(!supports_protocol(98));
         assert!(!supports_protocol(ipc::PROTOCOL_VERSION + 1));
+        for protocol in 129..=147 {
+            assert!(!supports_protocol(protocol));
+            assert!(!supports_history_protocol(protocol));
+        }
         assert_eq!(postcard::to_allocvec(&ClientRequest::List).unwrap(), [1]);
         assert_eq!(
             postcard::to_allocvec(&ClientRequest::ChatList).unwrap(),

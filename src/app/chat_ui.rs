@@ -601,6 +601,17 @@ struct DraftStartCheckpoint {
     model: Option<(String, Option<String>)>,
 }
 
+/// A peer started an empty shared draft before this window saw its candidate.
+/// Keep the saved source until an exact, proof-pinned attachment confirms it.
+struct SharedDraftAttachment {
+    source: chat::Session,
+    canonical: chat::Session,
+    writer: std::sync::Weak<crate::persistence::StateStore>,
+    registry: uuid::Uuid,
+    scope: crate::workspace_model::views::Scope,
+    backend: Option<(String, String, String)>,
+}
+
 fn draft_start_backend() -> Option<(String, String, String)> {
     crate::device::selected().map(|device| {
         (
@@ -620,6 +631,7 @@ pub(super) struct State {
     generation: u64,
     phases: HashMap<CardId, Phase>,
     draft_checkpoints: HashMap<CardId, DraftStartCheckpoint>,
+    shared_draft_attachments: HashMap<CardId, SharedDraftAttachment>,
     /// Transient user intent, never an execution proof. Automatic restoration
     /// cannot acquire this permission; an exact failed History start can retry.
     explicit_starts: HashMap<CardId, chat::Session>,
@@ -669,6 +681,7 @@ impl Default for State {
             generation: 0,
             phases: HashMap::new(),
             draft_checkpoints: HashMap::new(),
+            shared_draft_attachments: HashMap::new(),
             explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
@@ -6396,6 +6409,17 @@ impl Cagents {
             .session
             .as_ref()
             .map(|writer| Arc::downgrade(&writer.operation_store()));
+        let shared_draft_sources = self
+            .chat_ui
+            .shared_draft_attachments
+            .iter()
+            .filter(|(_, pending)| {
+                writer_identity
+                    .as_ref()
+                    .is_some_and(|writer| writer.ptr_eq(&pending.writer))
+            })
+            .map(|(card, pending)| (*card, &pending.source))
+            .collect::<HashMap<_, _>>();
         let draft_starts = self
             .chat_ui
             .draft_checkpoints
@@ -6414,6 +6438,7 @@ impl Cagents {
         if defaults.is_empty()
             && draft_starts.is_empty()
             && admission_sources.is_empty()
+            && shared_draft_sources.is_empty()
             && chat_drafts == self.durable.chat_drafts
             && chat_draft_attachments == self.durable.chat_draft_attachments
             && repository_navigation == self.durable.repository_navigation
@@ -6437,6 +6462,13 @@ impl Cagents {
                 saved
                     .pending_chat_admissions
                     .insert(card.id, (**source).clone());
+            }
+            if let Some(source) = shared_draft_sources.get(&card.id) {
+                // A restart loads this ordinary, unstarted source and can
+                // repeat the proof-pinned attachment from the shared view.
+                // It must not enter the distinct daemon-upgrade admission path.
+                card.kind = CardKind::Chat((**source).clone());
+                saved.pending_chat_admissions.remove(&card.id);
             }
         }
         if defaults.is_empty() {
@@ -6942,13 +6974,9 @@ impl Cagents {
             .next()
     }
 
-    pub(super) fn chat_forget(&mut self, card: CardId) {
-        self.chat_ui.explicit_starts.remove(&card);
-        self.chat_ui.capacity_offers.remove(&card);
-        self.release_draft_start_capture(card);
-        // The runtime is about to be dropped, so its unsent text is captured
-        // here rather than lost. `chat_forget` is the single place a chat
-        // runtime stops existing while its card lives on.
+    /// Keeps local editor work before replacing a runtime under the same card.
+    /// Restoring this draft grants no authority to submit or retire a prompt.
+    pub(super) fn capture_chat_draft(&mut self, card: CardId) {
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
             let (draft, images) = runtime.persistent_draft();
             if images.is_empty() {
@@ -6962,6 +6990,13 @@ impl Cagents {
                 self.chat_ui.drafts.insert(card, draft);
             }
         }
+    }
+
+    pub(super) fn chat_forget(&mut self, card: CardId) {
+        self.chat_ui.explicit_starts.remove(&card);
+        self.chat_ui.capacity_offers.remove(&card);
+        self.release_draft_start_capture(card);
+        self.capture_chat_draft(card);
         self.chat_ui.phases.remove(&card);
         self.observe_agent_activity_for_card(card, None);
     }
@@ -7041,6 +7076,102 @@ impl Cagents {
 
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.phases.contains_key(&card)
+    }
+
+    /// A peer can replace a draft before its first connection, but cannot
+    /// borrow an active start's authority. Cancel a still-local save while
+    /// its source is intact so its candidate is rolled back in writer order.
+    pub(super) fn prepare_shared_draft_replacement(&mut self, card: CardId) -> bool {
+        match self.chat_ui.phases.get(&card) {
+            Some(Phase::SavingDraft { .. }) => {
+                self.release_draft_start_capture(card);
+                self.chat_ui.phases.remove(&card);
+                true
+            }
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    /// Supersede only this peer's passive attachment, retaining the original
+    /// empty source for the next canonical draft descriptor.
+    pub(super) fn refresh_shared_draft_attachment(
+        &mut self,
+        card: CardId,
+        scope: &crate::workspace_model::views::Scope,
+        kind: &CardKind,
+    ) -> bool {
+        let Some(pending) = self.chat_ui.shared_draft_attachments.get(&card) else {
+            return true;
+        };
+        if matches!(kind, CardKind::Chat(session) if session == &pending.canonical) {
+            return true;
+        }
+        if !self.is_canonical_shared_chat(scope, card, kind) {
+            return false;
+        }
+        match self.chat_ui.phases.get(&card) {
+            Some(Phase::Starting(attempt))
+                if attempt.intent == chat::Intent::Restore
+                    && attempt.session == pending.canonical => {}
+            Some(_) => return false,
+            None => {}
+        }
+        let pending = self.chat_ui.shared_draft_attachments.remove(&card).unwrap();
+        self.chat_ui.phases.remove(&card);
+        if matches!(kind, CardKind::Chat(_)) {
+            self.capture_chat_draft(card);
+            self.cards.remove(&card);
+            if let Some(state) = self.card_state_mut(card) {
+                state.kind = CardKind::Chat(pending.source);
+            }
+        }
+        true
+    }
+
+    pub(super) fn prepare_shared_draft_attachment(
+        &mut self,
+        card: CardId,
+        scope: &crate::workspace_model::views::Scope,
+        canonical: &chat::Session,
+    ) -> bool {
+        if !canonical
+            .proof
+            .as_ref()
+            .is_some_and(HostSessionProof::is_complete)
+        {
+            self.status = Some(TransientNotice::warning(
+                "Waiting for the shared conversation to confirm its running host. Your draft is retained.",
+            ));
+            return false;
+        }
+        if !self.prepare_shared_draft_replacement(card) {
+            return false;
+        }
+        let Some(writer) = &self.session else {
+            self.status = Some(TransientNotice::warning(
+                "Session storage is unavailable. The shared conversation is waiting; your draft is retained.",
+            ));
+            return false;
+        };
+        let Some(CardKind::Chat(source)) = self.card_state(card).map(|state| &state.kind) else {
+            return false;
+        };
+        if !source.is_unstarted() {
+            return false;
+        }
+        self.chat_ui.shared_draft_attachments.insert(
+            card,
+            SharedDraftAttachment {
+                source: source.clone(),
+                canonical: canonical.clone(),
+                writer: Arc::downgrade(&writer.operation_store()),
+                registry: self.workspace_model.identity,
+                scope: scope.clone(),
+                backend: draft_start_backend(),
+            },
+        );
+        true
     }
     /// A shared echo may arrive before a starting chat has a runtime. Only
     /// the exact attempted descriptor reserves that attachment; a canonical
@@ -7564,6 +7695,18 @@ impl Cagents {
         if self.chat_awaiting_admission(card) {
             return Task::none();
         }
+        let (intent, source, terminate_source) = self
+            .chat_ui
+            .shared_draft_attachments
+            .get(&card)
+            .filter(|pending| pending.canonical == session)
+            .map_or((intent, source, terminate_source), |pending| {
+                (
+                    chat::Intent::Restore,
+                    pending.canonical.proof.clone(),
+                    false,
+                )
+            });
         self.start_chat_with_upgrade(card, session, intent, source, terminate_source, None)
     }
 
@@ -9189,7 +9332,7 @@ impl Cagents {
             }
             Action::Ready(target, ready) => {
                 let result = ready.0.lock().ok().and_then(|mut ready| ready.take());
-                let Some(result) = result else {
+                let Some(mut result) = result else {
                     return Task::none();
                 };
                 if let Some(session) = self.chat_ui.abandoned.remove(&target) {
@@ -9288,6 +9431,44 @@ impl Cagents {
                         return retained.0;
                     }
                     return Task::none();
+                }
+                let shared_draft_attachment = self
+                    .chat_ui
+                    .shared_draft_attachments
+                    .get(&target.card)
+                    .filter(|pending| pending.canonical == attempt.session);
+                let attaching_shared_draft = shared_draft_attachment.is_some();
+                if let Some(pending) = shared_draft_attachment {
+                    let context_matches = self.workspace_model.identity == pending.registry
+                        && self.draft_start_scope(target.card).as_ref() == Some(&pending.scope)
+                        && draft_start_backend() == pending.backend
+                        && self.session.as_ref().is_some_and(|writer| {
+                            pending
+                                .writer
+                                .ptr_eq(&Arc::downgrade(&writer.operation_store()))
+                        })
+                        && self.is_canonical_shared_chat(
+                            &pending.scope,
+                            target.card,
+                            &CardKind::Chat(pending.canonical.clone()),
+                        );
+                    result = match result {
+                        Ok(handle)
+                            if context_matches
+                                && handle.session() == pending.canonical
+                                && handle.proof() == pending.canonical.proof
+                                && handle.snapshot().session_id
+                                    == pending.canonical.launch.session_id =>
+                        {
+                            Ok(handle)
+                        }
+                        Ok(_) => Err(chat::StartFailure::retry(
+                            "The shared conversation changed before its attachment was confirmed. Your draft is retained.",
+                        )),
+                        // A passive attachment may retry its exact host, never
+                        // fall back to creating or retiring a conversation.
+                        Err(failure) => Err(chat::StartFailure::retry(failure.message)),
+                    };
                 }
                 match result {
                     Ok(handle) => {
@@ -9481,7 +9662,25 @@ impl Cagents {
                         }
                         self.chat_ui.explicit_starts.remove(&target.card);
                         self.resolve_notice(NoticeKey::ChatAttach(target.card));
-                        if account_source.is_some() || attempt.upgrade_admission.is_some() {
+                        if attaching_shared_draft {
+                            let pending = self
+                                .chat_ui
+                                .shared_draft_attachments
+                                .remove(&target.card)
+                                .expect("confirmed shared draft attachment");
+                            let mut draft = session.clone();
+                            draft.reset_owned_codex_listener();
+                            draft.launch.session_id = None;
+                            draft.proof = None;
+                            draft.terminal = None;
+                            self.shared_views.chat_replacements.push((
+                                target.card,
+                                pending.source.id,
+                                draft,
+                            ));
+                            self.install_chat_session(target.card, session);
+                            self.persist();
+                        } else if account_source.is_some() || attempt.upgrade_admission.is_some() {
                             // Shared projection may already hold the canonical
                             // descriptor. Still save the confirmed draft and
                             // removal of its pending marker after the receipt.
@@ -9533,10 +9732,11 @@ impl Cagents {
                         ]);
                     }
                     Err(failure)
-                        if matches!(
-                            self.cards.get(&target.card),
-                            Some(CardRuntime::Chat(runtime)) if runtime.is_draft()
-                        ) =>
+                        if !attaching_shared_draft
+                            && matches!(
+                                self.cards.get(&target.card),
+                                Some(CardRuntime::Chat(runtime)) if runtime.is_draft()
+                            ) =>
                     {
                         // A draft whose first message could not start it
                         // stays a draft, with the message back where it was
