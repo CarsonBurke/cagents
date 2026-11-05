@@ -424,9 +424,11 @@ slot here. Commands that compile nothing, such as `metadata`, `tree` or
 `clean`, run here at once. Under `scripts/cargo-gate exec COMMAND`, a `cargo`
 first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
 script of builds, such as the development runner or
-`scripts/build-ceditor-product`, builds there too. On the build host itself,
-or with `CAGENTS_BUILD_REMOTE=local`, commands build here through the local
-slots above.
+`scripts/build-ceditor-product`, builds there too, each command with its own
+admission budget. On the build host itself, or with
+`CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
+above. A gate without `scripts/cargo-offload` beside it refuses to build
+unless `CAGENTS_BUILD_REMOTE=local` is set.
 
 The host has a few build slots under
 `~/.cache/cagents-offload/<repository>/slot-N` (`CAGENTS_BUILD_REMOTE_SLOTS`,
@@ -436,7 +438,12 @@ checkout's tracked and untracked, not ignored, files into a free slot and
 removes the slot's other files. It prefers the slot this worktree used last,
 then one another worktree has built in. A slot's checkout path never changes,
 so a worktree reuses what any other built in that slot and recompiles only
-what differs. A slot is admitted as the gate admits builds here: beside other
+what differs. Files are copied when their content differs, and a copied file
+gets the time it arrives: Cargo judges the checkout's crates, including the
+`[patch]` crates under `vendor/`, by modification time, so keeping this
+checkout's older time would leave another worktree's build of that file in
+place. A slot last leased by a gate from before this rule rebuilds its sources
+once. A slot is admitted as the gate admits builds here: beside other
 running builds, only when the host's available memory, less what those builds
 are expected to take beyond what they already hold, covers this build's
 expected peak, and while the host's memory pressure (`some avg10` in
