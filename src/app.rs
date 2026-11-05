@@ -7580,6 +7580,12 @@ impl Cagents {
     /// [`Self::persist`] that leaves reported titles waiting for their
     /// deferred save held back from shared views.
     fn save_workspace(&mut self) {
+        self.save_workspace_with_view_publication(Self::publish_view_changes);
+    }
+
+    /// Snapshot the active strip before publishing its exact pane projection.
+    /// Shared reconciliation supplies an already projected publication pass.
+    fn save_workspace_with_view_publication(&mut self, publish: impl FnOnce(&mut Self)) {
         self.shared_views.prune_restoration_requests(&self.durable);
         if !self.durable.pending_terminal_creations.is_empty() {
             let open = self
@@ -7598,7 +7604,7 @@ impl Cagents {
         self.focus_save_pending = false;
         #[cfg(test)]
         terminal_output_tests::record_persist();
-        let saved = self.shared_window_snapshot();
+        let saved = self.shared_window_snapshot_with(publish);
         if let Some(session) = &self.session {
             let adoptions = std::mem::take(&mut self.shared_views.adoptions);
             let restorations = std::mem::take(&mut self.shared_views.restorations);
@@ -7614,8 +7620,15 @@ impl Cagents {
     /// the next shared projection, and storage refuses the snapshot that
     /// projection saves when it reverts what storage already holds.
     fn shared_window_snapshot(&mut self) -> Arc<WorkspaceState> {
+        self.shared_window_snapshot_with(Self::publish_view_changes)
+    }
+
+    fn shared_window_snapshot_with(
+        &mut self,
+        publish: impl FnOnce(&mut Self),
+    ) -> Arc<WorkspaceState> {
         self.snapshot_workspace_scope();
-        self.publish_view_changes();
+        publish(self);
         self.persistent_workspace()
     }
 
