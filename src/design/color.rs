@@ -319,9 +319,14 @@ mod tests {
             let (a, b) = (luminance(a), luminance(b));
             (a.max(b) + 0.05) / (a.min(b) + 0.05)
         };
+        // Links keep the 3:1 of large or non-text UI, and body text the 4.5:1
+        // of ordinary text, on the selection.
         for theme in [Theme::dark(), Theme::light()] {
-            let ratio = contrast(accent_color(&theme), selection_wash(&theme));
-            assert!(ratio >= 2.0, "{ratio}");
+            let wash = selection_wash(&theme);
+            let link = contrast(accent_color(&theme), wash);
+            assert!(link >= 3.0, "{link}");
+            let text = contrast(theme.cosmic().on_bg_color().into(), wash);
+            assert!(text >= 4.5, "{text}");
         }
     }
 
