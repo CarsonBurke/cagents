@@ -197,6 +197,21 @@ fi
 for binary in "$CLI_BINARY" "$UI_BINARY" "$HOST_BINARY"; do
     [ -x "$binary" ] || fail "missing release binary: $binary"
 done
+if [ "${CAGENTS_SKIP_BUILD:-0}" = 1 ]; then
+    require_prebuilt_version() {
+        # Preserve output through command substitution so extra lines cannot
+        # disappear. Accept the exact line with or without its final newline.
+        reported=$("$2" --version && printf '.') \
+            || fail "could not verify prebuilt $1 version: $2"
+        expected="$1 $VERSION"
+        [ "$reported" = "$expected." ] \
+            || [ "$reported" = "$(printf '%s\n.' "$expected")" ] \
+            || fail "prebuilt $1 does not report requested version $VERSION: $2"
+    }
+    require_prebuilt_version cagents "$CLI_BINARY"
+    require_prebuilt_version cagents-ui "$UI_BINARY"
+    require_prebuilt_version cagentsd "$HOST_BINARY"
+fi
 
 PROTOCOL_VERSION=$("$CLI_BINARY" daemon protocol-version) \
     || fail 'cannot inspect packaged daemon protocol'
@@ -236,6 +251,68 @@ fi
 # alone must retain the normal release stripping behavior.
 if [ "${CAGENTS_SKIP_STRIP:-0}" != 1 ]; then
     strip --strip-unneeded "$BIN_DIR/cagents" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagentsd"
+fi
+
+# Inspect the exact bytes about to enter both package formats, including
+# prebuilt/skip-strip mode. A successful link or a newer linker is not proof
+# that bundled HarfBuzz cannot interpose on the system FreeType/HarfBuzz pair.
+if [ "$VARIANT" = full ]; then
+    UI_DYNAMIC_SYMBOLS=$WORK_DIR/ui-dynamic-symbols
+    UI_DYNAMIC_ERRORS=$WORK_DIR/ui-dynamic-errors
+    LC_ALL=C readelf --wide --dyn-syms "$BIN_DIR/cagents-ui" \
+        > "$UI_DYNAMIC_SYMBOLS" 2> "$UI_DYNAMIC_ERRORS" \
+        || fail 'cannot inspect full UI dynamic symbols'
+    [ ! -s "$UI_DYNAMIC_ERRORS" ] || fail 'readelf reported invalid full UI dynamic symbols'
+    # Separate inspection and parsing: POSIX sh has no pipefail. Require a
+    # complete GNU readelf dynamic table so empty/truncated output cannot pass.
+    # UND entries are imports, including the required system FT_* functions.
+    LC_ALL=C awk '
+        BEGIN { rows = 0; tables = 0; headings = 0 }
+        /^[[:space:]]*$/ { next }
+        /^Symbol table / {
+            if (tables++ || NF != 6 || $3 != sprintf("%c.dynsym%c", 39, 39) ||
+                $4 != "contains" || $5 !~ /^[0-9]+$/ || $5 == 0 || $6 != "entries:") {
+                bad = 1; exit
+            }
+            expected = $5; next
+        }
+        /^[[:space:]]*Num:/ {
+            if (tables != 1 || headings++ || NF != 8 || $2 != "Value" ||
+                $3 != "Size" || $4 != "Type" || $5 != "Bind" ||
+                $6 != "Vis" || $7 != "Ndx" || $8 != "Name") {
+                bad = 1; exit
+            }
+            next
+        }
+        /^[[:space:]]*[0-9]+:/ {
+            # readelf names reserved type/binding values, such as C++
+            # GNU_UNIQUE objects, as "<OS specific>: 10". Keep them one field.
+            gsub(/<(OS|processor) specific>: [0-9]+/, "RESERVED")
+            if (tables != 1 || headings != 1 || NF < 7 || NF > 9 ||
+                $1 != rows ":" || $2 !~ /^[0-9a-fA-F]+$/ ||
+                $3 !~ /^(0x[0-9a-fA-F]+|[0-9]+)$/ ||
+                $4 !~ /^[A-Z][A-Z0-9_]*$/ || $5 !~ /^[A-Z][A-Z0-9_]*$/ ||
+                $6 !~ /^(DEFAULT|INTERNAL|HIDDEN|PROTECTED)$/ ||
+                $7 !~ /^(UND|ABS|COM|[0-9]+)$/ ||
+                (NF == 9 && $9 !~ /^\([0-9]+\)$/) ||
+                (rows == 0 && (NF != 7 || $2 !~ /^0+$/)) ||
+                (NF == 7 && (rows != 0 || $3 != 0 || $4 != "NOTYPE" ||
+                    $5 != "LOCAL" || $6 != "DEFAULT" || $7 != "UND"))) {
+                bad = 1; exit
+            }
+            if (NF >= 8 && $7 != "UND" && $8 ~ /^(hb_|FT_)/) {
+                print "forbidden bundled font export: " $8 > "/dev/stderr"
+                forbidden++
+            }
+            rows++; next
+        }
+        { bad = 1; exit }
+        END {
+            if (bad || tables != 1 || headings != 1 || rows != expected || forbidden)
+                exit 1
+        }
+    ' "$UI_DYNAMIC_SYMBOLS" \
+        || fail 'full UI dynamic symbol policy failed (malformed table or bundled hb_/FT_ definitions)'
 fi
 
 # A local/native package can be built on newer glibc than the official release

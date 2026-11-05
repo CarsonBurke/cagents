@@ -10,6 +10,8 @@ debug=false
 fresh_daemon=false
 hot=false
 log_file=
+instance=
+stop_instance=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --browserless) browserless=true ;;
@@ -17,6 +19,27 @@ while [ "$#" -gt 0 ]; do
         --fresh-daemon) fresh_daemon=true ;;
         --hot) hot=true; browserless=true ;;
         --hot-integrated) hot=true; browserless=false ;;
+        --instance|--stop-instance)
+            if [ "$1" = --stop-instance ]; then stop_instance=true; else stop_instance=false; fi
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                printf '%s\n' "$1 requires a name" >&2
+                exit 2
+            fi
+            shift
+            instance=$1
+            # Matches the application's own check, which also keeps the daemon
+            # socket path inside the session's runtime within 108 bytes.
+            case $instance in
+                [!A-Za-z0-9]*|*[!A-Za-z0-9-]*)
+                    printf '%s\n' "instance names use ASCII letters, digits and hyphens, starting with a letter or digit" >&2
+                    exit 2
+                    ;;
+            esac
+            [ "${#instance}" -le 24 ] || {
+                printf '%s\n' "instance names are at most 24 characters" >&2
+                exit 2
+            }
+            ;;
         --log-file)
             if [ "$#" -lt 2 ] || [ -z "$2" ]; then
                 printf '%s\n' "--log-file requires a path" >&2
@@ -40,6 +63,12 @@ Options:
   --hot            Experimental browserless Linux hot reload (pinned cargo-hot/bwrap)
   --hot-integrated  Explicit embedded-browser hot reload
   --log-file PATH  Write UI tracing output to PATH (relative to caller)
+  --instance NAME  Run an isolated instance, with its own storage and daemon, in
+                   a headless niri-harness session named cagents-NAME. Returns
+                   once its window maps; --fresh-daemon replaces a running one
+  --stop-instance NAME
+                   Stop that instance's daemon, its jobs and its session; keep
+                   its storage
   --help           Show this help
 
 Environment:
@@ -58,6 +87,27 @@ USAGE
     esac
     shift
 done
+
+if [ -n "$instance" ]; then
+    if [ "$hot" = true ] || [ -n "$log_file" ]; then
+        printf '%s\n' "--instance runs in niri-harness, which keeps the UI log; it cannot be combined with --hot or --log-file" >&2
+        exit 2
+    fi
+    command -v niri-harness >/dev/null 2>&1 || {
+        printf '%s\n' 'required command not found: niri-harness' >&2
+        exit 1
+    }
+    harness_session=cagents-$instance
+    if [ "$stop_instance" = false ] && [ "$fresh_daemon" = false ] &&
+        niri-harness --session "$harness_session" env >/dev/null 2>&1; then
+        printf '%s\n' "instance $instance already has a session; relaunch it with --fresh-daemon or stop it with --stop-instance $instance" >&2
+        exit 1
+    fi
+    export CAGENTS_DEVELOPMENT_INSTANCE="$instance"
+else
+    # The flags choose the instance, never an inherited environment.
+    unset CAGENTS_DEVELOPMENT_INSTANCE
+fi
 
 if [ "$hot" = true ]; then
     "$root/scripts/hot-development" --check
@@ -174,37 +224,157 @@ if [ "$hot" = true ]; then
     exec "$root/scripts/hot-development" "$@"
 fi
 
+if [ "$browserless" = true ]; then
+    default_features=--no-default-features
+    ui_feature=ui
+else
+    default_features=
+    ui_feature=integrated-browser
+fi
+
+# Where Cargo places the dev-runtime executables. They are run directly: a
+# `cargo run` would check the build again outside any build slot.
+find_products() {
+    [ -z "${products:-}" ] || return 0
+    target=$(cargo metadata --locked --format-version 1 --no-deps |
+        sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+    [ -n "$target" ] || {
+        printf '%s\n' 'cannot find the Cargo target directory' >&2
+        exit 1
+    }
+    products=$target/dev-runtime
+}
+products=
+
+# Builds the matched set in one build slot, so an up-to-date checkout waits
+# for a slot once rather than three times. Each product is a separate Cargo
+# invocation: features are package-wide, so a single --bins invocation would
+# reunify the UI and host graphs and make the UI compile Ghostty while making
+# the daemon compile libcosmic.
+build_products() {
+    # shellcheck disable=SC2016 # expanded by the inner shell
+    "$root/scripts/cargo-gate" exec sh -ec '
+        cargo build --locked --profile dev-runtime $1 --features development --bin cagents
+        cargo build --locked --profile dev-runtime $1 --features development,host --bin cagentsd
+        cargo build --locked --profile dev-runtime $1 --features "development,$2" --bin cagents-ui
+    ' build-products "$default_features" "$ui_feature"
+}
+
 run_cli() {
-    if [ "$browserless" = true ]; then
-        cargo run --quiet --locked --profile dev-runtime --no-default-features \
-            --features development --bin cagents -- "$@"
-    else
-        cargo run --quiet --locked --profile dev-runtime \
-            --features development --bin cagents -- "$@"
+    find_products
+    "$products/cagents" "$@"
+}
+
+# The CLI this checkout last built, so stopping an instance does not wait for
+# a build when one exists.
+instance_cli() {
+    find_products
+    if [ ! -x "$products/cagents" ]; then
+        # shellcheck disable=SC2086 # empty when the default features apply
+        "$root/scripts/cargo-gate" build --locked --profile dev-runtime $default_features \
+            --features development --bin cagents
+    fi
+    run_cli "$@"
+}
+
+# The instance's daemon lives in the harness session's private runtime
+# directory, which stopping the session deletes, so stop the daemon first.
+stop_instance_session() {
+    harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) || return 0
+    runtime=$(
+        eval "$harness_env"
+        printf '%s' "$XDG_RUNTIME_DIR"
+    )
+    (
+        eval "$harness_env"
+        socket=$XDG_RUNTIME_DIR/cagents-development-$instance/cagentsd.sock
+        if [ -e "$socket" ]; then
+            if ! output=$(instance_cli daemon stop-for-rebuild --including-subagents 2>&1); then
+                printf '%s\n' "$output" >&2
+                exit 1
+            fi
+            remaining=100
+            while [ -e "$socket" ]; do
+                if [ "$remaining" -eq 0 ]; then
+                    printf '%s\n' "instance $instance daemon did not stop within 5 seconds" >&2
+                    exit 1
+                fi
+                remaining=$((remaining - 1))
+                sleep 0.05
+            done
+        fi
+    )
+    # The harness reports a runtime it could not remove; the sweep below
+    # removes it, so only a failure that leaves it behind is worth showing.
+    harness_output=$(niri-harness --session "$harness_session" stop 2>&1 >/dev/null) || :
+    sweep_instance_runtime "$runtime"
+    if [ -n "$harness_output" ] && [ -e "$runtime" ]; then
+        printf '%s\n' "$harness_output" >&2
     fi
 }
 
-# Build each product boundary separately. Cargo features are package-wide, so a
-# single --bins invocation would reunify the UI and host graphs and make the UI
-# compile Ghostty while making the daemon compile libcosmic.
-if [ "$browserless" = true ]; then
-    cargo build --locked --profile dev-runtime --no-default-features \
-        --features development --bin cagents
-    cargo build --locked --profile dev-runtime --no-default-features \
-        --features development,host --bin cagentsd
-    cargo build --locked --profile dev-runtime --no-default-features \
-        --features development,ui --bin cagents-ui
-else
-    cargo build --locked --profile dev-runtime \
-        --features development --bin cagents
-    cargo build --locked --profile dev-runtime \
-        --features development,host --bin cagentsd
-    cargo build --locked --profile dev-runtime \
-        --features development,integrated-browser --bin cagents-ui
+# Bus-activated services such as the document portal and gvfs can outlive the
+# harness session, and their FUSE mounts keep the harness from removing its
+# runtime directory. Only processes started with that private directory carry
+# it in their environment. A killed FUSE server can leave its mount behind
+# until the kernel notices, so detach any that remain before removing it.
+sweep_instance_runtime() {
+    case $1 in
+        */*/nh-*/*|*/..*) return 0 ;;
+        "${XDG_RUNTIME_DIR:?}"/nh-?*) ;;
+        *) return 0 ;;
+    esac
+    for environment in /proc/[0-9]*/environ; do
+        if tr '\0' '\n' 2>/dev/null <"$environment" | grep -qxF "XDG_RUNTIME_DIR=$1"; then
+            process=${environment#/proc/}
+            kill "${process%/environ}" 2>/dev/null || :
+        fi
+    done
+    [ -d "$1" ] || return 0
+    awk -v runtime="$1" 'index($5, runtime "/") == 1 && $(NF - 2) ~ /^fuse/ { print $5 }' \
+        /proc/self/mountinfo | while IFS= read -r mount; do
+        fusermount3 -u -z "$mount" 2>/dev/null || fusermount -u -z "$mount" 2>/dev/null || :
+    done
+    if awk -v runtime="$1" '$5 == runtime || index($5, runtime "/") == 1 { found = 1 } END { exit !found }' /proc/self/mountinfo; then
+        printf '%s\n' "instance $instance runtime retained at $1: a filesystem is still mounted there" >&2
+        return 0
+    fi
+    rm -rf -- "$1"
+}
+
+if [ "$stop_instance" = true ]; then
+    if ! niri-harness --session "$harness_session" env >/dev/null 2>&1; then
+        printf '%s\n' "instance $instance is not running" >&2
+        exit 1
+    fi
+    printf '%s\n' "Stopping instance $instance stops its terminal/chat jobs and all their background subagents." >&2
+    stop_instance_session
+    printf '%s\n' "stopped instance $instance; its storage is kept"
+    exit 0
 fi
+
+build_products
+find_products
 
 # Keep the current development session alive if any part of the matched build
 # fails. Only stop its daemon once the replacement set is ready to launch.
+if [ -n "$instance" ]; then
+    if [ "$fresh_daemon" = true ]; then
+        printf '%s\n' "Replacing instance $instance stops its terminal/chat jobs and all their background subagents." >&2
+        stop_instance_session
+    fi
+    # Its own bus and runtime directory keep the instance's application ID,
+    # activation sockets and daemon apart from every other session.
+    niri-harness start --backend headless --name "$harness_session" --timeout 180 -- \
+        "$products/cagents-ui" "$@"
+    printf '%s\n' \
+        "Instance $instance is running in niri-harness session $harness_session." \
+        "  observe: niri-harness --session $harness_session observe" \
+        "  logs:    niri-harness --session $harness_session logs" \
+        "  stop:    scripts/run-development --stop-instance $instance"
+    exit 0
+fi
+
 if [ "$fresh_daemon" = true ]; then
     printf '%s\n' "Restarting the development daemon stops its terminal/chat jobs and all their background subagents." >&2
     run_cli daemon stop-for-rebuild --including-subagents >/dev/null
@@ -221,12 +391,7 @@ if [ "$fresh_daemon" = true ]; then
 fi
 
 run_ui() {
-    if [ "$browserless" = true ]; then
-        exec cargo run --quiet --locked --profile dev-runtime --no-default-features \
-            --features development,ui --bin cagents-ui -- "$@"
-    fi
-    exec cargo run --quiet --locked --profile dev-runtime \
-        --features development,integrated-browser --bin cagents-ui -- "$@"
+    exec "$products/cagents-ui" "$@"
 }
 
 if [ -n "$log_file" ]; then

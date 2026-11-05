@@ -198,7 +198,7 @@ impl RuntimePaths {
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .ok_or(PlatformError::MissingRuntimeDirectory)?;
-        let directory = base.join(instance::RUNTIME_SUBDIRECTORY);
+        let directory = base.join(instance::runtime_subdirectory());
         Ok(Self {
             socket: directory.join(SOCKET_FILE_NAME),
             lock: directory.join("cagentsd.lock"),
@@ -1099,7 +1099,7 @@ mod tests {
         // subprocess, where a blocking regression is bounded and cleaned up
         // through its original pidfd rather than stranding a libtest thread.
         let runtime = tempdir().unwrap();
-        let directory = runtime.path().join(instance::RUNTIME_SUBDIRECTORY);
+        let directory = runtime.path().join(instance::runtime_subdirectory());
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         for name in ["cagentsd.lock", "cagentsd.recovery.lock"] {
