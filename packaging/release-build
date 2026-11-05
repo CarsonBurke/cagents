@@ -53,7 +53,8 @@ if [[ ${1:-} == --provision ]]; then
         libdbus-1-dev libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev \
         libgbm-dev libgl1-mesa-dev libssl-dev libudev-dev libwayland-dev \
         libxkbcommon-dev ninja-build pkg-config python3 xz-utils \
-        appstream desktop-file-utils dpkg-dev jq fakeroot libfakeroot libcurl4-openssl-dev
+        appstream desktop-file-utils dpkg-dev jq fakeroot libfakeroot libcurl4-openssl-dev \
+        dbus
     audit=$(dpkg --audit)
     [[ -z $audit ]] || { printf '%s\n' "$audit" >&2; fail 'unfinished build dependencies'; }
     [[ -x /usr/bin/clang && -x /usr/bin/clang++ && -d /usr/lib/llvm-14/lib ]]
@@ -97,8 +98,17 @@ if [[ ${1:-} == --provision ]]; then
     [[ $(/opt/rust/bin/cargo --version) == 'cargo 1.93.0 '* ]]
     [[ $(/opt/zig/zig version) == 0.15.2 ]]
     [[ $(/opt/git/bin/git --version) == 'git version 2.55.0' ]]
+    # Test fixtures name /usr/bin/git and run with a /usr/bin:/bin PATH, and
+    # Jammy's 2.34 is below the supported floor. Keep one Git in this image.
+    if [[ $(readlink /usr/bin/git || :) != /opt/git/bin/git ]]; then
+        FAKEROOTDONTTRYCHOWN=1 /usr/bin/fakeroot-sysv -- dpkg-divert --local --rename --add /usr/bin/git
+        ln -s /opt/git/bin/git /usr/bin/git
+    fi
+    [[ $(/usr/bin/git --version) == 'git version 2.55.0' ]]
+    [[ -x /usr/bin/dbus-run-session ]]
     [[ -r /usr/share/zoneinfo/UTC && -r /usr/share/zoneinfo/America/Vancouver ]]
-    printf '%s\n' 'Ubuntu 22.04; Rust 1.93.0; Zig 0.15.2; Git 2.55.0' > /opt/.cagents-release-provisioned-v3
+    printf '%s\n' 'Ubuntu 22.04; Rust 1.93.0; Zig 0.15.2; Git 2.55.0; system Git diverted' \
+        > /opt/.cagents-release-provisioned-v4
     exit 0
 fi
 
@@ -109,7 +119,7 @@ fi
 [[ $(rustc -vV | sed -n 's/^host: //p') == "$CAGENTS_RELEASE_TARGET" ]]
 [[ $(rustc --version) == 'rustc 1.93.0 '* && $(cargo --version) == 'cargo 1.93.0 '* ]]
 [[ $(zig version) == 0.15.2 ]]
-[[ $(git --version) == 'git version 2.55.0' ]]
+[[ $(git --version) == 'git version 2.55.0' && $(/usr/bin/git --version) == 'git version 2.55.0' ]]
 [[ $SOURCE_COMMIT =~ ^[0-9a-f]{40}$ && $SOURCE_DATE_EPOCH =~ ^[0-9]+$ ]]
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
 chmod 0700 "$XDG_RUNTIME_DIR"

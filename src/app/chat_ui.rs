@@ -14,6 +14,55 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+/// A bounded executor that the whole application shares. Each libtest thread
+/// is its own application, so a concurrent test can neither take nor release
+/// this test's capacity. Call it on the UI thread; a permit keeps its
+/// semaphore alive on whichever thread it drops.
+macro_rules! application_capacity {
+    ($permits:expr) => {{
+        #[cfg(not(test))]
+        let capacity = {
+            static CAPACITY: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+                std::sync::OnceLock::new();
+            CAPACITY
+                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new($permits)))
+                .clone()
+        };
+        #[cfg(test)]
+        let capacity = {
+            thread_local! {
+                static CAPACITY: Arc<tokio::sync::Semaphore> =
+                    Arc::new(tokio::sync::Semaphore::new($permits));
+            }
+            CAPACITY.with(Arc::clone)
+        };
+        capacity
+    }};
+}
+
+/// A zeroed atomic the whole application shares, such as which selection owns
+/// the keyboard, under the same per-test-thread rule as
+/// `application_capacity`. The returned reference may be stored and used from
+/// any thread. Each test thread leaks one cell.
+macro_rules! application_atomic {
+    ($vis:vis fn $name:ident() -> $atomic:ident) => {
+        $vis fn $name() -> &'static $atomic {
+            #[cfg(not(test))]
+            {
+                static VALUE: $atomic = $atomic::new(0);
+                &VALUE
+            }
+            #[cfg(test)]
+            {
+                thread_local! {
+                    static VALUE: &'static $atomic = Box::leak(Box::new($atomic::new(0)));
+                }
+                VALUE.with(|value| *value)
+            }
+        }
+    };
+}
+
 mod artifacts;
 mod attachment_draft;
 mod auth_recovery;
@@ -199,6 +248,7 @@ pub enum Action {
     Wake(Target, Wake),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
+    DraftStartCheckpointed(Target, uuid::Uuid, Result<(), String>),
     /// Explicitly continue a settled saved-history reader in this same pane.
     /// Restoring a pane never acquires this launch permission.
     ResumeSaved(Target),
@@ -412,6 +462,7 @@ impl Action {
         matches!(
             self,
             Self::Ready(..)
+                | Self::DraftStartCheckpointed(..)
                 | Self::FindAvailable
                 | Self::FindGroups(..)
                 | Self::FindHighlight(..)
@@ -556,6 +607,9 @@ struct LocalReturn {
 /// Detached actors have their own target-keyed retirement ledger, since an old
 /// actor can still be shutting down while this card starts another one.
 enum Phase {
+    SavingDraft {
+        target: Target,
+    },
     Starting(Attempt),
     Returning {
         target: Target,
@@ -571,10 +625,39 @@ enum Phase {
 impl Phase {
     fn target(&self) -> Target {
         match self {
+            Self::SavingDraft { target } => *target,
             Self::Starting(attempt) => attempt.target,
             Self::Returning { target, .. } | Self::Closing { target, .. } => *target,
         }
     }
+}
+
+/// The save intent is private until this exact writer accepts it. Neither
+/// shared views nor a provider may borrow a candidate from a pending save.
+struct DraftStartCheckpoint {
+    target: Target,
+    attempt: uuid::Uuid,
+    source: chat::Session,
+    candidate: chat::Session,
+    writer: std::sync::Weak<crate::persistence::StateStore>,
+    registry: uuid::Uuid,
+    scope: Option<crate::workspace_model::views::Scope>,
+    backend: Option<(String, String, String)>,
+    revision: u64,
+    text: String,
+    resolved_text: String,
+    attachments: Vec<Attachment>,
+    model: Option<(String, Option<String>)>,
+}
+
+fn draft_start_backend() -> Option<(String, String, String)> {
+    crate::device::selected().map(|device| {
+        (
+            device.name.clone(),
+            device.host.clone(),
+            device.executable.clone(),
+        )
+    })
 }
 
 pub(super) struct State {
@@ -585,6 +668,7 @@ pub(super) struct State {
     receiver: async_channel::Receiver<(Target, Wake)>,
     generation: u64,
     phases: HashMap<CardId, Phase>,
+    draft_checkpoints: HashMap<CardId, DraftStartCheckpoint>,
     /// Transient user intent, never an execution proof. Automatic restoration
     /// cannot acquire this permission; an exact failed History start can retry.
     explicit_starts: HashMap<CardId, chat::Session>,
@@ -633,6 +717,7 @@ impl Default for State {
             receiver,
             generation: 0,
             phases: HashMap::new(),
+            draft_checkpoints: HashMap::new(),
             explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
@@ -2872,6 +2957,34 @@ impl Runtime {
             .unwrap_or(&self.attachments)
     }
 
+    /// A first prompt is still local work until the provider accepts it.
+    /// Keep that source and any later composer edits together as an inert
+    /// recovery draft; restoring it never automatically submits either part.
+    fn persistent_draft(&self) -> (String, Vec<Attachment>) {
+        let mut text = self.unsent_text();
+        let mut images = self
+            .unsent_attachments()
+            .iter()
+            .filter(|image| image.reference.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(queued) = &self.queued {
+            let first = queued.source.text();
+            if text.is_empty() {
+                text = first.to_owned();
+            } else {
+                text = format!("{first}\n{text}");
+            }
+            let later = std::mem::take(&mut images);
+            for image in queued.attachments.iter().chain(later.iter()) {
+                if image.reference.is_some() && !images.contains(image) {
+                    images.push(image.clone());
+                }
+            }
+        }
+        (text, images)
+    }
+
     /// An empty draft can show a suggestion only for its exact current turn.
     fn prompt_suggestion(&self) -> Option<&chat::PromptSuggestion> {
         let suggestion = self.snapshot.prompt_suggestion.as_ref()?;
@@ -3182,10 +3295,10 @@ impl Runtime {
         // connection that has gone has nothing to be told.
         let _ = self.present();
         let written = self.composer.text();
-        let text = if written.trim().is_empty() {
+        let text = if written.is_empty() {
             queued.source.text().to_owned()
         } else {
-            format!("{}\n{written}", queued.source.text().trim_end())
+            format!("{}\n{written}", queued.source.text())
         };
         self.replace_draft(text_editor::Content::with_text(&text));
         let written = self.replace_attachments(queued.attachments);
@@ -5497,6 +5610,11 @@ impl Cagents {
         provider: Provider,
         model: Option<String>,
     ) -> Task<Message> {
+        // A first Send is saving this draft's identity; its receipt decides
+        // what storage holds, so the draft's source is fixed until it answers.
+        if self.chat_start_pending(target.card) {
+            return Task::none();
+        }
         let models = self
             .account_ui
             .catalog(provider)
@@ -5623,6 +5741,9 @@ impl Cagents {
 
     /// Points a draft at account `id` of its own provider.
     fn choose_chat_account(&mut self, target: Target, id: AccountId) -> Task<Message> {
+        if self.chat_start_pending(target.card) {
+            return Task::none();
+        }
         let Some(account) = self.known_account(&id) else {
             return Task::none();
         };
@@ -5939,6 +6060,76 @@ impl Cagents {
         }
     }
 
+    /// Shows and launches in draft `card` the launch options another window
+    /// chose for it, which the shared view brought here.
+    ///
+    /// The shared pane keeps the draft's conversation, so its runtime stays
+    /// attached, but the runtime still holds the options this window had: it
+    /// would show them, start the conversation on them, and build any later
+    /// choice of its own from them, dropping the other window's. A draft
+    /// already sending its first message keeps the launch it is sending.
+    pub(super) fn adopt_shared_draft_session(
+        &mut self,
+        card: CardId,
+        session: &chat::Session,
+    ) -> Task<Message> {
+        // A conversation another window started is not a launch option; it
+        // is attached, or recovered, as the conversation it is. An operation
+        // already under way on the card keeps the launch it began with.
+        if !session.is_unstarted() || self.chat_start_pending(card) {
+            return Task::none();
+        }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return Task::none();
+        };
+        if !runtime.choosing() || runtime.session.id != session.id || runtime.session == *session {
+            return Task::none();
+        }
+        let provider = session.launch.provider;
+        let moved = runtime.session.launch.provider != provider;
+        let fresh = moved.then(|| self.chat_draft_snapshot(provider));
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+            return Task::none();
+        };
+        let previous = std::mem::replace(&mut runtime.session, session.clone());
+        // Which skills exist depends on the provider's home and directory, so
+        // a list found for others is wrong until discovery answers again.
+        let rehomed = moved
+            || previous.launch.recipe.environment != session.launch.recipe.environment
+            || previous.launch.recipe.working_directory != session.launch.recipe.working_directory;
+        if let Some(fresh) = fresh {
+            // Pickers listed the earlier provider's choices.
+            runtime.model_picker = None;
+            runtime.account_picker = false;
+            runtime.reasoning_picker = false;
+            runtime.permission_picker = false;
+            runtime.footer_picker = false;
+            runtime.snapshot = Arc::new(fresh);
+        } else if rehomed {
+            Arc::make_mut(&mut runtime.snapshot).skills.clear();
+        }
+        Arc::make_mut(&mut runtime.snapshot).permission_mode =
+            draft_permission_mode(&session.launch.recipe, provider);
+        if rehomed {
+            // A failed start's reason belongs to the account it failed on.
+            runtime.error = None;
+            runtime.completion.restart(true);
+        }
+        let target = runtime.target;
+        self.load_draft_skills(target)
+    }
+
+    /// Catches draft `card` up, once it can choose again, with launch options
+    /// another window chose while it could not: while its file chooser was
+    /// open or its first message was on the way.
+    fn adopt_stored_draft_session(&mut self, card: CardId) -> Task<Message> {
+        let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| state.kind.clone())
+        else {
+            return Task::none();
+        };
+        self.adopt_shared_draft_session(card, &session)
+    }
+
     pub(super) fn chat_scroll_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         let keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(key),
@@ -6134,18 +6325,12 @@ impl Cagents {
             .collect::<HashMap<_, _>>();
         for (card, runtime) in &self.chat_ui.parked {
             if open_cards.contains(card) {
-                let images = runtime
-                    .unsent_attachments()
-                    .iter()
-                    .filter(|a| a.reference.is_some())
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let (draft, images) = runtime.persistent_draft();
                 if images.is_empty() {
                     chat_draft_attachments.remove(card);
                 } else {
                     chat_draft_attachments.insert(*card, images);
                 }
-                let draft = runtime.unsent_text();
                 if draft.is_empty() {
                     chat_drafts.remove(card);
                 } else {
@@ -6157,18 +6342,12 @@ impl Cagents {
             if let CardRuntime::Chat(runtime) = card_runtime
                 && open_cards.contains(card)
             {
-                let images = runtime
-                    .unsent_attachments()
-                    .iter()
-                    .filter(|a| a.reference.is_some())
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let (draft, images) = runtime.persistent_draft();
                 if images.is_empty() {
                     chat_draft_attachments.remove(card);
                 } else {
                     chat_draft_attachments.insert(*card, images);
                 }
-                let draft = runtime.unsent_text();
                 if draft.is_empty() {
                     chat_drafts.remove(card);
                 } else {
@@ -6217,7 +6396,27 @@ impl Cagents {
                 _ => None,
             })
             .collect::<HashMap<_, _>>();
+        let writer_identity = self
+            .session
+            .as_ref()
+            .map(|writer| Arc::downgrade(&writer.operation_store()));
+        let draft_starts = self
+            .chat_ui
+            .draft_checkpoints
+            .iter()
+            .filter(|(card, pending)| {
+                let same_writer = writer_identity
+                    .as_ref()
+                    .is_some_and(|writer| writer.ptr_eq(&pending.writer));
+                same_writer
+                    && self.card_state(**card).is_some_and(|state| {
+                        matches!(&state.kind, CardKind::Chat(source) if source == &pending.source)
+                    })
+            })
+            .map(|(card, pending)| (*card, &pending.candidate))
+            .collect::<HashMap<_, _>>();
         if defaults.is_empty()
+            && draft_starts.is_empty()
             && admission_sources.is_empty()
             && chat_drafts == self.durable.chat_drafts
             && chat_draft_attachments == self.durable.chat_draft_attachments
@@ -6230,6 +6429,11 @@ impl Cagents {
         saved.chat_draft_attachments = chat_draft_attachments;
         saved.repository_navigation = repository_navigation;
         for card in &mut saved.cards {
+            if let Some(pending) = draft_starts.get(&card.id) {
+                // Only the writer sees B before its receipt. Autosaves of A
+                // must not race the explicit A -> B checkpoint back to A.
+                card.kind = CardKind::Chat((*pending).clone());
+            }
             if let Some(source) = admission_sources.get(&card.id) {
                 // The canonical view permits an attachment, not a speculative
                 // snapshot rewrite of the saved conversation's ownership.
@@ -6371,7 +6575,7 @@ impl Cagents {
         };
         Task::batch([
             scope,
-            self.insert_chat_card_with_lifetime(session, None, ephemeral, None),
+            self.insert_chat_card_with_lifetime(session, None, ephemeral, None, None),
         ])
     }
 
@@ -6385,7 +6589,18 @@ impl Cagents {
         beside: Option<CardId>,
         draft_from: Option<CardId>,
     ) -> Task<Message> {
-        self.insert_chat_card_with_lifetime(session, beside, false, draft_from)
+        self.insert_chat_card_with_lifetime(session, beside, false, draft_from, None)
+    }
+
+    /// Restore an existing conversation's manual pane name before its first
+    /// shared publication or provider attachment can report another title.
+    pub(super) fn insert_resumed_chat_card(
+        &mut self,
+        session: chat::Session,
+        beside: Option<CardId>,
+        user_title: Option<String>,
+    ) -> Task<Message> {
+        self.insert_chat_card_with_lifetime(session, beside, false, None, user_title)
     }
 
     fn insert_chat_card_with_lifetime(
@@ -6394,6 +6609,7 @@ impl Cagents {
         beside: Option<CardId>,
         ephemeral: bool,
         draft_from: Option<CardId>,
+        user_title: Option<String>,
     ) -> Task<Message> {
         let beside = beside.and_then(|source| {
             let index = self.workspace.order().position(|id| id == source)?;
@@ -6421,10 +6637,14 @@ impl Cagents {
         if ephemeral {
             self.chat_ui.default_chats.insert(card_id);
         }
+        let save_title = user_title.is_some();
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
-            title: chat_card_title(session.launch.provider).into(),
+            title: user_title
+                .as_deref()
+                .unwrap_or_else(|| chat_card_title(session.launch.provider))
+                .into(),
             width_fraction: self.new_pane_fraction(
                 beside
                     .and_then(|(source, _)| self.card_state(source))
@@ -6452,6 +6672,9 @@ impl Cagents {
         }
         durable.focused = Some(card_id);
         durable.cards.insert(durable_index, card.clone());
+        if let Some(title) = user_title {
+            self.chrome_ui.user_titles.insert(card_id, title);
+        }
         self.register_channel_card(card_id);
         let update = self
             .workspace
@@ -6480,11 +6703,17 @@ impl Cagents {
             self.open_chat(card_id, session, intent)
         };
         self.persist();
+        let title = if save_title {
+            self.save_settings_task(false)
+        } else {
+            Task::none()
+        };
         Task::batch([
             skills,
             self.apply_viewport(update, true, false),
             iced::widget::operation::focus(card_control_id(card_id, "chat-composer"))
                 .map(cosmic::Action::App),
+            title,
         ])
     }
 
@@ -6508,11 +6737,9 @@ impl Cagents {
     /// Opens the conversation card `card` holds: its draft, when nothing has
     /// ever run it, or else a connection to it.
     ///
-    /// A draft restored from an earlier run may have been started without
-    /// that start ever being answered, which leaves an actor with nothing on
-    /// screen able to reach it. Such an actor never took a message, so it is
-    /// given up quietly by identity; the draft's first message starts under
-    /// a new identity, never racing that.
+    /// A shared draft can be observed while another window is starting it.
+    /// Restoring its saved descriptor gives this window no ownership of that
+    /// execution, so opening the draft must not schedule provider retirement.
     pub(super) fn open_chat(
         &mut self,
         card: CardId,
@@ -6525,13 +6752,7 @@ impl Cagents {
         if !session.is_unstarted() {
             return self.start_chat(card, session, intent, None, false);
         }
-        let retire = if intent == chat::Intent::Restore {
-            self.retire_chat(card, None, Some(session.clone()))
-        } else {
-            Task::none()
-        };
-        let skills = self.open_chat_draft(card, session);
-        Task::batch([retire, skills])
+        self.open_chat_draft(card, session)
     }
 
     /// Puts a draft of `session` in card `card`, on the model last chosen for
@@ -6611,6 +6832,64 @@ impl Cagents {
         }
         Subscription::batch(subscriptions)
     }
+    pub(super) fn retain_chat_after_creation_refusal(
+        &mut self,
+        card: CardId,
+        scope: &crate::workspace_model::views::Scope,
+    ) -> bool {
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
+        };
+        if self.draft_start_scope(card).as_ref() != Some(scope)
+            || !runtime.is_some_and(|runtime| {
+                runtime.handle().is_some()
+                    && self.card_state(card).is_some_and(|state| {
+                        state.existence.is_open()
+                            && matches!(&state.kind, CardKind::Chat(session)
+                                if !session.is_unstarted() && session == &runtime.session)
+                    })
+            })
+        {
+            return false;
+        }
+        let message = if runtime.is_some_and(|runtime| runtime.disconnected) {
+            "This conversation could not be shared. It is kept only in this window. Reconnect to continue viewing it."
+        } else {
+            "This conversation could not be shared. It is kept only in this window; the current conversation is still attached."
+        };
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            runtime.error = Some(message.into());
+        }
+        if let Some(runtime) = self.chat_ui.parked.get_mut(&card) {
+            runtime.error = Some(message.into());
+        }
+        true
+    }
+
+    /// A draft whose first publication was refused was never in a shared
+    /// view, so no other client closed it. Keep it in this window, where it
+    /// can still start, and say why other windows will not show it.
+    pub(super) fn retain_draft_after_creation_refusal(
+        &mut self,
+        card: CardId,
+        scope: &crate::workspace_model::views::Scope,
+    ) -> bool {
+        if self.draft_start_scope(card).as_ref() != Some(scope)
+            || !self.shared_chat_has_local_work(card)
+            || !self.card_state(card).is_some_and(|state| {
+                state.existence.is_open()
+                    && matches!(&state.kind, CardKind::Chat(session) if session.is_unstarted())
+            })
+        {
+            return false;
+        }
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            runtime.error = Some("This pane could not be shared with your other windows. It stays in this window, and sending starts the conversation here.".into());
+        }
+        true
+    }
+
     pub(super) fn shared_chat_has_local_work(&self, card: CardId) -> bool {
         let runtime = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
@@ -6630,6 +6909,19 @@ impl Cagents {
                 .draft_attachments
                 .get(&card)
                 .is_some_and(|images| !images.is_empty())
+    }
+
+    /// A live or starting conversation no authoritative view has ever listed.
+    pub(super) fn chat_runs_unobserved_by_peers(&self, card: CardId) -> bool {
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
+        };
+        !self.shared_views.has_observed_chat(card)
+            && (self.chat_start_pending(card)
+                || runtime.is_some_and(|runtime| {
+                    runtime.handle().is_some() && !runtime.disconnected && !runtime.snapshot.exited
+                }))
     }
 
     pub(super) fn can_rekey_shared_terminal_draft(&self, alias: CardId, canonical: CardId) -> bool {
@@ -6655,6 +6947,7 @@ impl Cagents {
         // Dropping a phase also fences a late attachment result. Unlike
         // abandoned creator starts, it grants no authority to close an actor.
         self.chat_ui.phases.remove(&card);
+        self.release_draft_start_capture(card);
         self.chat_ui.parked.remove(&card);
         self.observe_agent_activity_for_card(card, None);
     }
@@ -6678,30 +6971,63 @@ impl Cagents {
     pub(super) fn chat_forget(&mut self, card: CardId) {
         self.chat_ui.explicit_starts.remove(&card);
         self.chat_ui.capacity_offers.remove(&card);
-        // The runtime is about to be dropped, so its unsent text is captured
-        // here rather than lost. `chat_forget` is the single place a chat
-        // runtime stops existing while its card lives on.
+        self.release_draft_start_capture(card);
+        self.stash_unsent_chat(card);
+        self.chat_ui.phases.remove(&card);
+        self.observe_agent_activity_for_card(card, None);
+    }
+
+    /// Captures the unsent text and images of `card`'s chat runtime, which is
+    /// about to be dropped while the card lives on, so whatever runtime the
+    /// card builds next opens with them rather than losing them.
+    pub(super) fn stash_unsent_chat(&mut self, card: CardId) {
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
-            let images = runtime
-                .unsent_attachments()
-                .iter()
-                .filter(|a| a.reference.is_some())
-                .cloned()
-                .collect::<Vec<_>>();
+            let (draft, images) = runtime.persistent_draft();
             if images.is_empty() {
                 self.chat_ui.draft_attachments.remove(&card);
             } else {
                 self.chat_ui.draft_attachments.insert(card, images);
             }
-            let draft = runtime.unsent_text();
             if draft.is_empty() {
                 self.chat_ui.drafts.remove(&card);
             } else {
                 self.chat_ui.drafts.insert(card, draft);
             }
         }
-        self.chat_ui.phases.remove(&card);
-        self.observe_agent_activity_for_card(card, None);
+    }
+
+    /// A first save that will not start its provider may still have
+    /// committed B. Queue the B -> A replacement behind it, so storage
+    /// converges on the conversation the composer still shows, including
+    /// settings changed while saving: when B never landed, storage already
+    /// holds A and the replacement is an idempotent no-op. The prompt and
+    /// image captures are released with the checkpoint.
+    fn release_draft_start_capture(&mut self, card: CardId) {
+        let Some(pending) = self.chat_ui.draft_checkpoints.remove(&card) else {
+            return;
+        };
+        let Some(current) = self.card_state(card).and_then(|state| match &state.kind {
+            CardKind::Chat(source)
+                if state.existence.is_open() && source.id == pending.source.id =>
+            {
+                Some(source.clone())
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        let same_writer = self.session.as_ref().is_some_and(|writer| {
+            pending
+                .writer
+                .ptr_eq(&Arc::downgrade(&writer.operation_store()))
+        });
+        if !same_writer {
+            return;
+        }
+        let snapshot = self.persistent_workspace();
+        if let Some(writer) = self.session.as_ref() {
+            writer.replace_chat_identity(card, pending.candidate.id, current, snapshot);
+        }
     }
     /// Forgets a chat runtime whose card is going away for good.
     ///
@@ -6840,6 +7166,7 @@ impl Cagents {
         }
         if let Some(phase) = self.chat_ui.phases.get(&card) {
             return Some(Cow::Borrowed(match phase {
+                Phase::SavingDraft { .. } => "Saving this conversation before connecting.",
                 Phase::Starting(_) => {
                     "Connecting to native chat. Wait for the connection to finish."
                 }
@@ -7616,36 +7943,259 @@ impl Cagents {
                 .card_state(target.card)
                 .is_none_or(|state| !state.existence.is_open())
             || self.refuse_for_deleting_card(target.card)
+            || self.pane_transfer_pending(target.card)
         {
             return Task::none();
         }
-        let Some(runtime) = self.chat_runtime_mut(target) else {
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) else {
             return Task::none();
         };
-        if !runtime.choosing() {
+        if runtime.target != target || !runtime.choosing() || !runtime.session.is_unstarted() {
             return Task::none();
         }
-        let model = runtime
-            .snapshot
-            .selected_model
-            .clone()
-            .map(|model| (model, runtime.snapshot.reasoning.clone()));
-        let mut session = runtime.session.clone();
-        session.id = TerminalId::new();
+        let source = runtime.session.clone();
+        if !self.card_state(target.card).is_some_and(
+            |state| matches!(&state.kind, CardKind::Chat(current) if current == &source),
+        ) {
+            return Task::none();
+        }
+        let Some(writer) = self.session.as_ref() else {
+            if let Some(runtime) = self.chat_card_runtime_mut(target) {
+                runtime.error = Some(
+                    "Session storage is unavailable. Nothing was started; your draft is retained."
+                        .into(),
+                );
+            }
+            return Task::none();
+        };
+        let writer_identity = Arc::downgrade(&writer.operation_store());
+        // Every Send saves a fresh identity. An earlier attempt that did not
+        // start was already returned to A behind its own write.
+        let mut candidate = source.clone();
+        candidate.id = TerminalId::new();
         let text = runtime.composer.text();
         let resolved_text = completion::invocations(
             completion::from_leading_skill(&text, &runtime.snapshot.skills),
             &runtime.snapshot.skills,
         )
         .into_owned();
+        let attachments = runtime.attachments.clone();
+        let model = runtime
+            .snapshot
+            .selected_model
+            .clone()
+            .map(|model| (model, runtime.snapshot.reasoning.clone()));
+        let attempt = uuid::Uuid::new_v4();
+        let pending = DraftStartCheckpoint {
+            target,
+            attempt,
+            source: source.clone(),
+            candidate: candidate.clone(),
+            writer: writer_identity,
+            registry: self.workspace_model.identity,
+            scope: self.draft_start_scope(target.card),
+            backend: draft_start_backend(),
+            revision: runtime.revision,
+            text,
+            resolved_text,
+            attachments,
+            model,
+        };
+        self.chat_ui.draft_checkpoints.insert(target.card, pending);
+        self.chat_ui
+            .phases
+            .insert(target.card, Phase::SavingDraft { target });
+        // The composer and public source are still A. The snapshot projection
+        // contains the exact candidate B and the still-editable text/images.
+        let snapshot = self.persistent_workspace();
+        let writer = self.session.as_ref().expect("writer was checked above");
+        // Exact replacement equality is idempotent when B already landed;
+        // otherwise the original A identity must still match. This explicit
+        // Send never re-arms unrelated quarantined workspace writes.
+        writer.replace_chat_identity(target.card, source.id, candidate, snapshot);
+        let receipt = writer.request_flush();
+        cosmic::task::future(async move {
+            let result = match receipt {
+                Ok(receipt) => tokio::task::spawn_blocking(move || {
+                    receipt
+                        .recv_timeout(Duration::from_secs(30))
+                        .map_err(|error| format!("Session save did not complete: {error}"))?
+                })
+                .await
+                .map_err(|_| "The session save worker stopped".to_owned())
+                .and_then(|r| r),
+                Err(error) => Err(error),
+            };
+            Message::ChatUi(Action::DraftStartCheckpointed(target, attempt, result))
+        })
+    }
+
+    fn draft_start_scope(&self, card: CardId) -> Option<crate::workspace_model::views::Scope> {
+        use crate::workspace_model::views::Scope;
+        self.durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&card))
+            .map(|channel| Scope::Channel(channel.id))
+            .or_else(|| {
+                self.card_state(card)
+                    .and_then(|state| self.card_worktree(state))
+                    .and_then(|path| self.worktree_view_scope(path))
+            })
+    }
+
+    fn restore_failed_draft_start_focus(
+        &self,
+        target: Target,
+        source: &chat::Session,
+    ) -> Task<Message> {
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) else {
+            return Task::none();
+        };
+        if !self.refresh_ui.focused
+            || !self.card_holds_keyboard(target.card)
+            || runtime.target != target
+            || runtime.session != *source
+            || !runtime.choosing()
+            || !runtime.session.is_unstarted()
+            || !self.card_state(target.card).is_some_and(|state| {
+                state.existence.is_open()
+                    && matches!(&state.kind, CardKind::Chat(source) if source == &runtime.session)
+            })
+        {
+            return Task::none();
+        }
+        // Saving temporarily replaces the editor. Restore it only if the
+        // reader has not given the keyboard to another control meanwhile.
+        workspace_widget::focus_after_loading(
+            self.card_header_widget_id(target.card),
+            card_control_id(target.card, "chat-composer"),
+        )
+        .map(cosmic::Action::App)
+    }
+
+    fn draft_start_checkpointed(
+        &mut self,
+        target: Target,
+        attempt: uuid::Uuid,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        let Some(pending) = self.chat_ui.draft_checkpoints.get(&target.card) else {
+            return Task::none();
+        };
+        if pending.target != target || pending.attempt != attempt {
+            return Task::none();
+        }
+        if !matches!(self.chat_ui.phases.get(&target.card), Some(Phase::SavingDraft { target: active }) if *active == target)
+        {
+            // Its save outlived the phase that would have started it.
+            self.release_draft_start_capture(target.card);
+            return Task::none();
+        }
+        let source_matches = self.card_state(target.card).is_some_and(|card| {
+            card.existence.is_open()
+                && matches!(&card.kind, CardKind::Chat(source) if source == &pending.source)
+        });
+        let context_matches = self.workspace_model.identity == pending.registry
+            && self.draft_start_scope(target.card) == pending.scope
+            && draft_start_backend() == pending.backend
+            && self.session.as_ref().is_some_and(|writer| {
+                pending
+                    .writer
+                    .ptr_eq(&Arc::downgrade(&writer.operation_store()))
+            });
+        let creation_revoked =
+            self.shared_chat_creation_revoked(target.card, pending.scope.as_ref());
+        let message_matches = self.cards.get(&target.card).is_some_and(|card| match card {
+            CardRuntime::Chat(runtime)
+                if runtime.target == target
+                    && runtime.choosing()
+                    && runtime.session == pending.source =>
+            {
+                let resolved = completion::invocations(
+                    completion::from_leading_skill(
+                        &runtime.composer.text(),
+                        &runtime.snapshot.skills,
+                    ),
+                    &runtime.snapshot.skills,
+                )
+                .into_owned();
+                runtime.revision == pending.revision
+                    && runtime.composer.text() == pending.text
+                    && runtime.attachments == pending.attachments
+                    && runtime
+                        .snapshot
+                        .selected_model
+                        .clone()
+                        .map(|model| (model, runtime.snapshot.reasoning.clone()))
+                        == pending.model
+                    && resolved == pending.resolved_text
+            }
+            _ => false,
+        });
+        let source = pending.source.clone();
+        self.chat_ui.phases.remove(&target.card);
+        if !source_matches || !context_matches {
+            self.release_draft_start_capture(target.card);
+            // Another window's launch options wait for this save's answer. The
+            // composer adopts them now, or the next Send refuses a stale source.
+            let adopted = self.adopt_stored_draft_session(target.card);
+            let Some(runtime) = self.chat_card_runtime_mut(target) else {
+                return adopted;
+            };
+            runtime.error = Some(if source_matches {
+                "The workspace changed while saving. Nothing was started; your draft is retained, so send it again when ready.".into()
+            } else {
+                "This draft changed in another window while saving. Nothing was started; your draft is retained, so review it and send again.".into()
+            });
+            // The same draft keeps the keyboard; another conversation's reader
+            // in this card owns its own.
+            let shown = runtime.session.clone();
+            let focus = if shown.id == source.id {
+                self.restore_failed_draft_start_focus(target, &shown)
+            } else {
+                Task::none()
+            };
+            return Task::batch([adopted, focus]);
+        }
+        if creation_revoked {
+            self.release_draft_start_capture(target.card);
+            if let Some(runtime) = self.chat_card_runtime_mut(target) {
+                runtime.error = Some("This pane was closed or its creation was refused. Nothing was started. Your draft is retained; copy it before closing this pane.".into());
+            }
+            return self.restore_failed_draft_start_focus(target, &source);
+        }
+        if !message_matches || self.modal_is_open() {
+            self.release_draft_start_capture(target.card);
+            if let Some(runtime) = self.chat_card_runtime_mut(target) {
+                runtime.error = Some("The draft or its workspace changed while saving. Nothing was started; review it and send again.".into());
+            }
+            return self.restore_failed_draft_start_focus(target, &source);
+        }
+        if let Err(error) = result {
+            self.release_draft_start_capture(target.card);
+            tracing::warn!(card = %target.card, %error, "First conversation checkpoint did not complete");
+            if let Some(runtime) = self.chat_card_runtime_mut(target) {
+                runtime.error = Some("The conversation could not be saved, so nothing was started. Your draft is retained; check the workspace save notice before trying again.".into());
+            }
+            return self.restore_failed_draft_start_focus(target, &source);
+        }
+        let pending = self
+            .chat_ui
+            .draft_checkpoints
+            .remove(&target.card)
+            .expect("matching checkpoint");
+        let Some(runtime) = self.chat_card_runtime_mut(target) else {
+            return Task::none();
+        };
         runtime.preparation.clear_local();
         runtime.queued = Some(Queued {
-            source: prompt::LocalSource::new(text),
+            source: prompt::LocalSource::new(pending.text),
             presentation: prompt::LocalPresentation::default(),
-            resolved_text,
+            resolved_text: pending.resolved_text,
             attachments: runtime.take_attachments(),
-            model,
-            draft: session.clone(),
+            model: pending.model,
+            draft: pending.candidate.clone(),
             since: None,
             rechecking: false,
         });
@@ -7657,9 +8207,17 @@ impl Cagents {
         runtime.model_picker = None;
         runtime.account_picker = false;
         runtime.reasoning_picker = false;
-        runtime.session = session.clone();
-        self.replace_chat_conversation(target.card, session.clone());
-        self.start_chat(target.card, session, chat::Intent::Start, None, false)
+        runtime.session = pending.candidate.clone();
+        // Only the accepted checkpoint authorizes B's public projection and
+        // the first provider handshake. No fallback or first prompt precedes it.
+        self.commit_chat_session(target.card, pending.candidate.clone());
+        self.start_chat(
+            target.card,
+            pending.candidate,
+            chat::Intent::Start,
+            None,
+            false,
+        )
     }
 
     /// Takes the next step of sending a started draft's first message: its
@@ -7820,7 +8378,7 @@ impl Cagents {
                 // it can only be this one.
                 let arrived = runtime
                     .handle()
-                    .is_some_and(|handle| handle.has_observed_user_item());
+                    .is_some_and(|handle| handle.has_accepted_user_input());
                 if !arrived {
                     return self.revert_chat_draft(target, Some(error));
                 }
@@ -7919,7 +8477,7 @@ impl Cagents {
                     .abandoned
                     .insert(attempt.target, attempt.session);
             }
-            return Task::none();
+            return self.adopt_stored_draft_session(target.card);
         }
         self.revert_chat_draft(target, None)
     }
@@ -8653,6 +9211,9 @@ impl Cagents {
                 }
                 return self.update(Message::ChatUi(Action::Ready(target, ready)));
             }
+            Action::DraftStartCheckpointed(target, attempt, result) => {
+                return self.draft_start_checkpointed(target, attempt, result);
+            }
             Action::Ready(target, ready) => {
                 let result = ready.0.lock().ok().and_then(|mut ready| ready.take());
                 let Some(result) = result else {
@@ -9370,9 +9931,10 @@ impl Cagents {
                     // Taken above, for a parked conversation too.
                     Wake::AccountUsage => return Task::none(),
                     Wake::Disconnected(error) => {
-                        // A first message still waiting will not be taken
-                        // now, and a conversation without it holds nothing.
-                        if runtime.queued.is_some() {
+                        // The reader can accept the first message before its
+                        // command callback reaches the UI. Preserve that
+                        // execution across EOF, as the command-error path does.
+                        if runtime.queued.is_some() && !handle.has_accepted_user_input() {
                             return self.revert_chat_draft(target, Some(error));
                         }
                         runtime.disconnected = true;
@@ -11038,14 +11600,22 @@ impl Cagents {
                         return Task::none();
                     }
                     runtime.attachment_chooser_pending = None;
-                    if !runtime.attachment_bookmarks.contains_key(&id.id) {
-                        return Task::none();
-                    }
-                    match result {
-                        Ok(Some(paths)) => return self.stage_chat_attachments(target, id, paths),
-                        Ok(None) => runtime.cancel_attachment_insert(id.id, None),
-                        Err(error) => runtime.cancel_attachment_insert(id.id, Some(error)),
-                    }
+                    let staged = if !runtime.attachment_bookmarks.contains_key(&id.id) {
+                        Task::none()
+                    } else {
+                        match result {
+                            Ok(Some(paths)) => self.stage_chat_attachments(target, id, paths),
+                            Ok(None) => {
+                                runtime.cancel_attachment_insert(id.id, None);
+                                Task::none()
+                            }
+                            Err(error) => {
+                                runtime.cancel_attachment_insert(id.id, Some(error));
+                                Task::none()
+                            }
+                        }
+                    };
+                    return Task::batch([staged, self.adopt_stored_draft_session(target.card)]);
                 }
             }
             Action::Dropped(target, payload) => {
@@ -11234,7 +11804,9 @@ impl Cagents {
                     Arc::make_mut(&mut runtime.snapshot).permission_mode = Some(mode);
                     let session = runtime.session.clone();
                     self.replace_chat_conversation(target.card, session);
-                    return Task::none();
+                    // Skills found for the earlier launch are not accepted for
+                    // this one, so a discovery under way would be dropped.
+                    return self.load_draft_skills(target);
                 }
                 return self.chat_send(target, Command::SetPermissionMode { mode }, false);
             }
@@ -11656,6 +12228,72 @@ impl Cagents {
     }
 }
 
+/// The permission mode draft `card` shows in its footer, and the launch its
+/// first message would start.
+#[cfg(test)]
+pub(super) fn draft_launch_for_test(
+    app: &Cagents,
+    card: CardId,
+) -> (Option<String>, chat::Session) {
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("a draft has a chat runtime");
+    };
+    assert!(runtime.choosing(), "the draft can still change its options");
+    (
+        runtime.snapshot.permission_mode.clone(),
+        runtime.session.clone(),
+    )
+}
+
+/// The reason draft `card` last failed to start, which it shows.
+#[cfg(test)]
+pub(super) fn draft_error_for_test(app: &mut Cagents, card: CardId) -> &mut Option<String> {
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+        panic!("a draft has a chat runtime");
+    };
+    &mut runtime.error
+}
+
+/// Runs `during` while draft `card`'s file chooser is open, then dismisses the
+/// chooser as its dialog would.
+#[cfg(test)]
+pub(super) fn with_attachment_chooser_open_for_test(
+    app: &mut Cagents,
+    card: CardId,
+    during: impl FnOnce(&mut Cagents),
+) {
+    let _admission = attachment_draft::test_admission();
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+        panic!("a draft has a chat runtime");
+    };
+    let target = runtime.target;
+    let ticket = runtime.begin_attachment_insert();
+    runtime.attachment_chooser_pending = Some(ticket.id);
+    during(app);
+    drop(app.update(Message::ChatUi(Action::Attached(target, ticket, Ok(None)))));
+}
+
+/// Sends draft `card`'s first message through its save, returning the launch it starts.
+#[cfg(test)]
+pub(super) fn start_draft_for_test(app: &mut Cagents, card: CardId) -> chat::Session {
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("a draft has a chat runtime");
+    };
+    let target = runtime.target;
+    let (target, attempt, result) =
+        first_start_checkpoint_tests::checkpoint(app.start_chat_draft(target));
+    drop(app.handle_chat_ui(Action::DraftStartCheckpointed(target, attempt, result)));
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("a starting draft keeps its chat runtime");
+    };
+    runtime
+        .queued
+        .as_ref()
+        .expect("the first message waits for its conversation")
+        .draft
+        .clone()
+}
+
 #[cfg(test)]
 pub(super) fn refused_switch_message(app: &Cagents, card: CardId, message: &str) -> Message {
     Message::ChatUi(Action::Ready(
@@ -11664,6 +12302,14 @@ pub(super) fn refused_switch_message(app: &Cagents, card: CardId, message: &str)
             message,
         )))))),
     ))
+}
+
+#[cfg(test)]
+pub(super) fn chat_error_for_test(app: &Cagents, card: CardId) -> Option<&str> {
+    match app.cards.get(&card) {
+        Some(CardRuntime::Chat(runtime)) => runtime.error.as_deref(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -17417,7 +18063,41 @@ mod tests {
     /// Sends what the composer of `card` holds.
     fn submit(app: &mut Cagents, card: CardId) {
         let target = chat_runtime(app, card).target;
-        let _ = app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send)));
+        submit_target(app, target);
+    }
+
+    fn settle_first_start_checkpoint(app: &mut Cagents, card: CardId, task: Task<Message>) {
+        if matches!(
+            app.chat_ui.phases.get(&card),
+            Some(Phase::SavingDraft { .. })
+        ) {
+            let (target, attempt, result) = super::first_start_checkpoint_tests::checkpoint(task);
+            assert!(
+                result.is_ok(),
+                "real first-start fixture checkpoint: {result:?}"
+            );
+            drop(app.draft_start_checkpointed(target, attempt, result));
+        }
+    }
+
+    fn submit_target(app: &mut Cagents, target: Target) {
+        // Existing start/Ready tests exercise the provider boundary, not a
+        // fabricated save receipt. Supply and drive the real writer barrier
+        // first, while never polling the returned provider-start Task.
+        let directory = app.session.is_none().then(|| tempfile::tempdir().unwrap());
+        if let Some(directory) = &directory {
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("first-start-test.sqlite3"),
+                crate::model::BootId::new("chat-submit-test"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+        }
+        let task = app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send)));
+        settle_first_start_checkpoint(app, target.card, task);
+        if directory.is_some() {
+            drop(app.session.take());
+        }
     }
 
     #[test]
@@ -18545,12 +19225,21 @@ mod tests {
     fn main_work_refuses_queued_native_composer_edits_and_submit_but_conversations_accepts_them() {
         let renderer = crate::app::tests::headless_renderer();
         for started in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = if started {
                 live_chat(&mut app, Some(KNOWN_THREAD))
             } else {
                 draft_chat(&mut app)
             };
+            if !started {
+                let (writer, _) = crate::session::SessionRuntime::open(
+                    directory.path().join("widget-first-start.sqlite3"),
+                    crate::model::BootId::new("widget-first-start"),
+                )
+                .unwrap();
+                app.session = Some(writer);
+            }
             write(&mut app, card, "unsent");
             let character = || keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character("x".into()),
@@ -18591,7 +19280,8 @@ mod tests {
             }
             assert_eq!(chat_runtime(&app, card).composer.text(), "unsentx");
             for message in queued_composer_key(&app, card, enter(), &renderer) {
-                drop(app.update(message));
+                let task = app.update(message);
+                settle_first_start_checkpoint(&mut app, card, task);
             }
             if started {
                 assert!(
@@ -23739,9 +24429,8 @@ mod tests {
         assert!(!app.chat_start_pending(card));
     }
 
-    /// A saved conversation nothing ever ran reopens as a draft, and any
-    /// actor an unanswered start left for it is given up; one that did run
-    /// reconnects as before.
+    /// An unstarted saved conversation reopens as a draft without retiring
+    /// another window's possible execution; a started one reconnects.
     #[test]
     fn only_a_conversation_that_ran_reconnects_on_restore() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -23752,7 +24441,7 @@ mod tests {
         let _ = app.open_chat(card, session, chat::Intent::Restore);
         assert!(chat_runtime(&app, card).is_draft());
         assert!(!app.chat_start_pending(card));
-        retired(&mut app, card);
+        assert!(app.chat_ui.retiring.is_empty());
 
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let session = chat_runtime(&app, card).session.clone();
@@ -23821,7 +24510,7 @@ mod tests {
             "{labels:?}"
         );
         let retry = runtime.target;
-        drop(app.handle_chat_ui(Action::Submit(retry, PromptMode::Send)));
+        submit_target(&mut app, retry);
         let attempt = chat_runtime_attempt(&app, card);
         let runtime = chat_runtime(&app, card);
         assert!(!runtime.capacity_refused);
@@ -23829,7 +24518,7 @@ mod tests {
         assert!(runtime.composer.text().is_empty());
         // A second press while that attempt owns the card cannot enqueue or
         // create another start, even with the old rendered target.
-        drop(app.handle_chat_ui(Action::Submit(retry, PromptMode::Send)));
+        submit_target(&mut app, retry);
         assert_eq!(chat_runtime_attempt(&app, card), attempt);
         assert_eq!(
             chat_runtime(&app, card)
@@ -27949,3 +28638,11 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "chat_ui/first_start_checkpoint_tests.rs"]
+mod first_start_checkpoint_tests;
+
+#[cfg(test)]
+#[path = "chat_ui/absence_tests.rs"]
+mod absence_tests;

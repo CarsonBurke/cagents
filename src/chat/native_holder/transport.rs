@@ -530,6 +530,9 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
             }
         })
         .map_err(|error| error.to_string())?;
+    // Only the daemon starts holders. A process that sweeps adopted orphans
+    // would have to register this child through `adopted_orphans`.
+    debug_assert!(!crate::daemon::adopted_orphans::sweeping());
     let child = holder.spawn().map_err(|error| error.to_string())?;
     let pid = child.id() as i32;
     *owner.child.lock().unwrap_or_else(|p| p.into_inner()) = Some(child);
@@ -2126,6 +2129,7 @@ exec /bin/sleep 60
             std::sync::Arc::new(std::fs::File::open(working.path()).unwrap()),
         )));
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: Some(context.clone()),
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket { socket },
@@ -2333,6 +2337,7 @@ exec /bin/sleep 60
         stripped.launch.recipe.arguments.clear();
         assert!(!stripped.owns_codex_listener());
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket {
@@ -2536,6 +2541,7 @@ exec /bin/sleep 60
             .allocator
             .boot_id = boot;
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket {
@@ -2650,6 +2656,7 @@ exec /bin/sleep 60
         let context = std::sync::Arc::new(crate::chat::protocol::ExecutionContext::default());
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: Some(context.clone()),
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket {

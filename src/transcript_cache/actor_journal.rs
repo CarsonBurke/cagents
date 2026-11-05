@@ -224,7 +224,8 @@ mod tests {
         );
         retention.allow_removal().unwrap();
         assert_eq!(
-            crate::transcript_cache::sweep(root.path()).unwrap().count,
+            crate::transcript_cache::sweep_reclaiming(root.path(), Path::new("/proc"), &directory)
+                .count,
             1
         );
         assert!(!directory.exists());

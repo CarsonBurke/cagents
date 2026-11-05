@@ -38,6 +38,12 @@ const ARGUMENT: &str = "--cagents-native-actor";
 pub(super) const PROTOCOL: u32 = 2;
 const CAPABILITY: &str = registry::RETAINED_CLAUDE_CAPABILITY;
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a caller waits for an input's acknowledgement before reporting
+/// its outcome as unknown.
+const ACKNOWLEDGEMENT_WAIT: Duration = Duration::from_secs(10);
+/// Delay before the second retransmission of an input whose `input` call
+/// failed. Later delays double, up to `TIMEOUT`.
+const RETRANSMIT_DELAY: Duration = Duration::from_millis(100);
 fn payload_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).into()
@@ -197,6 +203,19 @@ struct Pending {
     bytes: usize,
     reply: Option<crossbeam_channel::Sender<Result<(), Rejection>>>,
 }
+/// The newest input whose delivery is unconfirmed. It fences admission until
+/// a helper receipt resolves it.
+struct UncertainInput {
+    identity: InputIdentity,
+    /// When its caller stops waiting and reports the outcome as unknown.
+    acknowledgement_deadline: Instant,
+    /// Set once the original `input` call has failed.
+    retransmit: Option<Retransmit>,
+}
+struct Retransmit {
+    next: Instant,
+    delay: Duration,
+}
 struct Remote {
     close_only: bool,
     source: chat::Session,
@@ -214,7 +233,7 @@ struct Remote {
     desired_observe: AtomicBool,
     notified_prompt_revision: std::sync::atomic::AtomicU64,
     input_sequence: Mutex<u64>,
-    uncertain_input: Mutex<Option<InputIdentity>>,
+    uncertain_input: Mutex<Option<UncertainInput>>,
     pending: Mutex<Vec<Pending>>,
     retiring_inputs: Mutex<Vec<InputIdentity>>,
     recovering_inputs: AtomicBool,
@@ -319,6 +338,12 @@ pub(super) fn fixture_source() -> chat::Session {
 impl RemoteActor {
     #[cfg(test)]
     pub(in crate::chat::runtime) fn fixture() -> Self {
+        Self::fixture_at(PathBuf::from("/nonexistent/cagents-actor-fixture"))
+    }
+    /// A fixture proxy whose helper socket is `socket`. The in-process peer
+    /// authenticates, because the fixture names this process as its holder.
+    #[cfg(test)]
+    fn fixture_at(socket: PathBuf) -> Self {
         use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalId};
         let process = Process::read(std::process::id() as i32).unwrap();
         let boot = BootId::new("fixture-boot");
@@ -387,7 +412,7 @@ impl RemoteActor {
                 host_session_id: HostSessionId::new("fixture"),
                 host_incarnation: HostIncarnation::new("fixture"),
             },
-            socket: PathBuf::from("/nonexistent/cagents-actor-fixture"),
+            socket,
             state: Mutex::new(Arc::new(resident)),
             publication: Mutex::new(()),
             final_snapshot: Mutex::new(None),
@@ -1105,6 +1130,7 @@ impl RemoteActor {
                     {
                         actor.apply_receipts(&receipts);
                     }
+                    actor.retransmit_uncertain_input();
                     let _ = actor.flush_input_retirements();
                     drop(actor);
                     thread::sleep(Duration::from_millis(50));
@@ -1361,7 +1387,7 @@ impl RemoteActor {
             command,
             decline_only: true,
         })?
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(ACKNOWLEDGEMENT_WAIT)
         .map_err(|_| {
             "Retained refusal acknowledgement remains unknown; never resend automatically"
                 .to_owned()
@@ -1411,7 +1437,7 @@ impl RemoteActor {
                     "Input outcome retirement is pending; no new command was admitted".into(),
                 );
             }
-            if let Some(identity) = &*self
+            if let Some(UncertainInput { identity, .. }) = &*self
                 .0
                 .uncertain_input
                 .lock()
@@ -1462,7 +1488,11 @@ impl RemoteActor {
                 .0
                 .uncertain_input
                 .lock()
-                .unwrap_or_else(|p| p.into_inner()) = Some(identity.clone());
+                .unwrap_or_else(|p| p.into_inner()) = Some(UncertainInput {
+                identity: identity.clone(),
+                acknowledgement_deadline: Instant::now() + ACKNOWLEDGEMENT_WAIT,
+                retransmit: None,
+            });
             pending.push(Pending {
                 identity: identity.clone(),
                 payload: payload.clone(),
@@ -1471,11 +1501,74 @@ impl RemoteActor {
             });
         }
         // Preserve the exact identity and envelope before crossing the socket.
-        // An ambiguous write keeps the receipt pending and fences new input.
-        if let Ok(receipt) = self.call::<InputReceipt>("input", json!([identity, payload])) {
-            self.apply_receipts(&[receipt]);
+        // An ambiguous write keeps the receipt pending and fences new input
+        // until the metadata pump observes or retransmits it.
+        match self.call::<InputReceipt>("input", json!([identity, payload])) {
+            Ok(receipt) => self.apply_receipts(&[receipt]),
+            Err(_) => {
+                if let Some(uncertain) = self
+                    .0
+                    .uncertain_input
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_mut()
+                    .filter(|uncertain| uncertain.identity == identity)
+                {
+                    uncertain.retransmit = Some(Retransmit {
+                        next: Instant::now(),
+                        delay: RETRANSMIT_DELAY,
+                    });
+                }
+            }
         }
         Ok(response)
+    }
+    /// A failed `input` call may never have reached the helper, so no receipt
+    /// would ever resolve its fence. Retransmit the exact envelope once that
+    /// call has failed, backing off while the helper stays unreachable or
+    /// refuses it. The helper admits each identity once and otherwise returns
+    /// its existing receipt, so this never executes an input twice.
+    ///
+    /// Retransmission is part of the caller's own delivery attempt, so it
+    /// stops when the caller reports the outcome as unknown. An input never
+    /// starts long after its caller was told not to resend it; the fence
+    /// then awaits an explicit retry or a receipt.
+    fn retransmit_uncertain_input(&self) {
+        let due = {
+            let mut uncertain = self
+                .0
+                .uncertain_input
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let Some(uncertain) = uncertain.as_mut() else {
+                return;
+            };
+            let now = Instant::now();
+            if now >= uncertain.acknowledgement_deadline {
+                uncertain.retransmit = None;
+            }
+            match &uncertain.retransmit {
+                Some(retransmit) if retransmit.next <= now => uncertain.identity.clone(),
+                _ => return,
+            }
+        };
+        if self.retry_input(&due).is_ok() {
+            return;
+        }
+        if let Some(UncertainInput {
+            identity,
+            retransmit: Some(retransmit),
+            ..
+        }) = &mut *self
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            && *identity == due
+        {
+            retransmit.next = Instant::now() + retransmit.delay;
+            retransmit.delay = retransmit.delay.saturating_mul(2).min(TIMEOUT);
+        }
     }
     /// Explicit retransmission of the exact protocol envelope. Existing helper
     /// receipts return the original outcome without invoking the adapter again.
@@ -1514,7 +1607,10 @@ impl RemoteActor {
             else {
                 return true;
             };
-            if uncertain.as_ref() == Some(&receipt.identity) {
+            if uncertain
+                .as_ref()
+                .is_some_and(|uncertain| uncertain.identity == receipt.identity)
+            {
                 *uncertain = None;
             }
             match &receipt.state {
@@ -1610,13 +1706,13 @@ impl RemoteActor {
         command: Command,
     ) -> Result<(), Rejection> {
         let receiver = self.enqueue(run, command).map_err(Rejection::Refused)?;
-        receiver.recv_timeout(Duration::from_secs(10)).map_err(|_|Rejection::Unacknowledged("Retained actor input acknowledgement is pending; use its stable receipt, never resend blindly".into()))?
+        receiver.recv_timeout(ACKNOWLEDGEMENT_WAIT).map_err(|_|Rejection::Unacknowledged("Retained actor input acknowledgement is pending; use its stable receipt, never resend blindly".into()))?
     }
     pub fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
         let receiver = self
             .enqueue_payload(InputPayload::IdlePrompt { text })
             .map_err(Rejection::Refused)?;
-        receiver.recv_timeout(Duration::from_secs(10))
+        receiver.recv_timeout(ACKNOWLEDGEMENT_WAIT)
             .map_err(|_| Rejection::Unacknowledged("Retained idle prompt acknowledgement is pending; use its stable receipt, never resend blindly".into()))?
     }
     pub fn interrupt(
@@ -1629,7 +1725,7 @@ impl RemoteActor {
             including_subagents,
         })?;
         receiver
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(ACKNOWLEDGEMENT_WAIT)
             .map_err(|_| {
                 "Retained interrupt acknowledgement remains unknown; never resend automatically"
                     .to_owned()
@@ -2956,7 +3052,9 @@ impl Server {
             &Ok::<_, String>(self.attached()?),
             Duration::from_secs(30),
         )?;
+        let mut orphans = OrphanSweep::new();
         loop {
+            orphans.run_if_due();
             self.finish_inputs();
             if !self.installed && disconnected(&startup)? {
                 self.actor.close()?;
@@ -2992,6 +3090,7 @@ impl Server {
                             1,
                             crate::descriptor_frame::FrameByteOrder::LittleEndian,
                         );
+                        orphans.run();
                         continue;
                     }
                     let mut finished = false;
@@ -3008,6 +3107,7 @@ impl Server {
                     if finished {
                         break;
                     }
+                    orphans.run();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(20))
@@ -3119,6 +3219,44 @@ fn disconnected(control: &UnixStream) -> Result<bool, String> {
     }
     Ok(event.revents & (libc::POLLHUP | libc::POLLERR) != 0)
 }
+/// This actor is a subreaper, so every orphaned tool descendant of its
+/// provider becomes its child. Reap the exited ones while it serves; the
+/// provider and scope requests spawn through `adopted_orphans`, which reserves
+/// their statuses for their owners. Nothing here signals a live child.
+///
+/// The helper has no log sink, so a sweep failure is retried on the next tick
+/// rather than reported here. Its durable symptom is the per-holder zombie
+/// count that `cagents diagnostics` observes from outside the process.
+struct OrphanSweep {
+    due: Instant,
+}
+impl OrphanSweep {
+    const INTERVAL: Duration = Duration::from_millis(250);
+    /// Bounds one pass so a large backlog cannot stall the serve loop.
+    const LIMIT: usize = 4096;
+
+    fn new() -> Self {
+        Self {
+            due: Instant::now(),
+        }
+    }
+
+    fn run_if_due(&mut self) {
+        if Instant::now() >= self.due {
+            self.run();
+        }
+    }
+
+    fn run(&mut self) {
+        self.due = Instant::now() + Self::INTERVAL;
+        if let Ok(sweep) = crate::daemon::adopted_orphans::reap_exited(Self::LIMIT)
+            && sweep.truncated
+        {
+            // Continue the backlog on the next serve iteration.
+            self.due = Instant::now();
+        }
+    }
+}
 /// Only after the actor's ChildGuard has joined: no competing provider reaper
 /// remains. A child PID cannot be recycled until this sole reaper consumes it.
 fn reap_orphans() -> Result<(), String> {
@@ -3201,6 +3339,8 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
+        // Every child spawned from here on must register with the sweep.
+        crate::daemon::adopted_orphans::become_sweeper();
         let result = (|| {
             crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
             let server = Server::start_after_scope_enrollment(
@@ -3451,6 +3591,155 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         serving.parent.take();
         serving.worker.take().unwrap().join().unwrap().unwrap();
         assert!(!socket.exists() && !record_path.exists());
+    }
+
+    #[test]
+    fn serving_actor_reaps_exited_adopted_orphans_without_touching_live_ones() {
+        const CHILD: &str = "CAGENTS_RETAINED_ORPHAN_SWEEP_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let test = thread::current().name().unwrap().to_owned();
+            let output = ChildCommand::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", root.path())
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("HOME", root.path().join("home"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // This isolated process stands in for the helper: a subreaper that
+        // adopts every orphan its provider's tools leave behind.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let state = |pid: i32| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat[stat.rfind(')')? + 2..].chars().next()
+        };
+        let zombies = || {
+            crate::daemon::owned_children::direct_children()
+                .unwrap()
+                .into_iter()
+                .filter(|pid| state(*pid) == Some('Z'))
+                .count()
+        };
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let cwd = root.path().join("cwd");
+        let home = root.path().join("claude");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let orphaned = root.path().join("orphaned");
+        let mut source = fixture_source();
+        source.launch.recipe.working_directory = cwd.clone();
+        source.launch.recipe.environment = BTreeMap::from([
+            ("HOME".into(), root.path().to_string_lossy().into_owned()),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                home.to_string_lossy().into_owned(),
+            ),
+        ]);
+        source.proof.as_mut().unwrap().boot_id = crate::daemon::read_boot_id().unwrap();
+        let proof = source.proof.clone().unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let (control, parent) = UnixStream::pair().unwrap();
+        let (spec, adapter) = chat::protocol::create(&source.launch).unwrap();
+        let session_id = spec
+            .arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--session-id="))
+            .unwrap()
+            .to_owned();
+        // After initializing, the provider's tools orphan 600 grandchildren in
+        // bursts that exit together after their parents, so their SIGCHLDs
+        // coalesce. One more orphaned daemon shares the provider's stdin, so
+        // both stay alive until the actor, or this process, closes it.
+        let startup = Startup {
+            protocol: PROTOCOL,
+            source: source.clone(),
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                r#"IFS= read -r frame || exit 2
+id=${frame#*\"request_id\":\"}
+id=${id%%\"*}
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"current_permission_mode":"default"}}}\n' "$id"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$1"
+exec 3<&0
+for burst in 1 2 3 4 5 6; do
+  i=0
+  while [ $i -lt 100 ]; do (/bin/sleep 0.2 &); i=$((i + 1)); done
+done
+(/bin/cat <&3 >/dev/null & echo $! > "$2")
+while IFS= read -r frame; do :; done
+"#
+                .into(),
+                "orphan-fixture".into(),
+                session_id,
+                orphaned.to_string_lossy().into_owned(),
+            ],
+            prepared_identity: adapter.prepared_launch_identity().unwrap(),
+            environment: source.launch.recipe.environment.clone(),
+            working_directory: cwd.clone(),
+            directory_fd: None,
+            directory_identity: None,
+            mailbox_recognition: None,
+            provider_directory_observed: false,
+            recovery_environment: BTreeMap::new(),
+        };
+        let server = Server::start_after_scope_enrollment(startup, &control, || Ok(())).unwrap();
+        let provider = server.identity.record.root.clone();
+        let mut parent = Some(parent);
+        let worker = thread::spawn(move || server.serve(control));
+        let attached: Result<Attached, String> =
+            receive(parent.as_ref().unwrap(), TIMEOUT).unwrap();
+        attached.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let live: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&orphaned)
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "provider tools did not finish");
+            thread::sleep(Duration::from_millis(10));
+        };
+        // Every exited orphan is reaped within a bound while both the actor
+        // and its provider keep running.
+        let bound = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = zombies();
+            if remaining == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < bound,
+                "{remaining} exited adopted orphans were not reaped while serving"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(provider.is_current(), "the provider must keep running");
+        assert!(!worker.is_finished(), "the actor must keep serving");
+        // The live adopted daemon is still this actor's unsignalled child.
+        assert_eq!(state(live), Some('S'));
+        assert!(
+            crate::daemon::owned_children::direct_children()
+                .unwrap()
+                .contains(&live)
+        );
+        // Startup EOF retires the actor through its existing cleanup.
+        parent.take();
+        worker.join().unwrap().unwrap();
+        assert!(!provider.is_current(), "original provider must be reaped");
     }
 
     thread_local! {
@@ -5302,6 +5591,100 @@ exec /bin/sleep 60
         ));
     }
     #[test]
+    fn failed_input_call_is_retransmitted_until_its_receipt_lifts_the_fence() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = directory.path().join("actor.sock");
+        let actor = RemoteActor::fixture_at(socket.clone());
+        // The helper is unreachable, so the original `input` call fails and
+        // its delivery is unknown: it may never have reached the helper.
+        let response = actor.enqueue(None, Command::Refresh).unwrap();
+        let identity = actor.pending_inputs().pop().unwrap();
+        let fenced = actor.enqueue(None, Command::Refresh).unwrap_err();
+        assert!(fenced.starts_with("Resolve retained input"), "{fenced}");
+        actor.retransmit_uncertain_input();
+        let retransmit = |actor: &RemoteActor| {
+            let uncertain = actor.0.uncertain_input.lock().unwrap();
+            let retransmit = uncertain.as_ref().unwrap().retransmit.as_ref();
+            retransmit.map(|retransmit| (retransmit.next, retransmit.delay))
+        };
+        let (next, delay) = retransmit(&actor).expect("a failed call schedules retransmission");
+        assert!(next > Instant::now() && delay > RETRANSMIT_DELAY);
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        actor.retransmit_uncertain_input();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "nothing is retransmitted before its backoff elapses"
+        );
+        listener.set_nonblocking(false).unwrap();
+        let expected = identity.clone();
+        let helper = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&stream, TIMEOUT).unwrap();
+            assert_eq!(request.method, "input");
+            let (identity, payload): (InputIdentity, Value) =
+                serde_json::from_value(request.args).unwrap();
+            assert_eq!(identity, expected, "the exact original identity");
+            assert_eq!(
+                payload_digest(&serde_json::to_vec(&payload).unwrap()),
+                identity.hash,
+                "the exact original envelope"
+            );
+            let receipt = InputReceipt {
+                identity,
+                state: InputState::Acknowledged(Ok(())),
+            };
+            send(
+                &stream,
+                &Ok::<Value, String>(serde_json::to_value(receipt).unwrap()),
+                TIMEOUT,
+            )
+            .unwrap();
+        });
+        let backdate = |actor: &RemoteActor| {
+            let mut uncertain = actor.0.uncertain_input.lock().unwrap();
+            uncertain
+                .as_mut()
+                .unwrap()
+                .retransmit
+                .as_mut()
+                .unwrap()
+                .next = Instant::now();
+        };
+        backdate(&actor);
+        actor.retransmit_uncertain_input();
+        helper.join().unwrap();
+        assert!(actor.0.uncertain_input.lock().unwrap().is_none());
+        assert_eq!(response.try_recv(), Ok(Ok(())));
+        assert!(actor.pending_inputs().is_empty());
+
+        // Retransmission ends with the caller's acknowledgement wait: an input
+        // never starts after its caller reported the outcome as unknown.
+        std::fs::remove_file(&socket).unwrap();
+        let _unknown = actor.enqueue(None, Command::Refresh).unwrap();
+        backdate(&actor);
+        actor
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .acknowledgement_deadline = Instant::now();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        actor.retransmit_uncertain_input();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "nothing is retransmitted after the caller stopped waiting"
+        );
+        assert_eq!(retransmit(&actor), None);
+        let fenced = actor.enqueue(None, Command::Refresh).unwrap_err();
+        assert!(fenced.starts_with("Resolve retained input"), "{fenced}");
+    }
+    #[test]
     fn lost_input_reply_keeps_the_original_envelope_and_fences_new_input() {
         let actor = RemoteActor::fixture();
         let response = actor.enqueue(None, Command::Interrupt).unwrap();
@@ -5351,6 +5734,10 @@ exec /bin/sleep 60
             );
             return;
         }
+        // Each wait below is for a real event; under load the helper's RPCs
+        // and journal writes can take seconds, so the bound only turns a
+        // wedged actor into a failure instead of a hung test.
+        const HANG_GUARD: Duration = Duration::from_secs(120);
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         std::fs::create_dir(root.path().join("claude")).unwrap();
         let mut source = fixture_source();
@@ -5404,7 +5791,7 @@ done"#;
         let owner = Owner(actor);
         let actor = &owner.0;
         actor.commit_installation().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_GUARD;
         while !actor.state().ready {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
@@ -5413,18 +5800,8 @@ done"#;
         // Preserve itself fences new helper input, so manufacturing a command
         // after preserve would test a forbidden ordering rather than a lost ACK.
         actor.0.stop.store(true, Ordering::Release);
-        let deadline = Instant::now() + Duration::from_secs(6);
-        while actor
-            .0
-            .worker
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|worker| !worker.is_finished())
-        {
-            assert!(Instant::now() < deadline, "old metadata pump did not stop");
-            thread::sleep(Duration::from_millis(5));
-        }
+        let pump = actor.0.worker.lock().unwrap().take();
+        pump.expect("metadata pump").join().unwrap();
         let identity = InputIdentity {
             sequence: 1,
             id: uuid::Uuid::new_v4(),
@@ -5447,7 +5824,7 @@ done"#;
         })
         .unwrap();
         let _: InputReceipt = actor.call("input", json!([identity, payload])).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_GUARD;
         loop {
             let receipt: Option<InputReceipt> =
                 actor.call("input_receipt", json!([identity])).unwrap();
@@ -5513,7 +5890,7 @@ done"#;
             RemoteActor::adopt(&record, source.clone(), proof.clone(), |_| {}).unwrap();
         let replacement_owner = Owner(replacement);
         let actor = &replacement_owner.0;
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_GUARD;
         while actor.0.recovering_inputs.load(Ordering::Acquire) {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
@@ -5541,19 +5918,52 @@ done"#;
         let mut total = 0usize;
         while total < journal::MAX_INPUTS + 33 {
             let count = 32.min(journal::MAX_INPUTS + 33 - total);
-            let mut replies = Vec::new();
-            for _ in 0..count {
-                replies.push(actor.enqueue(None, Command::Refresh).unwrap());
+            let mut replies: Vec<crossbeam_channel::Receiver<_>> = Vec::new();
+            let mut settled = Vec::new();
+            while replies.len() + settled.len() < count {
+                match actor.enqueue(None, Command::Refresh) {
+                    Ok(reply) => replies.push(reply),
+                    // A slow `input` call leaves its newest input uncertain,
+                    // which fences admission until that input's receipt
+                    // arrives. Its reply is sent after the fence clears.
+                    Err(error) if error.starts_with("Resolve retained input") => {
+                        let uncertain = replies.pop().expect("the fenced input was admitted here");
+                        // Resolve it as the fence asks, as a caller must once
+                        // the proxy's bounded retransmission gives up: retry
+                        // the exact envelope until the helper's receipt lands.
+                        let deadline = Instant::now() + HANG_GUARD;
+                        loop {
+                            // Release the fence's lock before retrying: a
+                            // landed receipt lifts the fence under that lock.
+                            let uncertain = actor
+                                .0
+                                .uncertain_input
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .map(|uncertain| uncertain.identity.clone());
+                            let Some(identity) = uncertain else {
+                                break;
+                            };
+                            assert!(Instant::now() < deadline, "{error}");
+                            if actor.retry_input(&identity).is_err() {
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                        }
+                        settled.push(uncertain.recv_timeout(HANG_GUARD).unwrap());
+                    }
+                    Err(error) => panic!("{error}"),
+                }
             }
             for reply in replies {
-                reply
-                    .recv_timeout(Duration::from_secs(10))
-                    .unwrap()
-                    .unwrap();
+                settled.push(reply.recv_timeout(HANG_GUARD).unwrap());
+            }
+            for outcome in settled {
+                outcome.unwrap();
             }
             total += count;
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_GUARD;
         while !actor.0.retiring_inputs.lock().unwrap().is_empty() {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));

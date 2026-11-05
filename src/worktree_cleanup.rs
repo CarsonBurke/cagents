@@ -103,6 +103,15 @@ impl FencedTarget {
     }
 }
 
+/// Refusal for an older client that still requests automatic removal.
+#[cfg(feature = "host")]
+fn automatic_retention_reason(path: &Path) -> String {
+    format!(
+        "Kept {}: merged worktrees are no longer deleted automatically. Choose Delete worktree and confirm to remove it.",
+        path.display()
+    )
+}
+
 #[cfg(any(feature = "host", feature = "ui"))]
 fn exact_merged_head(request: &RemovalRequest, pr: &crate::github::PullRequest) -> bool {
     pr.state.0 == "MERGED"
@@ -243,19 +252,17 @@ impl PreparedRemoval {
     }
 
     /// Caller retains the daemon's exclusive admission gate through this call.
+    /// Advisory leases cannot fence later writes by unrelated programs.
+    /// Automatic cleanup retains the checkout for explicit confirmation.
     pub(crate) fn remove(
         self,
-        check_quiescence: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,
+        _check_quiescence: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,
     ) -> Result<crate::repository::RemovedWorktree, String> {
-        let request = self.request;
-        remove_fenced(
-            self.target,
-            WindowPolicy::RequireOne,
-            check_quiescence,
-            || checked_record(&request).map(drop),
-            false,
-            std::time::Duration::from_secs(30),
-        )
+        let Self {
+            request,
+            target: _target,
+        } = self;
+        Err(automatic_retention_reason(&request.path))
     }
 }
 
@@ -1081,36 +1088,50 @@ mod tests {
         request.path = worktree.clone();
         request.head_oid = git(&worktree, &["rev-parse", "HEAD"]);
         checked_record(&request).unwrap();
-        std::fs::write(
-            repository.join(".git/info/exclude"),
-            ".env\ntarget/\nnode_modules/\n",
-        )
-        .unwrap();
-        std::fs::write(worktree.join(".env"), "preserve secret").unwrap();
-        assert!(
-            checked_record(&request)
-                .unwrap_err()
-                .contains("ignored files .env")
-        );
-        // Exercise the production preparation entrypoint: ignored user data
-        // refuses before GitHub or removal can be reached, leaving it on disk.
-        assert!(
-            matches!(PreparedRemoval::prepare(request.clone()), Err(reason) if reason.contains("ignored files .env"))
-        );
-        assert_eq!(
-            std::fs::read_to_string(worktree.join(".env")).unwrap(),
-            "preserve secret"
-        );
-        std::fs::remove_file(worktree.join(".env")).unwrap();
-        std::fs::create_dir_all(worktree.join("target/nested")).unwrap();
-        std::fs::write(worktree.join("target/nested/generated"), "disposable").unwrap();
-        std::fs::create_dir_all(worktree.join("node_modules/package/nested")).unwrap();
-        std::fs::write(
-            worktree.join("node_modules/package/nested/output.js"),
-            "disposable",
-        )
-        .unwrap();
-        checked_record(&request).unwrap();
+        std::fs::write(repository.join(".git/info/exclude"), ".env\ntarget/\n").unwrap();
+        let service = crate::repository::RepositoryService::system("git");
+        let cancellation = crate::process::CancellationToken::new();
+        let before = service.list_worktrees(&repository, &cancellation).unwrap();
+        let admin = service.git_dir(&worktree, &cancellation).unwrap();
+        let head_before = std::fs::read(admin.join("HEAD")).unwrap();
+        for late_user_file in [true, false] {
+            let prepared = PreparedRemoval {
+                request: request.clone(),
+                target: FencedTarget::capture(&repository, &worktree, Some(request.branch.clone()))
+                    .unwrap(),
+            };
+            let file = if late_user_file {
+                worktree.join(".env")
+            } else {
+                std::fs::create_dir_all(worktree.join("target/nested")).unwrap();
+                worktree.join("target/nested/generated")
+            };
+            std::fs::write(&file, "late external data").unwrap();
+            let refusal = prepared
+                .remove(|_| panic!("automatic retention must not request destructive admission"))
+                .unwrap_err();
+            assert!(refusal.contains("no longer deleted automatically"));
+            assert!(refusal.contains("Delete worktree and confirm"));
+            assert_eq!(std::fs::read(&file).unwrap(), b"late external data");
+            assert_eq!(std::fs::read(admin.join("HEAD")).unwrap(), head_before);
+            assert_eq!(
+                service.list_worktrees(&repository, &cancellation).unwrap(),
+                before
+            );
+            assert_eq!(
+                git(&repository, &["rev-parse", "refs/heads/feature"]),
+                request.head_oid
+            );
+            if late_user_file {
+                assert!(
+                    matches!(PreparedRemoval::prepare(request.clone()), Err(reason) if reason.contains("ignored files .env")),
+                    "fresh ignored-data refusal must happen before the GitHub read"
+                );
+            } else {
+                checked_record(&request).unwrap();
+            }
+            std::fs::remove_file(&file).unwrap();
+        }
         std::fs::write(worktree.join("tracked"), "changed").unwrap();
         assert!(checked_record(&request).is_err());
         git(&worktree, &["restore", "tracked"]);

@@ -1,10 +1,8 @@
-//! Fresh worktree deletion evidence shared by manual and automatic removal.
+//! Ignored user-file inventory; it grants no deletion authority.
+use super::complete_inventory::require_complete_inventory;
 use super::*;
-use std::collections::HashSet;
 
 const DISPOSABLE_CONFIG: &str = "cagents.cleanupDisposableDirectories";
-
-use super::complete_inventory::require_complete_inventory;
 
 pub fn default_disposable_ignored_directories() -> Vec<String> {
     [
@@ -17,6 +15,14 @@ pub fn default_disposable_ignored_directories() -> Vec<String> {
         ".pytest_cache",
         ".mypy_cache",
         ".ruff_cache",
+        ".tox",
+        ".gradle",
+        ".next",
+        ".nuxt",
+        ".svelte-kit",
+        ".turbo",
+        ".parcel-cache",
+        "coverage",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -37,30 +43,6 @@ fn validate_disposable_directories(names: &[String]) -> Result<(), ValidationErr
         ));
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorktreeSafetySnapshot {
-    /// Detects changed paths and file identities even when counts are unchanged.
-    pub fingerprint: String,
-    pub modified: usize,
-    pub untracked: usize,
-    pub notable_ignored: Vec<RepoPath>,
-    pub unpushed_commits: u64,
-    pub detached_only_commits: u64,
-    pub branch: Option<String>,
-    pub head_oid: Option<String>,
-}
-
-impl WorktreeSafetySnapshot {
-    pub fn files_to_discard(&self) -> usize {
-        self.modified + self.untracked + self.notable_ignored.len()
-    }
-    pub fn requires_confirmation(&self) -> bool {
-        self.files_to_discard() != 0
-            || self.unpushed_commits != 0
-            || self.detached_only_commits != 0
-    }
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
@@ -196,142 +178,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         Ok(notable.into_iter().collect())
     }
-
-    /// Call on a worker at dialog open and again immediately before removal.
-    /// No cached sidebar count can authorize losing work.
-    pub fn worktree_safety(
-        &self,
-        worktree: &Path,
-        cancellation: &CancellationToken,
-    ) -> Result<WorktreeSafetySnapshot, RepositoryError> {
-        let status = self.status_for_removal(worktree, cancellation)?;
-        let modified = status
-            .entries
-            .iter()
-            .filter(|entry| entry.area != ChangeArea::Untracked)
-            .map(|entry| &entry.path)
-            .collect::<HashSet<_>>()
-            .len();
-        let head = self.resolve_head(worktree, cancellation)?;
-        let count = |detached: bool| -> Result<u64, RepositoryError> {
-            if head.is_none() {
-                return Ok(0);
-            }
-            let mut command = self.git_read(
-                worktree,
-                ["rev-list", "--count", "HEAD", "--not", "--remotes"],
-            );
-            if detached {
-                command = command.arg("--branches");
-            }
-            let output = self.run_checked(&command, cancellation)?;
-            String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .parse()
-                .map_err(|_| RepositoryError::InvalidOutput {
-                    field: "worktree_commit_count",
-                    reason: "Git did not return a commit count".into(),
-                })
-        };
-        let notable_ignored = self.notable_ignored_files(worktree, cancellation)?;
-        let mut fingerprint = sha2::Sha256::new();
-        use sha2::Digest;
-        use std::os::unix::fs::MetadataExt;
-        fingerprint.update(
-            serde_json::to_vec(&status).map_err(|error| ValidationError::Io(error.to_string()))?,
-        );
-        let paths: std::collections::BTreeSet<_> = status
-            .entries
-            .iter()
-            .map(|entry| &entry.path)
-            .chain(notable_ignored.iter())
-            .collect();
-        let root = fs_safety::Root::open(worktree)
-            .map_err(|error| ValidationError::Io(error.to_string()))?;
-        for path in paths {
-            use std::os::unix::ffi::OsStrExt;
-            fingerprint.update(path.as_os_str().as_bytes());
-            fingerprint.update([0]);
-            match fs_safety::metadata_beneath(&root, Path::new(path.as_os_str())) {
-                Ok(metadata) => {
-                    // Git reports an untracked nested repository as one
-                    // directory. Its own timestamps cannot detect edits to
-                    // existing descendants, so it cannot authorize deletion.
-                    if metadata.is_dir() {
-                        return Err(RepositoryError::InvalidOutput {
-                            field: "worktree_safety",
-                            reason: format!(
-                                "Cannot inspect all files inside directory {path}; worktree was kept"
-                            ),
-                        });
-                    }
-                    for value in [
-                        metadata.dev(),
-                        metadata.ino(),
-                        metadata.len(),
-                        metadata.mtime() as u64,
-                        metadata.mtime_nsec() as u64,
-                        metadata.ctime() as u64,
-                        metadata.ctime_nsec() as u64,
-                    ] {
-                        fingerprint.update(value.to_le_bytes());
-                    }
-                }
-                Err(error) if error.is_not_found() => fingerprint.update(b"missing"),
-                Err(error) => return Err(ValidationError::Io(error.to_string()).into()),
-            }
-        }
-        Ok(WorktreeSafetySnapshot {
-            fingerprint: format!("{:x}", fingerprint.finalize()),
-            modified,
-            untracked: status
-                .entries
-                .iter()
-                .filter(|entry| entry.area == ChangeArea::Untracked)
-                .count(),
-            notable_ignored,
-            unpushed_commits: count(false)?,
-            detached_only_commits: if status.branch().is_none() {
-                count(true)?
-            } else {
-                0
-            },
-            branch: status.branch().map(str::to_owned),
-            head_oid: head.map(|oid| oid.to_string()),
-        })
-    }
-
-    /// Rescue the exact observed detached commit before deleting its worktree.
-    /// Existing branches are never overwritten, including a same-named rescue.
-    pub fn rescue_detached_worktree(
-        &self,
-        worktree: &Path,
-        observed: &WorktreeSafetySnapshot,
-        cancellation: &CancellationToken,
-    ) -> Result<String, RepositoryError> {
-        let head = observed.head_oid.as_deref().ok_or_else(|| {
-            ValidationError::InvalidBase("Detached worktree has no commit".into())
-        })?;
-        let current = self.worktree_safety(worktree, cancellation)?;
-        if &current != observed || current.branch.is_some() {
-            return Err(ValidationError::InvalidBase(
-                "Worktree contents or HEAD changed; review its safety again".into(),
-            )
-            .into());
-        }
-        let branch = format!("rescue/{}", &head[..12.min(head.len())]);
-        self.run_checked(
-            &self.git_mutation(worktree, ["branch", "--", &branch, head]),
-            cancellation,
-        )?;
-        Ok(branch)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn git(root: &Path, arguments: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .arg("-C")
@@ -357,6 +208,12 @@ mod tests {
 
     #[test]
     fn ignored_user_data_blocks_but_disposable_directories_and_nested_files_do_not() {
+        if isolated_git_test(concat!(
+            module_path!(),
+            "::ignored_user_data_blocks_but_disposable_directories_and_nested_files_do_not"
+        )) {
+            return;
+        }
         let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
         let root = fixture.path();
         git(root, &["init", "-b", "main"]);
@@ -441,6 +298,12 @@ mod tests {
 
     #[test]
     fn unreadable_inventory_warnings_never_authorize_removal() {
+        if isolated_git_test(concat!(
+            module_path!(),
+            "::unreadable_inventory_warnings_never_authorize_removal"
+        )) {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         // Root bypasses directory permissions. The fw16 validation runs as
         // the ordinary user and exercises each real Git warning below.
@@ -527,138 +390,6 @@ mod tests {
         assert_eq!(
             fs::read_to_string(locked.join("secret")).unwrap(),
             "preserve"
-        );
-    }
-
-    #[test]
-    fn incomplete_nested_repository_inventories_refuse_deletion_before_and_after_child_edits() {
-        let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
-        let root = fixture.path();
-        git(root, &["init", "-b", "main"]);
-        fs::write(root.join(".gitignore"), "ignored/\ntarget/\n").unwrap();
-        git(root, &["add", ".gitignore"]);
-        git(root, &["commit", "-m", "initial"]);
-        let service = RepositoryService::system("git");
-        let cancel = CancellationToken::new();
-        for name in ["ignored", "untracked"] {
-            let nested = root.join(name);
-            fs::create_dir(&nested).unwrap();
-            git(&nested, &["init", "-b", "main"]);
-            fs::write(nested.join("data"), "original").unwrap();
-            for content in ["original", "changed descendant"] {
-                fs::write(nested.join("data"), content).unwrap();
-                let error = service.worktree_safety(root, &cancel).unwrap_err();
-                assert!(
-                    error
-                        .to_string()
-                        .contains("Cannot inspect all files inside"),
-                    "{error}"
-                );
-                assert_eq!(fs::read_to_string(nested.join("data")).unwrap(), content);
-            }
-            fs::remove_dir_all(nested).unwrap();
-        }
-        // Explicitly disposable ignored directories remain policy exclusions.
-        let disposable = root.join("target");
-        fs::create_dir(&disposable).unwrap();
-        git(&disposable, &["init", "-b", "main"]);
-        fs::write(disposable.join("data"), "generated").unwrap();
-        assert!(
-            service
-                .worktree_safety(root, &cancel)
-                .unwrap()
-                .notable_ignored
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn fresh_safety_counts_untracked_ignored_unpushed_and_detached_only_work() {
-        let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
-        let repository = fixture.path().join("repo");
-        let worktree = fixture.path().join("worktree");
-        fs::create_dir(&repository).unwrap();
-        git(&repository, &["init", "-b", "main"]);
-        fs::write(repository.join(".gitignore"), ".env\n").unwrap();
-        git(&repository, &["add", ".gitignore"]);
-        git(&repository, &["commit", "-m", "initial"]);
-        let initial = git(&repository, &["rev-parse", "HEAD"]);
-        git(
-            &repository,
-            &["update-ref", "refs/remotes/origin/main", &initial],
-        );
-        git(
-            &repository,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "feature",
-                worktree.to_str().unwrap(),
-            ],
-        );
-        let service = RepositoryService::system("git");
-        let cancel = CancellationToken::new();
-        let clean = service.worktree_safety(&worktree, &cancel).unwrap();
-        assert!(!clean.requires_confirmation());
-        assert_eq!(clean.branch.as_deref(), Some("feature"));
-        fs::write(worktree.join("new file"), "new").unwrap();
-        fs::write(worktree.join(".env"), "secret").unwrap();
-        let fresh = service.worktree_safety(&worktree, &cancel).unwrap();
-        assert_eq!(fresh.untracked, 1);
-        assert_eq!(fresh.notable_ignored.len(), 1);
-        assert_eq!(fresh.files_to_discard(), 2);
-        fs::remove_file(worktree.join("new file")).unwrap();
-        fs::write(worktree.join("replacement file"), "new").unwrap();
-        let replaced = service.worktree_safety(&worktree, &cancel).unwrap();
-        assert_eq!(fresh.files_to_discard(), replaced.files_to_discard());
-        assert_ne!(fresh.fingerprint, replaced.fingerprint);
-        fs::rename(worktree.join("replacement file"), worktree.join("new file")).unwrap();
-        git(&worktree, &["add", "new file"]);
-        git(&worktree, &["commit", "-m", "local work"]);
-        assert_eq!(
-            service
-                .worktree_safety(&worktree, &cancel)
-                .unwrap()
-                .unpushed_commits,
-            1
-        );
-        git(&worktree, &["checkout", "--detach"]);
-        git(
-            &worktree,
-            &["commit", "--allow-empty", "-m", "detached work"],
-        );
-        let detached = service.worktree_safety(&worktree, &cancel).unwrap();
-        assert!(detached.branch.is_none());
-        assert_eq!(detached.detached_only_commits, 1);
-        fs::write(worktree.join("late untracked"), "preserve").unwrap();
-        assert!(
-            service
-                .rescue_detached_worktree(&worktree, &detached, &cancel)
-                .is_err()
-        );
-        assert!(
-            git(
-                &repository,
-                &["for-each-ref", "--format=%(refname)", "refs/heads/rescue/"]
-            )
-            .is_empty()
-        );
-        fs::remove_file(worktree.join("late untracked")).unwrap();
-        let rescue = service
-            .rescue_detached_worktree(&worktree, &detached, &cancel)
-            .unwrap();
-        assert!(rescue.starts_with("rescue/"));
-        assert_eq!(
-            service
-                .worktree_safety(&worktree, &cancel)
-                .unwrap()
-                .detached_only_commits,
-            0
-        );
-        assert_eq!(
-            git(&repository, &["rev-parse", &rescue]),
-            detached.head_oid.unwrap()
         );
     }
 }

@@ -23,7 +23,8 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE_ROOTS = ("src", "tests", "crates")
-CACHE = ROOT / "target" / ".check-format-cache"
+# The checker runs from ROOT, which also anchors relative Cargo target paths.
+CACHE = ROOT / (os.environ.get("CARGO_TARGET_DIR") or "target") / ".check-format-cache"
 CONFIG_NAMES = ("rustfmt.toml", ".rustfmt.toml")
 MAX_FILES = 20_000
 MAX_BYTES = 128 * 1024 * 1024
@@ -42,9 +43,10 @@ class Uncacheable(Exception):
 class InputHashes:
     """Keep reusable content identity separate from the current race guard."""
 
-    def __init__(self):
+    def __init__(self, tool_digests=None):
         self.content = hashlib.sha256()
         self.guard = hashlib.sha256()
+        self.tool_digests = {} if tool_digests is None else tool_digests
 
     def update(self, value):
         self.content.update(value)
@@ -252,7 +254,7 @@ def ancestor_configs(hasher):
 
 
 def tool_file(hasher, path):
-    """Hash large formatter libraries without retaining them in memory."""
+    """Read each unchanged tool once per check, never trusting a persisted stat."""
     path = path.resolve(strict=True)
     with path.open("rb") as source:
         before = os.fstat(source.fileno())
@@ -260,14 +262,25 @@ def tool_file(hasher, path):
             raise Uncacheable("special formatter input")
         add(hasher, str(path))
         add_identity(hasher, path, before)
-        hasher.update(before.st_size.to_bytes(8, "big"))
-        size = 0
-        while block := source.read(1024 * 1024):
-            size += len(block)
-            hasher.update(block)
+        identity = file_identity(before)
+        remembered = hasher.tool_digests.get(path)
+        if remembered is not None and remembered[0] == identity:
+            digest = remembered[1]
+        else:
+            contents = hashlib.sha256()
+            contents.update(before.st_size.to_bytes(8, "big"))
+            size = 0
+            while block := source.read(1024 * 1024):
+                size += len(block)
+                contents.update(block)
+            if size != before.st_size:
+                raise Uncacheable("formatter input changed while hashing")
+            digest = contents.digest()
         after = os.fstat(source.fileno())
-        if size != before.st_size or file_identity(after) != file_identity(before):
+        if file_identity(after) != identity:
             raise Uncacheable("formatter input changed while hashing")
+        hasher.tool_digests[path] = (identity, digest)
+        add(hasher, digest)
 
 
 def elf_tool(hasher, path):
@@ -349,7 +362,7 @@ def rustfmt_binary(hasher, executable):
     formatter_libraries(hasher, actual)
 
 
-def fingerprint(command):
+def fingerprint(command, tool_digests=None):
     if not hasattr(os, "environb"):
         raise Uncacheable("byte environment unavailable")
     if command[:3] != ["--edition", "2024", "--check"] or not command[3:]:
@@ -368,8 +381,8 @@ def fingerprint(command):
     executable = shutil.which("rustfmt")
     if executable is None:
         raise Uncacheable("rustfmt unavailable")
-    hasher = InputHashes()
-    add(hasher, "check-format-cache-v1")
+    hasher = InputHashes(tool_digests)
+    add(hasher, "check-format-cache-v2")
     add(hasher, str(ROOT))
     for arg in command:
         add(hasher, arg)
@@ -414,13 +427,17 @@ def run(command):
 
 
 def main(command):
+    # Only the paired snapshots in this call share tool digests. Reopen and
+    # verify full file identity on every snapshot; resolve the formatter and its
+    # loader graph afresh. Source/configuration inputs are always reread.
+    tool_digests = {}
     try:
         # Initialize our own directory before source/config directory metadata
         # is captured, so creating target/ cannot invalidate the first marker.
         CACHE.mkdir(parents=True, exist_ok=True)
-        before = fingerprint(command)
+        before = fingerprint(command, tool_digests)
         try:
-            if cached(before[0]) and fingerprint(command) == before:
+            if cached(before[0]) and fingerprint(command, tool_digests) == before:
                 return 0
         except FileNotFoundError:
             pass
@@ -429,7 +446,7 @@ def main(command):
     result = run(command)
     if result == 0:
         try:
-            if fingerprint(command) == before:
+            if fingerprint(command, tool_digests) == before:
                 record(before[0])
         except (Uncacheable, OSError, subprocess.SubprocessError, ValueError):
             pass

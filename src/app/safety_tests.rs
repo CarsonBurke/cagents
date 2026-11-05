@@ -1365,3 +1365,83 @@ fn terminal_close_opt_out_persists_only_on_close_and_can_be_reenabled() {
     tests::settle_settings_task(&mut app, enable);
     assert!(settings::load(&path).unwrap().confirm_terminal_close);
 }
+
+#[test]
+fn enter_on_a_focused_button_leaves_the_next_click_to_the_control_under_the_pointer() {
+    use iced::{
+        Point, Size,
+        advanced::{clipboard, widget::operation},
+        keyboard, mouse,
+        runtime::user_interface::{Cache, UserInterface},
+    };
+
+    // The Enter-activated button comes first: a row offers each event to its
+    // children in order, so a latched button would take the click's release
+    // before the button under the pointer sees it.
+    let keyboard_id = widget::Id::new("enter.contract.keyboard");
+    let pointer_id = widget::Id::new("enter.contract.pointer");
+    let element: Element<'static, u8> = widget::row([
+        widget::button::custom(design::caption("Keyboard action"))
+            .id(keyboard_id.clone())
+            .width(Length::Fixed(100.0))
+            .height(Length::Fixed(40.0))
+            .on_press(1)
+            .into(),
+        widget::button::custom(design::caption("Pointer action"))
+            .id(pointer_id)
+            .width(Length::Fixed(100.0))
+            .height(Length::Fixed(40.0))
+            .on_press(2)
+            .into(),
+    ])
+    .spacing(20)
+    .into();
+    let mut renderer = tests::headless_renderer();
+    let mut ui = UserInterface::build(
+        element,
+        Size::new(400.0, 100.0),
+        Cache::default(),
+        &mut renderer,
+    );
+    ui.operate(
+        &renderer,
+        &mut operation::focusable::focus::<()>(keyboard_id),
+    );
+    let key = keyboard::Key::Named(keyboard::key::Named::Enter);
+    let enter = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+        key: key.clone(),
+        modified_key: key,
+        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+        location: keyboard::Location::Standard,
+        modifiers: keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    });
+    let mut messages = Vec::new();
+    ui.update(
+        &[enter],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert_eq!(messages, vec![1], "Enter activates the focused button");
+
+    let pointer = Point::new(170.0, 20.0);
+    ui.update(
+        &[
+            iced::Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        ],
+        mouse::Cursor::Available(pointer),
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert_eq!(
+        messages,
+        vec![1, 2],
+        "the first click after Enter reaches the button under the pointer"
+    );
+}

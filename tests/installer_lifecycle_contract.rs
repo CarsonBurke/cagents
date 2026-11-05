@@ -145,6 +145,11 @@ fn installer_entrypoints_refuse_inherited_callers_before_tools_or_purge() {
                     String::from_utf8_lossy(&output.stderr).contains("require your own terminal"),
                     "{script}: {output:?}"
                 );
+                let message = String::from_utf8_lossy(&output.stderr);
+                assert!(message.contains("Cagents terminals are hosted sessions."));
+                assert!(message.contains(
+                    "A person must run this command from a system terminal outside cagents."
+                ));
                 assert!(output.stdout.is_empty());
                 assert!(!root.path().join("tool-invoked").exists());
                 for leaf in ["data", "config", "cache"] {
@@ -429,7 +434,9 @@ esac
             "/usr/bin/ln -snf versions/independent \"$FIXTURE_PREFIX/current\"; exit 8"
         } else if matches!(failure, "outer-signal" | "outer-signal-invalid-target") {
             r#"target=$(cat "$FIXTURE_OUTER_PID_FILE") || exit 97
-if [ "$FIXTURE_REJECT_SIGNAL" = true ]; then target=not-a-pid; fi
+# Above any pid_max, so delivery fails with ESRCH. A non-numeric target is not
+# portable: bash 5.3 in POSIX mode reports it but exits 0.
+if [ "$FIXTURE_REJECT_SIGNAL" = true ]; then target=2147483647; fi
 # Successful delivery makes the outer installer cancel this tool's group.
 # Keep that TERM from interrupting the builtin send-and-record section.
 trap '' TERM
@@ -676,7 +683,7 @@ exec sh "$@""#,
             );
             assert_eq!(
                 fs::read_to_string(home.path().join("signal-rejected")).unwrap(),
-                "not-a-pid\n"
+                "2147483647\n"
             );
         } else {
             assert_eq!(

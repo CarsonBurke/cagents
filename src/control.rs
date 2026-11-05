@@ -2349,7 +2349,15 @@ where
     if std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some()
         && let Some(message) = user_only_message
     {
-        emit_error(cli.json, &AppError::new("permission_denied", message));
+        emit_error(
+            cli.json,
+            &AppError::new(
+                "permission_denied",
+                format!(
+                    "{message}. Cagents terminals are hosted sessions. A person must run this command from a system terminal outside cagents."
+                ),
+            ),
+        );
         return ExitCode::FAILURE;
     }
 
@@ -4531,6 +4539,15 @@ mod tests {
                                 "permission_denied"
                             }
                 }));
+                if case != "user" {
+                    assert!(errors.iter().all(|error| {
+                        let message = error["error"]["message"].as_str().unwrap();
+                        message.contains("Cagents terminals are hosted sessions.")
+                            && message.contains(
+                                "A person must run this command from a system terminal outside cagents.",
+                            )
+                    }));
+                }
             }
             return;
         };
@@ -7383,16 +7400,46 @@ mod tests {
 
     #[test]
     fn ui_launch_handshake_waits_for_saved_pane_recovery() {
+        // The announcement is already in the pipe when the base window starts,
+        // and `ready` is released only after that window has passed, so only
+        // the recovery allowance can admit it.
+        let window = Duration::from_millis(20);
+        let directory = tempfile::tempdir().unwrap();
+        let announced = directory.path().join("announced");
         let mut child = Command::new("sh")
             .args([
                 "-c",
-                "printf 'recovering: 1\\n'; sleep 0.1; printf 'ready\\n'",
+                "printf 'recovering: 1\\n'; : > \"$1\"; read -r _; printf 'ready\\n'",
+                "fixture",
             ])
+            .arg(&announced)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
         let mut stdout = child.stdout.take().unwrap();
-        let result = read_ui_launch_handshake(&mut stdout, Duration::from_millis(20));
+        let mut release = child.stdin.take().unwrap();
+        let hang_guard = Instant::now() + Duration::from_secs(60);
+        while !announced.exists() {
+            assert!(
+                Instant::now() < hang_guard,
+                "fixture never announced recovery"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Start the clock before the releaser so a descheduled test thread
+        // cannot shorten the measured interval below the release delay.
+        let started = Instant::now();
+        let releaser = thread::spawn(move || {
+            thread::sleep(window * 2);
+            release.write_all(b"\n").unwrap();
+        });
+        let result = read_ui_launch_handshake(&mut stdout, window);
+        assert!(
+            started.elapsed() > window,
+            "ready arrived inside the base window"
+        );
+        releaser.join().unwrap();
         child.wait().unwrap();
         result.unwrap();
     }
@@ -7422,7 +7469,9 @@ mod tests {
                 .spawn()
                 .unwrap();
             let mut stdout = child.stdout.take().unwrap();
-            let result = read_ui_launch_handshake(&mut stdout, Duration::from_secs(1));
+            // A hang guard: each response is complete before EOF, so only
+            // its content decides the result.
+            let result = read_ui_launch_handshake(&mut stdout, Duration::from_secs(60));
             child.wait().unwrap();
             assert_eq!(result.is_ok(), valid);
         }
@@ -7439,7 +7488,9 @@ mod tests {
             .spawn()
             .unwrap();
         let mut stdout = child.stdout.take().unwrap();
-        let result = read_ui_launch_handshake(&mut stdout, Duration::from_secs(1));
+        // Hang guards: the incomplete-recovery line ends the read, and the
+        // late acknowledgement follows it on its own.
+        let result = read_ui_launch_handshake(&mut stdout, Duration::from_secs(60));
         assert!(
             result
                 .as_ref()
@@ -7448,7 +7499,7 @@ mod tests {
                 .starts_with(UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX)
         );
         finish_ui_launch(child, result, Some(stdout)).unwrap_err();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !marker.is_file() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }

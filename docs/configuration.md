@@ -430,22 +430,37 @@ This lookup applies only when cagents creates a new default terminal.
 Explicit CLI commands and launch recipes restored from saved sessions run
 unchanged.
 
-### Managed worktree safety
+## Merged worktree notices and ignored files
 
-New managed worktrees use `.worktrees/` by default. In-checkout managed directories
-are excluded through the clone's `info/exclude`; tracked `.gitignore` files are
-unchanged. Existing configured locations remain in use. Registered worktrees under
-the previous `worktrees/` directory stay in place and that directory is excluded
-on the next managed creation. Absolute and sibling locations are supported.
+Settings → General → **Merged worktrees** shows a notice when a GitHub
+worktree's exact current commit is merged, including while chats, terminals or
+editors are open in it. The notice names what deleting the worktree would
+discard: uncommitted changes and ignored user files such as `.env`. When the
+ignored-file check cannot finish, the notice says so instead of reporting
+nothing. Each merged worktree is noticed once per app launch.
 
-Automatic merged-worktree cleanup checks uncommitted changes, untracked files and
-ignored user files. Ignored build directories are disposable by policy: defaults
-are `node_modules`, `target`, `dist`, `build`, `.venv`, `__pycache__`,
-`.pytest_cache`, `.mypy_cache` and `.ruff_cache`. A directory name matches at any
-depth, including its nested contents; a regular file with the same name remains
-protected. All other ignored content, including `.env`, prevents cleanup.
+Merged worktrees are never deleted automatically, including when they contain
+only build files: another program could write new user data after any
+inventory. To remove one, choose **Delete worktree** from its menu in Projects
+and confirm; the branch is retained. The saved option keeps its existing
+`auto_delete_merged_worktrees` key for compatibility.
 
-The per-project list is stored as a JSON array in the clone-local Git configuration
-key `cagents.cleanupDisposableDirectories`, shared by its linked worktrees. An
-empty array permits no ignored directories to be discarded. Values must be simple
-directory names, with no slashes, traversal components or control characters.
+The notice's ignored-file inventory skips the default disposable-directory names
+`node_modules`, `target`, `dist`, `build`, `.venv`, `__pycache__`,
+`.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox`, `.gradle`, `.next`,
+`.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache` and `coverage`. A directory
+name matches at any depth, including its nested contents; a regular file with
+the same name is still reported. Other ignored content, including `.env`, is
+reported as user data. This list only shapes the notice; it never authorizes
+deletion.
+
+There is no settings control for this list. To change it for one clone, set its
+clone-local Git configuration, which its linked worktrees share:
+
+```sh
+git config --local cagents.cleanupDisposableDirectories '["node_modules","target"]'
+```
+
+An empty array treats every ignored directory as user data. Values must be
+simple directory names, with no slashes, traversal components or control
+characters.
