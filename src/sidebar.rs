@@ -8127,7 +8127,8 @@ pub fn worktree_sidebar_with_body<'a, M: 'a>(
         navigation,
         sidebar_pane_width(width),
     );
-    let notices: Element<'a, SidebarAction> = source_control_notices(source, false).into();
+    let notices: Element<'a, SidebarAction> =
+        source_control_notices(source, false, modal_open).into();
     // The body sits between the sidebar's own header and footer, so each of
     // those maps on its own; the mapper is shared rather than cloned.
     let map = std::rc::Rc::new(map);
@@ -8365,6 +8366,45 @@ pub(crate) fn bound_source_control<'a>(
 /// view on screen - the file filter for Files, the tree/flat switch for a
 /// list of changed files - and nothing else. Navigation lives in its own row
 /// beneath, so an option never sits beside a peer it does not belong to.
+/// The header's activity glyph while a Git mutation runs: the spinner with a
+/// stop mark inside it, pressable to cancel the mutation and everything queued
+/// behind it.
+fn mutation_stop<'a>(
+    kind: MutationKind,
+    key: &ActiveWorktreeKey,
+    modal_open: bool,
+) -> Element<'a, SidebarAction> {
+    // "Committing…" reads "Cancel committing"; "Updating Git…" keeps its Git.
+    let (first, rest) = kind.progress_label().trim_end_matches('…').split_at(1);
+    let label = format!("Cancel {}{rest}", first.to_ascii_lowercase());
+    let glyph = cosmic::iced::widget::stack![
+        widget::container(crate::ui_controls::activity_spinner(
+            f32::from(ROW_ICON_SIZE) + 2.0,
+            design::warning_color,
+        ))
+        .center(Length::Fill),
+        widget::container(widget::icon(Icon::Stop.into()).size(8)).center(Length::Fill),
+    ];
+    let action = gated(
+        SidebarAction::CancelGitMutation { key: key.clone() },
+        modal_open,
+    );
+    let enabled = action.is_some();
+    let button = widget::button::custom(glyph)
+        .name(label.clone())
+        .class(crate::ui_controls::control_style(false, None))
+        .width(Length::Fixed(ROW_ICON_WIDTH))
+        .height(Length::Fixed(ROW_ICON_WIDTH))
+        .padding(0)
+        .on_press_maybe(action);
+    let button: Element<'a, SidebarAction> = if enabled {
+        crate::interaction::hover(button)
+    } else {
+        button.into()
+    };
+    crate::interaction::tooltip(button, label)
+}
+
 fn source_control_header<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
@@ -8390,8 +8430,11 @@ fn source_control_header<'a>(
     });
     // Replace the identity glyph in place: neither the title nor the body
     // gives up room when a background read or mutation starts.
-    let mut header = widget::row::with_children(vec![
-        crate::interaction::tooltip(
+    let identity = match source.mutation {
+        // A running mutation can be stopped from the glyph that shows it, so
+        // offering the stop moves nothing else in the header.
+        Some(kind) => mutation_stop(kind, key, modal_open),
+        None => crate::interaction::tooltip(
             widget::container(if activity.is_some() {
                 crate::ui_controls::activity_spinner(14.0, design::warning_color)
             } else {
@@ -8400,6 +8443,9 @@ fn source_control_header<'a>(
             .center(Length::Fixed(ROW_ICON_WIDTH)),
             activity.unwrap_or("Worktree"),
         ),
+    };
+    let mut header = widget::row::with_children(vec![
+        identity,
         widget::container(crate::interaction::tooltip(
             design::heading(worktree.map_or(&*chrome.subheading, |row| &*row.chrome.label))
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -8429,12 +8475,6 @@ fn source_control_header<'a>(
             ),
             entity_id("source.copy-branch", key.worktree_id),
         ));
-    }
-    if source.mutation.is_some() {
-        header = header.push(
-            widget::button::text("Cancel")
-                .on_press(SidebarAction::CancelGitMutation { key: key.clone() }),
-        );
     }
     match view {
         PanelView::Files => {
@@ -8481,7 +8521,10 @@ fn source_control_header<'a>(
 fn source_control_notices<'a>(
     source: &'a SourceControlModel,
     git_controls: bool,
+    modal_open: bool,
 ) -> cosmic::iced::widget::Column<'a, SidebarAction, cosmic::Theme, cosmic::Renderer> {
+    // A dialog is an overlay: nothing behind it may take a press.
+    let live = |action: Option<SidebarAction>| action.filter(|_| !modal_open);
     let mut notices = widget::column::with_capacity(3).spacing(space::XS);
     if let Some(error) = source.error.as_deref() {
         let (summary, output) = error.split_once("\n\nGit output:\n").unwrap_or((error, ""));
@@ -8494,9 +8537,9 @@ fn source_control_notices<'a>(
                 } else {
                     "Show Git output"
                 })
-                .on_press(SidebarAction::ToggleGitOutput {
+                .on_press_maybe(live(Some(SidebarAction::ToggleGitOutput {
                     key: source.key.clone(),
-                }),
+                }))),
             );
             if source.output_expanded {
                 notices = notices.push(
@@ -8522,7 +8565,7 @@ fn source_control_notices<'a>(
         notices = notices.push(
             widget::row::with_children(vec![
                 widget::button::text("Abort")
-                    .on_press_maybe(
+                    .on_press_maybe(live(
                         (!source.busy())
                             .then(|| operation.abort_request())
                             .flatten()
@@ -8530,10 +8573,10 @@ fn source_control_notices<'a>(
                                 key: source.key.clone(),
                                 operation,
                             }),
-                    )
+                    ))
                     .into(),
                 widget::button::text("Continue")
-                    .on_press_maybe(
+                    .on_press_maybe(live(
                         (!source.busy()
                             && source
                                 .group(ChangeArea::Conflict)
@@ -8544,26 +8587,25 @@ fn source_control_notices<'a>(
                             key: source.key.clone(),
                             operation,
                         }),
-                    )
+                    ))
                     .into(),
             ])
             .spacing(space::XS),
         );
         if operation.witness.is_none() {
-            notices = notices
-                .push(design::caption(
-                    operation
-                        .recovery_unavailable
-                        .as_deref()
-                        .unwrap_or("Reload repository state before continuing or aborting."),
-                ))
-                .push(
-                    widget::button::text("Reload").on_press_maybe((!source.busy()).then(|| {
-                        SidebarAction::RefreshWorktree {
+            notices =
+                notices
+                    .push(design::caption(
+                        operation
+                            .recovery_unavailable
+                            .as_deref()
+                            .unwrap_or("Reload repository state before continuing or aborting."),
+                    ))
+                    .push(widget::button::text("Reload").on_press_maybe(live(
+                        (!source.busy()).then(|| SidebarAction::RefreshWorktree {
                             key: source.key.clone(),
-                        }
-                    })),
-                );
+                        }),
+                    )));
         }
     }
     if source.pending_marker_stage.is_some() {
@@ -8587,16 +8629,16 @@ fn source_control_notices<'a>(
 
         notices = notices.push(widget::row::with_children(vec![
             widget::button::text("Stage anyway")
-                .on_press(SidebarAction::ConfirmStageMarkers {
+                .on_press_maybe(live(Some(SidebarAction::ConfirmStageMarkers {
                     key: source.key.clone(),
                     confirmed: true,
-                })
+                })))
                 .into(),
             widget::button::text("Cancel")
-                .on_press(SidebarAction::ConfirmStageMarkers {
+                .on_press_maybe(live(Some(SidebarAction::ConfirmStageMarkers {
                     key: source.key.clone(),
                     confirmed: false,
-                })
+                })))
                 .into(),
         ]));
     }
@@ -8609,7 +8651,7 @@ fn source_control_notices<'a>(
             .map(|target| target.remote())
             .or_else(|| source.remotes.first().map(String::as_str))
         {
-            actions = actions.push(widget::button::text("Fetch").on_press_maybe(
+            actions = actions.push(widget::button::text("Fetch").on_press_maybe(live(
                 (!source.busy()).then(|| SidebarAction::GitOperation {
                     key: key.clone(),
                     operation: GitOperation::Fetch {
@@ -8617,21 +8659,21 @@ fn source_control_notices<'a>(
                         prune: true,
                     },
                 }),
-            ));
+            )));
         }
         if source.upstream.is_some() {
-            actions = actions.push(widget::button::text("Sync").on_press_maybe(
+            actions = actions.push(widget::button::text("Sync").on_press_maybe(live(
                 (!source.busy()).then(|| SidebarAction::GitOperation {
                     key: key.clone(),
                     operation: GitOperation::Sync { rebase: false },
                 }),
-            ));
-            actions = actions.push(widget::button::text("Sync (rebase)").on_press_maybe(
+            )));
+            actions = actions.push(widget::button::text("Sync (rebase)").on_press_maybe(live(
                 (!source.busy()).then(|| SidebarAction::GitOperation {
                     key: key.clone(),
                     operation: GitOperation::Sync { rebase: true },
                 }),
-            ));
+            )));
         }
         notices = notices.push(actions);
         if let Some(time) = source.last_fetch_unix_ms {
@@ -8639,31 +8681,36 @@ fn source_control_notices<'a>(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
+            let elapsed = i64::try_from(now.saturating_sub(time) / 1_000).unwrap_or(i64::MAX);
             notices = notices.push(design::caption(format!(
-                "Fetched {} min ago",
-                now.saturating_sub(time) / 60_000
+                "Fetched {}",
+                crate::account::format_ago(elapsed)
             )));
         }
         notices = notices.push(
             widget::row::with_children(vec![
                 widget::button::text(format!("Stashes ({})", source.stashes.len()))
-                    .on_press(SidebarAction::ToggleStashes { key: key.clone() })
+                    .on_press_maybe(live(Some(SidebarAction::ToggleStashes {
+                        key: key.clone(),
+                    })))
                     .into(),
                 widget::button::text("Stash changes")
-                    .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
-                        key: key.clone(),
-                        operation: GitOperation::StashPush {
-                            message: None,
-                            include_untracked: false,
-                        },
-                    }))
+                    .on_press_maybe(live((!source.busy()).then(|| {
+                        SidebarAction::GitOperation {
+                            key: key.clone(),
+                            operation: GitOperation::StashPush {
+                                message: None,
+                                include_untracked: false,
+                            },
+                        }
+                    })))
                     .into(),
             ])
             .spacing(space::XS),
         );
         if source.stashes_expanded {
             notices = notices.push(
-                widget::button::text("Stash including new files").on_press_maybe(
+                widget::button::text("Stash including new files").on_press_maybe(live(
                     (!source.busy()).then(|| SidebarAction::GitOperation {
                         key: key.clone(),
                         operation: GitOperation::StashPush {
@@ -8671,7 +8718,7 @@ fn source_control_notices<'a>(
                             include_untracked: true,
                         },
                     }),
-                ),
+                )),
             );
             let mut rows = widget::column::with_capacity(source.stashes.len()).spacing(space::XS);
             for stash in &source.stashes {
@@ -8682,32 +8729,36 @@ fn source_control_notices<'a>(
                 rows = rows.push(
                     widget::row::with_children(vec![
                         widget::button::text("Apply")
-                            .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
-                                key: key.clone(),
-                                operation: GitOperation::StashApply {
-                                    reference: stash.reference.clone(),
-                                    expected_oid: stash.oid.clone(),
-                                    pop: false,
-                                },
-                            }))
+                            .on_press_maybe(live((!source.busy()).then(|| {
+                                SidebarAction::GitOperation {
+                                    key: key.clone(),
+                                    operation: GitOperation::StashApply {
+                                        reference: stash.reference.clone(),
+                                        expected_oid: stash.oid.clone(),
+                                        pop: false,
+                                    },
+                                }
+                            })))
                             .into(),
                         widget::button::text("Pop")
-                            .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
-                                key: key.clone(),
-                                operation: GitOperation::StashApply {
-                                    reference: stash.reference.clone(),
-                                    expected_oid: stash.oid.clone(),
-                                    pop: true,
-                                },
-                            }))
+                            .on_press_maybe(live((!source.busy()).then(|| {
+                                SidebarAction::GitOperation {
+                                    key: key.clone(),
+                                    operation: GitOperation::StashApply {
+                                        reference: stash.reference.clone(),
+                                        expected_oid: stash.oid.clone(),
+                                        pop: true,
+                                    },
+                                }
+                            })))
                             .into(),
                         widget::button::text("Drop…")
-                            .on_press_maybe((!source.busy()).then(|| {
+                            .on_press_maybe(live((!source.busy()).then(|| {
                                 SidebarAction::RequestStashDrop {
                                     key: key.clone(),
                                     entry: Some(stash.clone()),
                                 }
-                            }))
+                            })))
                             .into(),
                     ])
                     .spacing(space::XS),
@@ -8722,19 +8773,21 @@ fn source_control_notices<'a>(
             )));
             notices = notices.push(widget::row::with_children(vec![
                 widget::button::text("Drop stash")
-                    .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
-                        key: key.clone(),
-                        operation: GitOperation::StashDrop {
-                            reference: stash.reference.clone(),
-                            expected_oid: stash.oid.clone(),
-                        },
-                    }))
+                    .on_press_maybe(live((!source.busy()).then(|| {
+                        SidebarAction::GitOperation {
+                            key: key.clone(),
+                            operation: GitOperation::StashDrop {
+                                reference: stash.reference.clone(),
+                                expected_oid: stash.oid.clone(),
+                            },
+                        }
+                    })))
                     .into(),
                 widget::button::text("Cancel")
-                    .on_press(SidebarAction::RequestStashDrop {
+                    .on_press_maybe(live(Some(SidebarAction::RequestStashDrop {
                         key: key.clone(),
                         entry: None,
-                    })
+                    })))
                     .into(),
             ]));
         }
@@ -8759,8 +8812,11 @@ fn source_control_panel<'a>(
     let view = PanelView::new(panel, navigation, state);
     let header = source_control_header(state, source, worktree, modal_open, view);
     let tabs = panel_navigation(source, modal_open, view, navigation, width);
-    let mut notices =
-        source_control_notices(source, matches!(view, PanelView::Git(ChangesTab::Changes)));
+    let mut notices = source_control_notices(
+        source,
+        matches!(view, PanelView::Git(ChangesTab::Changes)),
+        modal_open,
+    );
 
     match &source.data_state {
         SidebarDataState::Loading => {
@@ -14124,7 +14180,10 @@ pub(crate) mod tests {
         abort: bool,
     ) -> SidebarAction {
         let renderer = headless_renderer();
-        let actions = frame_enter_presses(&renderer, source_control_notices(source, false).into());
+        let actions = frame_enter_presses(
+            &renderer,
+            source_control_notices(source, false, false).into(),
+        );
         let mut matching = actions.into_iter().filter(|action| match action {
             SidebarAction::GitOperation { operation, .. } => matches!(
                 (abort, operation),
@@ -14152,8 +14211,10 @@ pub(crate) mod tests {
         let mut source = fixture.source(&original);
         let key = source.key.clone();
         let renderer = headless_renderer();
-        let captured =
-            frame_enter_presses(&renderer, source_control_notices(&source, false).into());
+        let captured = frame_enter_presses(
+            &renderer,
+            source_control_notices(&source, false, false).into(),
+        );
         assert_eq!(
             captured,
             vec![
@@ -14185,7 +14246,10 @@ pub(crate) mod tests {
         assert_eq!(current.incoming_ref, observed.incoming_ref);
         assert_ne!(current.witness.as_ref(), Some(&expected));
         source = fixture.source(&replacement);
-        let newer = frame_enter_presses(&renderer, source_control_notices(&source, false).into());
+        let newer = frame_enter_presses(
+            &renderer,
+            source_control_notices(&source, false, false).into(),
+        );
         assert_eq!(newer.len(), 2, "replacement has its own enabled controls");
         for action in &captured {
             match action {
@@ -14227,7 +14291,10 @@ pub(crate) mod tests {
             .clone();
         let renderer = headless_renderer();
         assert_eq!(
-            frame_enter_presses(&renderer, source_control_notices(&source, false).into()),
+            frame_enter_presses(
+                &renderer,
+                source_control_notices(&source, false, false).into()
+            ),
             vec![SidebarAction::GitOperation {
                 key: source.key.clone(),
                 operation: GitOperation::Abort {
@@ -14238,8 +14305,11 @@ pub(crate) mod tests {
         );
         source.set_mutation(Some(MutationKind::Other));
         assert!(
-            frame_enter_presses(&renderer, source_control_notices(&source, false).into())
-                .is_empty()
+            frame_enter_presses(
+                &renderer,
+                source_control_notices(&source, false, false).into()
+            )
+            .is_empty()
         );
 
         fixture.resolve();
@@ -14254,7 +14324,10 @@ pub(crate) mod tests {
             Some(&expected)
         );
         assert_eq!(
-            frame_enter_presses(&renderer, source_control_notices(&source, false).into()),
+            frame_enter_presses(
+                &renderer,
+                source_control_notices(&source, false, false).into()
+            ),
             vec![
                 SidebarAction::GitOperation {
                     key: source.key.clone(),
@@ -14271,8 +14344,11 @@ pub(crate) mod tests {
         );
         source.set_mutation(Some(MutationKind::Other));
         assert!(
-            frame_enter_presses(&renderer, source_control_notices(&source, false).into())
-                .is_empty()
+            frame_enter_presses(
+                &renderer,
+                source_control_notices(&source, false, false).into()
+            )
+            .is_empty()
         );
     }
 
@@ -14314,7 +14390,10 @@ pub(crate) mod tests {
             let mut source = fixture.source(&snapshot);
             source.operation = Some(display);
             assert_eq!(
-                frame_enter_presses(&renderer, source_control_notices(&source, false).into()),
+                frame_enter_presses(
+                    &renderer,
+                    source_control_notices(&source, false, false).into()
+                ),
                 vec![SidebarAction::RefreshWorktree {
                     key: source.key.clone(),
                 }],
@@ -14322,7 +14401,7 @@ pub(crate) mod tests {
             );
 
             let mut element: Element<'_, SidebarAction> =
-                source_control_notices(&source, false).into();
+                source_control_notices(&source, false, false).into();
             let mut tree = Tree::new(element.as_widget());
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -14353,8 +14432,11 @@ pub(crate) mod tests {
             drop(element);
             source.set_mutation(Some(MutationKind::Other));
             assert!(
-                frame_enter_presses(&renderer, source_control_notices(&source, false).into())
-                    .is_empty(),
+                frame_enter_presses(
+                    &renderer,
+                    source_control_notices(&source, false, false).into()
+                )
+                .is_empty(),
                 "Reload and operation controls remain disabled while busy"
             );
         }
@@ -22723,7 +22805,15 @@ pub(crate) mod tests {
     #[test]
     fn committing_is_offered_only_by_the_working_tree_view() {
         let renderer = headless_renderer();
-        let model = panel_model();
+        let mut model = panel_model();
+        // Git refuses to commit over unmerged paths, so resolve the fixture's
+        // conflict: this test is about which view offers Commit, not when.
+        model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .groups
+            .retain(|group| group.area != ChangeArea::Conflict);
         let mut state = panel_state(&model);
         state.apply(&SidebarAction::CommitMessageChanged {
             key: main_key(),
@@ -22852,6 +22942,28 @@ pub(crate) mod tests {
         assert!(
             fired.contains(&pending.confirm_action()),
             "the dialog's Discard is the only route to a confirmed request; it published {fired:?}"
+        );
+    }
+
+    /// A running mutation is stopped from the header glyph that shows it, and
+    /// like every pane command that stop stands down behind a dialog.
+    #[test]
+    fn a_running_mutation_can_be_cancelled_from_its_activity_glyph() {
+        let renderer = headless_renderer();
+        let mut model = panel_model();
+        let state = panel_state(&model);
+        let cancel = SidebarAction::CancelGitMutation { key: main_key() };
+        let presses = |model: &SidebarModel, modal_open| {
+            frame_enter_presses(&renderer, git_panel(model, &state, 380.0, modal_open))
+        };
+        assert!(!presses(&model, false).contains(&cancel));
+        model.source_control.as_mut().unwrap().mutation = Some(MutationKind::Commit);
+        assert!(presses(&model, false).contains(&cancel));
+        assert!(!presses(&model, true).contains(&cancel));
+        assert!(
+            accessible_names(&renderer, git_panel(&model, &state, 380.0, false))
+                .iter()
+                .any(|name| name == "Cancel committing")
         );
     }
 
