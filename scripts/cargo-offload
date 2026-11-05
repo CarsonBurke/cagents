@@ -820,9 +820,8 @@ if command == "lease":
     with open(os.path.join(slot, "claim.new"), "w") as file:
         json.dump({"cost": cost, "pid": None, "build": build, "key": key}, file)
     os.replace(os.path.join(slot, "claim.new"), os.path.join(slot, "claim"))
-    # At the head of the queue, unless it waited for the same build: the
-    # build starts once the memory it is expected to need is free beside the
-    # builds already running here.
+    # At the head of the queue: the build starts once the memory it is
+    # expected to need is free beside the builds already running here.
     waiting = None
     while True:
         why = room(base, slot, cost)
