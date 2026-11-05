@@ -28,10 +28,15 @@ COMMAND`. Gated commands inside it run in that slot without waiting. Prefer
 gating each Cargo command, so tests run outside the slot.
 
 A checkout whose Cargo build directory has never been built is first seeded
-from the main checkout's with scripts/seed-build-dir.
+from the main checkout's with scripts/seed-build-dir. When the file system
+holding build directories runs low, scripts/build-disk-guard first reclaims
+removed worktrees' build directories, and refuses the build below a floor.
 
 Environment:
   CAGENTS_BUILD_SEED=0   Do not seed a new build directory
+  CAGENTS_BUILD_FREE_FLOOR_GIB
+                         Free space below which builds are refused; default
+                         5% of the file system, at most 64; 0 disables
   CAGENTS_BUILD_SLOTS    Concurrent builds; default: one per 8 GiB of RAM
                          after an 8 GiB reserve, at most one per 8 CPUs
   CAGENTS_BUILD_LOCK     First slot's lock file; the others add .1, .2, ...
@@ -332,8 +337,18 @@ fi
 # A new worktree's build directory starts from the main checkout's compiled
 # dependencies instead of empty, so it neither builds them all again nor
 # shares a build directory with another worktree. Copying needs no slot.
+# Before either, a file system running out of room for build directories
+# reclaims removed worktrees' or refuses the build.
+guard=$(dirname "$0")/build-disk-guard
 seed=$(dirname "$0")/seed-build-dir
-[ ! -x "$seed" ] || "$seed" || :
+if [ -x "$guard" ] || [ -x "$seed" ]; then
+    build_dir=$(cargo metadata --format-version 1 --no-deps 2>/dev/null |
+        sed -n 's/.*"build_directory":"\([^"]*\)".*/\1/p') || build_dir=
+    if [ -n "$build_dir" ]; then
+        [ ! -x "$guard" ] || "$guard" "$build_dir" || exit "$?"
+        [ ! -x "$seed" ] || "$seed" --to "$build_dir" || :
+    fi
+fi
 
 if [ "$mode" = exec ]; then
     acquire
