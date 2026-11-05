@@ -3173,6 +3173,7 @@ impl Adapter for Codex {
                 self.subagent_waiting = false;
                 self.subagent_detail = "Agent disconnected".into();
                 step.events.push(Event::Ready(false));
+                let interrupted = self.busy;
                 self.busy = false;
                 self.subagent_status = Some(
                     self.subagent_status
@@ -3181,10 +3182,24 @@ impl Adapter for Codex {
                 );
                 self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
                 self.invalidate(&mut step);
-                step.events.push(Event::Error {
-                    message: format!("Codex {method}; reconnect explicitly"),
-                    fatal: true,
-                });
+                if !self.is_child {
+                    step.events.push(Event::Error {
+                        message: format!("Codex {method}; reconnect explicitly"),
+                        fatal: true,
+                    });
+                } else if interrupted {
+                    // Codex also closes a child's thread once its work is
+                    // done; only a close that cut work short is news, and the
+                    // child has no reconnect of its own to point at.
+                    step.events.push(session_notice(
+                        if method == "thread/deleted" {
+                            "Codex removed this agent before it finished"
+                        } else {
+                            "Codex closed this agent before it finished"
+                        }
+                        .into(),
+                    ));
+                }
             }
             "error" => {
                 let message = params["error"]["message"]
@@ -6385,8 +6400,12 @@ mod tests {
             assert_eq!(child.items.len(), 2);
             let notice = &child.items[1];
             assert_eq!(notice.role, Role::System);
-            assert!(matches!(&notice.content, ItemContent::Text {text,..}
-                    if text == &format!("Codex {method}; reconnect explicitly")));
+            let expected = if method == "thread/deleted" {
+                "Codex removed this agent before it finished"
+            } else {
+                "Codex closed this agent before it finished"
+            };
+            assert!(matches!(&notice.content, ItemContent::Text {text,..} if text == expected));
             assert!(chat::failure::provider_error_text(Provider::Codex, notice).is_none());
         }
     }
@@ -6792,6 +6811,15 @@ mod tests {
             ] {
                 let observed = parent.receive(frame).unwrap();
                 assert!(observed.events.iter().any(|event| matches!(event, Event::Subagent {status:Some(status), ..} if *status == expected)), "{:?}", observed.events);
+                // A finished child's thread closing is routine, not a notice.
+                assert!(
+                    !observed
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, Event::SubagentItem { .. })),
+                    "{:?}",
+                    observed.events
+                );
             }
             let next = parent.receive(json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"next","items":[]}}})).unwrap();
             assert!(next.events.iter().any(|event| matches!(

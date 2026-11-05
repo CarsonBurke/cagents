@@ -5,10 +5,10 @@ Use a private CAGENTS_CHILD_ERROR_FIXTURE_ROOT, CODEX_HOME beneath that root,
 and a private XDG_RUNTIME_DIR. Launch through the ordinary native development
 runner with this script as the isolated Codex executable. Default prompts emit
 false/null/missing-retry child diagnostics before an authentic failed turn;
-`failed-turn`, `retry`, and `disconnect` select the neighboring cases. `large`
-adds a multi-page UTF-8 original; `unavailable` exceeds the per-original quota.
-This
-models protocol/UI behavior only, not provider execution or account recovery.
+`failed-turn`, `retry`, `disconnect` and `closed-after-finish` select the
+neighboring cases. `large` adds a multi-page UTF-8 original; `unavailable`
+exceeds the per-original quota. This models protocol/UI behavior only, not
+provider execution or account recovery.
 One fixture process owns one synthetic parent conversation.
 """
 import importlib.util
@@ -64,7 +64,12 @@ class Scenario:
             raw += "\n" + "猫 original λ\n" * 100_000
         elif "large" in text:
             raw += "\n" + "猫 original λ\n" * 20_000 + "TAIL original λ"
-        if "disconnect" in text:
+        if "closed-after-finish" in text:
+            # Codex also closes a child thread once it has finished.
+            frames.append(notify("turn/completed", self.child,
+                                 turn=turn(self.child, "completed")))
+            frames.append(notify("thread/closed", self.child))
+        elif "disconnect" in text:
             frames.append(notify("thread/closed", self.child))
         elif "failed-turn" in text:
             frames.append(notify("turn/completed", self.child,
