@@ -65,11 +65,25 @@ built() {
     return 1
 }
 
+# Cargo tags only a build directory it creates, and prune-cargo-build-dirs
+# reclaims only tagged ones, so tag those Cargo found already there, including
+# ones seeded before seeding tagged them.
+tag() {
+    [ -e "$1/CACHEDIR.TAG" ] || printf '%s\n' \
+        'Signature: 8a477f597d28d172789f06886806bc55' \
+        '# This file is a cache directory tag created by cargo.' \
+        '# For information about cache directory tags see https://bford.info/cachedir/' \
+        >"$1/CACHEDIR.TAG" 2>/dev/null || :
+}
+
 if [ -z "$to" ]; then
     to=$(build_dir_of .)
     [ -n "$to" ] || exit 0
 fi
-! built "$to" || exit 0
+if built "$to"; then
+    tag "$to"
+    exit 0
+fi
 if [ -z "$from" ]; then
     common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
     main=$(dirname -- "$common")
@@ -83,13 +97,7 @@ fi
 built "$from" || exit 0
 
 mkdir -p -- "$to"
-# Cargo tags only a build directory it creates, and prune-cargo-build-dirs
-# reclaims only tagged ones.
-[ -e "$to/CACHEDIR.TAG" ] || printf '%s\n' \
-    'Signature: 8a477f597d28d172789f06886806bc55' \
-    '# This file is a cache directory tag created by cargo.' \
-    '# For information about cache directory tags see https://bford.info/cachedir/' \
-    >"$to/CACHEDIR.TAG"
+tag "$to"
 # One seeder per destination; a second waits, then finds it seeded.
 exec 9>>"$to/.seed-lock"
 flock 9

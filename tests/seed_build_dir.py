@@ -10,6 +10,11 @@ import time
 import unittest
 
 
+CARGO_TAG = (
+    "Signature: 8a477f597d28d172789f06886806bc55\n"
+    "# This file is a cache directory tag created by cargo.\n"
+    "# For information about cache directory tags see https://bford.info/cachedir/\n"
+)
 SEED = Path(__file__).resolve().parents[1] / "scripts/seed-build-dir"
 
 
@@ -252,8 +257,7 @@ class SeedBuildDir(unittest.TestCase):
             # Incremental caches belong to the checkout's own crates.
             self.assertFalse((self.destination / profile / "incremental").exists())
         # Cargo tags only directories it creates; the pruner needs the tag.
-        self.assertIn("Signature: 8a477f597d28d172789f06886806bc55",
-                      (self.destination / "CACHEDIR.TAG").read_text())
+        self.assertEqual((self.destination / "CACHEDIR.TAG").read_text(), CARGO_TAG)
         leftovers = [path.name for path in self.destination.iterdir() if path.name.startswith(".seeding")]
         self.assertEqual(leftovers, [])
         # Seeded once, it is a build directory like any other.
@@ -286,6 +290,8 @@ class SeedBuildDir(unittest.TestCase):
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         self.assertFalse((self.destination / "debug/deps").exists())
         self.assertFalse((self.destination / "dev-runtime").exists())
+        # Built before seeding tagged directories, it still gets the tag.
+        self.assertEqual((self.destination / "CACHEDIR.TAG").read_text(), CARGO_TAG)
 
     def test_nothing_to_copy_or_opted_out_does_nothing(self):
         for name, run in (

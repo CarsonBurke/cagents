@@ -5,7 +5,8 @@
 # Below twice the floor, this reclaims the build directories of removed
 # worktrees at once instead of after the pruner's usual grace period. Below the
 # floor itself it refuses, so a build fails with an explanation instead of
-# filling the disk that other builds, agents and their logs share.
+# filling the disk that other builds, agents and their logs share. A guard
+# that cannot tell how much room there is lets the build run.
 set -eu
 
 program=build-disk-guard
@@ -22,8 +23,9 @@ Environment:
                                 default: 5% of the file system, at most 64.
                                 0 disables the guard.
   CAGENTS_BUILD_PRUNE           Command that reclaims build directories;
-                                default: prune-cargo-build-dirs --apply
-                                --orphan-grace 0, when installed
+                                default, when installed:
+                                prune-cargo-build-dirs --apply
+                                --orphan-grace 0 --max-idle 36500
 EOF
 }
 
@@ -35,7 +37,8 @@ directory=$1
 floor=${CAGENTS_BUILD_FREE_FLOOR_GIB:-}
 case $floor in
     0) exit 0 ;;
-    ''|*[!0-9]*) [ -z "$floor" ] || { usage >&2; exit 2; } ;;
+    '') ;;
+    0*|*[!0-9]*) usage >&2; exit 2 ;;
 esac
 
 # The build directory may not exist yet; its file system is its nearest
@@ -44,11 +47,14 @@ while [ ! -d "$directory" ]; do
     directory=$(dirname -- "$directory")
 done
 
-# Sizes and free space in GiB, rounded down.
+# Size and free space in GiB, rounded down.
 read_space() {
-    set -- $(df -Pk -- "$directory" | awk 'NR == 2 { print int($2 / 1048576), int($4 / 1048576) }')
-    size=$1
-    free=$2
+    space=$(df -Pk -- "$directory" 2>/dev/null |
+        awk 'NR == 2 && $2 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {
+            print int($2 / 1048576), int($4 / 1048576) }') || space=
+    [ -n "$space" ] || exit 0
+    size=${space% *}
+    free=${space#* }
 }
 read_space
 if [ -z "$floor" ]; then
@@ -62,7 +68,10 @@ fi
 state=${CAGENTS_BUILD_LOCK:-/var/tmp/cagents-cargo.lock}.prune
 prune=${CAGENTS_BUILD_PRUNE:-}
 if [ -z "$prune" ] && command -v prune-cargo-build-dirs >/dev/null 2>&1; then
-    prune='prune-cargo-build-dirs --apply --orphan-grace 0'
+    # Only removed worktrees': their builds cannot be running, while an idle
+    # live worktree's may be starting, and its lock is not one this pruner
+    # takes. Idle ones are left to the pruner's own schedule.
+    prune='prune-cargo-build-dirs --apply --orphan-grace 0 --max-idle 36500'
 fi
 if [ -n "$prune" ]; then
     exec 7>>"$state"
@@ -77,7 +86,9 @@ if [ -n "$prune" ]; then
         exec 7>&-
     else
         # Another build is reclaiming; its result decides for this one too.
-        flock 7
+        printf '%s: %s GiB free; waiting for another build to reclaim space\n' \
+            "$program" "$free" >&2
+        flock -w 900 7 || :
         exec 7>&-
     fi
     read_space

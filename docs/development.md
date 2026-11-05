@@ -403,11 +403,17 @@ directory a plain `cargo` would create. Seeded directories carry Cargo's
 `CACHEDIR.TAG`, so `prune-cargo-build-dirs` reclaims them after their worktree
 is removed.
 
+The gate's helpers run from the gate's own directory. Install a changed gate
+for every checkout with `scripts/install-cargo-gate`, never by copying
+`scripts/cargo-gate` alone: it stages the gate with its helpers, checks that
+the staged gate runs a command, renames them into `/var/tmp`, and checks the
+result.
+
 Build directories share one disk. When the file system holding them has less
 than twice a floor free (5% of its size, at most 64 GiB), `scripts/cargo-gate`
 runs `scripts/build-disk-guard`, which reclaims removed worktrees' build
-directories at once with `prune-cargo-build-dirs --apply --orphan-grace 0`, at
-most every ten minutes across the host. Below the floor it refuses the build
+directories at once with `prune-cargo-build-dirs`, at most every ten minutes
+across the host; idle live worktrees' are left to the pruner's own schedule. Below the floor it refuses the build
 and says why. Remove worktrees you no longer need; their build directories
 follow. Set `CAGENTS_BUILD_FREE_FLOOR_GIB` to change the floor, or `0` to
 disable the guard.
