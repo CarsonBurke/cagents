@@ -397,7 +397,7 @@ wait_for_native_lock() {
         if [ "$waited" -ge "$wait_lock" ]; then
             kill -KILL "$waiter" 2>/dev/null || true
             wait "$waiter" 2>/dev/null || true
-            printf 'the native lock stayed busy for %s seconds\n' "$wait_lock" >"$state/failed"
+            printf 'the native lock stayed busy for %s seconds; scripts/lock-holders %s shows who holds it\n' "$wait_lock" "$native_lock" >"$state/failed"
             return 1
         fi
         sleep 1
