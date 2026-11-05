@@ -72,6 +72,10 @@ def encoded(snapshot):
     return "\n".join([*lines, "  }", "}", ""])
 
 
+def changed_items(before, after):
+    return ", ".join(key for key in sorted(before.keys() | after.keys()) if before.get(key) != after.get(key))
+
+
 def snapshot_files(root):
     directory = root / FIXTURES
     real_directory(root, "tests/fixtures")
@@ -143,7 +147,7 @@ def compare_base(root, base, current):
             else contract(lambda path: git(root, "show", f"{resolved}:{path}").decode())
         )
         if current["items"] != previous["items"]:
-            raise ContractError("Selected IPC declarations changed without a new protocol number relative to the comparison base")
+            raise ContractError(f"Selected IPC declarations changed without a new protocol number relative to the comparison base: {changed_items(previous['items'], current['items'])}. Choose an unused higher PROTOCOL_VERSION and run scripts/check-protocol-contract --record")
     print(f"Trusted comparison base: {resolved}")
 
 
@@ -169,7 +173,8 @@ def main():
         existing = files.get(version)
         if existing:
             if existing[1] != current:
-                raise ContractError(f"Protocol {version} already has a different selected source contract; increment PROTOCOL_VERSION and record a new snapshot")
+                changes = changed_items(existing[1]["items"], current["items"])
+                raise ContractError(f"Protocol {version} already has a different selected source contract: {changes}. Choose an unused higher PROTOCOL_VERSION and run scripts/check-protocol-contract --record; preserve {FIXTURES}/{version}.json")
         elif args.record:
             directory = root / FIXTURES
             directory.mkdir(exist_ok=True)
@@ -184,6 +189,7 @@ def main():
         return 0
     except (ContractError, OSError, ValueError) as error:
         print(f"Protocol contract refused: {error}", file=sys.stderr)
+        print("Coverage is limited to seven selected declarations; review transitive DTO, custom Serde and dependency semantics separately.", file=sys.stderr)
         return 1
 
 

@@ -170,8 +170,11 @@ class LedgerContractTests(unittest.TestCase):
             with self.subTest(after=after):
                 source = (self.root / path).read_text()
                 self.replace(path, before, after)
-                self.refuses(contains="already has a different selected source contract")
-                self.refuses("--record", contains="increment PROTOCOL_VERSION")
+                result = self.refuses(contains="already has a different selected source contract")
+                self.assertIn(path + "::", result.stderr)
+                self.assertIn("scripts/check-protocol-contract --record", result.stderr)
+                self.assertIn("custom Serde", result.stderr)
+                self.refuses("--record", contains="unused higher PROTOCOL_VERSION")
                 self.write(path, source)
 
     def test_nonshape_edits_leave_the_snapshot_valid(self):
