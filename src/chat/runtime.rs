@@ -4874,9 +4874,9 @@ mod tests {
             "",
         );
         assert!(
-            invalid
-                .summary
-                .starts_with("The agent printed 8 lines in a row that are not part of the conversation"),
+            invalid.summary.starts_with(
+                "The agent printed 8 lines in a row that are not part of the conversation"
+            ),
             "a clean status adds nothing to the bounded framing diagnosis: {}",
             invalid.summary
         );
