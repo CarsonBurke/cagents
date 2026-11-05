@@ -875,6 +875,13 @@ impl State {
                     );
                     return ActionTask::none();
                 }
+                if self.pending_on_old_head() {
+                    self.discussion.submit_error = Some(
+                        "This pending review is on an older commit. Discard it to review the current head."
+                            .into(),
+                    );
+                    return ActionTask::none();
+                }
                 if self.discussion.event == ReviewEvent::Comment
                     && self.discussion.summary.text().trim().is_empty()
                     && self.pending_count() == 0
@@ -1057,21 +1064,24 @@ impl State {
             ));
         } else {
             rows.push(design::heading("Finish your review").into());
+            let old_head = self.pending_on_old_head();
             if let Some(pending) = self
                 .context
                 .as_ref()
                 .and_then(|context| context.pending.as_ref())
             {
                 let commit = pending.commit_oid.as_deref().unwrap_or("unknown");
-                let stale = self.pending_on_old_head();
-                rows.push(design::body(format!("You have a pending review with {} on {}.{}", comment_count(pending.comment_count), commit.get(..7).unwrap_or(commit), if stale { " This review belongs to an old head. Discard it to start a review on the current head." } else { "" })).into());
+                rows.push(design::body(format!("You have a pending review with {} on {}.{}", comment_count(pending.comment_count), commit.get(..7).unwrap_or(commit), if old_head { " This review belongs to an old head. Discard it to start a review on the current head." } else { "" })).into());
                 rows.push(
                     crate::ui_controls::button::secondary("Discard pending review…")
                         .on_press_maybe(enabled.then_some(Action::PrepareDiscard))
                         .into(),
                 );
             }
-            rows.push(
+            // Its comments can't be published to this head, so promising
+            // them would contradict the explanation above.
+            if !old_head {
+                rows.push(
                 design::caption(match pending {
                     0 => "No pending comments. Comment on a line from the diff gutter, or on a whole file from its toolbar.".to_owned(),
                     1 => "1 pending comment will be published with this review.".to_owned(),
@@ -1080,6 +1090,7 @@ impl State {
                 .wrapping(iced::widget::text::Wrapping::Word)
                 .into(),
             );
+            }
             let own = self.context.as_ref().is_some_and(|c| c.viewer_is_author);
             if own {
                 rows.push(design::caption("GitHub allows comments on your own pull request, but not approval or requests for changes.").into());
@@ -1171,9 +1182,12 @@ impl State {
                         "Submit review"
                     })
                     .on_press_maybe(
-                        (enabled && !drafting && !empty_comment).then_some(Action::PrepareSubmit),
+                        (enabled && !drafting && !empty_comment && !old_head)
+                            .then_some(Action::PrepareSubmit),
                     ),
-                    if empty_comment {
+                    if old_head {
+                        "Discard the pending review on the older commit before submitting."
+                    } else if empty_comment {
                         "Write a summary or add a pending comment to submit a Comment review."
                     } else {
                         "Confirm and submit this review"
@@ -2582,6 +2596,11 @@ mod tests {
             &state.discussion.discard_confirmation,
             Some((_, review)) if review == "REVIEW_old"
         ));
+        drop(state.update_discussion(Action::PrepareSubmit));
+        assert!(
+            state.discussion.confirmation.is_none() && state.discussion.submit_error.is_some(),
+            "an old-head review is discarded, not submitted"
+        );
         drop(state.update_discussion(Action::ConfirmDiscard));
         assert!(state.discussion.busy);
         drop(state.update_discussion(Action::Finished {
