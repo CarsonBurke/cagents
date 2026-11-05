@@ -455,10 +455,11 @@ dumps, which the host's `systemd-coredump` would otherwise store; set
 `CAGENTS_BUILD_REMOTE_CORE_DUMPS=1` to keep them.
 
 What callers here use comes back. `build`, `rustc`, `run`, and `test` or
-`bench` with `--no-run` copy the executables Cargo reported to where Cargo here
-would have put them: its target directory, or, for test harnesses, its build
-directory. Cargo's JSON messages (`--message-format=json...`) name this host's
-paths. `run` builds there and runs the program here, with Cargo's `CARGO_*`
+`bench` with `--no-run` copy back the executables Cargo reported, into this
+host's target directory, or its build directory for test harnesses when
+the build host also keeps one apart from its target directory. Either way
+they arrive at the paths Cargo's messages, and its JSON messages
+(`--message-format=json...`), name here. `run` builds there and runs the program here, with Cargo's `CARGO_*`
 settings. `doc` copies `target/doc` back, per `--target`, and `--open` opens it
 here. `--timings` copies the report back. `fix` and `clippy --fix` apply their
 fixes here, to the files they changed there, after the same uncommitted-change
@@ -485,18 +486,28 @@ A checkout's gate defers to the installed one, `/var/tmp/cagents-cargo-gate`
 (`CAGENTS_BUILD_INSTALLED_GATE`; empty disables this), when the installed
 `gate_version` is newer, so a worktree that has fallen behind `main` still
 builds the way `main` does. Raise `gate_version` in `scripts/cargo-gate` with
-any change to the gate or its helpers, and install it with
-`scripts/install-cargo-gate`, which refuses to install an older version over
-a newer one.
+any change to the gate or its helpers. `scripts/install-cargo-gate`
+installs a checkout's gate and refuses an older version over a newer one.
+
+Merged gate changes install themselves. The installer records the commit it
+installed from in `/var/tmp/cagents-cargo-gate.source`. Every gate run
+inside a checkout compares it with that checkout's `origin/main`. When main
+has moved past it and changed the gate or a helper, the gate installs main's
+versions, says so, and continues. Otherwise only the record moves. An
+installation main has not reached, such as a branch under test, stays until
+main contains it. An installation from files that differ from their commit
+records nothing, so the next run replaces it with main's. When main's gate
+cannot be installed, every run says so, and it is tried again only once main
+moves. `CAGENTS_BUILD_INSTALL_SYNC=0` turns this off.
 
 Only settings that change what Cargo, rustc or the tests do reach the host:
 `RUST_*`, `RUSTFLAGS`, `RUSTDOCFLAGS`, `CARGO_TERM_*`, `CARGO_PROFILE_*`,
 `CARGO_INCREMENTAL` and other `CAGENTS_` settings, except `CAGENTS_BUILD_*` and names that look like
 credentials (containing `TOKEN`, `KEY`, `SECRET`, `PASS`, `AUTH`,
 `CREDENTIAL` or `COOKIE`). They travel on the connection's standard input,
-not its command line, along with this shell's open-file limit, which the
-command gets up to the host's hard limit; an ssh session's usual 1024 fails
-descriptor-heavy suites that pass here. This user's Cargo `[profile]` settings are applied
+not its command line. The command may open as many files as the host's
+hard limit allows, whatever the soft limit here: an ssh session's usual
+1024 fails descriptor-heavy suites. This user's Cargo `[profile]` settings are applied
 there; its build settings, such as `jobs` and `build-dir`, describe this host
 and are not. Each slot's commands get a private `TMPDIR`,
 `$XDG_RUNTIME_DIR/cof/<repository>-<N>` (mode 0700) on the host, short enough
