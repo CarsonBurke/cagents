@@ -750,8 +750,8 @@ class PreflightCancellation(unittest.TestCase):
                 self.assertTrue(self.slot_is_free())
 
 
-class MemoryAdmission(unittest.TestCase):
-    """Two slots, one held by a gated build that records its expected cost."""
+class TwoSlots(unittest.TestCase):
+    """Two private slots, one of which a gated build can hold."""
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-memory-")
@@ -763,7 +763,8 @@ class MemoryAdmission(unittest.TestCase):
         self.env = {
             key: value for key, value in os.environ.items()
             if not key.startswith("CAGENTS_BUILD_") and key != "CARGO_BUILD_JOBS"
-        } | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_SLOTS": "2"}
+        } | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_SLOTS": "2",
+              "CAGENTS_BUILD_CPU_PRESSURE": "0"}
 
     def hold(self, cost):
         holder = subprocess.Popen(
@@ -787,6 +788,10 @@ class MemoryAdmission(unittest.TestCase):
             env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
             capture_output=True, text=True, timeout=timeout,
         )
+
+
+class MemoryAdmission(TwoSlots):
+    """One slot held by a gated build that records its expected cost."""
 
     def test_a_build_that_fits_starts_beside_a_running_one(self):
         self.hold(1)
@@ -847,6 +852,93 @@ class MemoryAdmission(unittest.TestCase):
         result = self.build("08", timeout=10)
         self.assertEqual(result.returncode, 2)
         self.assertIn("CAGENTS_BUILD_COST_GIB", result.stderr)
+
+class CpuPressureAdmission(TwoSlots):
+    """Two slots and memory to spare; the CPU pressure comes from a fixture."""
+
+    def setUp(self):
+        super().setUp()
+        self.pressure = self.root / "pressure"
+        self.env |= {
+            "CAGENTS_BUILD_CPU_PRESSURE": "60", "CAGENTS_BUILD_CPU_SETTLE_SECS": "0",
+            "CAGENTS_BUILD_CPU_PRESSURE_FILE": str(self.pressure),
+        }
+
+    def report(self, some, full="0.00"):
+        self.pressure.write_text(
+            f"some avg10={some} avg60=40.12 avg300=38.40 total=30831090039\n"
+            f"full avg10={full} avg60=0.00 avg300=0.00 total=0\n")
+
+    def test_a_build_starts_beside_a_running_one_while_cpus_have_room(self):
+        self.report("59.99", full="99.00")
+        self.hold(1)
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting", result.stderr)
+
+    def test_a_build_waits_while_cpu_pressure_is_at_the_limit(self):
+        self.report("60.00")
+        self.hold(1)
+        waiter = subprocess.Popen(
+            [str(self.gate), "exec", "true"], env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"},
+            cwd=self.root, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(waiter.stderr.close)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            waiter.wait(timeout=2)
+        # Pressure falling admits it beside the running build.
+        self.report("12.50")
+        self.assertEqual(waiter.wait(timeout=10), 0)
+        self.assertIsNone(self.holder.poll())
+        self.assertIn("CPUs busy (60% pressure, limit 60%)", waiter.stderr.read())
+
+    def test_a_lone_build_starts_whatever_the_pressure(self):
+        self.report("100.00")
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_build_waits_until_the_newest_one_can_show_in_the_pressure(self):
+        self.report("0.00")
+        self.hold(1)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            subprocess.run(
+                [str(self.gate), "exec", "true"],
+                env=self.env | {"CAGENTS_BUILD_COST_GIB": "1", "CAGENTS_BUILD_CPU_SETTLE_SECS": "3600"},
+                cwd=self.root, capture_output=True, timeout=2)
+
+    def test_a_host_without_pressure_reports_has_room(self):
+        self.hold(1)
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_zero_disables_the_pressure_limit(self):
+        self.report("100.00")
+        self.env["CAGENTS_BUILD_CPU_PRESSURE"] = "0"
+        self.hold(1)
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_invalid_limits_are_refused(self):
+        for name, value in (("CAGENTS_BUILD_CPU_PRESSURE", "060"),
+                            ("CAGENTS_BUILD_CPU_PRESSURE", "101"),
+                            ("CAGENTS_BUILD_CPU_PRESSURE", "high"),
+                            ("CAGENTS_BUILD_CPU_SETTLE_SECS", "-1")):
+            self.env[name] = value
+            result = self.build(1, timeout=10)
+            self.assertEqual(result.returncode, 2, (name, value))
+            self.assertIn(name, result.stderr)
+            del self.env[name]
+
+    def test_default_slots_are_capped_at_four(self):
+        del self.env["CAGENTS_BUILD_SLOTS"]
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        slots = {path.name for path in self.root.glob("slot.lock*")
+                 if not path.name.endswith((".queue", ".cost"))}
+        self.assertLessEqual(slots, {"slot.lock", "slot.lock.1", "slot.lock.2", "slot.lock.3"})
+        memory_gib = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
+        if os.cpu_count() >= 20 and memory_gib >= 28:
+            self.assertEqual(len(slots), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
