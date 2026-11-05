@@ -475,6 +475,10 @@ iced-core tree reconciliation, run the focused package first:
 scripts/cargo-gate test --locked -p cagents-iced-contracts
 ```
 
+The same package checks that a rebuilt named widget keeps the native
+accessibility ID it already published, so an assistive-technology action
+queued before the rebuild still reaches it.
+
 The package uses the UI's exact iced-core Git revision; the root Cargo patch
 resolves both targets to `vendor/iced-core`, with the production `a11y` Id
 implementation. It compiles without the application, libcosmic renderer, or
