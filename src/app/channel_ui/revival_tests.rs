@@ -887,6 +887,7 @@ fn an_explicit_peer_deletion_during_retirement_is_final() {
                 sequence,
                 edit: ModelEdit::DeleteChannel {
                     id: fixture.channel,
+                    reviewed: None,
                 },
             },
         ));
@@ -929,6 +930,7 @@ fn an_explicit_peer_deletion_overtaken_by_its_snapshot_stays_final() {
             sequence,
             edit: ModelEdit::DeleteChannel {
                 id: fixture.channel,
+                reviewed: None,
             },
         },
     ));
@@ -974,6 +976,7 @@ fn an_explicit_peer_deletion_severs_a_revival_created_before_its_edge() {
             sequence,
             edit: ModelEdit::DeleteChannel {
                 id: fixture.channel,
+                reviewed: None,
             },
         },
     ));

@@ -4219,7 +4219,10 @@ fn channel_output(
         }
         ResolvedChannel::Close { channel_id } => {
             client
-                .edit_workspace_model(ModelEdit::DeleteChannel { id: channel_id })
+                .edit_workspace_model(ModelEdit::DeleteChannel {
+                    id: channel_id,
+                    reviewed: None,
+                })
                 .map_err(protocol_error)?;
             Ok(CommandOutput {
                 command: "channel.close",

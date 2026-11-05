@@ -53,6 +53,7 @@ const SCHEMA_VERSION: u32 = 19;
 /// this store, so contention is between its own client threads and is measured
 /// in microseconds; the timeout exists for the WAL checkpoint, not for a rival.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const CHANNEL_GAINED_PANES: &str = "The channel gained panes after you confirmed its deletion, so it was kept. Review the channel and choose Delete channel again.";
 
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
@@ -416,7 +417,16 @@ impl Registry {
                     transaction.execute("DELETE FROM channels WHERE id=?1", params![home.channel.to_string()]).map_err(|e| e.to_string())? > 0
                 } else { false }
             }
-            ModelEdit::DeleteChannel { id } => {
+            ModelEdit::DeleteChannel { id, reviewed } => {
+                if let Some(reviewed) = reviewed {
+                    let view = views::read(
+                        &transaction,
+                        &crate::workspace_model::views::Scope::Channel(*id),
+                    )?;
+                    if view.panes.iter().any(|pane| !reviewed.contains(&pane.id)) {
+                        return Err(CHANNEL_GAINED_PANES.into());
+                    }
+                }
                 views::retire_channel_placements(&transaction, *id)?;
                 channel_work::deleted_in(&transaction, *id)?;
                 transaction
@@ -986,7 +996,9 @@ mod tests {
         let channel = registry.model().unwrap().channels.remove(0);
         assert_eq!(channel.title, "Repair channel navigation");
         assert_eq!(channel.title_source, ChannelTitleSource::Manual);
-        registry.apply(&ModelEdit::DeleteChannel { id }).unwrap();
+        registry
+            .apply(&ModelEdit::DeleteChannel { id, reviewed: None })
+            .unwrap();
         assert!(
             !registry
                 .apply(&suggest("Do not resurrect", ChannelTitleSource::Provider))
@@ -1365,7 +1377,10 @@ mod tests {
         assert!(retitled.model.channel(unknown).is_none());
 
         let deleted = registry
-            .apply(&ModelEdit::DeleteChannel { id: unknown })
+            .apply(&ModelEdit::DeleteChannel {
+                id: unknown,
+                reviewed: None,
+            })
             .unwrap();
         assert!(!deleted.changed);
         assert_eq!(deleted.model.sequence, sequence);
@@ -1450,7 +1465,10 @@ mod tests {
         );
 
         registry
-            .apply(&ModelEdit::DeleteChannel { id: newer })
+            .apply(&ModelEdit::DeleteChannel {
+                id: newer,
+                reviewed: None,
+            })
             .unwrap();
         let replacement = ChannelId::new();
         let after = registry

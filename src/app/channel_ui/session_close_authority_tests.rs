@@ -356,17 +356,16 @@ fn owning_delete(role: &str) {
             assert_eq!(app.workspace.focused(), focused);
             assert_eq!(app.durable.active_channel, Some(survivor));
             assert!(
-                !edits
-                    .iter()
-                    .any(|edit| matches!(edit, ModelEdit::DeleteChannel { id } if *id == channel))
+                !edits.iter().any(
+                    |edit| matches!(edit, ModelEdit::DeleteChannel { id, .. } if *id == channel)
+                )
             );
         } else {
             assert!(app.channel_ui.was_deleted(channel));
             assert!(!app.card_state(card).unwrap().existence.is_open());
             assert!(
-                edits
-                    .iter()
-                    .any(|edit| matches!(edit, ModelEdit::DeleteChannel { id } if *id == channel))
+                edits.iter().any(|edit| matches!(edit, ModelEdit::DeleteChannel { id, reviewed: Some(reviewed) } if *id == channel && reviewed.contains(&card))),
+                "a confirmed deletion carries the reviewed panes: {edits:?}"
             );
         }
     }

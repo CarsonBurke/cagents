@@ -532,7 +532,10 @@ fn a_peer_deleting_a_channel_only_closes_conversations_it_could_have_seen() {
         let channel = world.channel;
         drop(world.app.apply_workspace_model_update(ModelUpdate::Edited {
             sequence,
-            edit: ModelEdit::DeleteChannel { id: channel },
+            edit: ModelEdit::DeleteChannel {
+                id: channel,
+                reviewed: None,
+            },
         }));
         let open = world
             .app

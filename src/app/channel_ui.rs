@@ -577,6 +577,12 @@ impl State {
     pub(super) fn was_deleted(&self, id: ChannelId) -> bool {
         self.deleted.contains(&id)
     }
+
+    /// The registry kept a channel this window deleted. Let the next model
+    /// read adopt it again, with whatever panes it still holds.
+    pub(super) fn restore_refused_deletion(&mut self, id: ChannelId) {
+        self.deleted.remove(&id);
+    }
 }
 
 impl Cagents {
@@ -1844,9 +1850,20 @@ impl Cagents {
         // answers as a no-op because the channel is already gone - cheaper than
         // threading an origin flag through the one path that must behave
         // identically whoever asked.
-        self.publish_model_edit(ModelEdit::DeleteChannel { id });
+        //
+        // A confirmed deletion carries the panes the user reviewed. The
+        // registry retires every placement the channel holds when it applies
+        // the edit, so it refuses one that a peer has added to since.
+        let reviewed = self.channel_ui.approved.remove(&id).map(|target| {
+            let mut reviewed = target.members;
+            reviewed.extend(target.inactive);
+            reviewed.extend(target.panes.into_iter().map(|(card, ..)| card));
+            reviewed.sort_unstable();
+            reviewed.dedup();
+            reviewed
+        });
+        self.publish_model_edit(ModelEdit::DeleteChannel { id, reviewed });
         self.channel_ui.deleted.insert(id);
-        self.channel_ui.approved.remove(&id);
         // Only this window's own retirement of an emptied channel is undone by
         // reopening one of its cards; a deletion anywhere is final.
         let own_retirement = self.channel_work.retiring.remove(&id).is_some();
@@ -2724,8 +2741,9 @@ mod tests {
             assert!(!app.channel_ui.was_deleted(channel), "{change}");
             assert!(app.durable.channels.iter().any(|row| row.id == channel));
             assert!(
-                !std::iter::from_fn(|| publications.try_recv().ok())
-                    .any(|edit| matches!(edit, ModelEdit::DeleteChannel { id } if id == channel)),
+                !std::iter::from_fn(|| publications.try_recv().ok()).any(
+                    |edit| matches!(edit, ModelEdit::DeleteChannel { id, .. } if id == channel)
+                ),
                 "{change}: no channel deletion reaches the canonical placements"
             );
         }

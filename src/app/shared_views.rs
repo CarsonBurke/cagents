@@ -6338,7 +6338,7 @@ mod tests {
                 assert_eq!(
                     std::iter::from_fn(|| rx.try_recv().ok())
                         .filter(
-                            |edit| matches!(edit, ModelEdit::DeleteChannel { id } if *id == source)
+                            |edit| matches!(edit, ModelEdit::DeleteChannel { id, .. } if *id == source)
                         )
                         .count(),
                     1,

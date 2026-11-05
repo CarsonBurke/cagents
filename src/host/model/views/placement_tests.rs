@@ -213,7 +213,12 @@ mod placement_hooks {
         let channel_before = token(&registry, channel_actor.id);
         let other_before = token(&registry, other_actor.id);
         let worktree_before = token(&registry, worktree_actor.id);
-        registry.apply(&ModelEdit::DeleteChannel { id: a }).unwrap();
+        registry
+            .apply(&ModelEdit::DeleteChannel {
+                id: a,
+                reviewed: None,
+            })
+            .unwrap();
         assert!(owner(&registry.db, channel_actor.id).unwrap().is_none());
         assert!(channel_work::placement::token(&registry.db, channel_actor.id).is_err());
         assert_eq!(token(&registry, other_actor.id), other_before);
@@ -404,5 +409,40 @@ mod placement_hooks {
         assert!(registry.apply(&update).is_err());
         assert_eq!(registry.model().unwrap(), before);
         assert_eq!(read(&registry.db, &Scope::Channel(a)).unwrap(), view);
+    }
+
+    #[test]
+    fn reviewed_channel_deletion_refuses_panes_added_after_confirmation() {
+        let (mut registry, _directory, a, _) = setup();
+        let reviewed = live_source_pane();
+        seed(&mut registry, a, vec![reviewed.clone()]);
+        let confirmed = ModelEdit::DeleteChannel {
+            id: a,
+            reviewed: Some(vec![reviewed.id]),
+        };
+
+        // A peer adds a pane between the confirmation and its delivery.
+        let added = live_source_pane();
+        seed(&mut registry, a, vec![added.clone()]);
+        let before = registry.model().unwrap();
+        let view = read(&registry.db, &Scope::Channel(a)).unwrap();
+        assert!(registry.apply(&confirmed).is_err());
+        assert_eq!(registry.model().unwrap(), before);
+        assert_eq!(read(&registry.db, &Scope::Channel(a)).unwrap(), view);
+        assert!(owner(&registry.db, added.id).unwrap().is_some());
+
+        // Once only reviewed panes remain, the confirmed deletion applies.
+        let remove = edit(&mut registry, a, Change::Remove { id: added.id });
+        registry.apply(&remove).unwrap();
+        registry.apply(&confirmed).unwrap();
+        assert!(
+            registry
+                .model()
+                .unwrap()
+                .channels
+                .iter()
+                .all(|channel| channel.id != a)
+        );
+        assert!(owner(&registry.db, reviewed.id).unwrap().is_none());
     }
 }
