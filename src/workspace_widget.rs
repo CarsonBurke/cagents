@@ -5310,6 +5310,23 @@ mod tests {
         moved.offset = moved_offset;
         assert_eq!(positions, expected_overlay_positions(&moved, VIEWPORT));
     }
+    /// Saved settings and terminal passthrough name actions by these ids, so
+    /// each dispatchable action has exactly one saved name and no name is
+    /// left without an action.
+    #[test]
+    fn every_global_shortcut_id_is_a_saved_action_name() {
+        let mut ids: Vec<_> = GLOBAL_SHORTCUT_DESCRIPTORS
+            .iter()
+            .map(|descriptor| descriptor.action.id())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), GLOBAL_SHORTCUT_DESCRIPTORS.len());
+        let mut names = KeyboardShortcuts::action_names().to_vec();
+        names.sort_unstable();
+        assert_eq!(ids, names);
+    }
+
     #[test]
     fn a_field_inside_the_focused_pane_keeps_editing_keys_and_its_pane_commands() {
         use keyboard::key::Code;
