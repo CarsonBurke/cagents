@@ -2080,8 +2080,12 @@ impl Actor {
         let mut garbage_total = 0u64;
         let mut last_ignored = None;
         let mut startup_progress = self.started;
+        // A closed input pipe can precede publication of the provider's exit.
+        // Stop writing, but keep draining its already-readable diagnosis for
+        // the same bounded grace used by protocol EOF below.
+        let mut stdin_closed: Option<(String, Instant)> = None;
         loop {
-            if self.stop.load(Ordering::Acquire) {
+            if stdin_closed.is_none() && self.stop.load(Ordering::Acquire) {
                 if closing.is_none() {
                     closing = Some(Instant::now());
                 }
@@ -2108,7 +2112,9 @@ impl Actor {
                     ));
                 }
             }
-            self.drain_commands(closing.is_some())?;
+            if stdin_closed.is_none() {
+                self.drain_commands(closing.is_some())?;
+            }
             // Parse every frame that already arrived. Gating this on an empty stdin
             // queue froze streaming for a whole turn against any provider that reads
             // stdin only between turns, then killed the session by blaming its
@@ -2179,12 +2185,36 @@ impl Actor {
             if self.output.len() > FRAME_LIMIT {
                 return Err("Provider stdout frame exceeds 32 MiB".into());
             }
+            if let Some((error, at)) = &stdin_closed
+                && ((!frames_ready && stdout_eof && stderr_eof)
+                    || at.elapsed() >= PROTOCOL_EXIT_GRACE)
+            {
+                let grace = PROTOCOL_EXIT_GRACE.saturating_sub(at.elapsed());
+                let message = match self
+                    .child
+                    .as_ref()
+                    .ok_or("Provider process unavailable")?
+                    .observe_exit_within(grace)
+                {
+                    Ok(Some(status)) if !status.success() => {
+                        format!("Provider exited with {status}. {error}")
+                    }
+                    // A successful exit cannot turn undelivered input into a
+                    // successful conversation or hide its write failure.
+                    Ok(Some(status)) => format!("{error}; provider exited with {status}"),
+                    Ok(None) => error.clone(),
+                    Err(observation) => {
+                        format!("{error}; provider exit status unavailable: {observation}")
+                    }
+                };
+                return Err(with_ignored_output(&message, &last_ignored));
+            }
             // Only a genuinely incomplete line is on the framing deadline.
             if frames_ready || self.output.is_empty() {
                 partial_started = None;
             } else {
                 let since = partial_started.get_or_insert_with(Instant::now);
-                if since.elapsed() > IO_TIMEOUT {
+                if stdin_closed.is_none() && since.elapsed() > IO_TIMEOUT {
                     return Err(with_ignored_output(
                         "Provider JSON frame remained incomplete or blocked for 30 seconds",
                         &last_ignored,
@@ -2226,7 +2256,8 @@ impl Actor {
                     &last_ignored,
                 ));
             }
-            if (!self.first_frame || self.adapter.initialization_pending())
+            if stdin_closed.is_none()
+                && (!self.first_frame || self.adapter.initialization_pending())
                 && startup_expired(self.started, startup_progress, Instant::now())
             {
                 return Err(with_ignored_output(
@@ -2238,9 +2269,10 @@ impl Actor {
                     &last_ignored,
                 ));
             }
-            if self
-                .write_started
-                .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
+            if stdin_closed.is_none()
+                && self
+                    .write_started
+                    .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
             {
                 return Err("Provider stdin stalled for 30 seconds".into());
             }
@@ -2273,7 +2305,7 @@ impl Actor {
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: if self.pending.is_empty() {
+                    fd: if self.pending.is_empty() || stdin_closed.is_some() {
                         -1
                     } else {
                         stdin.as_raw_fd()
@@ -2283,9 +2315,16 @@ impl Actor {
                 },
             ];
             let timeout = if frames_ready
-                || (self.queued <= QUEUE_BACKPRESSURE && !self.incoming.is_empty())
+                || (stdin_closed.is_none()
+                    && self.queued <= QUEUE_BACKPRESSURE
+                    && !self.incoming.is_empty())
             {
                 0
+            } else if let Some((_, at)) = &stdin_closed {
+                PROTOCOL_EXIT_GRACE
+                    .saturating_sub(at.elapsed())
+                    .as_nanos()
+                    .div_ceil(1_000_000) as i32
             } else if self.dirty && self.visible.load(Ordering::Acquire) {
                 50
             } else if !self.first_frame
@@ -2311,7 +2350,9 @@ impl Actor {
             if fds[3].revents != 0 {
                 if let Some(line) = self.pending.front() {
                     match stdin.write(&line[self.offset..]) {
-                        Ok(0) => return Err("Provider closed stdin".into()),
+                        Ok(0) => {
+                            stdin_closed = Some(("Provider closed stdin".into(), Instant::now()));
+                        }
                         Ok(n) => {
                             self.offset += n;
                             self.queued -= n;
@@ -2326,6 +2367,9 @@ impl Actor {
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                            stdin_closed = Some((format!("Provider stdin: {e}"), Instant::now()));
+                        }
                         Err(e) => return Err(format!("Provider stdin: {e}")),
                     }
                 }
