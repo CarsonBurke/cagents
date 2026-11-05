@@ -7,8 +7,9 @@
 //! homes and PATH are fixture-owned. This exercises the User protocol fixture,
 //! not production CLI admission, because no CLI command is invoked.
 //!
-//! Ignored by default because admission requires an actual ordinary User
-//! terminal created by the native app. From that terminal, explicitly run:
+//! Ignored by default because admission requires genuine nondelegated User
+//! scope. Ordinary Cagents terminals carry agent authority and must refuse
+//! this manual contract. From a nondelegated User environment, explicitly run:
 //!
 //! ```sh
 //! cargo test --locked --no-default-features --features host \
@@ -743,7 +744,7 @@ fn unexpected_fixture_actor(stage: &str, _root: &std::path::Path) {
 }
 
 #[test]
-#[ignore = "requires an actual ordinary User terminal; see module documentation"]
+#[ignore = "requires genuine nondelegated User scope; see module documentation"]
 fn failed_first_reuse_start_releases_and_new_firings_establish_then_reuse_one_provider() {
     let authority = Authority::from_environment();
     assert_eq!(
