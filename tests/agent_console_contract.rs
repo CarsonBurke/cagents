@@ -152,6 +152,35 @@ impl Fixture {
         value["data"]["results"][0].clone()
     }
 
+    /// Runs an `agent spawn` that names an idempotency key, repeating it with
+    /// that key while the daemon's acceptance goes unanswered, as the CLI's
+    /// error instructs. Acceptance commits durably before the daemon answers,
+    /// and on a loaded disk that commit alone can outlast the CLI's 5 s reply
+    /// budget, which this capacity contract does not test. The key keeps a
+    /// repeat from starting the work twice. Says whether it repeated.
+    fn answered_spawn(&self, arguments: &[&str]) -> (Output, bool) {
+        let hang_guard = Instant::now() + Duration::from_secs(120);
+        let mut repeated = false;
+        loop {
+            let output = self.output(arguments);
+            let unanswered = !output.status.success()
+                && serde_json::from_slice::<Value>(&output.stderr).is_ok_and(|error| {
+                    error["error"]["details"]["idempotency_key"].is_string()
+                        && error["error"]["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("the daemon did not answer"))
+                });
+            if !unanswered {
+                return (output, repeated);
+            }
+            assert!(
+                Instant::now() < hang_guard,
+                "acceptance never answered: {output:?}"
+            );
+            repeated = true;
+        }
+    }
+
     /// Returns an `agent spawn --wait` receipt with its run, once settled, as
     /// `settled`. The CLI's wait budget is not the contract under test: under
     /// load a run can still be starting when it lapses, so this keeps waiting
@@ -240,7 +269,7 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
     let mut first = None;
     for index in 0..100 {
         let name = format!("capacity-{index}");
-        let spawned = fixture.output(&[
+        let (spawned, repeated) = fixture.answered_spawn(&[
             "agent",
             "spawn",
             "--provider",
@@ -262,7 +291,11 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
             "10",
         ]);
         let receipt = fixture.settled_spawn(spawned);
-        assert_eq!(receipt["created"], true, "conversation {index}");
+        // A repeat finds the acceptance its unanswered attempt committed.
+        assert!(
+            receipt["created"] == true || repeated,
+            "conversation {index}: {receipt}"
+        );
         let accepted = &receipt["settled"];
         assert_eq!(accepted["agent"]["origin"], "User");
         assert_eq!(accepted["agent"]["closed"], false);
