@@ -287,13 +287,19 @@ impl State {
                     }
                     needed.insert(key.clone());
                 }
-                Some((hydrated, readable))
+                // A message whose reads have all failed will not be read
+                // whole either, until it is rewritten or shown again.
+                let exhausted = key
+                    .as_ref()
+                    .and_then(|key| self.failures.get(key))
+                    .is_some_and(|failed| *failed >= ATTEMPTS);
+                Some((hydrated, readable && !exhausted))
             });
             let mut unjoined = index + 1;
             // Joining never makes a message larger than preparation accepts,
             // and never presents one message twice: such a run's parts all
             // stay separate. Nor does it join a run that starts inside a
-            // message that will never be read whole: parsed from a cut, one
+            // message that will not be read whole: parsed from a cut, one
             // structure misread at the start would run through the whole
             // window, and each slide of the window would prepare it all again.
             // Its parts stay separate, each preparing on its own.
@@ -825,12 +831,17 @@ mod tests {
             Some(source(message.len())),
         );
         let mut state = State::default();
-        state.project(raw.clone());
+        // While a read may still come, the parts the window holds are joined.
+        assert_eq!(state.project(raw.clone()).items.len(), 1);
         for attempt in 0..ATTEMPTS {
             assert_eq!(state.request().map(|(_, attempt)| attempt), Some(attempt));
             assert!(state.complete(&source(message.len()), Err("busy".into())));
             state.project(raw.clone());
         }
+        assert!(state.request().is_none());
+        // Once none will, they are parsed one by one rather than from the cut.
+        let exhausted = state.project(raw.clone());
+        assert!(Arc::ptr_eq(&exhausted, &raw));
         assert!(state.request().is_none());
         let mut rewritten = source(message.len());
         rewritten.revision += 1;
@@ -838,7 +849,7 @@ mod tests {
             parts("answer", &message, 1..usize::MAX),
             Some(rewritten.clone()),
         );
-        state.project(raw);
+        assert_eq!(state.project(raw).items.len(), 1);
         assert_eq!(
             state.request().map(|(source, _)| source.clone()),
             Some(rewritten)
