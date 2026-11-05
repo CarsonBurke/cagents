@@ -412,6 +412,15 @@ fn source_update_conflicts(
             })
 }
 
+#[cfg(test)]
+pub(in crate::app) fn source_update_conflicts_for_test(
+    model: &WorkspaceModel,
+    scope: &crate::workspace_model::views::Scope,
+    change: &crate::workspace_model::views::Change,
+) -> bool {
+    source_update_conflicts(model, scope, change)
+}
+
 /// What adopting one shared row asked of the window.
 enum Adoption {
     /// The window's own store changed.

@@ -39,10 +39,10 @@ impl Drop for Child {
 
 // Inherit all authority/session environment unchanged. Only owned XDG roots
 // and this fixture marker differ. Never use env_clear, set_var or a User role.
-fn isolated(initialized: bool) {
+fn isolated(initialized: bool, late_identity: bool) {
     let name = std::thread::current().name().unwrap().to_owned();
     if std::env::var(CHILD).as_deref() == Ok(name.as_str()) {
-        run(initialized);
+        run(initialized, late_identity);
         return;
     }
     let directory = tempfile::Builder::new().prefix("p1757-").tempdir().unwrap();
@@ -203,16 +203,14 @@ fn cleanup_peer(
     let (stop, stopped) = mpsc::channel();
     let worker = std::thread::spawn(move || {
         macro_rules! send {
-            ($stream:expr, $id:expr, $response:expr) => {{
+            (@message $stream:expr, $id:expr, $message:expr) => {{
                 let result = crate::terminal_ipc::write_frame(
                     $stream,
                     &ServerEnvelope {
                         version: PROTOCOL_VERSION,
-                        request_id: Some($id),
+                        request_id: $id,
                         proof: proof(),
-                        message: ServerMessage::Response {
-                            response: $response,
-                        },
+                        message: $message,
                     },
                 );
                 match result {
@@ -231,6 +229,9 @@ fn cleanup_peer(
                     Err(error) => panic!("private passive response failed: {error}"),
                 }
             }};
+            ($stream:expr, $id:expr, $response:expr) => {
+                send!(@message $stream, Some($id), ServerMessage::Response { response: $response })
+            };
         }
         for _ in 0..8_000 {
             if stopped.try_recv().is_ok() {
@@ -301,9 +302,20 @@ fn cleanup_peer(
                         observed.lock().unwrap().attaches.push(session.clone());
                         ServerResponse::ChatAttached { session, snapshot }
                     }
-                    ClientRequest::ChatVisibility { chat_id, .. } => {
-                        assert_eq!(chat_id, live.lock().unwrap().as_ref().unwrap().0.id);
-                        ServerResponse::Accepted
+                    ClientRequest::ChatVisibility { chat_id, visible } => {
+                        let (session, snapshot) = live.lock().unwrap().clone().unwrap();
+                        assert_eq!(chat_id, session.id);
+                        send!(&mut stream, request.request_id, ServerResponse::Accepted);
+                        if visible {
+                            // Match HOST: becoming visible announces a
+                            // presentation, which the actual client reads.
+                            send!(@message &mut stream, None, ServerMessage::ChatChanged { chat_id });
+                        } else if snapshot.generation > 1 {
+                            send!(@message &mut stream, None, ServerMessage::ChatObserved {
+                                chat_id, epoch: snapshot.generation,
+                            });
+                        }
+                        continue;
                     }
                     ClientRequest::ChatRead { chat_id, .. } => {
                         let (session, snapshot) = live.lock().unwrap().clone().unwrap();
@@ -348,6 +360,7 @@ fn cleanup_peer(
 fn creator_peer(
     actor: TerminalId,
     live: Arc<Mutex<Option<(chat::Session, Snapshot)>>>,
+    late_identity: bool,
 ) -> (UnixStream, WirePeer) {
     let (client, mut server) = UnixStream::pair().unwrap();
     let sockets = Arc::new(Mutex::new(vec![server.try_clone().unwrap()]));
@@ -396,11 +409,26 @@ fn creator_peer(
         assert_eq!(session.id, actor);
         assert!(session.is_unstarted());
         session.proof = Some(proof());
-        session.launch.session_id = Some("17570000-0000-4000-8000-000000000002".into());
+        session.launch.session_id =
+            (!late_identity).then(|| "17570000-0000-4000-8000-000000000002".into());
+        if late_identity {
+            session.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        }
         let initial = Snapshot {
             generation: 1,
             ready: true,
             session_id: session.launch.session_id.clone(),
+            native_continuity: session.native_continuity.clone(),
+            selected_model: session
+                .launch
+                .draft_model
+                .as_ref()
+                .map(|choice| choice.model.clone()),
+            reasoning: session
+                .launch
+                .draft_model
+                .as_ref()
+                .and_then(|choice| choice.reasoning.clone()),
             ..Snapshot::default()
         };
         send!(
@@ -455,6 +483,7 @@ fn creator_peer(
                     assert!(attachments.is_empty());
                     assert!(!prompt, "one original first prompt");
                     prompt = true;
+                    session.launch.session_id = Some("17570000-0000-4000-8000-000000000002".into());
                     // Normal HOST serial processing: acknowledge this command
                     // before any later read, then announce the new transcript.
                     send!(
@@ -471,6 +500,7 @@ fn creator_peer(
                         Snapshot {
                             generation: 2,
                             busy: true,
+                            session_id: session.launch.session_id.clone(),
                             items: vec![Arc::new(chat::Item {
                                 id: "passive-peer-first-user".into(),
                                 role: chat::Role::User,
@@ -568,10 +598,28 @@ fn outputs(task: Task<Message>, stop_at_command: bool) -> Vec<Message> {
     .unwrap()
 }
 
-fn run(initialized: bool) {
+fn next_wake(app: &Cagents) -> (Target, Wake) {
+    let receiver = app.chat_ui.receiver.clone();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                tokio::time::timeout(WAIT, receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
+    })
+    .join()
+    .unwrap()
+}
+
+fn run(initialized: bool, late_identity: bool) {
     chat::attachment_assets::with_test_image(|first| {
         let second = chat::attachment_assets::test_image("passive peer second image.png");
-        run_with_peer_draft(initialized, vec![first, second]);
+        run_with_peer_draft(initialized, late_identity, vec![first, second]);
     });
 }
 
@@ -618,7 +666,7 @@ fn reopen_peer_writer(
     peer.session = Some(writer);
 }
 
-fn run_with_peer_draft(initialized: bool, images: Vec<Attachment>) {
+fn run_with_peer_draft(initialized: bool, late_identity: bool, images: Vec<Attachment>) {
     let runtime_root = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
     let socket = crate::terminal::ipc::daemon_socket_path().unwrap();
     assert!(
@@ -651,7 +699,10 @@ fn run_with_peer_draft(initialized: bool, images: Vec<Attachment>) {
         native_continuity: Default::default(),
         owned_codex_listener: None,
         launch: chat::Launch {
-            draft_model: None,
+            draft_model: late_identity.then(|| chat::DraftModel {
+                model: "sonnet".into(),
+                reasoning: Some("high".into()),
+            }),
             provider: Provider::Claude,
             session_id: None,
             recipe: LaunchRecipe {
@@ -701,6 +752,28 @@ fn run_with_peer_draft(initialized: bool, images: Vec<Attachment>) {
     view.revision = 1;
     view.panes.push(pane_a.clone());
     creator.workspace_model.identity = uuid::Uuid::new_v4();
+    if late_identity {
+        let repository = directory.path().join(".git");
+        creator
+            .workspace_model
+            .projects
+            .push(crate::workspace_model::ModelProject {
+                repository: repository.clone(),
+                name: "Private enrichment race".into(),
+                kind: Default::default(),
+                ordinal: 1,
+            });
+        creator
+            .workspace_model
+            .channels
+            .push(crate::workspace_model::ModelChannel {
+                id: channel,
+                repository,
+                title: "private first start".into(),
+                title_source: crate::model::ChannelTitleSource::Manual,
+                ordinal: 1,
+            });
+    }
     creator.workspace_model.views = vec![view.clone()];
     let (publish, published) = async_channel::unbounded();
     creator.workspace_model_tx = publish;
@@ -772,10 +845,11 @@ fn run_with_peer_draft(initialized: bool, images: Vec<Attachment>) {
     let start_target = creator.chat_ui.attempt(card).unwrap().target;
     assert_ne!(candidate.id, source.id);
     assert!(candidate.is_unstarted());
-    let change = std::iter::from_fn(|| published.try_recv().ok())
+    let (operation, change) = std::iter::from_fn(|| published.try_recv().ok())
         .find_map(|edit| match edit {
             ModelEdit::ChangeView {
                 scope: edit_scope,
+                operation,
                 change: change @ Change::Update { .. },
                 ..
             } if edit_scope == scope
@@ -783,17 +857,19 @@ fn run_with_peer_draft(initialized: bool, images: Vec<Attachment>) {
                 if before.id == card && before.kind == CardKind::Chat(source.clone())
                     && pane.kind == CardKind::Chat(candidate.clone())) =>
             {
-                Some(change)
+                Some((operation, change))
             }
             _ => None,
         })
         .expect("checkpoint reducer must really publish unstarted B replacing A");
     assert!(view.apply(&change).unwrap());
     view.revision += 1;
+    creator.acknowledge_view_edit(scope.clone(), Some(operation));
+    creator.workspace_model.views = vec![view.clone()];
     peer.workspace_model.views = vec![view.clone()];
     // In the regression, capture the actual peer projection's task now and do
     // not poll it until B has accepted the creator's original prompt.
-    let delayed = (!initialized).then(|| peer.reconcile_shared_views());
+    let mut delayed = (!initialized).then(|| peer.reconcile_shared_views());
     assert_eq!(
         peer.card_state(card).unwrap().kind,
         if initialized {
@@ -803,7 +879,7 @@ fn run_with_peer_draft(initialized: bool, images: Vec<Attachment>) {
         }
     );
 
-    let (client, creator_wire) = creator_peer(candidate.id, live.clone());
+    let (client, creator_wire) = creator_peer(candidate.id, live.clone(), late_identity);
     let wake_sender = creator.chat_ui.sender.clone();
     let handle = Arc::new(
         ClientHandle::fixture_start_on(client, candidate.clone(), move |wake| {
@@ -818,6 +894,61 @@ fn run_with_peer_draft(initialized: bool, images: Vec<Attachment>) {
     if let CardRuntime::Chat(runtime) = creator.cards.get_mut(&card).unwrap() {
         runtime.show(true);
     }
+    let late_peer = late_identity.then(|| {
+        // The retained actor is authenticated before Claude names its native
+        // conversation. Attach the peer now, before polling the original Send.
+        drop(delayed.take());
+        let canonical = handle.session();
+        assert!(canonical.launch.session_id.is_none());
+        assert_eq!(
+            canonical.native_continuity,
+            chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+        );
+        *live.lock().unwrap() = Some((canonical.clone(), (*handle.snapshot()).clone()));
+        let edit = std::iter::from_fn(|| published.try_recv().ok())
+            .find(|edit| {
+                matches!(edit, ModelEdit::ChangeView {
+                change: Change::Update { before, pane }, ..
+            } if before.kind == CardKind::Chat(candidate.clone())
+                && pane.kind == CardKind::Chat(canonical.clone()))
+            })
+            .expect("Ready publishes the actual authenticated pre-ID actor");
+        let ModelEdit::ChangeView {
+            operation,
+            expected_revision,
+            change,
+            ..
+        } = edit
+        else {
+            unreachable!()
+        };
+        assert_eq!(expected_revision, view.revision);
+        assert!(view.apply(&change).unwrap());
+        view.revision += 1;
+        creator.acknowledge_view_edit(scope.clone(), Some(operation));
+        creator.workspace_model.views = vec![view.clone()];
+        peer.workspace_model.views = vec![view.clone()];
+        let (sender, edits) = async_channel::unbounded();
+        peer.workspace_model_tx = sender;
+        let attach = peer.reconcile_shared_views();
+        let peer_target = peer.chat_ui.attempt(card).unwrap().target;
+        for message in outputs(attach, false) {
+            assert!(matches!(&message, Message::ChatUi(Action::Ready(..))));
+            drop(peer.update(message));
+        }
+        assert_eq!(runtime(&peer, card).session, canonical);
+        assert_eq!(runtime(&peer, card).composer.text(), peer_draft);
+        assert_eq!(runtime(&peer, card).attachments, images);
+        assert!(runtime(&peer, card).queued.is_none());
+        peer.session.as_ref().unwrap().flush(WAIT).unwrap();
+        assert_eq!(peer.session.as_ref().unwrap().last_error(), None);
+        assert_eq!(stored(&peer, card), canonical);
+        assert!(
+            edits.try_recv().is_err(),
+            "passive Ready adopts the canonical source"
+        );
+        (edits, peer_target, canonical)
+    });
     let completed = outputs(send, true);
     assert_eq!(
         completed
@@ -899,6 +1030,162 @@ fn run_with_peer_draft(initialized: bool, images: Vec<Attachment>) {
         runtime(&creator, card).session.launch.session_id,
         accepted.launch.session_id
     );
+
+    if let Some((peer_edits, peer_target, pre_id)) = late_peer {
+        // Both reducer publications below come from actual reader metadata.
+        // Hold the peer's watcher so its revision still names pre-ID B while
+        // the creator's independently queued enrichment wins at the registry.
+        let source_edit = |edits: &async_channel::Receiver<ModelEdit>| {
+            let mut sources = std::iter::from_fn(|| edits.try_recv().ok()).filter(|edit| {
+                matches!(edit, ModelEdit::ChangeView {
+                    change: Change::Update { before, pane }, ..
+                } if pane.id == card && before.kind != pane.kind)
+            });
+            let edit = sources
+                .next()
+                .expect("reader enrichment publishes a source edit");
+            assert!(
+                sources.next().is_none(),
+                "one provider-ID enrichment per reader"
+            );
+            edit
+        };
+        let creator_edit = source_edit(&published);
+        let ModelEdit::ChangeView {
+            expected_revision: creator_revision,
+            change: creator_change @ Change::Update { .. },
+            ..
+        } = &creator_edit
+        else {
+            unreachable!()
+        };
+        let Change::Update { before, pane } = creator_change else {
+            unreachable!()
+        };
+        assert_eq!(before.kind, CardKind::Chat(pre_id.clone()));
+        assert_eq!(pane.kind, CardKind::Chat(accepted.clone()));
+        let mut only_provider_id = pre_id.clone();
+        only_provider_id.launch.session_id = accepted.launch.session_id.clone();
+        assert_eq!(
+            only_provider_id, accepted,
+            "no actor, recipe or capability changed"
+        );
+        assert_eq!(*creator_revision, view.revision);
+
+        if let Some(CardRuntime::Chat(runtime)) = peer.cards.get_mut(&card) {
+            runtime.show(true);
+        }
+        let mut wake_order = Vec::new();
+        for _ in 0..64 {
+            if runtime(&peer, card).session.launch.session_id == accepted.launch.session_id {
+                break;
+            }
+            let (target, wake) = next_wake(&peer);
+            assert_eq!(target, peer_target);
+            wake_order.push(format!("{wake:?}"));
+            drop(peer.handle_chat_ui(Action::Wake(target, wake)));
+        }
+        assert_eq!(runtime(&peer, card).session, accepted);
+        // Hidden observation uses the same real connection after the visible
+        // read. Exercise its actual Observed callback too; no synthetic wake.
+        if let Some(CardRuntime::Chat(runtime)) = peer.cards.get_mut(&card) {
+            runtime.show(false);
+        }
+        let mut observed_wake = false;
+        for _ in 0..64 {
+            let (target, wake) = next_wake(&peer);
+            assert_eq!(target, peer_target);
+            let observed = matches!(wake, Wake::Observed);
+            wake_order.push(format!("{wake:?}"));
+            drop(peer.handle_chat_ui(Action::Wake(target, wake)));
+            if observed {
+                observed_wake = true;
+                break;
+            }
+        }
+        assert!(observed_wake);
+        let peer_edit = source_edit(&peer_edits);
+        let ModelEdit::ChangeView {
+            scope: peer_scope,
+            operation,
+            expected_revision: peer_revision,
+            change: peer_change @ Change::Update { .. },
+        } = &peer_edit
+        else {
+            unreachable!()
+        };
+        let Change::Update { before, pane } = peer_change else {
+            unreachable!()
+        };
+        assert_eq!(peer_scope, &scope);
+        assert_eq!(*peer_revision, *creator_revision);
+        assert_eq!(before.kind, CardKind::Chat(pre_id.clone()));
+        assert_eq!(pane.kind, CardKind::Chat(accepted.clone()));
+        assert_eq!(before.pending_terminal_start, pane.pending_terminal_start);
+        assert_eq!(before.scope, pane.scope);
+        let source_conflicts = crate::app::workspace_model_sync::source_update_conflicts_for_test;
+        assert!(!source_conflicts(
+            &peer.workspace_model,
+            &scope,
+            peer_change
+        ));
+
+        // Accept the first window's actual source update at its original
+        // revision. The second request then hits the same revision refusal
+        // and exact source predicate used by the production publisher.
+        assert!(view.apply(creator_change).unwrap());
+        view.revision += 1;
+        let mut canonical_model = peer.workspace_model.clone();
+        canonical_model.sequence += 1;
+        canonical_model.views = vec![view.clone()];
+        assert_ne!(*peer_revision, view.revision);
+        assert!(source_conflicts(&canonical_model, &scope, peer_change));
+        assert_eq!(view.panes[0].kind, pane.kind);
+        assert_eq!(
+            view.panes[0].pending_terminal_start,
+            pane.pending_terminal_start
+        );
+        assert_eq!(view.panes[0].scope, pane.scope);
+        eprintln!(
+            "LATE_PROVIDER_ID_RACE initialized={initialized} wakes={wake_order:?} creator={creator_edit:?} peer={peer_edit:?} canonical={:?}",
+            view.panes[0],
+        );
+        drop(peer.apply_workspace_model_update(
+            crate::app::workspace_model_sync::ModelUpdate::ViewConflicted {
+                scope: scope.clone(),
+                operation: *operation,
+                change: peer_change.clone(),
+                model: canonical_model,
+                error: "daemon rejected the request (ViewConflict): The workspace view changed; rebase this pane mutation on the current revision".into(),
+            },
+        ));
+        assert_eq!(runtime(&peer, card).session, accepted);
+        assert_eq!(runtime(&peer, card).composer.text(), peer_draft);
+        assert_eq!(runtime(&peer, card).attachments, images);
+        assert!(runtime(&peer, card).queued.is_none() && runtime(&peer, card).pending.is_none());
+        assert!(peer.chat_ui.retiring.is_empty() && peer.chat_ui.abandoned.is_empty());
+        let false_refusal = peer
+            .notices
+            .recent()
+            .any(|entry| entry.notice.message.contains("session update was refused"));
+        peer.persist();
+        reopen_peer_writer(
+            &mut peer,
+            &peer_database,
+            card,
+            &accepted,
+            &peer_draft,
+            &images,
+        );
+        cleanup.finish();
+        creator_wire.finish();
+        assert!(observed.lock().unwrap().closes.is_empty());
+        assert!(
+            !false_refusal,
+            "the actual duplicate provider-ID publication is already canonical; it must settle without a source-refusal notice",
+        );
+        return;
+    }
 
     if let Some(delayed) = delayed {
         for message in outputs(delayed, false) {
@@ -1226,7 +1513,7 @@ fn initialized_peer_without_storage_keeps_its_draft_without_attaching() {
 
 #[test]
 fn passive_unstarted_peer_restore_cannot_close_creator_accepted_first_prompt() {
-    isolated(false);
+    isolated(false, false);
 }
 
 #[test]
@@ -1296,5 +1583,15 @@ fn initialized_peer_without_complete_canonical_proof_keeps_its_saved_draft() {
 
 #[test]
 fn passive_initialized_peer_restore_schedules_attachment_without_retirement() {
-    isolated(true);
+    isolated(true, false);
+}
+
+#[test]
+fn passive_sequential_provider_id_enrichment_settles_after_another_window_wins() {
+    isolated(false, true);
+}
+
+#[test]
+fn passive_direct_provider_id_enrichment_settles_after_another_window_wins() {
+    isolated(true, true);
 }

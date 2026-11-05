@@ -3082,15 +3082,21 @@ mod tests {
     }
 
     #[test]
-    fn a_source_conflict_refuses_session_intent_and_reissues_only_safe_presentation() {
+    fn a_source_conflict_reconciles_exact_canonical_intent_and_retries_only_safe_presentation() {
         use super::super::workspace_model_sync::ModelUpdate;
-        for control in [
-            "current",
-            "missing",
-            "foreign-project",
-            "foreign-watch-first",
-            "uncaptured",
-            "later-title",
+        for (control, already_current) in [
+            ("current", false),
+            ("missing", false),
+            ("foreign-project", false),
+            ("foreign-watch-first", false),
+            ("uncaptured", false),
+            ("later-title", false),
+            ("current", true),
+            ("missing", true),
+            ("foreign-project", true),
+            ("foreign-watch-first", true),
+            ("uncaptured", true),
+            ("later-title", true),
         ] {
             let (mut app, source, _, before) = channel_move_fixture();
             let (tx, rx) = async_channel::unbounded();
@@ -3139,6 +3145,11 @@ mod tests {
             };
             browser.current_url = "https://authoritative.example".parse().unwrap();
             current.scope = Some("/authoritative-source".into());
+            if already_current {
+                current.kind = desired.kind.clone();
+                current.pending_terminal_start = desired.pending_terminal_start;
+                current.scope = desired.scope.clone();
+            }
             let expected = current.clone();
             if control == "missing" {
                 model.views[0].panes.clear();
@@ -3172,10 +3183,12 @@ mod tests {
                     .iter()
                     .any(|(id, _, _)| *id == operation)
             );
-            assert!(
+            assert_eq!(
                 app.notices
                     .recent()
-                    .any(|entry| entry.notice.message.contains("session update was refused"))
+                    .any(|entry| entry.notice.message.contains("session update was refused")),
+                !already_current || !matches!(control, "current" | "later-title"),
+                "{control}, already_current={already_current}",
             );
             if matches!(
                 control,
