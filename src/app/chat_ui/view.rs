@@ -716,8 +716,15 @@ fn completion_kind(kind: completion::Kind) -> &'static str {
     }
 }
 
-/// A one-line row of a composer list: an optional icon, a name, what it
-/// does in muted text cut to the room left, and what kind of thing it is.
+/// How a turn that finished with `snapshot` ended, as its provider said.
+pub(super) fn turn_outcome(snapshot: &chat::Snapshot) -> &'static str {
+    match snapshot.detail.as_str() {
+        "Turn interrupted" => "Interrupted",
+        "Turn failed" => "Failed",
+        _ => "Finished",
+    }
+}
+
 /// The row that closes a working transcript: a small muted spinner, or the
 /// waiting glyph, beside what the agent is doing.
 fn activity_row<'a>(glyph: Icon, label: String) -> Element<'a, Message> {
@@ -740,6 +747,8 @@ fn activity_row<'a>(glyph: Icon, label: String) -> Element<'a, Message> {
     .into()
 }
 
+/// A one-line row of a composer list: an optional icon, a name, what it
+/// does in muted text cut to the room left, and what kind of thing it is.
 fn menu_row<'a>(
     icon: Option<Icon>,
     label: impl Into<Cow<'a, str>> + 'a,
@@ -1307,7 +1316,7 @@ impl Runtime {
             || self.queued.is_some()
             || transitioning
             || self.attachment_chooser_pending.is_some()
-            || self.pending.is_some()
+            || self.sending()
             || self.disconnected
             || snapshot.exited
         {
@@ -1451,27 +1460,41 @@ impl Runtime {
         }
     }
 
+    /// Whether a message is on its way to the provider. Other commands -
+    /// choosing a model or permissions, paging history, answering, stopping -
+    /// leave what the conversation is doing as it was until it says otherwise.
+    pub(super) fn sending(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.sent.is_some() || !pending.sent_attachments.is_empty())
+    }
+
     /// How the last turn ended, for the stamp that closes a settled
-    /// transcript.
+    /// transcript. The turn's own outcome is kept from when it finished, so a
+    /// later notice does not rewrite it; an error standing now is still said,
+    /// since a reader may have nowhere else to learn of it.
     pub(super) fn finished_label(&self) -> &'static str {
-        match self.snapshot.detail.as_str() {
-            "Turn interrupted" => "Interrupted",
-            "Turn failed" => "Failed",
-            // The closing of a card moved elsewhere is not the agent's error;
-            // the closed card says what happened.
-            _ if self
+        let ended = self
+            .finished_stamp
+            .as_ref()
+            .filter(|stamp| Some(stamp.at) == self.snapshot.finished_at)
+            .map_or_else(|| turn_outcome(&self.snapshot), |stamp| stamp.outcome);
+        // The closing of a card moved elsewhere is not the agent's error;
+        // the closed card says what happened.
+        if ended == "Finished"
+            && self
                 .error
                 .iter()
                 .chain(&self.snapshot.error)
-                .any(|error| !self.expected_remote_close_error(error)) =>
-            {
-                "Finished with error"
-            }
-            _ => "Finished",
+                .any(|error| !self.expected_remote_close_error(error))
+        {
+            "Finished with error"
+        } else {
+            ended
         }
     }
 
-    fn conversation_status_base(&self, transitioning: bool) -> (Option<Icon>, &str) {
+    pub(super) fn conversation_status_base(&self, transitioning: bool) -> (Option<Icon>, &str) {
         let snapshot = &self.snapshot;
         if self.closed_elsewhere {
             (
@@ -1488,7 +1511,7 @@ impl Runtime {
             (Some(Icon::AgentWorking), "Switching session")
         } else if self.attachment_chooser_pending.is_some() {
             (Some(Icon::AgentWorking), "Choosing attachments")
-        } else if self.pending.is_some() {
+        } else if self.sending() {
             (Some(Icon::AgentWorking), "Sending")
         } else if self.disconnected {
             (Some(Icon::Warning), "Disconnected")
@@ -2178,14 +2201,14 @@ impl Runtime {
                 && snapshot.queued_messages.is_empty()
                 && self.queued.is_none()
                 && self.followups.is_empty()
-                && self.pending.is_none()
-                && let Some((_, clock, full)) = &self.finished_stamp
+                && !self.sending()
+                && let Some(stamp) = &self.finished_stamp
             {
                 transcript.push(
                     widget::tooltip(
-                        design::caption(format!("{} at {clock}", self.finished_label()))
+                        design::caption(format!("{} at {}", self.finished_label(), stamp.clock))
                             .class(cosmic::theme::Text::Custom(design::muted_text)),
-                        design::caption(full.clone()),
+                        design::caption(stamp.full.clone()),
                         widget::tooltip::Position::Top,
                     )
                     .into(),
@@ -3088,6 +3111,10 @@ impl Runtime {
         // Narrow panes move them into the overflow control. What the agent is
         // doing is not repeated here: it closes the transcript, where it
         // scrolls with the turns it belongs to.
+        //
+        // The leading group says where the conversation is and who acts in it
+        // under which permissions; the trailing group what it runs on and
+        // what that has cost.
         let mut status: Vec<Element<'_, Message>> = Vec::new();
         if let Some(channel) = &place.channel {
             status.push(
@@ -3120,9 +3147,43 @@ impl Runtime {
                 .into(),
             );
         }
+        let mut engine = Vec::new();
         if !self.closed_elsewhere {
-            status.extend(self.session_controls(transitioning, accounts, offers, shortcuts));
+            let (context, controls) =
+                self.session_controls(transitioning, accounts, offers, shortcuts);
+            status.extend(context);
+            engine = controls;
         }
+        let compact_footer = content_width < 600.0;
+        let notice = permissions::notice(snapshot).map(|notice| {
+            widget::button::custom(
+                widget::row::with_children(
+                    std::iter::once(crate::ui_controls::passive_icon(
+                        Icon::Warning,
+                        design::COMPACT_ICON_SIZE,
+                    ))
+                    .chain((!compact_footer).then(|| {
+                        design::caption(notice)
+                            .class(cosmic::theme::Text::Custom(design::warning_text))
+                            .wrapping(iced::widget::text::Wrapping::None)
+                            .into()
+                    })),
+                )
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center),
+            )
+            .name("Resolve blocked permissions")
+            .class(crate::ui_controls::control_style(
+                self.permission_picker,
+                None,
+            ))
+            .padding(CONTROL_PADDING)
+            .on_press(action(Action::PermissionPicker(
+                target,
+                !self.permission_picker,
+            )))
+            .into()
+        });
         // Keep budget and cost together when the footer wraps.
         let mut spend: Vec<Element<'_, Message>> = Vec::new();
         if usage.context_limit > 0 {
@@ -3171,56 +3232,21 @@ impl Runtime {
             let (label, tooltip) = cost_estimate_label(estimate);
             spend.push(crate::interaction::tooltip(design::caption(label), tooltip));
         }
-        let compact_footer = content_width < 600.0;
-        let mut secondary = if compact_footer {
-            std::mem::take(&mut status)
-        } else {
-            Vec::new()
-        };
-        let mut footer = status;
-        if let Some(notice) = permissions::notice(snapshot) {
-            footer.push(
-                widget::button::custom(
-                    widget::row::with_children(
-                        std::iter::once(crate::ui_controls::passive_icon(
-                            Icon::Warning,
-                            design::COMPACT_ICON_SIZE,
-                        ))
-                        .chain((!compact_footer).then(|| {
-                            design::caption(notice)
-                                .class(cosmic::theme::Text::Custom(design::warning_text))
-                                .wrapping(iced::widget::text::Wrapping::None)
-                                .into()
-                        })),
-                    )
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center),
-                )
-                .name("Resolve blocked permissions")
-                .class(crate::ui_controls::control_style(
-                    self.permission_picker,
-                    None,
-                ))
-                .padding(CONTROL_PADDING)
-                .on_press(action(Action::PermissionPicker(
-                    target,
-                    !self.permission_picker,
-                )))
-                .into(),
-            );
-        }
         let spend = widget::row::with_children(spend)
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
             .into();
-        if compact_footer {
+        let footer_row: Element<'_, Message> = if compact_footer {
             // Model/reasoning/account popovers are anchored inside this
             // overflow. Keyboard shortcuts can open them while More is closed.
             let details_open = self.footer_picker
                 || self.model_picker.is_some()
                 || self.reasoning_picker
                 || self.account_picker;
+            let mut secondary = status;
+            secondary.extend(engine);
             secondary.push(spend);
+            let mut footer: Vec<Element<'_, Message>> = notice.into_iter().collect();
             footer.push(widget::Space::new().width(Length::Fill).into());
             footer.push(crate::ui_controls::popover(
                 crate::ui_controls::icon_button(Icon::More, "Conversation details and settings")
@@ -3239,20 +3265,32 @@ impl Runtime {
                 widget::popover::Position::Top,
                 action(Action::FooterPicker(target, false)),
             ));
-        } else {
-            footer.push(spend);
-        }
-        let footer_row: Element<'_, Message> = if compact_footer {
             widget::row::with_children(footer)
                 .spacing(step::GAP_S)
                 .align_y(Alignment::Center)
                 .width(Length::Fill)
                 .into()
         } else {
-            widget::flex_row(footer)
-                .spacing(step::GAP_S as u16)
-                .align_items(Alignment::Center)
-                .into()
+            let mut leading = status;
+            leading.extend(notice);
+            engine.push(spend);
+            // The leading group wraps when the place is long; the trailing
+            // one stays on a line of its own edge.
+            widget::row::with_children(vec![
+                widget::flex_row(leading)
+                    .spacing(step::GAP_S as u16)
+                    .align_items(Alignment::Center)
+                    .width(Length::Fill)
+                    .into(),
+                widget::row::with_children(engine)
+                    .spacing(step::GAP_S)
+                    .align_y(Alignment::Center)
+                    .into(),
+            ])
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .into()
         };
         let footer = crate::ui_controls::popover(
             footer_row,
@@ -3626,8 +3664,12 @@ impl Runtime {
             .into()
     }
 
-    /// The model, reasoning effort, and permission mode, at the status line's
-    /// own scale.
+    /// The account, model, reasoning effort, and permission mode, at the
+    /// status line's own scale.
+    ///
+    /// They come back in two groups: who acts and under which permissions,
+    /// which belong with the conversation's place, and what the agent runs
+    /// on, which sits with its usage at the footer's trailing edge.
     ///
     /// These were three full-size dropdowns stacked above the composer, which
     /// gave settings a reader changes occasionally more room than the message
@@ -3640,12 +3682,13 @@ impl Runtime {
         accounts: Option<ChatAccounts>,
         offers: Vec<Offer<'a>>,
         shortcuts: &crate::settings::KeyboardShortcuts,
-    ) -> Vec<Element<'a, Message>> {
+    ) -> (Vec<Element<'a, Message>>, Vec<Element<'a, Message>>) {
         let target = self.target;
         let snapshot = &self.snapshot;
+        let mut context: Vec<Element<'a, Message>> = Vec::new();
         let mut controls: Vec<Element<'a, Message>> = Vec::new();
         if let Some(accounts) = accounts {
-            controls.push(self.account_picker(accounts, transitioning, shortcuts));
+            context.push(self.account_picker(accounts, transitioning, shortcuts));
         }
         let draft = self.is_draft();
         if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft {
@@ -3745,7 +3788,7 @@ impl Runtime {
                 .iter()
                 .position(|mode| Some(mode) == snapshot.permission_mode.as_ref());
             if transitioning || (self.session.launch.provider == Provider::Codex && snapshot.busy) {
-                controls.push(
+                context.push(
                     design::caption(
                         selected
                             .map_or("Permissions", |index| permission_mode_label(&modes[index])),
@@ -3772,7 +3815,7 @@ impl Runtime {
                     .class(crate::ui_controls::control_style(open, None))
                     .padding(CONTROL_PADDING)
                     .on_press(action(Action::PermissionPicker(target, !open)));
-                controls.push(crate::interaction::tooltip(
+                context.push(crate::interaction::tooltip(
                     anchor,
                     crate::workspace_widget::shortcut_tooltip(
                         crate::workspace_widget::GlobalShortcut::ChatPermissions,
@@ -3781,7 +3824,7 @@ impl Runtime {
                 ));
             }
         }
-        controls
+        (context, controls)
     }
 
     /// A draft can explicitly pin its account. Started conversations display
@@ -7192,6 +7235,42 @@ mod tests {
         assert_eq!(runtime.finished_label(), "Finished");
         Arc::make_mut(&mut runtime.snapshot).error = Some("Provider failed".into());
         assert_eq!(runtime.finished_label(), "Finished with error");
+        // Once stamped, how the turn ended stays put through later notices
+        // and errors that are not about it.
+        runtime.finished_stamp = Some(FinishedStamp {
+            at: 42,
+            clock: "12:00".into(),
+            full: "2026-11-05 12:00".into(),
+            outcome: "Interrupted",
+        });
+        Arc::make_mut(&mut runtime.snapshot).detail = "Reconnected".into();
+        runtime.error = Some("Could not change the model".into());
+        assert_eq!(runtime.finished_label(), "Interrupted");
+        // Choosing a model is not a message on its way: it neither reads as
+        // sending nor takes the stamp away. A message does.
+        runtime.error = None;
+        let pending = |sent: Option<&str>| PendingCommand {
+            followup: false,
+            take_back: None,
+            id: 1,
+            draft_revision: None,
+            request: None,
+            first_prompt: None,
+            model: sent.is_none().then(|| ("haiku".to_owned(), None)),
+            sent: sent.map(str::to_owned),
+            sent_attachments: Vec::new(),
+            page: None,
+            queued: None,
+        };
+        runtime.pending = Some(pending(None));
+        assert!(!runtime.sending());
+        assert_eq!(activity(&runtime), None);
+        runtime.pending = Some(pending(Some("next")));
+        assert!(runtime.sending());
+        assert_eq!(
+            activity(&runtime),
+            Some((Icon::AgentWorking, "Sending".into()))
+        );
     }
 
     #[test]
@@ -9960,7 +10039,9 @@ mod tests {
                                 label.contains("Inspect repository")
                                     && label.ends_with(" · native-child")
                             }
-                            _ => label == "Main conversation",
+                            // The open subagent's transcript does not show the
+                            // main conversation's request, so its tab does.
+                            _ => label == "Main conversation: Waiting for you",
                         })
                 })
                 .and_then(|node| node.node().bounds())
