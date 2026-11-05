@@ -1481,6 +1481,11 @@ fn chip_with_window(
             if let Some(as_of) = &as_of {
                 tooltip.push_str(&format!(" ({as_of})"));
             }
+            // The row greys these figures once a check fails; the status bar
+            // says the same rather than presenting them as current.
+            if let Some(failure) = &account.failure {
+                tooltip.push_str(&format!("\nLast check failed: {failure}"));
+            }
             // A model's own allowance binding is worth knowing, but it is not
             // what the account as a whole has left.
             if let Some(scoped) = snapshot
@@ -1493,7 +1498,7 @@ fn chip_with_window(
                     percent_left(scoped.used)
                 ));
             }
-            let tone = if stale {
+            let tone = if stale || account.failure.is_some() {
                 ChipTone::Stale
             } else {
                 ChipTone::of_usage(snapshot.status, window.used)
@@ -6259,6 +6264,25 @@ mod tests {
         let mut failed = state_with(None);
         failed.failure = Some("Claude Code did not answer".into());
         assert_eq!(chip(&failed, "Claude", NOW).text, "Unavailable");
+    }
+
+    #[test]
+    fn a_failed_check_keeps_figures_but_marks_the_status_bar_stale() {
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", NOW);
+        snapshot.windows = vec![window(0.42, None)];
+        let mut state = state_with(Some(snapshot));
+        let current = chip(&state, "Codex", NOW);
+        assert_ne!(current.tone, ChipTone::Stale);
+        assert!(!current.tooltip.contains("Last check failed"));
+        state.failure = Some("Codex could not read usage just now".into());
+        let failed = chip(&state, "Codex", NOW);
+        assert_eq!(failed.text, current.text);
+        assert_eq!(failed.tone, ChipTone::Stale);
+        assert!(
+            failed
+                .tooltip
+                .ends_with("\nLast check failed: Codex could not read usage just now")
+        );
     }
 
     #[test]

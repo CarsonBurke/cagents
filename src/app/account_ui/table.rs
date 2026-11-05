@@ -796,7 +796,7 @@ fn row<'a>(
     // row, including when the Status column has been dropped for space.
     let mut lines = vec![content];
     // The group explains a missing CLI once, with the way to install it.
-    if let Some(reason) = failure_caption(account)
+    if let Some(reason) = failure_caption(account, now)
         .filter(|_| state.installed.get(&account.account.provider) != Some(&false))
     {
         lines.push(
@@ -1027,7 +1027,7 @@ fn status(account: &AccountState) -> (&'static str, fn(&cosmic::Theme) -> iced::
 
 /// A failed read does not invalidate the last figures, but they no longer
 /// describe the outcome of the most recent check.
-fn failure_caption(account: &AccountState) -> Option<String> {
+fn failure_caption(account: &AccountState, now: Millis) -> Option<String> {
     let failure = account.failure.as_ref()?;
     // Remote transport diagnostics can be longer than the probe's own fixed
     // summaries. Bound the always-visible text without copying the full
@@ -1056,9 +1056,15 @@ fn failure_caption(account: &AccountState) -> Option<String> {
     } else {
         ""
     };
-    Some(format!(
-        "Last check failed: {detail}{figures} Refresh to try again."
-    ))
+    // Name the row's own control, in the state it is in right now.
+    let next = if account.schedule.in_flight(now) || account.queued.is_some() {
+        "Checking again…"
+    } else if account.schedule.manual_ready(now) {
+        "Use Check now to try again."
+    } else {
+        "You can check again shortly."
+    };
+    Some(format!("Last check failed: {detail}{figures} {next}"))
 }
 
 fn status_badge<'a>(account: &AccountState) -> Element<'a, Message> {
@@ -1487,6 +1493,27 @@ mod tests {
     }
 
     #[test]
+    fn failure_caption_names_what_check_now_can_do_right_now() {
+        let now = 10 * schedule::MANUAL_DEBOUNCE;
+        let mut account = AccountState::new(Account::system(Provider::Codex));
+        account.failure = Some("Codex could not read usage just now".into());
+        let caption = |account: &AccountState, at| failure_caption(account, at).unwrap();
+        assert_eq!(
+            caption(&account, now),
+            "Last check failed: Codex could not read usage just now. Use Check now to try again."
+        );
+        account.schedule.start(Trigger::Manual, now);
+        assert!(caption(&account, now).ends_with(" Checking again…"));
+        account.schedule.fail(now + 1);
+        // The control stays disabled through the manual debounce.
+        assert!(caption(&account, now + 1).ends_with(" You can check again shortly."));
+        assert!(
+            caption(&account, now + schedule::MANUAL_DEBOUNCE)
+                .ends_with(" Use Check now to try again.")
+        );
+    }
+
+    #[test]
     fn failed_system_rows_keep_error_and_refresh_when_status_columns_drop() {
         use iced::advanced::{clipboard, mouse};
         use iced::runtime::{UserInterface, user_interface::Cache};
@@ -1568,7 +1595,7 @@ mod tests {
                 // the account's original login context.
                 assert!(
                     labels.contains(
-                        &"Last check failed: The provider returned no usable quota. Refresh to try again."
+                        &"Last check failed: The provider returned no usable quota. Use Check now to try again."
                     ),
                     "{provider:?} {width}: {labels:?}"
                 );
@@ -1731,7 +1758,7 @@ mod tests {
             app.account_ui.account(&id).unwrap().snapshot.as_ref(),
             Some(&snapshot)
         );
-        let caption = "Last check failed: Codex did not answer within 30 seconds. Showing last known usage. Refresh to try again.";
+        let caption = "Last check failed: Codex did not answer within 30 seconds. Showing last known usage. Use Check now to try again.";
         let mut wide_caption_height = None;
         for (index, width) in widths.into_iter().enumerate() {
             let (texts, size, controls) = measure(&app, &id, width);
@@ -1808,7 +1835,7 @@ mod tests {
         assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
         // status_badge's existing tooltip still formats this whole state.failure.
         let expected = format!(
-            "Last check failed: {}… Showing last known usage. Refresh to try again.",
+            "Last check failed: {}… Showing last known usage. Use Check now to try again.",
             "界🙂é ".repeat(60),
         );
         let (texts, size, controls) = measure(&app, &id, 360.0);
@@ -1831,13 +1858,13 @@ mod tests {
         );
         let (texts, _, _) = measure(&app, &id, 520.0);
         assert!(texts.iter().any(|(text, _)| text ==
-            "Last check failed: Codex could not read usage just now. Showing last known usage. Refresh to try again."));
+            "Last check failed: Codex could not read usage just now. Showing last known usage. Use Check now to try again."));
         // A first failed check explains the failure without claiming cached figures.
         let unchecked = app.account_ui.add_managed_fixture(Provider::Codex, 1168);
         probe(&mut app, &unchecked, Outcome::Failed(failure.into()));
         let (texts, _, _) = measure(&app, &unchecked, 360.0);
         assert!(texts.iter().any(|(text, _)| text
-            == "Last check failed: Codex did not answer within 30 seconds. Refresh to try again."));
+            == "Last check failed: Codex did not answer within 30 seconds. Use Check now to try again."));
         assert!(
             !texts
                 .iter()
