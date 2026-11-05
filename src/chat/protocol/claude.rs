@@ -5968,6 +5968,7 @@ mod tests {
         drop(file);
         std::fs::remove_dir(&cwd).unwrap();
         let launch = Launch {
+            draft_model: None,
             provider: Provider::Claude,
             session_id: Some(id.into()),
             recipe: crate::model::LaunchRecipe {
