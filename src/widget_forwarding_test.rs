@@ -65,6 +65,36 @@ impl<Message> Widget<Message, Theme, Renderer> for Leaf {
         _viewport: &Rectangle,
     ) {
     }
+    fn update(
+        &mut self,
+        _tree: &mut Tree,
+        _event: &cosmic::iced::Event,
+        layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        _renderer: &Renderer,
+        _clipboard: &mut dyn cosmic::iced::advanced::Clipboard,
+        _shell: &mut cosmic::iced::advanced::Shell<'_, Message>,
+        _viewport: &Rectangle,
+    ) {
+        self.visits
+            .0
+            .borrow_mut()
+            .push(("update", layout.virtual_offset()));
+    }
+    fn mouse_interaction(
+        &self,
+        _tree: &Tree,
+        layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+        _renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.visits
+            .0
+            .borrow_mut()
+            .push(("mouse_interaction", layout.virtual_offset()));
+        mouse::Interaction::None
+    }
     fn operate(
         &mut self,
         _tree: &mut Tree,
