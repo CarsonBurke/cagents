@@ -165,6 +165,95 @@ fn tool_preview(input: &str) -> String {
     }
 }
 
+/// How far back from the end of a failed command's output its diagnostic is
+/// looked for. A compiler prints its first error well before the summary that
+/// ends the run, but a log that kept going for megabytes after the failure is
+/// not searched in full on the way to drawing one row.
+const DIAGNOSTIC_WINDOW: usize = 16 * 1024;
+
+/// The line of a step's output its closed row shows under what it is.
+///
+/// While a command runs, or once it has worked, that is the last line it
+/// printed: the build's progress, or the summary it ended on. When it failed,
+/// the last line is usually a summary that says only that it failed
+/// ("error: could not compile `app`") or whatever noise followed the failure,
+/// so the row shows the first line in the end of the output that reads as a
+/// diagnostic, `error[E0308]: mismatched types` rather than the summary.
+fn tail_line<'a>(content: &ItemContent, output: &'a str) -> &'a str {
+    let last = || {
+        output
+            .rsplit('\n')
+            .map(str::trim_end)
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+    };
+    let failed = match content {
+        ItemContent::Command {
+            status, exit_code, ..
+        } => {
+            matches!(status, chat::ToolStatus::Failed | chat::ToolStatus::Stopped)
+                || exit_code.is_some_and(|code| code != 0)
+        }
+        ItemContent::Tool { .. } => true,
+        _ => false,
+    };
+    if !failed {
+        return last();
+    }
+    let mut start = output.len().saturating_sub(DIAGNOSTIC_WINDOW);
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    // A window that begins mid-line would offer a fragment of a line.
+    let window = match start {
+        0 => output,
+        start => match output[start..].find('\n') {
+            Some(newline) => &output[start + newline + 1..],
+            None => "",
+        },
+    };
+    window
+        .lines()
+        .map(str::trim_end)
+        .find(|line| is_diagnostic(line))
+        .unwrap_or_else(last)
+}
+
+/// Whether a line of output reads as the reason a command failed.
+///
+/// The test is lexical, as a reader scanning a log would apply it: the line
+/// opens with a severity word (`error[E0308]:`, `FAILED tests/x.py`,
+/// `fatal: not a git repository`), or names one as a field (`app.rs:3: error:
+/// expected`, `thread 'main' panicked at`, `AssertionError: 1 != 2`). Words
+/// that only contain a severity, such as `errors.rs` or `no failures`, do not
+/// count.
+fn is_diagnostic(line: &str) -> bool {
+    const OPENING: [&str; 7] = [
+        "error",
+        "fatal",
+        "panic",
+        "failed",
+        "failure",
+        "exception",
+        "traceback",
+    ];
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let opens = OPENING.iter().any(|word| {
+        lower.strip_prefix(word).is_some_and(|rest| {
+            rest.chars()
+                .next()
+                .is_none_or(|next| !next.is_ascii_alphanumeric())
+        })
+    });
+    opens
+        || lower.contains("error:")
+        || lower.contains("error[")
+        || lower.contains(" panicked at ")
+        || trimmed.contains("Error: ")
+        || trimmed.contains("Exception: ")
+}
+
 impl Preview {
     pub(super) fn empty(theme: crate::settings::EditorSyntaxTheme) -> Self {
         Self {
@@ -188,24 +277,21 @@ impl Preview {
         let (source, language, output) = match content {
             // Only a shell command is shell: a read's or a search's command
             // is the path or the pattern it was given.
+            // A shell row names the command, as `turn::step_label` does; a
+            // provider's description is only drawn as prose when the command
+            // itself is missing.
             ItemContent::Command {
                 command,
-                label,
-                action: chat::CommandAction::Run,
-                output,
-                ..
-            } if label.is_empty() || label == command => (
-                Cow::Borrowed(turn::first_line(command)),
-                Language::Shell,
-                output.as_str(),
-            ),
-            ItemContent::Command {
                 action: chat::CommandAction::Run,
                 output,
                 ..
             } => (
                 Cow::Borrowed(turn::step_label(content)),
-                Language::Plain,
+                if command.trim().is_empty() {
+                    Language::Plain
+                } else {
+                    Language::Shell
+                },
                 output.as_str(),
             ),
             // The last line of a file that was read, or of a search's
@@ -252,13 +338,7 @@ impl Preview {
             text
         };
         let text = bounded(&source);
-        let tail = bounded(
-            output
-                .rsplit('\n')
-                .map(str::trim_end)
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or_default(),
-        );
+        let tail = bounded(tail_line(content, output));
         if let Some(previous) = previous
             && previous.text == text
             && previous.language == language
@@ -1190,11 +1270,19 @@ mod tests {
                 Language::Shell,
                 "   Compiling b",
             ),
+            // A provider's description does not take the command's place.
             (
                 command("Run the tests", "cargo test", Run, "ok\n"),
+                "cargo test",
+                Language::Shell,
+                "ok",
+            ),
+            // Without a command, the description is all there is to say.
+            (
+                command("Run the tests", "", Run, ""),
                 "Run the tests",
                 Language::Plain,
-                "ok",
+                "",
             ),
             // A read's command is a path, its output is the file, and a
             // stored label loses its verb.
@@ -1248,6 +1336,86 @@ mod tests {
         );
         assert_eq!(after.tail, "two");
         assert!(Arc::ptr_eq(&spans, after.block.spans(true)));
+    }
+
+    /// A failed command's row shows why it failed, not the summary or noise
+    /// it ended on; a running or finished one follows its last line.
+    #[test]
+    fn a_failed_command_previews_its_diagnostic() {
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        let cargo = "   Compiling app v0.1.0\n\
+            error[E0308]: mismatched types\n --> src/main.rs:2:18\n\
+            \x20 |\n2 |     let x: u8 = \"a\";\n\n\
+            error: could not compile `app` (bin \"app\") due to 1 previous error\n";
+        let ran = |status, exit_code, output: &str| ItemContent::Command {
+            label: "Build the app".into(),
+            command: "cargo build".into(),
+            working_directory: String::new(),
+            action: chat::CommandAction::Run,
+            status,
+            exit_code,
+            duration_ms: None,
+            output: output.into(),
+        };
+        let tail = |content: &ItemContent| Preview::update(None, content, theme).tail;
+        use chat::ToolStatus::{Failed, Running, Succeeded};
+        assert_eq!(
+            tail(&ran(Failed, Some(101), cargo)),
+            "error[E0308]: mismatched types"
+        );
+        // Claude reports a failure without an exit code.
+        assert_eq!(
+            tail(&ran(Failed, None, cargo)),
+            "error[E0308]: mismatched types"
+        );
+        // A nonzero exit is a failure even where the status lags.
+        assert_eq!(
+            tail(&ran(
+                Succeeded,
+                Some(1),
+                "fatal: not a git repository\nusage: git\n"
+            )),
+            "fatal: not a git repository"
+        );
+        // Noise printed after the failure does not hide it.
+        let noisy = format!(
+            "thread 'tests::adds' panicked at src/lib.rs:5:9:\n{}\n",
+            "x".repeat(3000)
+        );
+        assert_eq!(
+            tail(&ran(Failed, Some(101), &noisy)),
+            "thread 'tests::adds' panicked at src/lib.rs:5:9:"
+        );
+        // While it runs, and once it worked, the row follows the last line.
+        assert_eq!(
+            tail(&ran(Running, None, cargo)),
+            "error: could not compile `app` (bin \"app\") due to 1 previous error"
+        );
+        assert_eq!(
+            tail(&ran(
+                Succeeded,
+                Some(0),
+                "running 3 tests\nerrors.rs ok\ntest result: ok\n"
+            )),
+            "test result: ok"
+        );
+        // A failure with nothing that reads as a diagnostic keeps its last line.
+        assert_eq!(
+            tail(&ran(
+                Failed,
+                Some(2),
+                "checked errors.rs\nno failures here\ndone\n"
+            )),
+            "done"
+        );
+        // Only the end of a long log is searched, from a whole line.
+        let early = format!(
+            "error: early\n{}\nlast line\n",
+            "ok\n".repeat(super::DIAGNOSTIC_WINDOW)
+        );
+        assert_eq!(tail(&ran(Failed, Some(1), &early)), "last line");
+        let multibyte = format!("{}\nerror: late\n", "λ".repeat(super::DIAGNOSTIC_WINDOW));
+        assert_eq!(tail(&ran(Failed, Some(1), &multibyte)), "error: late");
     }
 
     #[test]

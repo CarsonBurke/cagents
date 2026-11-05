@@ -491,11 +491,16 @@ impl Runtime {
         if let Some(detail) = &cached.detail {
             line.push(design::caption(detail.clone()).into());
         }
-        let name = if verb.is_empty() {
+        let mut name = if verb.is_empty() {
             label
         } else {
             format!("{verb} {label}")
         };
+        if coordinated.is_none()
+            && let Some(description) = turn::command_description(&item.content)
+        {
+            name = format!("{name} · {description}");
+        }
         let header = widget::button::custom(
             widget::row::with_children(line)
                 .spacing(GAP_S)
@@ -555,6 +560,11 @@ impl Runtime {
                 output,
                 ..
             } => {
+                // The provider's own account of what the command is for: the
+                // closed row names the command, so this is where it is read.
+                if let Some(description) = turn::command_description(&item.content) {
+                    rows.push(design::body(description.to_owned()).into());
+                }
                 rows.push(self.tool_code_surface(
                     item,
                     cached,

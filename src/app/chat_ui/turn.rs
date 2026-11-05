@@ -454,10 +454,14 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
             ..
         } => {
             if *action == chat::CommandAction::Run {
-                first_line(if label.trim().is_empty() {
-                    command
-                } else {
+                // What ran is the command. A provider's description of it
+                // ("Run tests for module 295") reads as a second verb after
+                // "Ran", and it is not what a reader scanning for the command
+                // that failed is looking for; the open step shows it.
+                first_line(if command.trim().is_empty() {
                     label
+                } else {
+                    command
                 })
             } else if label.is_empty() {
                 first_line(command)
@@ -491,6 +495,25 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
                 sender.get(..8).unwrap_or(sender)
             }
         }
+    }
+}
+
+/// What a provider said a shell command was for, when it said something the
+/// command does not already say. The row names the command, so this is the
+/// secondary line its detail and accessible name carry.
+pub(super) fn command_description(content: &ItemContent) -> Option<&str> {
+    match content {
+        ItemContent::Command {
+            label,
+            command,
+            action: chat::CommandAction::Run,
+            ..
+        } => {
+            let label = label.trim();
+            (!label.is_empty() && !command.trim().is_empty() && label != command.trim())
+                .then_some(label)
+        }
+        _ => None,
     }
 }
 
@@ -1338,8 +1361,13 @@ mod tests {
             (CommandAction::Search, "Search TODO", "Searched TODO"),
             (CommandAction::List, "**/*.rs", "Listed **/*.rs"),
             (CommandAction::List, "List src", "Listed src"),
-            // A shell command's label is the provider's own description.
-            (CommandAction::Run, "Read the logs", "Ran Read the logs"),
+            // A shell command's label is the provider's own description,
+            // which would repeat the verb; the row names the command.
+            (
+                CommandAction::Run,
+                "Read the logs",
+                "Ran sed -n 1,20p src/app.rs",
+            ),
             // Only the stored verb is taken off, and never the whole label.
             (CommandAction::Read, "Search.md", "Read Search.md"),
             (CommandAction::Read, "Read ", "Read Read "),
@@ -1360,6 +1388,49 @@ mod tests {
             }];
             assert_eq!(group(&items, &unasked(), plain)[0].summary, row);
         }
+    }
+
+    /// A shell row names what ran; the provider's description of it is kept
+    /// for the detail rather than read as a second verb.
+    #[test]
+    fn a_described_shell_command_is_named_by_its_command() {
+        let run = |label: &str, command: &str| ItemContent::Command {
+            label: label.into(),
+            command: command.into(),
+            working_directory: String::new(),
+            action: CommandAction::Run,
+            status: ToolStatus::Failed,
+            exit_code: Some(101),
+            duration_ms: None,
+            output: String::new(),
+        };
+        let described = run("Run tests for module 295", "cargo test --lib module_295");
+        assert_eq!(
+            format!("{} {}", step_verb(&described), step_label(&described)),
+            "Ran cargo test --lib module_295"
+        );
+        assert_eq!(
+            command_description(&described),
+            Some("Run tests for module 295")
+        );
+        // A label that is the command, or no label, adds nothing.
+        assert_eq!(command_description(&run("cargo test", "cargo test")), None);
+        assert_eq!(command_description(&run("", "cargo test")), None);
+        // Without a command the description is the row.
+        let bare = run("Run tests", "");
+        assert_eq!(step_label(&bare), "Run tests");
+        assert_eq!(command_description(&bare), None);
+        let items = [Item {
+            id: "step".into(),
+            role: Role::Assistant,
+            content: described,
+            started_at: None,
+            at: None,
+        }];
+        assert_eq!(
+            group(&items, &unasked(), plain)[0].summary,
+            "Ran cargo test --lib module_295 · failed"
+        );
     }
 
     #[test]
