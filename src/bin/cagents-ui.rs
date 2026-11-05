@@ -2,14 +2,14 @@ use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 
 use cagents::design::space;
-use cosmic::{Core, app::cosmic::Cosmic, iced};
-
-const PRODUCT: &str = "cagents-ui";
-const DEFAULT_LOG_FILTER: &str = "cagents=info,warn";
 use cagents::instance::{
     CONFIRM_DAEMON_STOP_MODE as CONFIRM_DAEMON_STOP, STARTUP_ERROR_MODE as STARTUP_ERROR,
     STARTUP_UPDATE_MODE as STARTUP_UPDATE,
 };
+use cosmic::{Core, app::cosmic::Cosmic, iced};
+
+const PRODUCT: &str = "cagents-ui";
+const DEFAULT_LOG_FILTER: &str = "cagents=info,warn";
 /// argv has a hard size limit and a dialog cannot show a novel either.
 const MAX_REPORTED_ERROR_BYTES: usize = 2048;
 /// The internal `--confirm-daemon-stop`, `--startup-error`, `--startup-update` and

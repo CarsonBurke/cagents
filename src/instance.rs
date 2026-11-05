@@ -2005,7 +2005,7 @@ fn legacy_ui_process_running(proc_root: &Path) -> io::Result<bool> {
         if name.trim_end() == LEGACY_PROCESS_NAME {
             let stat = match fs::read_to_string(entry.path().join("stat")) {
                 Ok(stat) => stat,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if process_exited(&error) => continue,
                 Err(error) => return Err(error),
             };
             let fields = stat
@@ -2030,26 +2030,33 @@ fn legacy_ui_process_running(proc_root: &Path) -> io::Result<bool> {
                 continue;
             }
             // Every helper mode postdates the lease, so one still carrying the
-            // old name is a lease-aware build's helper. An update's progress
-            // window comes from the build being replaced, which may not rename
-            // its helpers; refusing on it would block the update's own windows.
-            if runs_helper_mode(&entry.path()) {
-                continue;
+            // old name is a lease-aware build's helper. A launcher started
+            // before an update can open the progress window from a build that
+            // does not rename its helpers; refusing on it would block the
+            // update's own windows.
+            match runs_helper_mode(&entry.path()) {
+                Ok(true) => continue,
+                Err(error) if process_exited(&error) => continue,
+                Ok(false) | Err(_) => return Ok(true),
             }
-            return Ok(true);
         }
     }
     Ok(false)
 }
 
+/// A process that ended after its name was read: opening one of its `/proc`
+/// entries then fails with ENOENT, and reading one already open with ESRCH.
+fn process_exited(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 /// Unreadable arguments are not evidence of a helper, so they keep the refusal.
-fn runs_helper_mode(process: &Path) -> bool {
-    fs::read(process.join("cmdline")).is_ok_and(|arguments| {
-        arguments
-            .split(|byte| *byte == 0)
-            .nth(1)
-            .is_some_and(|mode| HELPER_MODES.iter().any(|helper| helper.as_bytes() == mode))
-    })
+fn runs_helper_mode(process: &Path) -> io::Result<bool> {
+    let arguments = fs::read(process.join("cmdline"))?;
+    Ok(arguments
+        .split(|byte| *byte == 0)
+        .nth(1)
+        .is_some_and(|mode| HELPER_MODES.iter().any(|helper| helper.as_bytes() == mode)))
 }
 
 fn current_uid() -> u32 {
@@ -2765,6 +2772,11 @@ mod tests {
         assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
 
         fs::write(legacy.join("comm"), "cagents-ui\n").unwrap();
+        fs::write(
+            legacy.join("cmdline"),
+            "/old/cagents-ui\0--window\0primary\0",
+        )
+        .unwrap();
         let mut fields = ["0"; 18];
         fields[0] = "S";
         fields[1] = "1";
@@ -2803,7 +2815,13 @@ mod tests {
         )
         .unwrap();
         assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        // Arguments that cannot be read are not evidence of a helper.
         fs::remove_file(legacy.join("cmdline")).unwrap();
+        fs::create_dir(legacy.join("cmdline")).unwrap();
+        assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        fs::remove_dir(legacy.join("cmdline")).unwrap();
+        // A process that exited after its name was read is gone.
+        assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
         fs::write(legacy.join("stat"), "malformed").unwrap();
         assert!(legacy_ui_process_running(proc_root.path()).is_err());
         fs::remove_file(legacy.join("stat")).unwrap();
