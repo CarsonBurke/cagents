@@ -45,7 +45,7 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
           git rev-parse HEAD 'HEAD^{tree}'
-          sha256sum scripts/run-development scripts/cargo-gate tests/run-development-zig.py \
+          sha256sum scripts/run-development tests/run-development-zig.py \
             scripts/check-format scripts/check-format-cache.py tests/check_format.py mise.toml
           for format_tool in git cargo rustc rustfmt rustup sh python3; do
             command -v "$format_tool"
@@ -66,6 +66,67 @@ jobs:
           esac
           cargo --version
           rustfmt --version
+
+      - name: Check Cargo gate source and contracts
+        run: |
+          python3 -I -B - <<'PY'
+          from pathlib import Path
+          import stat
+          import subprocess
+          import sys
+
+          def present(path):
+              current = Path()
+              for index, part in enumerate(path.parts):
+                  current /= part
+                  try:
+                      mode = current.lstat().st_mode
+                  except FileNotFoundError:
+                      return False
+                  expected = stat.S_ISREG if index == len(path.parts) - 1 else stat.S_ISDIR
+                  if not expected(mode):
+                      print(f"Invalid contract path: {current} must be a regular file or real directory, never a symlink", file=sys.stderr)
+                      raise SystemExit(2)
+              return True
+
+          gate = Path("scripts/cargo-gate")
+          source = Path("scripts/cargo-gate-command.py")
+          fixture = Path("tests/cargo_gate.py")
+          gate_present = present(gate)
+          source_present = present(source)
+          fixture_present = present(fixture)
+          if source_present != fixture_present:
+              print(f"Incomplete contract pair: {source} and {fixture} must both exist", file=sys.stderr)
+              raise SystemExit(2)
+          if source_present and not gate_present:
+              print(f"Incomplete Cargo gate: {gate} is required by {source} and {fixture}", file=sys.stderr)
+              raise SystemExit(2)
+          runner = Path("scripts/run-development")
+          if not gate_present and present(runner) and b"scripts/cargo-gate" in runner.read_bytes():
+              print(f"Incomplete Cargo gate: {runner} references missing {gate}", file=sys.stderr)
+              raise SystemExit(2)
+          if gate_present and not source_present and b"cargo-gate-command.py" in gate.read_bytes():
+              print(f"Incomplete Cargo gate: {gate} references missing {source} and {fixture}", file=sys.stderr)
+              raise SystemExit(2)
+          if gate_present:
+              print("Checking: Cargo gate source", flush=True)
+              paths = [str(gate)]
+              if source_present:
+                  paths.extend((str(source), str(fixture)))
+              for command in (["sha256sum", *paths], ["sh", "-n", str(gate)]):
+                  result = subprocess.run(command)
+                  if result.returncode:
+                      raise SystemExit(result.returncode)
+          else:
+              print("Not applicable: Cargo gate (source absent at this head)", flush=True)
+          if not source_present:
+              print("Not applicable: held-command cancellation (source and fixture both absent at this head)", flush=True)
+          else:
+              print("Checking: held-command cancellation", flush=True)
+              result = subprocess.run([sys.executable, "-I", "-B", str(fixture), "-v"])
+              if result.returncode:
+                  raise SystemExit(result.returncode)
+          PY
 
       - name: Check Zig discovery contracts
         run: python3 tests/run-development-zig.py -v
@@ -121,7 +182,6 @@ jobs:
       - name: Check shell syntax
         run: |
           sh -n scripts/run-development
-          sh -n scripts/cargo-gate
           sh -n scripts/check-format
 
       - name: Check repository formatting

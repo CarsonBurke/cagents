@@ -12,8 +12,8 @@
 The README's [Run from source](../README.md#run-from-source) section is the
 quick start; this page is the full reference. Repository tooling is shell
 (POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust. Python 3
-is also required by the ceditor development/installation scripts, experimental
-hot runner, and the full Servo dependency graph.
+is also required by the Cargo gate, ceditor development/installation scripts,
+experimental hot runner, and the full Servo dependency graph.
 
 ## Prerequisites
 
@@ -266,6 +266,13 @@ To gate a script that runs several Cargo commands, replace
 and gated commands inside it run in that slot. Gating each Cargo command
 instead keeps test runs out of the slot.
 
+Cancelling a held command keeps its slot until the command and its descendants
+have exited. The Linux Python 3 supervisor sends TERM, allows the command one
+shared two-second grace period, then kills and reaps remaining descendants,
+including children that created a separate session. Successful commands may leave background cache
+services running without holding a slot. The regression contract uses private
+locks and owned fixture processes only: `python3 tests/cargo_gate.py -v`.
+
 The feature lanes coexist in one build directory: a no-op check of one lane
 stays a no-op after building the others. With a per-checkout build directory,
 such as `build-dir = "/var/tmp/cargo-build{workspace-root}/target"` in
@@ -467,6 +474,10 @@ iced-core tree reconciliation, run the focused package first:
 ```sh
 scripts/cargo-gate test --locked -p cagents-iced-contracts
 ```
+
+The same package checks that a rebuilt named widget keeps the native
+accessibility ID it already published, so an assistive-technology action
+queued before the rebuild still reaches it.
 
 The package uses the UI's exact iced-core Git revision; the root Cargo patch
 resolves both targets to `vendor/iced-core`, with the production `a11y` Id
