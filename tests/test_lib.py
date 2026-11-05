@@ -389,6 +389,20 @@ class TestLib(unittest.TestCase):
         self.assertTrue(self.events("compiler")[0]["held"])
         self.assertFalse(self.events("test")[0]["held"])
 
+    def test_numbered_slot_uses_a_literal_configured_filename(self):
+        base = self.root / "slot[1]*?.lock"
+        slot = Path(str(base) + ".1")
+        slot.touch()
+        alias = self.root / "literal-slot-alias"
+        alias.hardlink_to(slot)
+        with alias.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self.invoke("cli", "module::one", pass_fds=(lock.fileno(),),
+                                 env=self.env | {"CAGENTS_BUILD_LOCK": str(base)})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("inherited descriptor holds build admission", result.stderr)
+        self.assertEqual(self.events(), [])
+
     def test_relative_lock_is_resolved_from_the_gate_package_cwd(self):
         with self.lock.open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
