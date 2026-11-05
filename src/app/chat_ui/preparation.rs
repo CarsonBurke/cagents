@@ -1,6 +1,7 @@
 //! Owned Markdown work. Renderer caches and reader interaction stay on the UI.
 use super::*;
 use std::sync::atomic::AtomicUsize;
+use tracing::Instrument;
 
 const SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const QUEUED_BYTES: usize = 72 * 1024 * 1024;
@@ -1488,13 +1489,20 @@ fn workers() -> &'static Arc<tokio::sync::Semaphore> {
 }
 fn stream(job: &Job) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
     let job = job.clone();
-    Box::pin(iced::futures::stream::once(async move {
-        let result = run(job.shared).await;
-        action(match job.id {
-            Some(id) => Action::MarkdownPrepared(job.target, id, job.run, Ready::new(result)),
-            None => Action::LocalPromptPrepared(job.target, job.run, Ready::new(result)),
-        })
-    }))
+    let span = tracing::trace_span!(target: "cagents::pane_open", "transcript_preparation",
+        card = ?job.target.card, target_generation = job.target.generation,
+        item = job.id.as_deref().unwrap_or_default(), run = job.run);
+    Box::pin(iced::futures::stream::once(
+        async move {
+            let result = run(job.shared).await;
+            tracing::trace!(target: "cagents::pane_open", stage = "transcript_prepared", ok = result.is_ok());
+            action(match job.id {
+                Some(id) => Action::MarkdownPrepared(job.target, id, job.run, Ready::new(result)),
+                None => Action::LocalPromptPrepared(job.target, job.run, Ready::new(result)),
+            })
+        }
+        .instrument(span),
+    ))
 }
 async fn run(shared: Arc<Shared>) -> Result<Prepared, String> {
     run_with_permits(shared, workers().clone()).await
@@ -1504,23 +1512,32 @@ async fn run_with_permits(
     shared: Arc<Shared>,
     permits: Arc<tokio::sync::Semaphore>,
 ) -> Result<Prepared, String> {
+    tracing::trace!(target: "cagents::pane_open", stage = "transcript_queued");
     let permit = permits
         .acquire_owned()
         .await
         .map_err(|_| "Message loading stopped.".to_owned())?;
+    tracing::trace!(target: "cagents::pane_open", stage = "transcript_permit_acquired");
     if shared.cancelled.load(Ordering::Relaxed) {
         return Err("Message loading was cancelled.".into());
     }
-    tokio::task::spawn_blocking(move || execute(shared, permit))
-        .await
-        .map_err(|_| "A message could not be loaded. Retry loading it.".to_owned())?
+    let span = tracing::enabled!(target: "cagents::pane_open", tracing::Level::TRACE)
+        .then(tracing::Span::current);
+    tokio::task::spawn_blocking(move || match span {
+        Some(span) => span.in_scope(|| execute(shared, permit)),
+        None => execute(shared, permit),
+    })
+    .await
+    .map_err(|_| "A message could not be loaded. Retry loading it.".to_owned())?
 }
 
 fn execute(
     shared: Arc<Shared>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Prepared, String> {
+    tracing::trace!(target: "cagents::pane_open", stage = "transcript_fifo_wait");
     reclaim_before_work()?;
+    tracing::trace!(target: "cagents::pane_open", stage = "transcript_fifo_complete");
     let request = shared
         .latest
         .lock()

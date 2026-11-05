@@ -4002,6 +4002,8 @@ impl Runtime {
         };
         let regroup = cached.coordination.is_some() || prepared.is_coordination();
         prepared.install(cached, managed, expanded);
+        tracing::trace!(target: "cagents::pane_open", stage = "transcript_dto_installed",
+            card = ?target.card, target_generation = target.generation, item = id, run);
         self.resume_preparation();
         if regroup && self.selected_subagent.is_none() {
             let turns = turn::group(&self.snapshot.items, &self.asked_after, |item| {
@@ -4486,7 +4488,9 @@ impl Runtime {
         self.snapshot = snapshot;
         drop(retired_metadata);
         self.presentation_evicted = false;
-        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id, resident_bytes = self.snapshot.transcript_bytes(), cache_entries = self.cache.len(), exposed_presentation_bytes = self.cache.values().map(CachedItem::retained_bytes).sum::<usize>());
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id,
+            card = ?self.target.card, target_generation = self.target.generation, source_generation = self.snapshot.generation,
+            resident_bytes = self.snapshot.transcript_bytes(), cache_entries = self.cache.len(), exposed_presentation_bytes = self.cache.values().map(CachedItem::retained_bytes).sum::<usize>());
         self.refresh_failure_ui();
         images::sync(self);
         self.refresh_find();
