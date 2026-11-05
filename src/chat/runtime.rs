@@ -112,6 +112,14 @@ impl Drop for InputEffects {
 
 type CommandRequest = (ActorCommand, crossbeam_channel::Sender<Result<(), String>>);
 
+pub(crate) fn wait_ownership(
+    response: crossbeam_channel::Receiver<Result<(), String>>,
+) -> Result<(), String> {
+    response
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
+}
+
 /// Why a provider command may not have taken effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Rejection {
@@ -977,6 +985,13 @@ impl LocalHandle {
             .map_err(Rejection::Refused)
     }
     fn ownership_command(&self, command: ActorCommand) -> Result<(), String> {
+        wait_ownership(self.enqueue_ownership(command)?)
+    }
+
+    fn enqueue_ownership(
+        &self,
+        command: ActorCommand,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
         if self.is_completed()
             || self.0.draining.load(Ordering::Acquire)
             || self.0.stop.load(Ordering::Acquire)
@@ -993,9 +1008,7 @@ impl LocalHandle {
             .try_send((command, reply))
             .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
         self.wake();
-        response
-            .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
+        Ok(response)
     }
 
     fn claim_idle_close(&self, generation: u64) -> Result<bool, String> {
@@ -1054,7 +1067,16 @@ impl LocalHandle {
         run: Option<crate::model::RunId>,
         including_subagents: bool,
     ) -> Result<(), String> {
-        self.ownership_command(ActorCommand::Interrupt {
+        wait_ownership(self.enqueue_interrupt_owned(run, including_subagents)?)
+    }
+
+    /// Queue an owned interrupt; its reply arrives with the provider's ACK.
+    pub(crate) fn enqueue_interrupt_owned(
+        &self,
+        run: Option<crate::model::RunId>,
+        including_subagents: bool,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
+        self.enqueue_ownership(ActorCommand::Interrupt {
             run,
             including_subagents,
         })

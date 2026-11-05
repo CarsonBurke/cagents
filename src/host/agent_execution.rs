@@ -983,7 +983,7 @@ fn control(
     // agent it does not own.
     status(host, authority, id)?;
     let gate = agent_gate(host, id);
-    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let (_, run, handle) = owned_provider(host, authority, id)?;
     if registry(host)?
         .lock()
@@ -1002,7 +1002,11 @@ fn control(
         Control::Interrupt {
             including_subagents,
         } => {
-            handle.interrupt_owned(Some(run.id), including_subagents)?;
+            let reply = handle.enqueue_interrupt_owned(Some(run.id), including_subagents)?;
+            // The interrupt is dispatched. Its acknowledgement can wait on the
+            // provider, which may first need an answer through this same gate.
+            drop(dispatch);
+            reply.wait()?;
             None
         }
         Control::Answer {
@@ -1322,8 +1326,13 @@ fn console(
             including_subagents,
         } => {
             let gate = agent_gate(host, id);
+            let dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let reply = handle.enqueue_interrupt_owned(None, including_subagents)?;
+            // Answers through this gate must stay possible while the provider
+            // acknowledges the interrupt.
+            drop(dispatch);
+            reply.wait()?;
             let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
-            handle.interrupt_owned(None, including_subagents)?;
             registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())

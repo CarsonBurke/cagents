@@ -31,6 +31,19 @@ impl From<crossbeam_channel::Receiver<Result<(), String>>> for CommandReply {
         Self::Local(reply)
     }
 }
+/// A queued owned interrupt whose provider acknowledgement is still pending.
+pub(crate) enum InterruptReply {
+    Local(crossbeam_channel::Receiver<Result<(), String>>),
+    Retained(crossbeam_channel::Receiver<Result<(), Rejection>>),
+}
+impl InterruptReply {
+    pub(crate) fn wait(self) -> Result<(), String> {
+        match self {
+            Self::Local(reply) => super::wait_ownership(reply),
+            Self::Retained(reply) => super::retained_actor::transport::wait_interrupt(reply),
+        }
+    }
+}
 use super::retained_actor::transport::{ActorIdentity, RemoteActor};
 use super::{LocalHandle, Rejection, Store, TitleUnavailable, Update, UpdateReadiness};
 use crate::chat::{
@@ -445,6 +458,22 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.interrupt_owned(run, including_subagents),
             Owner::Remote(remote) => remote.interrupt(run, including_subagents),
+        }
+    }
+    /// Queue an owned interrupt so a caller can release its dispatch gate
+    /// while the provider acknowledges it. Wait with [`InterruptReply::wait`].
+    pub(crate) fn enqueue_interrupt_owned(
+        &self,
+        run: Option<crate::model::RunId>,
+        including_subagents: bool,
+    ) -> Result<InterruptReply, String> {
+        match &self.0 {
+            Owner::Local(local) => local
+                .enqueue_interrupt_owned(run, including_subagents)
+                .map(InterruptReply::Local),
+            Owner::Remote(remote) => remote
+                .enqueue_interrupt(run, including_subagents)
+                .map(InterruptReply::Retained),
         }
     }
     pub(crate) fn update_native_source(

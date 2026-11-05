@@ -1681,17 +1681,19 @@ impl RemoteActor {
         run: Option<crate::model::RunId>,
         including_subagents: bool,
     ) -> Result<(), String> {
-        let receiver = self.enqueue_payload(InputPayload::Interrupt {
+        wait_interrupt(self.enqueue_interrupt(run, including_subagents)?)
+    }
+
+    /// Queue an interrupt; its reply arrives with the provider's ACK.
+    pub fn enqueue_interrupt(
+        &self,
+        run: Option<crate::model::RunId>,
+        including_subagents: bool,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
+        self.enqueue_payload(InputPayload::Interrupt {
             run,
             including_subagents,
-        })?;
-        receiver
-            .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| {
-                "Retained interrupt acknowledgement remains unknown; never resend automatically"
-                    .to_owned()
-            })?
-            .map_err(String::from)
+        })
     }
 
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
@@ -3393,6 +3395,18 @@ fn terminal_endpoint_error(error: &str, holder_current: bool) -> bool {
     !holder_current
         || error.contains("attachment was superseded")
         || error.starts_with("CAGENTS_ACTOR_AUTHORITY_UNCONFIRMED:")
+}
+
+pub(crate) fn wait_interrupt(
+    receiver: crossbeam_channel::Receiver<Result<(), Rejection>>,
+) -> Result<(), String> {
+    receiver
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| {
+            "Retained interrupt acknowledgement remains unknown; never resend automatically"
+                .to_owned()
+        })?
+        .map_err(String::from)
 }
 
 #[cfg(test)]
@@ -6200,3 +6214,4 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "transport_deadline_tests.rs"]
 mod deadline_tests;
+
