@@ -164,10 +164,13 @@ while IFS= read -r frame; do
                 # A Markdown file in the config directory can stand in for the
                 # answer, so rendering and long-transcript checks need no live
                 # provider.
-                reply="I’m checking the submission logs and comparing the failed run with the last successful version."
-                if [ -f "$config/fixture-reply.md" ]; then reply=$(cat "$config/fixture-reply.md"); fi
-                assistant=$(jq -cn --arg turn "$turn" --arg text "$reply" \
-                    '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:$text}],usage:{input_tokens:4200,output_tokens:180}}}')
+                # jq reads the file itself: an answer over 128 KiB exceeds the
+                # kernel's limit for a single command-line argument.
+                reply=$config/fixture-reply.md
+                [ -f "$reply" ] || reply=/dev/null
+                assistant=$(jq -cn --arg turn "$turn" --rawfile text "$reply" \
+                    --arg default "I’m checking the submission logs and comparing the failed run with the last successful version." \
+                    '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:(if $text == "" then $default else $text end)}],usage:{input_tokens:4200,output_tokens:180}}}')
                 persist_record "$assistant"
                 printf '%s\n' "$assistant"
                 if [ "$turn" -eq 1 ]; then
