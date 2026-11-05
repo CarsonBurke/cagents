@@ -1549,6 +1549,10 @@ impl Drop for Inner {
             .get_mut()
             .unwrap_or_else(|p| p.into_inner())
             .take()
+            // The worker's own final notification can release the last
+            // handle, for example when the host retires its record. That
+            // thread is already finishing, and joining itself panics.
+            && worker.thread().id() != thread::current().id()
         {
             let _ = worker.join();
         }
