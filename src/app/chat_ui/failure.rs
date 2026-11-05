@@ -980,6 +980,21 @@ impl Runtime {
         retained.then_some(complete)
     }
 
+    /// A child's bare status line ("Turn failed") that joined the error
+    /// explaining it. The error is the diagnostic; the status adds nothing
+    /// to read or copy.
+    fn restates_child_error(&self, incident: &Incident, source: &Source) -> bool {
+        let Source::ChildDetail(child) = source else {
+            return false;
+        };
+        child_source(&self.snapshot, source)
+            .is_some_and(|detail| Failure::parse(self.session.launch.provider, detail).is_none())
+            && incident
+                .sources
+                .iter()
+                .any(|other| matches!(other, Source::ChildItem(owner, _) if owner == child))
+    }
+
     pub(super) fn failure_copy_plan(&self, key: &str) -> Result<Option<CopyPlan>, String> {
         let Some(incident) = self
             .failure_ui
@@ -1006,6 +1021,9 @@ impl Runtime {
         }
         let mut parts = Vec::new();
         for identity in &incident.sources {
+            if self.restates_child_error(incident, identity) {
+                continue;
+            }
             let text = child_source(&self.snapshot, identity)
                 .ok_or("Original diagnostic unavailable in this view")?;
             let source = match identity {
@@ -1239,6 +1257,9 @@ impl Runtime {
             .find(|incident| incident.key == key)?;
         let mut details = Vec::new();
         for source in &incident.sources {
+            if self.restates_child_error(incident, source) {
+                continue;
+            }
             if let Some(text) = self.failure_source(source)
                 && !details.contains(&text)
             {
@@ -1892,6 +1913,15 @@ mod tests {
                 Source::ChildItem("child".into(), "codex-notice:limit".into()),
                 Source::ChildDetail("child".into()),
             ]
+        );
+        // The status restates the error, so details and Copy hold the error.
+        let key = incident.key.clone();
+        assert_eq!(runtime.failure_details(&key).as_deref(), Some(raw));
+        let plan = runtime.failure_copy_plan(&key).unwrap().unwrap();
+        assert!(
+            plan.parts
+                .iter()
+                .all(|(source, _, _)| !matches!(source, Source::ChildDetail(_)))
         );
 
         // Later work means the status may describe something else, so the
