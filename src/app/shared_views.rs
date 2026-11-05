@@ -1855,12 +1855,18 @@ impl Cagents {
                         if !same_session {
                             // A held title belongs to the replaced session.
                             self.reported_title_save.cards.remove(&pane.id);
-                            // An unstarted chat replaced by another unstarted
-                            // one is still the reader's draft, so it opens with
-                            // their unsent text. Text written to a started
+                            // Text the reader is composing in a draft was never
+                            // sent anywhere, so the chat that replaces the draft
+                            // opens with it: another unstarted draft, or the
+                            // conversation another client started from it, even
+                            // when the reader never saw the intermediate draft.
+                            // What the runtime shows decides, not the stored
+                            // descriptor, which may already name a started
+                            // conversation. Text written to a started
                             // conversation is not handed to a different one.
-                            if matches!((&card.kind, &pane.kind),
-                                (CardKind::Chat(a), CardKind::Chat(b)) if a.is_unstarted() && b.is_unstarted())
+                            if matches!(pane.kind, CardKind::Chat(_))
+                                && matches!(self.cards.get(&pane.id),
+                                    Some(CardRuntime::Chat(runtime)) if runtime.session.is_unstarted())
                             {
                                 self.stash_unsent_chat(pane.id);
                             }
@@ -6501,9 +6507,9 @@ mod tests {
 
     /// Unsent composer text belongs to the card. Another client replacing an
     /// unstarted chat's identity, then moving the card to another channel, must
-    /// leave the text in the composer and in what autosave writes. A started
-    /// conversation put in its place is a different conversation, which the
-    /// text was not written to.
+    /// leave the text in the composer and in what autosave writes. That holds
+    /// when the replacement is already started, as when another client's Send
+    /// lands before this window sees its unstarted candidate.
     #[test]
     fn unsent_text_survives_replaced_identity_and_transfer() {
         use crate::app::workspace_model_sync::ModelUpdate;
@@ -6571,14 +6577,28 @@ mod tests {
                 apply(&mut app, &mut model, Scope::Channel(a));
             }
             if started {
+                // The started conversation attaches asynchronously and opens
+                // its composer with the text it was handed.
                 assert!(app.card_state(card).unwrap().existence.is_open(), "{case}");
-                assert!(
-                    !matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if !runtime.unsent_text().is_empty()),
-                    "{case}: the started conversation does not show the text"
+                let ready = chat_ui::ready_message_for_pending_switch(
+                    &app,
+                    card,
+                    crate::chat::Snapshot::default(),
                 );
+                drop(app.update(ready));
+                match app.cards.get(&card) {
+                    Some(CardRuntime::Chat(runtime)) => {
+                        assert!(!runtime.session.is_unstarted(), "{case}: attached");
+                        assert_eq!(runtime.unsent_text(), TEXT, "{case}: composer");
+                    }
+                    _ => panic!("{case}: the started conversation attaches"),
+                }
                 assert_eq!(
-                    app.persistent_workspace().chat_drafts.get(&card),
-                    None,
+                    app.persistent_workspace()
+                        .chat_drafts
+                        .get(&card)
+                        .map(String::as_str),
+                    Some(TEXT),
                     "{case}: autosave"
                 );
                 continue;
