@@ -216,6 +216,7 @@ jobs:
           for name, source, fixture in (
               ("validation checkout", "scripts/prepare-validation-checkout", "tests/prepare_validation_checkout.py"),
               ("process custody", "scripts/qualification/process_custody.py", "tests/qualification/test_process_custody.py"),
+              ("focused lib tests", "scripts/test-lib", "tests/test_lib.py"),
           ):
               source_present = present(Path(source))
               fixture_present = present(Path(fixture))
