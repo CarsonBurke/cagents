@@ -968,7 +968,7 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
     dispatch_accepted(&host, next.clone()).unwrap();
     let done = settled(&host, next.run.id);
     assert_eq!(
-        reconcile_agent_run(&host, &done, true).unwrap(),
+        reconcile_settled(&host, &done, true),
         Reconciliation::Closed
     );
     assert_eq!(
@@ -1057,7 +1057,7 @@ done
         "interrupt\n"
     );
     assert_eq!(
-        reconcile_agent_run(&host, &finished, true).unwrap(),
+        reconcile_settled(&host, &finished, true),
         Reconciliation::Closed
     );
 }
@@ -1341,7 +1341,7 @@ fn interactive_work_claims_automation_agent_before_cleanup_or_reuse() {
     )
     .unwrap();
     assert_eq!(
-        reconcile_agent_run(&host, &done, false).unwrap(),
+        reconcile_settled(&host, &done, false),
         Reconciliation::Idle,
         "presentation alone is not takeover"
     );
@@ -1543,11 +1543,24 @@ fn claim_fixture(host: &SharedHost, automation: &crate::automations::Automation)
         .unwrap()
 }
 
+/// Reconciles a settled run as the automation broker does: the registry can
+/// record a run's result before its provider reports itself idle, and the
+/// broker retries `Busy` on its next pass.
+fn reconcile_settled(host: &SharedHost, run: &Run, retire: bool) -> Reconciliation {
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    loop {
+        match reconcile_agent_run(host, run, retire).unwrap() {
+            Reconciliation::Busy => {
+                assert!(Instant::now() < hang_guard, "provider stayed busy");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            reconciliation => return reconciliation,
+        }
+    }
+}
+
 fn release_fixture(host: &SharedHost, run: &Run) {
-    assert_eq!(
-        reconcile_agent_run(host, run, false).unwrap(),
-        Reconciliation::Idle
-    );
+    assert_eq!(reconcile_settled(host, run, false), Reconciliation::Idle);
     let registry = registry(host).unwrap();
     let mut registry = registry.lock().unwrap();
     let firing = registry
