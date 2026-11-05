@@ -3215,9 +3215,11 @@ mod tests {
                 .any(|label| label == "Press a shortcut · Escape cancels")
         );
         let _ = tree.into_cache();
+        // Alt+Y is unbound: a chord another action owns would offer Reassign
+        // and keep the recorder open instead of recording.
         let mut event = match key(
-            keyboard::Key::Character("j".into()),
-            keyboard::key::Code::KeyJ,
+            keyboard::Key::Character("y".into()),
+            keyboard::key::Code::KeyY,
             None,
         ) {
             iced::Event::Keyboard(event) => event,
@@ -3239,9 +3241,16 @@ mod tests {
             app.settings_draft
                 .keyboard_shortcuts
                 .command_palette
-                .contains("Alt+J")
+                .contains("Alt+Y")
         );
-        assert!(app.settings_pending.contains_key(&field));
+        // A recorded chord applies at once rather than waiting as a draft.
+        assert!(
+            app.settings
+                .keyboard_shortcuts
+                .command_palette
+                .iter()
+                .any(|chord| chord == "Alt+Y")
+        );
 
         drop(app.update(Message::Palette(palette_ui::Action::Record(field))));
         app.settings_reset_confirm = true;
@@ -3252,7 +3261,7 @@ mod tests {
             .keyboard_shortcuts
             .command_palette
             .clone();
-        let pending = app.settings_pending[&field].clone();
+        let pending = app.settings_pending.get(&field).cloned();
         drop(app.update(Message::KeyEvent {
             event,
             captured: false,
@@ -3265,7 +3274,7 @@ mod tests {
             app.settings_draft.keyboard_shortcuts.command_palette,
             before
         );
-        assert_eq!(app.settings_pending[&field], pending);
+        assert_eq!(app.settings_pending.get(&field).cloned(), pending);
         drop(app.update(Message::CancelResetSettings));
         assert!(!app.modal_is_open());
     }
@@ -3569,7 +3578,7 @@ mod tests {
         drop(app.update(Message::SelectSettingsCategory(SettingsCategory::Keyboard)));
         drop(app.update(Message::SettingsSearchChanged("Command palette".into())));
         let mut tree = utility_native(&app, &mut renderer, true);
-        let point = bounds(&tree, "Record shortcut for Open command palette").center();
+        let point = bounds(&tree, "Record shortcut for Command palette").center();
         let mut messages = click(&mut tree, &mut renderer, point);
         assert!(
             matches!(messages.as_slice(), [Message::UtilityPaneUi(inner)]
@@ -3583,7 +3592,7 @@ mod tests {
         let owner = app.channel_work.view.owner().unwrap();
         drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
         let mut tree = utility_native(&app, &mut renderer, true);
-        let point = bounds(&tree, "Record shortcut for Open command palette").center();
+        let point = bounds(&tree, "Record shortcut for Command palette").center();
         let mut messages = click(&mut tree, &mut renderer, point);
         assert!(
             matches!(messages.as_slice(), [Message::UtilityPaneUi(inner)]
