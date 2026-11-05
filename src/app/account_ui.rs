@@ -5564,6 +5564,32 @@ impl State {
 }
 
 #[cfg(test)]
+impl Cagents {
+    /// Answers the newest discovery as finding every home and CLI where the
+    /// window already believed it was, which is what a Check now's
+    /// rediscovery reports on an unchanged machine.
+    pub(super) fn settle_discovery_for_test(&mut self) {
+        let restored = self
+            .account_ui
+            .accounts
+            .iter()
+            .filter(|state| !state.account.is_brokered())
+            .map(|state| Restored {
+                id: state.id.clone(),
+                present: state.present,
+                entry: None,
+            })
+            .collect();
+        drop(self.update(Message::AccountUi(Action::Located {
+            generation: self.account_ui.discovery_generation,
+            owners: self.account_ui.discovery_owners(),
+            restored,
+            installed: self.account_ui.installed.clone(),
+        })));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::account::WindowKind;
@@ -5605,6 +5631,7 @@ mod tests {
         let registry = store.load().unwrap();
         drop(
             app.update(Message::AccountUi(Action::Loaded(Loaded {
+                generation: app.account_ui.discovery_generation,
                 registry: Ok(registry.clone()),
                 restored: Account::PROVIDERS
                     .into_iter()
@@ -5632,6 +5659,7 @@ mod tests {
         );
         let id = Account::system(Provider::Codex).id();
         drop(app.update(Message::AccountUi(Action::Refresh(id.clone()))));
+        app.settle_discovery_for_test();
         assert!(
             app.account_ui
                 .account(&id)
@@ -5666,6 +5694,7 @@ mod tests {
         let registry = store.load().unwrap();
         assert_eq!(registry, Registry::default());
         drop(app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: app.account_ui.discovery_generation,
             registry: Ok(registry),
             restored: Vec::new(),
             catalogs: BTreeMap::new(),
@@ -5705,11 +5734,13 @@ mod tests {
         app.account_ui = State::new(None, None, None);
         app.refresh_ui.focused = true;
         let id = Account::system(Provider::Claude).id();
-        drop(app.update(Message::AccountUi(Action::RemoteLoaded(Err(
-            "device unavailable".into(),
-        )))));
+        drop(app.update(Message::AccountUi(Action::RemoteLoaded(
+            app.account_ui.discovery_generation,
+            Err("device unavailable".into()),
+        ))));
         assert!(!app.account_ui.registry_ready);
         drop(app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: app.account_ui.discovery_generation,
             registry: Err("registry unreadable".into()),
             restored: Vec::new(),
             catalogs: BTreeMap::new(),
@@ -5738,6 +5769,7 @@ mod tests {
                 .all(|state| !state.schedule.in_flight(now_ms()) && state.queued.is_none())
         );
         drop(app.update(Message::AccountUi(Action::Refresh(id.clone()))));
+        app.settle_discovery_for_test();
         assert!(
             app.account_ui
                 .account(&id)
@@ -8876,6 +8908,7 @@ mod app_tests {
                         // The row's real Refresh action admits recovery; its
                         // provider Task stays unpolled, as in the other phases.
                         drop(app.update(Message::AccountUi(Action::Refresh(id.clone()))));
+                        app.settle_discovery_for_test();
                         (
                             app.account_ui.probe_owner(&id).unwrap(),
                             app.account_ui
@@ -9129,6 +9162,7 @@ mod app_tests {
 
                 let task = match source {
                     "loaded" => app.update(Message::AccountUi(Action::Loaded(Loaded {
+                        generation: app.account_ui.discovery_generation,
                         registry: Ok(app.account_ui.registry.clone()),
                         restored: Vec::new(),
                         catalogs: BTreeMap::from([(provider, catalog(now, "current"))]),
@@ -9505,6 +9539,7 @@ mod app_tests {
     fn a_changed_login_reported_live_is_checked_at_once() {
         let mut app = context_inspector_test_app(false);
         drop(app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: app.account_ui.discovery_generation,
             registry: Ok(Registry::default()),
             restored: Vec::new(),
             catalogs: BTreeMap::new(),
@@ -10784,8 +10819,13 @@ mod app_tests {
     fn opening_and_returning_to_accounts_rediscovers_without_starting_a_probe_first() {
         let mut app = context_inspector_test_app(false);
         app.settings.show_status_bar = false;
-        app.refresh_ui.focused = true;
         app.account_ui.installed.insert(Provider::Codex, false);
+        // Startup's authoritative registry read admits automatic probes
+        // before the window is focused.
+        let registry = app.account_ui.registry.clone();
+        drop(app.update(Message::AccountUi(Action::RegistryLoaded(Ok(registry)))));
+        assert!(app.account_ui.registry_ready);
+        app.refresh_ui.focused = true;
         let before = app.account_ui.discovery_generation;
         let _ = app.update(Message::AccountUi(Action::OpenPane));
         assert!(app.account_ui.discovery_generation > before);
@@ -10986,8 +11026,10 @@ mod app_tests {
             let state = app.account_ui.account_mut(&id).unwrap();
             state.present = true;
             state.snapshot = Some(old.clone());
-            state.schedule.start(Trigger::Focus, now_ms());
         }
+        let (_, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
         let _ = app.locate_accounts();
         finish_discovery(&mut app, BTreeMap::from([(Provider::Codex, false)]));
         let state = app.account_ui.account(&id).unwrap();
@@ -10997,6 +11039,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::Probed {
             owner,
             id: id.clone(),
+            ticket,
             outcome: Outcome::Answered {
                 identity: Some(Identity::default()),
                 catalog: None,
@@ -11075,9 +11118,15 @@ mod app_tests {
                 "previous usage",
                 now - 1,
             ));
-            state.schedule.start(Trigger::Focus, now);
-            state.schedule.await_login(now);
         }
+        let (_, late) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now);
+        app.account_ui
+            .account_mut(&id)
+            .unwrap()
+            .schedule
+            .await_login(now);
         let _ = app.locate_accounts();
         finish_discovery(&mut app, BTreeMap::from([(Provider::Claude, false)]));
         let _ = app.account_reported(Provider::Claude, &recipe, vec![(claude_report(0.43), now)]);
@@ -11108,6 +11157,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::Probed {
             owner,
             id: id.clone(),
+            ticket: late,
             outcome: Outcome::Answered {
                 identity: Some(Identity::default()),
                 catalog: None,
@@ -11128,10 +11178,14 @@ mod app_tests {
         finish_discovery(&mut app, BTreeMap::from([(Provider::Claude, true)]));
         assert!(app.account_ui.account(&id).unwrap().present);
         let fresh = UsageSnapshot::state(UsageStatus::Ok, "fresh executable", now + 2);
+        let (_, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
         let answer = |owner| {
             Message::AccountUi(Action::Probed {
                 owner,
                 id: id.clone(),
+                ticket: ticket.clone(),
                 outcome: Outcome::Answered {
                     identity: None,
                     catalog: None,
@@ -11230,10 +11284,11 @@ mod app_tests {
     fn only_a_probe_started_after_discovery_can_restore_a_missing_home() {
         let mut app = context_inspector_test_app(false);
         let id = app.account_ui.add_managed_fixture(Provider::Claude, 913);
-        let answer = |app: &Cagents, status| {
+        let answer = |(owner, ticket): (u64, ProbeTicket), status| {
             Message::AccountUi(Action::Probed {
-                owner: app.account_ui.account(&id).unwrap().owner,
+                owner,
                 id: id.clone(),
+                ticket,
                 outcome: Outcome::Answered {
                     catalog: None,
                     identity: None,
@@ -11265,33 +11320,27 @@ mod app_tests {
         // A probe already running when discovery found the home missing
         // describes the home as it was.
         let before = now_ms().saturating_sub(1_000);
-        app.account_ui
-            .account_mut(&id)
-            .unwrap()
-            .schedule
-            .start(Trigger::Focus, before);
+        let probe = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, before);
         missing(&mut app);
-        let _ = app.update(answer(&app, UsageStatus::Ok));
+        let _ = app.update(answer(probe, UsageStatus::Ok));
         assert!(!app.account_ui.account(&id).unwrap().present);
 
         // The probe discovery starts next confirms the home is not set up.
         let after = now_ms();
-        app.account_ui
-            .account_mut(&id)
-            .unwrap()
-            .schedule
-            .start(Trigger::Focus, after);
-        let _ = app.update(answer(&app, UsageStatus::Unavailable));
+        let probe = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, after);
+        let _ = app.update(answer(probe, UsageStatus::Unavailable));
         assert!(!app.account_ui.account(&id).unwrap().present);
 
         // Once the home is back, a later probe that reaches the CLI restores
         // it, and live usage can again clear a failure.
-        app.account_ui
-            .account_mut(&id)
-            .unwrap()
-            .schedule
-            .start(Trigger::Focus, now_ms());
-        let _ = app.update(answer(&app, UsageStatus::Ok));
+        let probe = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
+        let _ = app.update(answer(probe, UsageStatus::Ok));
         let state = app.account_ui.account(&id).unwrap();
         assert!(state.present);
         assert_eq!(state.absent_since, None);

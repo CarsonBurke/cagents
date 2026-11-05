@@ -3449,8 +3449,10 @@ mod tests {
             ));
             let queued_cancel = messages.remove(0);
             let _ = tree.into_cache();
-            // Start a real adapter probe but never poll its returned task.
+            // Check now rediscovers, then starts a real adapter probe; neither
+            // returned task is polled.
             drop(app.update(Message::AccountUi(AccountAction::Refresh(id.clone()))));
+            app.settle_discovery_for_test();
             let probe_owner = app.account_ui.probe_owner(&id).unwrap();
             let probe_ticket = app.account_ui.pending_probe_for_test(&id).unwrap();
             drop(app.open_channel_work(home.channel));

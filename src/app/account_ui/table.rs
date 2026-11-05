@@ -1696,17 +1696,26 @@ mod tests {
             span_secs: None,
             binding: false,
         }];
-        let owner = app.account_ui.account(&id).unwrap().owner;
         // Exercise accepted probe completions; no returned background Task is polled.
-        let _ = app.update(Message::AccountUi(Action::Probed {
-            owner,
-            id: id.clone(),
-            outcome: Outcome::Answered {
+        let probe = |app: &mut crate::app::Cagents, id: &AccountId, outcome| {
+            let now = app.account_ui.now_ms;
+            let (owner, ticket) = app.account_ui.begin_probe_for_test(id, Trigger::Focus, now);
+            drop(app.update(Message::AccountUi(Action::Probed {
+                owner,
+                id: id.clone(),
+                ticket,
+                outcome,
+            })));
+        };
+        probe(
+            &mut app,
+            &id,
+            Outcome::Answered {
                 identity: None,
                 catalog: None,
                 snapshot: snapshot.clone(),
             },
-        }));
+        );
         let widths = [1_400.0, 1_100.0, 520.0, 360.0];
         let healthy = widths.map(|width| measure(&app, &id, width));
         assert!(healthy[0].0.iter().any(|(text, _)| text == "Available"));
@@ -1717,11 +1726,7 @@ mod tests {
                     .any(|(text, _)| text.starts_with("Last check failed:"))
         }));
         let failure = "Codex did not answer within 30 seconds";
-        let _ = app.update(Message::AccountUi(Action::Probed {
-            owner,
-            id: id.clone(),
-            outcome: Outcome::Failed(failure.into()),
-        }));
+        probe(&mut app, &id, Outcome::Failed(failure.into()));
         assert_eq!(
             app.account_ui.account(&id).unwrap().snapshot.as_ref(),
             Some(&snapshot)
@@ -1767,15 +1772,15 @@ mod tests {
                 assert!(!layout(width).columns.contains(&Column::Status));
             }
         }
-        let _ = app.update(Message::AccountUi(Action::Probed {
-            owner,
-            id: id.clone(),
-            outcome: Outcome::Answered {
+        probe(
+            &mut app,
+            &id,
+            Outcome::Answered {
                 identity: None,
                 catalog: None,
                 snapshot: snapshot.clone(),
             },
-        }));
+        );
         assert_eq!(
             app.account_ui.account(&id).unwrap().snapshot.as_ref(),
             Some(&snapshot)
@@ -1797,11 +1802,7 @@ mod tests {
         // Long transport diagnostics cannot turn the visible row into an
         // unbounded body. Unicode stays intact and guidance is outside the cap.
         let long_failure = "界🙂é ".repeat(4_000);
-        let _ = app.update(Message::AccountUi(Action::Probed {
-            owner,
-            id: id.clone(),
-            outcome: Outcome::Failed(long_failure.clone()),
-        }));
+        probe(&mut app, &id, Outcome::Failed(long_failure.clone()));
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(state.failure.as_ref(), Some(&long_failure));
         assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
@@ -1823,21 +1824,17 @@ mod tests {
         assert!(captions[0].1.y + captions[0].1.height <= size.height + 0.1);
         assert_eq!(controls, healthy[3].2);
         // Existing sentence punctuation is not duplicated by the caption.
-        let _ = app.update(Message::AccountUi(Action::Probed {
-            owner,
-            id: id.clone(),
-            outcome: Outcome::Failed("Codex could not read usage just now.".into()),
-        }));
+        probe(
+            &mut app,
+            &id,
+            Outcome::Failed("Codex could not read usage just now.".into()),
+        );
         let (texts, _, _) = measure(&app, &id, 520.0);
         assert!(texts.iter().any(|(text, _)| text ==
             "Last check failed: Codex could not read usage just now. Showing last known usage. Refresh to try again."));
         // A first failed check explains the failure without claiming cached figures.
         let unchecked = app.account_ui.add_managed_fixture(Provider::Codex, 1168);
-        let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&unchecked).unwrap().owner,
-            id: unchecked.clone(),
-            outcome: Outcome::Failed(failure.into()),
-        }));
+        probe(&mut app, &unchecked, Outcome::Failed(failure.into()));
         let (texts, _, _) = measure(&app, &unchecked, 360.0);
         assert!(texts.iter().any(|(text, _)| text
             == "Last check failed: Codex did not answer within 30 seconds. Refresh to try again."));
