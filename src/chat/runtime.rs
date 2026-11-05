@@ -9661,7 +9661,15 @@ mod tests {
         let handle =
             LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
-        assert_eq!(snapshot.error.as_deref(), Some("missing echo text"));
+        // The summary adds a recovery hint after the adapter's own error.
+        assert!(
+            snapshot
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("missing echo text.")),
+            "{:?}",
+            snapshot.error
+        );
         handle.close().unwrap();
         assert!(handle.failure().is_some());
     }

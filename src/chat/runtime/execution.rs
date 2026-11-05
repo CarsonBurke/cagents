@@ -252,8 +252,9 @@ pub(super) fn exit_reason(
     };
     let reason = match diagnostic.filter(|message| !message.is_empty() && !generic(message)) {
         Some(message) if message.starts_with(&status) => message.to_owned(),
-        // The cause already says what was left unfinished.
-        Some(message) if clean => format!("Provider exited with status 0: {message}"),
+        // A successful exit status is no evidence of its own, so a specific
+        // cause stands alone.
+        Some(message) if clean => message.to_owned(),
         Some(message) => format!("{status}: {message}"),
         None => status,
     };
@@ -331,10 +332,7 @@ mod tests {
         let clean = std::process::ExitStatus::from_raw(0);
         let specific = "Provider exited before completing initialization. \
                         Last ignored output: wrapper diagnostic";
-        assert_eq!(
-            exit_reason(Some(clean), Some(specific)),
-            format!("Provider exited with status 0: {specific}")
-        );
+        assert_eq!(exit_reason(Some(clean), Some(specific)), specific);
         assert_eq!(
             exit_reason(
                 Some(clean),
