@@ -20,6 +20,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+mod child_diagnostics;
 mod child_text_copy;
 #[cfg(test)]
 pub(crate) mod courier_tests;
@@ -980,11 +981,43 @@ impl LocalHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .text_copy(source, offset),
-            super::TextCopyScope::Subagent { .. } => child_text_copy::read(
-                &self.0.state.lock().unwrap_or_else(|p| p.into_inner()),
-                source,
-                offset,
-            ),
+            super::TextCopyScope::Subagent { id } => {
+                // Keep the existing store-before-state lock order. Resident
+                // authority is checked before disk IO; no database read holds
+                // the state lock, and guessed child/item IDs grant no access.
+                let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+                let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+                let item = state
+                    .text_copy_sources
+                    .children
+                    .get(id)
+                    .and_then(|sources| {
+                        sources
+                            .iter()
+                            .position(|current| current.as_ref() == Some(source))
+                    })
+                    .and_then(|index| {
+                        state
+                            .subagents
+                            .iter()
+                            .find(|agent| agent.id == *id)
+                            .and_then(|agent| agent.items.get(index))
+                    })
+                    .filter(|item| child_diagnostics::marked(item))
+                    .map(|item| item.id.clone());
+                if let Some(item) = item {
+                    drop(state);
+                    let result = store.diagnostics.read(id, &item, source, offset);
+                    if result.is_err() && store.diagnostics.is_empty() {
+                        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+                        store.diagnostics.publish(&mut state);
+                        state.generation = state.generation.saturating_add(1);
+                    }
+                    result
+                } else {
+                    child_text_copy::read(&state, source, offset)
+                }
+            }
         }
     }
     /// Resident provider usage only: never opens the transcript store.
@@ -1549,6 +1582,10 @@ impl Drop for Inner {
             .get_mut()
             .unwrap_or_else(|p| p.into_inner())
             .take()
+            // The worker's own final notification can release the last
+            // handle, for example when the host retires its record. That
+            // thread is already finishing, and joining itself panics.
+            && worker.thread().id() != thread::current().id()
         {
             let _ = worker.join();
         }
@@ -2072,6 +2109,9 @@ impl Actor {
         self.step(initial)?;
         let mut stdout_eof = false;
         let mut stderr_eof = false;
+        // A provider that exits closes its stdin before its exit is observable.
+        // Keep the write error only as a fallback: the exit explains the failure.
+        let mut stdin_closed: Option<String> = None;
         let mut closing = None;
         let mut partial_started = None;
         let mut interrupt_sent = false;
@@ -2192,8 +2232,9 @@ impl Actor {
                 }
             }
             // A parsing budget can leave complete lines queued even after
-            // the pipe closes. Keep fair poll passes until those drain.
-            if stdout_eof && self.pending.is_empty() && !frames_ready {
+            // the pipe closes. Keep fair poll passes until those drain. Input
+            // the provider stopped reading no longer holds the actor open.
+            if stdout_eof && (self.pending.is_empty() || stdin_closed.is_some()) && !frames_ready {
                 if !self.output.is_empty() {
                     return Err(with_ignored_output(
                         "Provider ended with an incomplete JSON line",
@@ -2214,7 +2255,8 @@ impl Actor {
                                 &last_ignored,
                             ));
                         }
-                        return Ok(());
+                        // A clean exit still lost any input it never read.
+                        return stdin_closed.map_or(Ok(()), Err);
                     }
                     return Err(with_ignored_output(
                         &format!("Provider exited with {status}"),
@@ -2242,7 +2284,9 @@ impl Actor {
                 .write_started
                 .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
             {
-                return Err("Provider stdin stalled for 30 seconds".into());
+                return Err(
+                    stdin_closed.unwrap_or_else(|| "Provider stdin stalled for 30 seconds".into())
+                );
             }
             if self.dirty
                 && self.visible.load(Ordering::Acquire)
@@ -2273,7 +2317,7 @@ impl Actor {
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: if self.pending.is_empty() {
+                    fd: if self.pending.is_empty() || stdin_closed.is_some() {
                         -1
                     } else {
                         stdin.as_raw_fd()
@@ -2326,6 +2370,12 @@ impl Actor {
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        // The provider closed its input, ordinarily by exiting.
+                        // Drain its output to EOF so its exit status, and any
+                        // final frames, explain the failure instead of EPIPE.
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                            stdin_closed = Some(format!("Provider stdin: {e}"));
+                        }
                         Err(e) => return Err(format!("Provider stdin: {e}")),
                     }
                 }
@@ -2980,6 +3030,15 @@ impl Actor {
         content: Option<crate::notifications::Content>,
         preview_observed: bool,
     ) {
+        let child_changed = matches!(
+            &event,
+            Event::Subagent { .. }
+                | Event::SubagentItem { .. }
+                | Event::SubagentTextDelta { .. }
+                | Event::SubagentOutputDelta { .. }
+                | Event::SubagentItemsRemoved { .. }
+                | Event::Reset { .. }
+        );
         if matches!(
             event,
             Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
@@ -2998,10 +3057,22 @@ impl Actor {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = None;
         }
+        let mut diagnostic_store =
+            child_changed.then(|| self.store.lock().unwrap_or_else(|p| p.into_inner()));
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         recover_login_error(&mut state.error, &mut self.login_recovery, &event);
         recover_history_error(&mut state.error, &mut self.history_error, &event);
         apply_projected_event(&mut state, &mut self.indices, event, preview_observed);
+        if let Some(store) = &mut diagnostic_store {
+            let owners = store.diagnostics.owners(&state);
+            drop(state);
+            // Keep the store lock across projection and source publication so
+            // no snapshot caches this generation without its final authority.
+            // Disk pruning itself never holds the resident-state lock.
+            store.diagnostics.retain(&owners);
+            state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            store.diagnostics.publish(&mut state);
+        }
         // Only metadata is resident independently of the disk-backed window.
         let items = std::mem::take(&mut state.items);
         let child_items: Vec<_> = state
@@ -3715,6 +3786,12 @@ fn trim_subagent(agent: &mut Subagent) {
     const MAX_ITEMS: usize = 64;
     if let Some(last) = agent.items.last_mut()
         && last.content.byte_len() > MAX_BYTES
+        && child_diagnostics::marked(last)
+    {
+        child_diagnostics::project(Arc::make_mut(last));
+    }
+    if let Some(last) = agent.items.last_mut()
+        && last.content.byte_len() > MAX_BYTES
     {
         Arc::make_mut(last).content = ItemContent::Text {
             text: "[This large item is available in the provider transcript.]".into(),
@@ -3775,11 +3852,34 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
     )>,
     Snapshot,
 ) {
+    let (receipts, snapshot, ()) =
+        notification_frames_with_probe_for_test(adapter, frames, fail_store, |_, _| ());
+    (receipts, snapshot)
+}
+
+#[cfg(test)]
+pub(crate) fn notification_frames_with_probe_for_test<R>(
+    adapter: Box<dyn Adapter>,
+    frames: Vec<serde_json::Value>,
+    fail_store: bool,
+    probe: impl FnOnce(
+        &Snapshot,
+        &dyn Fn(&super::TextCopySource, u64) -> Result<super::TextCopyPage, String>,
+    ) -> R,
+) -> (
+    Vec<(
+        crate::notifications::Evidence,
+        crate::notifications::Content,
+    )>,
+    Snapshot,
+    R,
+) {
     assert!(!frames.is_empty() && frames.len() <= 32);
     let count = frames.len();
     struct Frame {
         adapter: Box<dyn Adapter>,
         frames: std::collections::VecDeque<serde_json::Value>,
+        interrupted: Arc<AtomicBool>,
     }
     impl Adapter for Frame {
         fn initialize(&mut self) -> Result<Step, String> {
@@ -3788,9 +3888,26 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
                 ..Default::default()
             })
         }
-        fn command(&mut self, _: Command) -> Result<Step, String> {
-            self.adapter
-                .receive(self.frames.pop_front().ok_or("fixture frames consumed")?)
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            match command {
+                Command::Refresh => self
+                    .adapter
+                    .receive(self.frames.pop_front().ok_or("fixture frames consumed")?),
+                Command::Interrupt if self.frames.is_empty() => {
+                    // The script has no live provider work. A busy captured
+                    // snapshot still needs an explicit fixture teardown ACK;
+                    // never consume another provider frame or emit an outcome.
+                    self.interrupted.store(true, Ordering::Release);
+                    Ok(Step {
+                        events: vec![Event::Status {
+                            busy: false,
+                            detail: "Fixture interruption acknowledged".into(),
+                        }],
+                        ..Step::default()
+                    })
+                }
+                _ => Err("fixture accepts scripted Refresh and final Interrupt only".into()),
+            }
         }
         fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
             Ok(Step::default())
@@ -3808,9 +3925,11 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
         working_directory: directory.path().into(),
         environment: BTreeMap::new(),
     };
+    let interrupted = Arc::new(AtomicBool::new(false));
     let mut adapter: Box<dyn Adapter> = Box::new(Frame {
         adapter,
         frames: frames.into(),
+        interrupted: interrupted.clone(),
     });
     let mut initial = adapter.initialize().unwrap();
     let store = preflight(&spec, &mut initial).unwrap();
@@ -3833,7 +3952,15 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
         .collect();
     let first = receive.recv_timeout(Duration::from_secs(2));
     let later: Vec<_> = receive.try_iter().collect();
-    let snapshot = handle.0.state.lock().unwrap().clone();
+    // Parent items belong to the transcript Store, so the resident metadata
+    // alone is not a client snapshot. Hydrate through the normal read boundary
+    // before probing original-copy sources and capturing pre-teardown state.
+    let snapshot = handle.snapshot(None).unwrap();
+    // Collect observations before teardown; callers assert them only after
+    // the existing process cleanup/completion guards below have succeeded.
+    let probed = probe(&snapshot, &|source, offset| {
+        handle.text_copy(source, offset)
+    });
     // Retire the actual process before asserting any result, including the
     // missing-callback/error paths, just as the one-frame fixture did.
     let closed = handle.close();
@@ -3850,17 +3977,81 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
         }
     }
     closed.unwrap();
+    if snapshot.busy && !snapshot.exited && snapshot.error.is_none() && !fail_store {
+        assert!(
+            interrupted.load(Ordering::Acquire),
+            "a healthy busy fixture must acknowledge teardown explicitly"
+        );
+        assert!(
+            handle.failure().is_none(),
+            "fixture teardown must not wait for an interruption timeout: {:?}",
+            handle.failure()
+        );
+        let teardown_receipts: Vec<_> = receive.try_iter().collect();
+        assert!(
+            teardown_receipts.is_empty(),
+            "fixture teardown cannot invent provider attention: {teardown_receipts:?}"
+        );
+    }
     assert!(
         handle.is_completed(),
         "real fixture process teardown must still be proved"
     );
     let mut receipts = vec![first.expect("real adapter must publish an outcome through the actor")];
     receipts.extend(later);
-    (receipts, snapshot)
+    (receipts, snapshot, probed)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notification_frame_fixture_preserves_busy_capture_and_acknowledges_teardown() {
+        struct Waiting;
+        impl Adapter for Waiting {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture commands must not reach the decoder".into())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step {
+                    // TurnStarted establishes identity, not busy state. This
+                    // fixture must report work as well as its input wait.
+                    events: vec![
+                        Event::Status {
+                            busy: true,
+                            detail: "Fixture work waiting for input".into(),
+                        },
+                        Event::Waiting(true),
+                    ],
+                    ..Step::default()
+                })
+            }
+        }
+        let (receipts, snapshot) = notification_frames_with_snapshot_for_test(
+            Box::new(Waiting),
+            vec![serde_json::Value::Null],
+            false,
+        );
+        assert!(
+            snapshot.busy && snapshot.waiting && !snapshot.exited,
+            "captured busy={}, waiting={}, exited={}, error_present={}",
+            snapshot.busy,
+            snapshot.waiting,
+            snapshot.exited,
+            snapshot.error.is_some(),
+        );
+        assert!(snapshot.error.is_none());
+        assert_eq!(
+            receipts.len(),
+            1,
+            "teardown must not publish a turn outcome"
+        );
+        assert_eq!(receipts[0].0.kind, crate::notifications::Kind::Waiting);
+        assert_eq!(receipts[0].1.request, None);
+    }
+
     #[test]
     fn typed_provider_error_items_keep_full_provenance_and_ids_through_store_hydration() {
         let mut store = Store::new().unwrap();
@@ -8154,6 +8345,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn provider_exit_during_a_write_reports_its_exit_status_not_the_broken_pipe() {
+        let directory = tempfile::tempdir().unwrap();
+        let release = directory.path().join("release");
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            // Close stdin before announcing it, so the next host write
+            // always meets EPIPE; exit only after that write is queued.
+            arguments: vec![
+                "-c".into(),
+                format!(
+                    "read -r init; exec 0<&-; printf '%s\\n' '{{\"text\":\"closed\"}}'; \
+                     until [ -e '{}' ]; do sleep 0.01; done; exit 75",
+                    release.display()
+                ),
+            ],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| !snapshot.items.is_empty());
+        handle.command(Command::Refresh).unwrap();
+        std::fs::write(&release, b"").unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        let failure = handle.failure();
+        handle.close().unwrap();
+        assert!(
+            failure
+                .as_deref()
+                .is_some_and(|error| error.contains("Provider exited with exit status: 75")),
+            "{failure:?} {:?}",
+            snapshot.error
+        );
     }
 
     #[test]

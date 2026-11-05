@@ -104,6 +104,7 @@ STUBS = {
         ls -l /proc/self/fd >> "$STUB_LOG/cargo-fds" 2>&1
         [ -z "${STUB_CARGO_FAILS:-}" ] || exit 101
         printf '%s %s\\n' "$CARGO_TARGET_DIR" "$CARGO_BUILD_JOBS" >> "$STUB_LOG/cargo-env"
+        printf '%s\\n' "${CAGENTS_BUILD_SEED:-unset}" >> "$STUB_LOG/cargo-seed"
         mkdir -p "$CARGO_TARGET_DIR/dev-runtime"
         for name in cagents cagentsd cagents-ui; do
             cp "$STUB_BIN/fixture-cli" "$CARGO_TARGET_DIR/dev-runtime/$name"
@@ -279,6 +280,8 @@ class Evidence(unittest.TestCase):
             line.startswith(str(target))
             for line in (self.logs / "cargo-env").read_text().splitlines()
         ))
+        # The gate would otherwise seed the build directory of whatever checkout it's run in.
+        self.assertEqual(set((self.logs / "cargo-seed").read_text().split()), {"0"})
         self.assertTrue(self.lock_is_free(self.cargo_lock))
         self.assertFalse(self.native_lock.exists())
         # A build outlives nothing, but a compiler daemon must not keep the slot.
@@ -424,6 +427,7 @@ class Evidence(unittest.TestCase):
         env = (self.logs / "runner-env").read_text()
         lock = next(l.split("=", 1)[1] for l in env.splitlines() if l.startswith("CAGENTS_BUILD_LOCK="))
         self.assertTrue(lock.startswith(str(self.task)), lock)
+        self.assertIn("CAGENTS_BUILD_SEED=0", env.splitlines())
         self.assertEqual((self.logs / "cargo").read_text(), before)
         # The stub runner execs this last, after its gated builds.
         for _ in range(100):
@@ -537,6 +541,22 @@ class Evidence(unittest.TestCase):
             self.assertEqual(result.returncode, 2, task)
         self.assertEqual(list(cwd.iterdir()), [])
 
+    def test_a_clear_that_ends_on_the_timeout_says_it_timed_out(self) -> None:
+        self.built()
+        write_executable(
+            self.bin / "rm",
+            """
+            #!/bin/bash
+            [ "$1" = -rf ] || exec /usr/bin/rm "$@"
+            exec sleep 300
+            """,
+            self.logs,
+        )
+        result = self.run_tool("start", "after", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("still going after 30 seconds", result.stderr)
+        self.assertTrue(self.lock_is_free(self.native_lock))
+
     def test_a_wedged_clear_gives_up_and_does_not_hold_the_lock(self) -> None:
         self.built()
         write_executable(
@@ -545,14 +565,28 @@ class Evidence(unittest.TestCase):
             #!/bin/bash
             [ "$1" = -rf ] || exec /usr/bin/rm "$@"
             ls -l /proc/self/fd > "$STUB_LOG/rm-fds" 2>&1
+            # Ignores TERM, so the clear's timeout has to kill it.
+            trap '' TERM
             exec sleep 300
             """,
             self.logs,
         )
+        write_executable(
+            self.bin / "awk",
+            """
+            #!/bin/bash
+            ls -l /proc/self/fd > "$STUB_LOG/awk-fds" 2>&1
+            exec /usr/bin/awk "$@"
+            """,
+            self.logs,
+        )
+        # The mount scan runs only over a runtime left by an earlier session.
+        (self.task / "rt").mkdir(exist_ok=True)
         result = self.run_tool("start", "after", check=False)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("could not clear the last session", result.stderr)
+        self.assertIn("still going after 30 seconds", result.stderr)
         self.assertNotIn(str(self.native_lock), (self.logs / "rm-fds").read_text())
+        self.assertNotIn(str(self.native_lock), (self.logs / "awk-fds").read_text())
         self.assertTrue(self.lock_is_free(self.native_lock))
 
     def test_a_runtime_it_cannot_clear_fails_with_the_reason(self) -> None:

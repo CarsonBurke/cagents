@@ -373,6 +373,96 @@ impl Cagents {
         }
     }
 
+    /// A terminal start that has to wait. An automatic or explicit creation
+    /// waits for the registry to accept its pane, and a restored terminal this
+    /// window may share waits for the registry to say whether it does.
+    pub(super) fn terminal_start_held(&self, card: CardId, explicit_retry: bool) -> bool {
+        self.shared_views.defaults.contains_key(&card)
+            || self.durable.pending_terminal_creations.contains(&card)
+            || (self.shared_views.attached.contains(&card)
+                && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+                && !explicit_retry)
+    }
+
+    /// Whether the registry shows this card in any view, so another window
+    /// may host it.
+    fn listed_in_registry(&self, card: CardId) -> bool {
+        self.workspace_model
+            .views
+            .iter()
+            .any(|view| view.panes.iter().any(|pane| pane.id == card))
+    }
+
+    /// Admits again the hydration of a restored terminal whose start was held
+    /// for the registry. The lifecycle already counts it as hydrating, so it
+    /// would otherwise never be asked to start and its pane would stay on
+    /// "Starting terminal…" for as long as the window is open.
+    fn readmit_held_terminal(&mut self, card: CardId, exposure: Exposure) {
+        self.cards.insert(card, CardRuntime::Loading);
+        self.lifecycle
+            .register(card, exposure, Residency::Cold, Instant::now());
+        if let Some(state) = self.card_state_mut(card) {
+            state.residency = Residency::Cold;
+        }
+    }
+
+    /// A restored window holds every saved terminal as possibly shared until
+    /// the registry answers. Projecting a view releases that view's own held
+    /// terminals, but some terminals have no projection to do it: the
+    /// registry lists a window-local terminal in no view, and a listed one's
+    /// view can stay unprojected while its scope loads. Once the registry has
+    /// answered, every terminal still held is released here, so none waits on
+    /// a projection that never comes.
+    ///
+    /// A terminal the registry lists in no view belongs to this window alone.
+    /// It stops counting as shared and restores the way an unshared window
+    /// restores it: a saved recipe is inspected without being run, attaching
+    /// only to its exact existing terminal. A listed terminal is admitted to
+    /// hydrate again and only attaches, since another window may host it.
+    fn release_held_terminals(&mut self) -> Task<Message> {
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return Task::none();
+        }
+        let held = self
+            .durable
+            .cards
+            .iter()
+            .filter_map(|card| match &card.kind {
+                CardKind::Terminal(session)
+                    if !terminal_ended(session)
+                        && card.existence.is_open()
+                        && matches!(card.residency, Residency::Hydrating { .. })
+                        && matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
+                        && self.shared_views.attached.contains(&card.id)
+                        && !self.terminal_start_held(card.id, false)
+                        && !self.terminal_start_in_flight(card.id)
+                        && !self.terminal_retry_pending(card.id)
+                        && !self.pane_close_owned(card.id) =>
+                {
+                    Some((card.id, card.exposure, session.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut tasks = Vec::new();
+        let mut hydrate = false;
+        for (card, exposure, session) in held {
+            if !self.listed_in_registry(card) {
+                self.shared_views.attached.remove(&card);
+                if self.prepare_saved_terminal(card, &session) {
+                    tasks.push(self.inspect_saved_terminal(card));
+                    continue;
+                }
+            }
+            self.readmit_held_terminal(card, exposure);
+            hydrate = true;
+        }
+        if hydrate {
+            tasks.push(cosmic::task::message(Message::LifecycleSweep));
+        }
+        Task::batch(tasks)
+    }
+
     pub(super) fn worktree_view_scope(&self, path: &Path) -> Option<Scope> {
         let project = self.sidebar_model.projects.iter().find(|project| {
             project
@@ -1461,6 +1551,7 @@ impl Cagents {
             }
         }
         self.reproject_notification_unread();
+        tasks.push(self.release_held_terminals());
         Task::batch(tasks)
     }
 
@@ -1784,7 +1875,14 @@ impl Cagents {
                     }
                 }
             }
+            // A terminal this window restored as its own saved terminal can be
+            // listed in a view later, through its own seed or once its folder
+            // is opened as a project. Shared, it may only attach, so it leaves
+            // the saved presentation, which no longer owns it, and hydrates on
+            // the attach-only path instead of loading with nothing to start it.
             self.shared_views.attached.insert(pane.id);
+            let leaves_saved = matches!(pane.kind, CardKind::Terminal(_))
+                && self.saved_terminals.entries.remove(&pane.id).is_some();
             if self.shared_upgrade_target_changed(pane) {
                 let (pending, saved_copy) = self.preserve_pending_shared_upgrade(pane.id);
                 tasks.push(pending);
@@ -1822,17 +1920,15 @@ impl Cagents {
                     .is_some_and(|card| matches!(card.residency, Residency::Hydrating { .. }));
             let failed_pending = pane.pending_terminal_start
                 && matches!(self.cards.get(&pane.id), Some(CardRuntime::Failed(_)));
-            if matches!(pane.kind, CardKind::Terminal(_)) && no_start && (waiting || failed_pending)
+            if matches!(pane.kind, CardKind::Terminal(_))
+                && ((no_start && (waiting || failed_pending))
+                    || (leaves_saved
+                        && matches!(self.cards.get(&pane.id), Some(CardRuntime::Loading))))
             {
-                self.cards.insert(pane.id, CardRuntime::Loading);
                 let exposure = existing
                     .as_ref()
                     .map_or(Exposure::Offscreen, |card| card.exposure);
-                self.lifecycle
-                    .register(pane.id, exposure, Residency::Cold, Instant::now());
-                if let Some(card) = self.card_state_mut(pane.id) {
-                    card.residency = Residency::Cold;
-                }
+                self.readmit_held_terminal(pane.id, exposure);
             }
             match existing {
                 Some(card) if card.existence.is_open() => {
@@ -1855,6 +1951,21 @@ impl Cagents {
                         if !same_session {
                             // A held title belongs to the replaced session.
                             self.reported_title_save.cards.remove(&pane.id);
+                            // Text the reader is composing in a draft was never
+                            // sent anywhere, so the chat that replaces the draft
+                            // opens with it: another unstarted draft, or the
+                            // conversation another client started from it, even
+                            // when the reader never saw the intermediate draft.
+                            // What the runtime shows decides, not the stored
+                            // descriptor, which may already name a started
+                            // conversation. Text written to a started
+                            // conversation is not handed to a different one.
+                            if matches!(pane.kind, CardKind::Chat(_))
+                                && matches!(self.cards.get(&pane.id),
+                                    Some(CardRuntime::Chat(runtime)) if runtime.session.is_unstarted())
+                            {
+                                self.stash_unsent_chat(pane.id);
+                            }
                             self.cards.remove(&pane.id);
                             self.lifecycle.remove(pane.id);
                             // Card identity survives a session replacement, but
@@ -2305,7 +2416,7 @@ mod tests {
         assert_eq!(
             app.notices
                 .recent()
-                .map(|entry| entry.notice.key)
+                .map(|entry| entry.notice.key.clone())
                 .collect::<Vec<_>>(),
             [Some(NoticeKey::ChatAttach(card))],
             "an open pane keeps its report; one that is gone has none"
@@ -5245,6 +5356,168 @@ mod tests {
         assert!(app.terminal_starts.lock().unwrap().contains_key(&id));
     }
 
+    /// #2104: a window restored while its registry is still connecting holds
+    /// every saved terminal it may share. Projecting a view admits its own held
+    /// terminals again once the registry answers; a terminal the registry lists
+    /// in no view has no projection, so it must be released too. It restores
+    /// as this window's own saved terminal rather than spinning forever or
+    /// waiting for another window to host it.
+    #[test]
+    fn restored_window_local_terminal_held_for_registry_restores_as_saved_once_it_answers() {
+        let (mut app, _, _, _) = fixture();
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(session, None));
+        let id = app.workspace.focused().unwrap();
+        assert!(!app.durable.pending_terminal_creations.contains(&id));
+        // Restart: the saved window had joined a registry, so its terminal
+        // may be shared, and the new process has not heard from one yet.
+        let identity = app.workspace_model.identity;
+        Arc::make_mut(&mut app.durable).workspace_model_identity = Some(identity);
+        app.shared_views = State::for_workspace(&app.durable);
+        app.workspace_model = crate::workspace_model::WorkspaceModel::default();
+        app.terminal_starts.lock().unwrap().clear();
+        app.cards.insert(id, CardRuntime::Loading);
+        app.card_state_mut(id).unwrap().residency = Residency::Hibernated;
+        app.lifecycle
+            .register(id, Exposure::Visible, Residency::Hibernated, Instant::now());
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        assert!(
+            matches!(
+                app.lifecycle.state(id),
+                Some((_, Residency::Hydrating { .. }))
+            ),
+            "the lifecycle counts the held terminal as hydrating"
+        );
+        assert!(
+            app.terminal_starts.lock().unwrap().is_empty(),
+            "a possibly shared terminal waits for the registry"
+        );
+
+        let mut model = crate::workspace_model::WorkspaceModel::default();
+        model.identity = identity;
+        model.sequence = 1;
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Connected(model),
+        ));
+        assert!(
+            !app.shared_views.attached.contains(&id),
+            "a terminal the registry lists in no view is this window's own"
+        );
+        assert!(
+            app.saved_terminal_current(id).is_some(),
+            "it restores as a saved terminal, as an unshared window restores it"
+        );
+        // The one start in flight is the saved terminal's metadata-only
+        // inspection, which attaches only an exact existing terminal.
+        assert_eq!(app.terminal_starts.lock().unwrap().get(&id), Some(&1));
+        // Neither the lifecycle nor a later reconciliation starts the saved
+        // command alongside it.
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        drop(app.reconcile_shared_views());
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        assert_eq!(
+            app.terminal_starts.lock().unwrap().get(&id),
+            Some(&1),
+            "a saved recipe is not run without the user asking"
+        );
+        assert!(app.saved_terminal_current(id).is_some());
+        assert!(!app.shared_views.attached.contains(&id));
+    }
+
+    /// A terminal restored as this window's own saved terminal can be listed
+    /// in a view later, by this window's own seed or once its folder is
+    /// opened as a project. Listed, it is shared and may only attach, so it
+    /// must leave the saved presentation and start on the attach-only path
+    /// rather than keep loading with nothing left to start it.
+    #[test]
+    fn saved_terminal_listed_in_a_view_later_hydrates_as_shared() {
+        // The registry knows the channel, so its view can be projected here.
+        let (mut app, a, _, _) = channel_move_fixture();
+        let channels = app.workspace_model.channels.clone();
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(session, None));
+        let id = app.workspace.focused().unwrap();
+        // Saved before the window last closed, its creation long settled.
+        Arc::make_mut(&mut app.durable)
+            .pending_terminal_creations
+            .remove(&id);
+        let identity = app.workspace_model.identity;
+        Arc::make_mut(&mut app.durable).workspace_model_identity = Some(identity);
+        app.shared_views = State::for_workspace(&app.durable);
+        app.workspace_model = crate::workspace_model::WorkspaceModel::default();
+        app.terminal_starts.lock().unwrap().clear();
+        app.cards.insert(id, CardRuntime::Loading);
+        app.card_state_mut(id).unwrap().residency = Residency::Hibernated;
+        app.lifecycle
+            .register(id, Exposure::Visible, Residency::Hibernated, Instant::now());
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        let mut model = crate::workspace_model::WorkspaceModel::default();
+        model.identity = identity;
+        model.sequence = 1;
+        model.channels = channels;
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Connected(model),
+        ));
+        assert!(app.saved_terminal_current(id).is_some());
+        assert_eq!(app.terminal_starts.lock().unwrap().get(&id), Some(&1));
+
+        let mut view = View::empty(a);
+        view.panes
+            .push(Pane::from_card(app.card_state(id).unwrap(), None).unwrap());
+        app.workspace_model.views = vec![view.clone()];
+        drop(app.project_shared_view(&view, &HashSet::from([id])));
+        assert!(app.shared_views.attached.contains(&id));
+        assert!(
+            !app.saved_terminals.entries.contains_key(&id),
+            "a listed terminal is no longer presented as this window's saved terminal"
+        );
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        assert_eq!(
+            app.terminal_starts.lock().unwrap().get(&id),
+            Some(&2),
+            "the attach-only start runs beside the inspection it replaces"
+        );
+    }
+
+    /// The shared counterpart: a held terminal the registry lists in a view
+    /// this window does not project (here the fixture's channels are absent
+    /// from the registry) is admitted to hydrate again and stays shared, so it
+    /// only attaches, since another window may host it.
+    #[test]
+    fn restored_shared_terminal_held_for_registry_attaches_once_it_answers() {
+        let (mut app, a, _, _) = fixture();
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(session, None));
+        let id = app.workspace.focused().unwrap();
+        let identity = app.workspace_model.identity;
+        Arc::make_mut(&mut app.durable).workspace_model_identity = Some(identity);
+        app.shared_views = State::for_workspace(&app.durable);
+        app.shared_views.initialized.insert(Scope::Channel(a));
+        app.workspace_model = crate::workspace_model::WorkspaceModel::default();
+        app.terminal_starts.lock().unwrap().clear();
+        app.cards.insert(id, CardRuntime::Loading);
+        app.card_state_mut(id).unwrap().residency = Residency::Hibernated;
+        app.lifecycle
+            .register(id, Exposure::Visible, Residency::Hibernated, Instant::now());
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+
+        let mut view = View::empty(a);
+        view.panes
+            .push(Pane::from_card(app.card_state(id).unwrap(), None).unwrap());
+        let mut model = crate::workspace_model::WorkspaceModel::default();
+        model.identity = identity;
+        model.sequence = 1;
+        model.views = vec![view];
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Connected(model),
+        ));
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        assert_eq!(app.terminal_starts.lock().unwrap().get(&id), Some(&1));
+        assert!(app.shared_views.attached.contains(&id));
+        assert!(app.saved_terminal_current(id).is_none());
+    }
+
     #[test]
     fn explicit_terminal_creation_is_durable_and_waits_for_reservation() {
         let (mut app, a, _, first) = fixture();
@@ -6488,5 +6761,146 @@ mod tests {
         );
         assert!(!app.card_state(pane.id).unwrap().existence.is_open());
         drop((first, second));
+    }
+
+    /// Unsent composer text belongs to the card. Another client replacing an
+    /// unstarted chat's identity, then moving the card to another channel, must
+    /// leave the text in the composer and in what autosave writes. That holds
+    /// when the replacement is already started, as when another client's Send
+    /// lands before this window sees its unstarted candidate.
+    #[test]
+    fn unsent_text_survives_replaced_identity_and_transfer() {
+        use crate::app::workspace_model_sync::ModelUpdate;
+        const TEXT: &str = "unsent fixture draft\n  keeps its spacing ";
+        for (replace, transfer, started) in [
+            (true, false, false),
+            (true, true, false),
+            (false, true, false),
+            (true, false, true),
+        ] {
+            let case = format!("replace={replace} transfer={transfer} started={started}");
+            let (mut app, a, b, _) = fixture();
+            app.active_workspace = Some(PathBuf::from("/repo"));
+            Arc::make_mut(&mut app.durable).active_channel = Some(a);
+            drop(app.new_native_chat(crate::agent::Provider::Claude, Some("/repo".into())));
+            let card = app.workspace.focused().unwrap();
+            let target = match app.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) => runtime.target,
+                _ => panic!("{case}: a new chat opens a draft runtime"),
+            };
+            drop(app.update(Message::ChatUi(chat_ui::Action::Composer(
+                target,
+                cosmic::widget::text_editor::Action::Edit(
+                    cosmic::widget::text_editor::Edit::Paste(Arc::new(TEXT.into())),
+                ),
+            ))));
+            let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+            app.shared_views.pending.clear();
+            let mut model = app.workspace_model.clone();
+            model.views = vec![View::empty(a), View::empty(b)];
+            model.channels = [a, b]
+                .into_iter()
+                .map(|id| crate::workspace_model::ModelChannel {
+                    id,
+                    repository: PathBuf::from("/repo"),
+                    title: "view".into(),
+                    title_source: Default::default(),
+                    ordinal: 1,
+                })
+                .collect();
+            model.views[0].panes.push(pane.clone());
+            let mut apply =
+                |app: &mut Cagents, model: &mut crate::workspace_model::WorkspaceModel, scope| {
+                    model.sequence += 1;
+                    for view in &mut model.views {
+                        view.revision += 1;
+                    }
+                    drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                        scope,
+                        operation: None,
+                        model: model.clone(),
+                    }));
+                };
+            apply(&mut app, &mut model, Scope::Channel(a));
+            if replace {
+                let CardKind::Chat(session) = &mut pane.kind else {
+                    unreachable!()
+                };
+                session.id = TerminalId::new();
+                if started {
+                    session.launch.session_id = Some("fixture-started-conversation".into());
+                }
+                assert_eq!(session.is_unstarted(), !started, "{case}");
+                model.views[0].panes = vec![pane.clone()];
+                apply(&mut app, &mut model, Scope::Channel(a));
+            }
+            if started {
+                // The started conversation attaches asynchronously and opens
+                // its composer with the text it was handed.
+                assert!(app.card_state(card).unwrap().existence.is_open(), "{case}");
+                let ready = chat_ui::ready_message_for_pending_switch(
+                    &app,
+                    card,
+                    crate::chat::Snapshot::default(),
+                );
+                drop(app.update(ready));
+                match app.cards.get(&card) {
+                    Some(CardRuntime::Chat(runtime)) => {
+                        assert!(!runtime.session.is_unstarted(), "{case}: attached");
+                        assert_eq!(runtime.unsent_text(), TEXT, "{case}: composer");
+                    }
+                    _ => panic!("{case}: the started conversation attaches"),
+                }
+                assert_eq!(
+                    app.persistent_workspace()
+                        .chat_drafts
+                        .get(&card)
+                        .map(String::as_str),
+                    Some(TEXT),
+                    "{case}: autosave"
+                );
+                continue;
+            }
+            if transfer {
+                model.views[0].panes.clear();
+                model.views[1].panes = vec![pane.clone()];
+                apply(&mut app, &mut model, Scope::Channel(b));
+                // A repeated delivery must not open the draft a second time
+                // without its text.
+                apply(&mut app, &mut model, Scope::Channel(b));
+            }
+            let home = if transfer { b } else { a };
+            assert!(
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == home)
+                    .is_some_and(|channel| channel.cards == [card]),
+                "{case}: the card follows the view"
+            );
+            assert!(app.card_state(card).unwrap().existence.is_open(), "{case}");
+            match app.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) => {
+                    assert_eq!(runtime.unsent_text(), TEXT, "{case}: composer");
+                    assert_eq!(
+                        Some(&runtime.session.id),
+                        match &pane.kind {
+                            CardKind::Chat(session) => Some(&session.id),
+                            _ => None,
+                        },
+                        "{case}: the runtime follows the canonical identity"
+                    );
+                }
+                _ => panic!("{case}: the card keeps a chat runtime"),
+            }
+            assert_eq!(
+                app.persistent_workspace()
+                    .chat_drafts
+                    .get(&card)
+                    .map(String::as_str),
+                Some(TEXT),
+                "{case}: autosave"
+            );
+        }
     }
 }

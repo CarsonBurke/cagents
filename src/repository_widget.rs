@@ -5195,10 +5195,11 @@ impl RepositoryRuntime {
         // Highlighting follows the bytes, which is the source; the identity
         // stays the row, which is what the result is matched against.
         let source = document.source.clone();
-        // Capture this revision without copying the native buffer on the UI
-        // thread. The worker serializes only if its revision is still wanted.
-        let snapshot = document.content.text_snapshot();
-        if snapshot.len() as u64 > MAX_DIFF_SIDE_BYTES {
+        // Only the debounce boundary serializes the native buffer. No Git is
+        // invoked, no second editable Content is created, and queued edits do
+        // not retain copies of superseded text.
+        let after = document.content.text();
+        if after.len() as u64 > MAX_DIFF_SIDE_BYTES {
             self.working_diff.applied = self.working_diff.desired.clone();
             self.working_diff.error = Some("The unsaved buffer exceeds the diff size limit. Editing and safe saving remain available.".into());
             return Task::none();
@@ -5215,10 +5216,6 @@ impl RepositoryRuntime {
         cosmic::task::future(async move {
             let baseline = Arc::clone(&before);
             let result = tokio::task::spawn_blocking(move || {
-                if cancellation.is_cancelled() {
-                    return None;
-                }
-                let after = snapshot.to_string_uncached();
                 build_document_diff(baseline, &after, &source, syntax_theme, &cancellation)
             })
             .await
@@ -12031,6 +12028,20 @@ struct DiffHorizontalContent<'a> {
     viewport: Option<iced::Size>,
 }
 
+impl DiffHorizontalContent<'_> {
+    /// The translated content, still in the enclosing scrollable's
+    /// coordinates. The real X translation is part of the child's layout, so
+    /// it must not consume the virtual offset descendants use for screen
+    /// positions, popup anchors and operation bounds.
+    fn content_layout(layout: Layout<'_>) -> Layout<'_> {
+        layout
+            .children()
+            .next()
+            .expect("diff content")
+            .with_virtual_offset(layout.virtual_offset())
+    }
+}
+
 impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizontalContent<'_> {
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
@@ -12061,6 +12072,27 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
             vec![child.move_to(iced::Point::new(-self.offset, 0.0))],
         )
     }
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &cosmic::Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        let Some(child) = layout.children().next() else {
+            return;
+        };
+        let mut inner = cosmic::iced::advanced::clipboard::DndDestinationRectangles::new();
+        self.content.as_widget().drag_destinations(
+            &tree.children[0],
+            child.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            &mut inner,
+        );
+        let mut rectangles = inner.into_rectangles();
+        crate::workspace_widget::clip_drag_destinations(&mut rectangles, layout.bounds());
+        destinations.append(&mut rectangles);
+    }
     fn operate(
         &mut self,
         tree: &mut Tree,
@@ -12070,7 +12102,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
     ) {
         self.content.as_widget_mut().operate(
             &mut tree.children[0],
-            layout.children().next().expect("diff content"),
+            Self::content_layout(layout),
             renderer,
             operation,
         );
@@ -12089,7 +12121,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
-            layout.children().next().expect("diff content"),
+            Self::content_layout(layout),
             cursor,
             renderer,
             clipboard,
@@ -12115,7 +12147,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
                     renderer,
                     theme,
                     style,
-                    layout.children().next().expect("diff content"),
+                    Self::content_layout(layout),
                     cursor,
                     &clip,
                 );
@@ -12133,7 +12165,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
     ) -> iced::mouse::Interaction {
         self.content.as_widget().mouse_interaction(
             &tree.children[0],
-            layout.children().next().expect("diff content"),
+            Self::content_layout(layout),
             cursor,
             viewport,
             renderer,
@@ -12151,7 +12183,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
     > {
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
-            layout.children().next().expect("diff content"),
+            Self::content_layout(layout),
             renderer,
             viewport,
             translation,
@@ -12204,32 +12236,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
             || layout.bounds(),
             |size| iced::Rectangle::new(layout.position() + offset, size),
         );
-        for roots in [true, false] {
-            let nodes = if roots {
-                accessible.root_mut()
-            } else {
-                accessible.children_mut()
-            };
-            for accessible_node in nodes {
-                let node = accessible_node.node_mut();
-                if let Some(bounds) = node.bounds() {
-                    let x0 = bounds.x0.max(f64::from(clip.x));
-                    let y0 = bounds.y0.max(f64::from(clip.y));
-                    let x1 = bounds.x1.min(f64::from(clip.x + clip.width));
-                    let y1 = bounds.y1.min(f64::from(clip.y + clip.height));
-                    if x1 <= x0 || y1 <= y0 {
-                        node.set_hidden();
-                    } else {
-                        node.set_bounds(Rect::new(
-                            x0 - f64::from(offset.x),
-                            y0 - f64::from(offset.y),
-                            x1 - f64::from(offset.x),
-                            y1 - f64::from(offset.y),
-                        ));
-                    }
-                }
-            }
-        }
+        crate::ui_controls::accessible_bounds::place(&mut accessible, offset, Some(clip));
         accessible
     }
 }
@@ -13049,7 +13056,7 @@ mod tests {
     }
 
     #[test]
-    fn working_diff_serializes_native_source_only_on_an_uncancelled_worker() {
+    fn working_diff_worker_matches_the_native_source_and_leaves_the_editor_alone() {
         use cosmic::iced::futures::StreamExt;
 
         for cancelled in [false, true] {
@@ -13068,10 +13075,6 @@ mod tests {
             drop(runtime.working_diff_task(card));
             let ticket = runtime.working_diff.timer.unwrap();
             runtime.working_diff.deadline = Some(Instant::now());
-            let DocumentState::Editable(document) = &runtime.document else {
-                panic!("native buffer")
-            };
-            let snapshot = document.content.text_snapshot();
             let editor_state = |runtime: &RepositoryRuntime| {
                 let DocumentState::Editable(document) = &runtime.document else {
                     panic!("native buffer")
@@ -13087,15 +13090,8 @@ mod tests {
             };
             let original_state = editor_state(&runtime);
             assert!(runtime.is_dirty());
-            text_editor::take_text_call_count();
 
             let task = runtime.start_working_diff(card, ticket);
-            assert_eq!(
-                text_editor::take_text_call_count(),
-                0,
-                "starting a debounced diff must not serialize on the UI thread"
-            );
-            assert_eq!(snapshot.serialization_count(), 0);
             assert_eq!(editor_state(&runtime), original_state);
             if cancelled {
                 runtime
@@ -13124,7 +13120,6 @@ mod tests {
             };
             if cancelled {
                 assert!(matches!(result, Ok(None)));
-                assert_eq!(snapshot.serialization_count(), 0);
             } else {
                 let model = result.as_ref().unwrap().as_ref().unwrap();
                 let expected = crate::diff_view::build_diff(baseline, after);
@@ -13139,17 +13134,12 @@ mod tests {
                 assert_eq!(model.line_counts, expected.line_counts);
                 assert_eq!(model.inline_rows, expected.inline_rows);
                 assert_eq!(model.split_rows, expected.split_rows);
-                assert_eq!(snapshot.serialization_count(), 1);
             }
             drop(runtime.update(completion));
             if !cancelled {
                 assert!(runtime.working_annotations_current());
             }
             assert_eq!(editor_state(&runtime), original_state);
-            assert!(
-                !snapshot.is_materialized(),
-                "a transient diff input must not stay cached in native history"
-            );
         }
     }
 
@@ -20267,6 +20257,158 @@ mod tests {
     /// A buffer whose tokens are exactly the ones the smoke run found
     /// indistinguishable: a comment, a keyword, a string, and a macro call.
     const HIGHLIGHTABLE: &str = "// what main does\nfn main() {\n    let hello = \"world\";\n    println!(\"{hello}\");\n}\n";
+
+    #[test]
+    fn nested_horizontal_diff_preserves_virtual_offsets_for_descendants() {
+        use crate::workspace_widget::forwarding_test::{Traverse, leaf, renderer};
+        use cosmic::iced::{Point, Size, Vector};
+
+        let mut renderer = renderer();
+        // The canvas cancels horizontal scrolling while a row applies it to
+        // its text. Neither real translation may consume the enclosing
+        // scrollable's virtual offset before a descendant opens an overlay
+        // or participates in an operation.
+        for offset in [
+            Vector::ZERO,
+            Vector::new(4.0, -20.0),
+            Vector::new(-9.0, 35.0),
+        ] {
+            let (content, visits) = leaf::<RepositoryAction>(Size::new(500.0, 60.0), vec![]);
+            let row = Element::new(DiffHorizontalContent {
+                content,
+                width: Length::Fixed(300.0),
+                content_width: 500.0,
+                offset: 80.0,
+                accessible_text: None,
+                viewport: None,
+            });
+            let mut canvas = Element::new(DiffHorizontalContent {
+                content: row,
+                width: Length::Fixed(100.0),
+                content_width: 300.0,
+                offset: -80.0,
+                accessible_text: None,
+                viewport: None,
+            });
+            let mut tree = Tree::new(&canvas);
+            let node = canvas
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(100.0, 60.0)),
+                )
+                .move_to(Point::new(30.0, 40.0));
+            let layout = Layout::new(&node).with_virtual_offset(offset);
+            canvas
+                .as_widget_mut()
+                .operate(&mut tree, layout, &renderer, &mut Traverse);
+            assert!(
+                canvas
+                    .as_widget_mut()
+                    .overlay(&mut tree, layout, &renderer, &layout.bounds(), Vector::ZERO)
+                    .is_none()
+            );
+            let mut messages = Vec::new();
+            canvas.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                    position: Point::new(50.0, 50.0),
+                }),
+                layout,
+                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &layout.bounds(),
+            );
+            canvas.as_widget().mouse_interaction(
+                &tree,
+                layout,
+                iced::mouse::Cursor::Unavailable,
+                &layout.bounds(),
+                &renderer,
+            );
+            canvas.as_widget().draw(
+                &tree,
+                &mut renderer,
+                &cosmic::Theme::default(),
+                &renderer::Style::default(),
+                layout,
+                iced::mouse::Cursor::Unavailable,
+                &layout.bounds(),
+            );
+            for kind in ["operate", "overlay", "update", "mouse_interaction", "draw"] {
+                assert_eq!(visits.offsets(kind), vec![offset], "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn horizontal_diff_forwards_translated_and_clipped_drop_targets() {
+        use crate::workspace_widget::forwarding_test::{leaf, renderer};
+        use cosmic::iced::{
+            Point, Rectangle, Size, Vector, advanced::clipboard::DndDestinationRectangles,
+        };
+        let renderer = renderer();
+        let (content, visits) = leaf::<RepositoryAction>(
+            Size::new(300.0, 60.0),
+            vec![
+                (1, Rectangle::new(Point::ORIGIN, Size::new(50.0, 60.0))),
+                (
+                    2,
+                    Rectangle::new(Point::new(60.0, 0.0), Size::new(80.0, 60.0)),
+                ),
+                (
+                    3,
+                    Rectangle::new(Point::new(150.0, 0.0), Size::new(80.0, 60.0)),
+                ),
+            ],
+        );
+        let mut widget = Element::new(DiffHorizontalContent {
+            content,
+            width: Length::Fixed(100.0),
+            content_width: 300.0,
+            offset: 80.0,
+            accessible_text: None,
+            viewport: None,
+        });
+        let mut tree = Tree::new(&widget);
+        let node = widget
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(100.0, 60.0)),
+            )
+            .move_to(Point::new(30.0, 40.0));
+        let offset = Vector::new(4.0, -20.0);
+        let mut destinations = DndDestinationRectangles::new();
+        widget.as_widget().drag_destinations(
+            &tree,
+            Layout::new(&node).with_virtual_offset(offset),
+            &renderer,
+            &mut destinations,
+        );
+        let actual: Vec<_> = destinations
+            .into_native_rectangles()
+            .into_iter()
+            .map(|destination| {
+                (
+                    destination.id,
+                    destination.rectangle.x,
+                    destination.rectangle.y,
+                    destination.rectangle.width,
+                    destination.rectangle.height,
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            vec![(3, 100.0, 40.0, 30.0, 60.0), (2, 30.0, 40.0, 60.0, 60.0)]
+        );
+        assert_eq!(visits.offsets("drag"), vec![offset]);
+    }
 
     /// A headless `cosmic::Renderer`. With no graphics device it falls back to
     /// `tiny-skia`, which needs neither a device nor a surface and which can

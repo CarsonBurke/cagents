@@ -216,9 +216,12 @@ jobs:
           for name, source, fixture in (
               ("validation checkout", "scripts/prepare-validation-checkout", "tests/prepare_validation_checkout.py"),
               ("process custody", "scripts/qualification/process_custody.py", "tests/qualification/test_process_custody.py"),
+              ("native evidence", "scripts/native-evidence", "tests/native_evidence.py"),
               ("build directory seeding", "scripts/seed-build-dir", "tests/seed_build_dir.py"),
               ("build disk guard and gate install", "scripts/build-disk-guard", "tests/build_disk_guard.py"),
+              ("build offload", "scripts/cargo-offload", "tests/cargo_offload.py"),
               ("focused lib tests", "scripts/test-lib", "tests/test_lib.py"),
+              ("lock holders", "scripts/lock-holders", "tests/lock_holders.py"),
           ):
               source_present = present(Path(source))
               fixture_present = present(Path(fixture))
@@ -234,6 +237,10 @@ jobs:
                   result = subprocess.run(["sh", "-n", *shell])
                   if result.returncode:
                       raise SystemExit(result.returncode)
+              if source == "scripts/native-evidence":
+                  result = subprocess.run(["bash", "-n", source])
+                  if result.returncode:
+                      raise SystemExit(result.returncode)
               result = subprocess.run([sys.executable, "-I", "-B", fixture, "-v"])
               if result.returncode:
                   raise SystemExit(result.returncode)
@@ -244,14 +251,10 @@ jobs:
           CHECK_FORMAT_CARGO_FIXTURE: "1"
         run: python3 tests/check_format.py -v
 
-      - name: Check native evidence contracts
-        run: python3 -I -B tests/native_evidence.py -v
-
       - name: Check shell syntax
         run: |
           sh -n scripts/run-development
           sh -n scripts/check-format
-          bash -n scripts/native-evidence
 
       - name: Check repository formatting
         run: scripts/check-format

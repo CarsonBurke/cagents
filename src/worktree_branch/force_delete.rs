@@ -1,7 +1,7 @@
 //! Keep native checkout refusal and bind force consent inside Git's ref lock.
 use super::git_command;
 use crate::repository::{CancellationToken, ProcessExecutor, SystemProcessExecutor};
-use std::{io::Write, os::unix::fs::PermissionsExt, path::Path};
+use std::path::Path;
 
 const PROBE: &str = "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nif [ \"$1\" = prepared ]; then printf prepared > \"$CAGENTS_DELETE_PROOF\"; fi\n";
 const GUARD: &str = r##"#!/bin/sh
@@ -64,9 +64,7 @@ pub(super) fn delete(
     let registration_guard = guards.write_proof(temporary.path())?;
     let hook = temporary.path().join("reference-transaction");
     let proof = temporary.path().join("prepared");
-    std::fs::write(&hook, PROBE).map_err(|error| error.to_string())?;
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700))
-        .map_err(|error| error.to_string())?;
+    super::write_executable(&hook, PROBE.as_bytes(), true)?;
     let mut hooks = std::ffi::OsString::from("core.hooksPath=");
     hooks.push(temporary.path());
     // Prove the installed Git calls a rejecting-capable prepared hook before
@@ -94,15 +92,7 @@ pub(super) fn delete(
         return Err("Git did not prove reference-transaction support; branch retained".into());
     }
     std::fs::remove_file(&proof).map_err(|error| error.to_string())?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&hook)
-        .map_err(|error| error.to_string())?;
-    file.write_all(GUARD.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|error| error.to_string())?;
-    drop(file);
+    super::write_executable(&hook, GUARD.as_bytes(), false)?;
     // Git propagates this command's -c hooksPath through its environment.
     // Restore the original command configuration only for the chained hook,
     // so policy hooks can delegate to sibling hooks and child Git commands.
