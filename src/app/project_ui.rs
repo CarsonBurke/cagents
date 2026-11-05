@@ -2018,7 +2018,8 @@ impl Cagents {
     }
 }
 
-/// Names a few ignored files inline; the notice details list all of them.
+/// Names a few ignored files inline; when more remain, the notice details
+/// list all of them.
 fn merged_worktree_kept_notice(label: &str, ignored: &[String]) -> TransientNotice {
     const INLINE: usize = 3;
     if ignored.is_empty() {
@@ -2026,13 +2027,19 @@ fn merged_worktree_kept_notice(label: &str, ignored: &[String]) -> TransientNoti
             "{label} is merged. Its worktree was kept; choose Delete worktree when you no longer need it."
         ));
     }
-    let mut names = ignored[..ignored.len().min(INLINE)].join(", ");
-    if ignored.len() > INLINE {
-        names.push_str(&format!(" and {} more", ignored.len() - INLINE));
+    let names = ignored[..ignored.len().min(INLINE)].join(", ");
+    let message = |names: &str| {
+        format!(
+            "{label} is merged. Its worktree was kept because it holds ignored files: {names}. Deleting it would discard them."
+        )
+    };
+    if ignored.len() <= INLINE {
+        return TransientNotice::warning(message(&names));
     }
-    TransientNotice::warning(format!(
-        "{label} is merged. Its worktree was kept because it holds ignored files: {names}. Deleting it would discard them."
-    ))
+    TransientNotice::warning(message(&format!(
+        "{names} and {} more",
+        ignored.len() - INLINE
+    )))
     .with_details(ignored.join("\n"))
 }
 
@@ -2714,6 +2721,24 @@ mod tests {
     }
 
     #[test]
+    fn merged_worktree_kept_notice_lists_overflowing_ignored_files_in_details() {
+        let quiet = merged_worktree_kept_notice("feature", &[]);
+        assert!(quiet.message.contains("choose Delete worktree"));
+        assert_eq!(quiet.details, None);
+
+        let files: Vec<String> = [".env", "a.db", "b.db", "c.db", "d.db"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let notice = merged_worktree_kept_notice("feature", &files);
+        assert!(notice.message.contains(".env, a.db, b.db and 2 more"));
+        assert_eq!(
+            notice.details.as_deref(),
+            Some(".env\na.db\nb.db\nc.db\nd.db")
+        );
+    }
+
+    #[test]
     fn merged_worktree_notice_keeps_editor_documents_and_cards() {
         removal_callback_test(|| {
             let (mut app, _root, target) = removal_lsp_app();
@@ -3044,7 +3069,7 @@ mod tests {
         let notice = app.status.as_ref().unwrap();
         assert!(notice.message.contains("is merged"));
         assert!(notice.message.contains(".env, data.db"));
-        assert_eq!(notice.details.as_deref(), Some(".env\ndata.db"));
+        assert_eq!(notice.details, None);
         let session = app.session.as_ref().unwrap();
         session.flush(Duration::from_secs(5)).unwrap();
         let retained = session
