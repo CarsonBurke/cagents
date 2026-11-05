@@ -2619,6 +2619,7 @@ impl Actor {
                 | Command::Compact
                 | Command::Slash { .. }
                 | Command::StartQueued { .. }
+                | Command::SendQueuedNow
                 | Command::Branch { .. }
                 | Command::SetPermissionMode { .. } => true,
                 Command::UpdatePermissionSettings { .. } => true,
@@ -3274,6 +3275,8 @@ fn apply_projected_event(
             );
         }
         Event::QueueChanged(messages) => state.queued_messages = messages,
+        Event::SendNow(send_now) => state.send_now = send_now,
+        Event::BackgroundCommands(commands) => state.background_commands = commands,
         Event::QueueRemoval(removal) => {
             state.queue_removals.push(removal);
             let excess = state
@@ -3296,6 +3299,8 @@ fn apply_projected_event(
             state.forked = None;
             state.interrupt_mode = None;
             state.queued_messages.clear();
+            state.send_now = None;
+            state.background_commands.clear();
             state.queue_removals.clear();
             state.items.clear();
             state.subagents.clear();
@@ -3668,6 +3673,9 @@ fn apply_projected_event(
         }
         Event::Exited { .. } => {
             state.prompt_suggestion = None;
+            // Nothing is left to deliver to or to stop.
+            state.send_now = None;
+            state.background_commands.clear();
             state.exited = true;
             state.waiting = false;
             state.busy = false;

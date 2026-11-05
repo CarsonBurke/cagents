@@ -1179,6 +1179,12 @@ pub struct Snapshot {
     pub ready: bool,
     #[serde(default)]
     pub queued_messages: Vec<QueuedMessage>,
+    /// How a request to hand the queued messages to the running turn stands.
+    #[serde(default)]
+    pub send_now: Option<SendNow>,
+    /// Commands the main agent left running behind it, oldest first.
+    #[serde(default)]
+    pub background_commands: Vec<BackgroundCommand>,
     /// How the provider answered recent requests to remove a queued message,
     /// oldest first. A message leaving `queued_messages` does not say whether
     /// it was removed or delivered; this does.
@@ -1510,6 +1516,13 @@ pub enum Command {
         id: String,
     },
     StartQueued {
+        id: String,
+    },
+    /// Ask the running turn to make way for everything queued. Carried only
+    /// where [`Capabilities::send_queued_now`] says so.
+    SendQueuedNow,
+    /// Stop one entry of [`Snapshot::background_commands`].
+    StopBackgroundCommand {
         id: String,
     },
     SetInterruptMode {
@@ -2149,7 +2162,42 @@ pub struct Capabilities {
     /// background, rather than only the turn and the work inside it.
     #[serde(default)]
     pub interrupt_stops_background: bool,
+    /// Whether [`Command::SendQueuedNow`] is carried by the provider, which
+    /// can then take queued messages into a turn blocked on long-running work.
+    #[serde(default)]
+    pub send_queued_now: bool,
 }
+/// What became of a request to hand the queued messages to the running turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SendNow {
+    /// Asked for. The provider has not yet said how the turn will make way.
+    Requested,
+    /// The turn is making way, and whatever it was waiting on is out of its
+    /// path. That work may or may not outlive the move.
+    Delivering,
+    /// The turn was stopped so the messages can start a new one.
+    Stopped,
+    /// The provider found nothing it could deliver early; what is still
+    /// queued goes when the turn reaches it.
+    Declined,
+}
+
+impl SendNow {
+    /// Whether the request is still being carried out.
+    pub fn in_flight(self) -> bool {
+        self != Self::Declined
+    }
+}
+
+/// A command still running after the main agent moved on from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundCommand {
+    pub id: String,
+    pub description: String,
+    /// A stop was requested and the provider has not yet reported the end.
+    pub stopping: bool,
+}
+
 /// Provider-confirmed speed setting, independent of model reasoning effort.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FastMode {
@@ -2390,6 +2438,8 @@ pub enum Event {
     },
     QueueChanged(Vec<QueuedMessage>),
     QueueRemoval(QueueRemoval),
+    SendNow(Option<SendNow>),
+    BackgroundCommands(Vec<BackgroundCommand>),
     /// Published until the provider has answered the asynchronous history
     /// request, independently of the command acknowledgement.
     HistoryLoading(bool),
