@@ -7,6 +7,17 @@
 use cosmic::iced::{Rectangle, Vector};
 use iced_accessibility::{A11yNode, A11yTree, accesskit::Rect};
 
+/// A clip spanning `left..right` that leaves the vertical axis unbounded,
+/// for a wrapper that hides only what it scrolls out of view horizontally.
+pub(crate) fn columns(left: f32, right: f32) -> Rectangle {
+    Rectangle {
+        x: left,
+        y: f32::MIN / 2.0,
+        width: right - left,
+        height: f32::MAX,
+    }
+}
+
 /// Moves every node of `accessible`, laid out in layout coordinates, to the
 /// screen by `offset`. With a `clip` in the same layout coordinates, a node
 /// outside it is hidden and one crossing it keeps only its shown part.
