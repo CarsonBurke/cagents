@@ -227,9 +227,13 @@ held() {
     trap 'interrupt 15' TERM
     trap 'interrupt 1' HUP
     trap 'interrupt 3' QUIT
+    # POSIX shells may replace async stdin with /dev/null before applying
+    # redirections. Save the caller's stdin on the now-free queue descriptor.
+    exec 8<&0
     CAGENTS_BUILD_SLOT_HELD=$$ python3 "$(dirname "$0")/cargo-gate-command.py" \
-        "$command_state/cancelled" "$@" 0<&0 8>&- 9>&- &
+        "$command_state/cancelled" "$@" 0<&8 8>&- 9>&- &
     child=$!
+    exec 8<&-
     status=0
     while :; do
         interrupted=false
