@@ -592,6 +592,13 @@ exact saved launch settings before confirmation; changing those settings or the
 schedule pauses future runs until you confirm again. Renaming preserves the
 existing execution settings.
 
+Select an automation to see its schedule, status and management actions first.
+Expand **Instructions**, **Execution settings**, or **Shell precheck** for the
+complete saved configuration. A precheck's presence and timeout stay visible
+while its command is collapsed. **Changes** loads recorded edits and schedule
+changes; **Run history** opens individual results. In a narrow pane, **Back to
+automations** restores the loaded list and search.
+
 Unless an existing channel was explicitly chosen and approved, the first accepted run creates the automation’s own channel, named after the
 automation. Later runs keep that channel and its title; provider-generated
 conversation titles do not replace it. You can rename the channel separately.
@@ -633,6 +640,9 @@ session; completed fresh sessions remain readable in history. A completion alert
 opens its run under **Automations**, with a trail back to the list, and
 survives provider cleanup. Removing a definition prevents future runs and
 retains its past runs.
+Removal first closes an idle reused agent. Resolve active or uncertain work
+before removing its automation; **View run** or **View latest run** opens
+the relevant run for inspection and agent recovery.
 
 The same operations are available without a window:
 
