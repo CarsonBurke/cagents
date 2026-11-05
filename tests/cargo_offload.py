@@ -106,6 +106,23 @@ class Parsing(unittest.TestCase):
         self.assertEqual(words("test", "--", "--nocapture"), ["test", "--", "--nocapture"])
 
 
+class BuildIdentity(unittest.TestCase):
+    def identity(self, *arguments, environment=None):
+        return offload.Offload("host", offload.parse(list(arguments)),
+                               environment or {}).build_identity()
+
+    def test_a_build_is_the_same_whatever_tests_it_would_pick(self):
+        self.assertEqual(self.identity("test", "--no-run", "--lib", "app::"),
+                         self.identity("test", "--no-run", "--lib", "--", "chat::"))
+        self.assertNotEqual(self.identity("test", "--no-run", "--lib"),
+                            self.identity("test", "--no-run", "--lib", "--features", "ui"))
+        self.assertNotEqual(self.identity("check"),
+                            self.identity("check", environment={"RUSTFLAGS": "-Dwarnings"}))
+
+    def test_a_command_that_runs_tests_there_is_no_build_to_wait_for(self):
+        self.assertEqual(self.identity("test", "--lib"), "")
+
+
 class Rewrite(unittest.TestCase):
     def test_the_build_hosts_paths_become_this_hosts(self):
         mappings = [("/h/slot-0/src/target", "/c/target"), ("/h/slot-0/src", "/c")]
@@ -510,7 +527,8 @@ class StandInHost(unittest.TestCase):
         self.root = Path(temporary.name)
         tools = self.root / "tools"
         tools.mkdir()
-        for name in ("cargo-gate", "cargo-gate-command.py", "cargo-offload"):
+        for name in ("cargo-gate", "cargo-gate-command.py", "cargo-gate-rustc-guard",
+                     "cargo-offload"):
             shutil.copy2(ROOT / "scripts" / name, tools / name)
         (tools / "ssh").write_text(STAND_IN_SSH)
         (tools / "ssh").chmod(0o755)
@@ -1280,6 +1298,20 @@ class RemoteRun(unittest.TestCase):
                 fcntl.flock(lock, fcntl.LOCK_UN)
                 self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
 
+    def test_slots_made_lately_count_as_full_until_they_fill(self):
+        with tempfile.TemporaryDirectory() as base:
+            stat = os.statvfs(base)
+            slot_disk = int(stat.f_bavail * stat.f_frsize * 0.6)
+            self.hold(base, 0, {"cost": 1, "pid": None})
+            first, lines = self.lease(base, slots=8, slot_disk=slot_disk)
+            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
+            # Slot 1 holds nothing yet, but will.
+            second, lines = self.lease(base, slots=8, slot_disk=slot_disk)
+            self.assertEqual(lines.next(10), "wait")
+            with self.assertRaises(TimeoutError):
+                lines.next(1.5)
+            self.assertFalse(Path(base, "slot-2").exists())
+
     def test_the_same_build_waits_for_its_slot_rather_than_build_again_elsewhere(self):
         with tempfile.TemporaryDirectory() as base:
             lock = self.hold(base, 0, {"cost": 1, "pid": None, "build": "same"})
@@ -1315,10 +1347,11 @@ class RemoteRun(unittest.TestCase):
             os.makedirs(base)
             self.hold(root, 0)
             echo = ["sh", "-c", "printf %s \"$CARGO_BUILD_JOBS\""]
-            self.assertEqual(self.run_agent(base, echo), str(max(4, cpus)))
+            most = max(4, min(8, cpus // 2))
+            self.assertEqual(self.run_agent(base, echo), str(min(max(4, cpus), most)))
             for index in (1, 2, 3):
                 self.hold(root, index)
-            self.assertEqual(self.run_agent(base, echo), str(max(4, cpus // 4)))
+            self.assertEqual(self.run_agent(base, echo), str(min(max(4, cpus // 4), most)))
 
     def test_closing_the_connection_ends_the_command_and_its_children(self):
         with tempfile.TemporaryDirectory() as base:

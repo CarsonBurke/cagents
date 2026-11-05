@@ -569,6 +569,8 @@ CPU_PRESSURE_LIMIT = 40
 # floor the host keeps free, before one is made. The variable is for tests
 # standing in for the build host; ssh does not pass it on.
 SLOT_DISK = int(os.environ.get("CAGENTS_OFFLOAD_SLOT_DISK_BYTES") or 50 * GIB)
+# How long a new slot is taken to be filling to that size.
+SLOT_FILLS = 12 * 3600
 
 
 def available_memory():
@@ -724,14 +726,18 @@ if command == "lease":
     marker = enclosing_checkout(temporary_directory(os.path.join(base, "slot-0")))
     if marker:
         say("marker", json.dumps(marker))
-    queue = open(os.path.join(base, "queue"), "a")
     announced = False
-    try:
-        fcntl.flock(queue, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        say("wait")
-        announced = True
-        fcntl.flock(queue, fcntl.LOCK_EX)
+    def join_queue():
+        global announced
+        queue = open(os.path.join(base, "queue"), "a")
+        try:
+            fcntl.flock(queue, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            say("wait")
+            announced = True
+            fcntl.flock(queue, fcntl.LOCK_EX)
+        return queue
+    queue = join_queue()
     def owner(index):
         try:
             with open(os.path.join(base, f"slot-{index}", "owner")) as file:
@@ -757,14 +763,31 @@ if command == "lease":
         if same:
             return same, "same"
         indices = existing[:]
-        # The first slot is always made; the disk floor below governs it.
-        if not existing or len(existing) < slots and free() - floor >= SLOT_DISK:
+        # The first slot is always made; the disk floor below governs it. A
+        # further one needs room for its build output beyond what the slots
+        # made lately have yet to take as they fill.
+        def growing(index):
+            try:
+                made = os.stat(os.path.join(base, f"slot-{index}", "made")).st_mtime
+            except OSError:
+                return False
+            return time.time() - made < SLOT_FILLS
+        pending = SLOT_DISK * sum(1 for index in existing if growing(index))
+        if not existing or len(existing) < slots and free() - floor - pending >= SLOT_DISK:
             indices.append(max(existing, default=-1) + 1)
         return sorted(indices, key=lambda index: (owner(index) != key, not built(index), index)), None
     while True:
         order, why = candidates()
+        if why != "same" and queue.closed:
+            # The build it waited for has ended: back in line, behind the
+            # builds that went on meanwhile.
+            queue = join_queue()
+            order, why = candidates()
         for index in order:
             slot = os.path.join(base, f"slot-{index}")
+            if not os.path.isdir(slot):
+                os.makedirs(os.path.join(slot, "src"), exist_ok=True)
+                open(os.path.join(slot, "made"), "a").close()
             os.makedirs(os.path.join(slot, "src"), exist_ok=True)
             lock = open(os.path.join(slot, "lock"), "a")
             try:
@@ -788,6 +811,11 @@ if command == "lease":
             continue
         break
     leases.append(slot)
+    # What this build is, at once, so that builds deciding meanwhile price it
+    # and do not take it for a build it is not.
+    with open(os.path.join(slot, "claim.new"), "w") as file:
+        json.dump({"cost": cost, "pid": None, "build": build}, file)
+    os.replace(os.path.join(slot, "claim.new"), os.path.join(slot, "claim"))
     # At the head of the queue, unless it waited for the same build: the
     # build starts once the memory it is expected to need is free beside the
     # builds already running here.
@@ -801,9 +829,6 @@ if command == "lease":
             announced = True
             waiting = why.split()[0]
         time.sleep(1)
-    with open(os.path.join(slot, "claim.new"), "w") as file:
-        json.dump({"cost": cost, "pid": None, "build": build}, file)
-    os.replace(os.path.join(slot, "claim.new"), os.path.join(slot, "claim"))
     queue.close()
     # A previous build's command or prune may outlive its lease's
     # connection; nothing in the slot changes until it has ended.
@@ -942,7 +967,11 @@ elif command == "run":
         # never so few that one build's slow crates stall it.
         builds = sum(leased(os.path.join(os.path.dirname(base), f"slot-{index}"))
                      for index in slot_indices(os.path.dirname(base)))
-        environment["CARGO_BUILD_JOBS"] = str(max(4, len(os.sched_getaffinity(0)) // max(1, builds)))
+        # At most 8 and half the CPUs, as scripts/cargo-gate gives builds on
+        # its host: the memory builds are expected to need was measured so.
+        cpus = len(os.sched_getaffinity(0))
+        environment["CARGO_BUILD_JOBS"] = str(
+            min(max(4, cpus // max(1, builds)), max(4, min(8, cpus // 2))))
     # Temporary files go on disk in a directory of this slot's own, rather
     # than in the host's /tmp, which may be memory and which others use. The
     # path stays short: tests bind Unix sockets under it, whose paths are
@@ -1275,9 +1304,14 @@ class Offload:
                 time.sleep(0.1)
 
     def build_identity(self):
-        """The Cargo command this is, without what only its tests or program
-        take, which a build of it does not depend on."""
-        identity = json.dumps([self.plan.toolchain, self.plan.name, self.plan.options,
+        """The Cargo command this is, for a command that only builds there,
+        without what only its tests take; empty for one that also runs tests
+        there, which a request for the same build should not wait out."""
+        if self.plan.subcommand in ("test", "bench") and not self.plan.no_run:
+            return ""
+        options = [option for option in self.plan.options
+                   if option[0] is not None or self.plan.subcommand not in ("test", "bench")]
+        identity = json.dumps([self.plan.toolchain, self.plan.name, options,
                                sorted((name, value) for name, value
                                       in forwarded_environment(self.environment).items()
                                       if not name.startswith("CAGENTS_"))])

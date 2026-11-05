@@ -427,8 +427,8 @@ script of builds, such as the development runner or
 `scripts/build-ceditor-product`, builds there too, each command with its own
 admission budget. A Cargo reached any other way inside COMMAND, by path,
 through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
-also sets `RUSTC_WRAPPER` to a guard that refuses to compile a crate and says
-why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
+compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
 On the build host itself, or with
 `CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
 above. A gate without `scripts/cargo-offload` beside it refuses to build
@@ -438,12 +438,15 @@ The host has build slots under
 `~/.cache/cagents-offload/<repository>/slot-N`, each with its own checkout and
 target directory. A further slot is made when every slot is leased, up to
 `CAGENTS_BUILD_REMOTE_SLOTS` (default 8), and only while the host's free space
-holds another 50 GiB of build output above its floor; how many build at once
-is then down to memory and CPU, below. Unless `CAGENTS_BUILD_REMOTE_JOBS` is
-set, each build gets the host's CPUs divided among the builds leased when it
-starts, at least 4, as `CARGO_BUILD_JOBS`. A request for the same Cargo
-command from the same worktree as one building now waits for that slot rather
-than build it again in another: once it ends, little is left to compile. A
+holds another 50 GiB of build output above its floor, beyond the 50 GiB each
+slot made in the last 12 hours is taken to be filling to; how many build at
+once is then down to memory and CPU, below. Unless `CAGENTS_BUILD_REMOTE_JOBS`
+is set, each build gets the host's CPUs divided among the builds leased when
+it starts, as `CARGO_BUILD_JOBS`, between 4 and 8 and at most half the CPUs,
+as builds here get. A request from the same worktree for the same build as
+one building now, a command that runs nothing there, waits for that slot
+rather than build it again in another, outside the queue meanwhile: once it
+ends, little is left to compile. A
 build copies the
 checkout's tracked and untracked, not ignored, files into a free slot and
 removes the slot's other files. It prefers the slot this worktree used last,
