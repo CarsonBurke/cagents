@@ -1357,12 +1357,41 @@ fn effect_layout(kind: Kind, layout: Layout<'_>) -> Layout<'_> {
     }
 }
 
+/// Where a press hid a tooltip, and whether the pointer has since been
+/// hidden from the control. A menu the press opened, or an ancestor gating
+/// the cursor to its own region, reports no position without saying where
+/// the pointer went; seeing it again anywhere but the press point means it
+/// moved away and came back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PressSuppression {
+    at: Option<Point>,
+    obscured: bool,
+}
+
+impl PressSuppression {
+    /// Whether this cursor shows the pointer has left the control.
+    fn released_by(&mut self, cursor: mouse::Cursor, bounds: Option<Rectangle>) -> bool {
+        match cursor.position() {
+            None => {
+                self.obscured = true;
+                false
+            }
+            Some(position) => {
+                !bounds.is_some_and(|bounds| bounds.contains(position))
+                    || (self.obscured && self.at != Some(position))
+            }
+        }
+    }
+}
+
 struct State {
     hover: Animation<bool>,
     tooltip: Animation<bool>,
     entered: Option<Instant>,
     tip_open: bool,
-    tip_suppressed: bool,
+    /// Set by a press on the control; its tooltip stays hidden until the
+    /// pointer really leaves.
+    tip_suppressed: Option<PressSuppression>,
     inspect_control: bool,
     disabled: bool,
     focused: bool,
@@ -1377,7 +1406,7 @@ impl Default for State {
             tooltip: Animation::new(false).duration(HOVER_DURATION),
             entered: None,
             tip_open: false,
-            tip_suppressed: false,
+            tip_suppressed: None,
             inspect_control: true,
             disabled: false,
             focused: true,
@@ -1695,20 +1724,18 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             state.inspect_control = true;
         }
         // A press keeps the tooltip hidden until the pointer leaves the
-        // control or the window, or the window loses focus. A menu the press
-        // opened makes the cursor unavailable to this layer without the
-        // pointer moving, so an unavailable cursor alone is not a leave.
-        let left = matches!(
+        // control or the window, or the window loses focus. An unavailable
+        // cursor alone is not a leave: a menu the press opened hides the
+        // pointer from this layer without it moving.
+        let window_left = matches!(
             event,
             Event::Mouse(mouse::Event::CursorLeft) | Event::Window(window::Event::Unfocused)
-        ) || cursor.position().is_some_and(|position| {
-            !layout
-                .bounds()
-                .intersection(viewport)
-                .is_some_and(|bounds| bounds.contains(position))
-        });
-        if left {
-            state.tip_suppressed = false;
+        );
+        let bounds = layout.bounds().intersection(viewport);
+        if let Some(suppression) = &mut state.tip_suppressed
+            && (window_left || suppression.released_by(cursor, bounds))
+        {
+            state.tip_suppressed = None;
         }
         if matches!(self.kind, Kind::Tooltip) && inside && state.inspect_control {
             // The Widget API has no enabled query. COSMIC buttons expose this
@@ -1730,7 +1757,10 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                     | Event::Touch(cosmic::iced::touch::Event::FingerPressed { .. })
             )
         {
-            state.tip_suppressed = true;
+            state.tip_suppressed = Some(PressSuppression {
+                at: cursor.position(),
+                obscured: false,
+            });
             state.entered = None;
             state.tip_open = false;
             state.tooltip = Animation::new(false).duration(HOVER_DURATION);
@@ -1747,7 +1777,10 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             Kind::Hover if state.hover.is_animating(now) => shell.request_redraw(),
             Kind::Tooltip => {
                 let mut visible = false;
-                if let Some(entered) = state.entered.filter(|_| inside && !state.tip_suppressed) {
+                if let Some(entered) = state
+                    .entered
+                    .filter(|_| inside && state.tip_suppressed.is_none())
+                {
                     let deadline = entered + TOOLTIP_DELAY;
                     visible = now >= deadline;
                     if !visible {
@@ -2040,7 +2073,7 @@ mod tests {
                 &bounds,
             );
             assert!(!tree.state.downcast_ref::<State>().tip_open);
-            assert!(tree.state.downcast_ref::<State>().tip_suppressed);
+            assert!(tree.state.downcast_ref::<State>().tip_suppressed.is_some());
         }
         // A context menu the press opened covers the control: the runtime
         // hands this layer an unavailable cursor while the pointer stays put.
@@ -2079,7 +2112,7 @@ mod tests {
                 !tree.state.downcast_ref::<State>().tip_open,
                 "a menu over the pressed control must not re-arm its tooltip"
             );
-            assert!(tree.state.downcast_ref::<State>().tip_suppressed);
+            assert!(tree.state.downcast_ref::<State>().tip_suppressed.is_some());
         }
         element.as_widget_mut().update(
             &mut tree,
@@ -2091,7 +2124,7 @@ mod tests {
             &mut Shell::new(&mut messages),
             &bounds,
         );
-        assert!(!tree.state.downcast_ref::<State>().tip_suppressed);
+        assert!(tree.state.downcast_ref::<State>().tip_suppressed.is_none());
         for event in [
             Event::Mouse(mouse::Event::CursorMoved {
                 position: node.bounds().center(),
@@ -2114,6 +2147,68 @@ mod tests {
         assert!(
             tree.state.downcast_ref::<State>().tip_open,
             "a fresh hover can show the tooltip again"
+        );
+    }
+
+    #[test]
+    fn pressed_tooltip_returns_after_leaving_through_a_cursor_gate() {
+        use cosmic::iced::advanced::clipboard;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = tooltip(
+            cosmic::widget::button::text("Settings").on_press(1u8),
+            "Open settings",
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+        );
+        let bounds = Rectangle::with_size(Size::new(300.0, 100.0));
+        let control = node.bounds();
+        let pressed = Point::new(control.x + 2.0, control.center_y());
+        let returned = Point::new(control.x + control.width - 2.0, control.center_y());
+        let start = Instant::now();
+        let mut messages = Vec::new();
+        // An ancestor that gates the cursor to its own region (a sidebar row
+        // list, a scrollable) reports no position once the pointer leaves it,
+        // so the control never sees a position outside itself.
+        for (event, cursor) in [
+            (
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                mouse::Cursor::Available(pressed),
+            ),
+            (
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(900.0, 900.0),
+                }),
+                mouse::Cursor::Unavailable,
+            ),
+            (
+                Event::Mouse(mouse::Event::CursorMoved { position: returned }),
+                mouse::Cursor::Available(returned),
+            ),
+            (
+                Event::Window(window::Event::RedrawRequested(start + TOOLTIP_DELAY * 2)),
+                mouse::Cursor::Available(returned),
+            ),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+        }
+        let state = tree.state.downcast_ref::<State>();
+        assert!(state.tip_suppressed.is_none());
+        assert!(
+            state.tip_open,
+            "returning to the control after leaving its region shows the tooltip"
         );
     }
 
