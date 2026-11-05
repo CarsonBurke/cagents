@@ -312,7 +312,9 @@ fn cleanup_peer(
                             send!(@message &mut stream, None, ServerMessage::ChatChanged { chat_id });
                         } else if snapshot.generation > 1 {
                             send!(@message &mut stream, None, ServerMessage::ChatObserved {
-                                chat_id, epoch: snapshot.generation,
+                                // No acknowledgement has advanced this
+                                // subscriber's observation epoch from zero.
+                                chat_id, epoch: 0,
                             });
                         }
                         continue;
