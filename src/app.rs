@@ -18755,7 +18755,13 @@ impl Application for Cagents {
                         .channels
                         .iter()
                         .find(|channel| channel.id == id)
-                        .map(|channel| channel.title.clone())
+                        .map(|channel| {
+                            channel_ui::channel_display_title(
+                                channel,
+                                self.sidebar_model.project(channel.project_id),
+                            )
+                            .into_owned()
+                        })
                 })
                 .or_else(|| {
                     directory

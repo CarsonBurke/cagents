@@ -1641,13 +1641,30 @@ impl Cagents {
         };
         let title = self.alias_title(alias, shared);
         let place = self.scope_display_name(scope);
+        // Only a chat card's text can follow it.
+        let carries_text = matches!(
+            self.card_state(alias).map(|state| &state.kind),
+            Some(CardKind::Chat(_))
+        );
         if self.chat_closed_elsewhere_here(alias) {
+            let after = if carries_text {
+                format!("Your unsent text goes with it and the {session} keeps running.")
+            } else {
+                format!("The {session} keeps running.")
+            };
             return format!(
-                "\u{201c}{title}\u{201d} is also in {place}. Close this card to show it there. Your unsent text goes with it and the {session} keeps running."
+                "\u{201c}{title}\u{201d} is also in {place}. Close this card to show it there. {after}"
             );
         }
+        let closing = if carries_text {
+            format!(
+                "Closing it here keeps the {session} running, sends your unsent text there and discards anything else waiting."
+            )
+        } else {
+            format!("Closing it here keeps the {session} running and discards what's waiting.")
+        };
         format!(
-            "\u{201c}{title}\u{201d} is also in {place}. It moves there once what's waiting here is finished or cleared. Closing it here keeps the {session} running, sends your unsent text there and discards anything else waiting."
+            "\u{201c}{title}\u{201d} is also in {place}. It moves there once what's waiting here is finished or cleared. {closing}"
         )
     }
 
@@ -1796,12 +1813,12 @@ impl Cagents {
 
     /// Sends what a departing `card` has not sent to the pane holding its
     /// session, and says where it went, so giving up the card keeps the text.
-    pub(super) fn carry_draft_of_card_held_elsewhere(&mut self, card: CardId) {
+    pub(super) fn carry_draft_of_card_held_elsewhere(&mut self, card: CardId, going: &[ChannelId]) {
         let Some(CardKind::Chat(_)) = self.card_state(card).map(|state| &state.kind) else {
             return;
         };
         let Some((scope, shared)) = self
-            .pane_holding_card_session(card, &[])
+            .pane_holding_card_session(card, going)
             .map(|(view, pane)| (view.scope.clone(), pane.clone()))
         else {
             return;
@@ -1816,7 +1833,7 @@ impl Cagents {
     /// Lets go of a card whose session a shared pane holds. The session belongs
     /// to that pane now, so only this card and its local work go away.
     pub(super) fn release_card_held_elsewhere(&mut self, card: CardId) -> Task<Message> {
-        self.carry_draft_of_card_held_elsewhere(card);
+        self.carry_draft_of_card_held_elsewhere(card, &[]);
         self.chat_discard_local_work(card);
         // Read before this card leaves its channel's membership.
         let emptied = self.close_emptied_channels(&[card]);

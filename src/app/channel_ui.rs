@@ -441,9 +441,12 @@ impl State {
             .operation
     }
 
-    /// Whether `id` is being deleted, or is about to be with a selection.
+    /// Whether `id` is being deleted, is about to be with a selection, or has
+    /// been and the daemon hasn't yet dropped its view.
     pub(super) fn is_going(&self, id: ChannelId) -> bool {
-        self.deleting.contains(&id) || self.deleting_together.contains(&id)
+        self.deleting.contains(&id)
+            || self.deleting_together.contains(&id)
+            || self.deleted.contains(&id)
     }
 
     pub(super) fn is_deleting(&self, id: ChannelId) -> bool {
@@ -1284,14 +1287,33 @@ impl Cagents {
             .collect()
     }
 
+    /// One that has to wait for a pane move stays, so it isn't counted as going
+    /// and what it holds stays held.
     pub(super) fn delete_channels(&mut self, ids: Vec<ChannelId>) -> Task<Message> {
-        self.channel_ui.deleting_together = ids.clone();
+        self.channel_ui.deleting_together = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.channel_pane_transfer_pending(*id))
+            .collect();
         let tasks = ids
             .into_iter()
             .map(|id| self.delete_channel(id))
             .collect::<Vec<_>>();
         self.channel_ui.deleting_together.clear();
         Task::batch(tasks)
+    }
+
+    fn channel_pane_transfer_pending(&self, id: ChannelId) -> bool {
+        self.durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .is_some_and(|channel| {
+                channel
+                    .cards
+                    .iter()
+                    .any(|card| self.pane_transfer_pending(*card))
+            })
     }
 
     /// Removes a channel along with everything that existed only inside it.
@@ -1310,7 +1332,7 @@ impl Cagents {
         else {
             return Task::none();
         };
-        if cards.iter().any(|card| self.pane_transfer_pending(*card)) {
+        if self.channel_pane_transfer_pending(id) {
             self.status = Some(TransientNotice::warning(
                 "Wait for the pane move to finish before deleting this channel.",
             ));
@@ -1355,16 +1377,7 @@ impl Cagents {
             return Task::batch([leave, retry]);
         }
         // A session another pane holds is not this channel's to end; its card
-        // leaves with the channel, its text goes to that pane, and the session
-        // stays there.
-        for card in &cards {
-            if self
-                .card_state(*card)
-                .is_some_and(|state| state.existence.is_open())
-            {
-                self.carry_draft_of_card_held_elsewhere(*card);
-            }
-        }
+        // leaves with the channel and the session stays there.
         let sessions: Vec<_> = self
             .durable
             .cards
@@ -1522,6 +1535,23 @@ impl Cagents {
     }
 
     pub(super) fn finish_delete_channel(&mut self, id: ChannelId) -> Task<Message> {
+        // Text moves only now that the channel is certain to go: a close that
+        // fails leaves the channel, and the text stays on its card.
+        let cards = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .map(|channel| channel.cards.clone())
+            .unwrap_or_default();
+        for card in cards {
+            if self
+                .card_state(card)
+                .is_some_and(|state| state.existence.is_open())
+            {
+                self.carry_draft_of_card_held_elsewhere(card, &[id]);
+            }
+        }
         self.retire_channel(id, false)
     }
 

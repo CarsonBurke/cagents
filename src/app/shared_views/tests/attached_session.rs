@@ -303,6 +303,166 @@ fn deleting_the_channel_that_also_holds_the_session_closes_it() {
     );
 }
 
+/// Selecting both rows in the sidebar and confirming, as a person does it.
+#[test]
+fn deleting_a_card_and_the_pane_holding_it_from_the_sidebar_closes_the_session() {
+    let (mut app, mut view, attached, _directory) = local_only_chat();
+    let card = app.workspace.focused().unwrap();
+    let old = channel_holding(&app, card);
+    let Scope::Channel(destination) = view.scope.clone() else {
+        unreachable!()
+    };
+    hold_in_view(&mut app, &mut view, &attached);
+    let project = ProjectId::new();
+    app.sidebar_model
+        .projects
+        .push(crate::sidebar::SidebarProject::new(
+            project,
+            crate::repository::RepositoryId::new(),
+            "Selected project".into(),
+            "/selection-project".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+    for channel in &mut Arc::make_mut(&mut app.durable).channels {
+        if channel.id == old || channel.id == destination {
+            channel.project_id = project;
+        }
+    }
+    app.refresh_sidebar_channels();
+    for id in [old, destination] {
+        app.select_sidebar_rows(
+            crate::sidebar::SelectionRow::Channel(id),
+            crate::sidebar::SelectionIntent::Toggle,
+        );
+    }
+    drop(app.begin_sidebar_group_delete());
+    assert!(app.sidebar_selection_dialog().is_some());
+    drop(app.update_sidebar_selection(crate::app::sidebar_selection_ui::Action::Confirm));
+
+    assert!(
+        app.durable.channels.iter().any(|channel| channel.id == old),
+        "the channel waits for the session's close"
+    );
+    assert!(app.card_state(card).unwrap().existence.is_open());
+}
+
+/// The pane's channel is already gone from this window, and the daemon hasn't
+/// yet said so.
+#[test]
+fn deleting_the_holders_channel_then_the_cards_closes_the_session() {
+    let (mut app, mut view, attached, _directory) = local_only_chat();
+    let card = app.workspace.focused().unwrap();
+    let old = channel_holding(&app, card);
+    let Scope::Channel(destination) = view.scope.clone() else {
+        unreachable!()
+    };
+    hold_in_view(&mut app, &mut view, &attached);
+    drop(app.delete_channel(destination));
+    assert!(app.channel_ui.was_deleted(destination));
+    assert!(
+        app.workspace_model
+            .views
+            .iter()
+            .any(|view| view.scope == Scope::Channel(destination))
+    );
+
+    assert!(!app.another_pane_holds_session(card));
+    drop(app.delete_channel(old));
+    assert!(
+        app.durable.channels.iter().any(|channel| channel.id == old),
+        "the channel waits for the session's close"
+    );
+}
+
+/// The pane's channel can't go yet, so the session stays held rather than
+/// closing under a pane that remains.
+#[test]
+fn a_selected_channel_waiting_on_a_pane_move_keeps_what_it_holds() {
+    let (mut app, mut view, attached, _directory) = local_only_chat();
+    let card = app.workspace.focused().unwrap();
+    let old = channel_holding(&app, card);
+    let Scope::Channel(destination) = view.scope.clone() else {
+        unreachable!()
+    };
+    hold_in_view(&mut app, &mut view, &attached);
+    let moving = CardId::new();
+    Arc::make_mut(&mut app.durable)
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id == destination)
+        .unwrap()
+        .cards
+        .push(moving);
+    app.shared_views
+        .requested_transfers
+        .insert(uuid::Uuid::new_v4(), moving);
+
+    drop(app.delete_channels(vec![old, destination]));
+    assert!(
+        !app.durable.channels.iter().any(|channel| channel.id == old),
+        "nothing of its own to close"
+    );
+    assert!(
+        app.durable
+            .channels
+            .iter()
+            .any(|channel| channel.id == destination)
+    );
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+}
+
+/// A deletion stopped by another session's failed close leaves the text on its
+/// card, where the person left it. It moves when the deletion completes.
+#[test]
+fn a_failed_delete_leaves_a_held_cards_text_until_the_channel_goes() {
+    let (mut app, mut view, attached, _directory) = local_only_chat();
+    let card = app.workspace.focused().unwrap();
+    let old = channel_holding(&app, card);
+    let _ = app.new_native_chat(Provider::Claude, Some("/workspace/other-chat".into()));
+    let other = app.workspace.focused().unwrap();
+    assert_ne!(card, other);
+    assert_eq!(channel_holding(&app, other), old);
+    app.cards.remove(&card);
+    app.cards.remove(&other);
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(card, "unsent".into())]));
+    hold_in_view(&mut app, &mut view, &attached);
+
+    drop(app.delete_channel(old));
+    let operation = app.channel_ui.close_operation(old);
+    drop(app.handle_channel_ui(channel_ui::Action::SessionsClosed(
+        old,
+        operation,
+        Err("refused".into()),
+    )));
+    assert!(app.durable.channels.iter().any(|channel| channel.id == old));
+    assert_eq!(app.chat_ui.draft_for_test(card), Some("unsent"));
+    assert_eq!(app.chat_ui.draft_for_test(attached.id), None);
+
+    drop(app.handle_channel_ui(channel_ui::Action::RetryFailed(old)));
+    let operation = app.channel_ui.close_operation(old);
+    drop(app.handle_channel_ui(channel_ui::Action::SessionsClosed(old, operation, Ok(()))));
+    assert!(!app.durable.channels.iter().any(|channel| channel.id == old));
+    assert_eq!(app.chat_ui.draft_for_test(attached.id), Some("unsent"));
+}
+
+/// A terminal card has no text to send, and its notice doesn't promise any.
+#[test]
+fn the_held_notice_only_promises_text_a_chat_card_can_send() {
+    let (app, view, attached, _directory) = local_only_chat();
+    let card = app.workspace.focused().unwrap();
+    assert!(
+        app.alias_held_notice(card, &attached, &view.scope)
+            .contains("sends your unsent text there")
+    );
+
+    let app = crate::app::tests::context_inspector_test_app(true);
+    let card = app.workspace.focused().unwrap();
+    let pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+    let notice = app.alias_held_notice(card, &pane, &view.scope);
+    assert!(!notice.contains("unsent"), "{notice}");
+}
+
 #[test]
 fn deleting_a_card_and_the_channel_holding_its_session_together_closes_it() {
     let (mut app, mut view, attached, _directory) = local_only_chat();

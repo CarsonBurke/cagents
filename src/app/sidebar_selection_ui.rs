@@ -637,10 +637,20 @@ impl Cagents {
             self.sidebar_selection_ui.dialog = Some(dialog);
             return iced::widget::operation::focus(focus).map(cosmic::Action::App);
         }
-        let mut tasks = Vec::new();
+        // Channels go as one deletion, so a session whose card and pane are both
+        // selected closes with them, as the dialog said.
+        let channels = dialog
+            .targets
+            .iter()
+            .filter_map(|target| match target.row {
+                SelectionRow::Channel(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        let mut tasks = vec![self.delete_channels(channels)];
         for target in dialog.targets {
             tasks.push(match target.row {
-                SelectionRow::Channel(id) => self.delete_channel(id),
+                SelectionRow::Channel(_) => Task::none(),
                 SelectionRow::Worktree(project, id) => self.delete_selected_worktree(project, id),
                 SelectionRow::Project(project_id) => {
                     // Prepare the same project removal used by its row, then

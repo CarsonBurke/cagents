@@ -21241,6 +21241,23 @@ mod tests {
     }
 
     #[test]
+    fn a_card_closed_elsewhere_says_closing_it_shows_the_pane() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.closed_elsewhere = true;
+        }
+        attach_to_new_channel(&mut app, card);
+        let notice = app.status.take().expect("a hold says so");
+        assert!(
+            notice.message.contains("Close this card to show it there")
+                && !notice.message.contains("finished or cleared"),
+            "{}",
+            notice.message
+        );
+    }
+
+    #[test]
     fn the_held_notice_follows_the_pane_holding_the_session() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
