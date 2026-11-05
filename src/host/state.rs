@@ -8090,6 +8090,7 @@ for line in sys.stdin:
             crate::model::agent_recovery::fresh_native_environment(Provider::Claude, false);
         environment.extend(selected.clone());
         let spec = ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),

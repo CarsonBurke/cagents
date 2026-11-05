@@ -188,6 +188,9 @@ jobs:
       - name: Check Zig discovery contracts
         run: python3 tests/run-development-zig.py -v
 
+      - name: Check build directory seeding contracts
+        run: python3 tests/seed_build_dir.py -v
+
       - name: Check installer coordinator extraction contracts
         run: python3 tests/installer_coordinator.py -v
 
@@ -240,6 +243,7 @@ jobs:
         run: |
           sh -n scripts/run-development
           sh -n scripts/check-format
+          sh -n scripts/seed-build-dir
 
       - name: Check repository formatting
         run: scripts/check-format
