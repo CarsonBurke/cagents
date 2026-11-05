@@ -641,6 +641,8 @@ pub(crate) struct DaemonStartError {
     pub(crate) spawned: bool,
 }
 
+pub(crate) const DAEMON_START_BUDGET_EXCEEDED: &str = "The matched terminal service exceeded its startup budget; its original command was retained until its actual wait completed. Check cagents daemon status before retrying";
+
 /// Startup owns restoration, not a disposable download. Crossing its budget
 /// remains an error, but this coordinator must stay alive until the ORIGINAL
 /// child has actually been waited. A pathological hang can delay it indefinitely;
@@ -669,12 +671,7 @@ pub(crate) fn wait_daemon_start_with_progress(
             error,
             spawned: false,
         })?;
-    let budget_error = || {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "The matched terminal service exceeded its startup budget; its original command was retained until its actual wait completed. Check cagents daemon status before retrying",
-        )
-    };
+    let budget_error = || io::Error::new(io::ErrorKind::TimedOut, DAEMON_START_BUDGET_EXCEEDED);
     loop {
         let (error, overdue) = match child.try_wait() {
             Ok(Some(status)) => {

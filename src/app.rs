@@ -2309,7 +2309,7 @@ pub enum ContextTab {
     Details,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct WindowView {
     #[serde(default)]
     user_titles: HashMap<CardId, String>,
@@ -4408,8 +4408,15 @@ pub enum Message {
     },
     StartupWindowOpened(window::Id),
     StartupReported(Result<(), String>),
-    VerifyStartupPanes,
-    StartupPanesSaved(Result<SettingsSaved, String>, Result<(), String>),
+    VerifyStartupPanes(uuid::Uuid),
+    StartupDeadline(uuid::Uuid),
+    StartupProgressFinished(uuid::Uuid, Result<(), String>),
+    StartupPanesSaved(
+        uuid::Uuid,
+        Result<SettingsSaved, String>,
+        Result<(), String>,
+    ),
+    UiStartupCheck(instance::UiStartupCheckRequest),
     UiUpdate(instance::UiUpdateRequest),
     UiUpdateWatchdog(u64),
     UiUpdateFlushed {
@@ -13430,18 +13437,8 @@ impl Cagents {
             .retain(|id, _| retained.contains(id));
     }
 
-    fn capture_settings_save(&mut self) -> Result<SettingsSave, String> {
-        if self.settings_write_blocked {
-            return Err(
-                "settings were not loaded successfully; use Reset all settings to replace them"
-                    .to_owned(),
-            );
-        }
-        let path = match self.settings_path.clone() {
-            Some(path) => path,
-            None => settings::default_path().map_err(|error| error.to_string())?,
-        };
-        self.prune_pane_title_overrides();
+    /// The current view payload without pruning or scheduling a save.
+    fn current_window_view(&self) -> WindowView {
         let mut view = WindowView {
             user_titles: self.chrome_ui.user_titles.clone(),
             projects_sidebar_collapsed: self.chrome_ui.projects_collapsed,
@@ -13458,6 +13455,22 @@ impl Cagents {
             view.worktree_offsets
                 .insert(path.clone(), self.workspace.camera().offset());
         }
+        view
+    }
+
+    fn capture_settings_save(&mut self) -> Result<SettingsSave, String> {
+        if self.settings_write_blocked {
+            return Err(
+                "settings were not loaded successfully; use Reset all settings to replace them"
+                    .to_owned(),
+            );
+        }
+        let path = match self.settings_path.clone() {
+            Some(path) => path,
+            None => settings::default_path().map_err(|error| error.to_string())?,
+        };
+        self.prune_pane_title_overrides();
+        let view = self.current_window_view();
         self.settings_save_generation += 1;
         Ok(SettingsSave {
             generation: self.settings_save_generation,
@@ -16149,10 +16162,13 @@ impl Application for Cagents {
                 #[cfg(not(feature = "integrated-browser"))]
                 report
             }
-            Message::VerifyStartupPanes => self.verify_startup_gate(),
-            Message::StartupPanesSaved(settings, saved) => {
-                self.startup_panes_saved(settings, saved)
+            Message::VerifyStartupPanes(attempt) => self.verify_startup_gate(attempt),
+            Message::StartupDeadline(attempt) => self.startup_deadline(attempt),
+            Message::StartupProgressFinished(attempt, result) => self.startup_progress_finished(attempt, result),
+            Message::StartupPanesSaved(attempt, settings, saved) => {
+                self.startup_panes_saved(attempt, settings, saved)
             }
+            Message::UiStartupCheck(request) => self.check_retained_startup(request),
             Message::StartupReported(result) => match result {
                 Ok(()) => Task::none(),
                 Err(error) => {
@@ -18152,9 +18168,10 @@ impl Application for Cagents {
                 UiActivationSource(self.activation_rx.clone()),
                 ui_activation_stream,
             )
-            .map(|activation| match activation.update {
-                Some(request) => Message::UiUpdate(request),
-                None => match activation.session {
+            .map(|activation| match (activation.startup, activation.update) {
+                (Some(request), _) => Message::UiStartupCheck(request),
+                (None, Some(request)) => Message::UiUpdate(request),
+                (None, None) => match activation.session {
                     Some(session) => Message::ActivateSession {
                         session,
                         token: activation.token,
@@ -20799,6 +20816,7 @@ mod tests {
                     token: None,
                     session: None,
                     update: None,
+                    startup: None,
                 })
                 .is_err()
         );

@@ -41,8 +41,97 @@ fn projected(phase: UpdatePhase, helper: LockState, fence: LockState) -> Snapsho
             phase,
             waiting: 0,
             blocked: 0,
+            startup_delayed: false,
             daemon_timeout: false,
         }),
+    }
+}
+
+#[test]
+fn recovery_entry_requires_the_original_parent_and_preserves_only_public_arguments() {
+    let public = vec![
+        "--device".to_owned(),
+        "build-host".to_owned(),
+        "--device-window-scoped".to_owned(),
+        "--window".to_owned(),
+        "device-0123456789abcdef".to_owned(),
+        "--from-window".to_owned(),
+        "device-fedcba9876543210".to_owned(),
+    ];
+    for guarded in [false, true] {
+        for owned in [false, true] {
+            let mut arguments = public.clone();
+            if guarded {
+                arguments.push(RECOVERY_ENTRY_ARGUMENT.to_owned());
+            }
+            let original = arguments.clone();
+            let result = consume_recovery_argument(&mut arguments, owned);
+            if guarded && !owned {
+                assert!(result.is_err());
+                assert_eq!(arguments, original, "refuse before touching the request");
+            } else {
+                result.unwrap();
+                assert_eq!(arguments, public);
+            }
+        }
+    }
+    for option in ["--device", "--window", "--from-window"] {
+        for owned in [false, true] {
+            let mut arguments = vec![option.to_owned(), RECOVERY_ENTRY_ARGUMENT.to_owned()];
+            let public = arguments.clone();
+            consume_recovery_argument(&mut arguments, owned).unwrap();
+            assert_eq!(
+                arguments, public,
+                "a public value is never a private marker"
+            );
+            arguments.push(RECOVERY_ENTRY_ARGUMENT.to_owned());
+            if owned {
+                consume_recovery_argument(&mut arguments, owned).unwrap();
+                assert_eq!(arguments, public);
+            } else {
+                assert!(consume_recovery_argument(&mut arguments, owned).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn unverified_helper_copy_and_reopen_refusal_distinguish_free_held_and_unknown_access() {
+    for helper in [LockState::Free, LockState::Unknown] {
+        for phase in [
+            UpdatePhase::Installing,
+            UpdatePhase::Complete,
+            UpdatePhase::Failed,
+        ] {
+            for installation in [LockState::Free, LockState::Held, LockState::Unknown] {
+                let snapshot = projected(phase.clone(), helper, installation);
+                let explanation = snapshot.explanation();
+                assert_eq!(snapshot.can_open(), installation == LockState::Free);
+                match installation {
+                    LockState::Free => {
+                        assert!(snapshot.opening_refusal().is_none());
+                        assert!(!explanation.contains("still locked"));
+                        if helper == LockState::Unknown {
+                            assert_eq!(snapshot.heading(), "Update ownership is unconfirmed");
+                            assert!(explanation.contains("normal startup checks"));
+                        }
+                    }
+                    LockState::Held => {
+                        assert!(explanation.contains("still locked"));
+                        assert!(snapshot.opening_refusal().unwrap().contains("still locked"));
+                    }
+                    LockState::Unknown => {
+                        assert_eq!(snapshot.heading(), "Checking installation access");
+                        assert!(explanation.contains("could not be verified"));
+                        assert!(!explanation.contains("still locked"));
+                        let refusal = snapshot.opening_refusal().unwrap();
+                        assert!(refusal.contains("could not be verified"));
+                        assert!(!refusal.contains("still locked"));
+                    }
+                }
+                assert!(!Follow::default().observe(&snapshot));
+            }
+        }
     }
 }
 
@@ -78,6 +167,81 @@ fn real_worker_lock_and_unchanged_status_distinguish_active_from_orphan_without_
         fs::metadata(state.join("status.json")).unwrap().mode(),
         meta.mode()
     );
+}
+
+#[test]
+fn current_retained_startup_and_budget_failure_messages_keep_progress_and_fences() {
+    let (_root, executable, state) = installation();
+    let mut job = job(UpdatePhase::Installing);
+    job.message = super::super::installed::WAITING_FOR_STARTUP.into();
+    write(&state, &job);
+    let lock = super::super::acquire_lock(&state).unwrap();
+    let original = fs::read(state.join("status.json")).unwrap();
+    let mut follow = Follow::default();
+    let delayed = observe_installation(&executable, LockState::Held);
+    assert_eq!(delayed.heading(), "Waiting for saved sessions to restore");
+    assert!(
+        delayed
+            .explanation()
+            .contains("taking longer than expected")
+    );
+    assert!(delayed.explanation().contains("diagnostics"));
+    assert_eq!(delayed.helper_lock, LockState::Held);
+    assert!(!delayed.can_open() && !delayed.finished() && !follow.observe(&delayed));
+    assert!(matches!(
+        super::super::acquire_lock(&state),
+        Err(super::super::UpdateError::Busy)
+    ));
+    assert_eq!(fs::read(state.join("status.json")).unwrap(), original);
+
+    let unknown = observe_installation(&executable, LockState::Unknown);
+    assert!(!unknown.can_open() && !unknown.finished() && !follow.observe(&unknown));
+    // Only the producer's complete known message is public progress. A raw
+    // error containing similar words must neither impersonate it nor leak.
+    job.message = format!(
+        "PRIVATE_SENTINEL {}",
+        super::super::installed::WAITING_FOR_STARTUP
+    );
+    write(&state, &job);
+    let unrelated = observe_installation(&executable, LockState::Held);
+    assert_eq!(unrelated.heading(), "Installing cagents");
+    assert!(!unrelated.explanation().contains("PRIVATE_SENTINEL"));
+
+    job.phase = UpdatePhase::Failed;
+    job.message = super::super::installed::WAITING_FOR_STARTUP.into();
+    write(&state, &job);
+    let terminal_progress = observe_installation(&executable, LockState::Held);
+    assert!(!terminal_progress.job.as_ref().unwrap().startup_delayed);
+    assert!(!terminal_progress.can_open() && !follow.observe(&terminal_progress));
+
+    // This is the current producer's actual terminal budget message, with
+    // private context around it. Project a category, never that raw context.
+    job.message = format!(
+        "PRIVATE_SENTINEL /private/path: {}",
+        crate::install_guard::DAEMON_START_BUDGET_EXCEEDED
+    );
+    write(&state, &job);
+    let original = fs::read(state.join("status.json")).unwrap();
+    let retained = observe_installation(&executable, LockState::Held);
+    assert!(retained.job.as_ref().unwrap().daemon_timeout);
+    assert!(!retained.can_open() && !retained.finished() && !follow.observe(&retained));
+    assert!(matches!(
+        super::super::acquire_lock(&state),
+        Err(super::super::UpdateError::Busy)
+    ));
+    assert_eq!(fs::read(state.join("status.json")).unwrap(), original);
+    drop(lock);
+    let settled = observe_installation(&executable, LockState::Free);
+    assert_eq!(settled.heading(), "The update did not complete");
+    assert!(
+        settled
+            .explanation()
+            .contains("Startup took longer than allowed")
+    );
+    assert!(settled.can_open() && !settled.finished() && !follow.observe(&settled));
+    assert!(!settled.explanation().contains("PRIVATE_SENTINEL"));
+    assert!(!settled.explanation().contains("/private/path"));
+    assert_eq!(fs::read(state.join("status.json")).unwrap(), original);
 }
 
 #[test]
@@ -147,7 +311,7 @@ fn failed_or_terminal_status_does_not_override_real_held_or_unknown_ownership() 
     assert!(
         failed
             .explanation()
-            .contains("daemon did not finish starting")
+            .contains("Startup took longer than allowed")
     );
 }
 
