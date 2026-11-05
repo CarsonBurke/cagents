@@ -88,6 +88,7 @@ impl Memory {
         anchor.clock += 1;
         anchor.contexts[index].used = anchor.clock;
         anchor.contexts[index].edge = Some(edge);
+        anchor.contexts[index].reflow = None;
     }
     pub(super) fn clear_latest(&self) {
         if let Some(context) = self
@@ -268,10 +269,15 @@ impl Memory {
         if evicted && (saved.geometry.is_some() || saved.edge.is_some()) {
             return true;
         }
-        let Some((geometry, top)) = saved.geometry.zip(saved.top) else {
+        let reference = saved.reflow.as_ref();
+        let Some((geometry, top)) = reference
+            .map(|saved| (saved.geometry, saved.top))
+            .or_else(|| saved.geometry.zip(saved.top))
+        else {
             return false;
         };
-        saved.rows.iter().any(|row| {
+        let rows = reference.map_or(saved.rows.as_slice(), |saved| saved.rows.as_slice());
+        rows.iter().any(|row| {
             row.bounds.y + row.bounds.height > top
                 && row.bounds.y < top + geometry.viewport.height
                 && pending(&row.id)
@@ -283,7 +289,9 @@ impl Memory {
             .borrow()
             .contexts
             .iter()
-            .map(|context| context.rows.len())
+            .map(|context| {
+                context.rows.len() + context.reflow.as_ref().map_or(0, |saved| saved.rows.len())
+            })
             .sum()
     }
 
@@ -888,16 +896,40 @@ struct ItemBounds<'a> {
     rows: std::collections::HashMap<&'a str, Rectangle>,
     wanted: HashSet<u64>,
     virtual_rows: Vec<(String, Rectangle)>,
+    mounted: HashSet<String>,
+    wanted_guards: HashSet<u64>,
+    guards: HashMap<u64, bool>,
+    path: Vec<u64>,
+    paths: HashMap<String, Vec<u64>>,
 }
 impl Operation for ItemBounds<'_> {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
         visit(self);
     }
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if let Some(scope) = state.downcast_mut::<virtualized::RowScope>() {
+            match scope {
+                virtualized::RowScope::Probe(enabled) => *enabled = true,
+                virtualized::RowScope::Enter(key) => self.path.push(*key),
+                virtualized::RowScope::Exit => {
+                    self.path.pop();
+                }
+            }
+            return;
+        }
+        self.guards
+            .extend(virtualized::row_status(state, &self.wanted_guards));
         self.virtual_rows.extend(
             virtualized::anchor_points(state, bounds, &self.wanted)
                 .into_iter()
-                .map(|(key, bounds)| (format!("virtual-chunk-{key:016x}"), bounds)),
+                .map(|(key, bounds, mounted)| {
+                    let id = format!("virtual-chunk-{key:016x}");
+                    self.paths.insert(id.clone(), self.path.clone());
+                    if mounted {
+                        self.mounted.insert(id.clone());
+                    }
+                    (id, bounds)
+                }),
         );
     }
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
@@ -905,6 +937,94 @@ impl Operation for ItemBounds<'_> {
             for id in id {
                 self.rows.insert(*id, bounds);
             }
+        }
+    }
+}
+
+struct MountedItems<'a, 'b> {
+    ids: &'b std::collections::HashMap<Id, Vec<&'a str>>,
+    items: HashSet<&'a str>,
+    target: Option<Target>,
+    root: Option<Id>,
+    root_translation: Option<Vector>,
+    pending: Vec<Rectangle>,
+    translation: Vector,
+    clip: Option<Rectangle>,
+    pending_clip: Option<(Rectangle, Vector)>,
+}
+
+impl MountedItems<'_, '_> {
+    fn pending_geometry(&mut self, bounds: Rectangle) {
+        if self.clip.is_some_and(|clip| {
+            clip.intersection(&Rectangle {
+                x: bounds.x - self.translation.x,
+                y: bounds.y - self.translation.y,
+                ..bounds
+            })
+            .is_some()
+        }) {
+            let nested = self.translation - self.root_translation.unwrap_or_default();
+            self.pending.push(Rectangle {
+                x: bounds.x - nested.x,
+                y: bounds.y - nested.y,
+                ..bounds
+            });
+        }
+    }
+}
+
+impl Operation for MountedItems<'_, '_> {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+        let translation = self.translation;
+        let clip = self.clip;
+        if let Some((bounds, offset)) = self.pending_clip.take() {
+            let bounds = Rectangle {
+                x: bounds.x - self.translation.x,
+                y: bounds.y - self.translation.y,
+                ..bounds
+            };
+            self.clip = Some(self.clip.map_or(bounds, |clip| {
+                clip.intersection(&bounds).unwrap_or_default()
+            }));
+            self.translation += offset;
+        }
+        visit(self);
+        self.translation = translation;
+        self.clip = clip;
+    }
+
+    fn scrollable(
+        &mut self,
+        id: Option<&Id>,
+        bounds: Rectangle,
+        _: Rectangle,
+        translation: Vector,
+        _: &mut dyn operation::Scrollable,
+    ) {
+        if self.root_translation.is_none() && (self.root.is_none() || self.root.as_ref() == id) {
+            self.root_translation = Some(translation);
+        }
+        self.pending_clip = Some((bounds, translation));
+    }
+
+    fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+            policy.visit = false;
+        }
+        if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+            && let (Some(target), Some(logical)) =
+                (self.target.or(prose.target), prose.logical.as_ref())
+            && prose
+                .logical_geometry_pending(target, logical.identity, logical.start)
+                .is_some()
+        {
+            self.pending_geometry(bounds);
+        }
+    }
+
+    fn container(&mut self, id: Option<&Id>, _: Rectangle) {
+        if let Some(ids) = id.and_then(|id| self.ids.get(id)) {
+            self.items.extend(ids.iter().copied());
         }
     }
 }
@@ -940,9 +1060,19 @@ impl Geometry {
     }
 }
 
+#[derive(Clone)]
 struct Row {
     id: String,
     bounds: Rectangle,
+}
+
+struct Reflow {
+    geometry: Geometry,
+    rows: Vec<Row>,
+    top: f32,
+    follow_end: bool,
+    preserve: bool,
+    path: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -955,27 +1085,37 @@ struct Context {
     follow_end: bool,
     edge: Option<Edge>,
     preserve: Option<PreserveRefresh>,
+    reflow: Option<Reflow>,
+    paths: HashMap<String, Vec<u64>>,
 }
 
 impl Context {
     fn position(&self, next: Geometry, rows: &[(&str, Rectangle)], follow_end: bool) -> f32 {
-        let Some((previous, top)) = self.geometry.zip(self.top) else {
+        let reference = self.reflow.as_ref();
+        let previous_top = reference
+            .map(|saved| (saved.geometry, saved.top))
+            .or_else(|| self.geometry.zip(self.top));
+        let Some((previous, top)) = previous_top else {
             return if self.subagent.is_some() {
                 0.0
             } else {
                 next.travel()
             };
         };
+        let old_rows = reference.map_or(self.rows.as_slice(), |saved| saved.rows.as_slice());
+        let was_following = reference.map_or(self.follow_end, |saved| saved.follow_end);
+        let preserving = reference.is_some_and(|saved| saved.preserve)
+            || self.preserve.is_some_and(|preserve| preserve.arrived);
         // Fitting live content normally follows its end. But an earlier page
         // can prepend surviving rows to that same short transcript: preserve
         // the exchange the reader was looking at instead of jumping past it.
-        let prepended = self.rows.first().is_some_and(|old| {
+        let prepended = old_rows.first().is_some_and(|old| {
             rows.iter()
                 .any(|(id, bounds)| *id == old.id && bounds.y > old.bounds.y + 0.5)
         });
         if !prepended
-            && self.follow_end
-            && !self.preserve.is_some_and(|preserve| preserve.arrived)
+            && was_following
+            && !preserving
             && follow_end
             && previous.travel() - top <= 0.5
             && (previous.travel() > 0.0 || self.subagent.is_none())
@@ -984,14 +1124,13 @@ impl Context {
         }
         // A recreated widget can restore authoritative native geometry from
         // the Runtime before it has any measured row anchors.
-        if self.rows.is_empty() {
+        if old_rows.is_empty() {
             return top.clamp(0.0, next.travel());
         }
         // Most relayouts only refresh a timer or hover state. Avoid building
         // a lookup table when every measured row is unchanged.
-        if self.rows.len() == rows.len()
-            && self
-                .rows
+        if old_rows.len() == rows.len()
+            && old_rows
                 .iter()
                 .zip(rows)
                 .all(|(old, (id, bounds))| old.id == *id && old.bounds == *bounds)
@@ -1002,7 +1141,7 @@ impl Context {
         // Preserve the first visible surviving exchange, not the transcript's
         // total height: a page may arrive while the live answer also grows.
         let visible = || {
-            self.rows.iter().filter(|row| {
+            old_rows.iter().filter(|row| {
                 row.bounds.y + row.bounds.height > top
                     && row.bounds.y < top + previous.viewport.height
             })
@@ -1019,7 +1158,7 @@ impl Context {
             .or_else(|| {
                 // Front eviction can remove every visible exchange. Keep the
                 // nearest surviving boundary instead of jumping to live output.
-                self.rows
+                old_rows
                     .iter()
                     .filter_map(|row| next_rows.get(row.id.as_str()).map(|bounds| (row, bounds)))
                     .min_by(|(a, _), (b, _)| {
@@ -1028,7 +1167,7 @@ impl Context {
                             .total_cmp(&(b.bounds.y - top).abs())
                     })
             });
-        let fallback = if self.preserve.is_some_and(|preserve| preserve.arrived) {
+        let fallback = if preserving {
             top.clamp(0.0, next.travel())
         } else {
             next.travel()
@@ -1038,12 +1177,96 @@ impl Context {
             // A disclosure or reflow may shorten the anchored exchange itself.
             // Do not carry an offset past its new end into an unrelated turn.
             let within = if within > 0.0 {
-                within.min(new.height.max(0.0))
+                // During reflow keep the source intersecting the viewport.
+                // Landing exactly at an estimated end would exclude the row
+                // both from realization and its redraw-driven Flow request.
+                let inset = if reference.is_some() { 1.0 } else { 0.0 };
+                within.min((new.height - inset).max(0.0))
             } else {
                 within
             };
             (new.y + within).clamp(0.0, next.travel())
         })
+    }
+
+    fn finish_reflow(
+        &mut self,
+        rows: &[(&str, Rectangle)],
+        mounted: &HashSet<String>,
+        pending: &[Rectangle],
+        mounted_items: &HashSet<&str>,
+        guards: &HashMap<u64, bool>,
+    ) {
+        let Some(saved) = &self.reflow else {
+            return;
+        };
+        let visible = |row: &&Row| {
+            row.bounds.y + row.bounds.height > saved.top
+                && row.bounds.y < saved.top + saved.geometry.viewport.height
+        };
+        let fine = saved
+            .rows
+            .iter()
+            .filter(visible)
+            .find(|row| row.id.starts_with("virtual-chunk-"));
+        let prepended = saved.rows.first().is_some_and(|old| {
+            rows.iter()
+                .any(|(id, bounds)| *id == old.id && bounds.y > old.bounds.y + 0.5)
+        });
+        let following_end = !prepended
+            && saved.follow_end
+            && self.follow_end
+            && !saved.preserve
+            && !self.preserve.is_some_and(|preserve| preserve.arrived)
+            && saved.geometry.travel() - saved.top <= 0.5
+            && (saved.geometry.travel() > 0.0 || self.subagent.is_none());
+        let viewport_ready = || self.top.is_some() && pending.is_empty();
+        let ready = if following_end {
+            viewport_ready()
+        } else if let Some(fine) = fine {
+            let parent = |row: &&Row| {
+                !row.id.starts_with("virtual-chunk-")
+                    && row.bounds.y <= fine.bounds.y
+                    && row.bounds.y + row.bounds.height >= fine.bounds.y + fine.bounds.height - 0.5
+            };
+            let still_loaded = saved
+                .rows
+                .iter()
+                .filter(parent)
+                .any(|row| rows.iter().any(|(id, _)| *id == row.id));
+            let mut route_ready = true;
+            for key in &saved.path {
+                match guards.get(key) {
+                    Some(true) => {}
+                    Some(false) => {
+                        route_ready = false;
+                        break;
+                    }
+                    // Every preceding descriptor is mounted. The first
+                    // absent child belongs to a replaced native source path.
+                    None => break,
+                }
+            }
+            let parent_ready = route_ready
+                && viewport_ready()
+                && saved.rows.iter().filter(visible).any(|row| {
+                    !row.id.starts_with("virtual-chunk-")
+                        && row.bounds.y <= fine.bounds.y
+                        && row.bounds.y + row.bounds.height
+                            >= fine.bounds.y + fine.bounds.height - 0.5
+                        && mounted_items.contains(row.id.as_str())
+                        && rows.iter().any(|(id, _)| *id == row.id)
+                });
+            rows.iter()
+                .find(|(id, _)| *id == fine.id)
+                .is_some_and(|(id, _)| mounted.contains(*id) && viewport_ready())
+                || (!rows.iter().any(|(id, _)| *id == fine.id) && (!still_loaded || parent_ready))
+        } else {
+            viewport_ready()
+        };
+        if ready {
+            self.reflow = None;
+        }
     }
 
     fn remember(&mut self, next: Geometry, rows: &[(&str, Rectangle)], top: f32) {
@@ -1164,6 +1387,36 @@ impl Anchor {
             });
             context.top = Some(seed.from_top());
             context.follow_end = seed.at_bottom() && follow_end;
+        }
+        if context.reflow.is_none()
+            && context.edge.is_none()
+            && let Some((previous, top)) = context.geometry.zip(context.top)
+            && previous.viewport.width != next.viewport.width
+        {
+            // Keep the measured source identity through width estimates and
+            // asynchronous shaping. A temporary item alias can realize the
+            // original chunk, but must not replace its reading bookmark.
+            context.reflow = Some(Reflow {
+                geometry: previous,
+                rows: context.rows.clone(),
+                top,
+                follow_end: context.follow_end,
+                preserve: context.preserve.is_some_and(|preserve| preserve.arrived),
+                path: context
+                    .rows
+                    .iter()
+                    .find(|row| {
+                        row.id.starts_with("virtual-chunk-")
+                            && row.bounds.y + row.bounds.height > top
+                            && row.bounds.y < top + previous.viewport.height
+                    })
+                    .and_then(|row| context.paths.get(&row.id))
+                    .cloned()
+                    .unwrap_or_default(),
+            });
+        }
+        if let Some(saved) = &mut context.reflow {
+            saved.preserve |= context.preserve.is_some_and(|preserve| preserve.arrived);
         }
         let switched = previous_active != Some(index) || context.geometry.is_none();
         let old_bottom = context
@@ -1481,7 +1734,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             );
         }
         let mut node = self.content.as_widget_mut().layout(child, renderer, limits);
-        for _ in 0..4 {
+        for pass in 0..4 {
             let next = Geometry {
                 viewport: node.size(),
                 content: node.children()[0].size(),
@@ -1503,7 +1756,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             let wanted = anchor
                 .active
                 .into_iter()
-                .flat_map(|index| anchor.contexts[index].rows.iter())
+                .flat_map(|index| {
+                    let context = &anchor.contexts[index];
+                    context
+                        .rows
+                        .iter()
+                        .chain(context.reflow.iter().flat_map(|saved| saved.rows.iter()))
+                })
                 .filter_map(|row| {
                     row.id
                         .strip_prefix("virtual-chunk-")
@@ -1515,6 +1774,23 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 rows: Default::default(),
                 wanted,
                 virtual_rows: vec![],
+                mounted: HashSet::new(),
+                wanted_guards: anchor
+                    .active
+                    .into_iter()
+                    .flat_map(|index| {
+                        let context = &anchor.contexts[index];
+                        context.paths.values().flatten().copied().chain(
+                            context
+                                .reflow
+                                .iter()
+                                .flat_map(|saved| saved.path.iter().copied()),
+                        )
+                    })
+                    .collect(),
+                guards: HashMap::new(),
+                path: vec![],
+                paths: HashMap::new(),
             };
             self.content.as_widget_mut().operate(
                 child,
@@ -1585,6 +1861,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                                 .unwrap_or_default()
                     })
                 });
+            if let Some(index) = anchor.active {
+                anchor.contexts[index].paths = std::mem::take(&mut measured.paths);
+            }
             if let Some(offset) = offset {
                 self.content.as_widget_mut().operate(
                     child,
@@ -1603,14 +1882,52 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 &mut virtual_viewport,
             );
             if !virtual_viewport.changed {
+                if let Some(index) = anchor.active {
+                    // A projected alias cannot prove that a fine source was
+                    // removed. Only a settled, mounted parent without pending
+                    // shaping can establish that its old chunk was replaced.
+                    let mut mounted_items = MountedItems {
+                        ids: &measured.ids,
+                        items: HashSet::new(),
+                        target: self.target,
+                        root: self
+                            .target
+                            .map(|target| card_control_id(target.card, "chat-transcript")),
+                        root_translation: None,
+                        pending: vec![],
+                        translation: Vector::ZERO,
+                        clip: None,
+                        pending_clip: None,
+                    };
+                    if anchor.contexts[index].reflow.is_some() {
+                        self.content.as_widget_mut().operate(
+                            child,
+                            Layout::new(&node),
+                            renderer,
+                            &mut mounted_items,
+                        );
+                    }
+                    anchor.contexts[index].finish_reflow(
+                        &rows,
+                        &measured.mounted,
+                        &mounted_items.pending,
+                        &mounted_items.items,
+                        &measured.guards,
+                    );
+                }
                 state.revealing &= self.restoration_pending;
                 state.needs_layout = false;
                 break;
             }
-            // A cold reader is not presentable while its native virtual
-            // windows still disagree with the restored scroll position. Keep
-            // the four-pass bound and continue in the next native update.
-            state.needs_layout = state.revealing && !self.restoration_pending;
+            // Keep every returned layout paired with the row geometry and
+            // scroll correction measured above. An extra child layout after
+            // the final pass would return new estimates without anchoring
+            // them, and the next update could save that provisional offset.
+            // Warm readers need the same bounded continuation as cold ones.
+            state.needs_layout = !self.restoration_pending;
+            if pass == 3 {
+                break;
+            }
             node = self.content.as_widget_mut().layout(child, renderer, limits);
         }
         node
@@ -1667,6 +1984,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                         anchor.active = Some(index);
                         let context = &mut anchor.contexts[index];
                         context.edge = None;
+                        context.reflow = None;
                         context.top = Some(top);
                         if self.restoration_pending {
                             context.geometry = Some(Geometry {
@@ -1849,6 +2167,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                         .find(|context| context.subagent.as_deref() == self.subagent)
                 {
                     context.edge = None;
+                    context.reflow = None;
                     let top = (saved_top + top - before.0.unwrap_or(top))
                         .clamp(0.0, saved_geometry.travel());
                     context.top = Some(top);
@@ -1915,6 +2234,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     .find(|context| context.subagent.as_deref() == self.subagent)
                 {
                     context.edge = None;
+                    if wheel_intent || !matches!(event, Event::Window(_)) {
+                        context.reflow = None;
+                    }
                 }
             }
             if state.restore && self.restoration_pending && !moved {
@@ -2371,6 +2693,186 @@ mod tests {
                 .root()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn warm_virtual_reader_keeps_returned_geometry_coherent_and_finishes_redraws() {
+        fn nested(
+            depth: u64,
+            draws: Rc<std::cell::RefCell<Vec<&'static str>>>,
+            clicks: Rc<Cell<usize>>,
+        ) -> Element<'static, Message> {
+            if depth == 0 {
+                return presentation_probe("reading beginning", 400.0, &draws, &clicks);
+            }
+            let nested_draws = draws.clone();
+            let nested_clicks = clicks.clone();
+            let mut first = virtualized::Row::new(depth * 2, 0, 12_000.0, None, move || {
+                nested(depth - 1, nested_draws.clone(), nested_clicks.clone())
+            });
+            first.anchor = true;
+            virtualized::column(
+                vec![
+                    first,
+                    virtualized::Row::new(depth * 2 + 1, 0, 6_000.0, None, move || {
+                        presentation_probe("later content", 6_000.0, &draws, &clicks)
+                    }),
+                ],
+                Default::default(),
+            )
+        }
+
+        fn assert_native_geometry(
+            element: &mut Element<'_, Message>,
+            tree: &mut Tree,
+            node: &layout::Node,
+            renderer: &cosmic::Renderer,
+            memory: &Memory,
+        ) {
+            // Read the bookmark before any operation or redraw can overwrite
+            // it. Its geometry must describe the frame actually returned.
+            let (remembered, remembered_top) = {
+                let anchor = memory.0.borrow();
+                let context = &anchor.contexts[anchor.active.unwrap()];
+                (context.geometry.unwrap(), context.top.unwrap())
+            };
+            assert_eq!(remembered.viewport, node.size());
+            assert_eq!(
+                remembered.content,
+                node.children()[0].size(),
+                "the returned native frame must not outrun its retained reader geometry"
+            );
+            let mut actual = ReadTop::default();
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(node), renderer, &mut actual);
+            assert!(
+                (actual.0.unwrap() - remembered_top).abs() <= 0.5,
+                "the returned native translation and retained reader must agree"
+            );
+        }
+
+        let mut renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let memory = Memory::default();
+        let observations = Observations::default();
+        let draws = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let clicks = Rc::new(Cell::new(0));
+        let make = |body| {
+            transcript_observed(
+                item("reader", body),
+                target,
+                None,
+                vec![],
+                true,
+                vec![(item_id("reader"), "reader")],
+                observations.clone(),
+                memory.clone(),
+                false,
+                HashSet::new(),
+                None,
+            )
+        };
+        memory.request_edge(None, Edge::Start);
+        let mut element = make(
+            widget::column::with_children(vec![
+                presentation_probe("reading beginning", 400.0, &draws, &clicks),
+                widget::Space::new().height(6_000.0).into(),
+            ])
+            .into(),
+        );
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        let initial = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &cosmic::Theme::dark(),
+            &renderer::Style::default(),
+            Layout::new(&initial),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        assert_eq!(&*draws.borrow(), &["reading beginning"]);
+        assert!(
+            !tree.state.downcast_ref::<ReaderState>().revealing,
+            "the changed reader has already been presented"
+        );
+        draws.borrow_mut().clear();
+
+        // Real nested virtual windows replace the warm body in the same
+        // native tree. Their estimates reveal more windows as they resolve.
+        element = make(nested(10, draws.clone(), clicks));
+        tree.diff(element.as_widget_mut());
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut continued = 0;
+        let mut settled = false;
+        for _ in 0..32 {
+            assert_native_geometry(&mut element, &mut tree, &node, &renderer, &memory);
+            let mut pending = virtualized::UpdateViewport::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut pending);
+            let mut messages = vec![];
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Window(iced::window::Event::RedrawRequested(
+                    iced::time::Instant::now(),
+                )),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            if pending.changed {
+                assert!(
+                    shell.is_layout_invalid(),
+                    "a warm reader with unresolved native windows must continue layout"
+                );
+                assert_eq!(
+                    shell.redraw_request(),
+                    iced::window::RedrawRequest::NextFrame,
+                    "a warm reader must schedule the frame needed to finish its windows"
+                );
+                continued += 1;
+            }
+            if !shell.is_layout_invalid() {
+                settled = true;
+                break;
+            }
+            node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+        }
+        assert!(continued > 0, "the fixture must require warm continuation");
+        assert!(settled, "actual warm virtual windows must converge");
+        assert_native_geometry(&mut element, &mut tree, &node, &renderer, &memory);
+        let mut actual = ReadTop::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(actual.0, Some(0.0), "the reading beginning stays in view");
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &cosmic::Theme::dark(),
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        assert_eq!(&*draws.borrow(), &["reading beginning"]);
     }
 
     #[test]
@@ -5365,5 +5867,800 @@ mod tests {
             ),
             Some(0.0)
         );
+    }
+
+    const REFLOW_FINE: &str = "virtual-chunk-000000000000002a";
+
+    fn width_reflow_geometry(width: f32, height: f32) -> Geometry {
+        Geometry {
+            viewport: Size::new(width, 400.0),
+            content: Size::new(width, height),
+        }
+    }
+
+    fn width_reflow_reader(top: f32, follow_end: bool) -> Anchor {
+        let mut anchor = Anchor::default();
+        let measured = rows(&[
+            ("answer", 100.0, 2000.0),
+            (REFLOW_FINE, 1100.0, 400.0),
+            ("next", 2100.0, 900.0),
+        ]);
+        let geometry = width_reflow_geometry(720.0, 3000.0);
+        anchor.layout_following(None, &measured, geometry, None, follow_end);
+        anchor.layout_following(None, &measured, geometry, Some(top), follow_end);
+        assert_eq!(anchor.contexts[0].top, Some(top));
+        anchor
+    }
+
+    #[test]
+    fn width_reflow_keeps_fine_displacement_through_alias_estimate_and_pending_flow() {
+        let mut anchor = width_reflow_reader(1250.0, false);
+        let cold_parent = rows(&[("answer", 100.0, 100.0), ("next", 200.0, 1800.0)]);
+        anchor.layout_following(
+            None,
+            &cold_parent,
+            width_reflow_geometry(400.0, 2000.0),
+            Some(1250.0),
+            false,
+        );
+        let route = anchor.contexts[0].top.unwrap();
+        assert!(
+            route >= cold_parent[0].1.y && route < cold_parent[0].1.y + cold_parent[0].1.height,
+            "the coarse route must intersect its parent so the fine row can mount"
+        );
+        anchor.contexts[0].finish_reflow(
+            &cold_parent,
+            &HashSet::new(),
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(anchor.contexts[0].reflow.is_some());
+
+        let estimated = rows(&[("answer", 100.0, 1700.0), (REFLOW_FINE, 850.0, 100.0)]);
+        anchor.layout_following(
+            None,
+            &estimated,
+            width_reflow_geometry(400.0, 1800.0),
+            Some(route),
+            false,
+        );
+        assert_eq!(anchor.contexts[0].top, Some(949.0));
+        assert!(
+            anchor.contexts[0].top.unwrap() < estimated[1].1.y + estimated[1].1.height,
+            "the estimated fine row must remain eligible to request its visible Flow"
+        );
+        anchor.contexts[0].finish_reflow(
+            &estimated,
+            &HashSet::new(),
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(anchor.contexts[0].reflow.is_some());
+
+        let mounted = rows(&[("answer", 100.0, 2200.0), (REFLOW_FINE, 900.0, 300.0)]);
+        let mounted_ids = HashSet::from([REFLOW_FINE.to_owned()]);
+        anchor.layout_following(
+            None,
+            &mounted,
+            width_reflow_geometry(400.0, 2300.0),
+            Some(949.0),
+            false,
+        );
+        assert_eq!(anchor.contexts[0].top, Some(1050.0));
+        anchor.contexts[0].finish_reflow(
+            &mounted,
+            &mounted_ids,
+            &[mounted[1].1],
+            &HashSet::from(["answer"]),
+            &HashMap::new(),
+        );
+        assert!(
+            anchor.contexts[0].reflow.is_some(),
+            "mounting the row does not make its pending Flow geometry exact"
+        );
+
+        let exact = rows(&[
+            ("answer", 100.0, 2400.0),
+            (REFLOW_FINE, 1450.0, 600.0),
+            ("next", 2500.0, 900.0),
+        ]);
+        let geometry = width_reflow_geometry(400.0, 3400.0);
+        anchor.layout_following(None, &exact, geometry, Some(1050.0), false);
+        assert_eq!(
+            anchor.contexts[0].top.unwrap() - exact[1].1.y,
+            150.0,
+            "neither the coarse alias nor the shortened estimate replaces the original fine displacement"
+        );
+        anchor.contexts[0].finish_reflow(
+            &exact,
+            &mounted_ids,
+            &[],
+            &HashSet::from(["answer"]),
+            &HashMap::new(),
+        );
+        assert!(anchor.contexts[0].reflow.is_none());
+        anchor.layout_following(None, &exact, geometry, Some(1600.0), false);
+        assert_eq!(anchor.contexts[0].top, Some(1600.0));
+    }
+
+    #[test]
+    fn width_reflow_releases_disappeared_source_and_uses_replacement_boundary() {
+        let mut anchor = width_reflow_reader(1250.0, false);
+        let alias = rows(&[("answer", 0.0, 2000.0)]);
+        anchor.layout_following(
+            None,
+            &alias,
+            width_reflow_geometry(400.0, 2000.0),
+            Some(1250.0),
+            false,
+        );
+        anchor.contexts[0].finish_reflow(
+            &alias,
+            &HashSet::new(),
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(anchor.contexts[0].reflow.is_some());
+
+        let replacement = rows(&[("replacement", 0.0, 900.0)]);
+        anchor.layout_following(
+            None,
+            &replacement,
+            width_reflow_geometry(400.0, 900.0),
+            anchor.contexts[0].top,
+            false,
+        );
+        assert_eq!(anchor.contexts[0].top, Some(500.0));
+        anchor.contexts[0].finish_reflow(
+            &replacement,
+            &HashSet::new(),
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(anchor.contexts[0].reflow.is_none());
+        let grown = rows(&[("replacement", 0.0, 1900.0)]);
+        anchor.layout_following(
+            None,
+            &grown,
+            width_reflow_geometry(400.0, 1900.0),
+            Some(500.0),
+            false,
+        );
+        assert_eq!(anchor.contexts[0].top, Some(500.0));
+    }
+
+    #[test]
+    fn width_reflow_keeps_true_end_follow_through_fitting_estimates() {
+        let mut anchor = Anchor::default();
+        let original = rows(&[("answer", 0.0, 3000.0), (REFLOW_FINE, 2400.0, 600.0)]);
+        anchor.layout(None, &original, width_reflow_geometry(720.0, 3000.0), None);
+        assert_eq!(anchor.contexts[0].top, Some(2600.0));
+        let fitting = rows(&[("answer", 0.0, 200.0)]);
+        anchor.layout(
+            None,
+            &fitting,
+            width_reflow_geometry(400.0, 200.0),
+            Some(2600.0),
+        );
+        assert_eq!(anchor.contexts[0].top, Some(0.0));
+        anchor.contexts[0].finish_reflow(
+            &fitting,
+            &HashSet::new(),
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(anchor.contexts[0].follow_end);
+
+        let estimated = rows(&[("answer", 0.0, 600.0), (REFLOW_FINE, 200.0, 400.0)]);
+        anchor.layout(
+            None,
+            &estimated,
+            width_reflow_geometry(400.0, 600.0),
+            Some(0.0),
+        );
+        assert_eq!(anchor.contexts[0].top, Some(200.0));
+        anchor.contexts[0].finish_reflow(
+            &estimated,
+            &HashSet::new(),
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(anchor.contexts[0].follow_end);
+        let exact = rows(&[("answer", 0.0, 4000.0), (REFLOW_FINE, 3400.0, 600.0)]);
+        let mounted = HashSet::from([REFLOW_FINE.to_owned()]);
+        anchor.layout(
+            None,
+            &exact,
+            width_reflow_geometry(400.0, 4000.0),
+            Some(200.0),
+        );
+        assert_eq!(anchor.contexts[0].top, Some(3600.0));
+        anchor.contexts[0].finish_reflow(
+            &exact,
+            &mounted,
+            &[exact[1].1],
+            &HashSet::from(["answer"]),
+            &HashMap::new(),
+        );
+        assert_eq!(anchor.contexts[0].top, Some(3600.0));
+        anchor.contexts[0].finish_reflow(
+            &exact,
+            &mounted,
+            &[],
+            &HashSet::from(["answer"]),
+            &HashMap::new(),
+        );
+        assert!(anchor.contexts[0].follow_end);
+        let grown = rows(&[("answer", 0.0, 4400.0), (REFLOW_FINE, 3400.0, 1000.0)]);
+        anchor.layout(
+            None,
+            &grown,
+            width_reflow_geometry(400.0, 4400.0),
+            Some(3600.0),
+        );
+        assert_eq!(anchor.contexts[0].top, Some(4000.0));
+    }
+
+    #[test]
+    fn width_reflow_clamping_historical_reader_at_provisional_end_does_not_follow() {
+        let mut anchor = width_reflow_reader(1250.0, true);
+        let provisional = rows(&[("answer", 0.0, 600.0)]);
+        let geometry = width_reflow_geometry(400.0, 600.0);
+        anchor.layout(None, &provisional, geometry, Some(1250.0));
+        assert_eq!(anchor.contexts[0].top, Some(geometry.travel()));
+        anchor.contexts[0].finish_reflow(
+            &provisional,
+            &HashSet::new(),
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(anchor.contexts[0].reflow.is_some());
+        let exact = rows(&[
+            ("answer", 100.0, 2400.0),
+            (REFLOW_FINE, 1450.0, 600.0),
+            ("next", 2500.0, 900.0),
+        ]);
+        let geometry = width_reflow_geometry(400.0, 3400.0);
+        anchor.layout(None, &exact, geometry, Some(200.0));
+        assert_eq!(anchor.contexts[0].top, Some(1600.0));
+        assert_ne!(anchor.contexts[0].top, Some(geometry.travel()));
+        anchor.contexts[0].finish_reflow(
+            &exact,
+            &HashSet::from([REFLOW_FINE.to_owned()]),
+            &[],
+            &HashSet::from(["answer"]),
+            &HashMap::new(),
+        );
+        assert!(anchor.contexts[0].reflow.is_none());
+    }
+
+    #[test]
+    fn width_reflow_explicit_edges_supersede_the_retained_fine_reader() {
+        for edge in [Edge::Start, Edge::End, Edge::Latest] {
+            let memory = Memory::default();
+            let mut anchor = width_reflow_reader(1250.0, false);
+            let provisional = rows(&[("answer", 100.0, 100.0)]);
+            anchor.layout_following(
+                None,
+                &provisional,
+                width_reflow_geometry(400.0, 2000.0),
+                Some(1250.0),
+                false,
+            );
+            assert!(anchor.contexts[0].reflow.is_some());
+            *memory.0.borrow_mut() = anchor;
+            memory.request_edge(None, edge);
+            let mut anchor = memory.0.borrow_mut();
+            assert!(anchor.contexts[0].reflow.is_none());
+            let exact = rows(&[("answer", 0.0, 3400.0), (REFLOW_FINE, 1450.0, 600.0)]);
+            let geometry = width_reflow_geometry(400.0, 3400.0);
+            let previous_top = anchor.contexts[0].top;
+            anchor.layout(None, &exact, geometry, previous_top);
+            assert_eq!(
+                anchor.contexts[0].top,
+                Some(if edge == Edge::Start {
+                    0.0
+                } else {
+                    geometry.travel()
+                })
+            );
+            assert!(anchor.contexts[0].reflow.is_none());
+        }
+    }
+
+    #[test]
+    fn width_reflow_same_parent_rewrite_waits_for_mounted_ready_source() {
+        const REWRITTEN_FINE: &str = "virtual-chunk-0000000000000099";
+        for pending_flow in [false, true] {
+            let mut anchor = width_reflow_reader(1250.0, false);
+            let rewritten = rows(&[
+                ("answer", 100.0, 2400.0),
+                (REWRITTEN_FINE, 1450.0, 600.0),
+                ("next", 2500.0, 900.0),
+            ]);
+            anchor.layout_following(
+                None,
+                &rewritten,
+                width_reflow_geometry(400.0, 3400.0),
+                Some(1250.0),
+                false,
+            );
+            let mounted = HashSet::from([REWRITTEN_FINE.to_owned()]);
+            anchor.contexts[0].finish_reflow(
+                &rewritten,
+                &mounted,
+                &[],
+                &HashSet::new(),
+                &HashMap::new(),
+            );
+            assert!(
+                anchor.contexts[0].reflow.is_some(),
+                "a coarse alias alone cannot prove the old fine source was rewritten"
+            );
+            let pending = if pending_flow {
+                vec![rewritten[1].1]
+            } else {
+                vec![]
+            };
+            anchor.contexts[0].finish_reflow(
+                &rewritten,
+                &mounted,
+                &pending,
+                &HashSet::from(["answer"]),
+                &HashMap::new(),
+            );
+            assert_eq!(anchor.contexts[0].reflow.is_some(), pending_flow);
+            if pending_flow {
+                anchor.contexts[0].finish_reflow(
+                    &rewritten,
+                    &mounted,
+                    &[],
+                    &HashSet::from(["answer"]),
+                    &HashMap::new(),
+                );
+            }
+            assert!(anchor.contexts[0].reflow.is_none());
+
+            // The replacement owns subsequent geometry. No retired fine key
+            // or old parent displacement may reassert itself on another pass.
+            let shifted = rows(&[
+                ("answer", 400.0, 2400.0),
+                (REWRITTEN_FINE, 2050.0, 600.0),
+                ("next", 2800.0, 900.0),
+            ]);
+            let previous_top = anchor.contexts[0].top;
+            anchor.layout_following(
+                None,
+                &shifted,
+                width_reflow_geometry(400.0, 3700.0),
+                previous_top,
+                false,
+            );
+            assert_eq!(anchor.contexts[0].top, Some(1850.0));
+        }
+    }
+
+    #[test]
+    fn width_reflow_changed_native_scroll_operation_supersedes_retained_reader() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let memory = Memory::default();
+        let make = |fine_y| {
+            transcript_observed(
+                item(
+                    "answer",
+                    widget::column::with_children(vec![
+                        widget::Space::new().height(fine_y).into(),
+                        item(REFLOW_FINE, widget::Space::new().height(400.0)),
+                        widget::Space::new().height(2600.0 - fine_y).into(),
+                    ])
+                    .width(Length::Fill),
+                ),
+                target,
+                None,
+                vec![],
+                false,
+                vec![
+                    (item_id("answer"), "answer"),
+                    (item_id(REFLOW_FINE), REFLOW_FINE),
+                ],
+                Observations::default(),
+                memory.clone(),
+                false,
+                HashSet::new(),
+                None,
+            )
+        };
+        let mut element = make(1100.0);
+        let mut tree = Tree::new(&element);
+        let wide = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
+        let node = element.as_widget_mut().layout(&mut tree, &renderer, &wide);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut SetBottom(1350.0),
+        );
+        assert_eq!(memory.0.borrow().contexts[0].top, Some(1250.0));
+        let narrow = layout::Limits::new(Size::ZERO, Size::new(400.0, 400.0));
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &narrow);
+        assert!(memory.0.borrow().contexts[0].reflow.is_some());
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut SetBottom(2200.0),
+        );
+        assert!(memory.0.borrow().contexts[0].reflow.is_none());
+        assert_eq!(memory.0.borrow().contexts[0].top, Some(400.0));
+        element = make(1800.0);
+        tree.diff(element.as_widget_mut());
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &narrow);
+        let mut actual = ReadTop::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(actual.0, Some(400.0));
+        assert_eq!(memory.0.borrow().contexts[0].top, Some(400.0));
+    }
+
+    #[test]
+    fn width_reflow_prepend_at_old_end_keeps_original_exchange_until_fine_ready() {
+        let mut anchor = Anchor::default();
+        let original = rows(&[("answer", 0.0, 3000.0), (REFLOW_FINE, 2400.0, 600.0)]);
+        anchor.layout(None, &original, width_reflow_geometry(720.0, 3000.0), None);
+        assert_eq!(anchor.contexts[0].top, Some(2600.0));
+        let estimated = rows(&[
+            ("older", 0.0, 500.0),
+            ("answer", 500.0, 1800.0),
+            (REFLOW_FINE, 1800.0, 100.0),
+            ("newer", 2300.0, 1200.0),
+        ]);
+        let geometry = width_reflow_geometry(400.0, 3500.0);
+        anchor.layout(None, &estimated, geometry, Some(2600.0));
+        assert_eq!(anchor.contexts[0].top, Some(1899.0));
+        assert_ne!(anchor.contexts[0].top, Some(geometry.travel()));
+        anchor.contexts[0].finish_reflow(
+            &estimated,
+            &HashSet::new(),
+            &[],
+            &HashSet::from(["answer"]),
+            &HashMap::new(),
+        );
+        assert!(
+            anchor.contexts[0].reflow.is_some(),
+            "the old end became a history exchange when an earlier page arrived"
+        );
+        let exact = rows(&[
+            ("older", 0.0, 500.0),
+            ("answer", 500.0, 3500.0),
+            (REFLOW_FINE, 2900.0, 1000.0),
+            ("newer", 4000.0, 1000.0),
+        ]);
+        let geometry = width_reflow_geometry(400.0, 5000.0);
+        anchor.layout(None, &exact, geometry, Some(1899.0));
+        assert_eq!(anchor.contexts[0].top.unwrap() - exact[2].1.y, 200.0);
+        assert_ne!(anchor.contexts[0].top, Some(geometry.travel()));
+        anchor.contexts[0].finish_reflow(
+            &exact,
+            &HashSet::from([REFLOW_FINE.to_owned()]),
+            &[],
+            &HashSet::from(["answer"]),
+            &HashMap::new(),
+        );
+        assert!(anchor.contexts[0].reflow.is_none());
+    }
+
+    #[test]
+    fn width_reflow_late_preserved_refresh_arrival_survives_consumed_estimates() {
+        for replaced_source in [false, true] {
+            let memory = Memory::default();
+            let original = rows(&[("answer", 0.0, 3000.0), (REFLOW_FINE, 2400.0, 600.0)]);
+            memory.0.borrow_mut().layout(
+                None,
+                &original,
+                width_reflow_geometry(720.0, 3000.0),
+                None,
+            );
+            memory.preserve_refresh(42, 10);
+            let estimated = rows(&[("answer", 0.0, 600.0), (REFLOW_FINE, 200.0, 100.0)]);
+            {
+                let mut anchor = memory.0.borrow_mut();
+                anchor.layout(
+                    None,
+                    &estimated,
+                    width_reflow_geometry(400.0, 600.0),
+                    Some(2600.0),
+                );
+                anchor.contexts[0].finish_reflow(
+                    &estimated,
+                    &HashSet::new(),
+                    &[estimated[1].1],
+                    &HashSet::from(["answer"]),
+                    &HashMap::new(),
+                );
+                assert!(anchor.contexts[0].reflow.is_some());
+            }
+            // The accepted history fetch can answer after width restoration
+            // already started; its one-shot arrival is consumed next layout.
+            memory.latest_source(Some(10), 11, true, false);
+            assert!(memory.preserve_arrived(None));
+            {
+                let mut anchor = memory.0.borrow_mut();
+                anchor.layout(
+                    None,
+                    &estimated,
+                    width_reflow_geometry(400.0, 600.0),
+                    Some(200.0),
+                );
+                anchor.contexts[0].finish_reflow(
+                    &estimated,
+                    &HashSet::new(),
+                    &[],
+                    &HashSet::from(["answer"]),
+                    &HashMap::new(),
+                );
+                assert!(
+                    anchor.contexts[0].reflow.is_some(),
+                    "consuming arrival cannot promote an estimated historical row to live end-follow"
+                );
+            }
+            assert!(!memory.preserve_arrived(None));
+            let exact = if replaced_source {
+                rows(&[("replacement", 0.0, 6000.0)])
+            } else {
+                rows(&[("answer", 0.0, 6000.0), (REFLOW_FINE, 3400.0, 1000.0)])
+            };
+            let geometry = width_reflow_geometry(400.0, 6000.0);
+            let mut anchor = memory.0.borrow_mut();
+            anchor.layout(None, &exact, geometry, Some(200.0));
+            assert_eq!(
+                anchor.contexts[0].top,
+                Some(if replaced_source { 2600.0 } else { 3600.0 }),
+                "preserved refresh keeps original geometry even if overlap disappears"
+            );
+            assert_ne!(anchor.contexts[0].top, Some(geometry.travel()));
+            anchor.contexts[0].finish_reflow(
+                &exact,
+                &HashSet::from([REFLOW_FINE.to_owned()]),
+                &[],
+                &HashSet::from(["answer"]),
+                &HashMap::new(),
+            );
+            assert!(anchor.contexts[0].reflow.is_none());
+        }
+    }
+
+    #[test]
+    fn width_reflow_partial_eviction_releases_removed_parent_despite_visible_survivor() {
+        let mut anchor = Anchor::default();
+        let original = rows(&[
+            ("answer", 100.0, 1400.0),
+            (REFLOW_FINE, 1100.0, 400.0),
+            ("survivor", 1500.0, 1500.0),
+        ]);
+        let geometry = width_reflow_geometry(720.0, 3000.0);
+        anchor.layout_following(None, &original, geometry, None, false);
+        anchor.layout_following(None, &original, geometry, Some(1250.0), false);
+        let evicted = rows(&[("survivor", 0.0, 2000.0)]);
+        anchor.layout_following(
+            None,
+            &evicted,
+            width_reflow_geometry(400.0, 2000.0),
+            Some(1250.0),
+            false,
+        );
+        assert_eq!(anchor.contexts[0].top, Some(0.0));
+        anchor.contexts[0].finish_reflow(
+            &evicted,
+            &HashSet::new(),
+            &[],
+            &HashSet::from(["survivor"]),
+            &HashMap::new(),
+        );
+        assert!(
+            anchor.contexts[0].reflow.is_none(),
+            "a neighboring visible survivor cannot retain a different source's removed fine bookmark"
+        );
+        let shifted = rows(&[("survivor", 200.0, 2000.0)]);
+        anchor.layout_following(
+            None,
+            &shifted,
+            width_reflow_geometry(400.0, 2200.0),
+            Some(0.0),
+            false,
+        );
+        assert_eq!(anchor.contexts[0].top, Some(200.0));
+    }
+
+    #[test]
+    fn width_reflow_overscan_flow_does_not_hold_ready_replacement_or_bypass_unmounted_source() {
+        const REWRITTEN_FINE: &str = "virtual-chunk-0000000000000099";
+        for rewritten in [false, true] {
+            let mut anchor = width_reflow_reader(1250.0, false);
+            let fine = if rewritten {
+                REWRITTEN_FINE
+            } else {
+                REFLOW_FINE
+            };
+            let current = rows(&[
+                ("answer", 100.0, 2400.0),
+                (fine, 1450.0, 600.0),
+                ("next", 2500.0, 900.0),
+            ]);
+            let geometry = width_reflow_geometry(400.0, 3400.0);
+            anchor.layout_following(None, &current, geometry, Some(1250.0), false);
+            let overscan = Rectangle {
+                y: 2001.0,
+                height: 40.0,
+                ..current[1].1
+            };
+            assert!(overscan.intersection(&current[1].1).is_some());
+            assert!(overscan.y > anchor.contexts[0].top.unwrap() + geometry.viewport.height);
+            let top = anchor.contexts[0].top.unwrap();
+            let parent_id = item_id("answer");
+            let ids = HashMap::from([(parent_id.clone(), vec!["answer"])]);
+            let nested_translation = Vector::new(120.0, 80.0);
+            let mut mounted_items = MountedItems {
+                ids: &ids,
+                items: HashSet::new(),
+                target: None,
+                root: None,
+                root_translation: Some(Vector::new(0.0, top)),
+                pending: vec![],
+                translation: Vector::new(120.0, top + 80.0),
+                clip: Some(Rectangle::with_size(Size::new(400.0, 400.0))),
+                pending_clip: None,
+            };
+            mounted_items.container(Some(&parent_id), current[0].1);
+            mounted_items.pending_geometry(Rectangle {
+                x: overscan.x + nested_translation.x,
+                y: overscan.y + nested_translation.y,
+                ..overscan
+            });
+            assert!(
+                mounted_items.pending.is_empty(),
+                "nested translation cannot make a clipped overscan Flow eligible"
+            );
+            let visible = Rectangle {
+                x: 50.0,
+                y: top + 100.0,
+                width: 200.0,
+                height: 40.0,
+            };
+            mounted_items.pending_geometry(Rectangle {
+                x: visible.x + nested_translation.x,
+                y: visible.y + nested_translation.y,
+                ..visible
+            });
+            assert_eq!(mounted_items.pending, [visible]);
+            anchor.contexts[0].finish_reflow(
+                &current,
+                &HashSet::from([fine.to_owned()]),
+                &mounted_items.pending,
+                &mounted_items.items,
+                &HashMap::new(),
+            );
+            assert!(
+                anchor.contexts[0].reflow.is_some(),
+                "eligible visible Flow must finish even after its parent and fine row mount"
+            );
+            mounted_items.pending.clear();
+            anchor.contexts[0].finish_reflow(
+                &current,
+                &HashSet::new(),
+                &mounted_items.pending,
+                &mounted_items.items,
+                &HashMap::new(),
+            );
+            assert_eq!(
+                anchor.contexts[0].reflow.is_none(),
+                rewritten,
+                "overscan Flow never starts, but the original fine source still requires actual mounting"
+            );
+            if !rewritten {
+                assert_eq!(anchor.contexts[0].top, Some(1600.0));
+                anchor.contexts[0].finish_reflow(
+                    &current,
+                    &HashSet::from([REFLOW_FINE.to_owned()]),
+                    &mounted_items.pending,
+                    &mounted_items.items,
+                    &HashMap::new(),
+                );
+                assert!(anchor.contexts[0].reflow.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn width_reflow_nested_source_route_waits_for_non_anchor_ancestors_in_order() {
+        const REWRITTEN_FINE: &str = "virtual-chunk-0000000000000099";
+        let measured_bounds = Rectangle::with_size(Size::new(400.0, 400.0));
+        let mut measured = ItemBounds {
+            ids: HashMap::new(),
+            rows: HashMap::new(),
+            wanted: HashSet::new(),
+            virtual_rows: vec![],
+            mounted: HashSet::new(),
+            wanted_guards: HashSet::from([1, 2]),
+            guards: HashMap::new(),
+            path: vec![],
+            paths: HashMap::new(),
+        };
+        let mut probe = virtualized::RowScope::Probe(false);
+        measured.custom(None, measured_bounds, &mut probe);
+        assert!(matches!(probe, virtualized::RowScope::Probe(true)));
+        measured.custom(None, measured_bounds, &mut virtualized::RowScope::Enter(1));
+        // A horizontal cell still guards the native source path even though
+        // it contributes no selectable fine anchor of its own.
+        measured.custom(None, measured_bounds, &mut virtualized::RowScope::Enter(2));
+        assert!(measured.virtual_rows.is_empty());
+        assert_eq!(measured.path, [1, 2]);
+        let source_path = measured.path.clone();
+        measured.custom(None, measured_bounds, &mut virtualized::RowScope::Exit);
+        measured.custom(None, measured_bounds, &mut virtualized::RowScope::Exit);
+        assert!(measured.path.is_empty());
+
+        for (guards, ready) in [
+            (HashMap::from([(1, true), (2, false)]), false),
+            (HashMap::from([(1, true), (2, true)]), true),
+            (HashMap::from([(1, true)]), true),
+            (HashMap::from([(1, false)]), false),
+        ] {
+            let mut anchor = width_reflow_reader(1250.0, false);
+            anchor.contexts[0]
+                .paths
+                .insert(REFLOW_FINE.into(), source_path.clone());
+            let rewritten = rows(&[
+                ("answer", 100.0, 2400.0),
+                (REWRITTEN_FINE, 1450.0, 600.0),
+                ("next", 2500.0, 900.0),
+            ]);
+            let geometry = width_reflow_geometry(400.0, 3400.0);
+            anchor.layout_following(None, &rewritten, geometry, Some(1250.0), false);
+            assert_eq!(
+                anchor.contexts[0].reflow.as_ref().unwrap().path,
+                source_path
+            );
+            anchor.contexts[0].finish_reflow(
+                &rewritten,
+                &HashSet::from([REWRITTEN_FINE.to_owned()]),
+                &[],
+                &HashSet::from(["answer"]),
+                &guards,
+            );
+            assert_eq!(anchor.contexts[0].reflow.is_none(), ready);
+            if !ready {
+                let original_fine = rows(&[
+                    ("answer", 100.0, 2400.0),
+                    (REFLOW_FINE, 1450.0, 600.0),
+                    ("next", 2500.0, 900.0),
+                ]);
+                anchor.layout_following(None, &original_fine, geometry, Some(1250.0), false);
+                assert_eq!(anchor.contexts[0].top, Some(1600.0));
+                anchor.contexts[0].finish_reflow(
+                    &original_fine,
+                    &HashSet::from([REFLOW_FINE.to_owned()]),
+                    &[],
+                    &HashSet::from(["answer"]),
+                    &HashMap::from([(1, true), (2, true)]),
+                );
+                assert!(anchor.contexts[0].reflow.is_none());
+            }
+        }
     }
 }
