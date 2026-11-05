@@ -696,6 +696,7 @@ impl Cagents {
                     // still names them; they are not ordinary undo history.
                     self.channel_ui.deleted_cards.extend(
                         attempt
+                            .target
                             .panes
                             .iter()
                             .filter(|(_, kind, _)| !kind.is_utility())
