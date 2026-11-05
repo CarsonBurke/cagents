@@ -165,9 +165,15 @@ class Clear(unittest.TestCase):
             locked = Path(root, "t", "a", "target")
             (locked / "deep").mkdir(parents=True)
             (locked / "deep" / "file").write_text("")
+            nested = locked / "deep"
+            nested.chmod(0)
             locked.chmod(0)
+            Path(root, "t").chmod(0o500)
+            Path(root).chmod(0o755)
             scope["clear"](str(Path(root, "t")))
             self.assertFalse(Path(root, "t").exists())
+            # Outside the tree, nothing changed.
+            self.assertEqual(Path(root).stat().st_mode & 0o777, 0o755)
 
 
 class TemporaryDirectory(unittest.TestCase):
@@ -585,6 +591,9 @@ class RemoteRun(unittest.TestCase):
                 self.addCleanup(lease.stdout.close)
                 self.addCleanup(lease.kill)
                 lines = offload.Lines(lease.stdout)
+                # It says it is waiting, so a long wait is not taken for a
+                # host that does not answer.
+                self.assertEqual(lines.next(10), "wait")
                 with self.assertRaises(TimeoutError):
                     lines.next(1)
             line = lines.next(10)

@@ -219,12 +219,16 @@ def temporary_directory(slot):
     """A short private directory for the slot's temporary files, or one in
     the slot when the short one is unsafe. Tests bind Unix sockets several
     levels under it, within 108 bytes, so the HOST fixtures want a base of at
-    most 28 bytes (docs/development.md). It is in the home directory because
-    agent sandboxes leave `.git` placeholders in /tmp, /var/tmp and ~/.cache,
-    and recovery placement refuses any enclosing `.git` by design."""
+    most 28 bytes (docs/development.md). As in that document's recipe, it is
+    in the user's runtime directory: agent sandboxes leave `.git`
+    placeholders in /tmp, /var/tmp and ~/.cache, under which recovery
+    placement refuses by design, and fixtures refuse roots inside the home
+    directory. A host test lane leaves about 12 MB there, which the next
+    command in the slot removes."""
     # The variable is for tests standing in for the build host; ssh does not
     # pass it on.
-    private = os.environ.get("CAGENTS_OFFLOAD_TEMPORARY_ROOT") or os.path.expanduser("~/.cof")
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    private = os.environ.get("CAGENTS_OFFLOAD_TEMPORARY_ROOT") or os.path.join(runtime, "cof")
     try:
         os.mkdir(private, 0o700)
     except FileExistsError:
@@ -244,28 +248,37 @@ def temporary_directory(slot):
     return path
 
 
-def clear(path):
+def clear(root):
     """Removes a directory tree, including directories a test left without
-    owner permissions."""
+    owner permissions, changing permissions only inside the tree."""
+    def inside(path):
+        return os.path.commonpath([root, path]) == root
     def retry(function, failed, _error):
-        parent = os.path.dirname(failed)
-        for directory in (parent, failed):
-            try:
-                if os.path.isdir(directory) and not os.path.islink(directory):
+        unlocked = False
+        for directory in (os.path.dirname(failed), failed):
+            if inside(directory) and os.path.isdir(directory) and not os.path.islink(directory):
+                try:
                     os.chmod(directory, 0o700)
-            except OSError:
-                pass
+                    unlocked = True
+                except OSError:
+                    pass
+        if not unlocked:
+            return
         try:
             if os.path.isdir(failed) and not os.path.islink(failed):
-                shutil.rmtree(failed, ignore_errors=True)
+                if failed != root:
+                    remove(failed)
             else:
                 function(failed)
         except OSError:
             pass
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(path, onexc=retry)
-    else:
-        shutil.rmtree(path, onerror=retry)
+    def remove(path):
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=retry)
+        else:
+            shutil.rmtree(path, onerror=retry)
+    if os.path.lexists(root):
+        remove(root)
 
 
 def enclosing_checkout(path):
@@ -336,6 +349,16 @@ if command == "lease":
         break
     queue.close()
     leased.append(slot)
+    # A previous build's command or prune may outlive its lease's
+    # connection; nothing in the slot changes until it has ended.
+    with open(os.path.join(slot, "running"), "a") as running:
+        try:
+            fcntl.flock(running, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if not announced:
+                say("wait")
+                announced = True
+            fcntl.flock(running, fcntl.LOCK_EX)
     def free():
         stat = os.statvfs(base)
         return stat.f_bavail * stat.f_frsize
@@ -358,10 +381,6 @@ if command == "lease":
         with open(config + ".new", "w") as file:
             file.write(profiles)
         os.replace(config + ".new", config)
-    # A previous build's command or prune may outlive its lease's
-    # connection; this one starts after it.
-    with open(os.path.join(slot, "running"), "a") as running:
-        fcntl.flock(running, fcntl.LOCK_EX)
     say("slot", json.dumps({"index": index, "path": os.path.realpath(slot)}))
     while True:
         time.sleep(3600)

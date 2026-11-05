@@ -441,12 +441,14 @@ credentials (containing `TOKEN`, `KEY`, `SECRET`, `PASS`, `AUTH`,
 `CREDENTIAL` or `COOKIE`). They travel on the connection's standard input,
 not its command line. This user's Cargo `[profile]` settings are applied
 there; its build settings, such as `jobs` and `build-dir`, describe this host
-and are not. Each slot's commands get a private `TMPDIR` on the host's disk,
-`~/.cof/<repository>-<N>` (mode 0700), short enough for the Unix sockets
-tests bind under it and emptied before the next command there. It lives in
-the home directory because agent sandboxes create `.git` placeholders in
-`/tmp`, `/var/tmp` and `~/.cache`, and recovery placement deliberately refuses
-any enclosing `.git`, so HOST fixtures fail under those. While a
+and are not. Each slot's commands get a private `TMPDIR`,
+`$XDG_RUNTIME_DIR/cof/<repository>-<N>` (mode 0700) on the host, short enough
+for the Unix sockets tests bind under it and emptied before the next command
+there; a HOST test lane leaves about 12 MB. It follows the HOST recipe below
+rather than `/tmp`, `/var/tmp`, `~/.cache` or the home directory: agent
+sandboxes create `.git` placeholders in the first three, recovery placement
+deliberately refuses any enclosing `.git`, and fixtures refuse roots inside
+the home directory. While a
 `.git` sits in any of its ancestors on the host, `test` stops with status 78
 and names it, since fixtures that check Git ancestry fail under one and
 building here instead would hide the leak; remove the marker, or set
