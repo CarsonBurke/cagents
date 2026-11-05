@@ -146,11 +146,15 @@ fn git_metadata(base: &str) -> Option<String> {
             "Cargo.toml",
             "Cargo.lock",
             "build.rs",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
             "src",
             "crates",
             "vendor",
             "assets",
             "packaging",
+            "fixtures",
+            "tests/fixtures",
         ] {
             let path = manifest.join(source);
             if path.exists() {

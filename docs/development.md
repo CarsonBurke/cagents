@@ -404,8 +404,9 @@ directory a plain `cargo` would create.
 The build script that stamps `--version` reruns only when the stamp could
 change, because each rerun recompiles `cagents`. It watches this checkout's
 `HEAD` and `HEAD` reflog. While the checkout is clean it also watches the
-compiled sources (`src`, `crates`, `vendor`, `assets`, `packaging`, the
-manifest, lockfile and build script), and while it is dirty, the index, which
+compiled sources (`src`, `crates`, `vendor`, `assets`, `packaging`,
+`fixtures`, `tests/fixtures`, the manifest, lockfile, toolchain, Cargo
+configuration and build script), and while it is dirty, the index, which
 restoring or stashing rewrites. It reads `git status` without refreshing the
 index, and it does not watch the shared `packed-refs`, which pruning or
 deleting any branch rewrites. An edit outside those sources, or undoing an edit
