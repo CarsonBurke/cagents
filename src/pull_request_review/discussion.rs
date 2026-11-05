@@ -172,6 +172,9 @@ fn mutation_authority(
     }
 }
 
+/// Why a comment cannot join a pending review of an older head.
+pub const OLD_HEAD_REVIEW: &str = "Your pending review is on an older commit, so nothing was added to it. Discard it from Finish review to start one on this head, or comment now.";
+
 fn pending_review(
     api: &dyn GitHubReviewApi,
     repository: &GitHubRepoKey,
@@ -188,9 +191,7 @@ fn pending_review(
         ))?,
     };
     if pending.commit_oid.as_deref() != Some(context.head_oid.as_str()) {
-        return Err(Outcome::Refused(
-            "Your pending review belongs to another commit. Use Discard pending review before adding comments to this head.".into(),
-        ));
+        return Err(Outcome::Refused(OLD_HEAD_REVIEW.into()));
     }
     Ok(pending)
 }

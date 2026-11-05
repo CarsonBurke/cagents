@@ -110,6 +110,8 @@ pub(super) struct DiscussionState {
     busy: bool,
     submitting: bool,
     saving_composer: bool,
+    /// What the write in flight reports once GitHub applies it.
+    applied_notice: &'static str,
     unknown: Option<String>,
     loading: bool,
     drafts_saved: bool,
@@ -136,6 +138,7 @@ impl Default for DiscussionState {
             busy: false,
             submitting: false,
             saving_composer: false,
+            applied_notice: "Review updated on GitHub.",
             unknown: None,
             loading: false,
             drafts_saved: true,
@@ -344,6 +347,25 @@ impl State {
                 | Mutation::Reply { .. }
                 | Mutation::Edit { .. }
         );
+        self.discussion.applied_notice = match &mutation {
+            Mutation::Comment { single: true, .. }
+            | Mutation::FileComment { single: true, .. }
+            | Mutation::Reply {
+                add_to_review: false,
+                ..
+            } => "Comment posted to GitHub.",
+            Mutation::Comment { .. } | Mutation::FileComment { .. } | Mutation::Reply { .. } => {
+                "Added to your pending review."
+            }
+            Mutation::Edit { .. } => "Pending comment updated.",
+            Mutation::Delete { .. } => "Pending comment deleted.",
+            Mutation::Discard { .. } => "Pending review discarded.",
+            Mutation::Resolve { resolved: true, .. } => "Thread resolved.",
+            Mutation::Resolve {
+                resolved: false, ..
+            } => "Thread reopened.",
+            Mutation::Submit { .. } => "Review submitted to GitHub.",
+        };
         // A load started before this write must not install an older pending count.
         self.load_generation = self.load_generation.wrapping_add(1);
         self.refreshing = false;
@@ -479,7 +501,7 @@ impl State {
                             self.discussion.review_open = false;
                             "Review submitted to GitHub.".into()
                         } else {
-                            "Review updated on GitHub.".into()
+                            self.discussion.applied_notice.into()
                         });
                     }
                     // A refused submission is reported where it was made; the
@@ -715,6 +737,13 @@ impl State {
                     self.notice = Some("The draft's diff changed. Re-anchor it to the current head, or select its new line in the gutter.".into());
                     return ActionTask::none();
                 }
+                if !single
+                    && !matches!(composer.destination, Destination::Edit(_))
+                    && self.pending_on_old_head()
+                {
+                    self.notice = Some(discussion::OLD_HEAD_REVIEW.into());
+                    return ActionTask::none();
+                }
                 let authority = composer.authority.clone();
                 let body = composer.content.text();
                 if body.trim().is_empty() {
@@ -749,6 +778,9 @@ impl State {
                 {
                     self.discussion.discard_confirmation =
                         Some((authority.clone(), pending.id.clone()));
+                    // The composer offers this too; its confirmation lives
+                    // in the review popover.
+                    self.discussion.review_open = true;
                 }
             }
             Action::ConfirmDiscard => {
@@ -880,6 +912,15 @@ impl State {
             | Action::CancelSubmit => {}
         }
         ActionTask::none()
+    }
+
+    /// GitHub accepts no new comment into a pending review of an older head.
+    fn pending_on_old_head(&self) -> bool {
+        self.context.as_ref().is_some_and(|context| {
+            context.pending.as_ref().is_some_and(|pending| {
+                pending.commit_oid.as_deref() != Some(context.head_oid.as_str())
+            })
+        })
     }
 
     fn pending_count(&self) -> u64 {
@@ -1014,10 +1055,8 @@ impl State {
                 .and_then(|context| context.pending.as_ref())
             {
                 let commit = pending.commit_oid.as_deref().unwrap_or("unknown");
-                let stale = self.context.as_ref().is_some_and(|context| {
-                    Some(context.head_oid.as_str()) != pending.commit_oid.as_deref()
-                });
-                rows.push(design::body(format!("You have a pending review with {} comments on {}.{}", pending.comment_count, commit.get(..7).unwrap_or(commit), if stale { " This review belongs to an old head. Discard it to start a review on the current head." } else { "" })).into());
+                let stale = self.pending_on_old_head();
+                rows.push(design::body(format!("You have a pending review with {} on {}.{}", comment_count(pending.comment_count), commit.get(..7).unwrap_or(commit), if stale { " This review belongs to an old head. Discard it to start a review on the current head." } else { "" })).into());
                 rows.push(
                     crate::ui_controls::button::secondary("Discard pending review…")
                         .on_press_maybe(enabled.then_some(Action::PrepareDiscard))
@@ -1222,6 +1261,13 @@ impl State {
 /// Where the submission popover opens, below its anchor button.
 const REVIEW_POPUP_OFFSET: f32 = 30.0;
 const REVIEW_POPUP_WIDTH: f32 = 380.0;
+
+fn comment_count(count: u64) -> String {
+    match count {
+        1 => "1 comment".into(),
+        count => format!("{count} comments"),
+    }
+}
 
 fn count_pill<'a>(count: u64) -> Element<'a, Action> {
     widget::container(
@@ -1556,14 +1602,14 @@ impl State {
         for thread in self.threads_at(path, old, new, leading, bounds) {
             let expanded = !thread.resolved || self.discussion.expanded.contains(&thread.id);
             let mut label = format!(
-                "{}{} · {} comments",
+                "{}{} · {}",
                 if thread.outdated { "Outdated · " } else { "" },
                 if thread.resolved {
                     "Resolved"
                 } else {
                     "Discussion"
                 },
-                thread.comments.len()
+                comment_count(thread.comments.len() as u64)
             );
             if leading && !thread.outdated {
                 label = match thread.line {
@@ -1663,6 +1709,7 @@ impl State {
             .context
             .as_ref()
             .is_some_and(|context| context.pending.is_some());
+        let pending_on_old_head = self.pending_on_old_head();
         if self.composer_at(path, old, new, leading, bounds)
             && let Some(composer) = &self.discussion.composer
         {
@@ -1715,6 +1762,19 @@ impl State {
                 }
                 rows.push(editor.into());
             }
+            let editing = matches!(composer.destination, Destination::Edit(_));
+            if pending_on_old_head && !editing {
+                rows.push(
+                    design::caption("Your pending review is on an older commit, so this can't be added to it. Discard that review to start one on this head, or comment now.")
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .into(),
+                );
+                rows.push(
+                    crate::ui_controls::button::secondary("Discard pending review…")
+                        .on_press_maybe(enabled.then_some(Action::PrepareDiscard))
+                        .into(),
+                );
+            }
             rows.push(
                 widget::row::with_children(vec![
                     crate::ui_controls::button::primary(
@@ -1727,16 +1787,19 @@ impl State {
                         },
                     )
                     .on_press_maybe(
-                        (enabled && !stale && !composer.content.text().trim().is_empty())
-                            .then_some(
-                                if matches!(composer.destination, Destination::Edit(_))
-                                    || has_pending_review
-                                {
-                                    Action::Save
-                                } else {
-                                    Action::SaveNow
-                                },
-                            ),
+                        (enabled
+                            && !stale
+                            && (editing || !pending_on_old_head)
+                            && !composer.content.text().trim().is_empty())
+                        .then_some(
+                            if matches!(composer.destination, Destination::Edit(_))
+                                || has_pending_review
+                            {
+                                Action::Save
+                            } else {
+                                Action::SaveNow
+                            },
+                        ),
                     )
                     .into(),
                     crate::ui_controls::button::secondary(if has_pending_review {
@@ -2472,6 +2535,52 @@ mod tests {
         assert_eq!(composer.content.text(), "Keep this draft");
         assert_eq!(composer.authority.context.head_oid, "c".repeat(40));
         assert!(matches!(&composer.destination, Destination::Line(a) if a.line == 10));
+    }
+
+    fn with_old_head_review(state: &mut State) {
+        let mut next = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]);
+        next.context.pending = Some(crate::github::PendingReview {
+            id: "REVIEW_old".into(),
+            comment_count: 1,
+            commit_oid: Some("0".repeat(40)),
+        });
+        state.adopt(&next);
+    }
+
+    #[test]
+    fn a_comment_cannot_join_a_review_of_an_older_head_but_can_post_now() {
+        let mut state = ready();
+        with_old_head_review(&mut state);
+        assert!(state.pending_on_old_head());
+        drop(state.update_discussion(Action::Begin(anchor())));
+        state.discussion.composer.as_mut().unwrap().content =
+            text_editor::Content::with_text("Still doubled?");
+        drop(state.update_discussion(Action::Save));
+        assert!(!state.discussion.busy, "nothing is sent to GitHub");
+        assert_eq!(state.notice.as_deref(), Some(discussion::OLD_HEAD_REVIEW));
+        assert!(state.discussion.composer.is_some(), "the draft is kept");
+        drop(state.update_discussion(Action::SaveNow));
+        assert!(state.discussion.busy, "a single comment needs no review");
+        assert_eq!(state.discussion.applied_notice, "Comment posted to GitHub.");
+    }
+
+    #[test]
+    fn the_composer_opens_the_discard_confirmation_in_the_review_popover() {
+        let mut state = ready();
+        with_old_head_review(&mut state);
+        drop(state.update_discussion(Action::PrepareDiscard));
+        assert!(state.discussion.review_open);
+        assert!(matches!(
+            &state.discussion.discard_confirmation,
+            Some((_, review)) if review == "REVIEW_old"
+        ));
+        drop(state.update_discussion(Action::ConfirmDiscard));
+        assert!(state.discussion.busy);
+        drop(state.update_discussion(Action::Finished {
+            generation: state.generation,
+            outcome: Outcome::Applied,
+        }));
+        assert_eq!(state.notice.as_deref(), Some("Pending review discarded."));
     }
 
     #[test]
