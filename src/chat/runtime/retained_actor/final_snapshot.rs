@@ -11,7 +11,6 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
-    fs::File,
     io::{Read, Write},
     path::PathBuf,
 };
@@ -86,6 +85,12 @@ pub(super) fn save(
     }
     save_at(&path(&identity.record)?, &bytes)
 }
+/// Publishes a complete receipt by rename, without fsync. Receipts live in the
+/// runtime directory beside the boot-bound holder records that validate them,
+/// so only readers in the same boot exist, and the page cache serves those
+/// across any daemon crash or upgrade. The helper publishes from its single
+/// request loop, where an fsync can take seconds on a disk-backed runtime
+/// directory and expire the `close` or `retire` request (#2180).
 fn save_at(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("Missing final snapshot directory")?;
     let temporary = parent.join(format!(".actor-final-{}", uuid::Uuid::new_v4()));
@@ -97,13 +102,8 @@ fn save_at(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&temporary)
             .map_err(|error| error.to_string())?;
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| error.to_string())?;
-        std::fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
-        File::open(parent)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| error.to_string())
+        file.write_all(bytes).map_err(|error| error.to_string())?;
+        std::fs::rename(&temporary, path).map_err(|error| error.to_string())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -420,9 +420,7 @@ pub(crate) fn remove(record: &Record) -> Result<(), String> {
         Err(error) => return Err(error.to_string()),
     }
     match std::fs::remove_file(&path) {
-        Ok(()) => File::open(path.parent().ok_or("Missing final snapshot directory")?)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| error.to_string()),
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
@@ -902,7 +900,7 @@ os.waitpid(pid,0)
     }
 
     #[test]
-    fn final_publication_is_private_durable_and_bound_to_the_exact_actor() {
+    fn final_publication_is_private_and_bound_to_the_exact_actor() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let path = directory.path().join("final");
