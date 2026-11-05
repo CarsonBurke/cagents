@@ -166,6 +166,11 @@ while IFS= read -r frame; do
                 if [ "$fast_fixture" = 1 ]; then
                     metadata=$(jq -cn --arg fast "$fast" '{claude_code_version:"2.1.286",current_permission_mode:"default",model:"opus",fast_mode_state:$fast,models:[{value:"opus",displayName:"Claude Opus",supportedEffortLevels:["high"]}]}')
                 fi
+                # Optional advertised commands and skills: a JSON object with
+                # `commands` ([{name, description}]) and `skills` ([name]).
+                if [ -f "$config/fixture-commands.json" ]; then
+                    metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile extra "$config/fixture-commands.json" '$metadata + $extra[0]')
+                fi
             elif [ "$subtype" = apply_flag_settings ] && [ "$fast_fixture" = 1 ]; then
                 requested=$(printf '%s' "$frame" | jq -r '.request.settings.fastMode // false')
                 if [ "$requested" = true ]; then fast=on; else fast=off; fi
