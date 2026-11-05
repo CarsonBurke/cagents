@@ -1866,8 +1866,9 @@ const EXTENSIONLESS_FILES: [&str; 12] = [
 ///
 /// A file position needs a line and a file name that reads as one: an
 /// extension that starts with a letter, a dotfile, or a conventional
-/// extensionless name such as `Makefile`. So a time such as `12:30`,
-/// `issue:42`, and an image tag such as `bitnami/redis:7` stay text.
+/// extensionless name in a directory, such as `docker/Dockerfile`. So a time
+/// such as `12:30`, `issue:42`, and an image tag such as `bitnami/redis:7`
+/// stay text.
 fn destination(reference: &str) -> Option<Uri> {
     // A code span holding a command (`cargo test src/a.rs:3`) is not a link.
     if reference.is_empty() || reference.contains(char::is_whitespace) {
@@ -1888,10 +1889,12 @@ fn destination(reference: &str) -> Option<Uri> {
     position?;
     // `api.example.com:5432` and `ghcr.io/org/app:2` name a host's port or an
     // image's tag, not a line of a file.
+    // No host starts with a dot, and dotfiles such as `.env.local` end in one.
     let first = path.split('/').next().unwrap_or(path);
-    if first
-        .rsplit_once('.')
-        .is_some_and(|(_, suffix)| HOST_SUFFIXES.contains(&suffix.to_ascii_lowercase().as_str()))
+    if !first.starts_with('.')
+        && first.rsplit_once('.').is_some_and(|(_, suffix)| {
+            HOST_SUFFIXES.contains(&suffix.to_ascii_lowercase().as_str())
+        })
     {
         return None;
     }
@@ -2069,7 +2072,7 @@ mod tests {
     #[test]
     fn bare_addresses_and_file_positions_are_links() {
         let answer = "See (https://example.com/a_(b)), src/main.rs:42:7. Then \
-            docs/guide.md:9, *lib.rs:3*, docker/Dockerfile:4, .env:2 and <https://kept.example>.";
+            docs/guide.md:9, *lib.rs:3*, docker/Dockerfile:4, .env:2, .env.local:3 and <https://kept.example>.";
         let content = Content::parse(answer);
         let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
             list.iter()
@@ -2085,6 +2088,7 @@ mod tests {
                 ("lib.rs:3", "lib.rs:3"),
                 ("docker/Dockerfile:4", "docker/Dockerfile:4"),
                 (".env:2", ".env:2"),
+                (".env.local:3", ".env.local:3"),
                 ("https://kept.example", "https://kept.example"),
             ])
         );
@@ -2094,7 +2098,7 @@ mod tests {
         assert_eq!(
             text.plain().as_ref(),
             "See (https://example.com/a_(b)), src/main.rs:42:7. Then docs/guide.md:9, \
-             lib.rs:3, docker/Dockerfile:4, .env:2 and https://kept.example."
+             lib.rs:3, docker/Dockerfile:4, .env:2, .env.local:3 and https://kept.example."
         );
         // A code span that is exactly a position opens too, still as code.
         let content = Content::parse("Open `src/code.rs:22` or `cargo test src/a.rs:3`.");
