@@ -2457,7 +2457,9 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
     ) -> Result<PullRequestPage, GitHubError> {
         // Creation order is stable while checks and review state change.
         // Updated-order cursors can skip rows as older PRs receive activity.
-        let query = "query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){pullRequests(first:50,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:DESC}){nodes{id number title state isDraft headRefName headRefOid baseRefName baseRefOid author{login} updatedAt url reviewDecision commits(last:1){nodes{commit{statusCheckRollup{state}}}}} pageInfo{hasNextPage endCursor}}}}";
+        let query = format!(
+            "query($owner:String!,$name:String!,$cursor:String){{repository(owner:$owner,name:$name){{pullRequests(first:50,after:$cursor,states:OPEN,orderBy:{{field:CREATED_AT,direction:DESC}}){{nodes{{{BROWSER_PULL_REQUEST_FIELDS}}} pageInfo{{hasNextPage endCursor}}}}}}}}"
+        );
         let mut variables = vec![
             ("owner", repository.owner.as_str().into()),
             ("name", repository.name.as_str().into()),
@@ -2465,7 +2467,7 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
         if let Some(cursor) = cursor {
             variables.push(("cursor", cursor.into()));
         }
-        let data = self.graphql(repository, query, variables, cancellation)?;
+        let data = self.graphql(repository, &query, variables, cancellation)?;
         let connection: Connection<serde_json::Value> =
             decode_value(data.pointer("/repository/pullRequests").ok_or_else(|| {
                 GitHubError::Inspection("GitHub returned no pull request page.".into())
@@ -2475,18 +2477,11 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
         } else {
             None
         };
-        let pull_requests = connection.nodes.into_iter().map(|mut value| {
-            // The aggregate state is enough for the browser filter; the
-            // detailed review header loads individual checks on demand.
-            if let Some(state) = value.pointer("/commits/nodes/0/commit/statusCheckRollup/state").and_then(serde_json::Value::as_str).map(str::to_owned) {
-                value["statusCheckRollup"] = serde_json::json!([{
-                    "__typename":"StatusContext", "context":"All checks", "state":state, "targetUrl":null
-                }]);
-            }
-            let pull_request: PullRequest = decode_value(&value)?;
-            validate_pull_request(&pull_request, repository)?;
-            Ok(pull_request)
-        }).collect::<Result<Vec<_>, GitHubError>>()?;
+        let pull_requests = connection
+            .nodes
+            .into_iter()
+            .map(|value| decode_browser_pull_request(value, repository))
+            .collect::<Result<Vec<_>, GitHubError>>()?;
         Ok(PullRequestPage {
             pull_requests,
             next_cursor: next,
@@ -2942,6 +2937,38 @@ pub fn parse_pull_request(
     repository: &GitHubRepoKey,
 ) -> Result<PullRequest, GitHubError> {
     let pull_request: PullRequest = parse_json(output)?;
+    validate_pull_request(&pull_request, repository)?;
+    Ok(pull_request)
+}
+
+/// GraphQL selection for one browser row. Every source of browser rows (open
+/// pages, repository search, exact number) selects the same fields so a row's
+/// check summary and filter membership do not depend on how it was found.
+pub(crate) const BROWSER_PULL_REQUEST_FIELDS: &str = "id number title state isDraft headRefName headRefOid baseRefName baseRefOid author{login} updatedAt url reviewDecision headRepository{name owner{login}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}";
+
+/// Decode a row selected with [`BROWSER_PULL_REQUEST_FIELDS`].
+pub(crate) fn decode_browser_pull_request(
+    mut value: serde_json::Value,
+    repository: &GitHubRepoKey,
+) -> Result<PullRequest, GitHubError> {
+    // The aggregate state is enough for the browser filter; the detailed
+    // review header loads individual checks on demand.
+    if let Some(state) = value
+        .pointer("/commits/nodes/0/commit/statusCheckRollup/state")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    {
+        value["statusCheckRollup"] = serde_json::json!([{
+            "__typename": "StatusContext",
+            "context": "All checks",
+            "state": state,
+            "targetUrl": null
+        }]);
+    }
+    if let Some(owner) = value.pointer("/headRepository/owner").cloned() {
+        value["headRepositoryOwner"] = owner;
+    }
+    let pull_request: PullRequest = decode_value(&value)?;
     validate_pull_request(&pull_request, repository)?;
     Ok(pull_request)
 }

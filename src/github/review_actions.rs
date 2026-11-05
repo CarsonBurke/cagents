@@ -18,10 +18,12 @@ impl<E: ProcessExecutor> GitHubService<E> {
                     next_cursor: None,
                 });
             }
-            let query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id number title state isDraft headRefName headRefOid baseRefName baseRefOid author{login} updatedAt url reviewDecision headRepository{name owner{login}}}}}";
+            let query = format!(
+                "query($owner:String!,$name:String!,$number:Int!){{repository(owner:$owner,name:$name){{pullRequest(number:$number){{{BROWSER_PULL_REQUEST_FIELDS}}}}}}}"
+            );
             let data = self.graphql(
                 repository,
-                query,
+                &query,
                 vec![
                     ("owner", repository.owner.clone().into()),
                     ("name", repository.name.clone().into()),
@@ -36,7 +38,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 Some(value)
                     if value.get("state").and_then(serde_json::Value::as_str) == Some("OPEN") =>
                 {
-                    vec![decode_search_pr(value.clone(), repository)?]
+                    vec![decode_browser_pull_request(value.clone(), repository)?]
                 }
                 _ => Vec::new(),
             };
@@ -46,12 +48,14 @@ impl<E: ProcessExecutor> GitHubService<E> {
             });
         }
         let search = search_query(repository, text);
-        let query = "query($searchText:String!,$cursor:String){search(type:ISSUE,query:$searchText,first:50,after:$cursor){nodes{... on PullRequest{id number title state isDraft headRefName headRefOid baseRefName baseRefOid author{login} updatedAt url reviewDecision headRepository{name owner{login}}}} pageInfo{hasNextPage endCursor}}}";
+        let query = format!(
+            "query($searchText:String!,$cursor:String){{search(type:ISSUE,query:$searchText,first:50,after:$cursor){{nodes{{... on PullRequest{{{BROWSER_PULL_REQUEST_FIELDS}}}}} pageInfo{{hasNextPage endCursor}}}}}}"
+        );
         let mut variables = vec![("searchText", search.into())];
         if let Some(cursor) = cursor {
             variables.push(("cursor", cursor.into()));
         }
-        let data = self.graphql(repository, query, variables, cancellation)?;
+        let data = self.graphql(repository, &query, variables, cancellation)?;
         let connection: Connection<serde_json::Value> =
             decode_value(data.get("search").ok_or_else(|| {
                 GitHubError::Inspection("GitHub returned no search results".into())
@@ -64,7 +68,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         let pull_requests = connection
             .nodes
             .into_iter()
-            .map(|value| decode_search_pr(value, repository))
+            .map(|value| decode_browser_pull_request(value, repository))
             .collect::<Result<Vec<_>, GitHubError>>()?;
         Ok(PullRequestPage {
             pull_requests,
@@ -79,19 +83,6 @@ fn exact_number(text: &str) -> Option<u64> {
         .then(|| number.parse::<u64>().ok())
         .flatten()
         .filter(|number| *number > 0 && *number <= i32::MAX as u64)
-}
-
-fn decode_search_pr(
-    mut value: serde_json::Value,
-    repository: &GitHubRepoKey,
-) -> Result<PullRequest, GitHubError> {
-    value["headRepositoryOwner"] = value
-        .pointer("/headRepository/owner")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let pr: PullRequest = decode_value(&value)?;
-    validate_pull_request(&pr, repository)?;
-    Ok(pr)
 }
 
 /// Match the browser's explicit #number and @author affordances. Query terms
@@ -133,7 +124,8 @@ mod tests {
                         "number":912,"title":"needle beyond page one","state":"OPEN","headRefName":"topic",
                         "headRefOid":"abc","baseRefName":"main","updatedAt":"now",
                         "url":"https://github.com/owner/repo/pull/912",
-                        "headRepository":{"name":"repo","owner":{"login":"owner"}}
+                        "headRepository":{"name":"repo","owner":{"login":"owner"}},
+                        "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"FAILURE"}}}]}
                     }],"pageInfo":{"hasNextPage":true,"endCursor":"page3"}}}}).to_string().into_bytes(), stderr: Vec::new() })
             }
         }
@@ -146,6 +138,11 @@ mod tests {
         assert_eq!(result.pull_requests[0].number, 912);
         assert_eq!(result.pull_requests[0].head_repository_key(), Some(repo));
         assert_eq!(result.next_cursor.as_deref(), Some("page3"));
+        // Search rows carry the same aggregate check state as loaded pages,
+        // so check filters and row captions do not depend on how a row was found.
+        let checks = result.pull_requests[0].check_summaries();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].bucket.0, "fail");
         let calls = executor.0.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].arguments.iter().any(|arg| arg == "cursor=page2"));
@@ -210,9 +207,9 @@ mod tests {
                     .any(|argument| argument == "number=912")
             );
             assert!(calls[0].arguments.iter().any(|argument| {
-                argument
-                    .to_string_lossy()
-                    .contains("pullRequest(number:$number)")
+                let argument = argument.to_string_lossy();
+                argument.contains("pullRequest(number:$number)")
+                    && argument.contains("statusCheckRollup{state}")
             }));
         }
     }
