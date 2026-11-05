@@ -894,6 +894,27 @@ fn report_close(app: &mut Cagents, outcome: terminal_close::CloseOutcome) {
     });
 }
 
+/// Reopening a closed pane runs its saved command again without asking. That
+/// is an undo for a pane someone just stopped, but a dead one has nothing to
+/// undo, and clearing many of them mustn't leave a stack of launches behind.
+#[test]
+fn only_a_terminal_that_was_running_can_be_reopened() {
+    let (mut app, card, _, _) = live_app();
+    let _ = app.update(Message::CloseCard(card));
+    report_close(&mut app, terminal_close::CloseOutcome::NotHosted);
+    let _ = app.update(Message::CommitClose(card));
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+    assert!(app.recently_closed.is_empty());
+    assert!(app.proven_gone_cards.is_empty());
+
+    let (mut app, card, _, _) = live_app();
+    let _ = app.update(Message::CloseCard(card));
+    report_close(&mut app, terminal_close::CloseOutcome::Closed);
+    let _ = app.update(Message::CommitClose(card));
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+    assert_eq!(app.recently_closed.len(), 1);
+}
+
 #[test]
 fn a_terminal_proven_gone_leaves_through_ordinary_removal() {
     let (mut app, card, terminal, _) = live_app();

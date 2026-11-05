@@ -410,6 +410,7 @@ impl Cagents {
             Ok(handoff) => self.card_removal(handoff),
             Err(error) => {
                 self.closed_terminal_cards.remove(&card);
+                self.proven_gone_cards.remove(&card);
                 self.status = Some(TransientNotice::error(error.to_string()));
                 // Nothing will settle this close, so unless another removal is
                 // on its way, nothing else would advance the queue.
@@ -478,7 +479,9 @@ impl Cagents {
         } else {
             self.close_emptied_channels(&[id])
         };
-        if let Some(card) = closed_descriptor {
+        // Nothing of a terminal proven gone is left to bring back. Reopening
+        // could only run its saved command again, unasked.
+        if let Some(card) = closed_descriptor.filter(|_| !self.proven_gone_cards.remove(&id)) {
             self.recently_closed
                 .push((card, self.active_workspace_destination()));
             if self.recently_closed.len() > 32 {
@@ -717,6 +720,7 @@ impl Cagents {
                 // No request was sent, so nothing is outstanding for the fence.
                 self.terminal_close_attempts.remove(&terminal);
                 self.closed_terminal_cards.insert(card);
+                self.proven_gone_cards.insert(card);
                 self.request_card_removal(card)
             }
             CloseOutcome::Closed if identity_matches => {

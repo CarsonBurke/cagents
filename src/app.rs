@@ -5352,6 +5352,9 @@ pub struct Cagents {
     terminal_close_attempts: HashSet<TerminalId>,
     terminal_close_generation: u64,
     closed_terminal_cards: HashSet<CardId>,
+    /// Closing panes whose terminal the daemon proved gone, which reopening
+    /// must not start again.
+    proven_gone_cards: HashSet<CardId>,
     uncertain_terminal_proofs: HashMap<CardId, HostSessionProof>,
     terminal_recovery_attempts: HashSet<TerminalId>,
     /// Restored ended terminals whose final screen the daemon was asked for.
@@ -7700,6 +7703,7 @@ impl Cagents {
             state.residency = residency;
         }
         self.closed_terminal_cards.remove(&card);
+        self.proven_gone_cards.remove(&card);
         self.cards.insert(card, CardRuntime::Loading);
         self.card_chrome.remove(&card);
         let saved = self.shared_window_snapshot();
@@ -14343,6 +14347,7 @@ impl Application for Cagents {
             terminal_close_attempts: HashSet::new(),
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
+            proven_gone_cards: HashSet::new(),
             uncertain_terminal_proofs: HashMap::new(),
             terminal_recovery_attempts: HashSet::new(),
             retained_outputs: HashMap::new(),
@@ -16621,6 +16626,7 @@ impl Application for Cagents {
                         // Refused after all: the pane stays, and nothing else
                         // will advance the closes queued behind it.
                         self.closed_terminal_cards.remove(&id);
+                        self.proven_gone_cards.remove(&id);
                         self.next_queued_card_close()
                     }
                 }
@@ -29747,6 +29753,7 @@ mod tests {
             terminal_close_attempts: HashSet::new(),
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
+            proven_gone_cards: HashSet::new(),
             worktree_operations: HashMap::new(),
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
