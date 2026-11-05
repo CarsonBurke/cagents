@@ -2,6 +2,7 @@
 //! replace local rows, and filesystem events never schedule a GitHub process.
 use super::*;
 use crate::{git_watch, model::WorktreeId, repository::HeadState};
+use std::collections::BTreeSet;
 
 const LOCAL_WORKERS: usize = 2;
 const FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
@@ -586,17 +587,26 @@ fn read_local_with_plan(
     });
     let plan = (change.membership || change.topology || !vanished.is_empty())
         .then(|| {
+            let records = snapshot
+                .worktrees
+                .iter()
+                .map(|(record, _)| record.clone())
+                .collect::<Vec<_>>();
+            // A topology edge may name only the shared metadata owner. Every
+            // surviving checkout's index may have changed while it was absent.
+            let all_changed = change.topology.then(|| {
+                records
+                    .iter()
+                    .map(|record| record.id)
+                    .collect::<BTreeSet<_>>()
+            });
             git_watch::Project::read_changed(
                 project,
                 snapshot.repository.common_dir.clone(),
-                &snapshot
-                    .worktrees
-                    .iter()
-                    .map(|(record, _)| record.clone())
-                    .collect::<Vec<_>>(),
+                &records,
                 &cancellation,
                 previous_plan,
-                &change.worktrees,
+                all_changed.as_ref().unwrap_or(&change.worktrees),
             )
         })
         .transpose()?;
@@ -767,6 +777,10 @@ mod tests {
         fs::write(directory.join("tracked.txt"), "original\n").unwrap();
         git(directory, &["add", "tracked.txt"]);
         git(directory, &["commit", "-m", "fixture"]);
+        fixture_snapshot(directory)
+    }
+
+    fn fixture_snapshot(directory: &Path) -> Snapshot {
         let service = RepositoryService::system("git");
         let cancellation = CancellationToken::default();
         let repository = service.discover(directory, &cancellation).unwrap();
@@ -785,6 +799,131 @@ mod tests {
             repository,
             worktrees,
             heads: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn topology_revalidates_linked_inventory_after_shared_metadata_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let root = base.join("repo");
+        let linked = base.join("linked");
+        let initial = fixture(&root);
+        git(
+            &root,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        let project = ProjectId::new();
+        let (initial, old_plan) = read_local(
+            project,
+            initial,
+            git_watch::Change {
+                topology: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let old_plan = Arc::new(old_plan.unwrap());
+        let primary = initial
+            .worktrees
+            .iter()
+            .find(|(record, _)| record.path == root)
+            .unwrap()
+            .0
+            .id;
+        let linked_id = initial
+            .worktrees
+            .iter()
+            .find(|(record, _)| record.path == linked)
+            .unwrap()
+            .0
+            .id;
+        let old_linked = old_plan
+            .worktrees
+            .iter()
+            .find(|row| row.id == linked_id)
+            .unwrap();
+        assert!(
+            !initial
+                .worktrees
+                .iter()
+                .find(|(record, _)| record.id == linked_id)
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap()
+                .dirty
+                .is_dirty()
+        );
+        // End the covered native epoch before replacing metadata and adding
+        // the nested directory, so no index callback can enrich this operand.
+        drop(git_watch::test_support::covered_monitor(old_plan.clone()));
+        let change = git_watch::test_support::replace_linked_metadata(&old_plan);
+        assert!(change.topology && change.membership);
+        assert_eq!(change.worktrees, BTreeSet::from([primary]));
+        let nested = linked.join("new-watch-scope/nested");
+        fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("tracked.rs");
+        fs::write(&file, "new tracked file while coverage is absent\n").unwrap();
+        git(&linked, &["add", "new-watch-scope/nested/tracked.rs"]);
+        let read = |change| {
+            read_local_with_plan(
+                project,
+                initial.clone(),
+                change,
+                CancellationToken::default(),
+                Some(&old_plan),
+            )
+            .unwrap()
+        };
+        let (_, selective) = read(git_watch::Change {
+            worktrees: BTreeSet::from([primary]),
+            membership: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            selective
+                .unwrap()
+                .worktrees
+                .iter()
+                .find(|row| row.id == linked_id)
+                .unwrap(),
+            old_linked,
+            "ordinary primary-only membership keeps the linked cache"
+        );
+        // Reset to the same old snapshot and plan for each operand. The empty
+        // ID case is the reader contract, not a claim about today's fallback.
+        for empty_ids in [false, true] {
+            let mut topology = change.clone();
+            if empty_ids {
+                topology.worktrees.clear();
+            }
+            let (fresh, recovered) = read(topology);
+            let recovered = Arc::new(recovered.unwrap());
+            let fresh_linked = fresh
+                .worktrees
+                .iter()
+                .find(|(record, _)| record.id == linked_id)
+                .unwrap();
+            assert_eq!(fresh_linked.0.path, linked);
+            assert!(fresh_linked.1.as_ref().unwrap().dirty.staged > 0);
+            let current = recovered
+                .worktrees
+                .iter()
+                .find(|row| row.id == linked_id)
+                .unwrap();
+            assert_eq!(current.root, old_linked.root);
+            assert_ne!(
+                current, old_linked,
+                "topology must read the linked census, not just fresh status"
+            );
+            git_watch::test_support::reconfigure_then_observe(
+                old_plan.clone(),
+                recovered,
+                linked_id,
+                &file,
+            );
         }
     }
 
@@ -1306,6 +1445,211 @@ mod tests {
             app.sidebar_model.project(project).unwrap().worktrees[0]
                 .pull_request()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn native_quota_failure_polls_then_recovers_and_reads_a_later_edit() {
+        use git_watch::test_support::wait_for;
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let first = fixture(&base.join("first"));
+        let second_root = base.join("second");
+        fixture(&second_root);
+        fs::create_dir(second_root.join("src")).unwrap();
+        let later_file = second_root.join("src/later.txt");
+        fs::write(&later_file, "original\n").unwrap();
+        git(&second_root, &["add", "src/later.txt"]);
+        git(&second_root, &["commit", "-m", "tracked nested file"]);
+        let second = fixture_snapshot(&second_root);
+        let mut ids = [ProjectId::new(), ProjectId::new()];
+        ids.sort();
+        let [other, project] = ids;
+        let plan = |id, snapshot| {
+            read_local(
+                id,
+                snapshot,
+                git_watch::Change {
+                    topology: true,
+                    ..Default::default()
+                },
+                CancellationToken::default(),
+            )
+            .unwrap()
+        };
+        let (other_snapshot, other_plan) = plan(other, first);
+        let (snapshot, project_plan) = plan(project, second);
+        let project_plan = Arc::new(project_plan.unwrap());
+        let worktree = snapshot.worktrees[0].0.id;
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model.projects.clear();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            snapshot.repository.id,
+            "Recovering repository".into(),
+            snapshot.repository.common_dir.clone(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.repository_generations.insert(project, 1);
+        let entry = |snapshot, plan| Entry {
+            snapshot,
+            generation: 1,
+            plan: Some(plan),
+            archived: Vec::new(),
+            remote_started: false,
+            cancellation: None,
+            read_failure: None,
+            read_full_scan: false,
+            pending: Default::default(),
+            fallback: None,
+            last_full_scan: Instant::now(),
+        };
+        app.refresh_ui
+            .git
+            .entries
+            .insert(project, entry(snapshot.clone(), project_plan.clone()));
+        app.sidebar_model.projects.push(SidebarProject::new(
+            other,
+            other_snapshot.repository.id,
+            "Competing repository".into(),
+            other_snapshot.repository.common_dir.clone(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.refresh_ui
+            .git
+            .entries
+            .insert(other, entry(other_snapshot, Arc::new(other_plan.unwrap())));
+        // One real repository fits; a second competes for the same bounded
+        // coordinator budget. No global kernel-watch exhaustion is required.
+        let (wake, receiver) = async_channel::bounded(1);
+        let monitor = git_watch::Monitor::start_with_limit(
+            move || {
+                let _ = wake.try_send(());
+            },
+            6,
+        )
+        .unwrap();
+        app.refresh_ui.git.watch = Some(Watch { monitor, receiver });
+        app.refresh_ui.git.configure();
+        let failure = wait_for(
+            &app.refresh_ui.git.watch.as_ref().unwrap().monitor,
+            project,
+            "native quota failure",
+            |change| change.coverage == Some(false) && change.error.is_some(),
+        );
+        assert_eq!(
+            failure.error.as_deref(),
+            Some("directory watch limit reached")
+        );
+        let initial_read = read_local_with_plan(
+            project,
+            snapshot.clone(),
+            failure.clone(),
+            CancellationToken::default(),
+            Some(&project_plan),
+        )
+        .unwrap();
+        app.refresh_ui.git.changed(project, failure);
+        drop(app.start_git_reads());
+        drop(app.update_git(Action::Read {
+            project,
+            generation: 1,
+            result: Ok(initial_read),
+        }));
+        let entry = app.refresh_ui.git.entries.get_mut(&project).unwrap();
+        assert!(entry.fallback.is_some());
+        entry.last_full_scan = Instant::now() - FALLBACK_INTERVAL;
+        drop(app.git_fallback_tick());
+        assert!(app.refresh_ui.git.entries[&project].read_full_scan);
+        let (fresh, recovered_plan) = read_local_with_plan(
+            project,
+            snapshot,
+            git_watch::Change {
+                topology: true,
+                membership: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+            Some(&project_plan),
+        )
+        .unwrap();
+        drop(app.update_git(Action::Read {
+            project,
+            generation: 1,
+            result: Ok((fresh, recovered_plan)),
+        }));
+        // Closing the competing project frees the budget. Use the real
+        // consumer's recovered inventory and real coordinator acknowledgement.
+        app.sidebar_model.projects.retain(|row| row.id != other);
+        app.refresh_ui.git.forget(other);
+        let recovered = wait_for(
+            &app.refresh_ui.git.watch.as_ref().unwrap().monitor,
+            project,
+            "native quota recovery",
+            |change| change.coverage == Some(true) && change.error.is_none(),
+        );
+        app.refresh_ui.git.changed(project, recovered);
+        assert!(app.refresh_ui.git.entries[&project].fallback.is_none());
+        // Settle the recovery read before the next edit, as the application
+        // does, so its own configure acknowledgement cannot satisfy this edge.
+        let entry = &app.refresh_ui.git.entries[&project];
+        let (fresh, plan) = read_local_with_plan(
+            project,
+            entry.snapshot.clone(),
+            entry.pending.clone(),
+            CancellationToken::default(),
+            entry.plan.as_deref(),
+        )
+        .unwrap();
+        drop(app.start_git_reads());
+        drop(app.update_git(Action::Read {
+            project,
+            generation: 1,
+            result: Ok((fresh, plan)),
+        }));
+        fs::write(&later_file, "edit after quota recovery\n").unwrap();
+        let changed = wait_for(
+            &app.refresh_ui.git.watch.as_ref().unwrap().monitor,
+            project,
+            "ordinary edit after quota recovery",
+            |change| {
+                change.worktrees.contains(&worktree)
+                    // A redundant unchanged configuration can acknowledge
+                    // coverage alongside the edit; its ACK alone has no IDs.
+                    && change.coverage != Some(false)
+                    && change.error.is_none()
+                    && !change.topology
+                    && !change.membership
+                    && !change.references
+            },
+        );
+        app.refresh_ui.git.changed(project, changed.clone());
+        assert!(app.refresh_ui.git.queue.contains(&project));
+        let entry = &app.refresh_ui.git.entries[&project];
+        let (fresh, plan) = read_local_with_plan(
+            project,
+            entry.snapshot.clone(),
+            changed,
+            CancellationToken::default(),
+            entry.plan.as_deref(),
+        )
+        .unwrap();
+        assert!(fresh.worktrees[0].1.as_ref().unwrap().dirty.is_dirty());
+        drop(app.start_git_reads());
+        drop(app.update_git(Action::Read {
+            project,
+            generation: 1,
+            result: Ok((fresh, plan)),
+        }));
+        assert!(
+            app.refresh_ui.git.entries[&project].snapshot.worktrees[0]
+                .1
+                .as_ref()
+                .unwrap()
+                .dirty
+                .is_dirty()
         );
     }
 
