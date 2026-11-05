@@ -716,9 +716,13 @@ impl Cagents {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
+                let going = channels
+                    .iter()
+                    .map(|channel| channel.id)
+                    .collect::<Vec<_>>();
                 let conversations = channels
                     .iter()
-                    .map(|channel| self.channel_conversation_count(channel))
+                    .map(|channel| self.channel_conversation_count(channel, &going))
                     .sum::<usize>();
                 let closes = (conversations > 0).then(|| {
                     format!(
@@ -731,7 +735,7 @@ impl Cagents {
                     .chain(
                         channels
                             .iter()
-                            .flat_map(|channel| self.channel_held_elsewhere_notes(channel)),
+                            .flat_map(|channel| self.channel_held_elsewhere_notes(channel, &going)),
                     )
                     .collect::<Vec<_>>()
                     .join(" ");

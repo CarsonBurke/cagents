@@ -734,6 +734,10 @@ impl Default for State {
 }
 impl State {
     #[cfg(test)]
+    pub(super) fn draft_for_test(&self, card: CardId) -> Option<&str> {
+        self.drafts.get(&card).map(String::as_str)
+    }
+    #[cfg(test)]
     pub(super) fn with_drafts(drafts: HashMap<CardId, String>) -> Self {
         Self {
             drafts,
@@ -6957,7 +6961,68 @@ impl Cagents {
         carried && self.rekey_shared_draft(alias, canonical)
     }
 
-    /// A released card's text and attachments go with it.
+    /// What `card` has not sent, wherever it currently lives.
+    fn chat_unsent_draft(&self, card: CardId) -> (String, Vec<Attachment>) {
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
+        };
+        match runtime {
+            Some(runtime) => runtime.persistent_draft(),
+            None => (
+                self.chat_ui.drafts.get(&card).cloned().unwrap_or_default(),
+                self.chat_ui
+                    .draft_attachments
+                    .get(&card)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    pub(super) fn chat_has_unsent_draft(&self, card: CardId) -> bool {
+        let (text, images) = self.chat_unsent_draft(card);
+        !text.is_empty() || !images.is_empty()
+    }
+
+    /// An open pane has already read its saved draft and would not see this
+    /// one, and text of its own is not overwritten.
+    pub(super) fn chat_draft_can_go_to_pane(&self, canonical: CardId) -> bool {
+        !self.cards.contains_key(&canonical) && !self.shared_chat_has_local_work(canonical)
+    }
+
+    /// A card being given up leaves its text with the pane holding the
+    /// session. Unlike a move, its own runtime is about to go, so nothing it
+    /// has in flight needs to finish first. Returns whether any text went.
+    pub(super) fn carry_released_chat_draft(&mut self, card: CardId, canonical: CardId) -> bool {
+        if !self.chat_draft_can_go_to_pane(canonical) {
+            return false;
+        }
+        let (text, images) = self.chat_unsent_draft(card);
+        if text.is_empty() && images.is_empty() {
+            return false;
+        }
+        if !images.is_empty() {
+            self.chat_ui.draft_attachments.insert(canonical, images);
+        }
+        if !text.is_empty() {
+            self.chat_ui.drafts.insert(canonical, text);
+        }
+        true
+    }
+
+    pub(super) fn chat_closed_elsewhere_here(&self, card: CardId) -> bool {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.closed_elsewhere,
+            _ => self
+                .chat_ui
+                .parked
+                .get(&card)
+                .is_some_and(|runtime| runtime.closed_elsewhere),
+        }
+    }
+
+    /// A released card's remaining text and attachments go with it.
     pub(super) fn chat_discard_local_work(&mut self, card: CardId) {
         self.chat_ui.drafts.remove(&card);
         self.chat_ui.draft_attachments.remove(&card);
@@ -21075,6 +21140,32 @@ mod tests {
     }
 
     #[test]
+    fn closing_a_held_card_sends_its_typed_text_to_the_pane_and_discards_the_rest() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        write(&mut app, card, "still typing");
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.followups.push(followup(0, "waiting", &[]));
+        }
+        let held = attach_to_new_channel(&mut app, card);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(notice(&app).contains("sends your unsent text there"));
+        let promised = app.session_held_elsewhere_note(card, &[]).unwrap();
+        assert!(
+            promised.contains("your unsent text goes with it"),
+            "{promised}"
+        );
+        assert!(promised.contains("Anything else waiting"), "{promised}");
+
+        drop(app.begin_chat_close(card));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(
+            app.chat_ui.drafts.get(&held).map(String::as_str),
+            Some("still typing")
+        );
+    }
+
+    #[test]
     fn a_queued_followup_keeps_an_attached_session_here_until_a_chat_action_clears_it() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
@@ -21113,7 +21204,7 @@ mod tests {
         let keys = app
             .notices
             .recent()
-            .map(|entry| (entry.notice.severity, entry.notice.key))
+            .map(|entry| (entry.notice.severity, entry.notice.key.clone()))
             .collect::<Vec<_>>();
         assert!(
             !keys
@@ -21128,6 +21219,63 @@ mod tests {
             }),
             "{keys:?}"
         );
+    }
+
+    #[test]
+    fn the_held_notice_follows_the_pane_holding_the_session() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.followups.push(followup(0, "waiting", &[]));
+        }
+        let held = attach_to_new_channel(&mut app, card);
+        let drain = |app: &mut Cagents| {
+            if let Some(notice) = app.status.take() {
+                app.notices.record(notice);
+            }
+        };
+        drain(&mut app);
+        let held_notice = |app: &Cagents| {
+            app.notices
+                .recent()
+                .find(|entry| entry.notice.key == Some(crate::app::NoticeKey::SessionHeld(card)))
+                .map(|entry| entry.notice.message.clone())
+        };
+        assert!(held_notice(&app).unwrap().contains("destination"));
+
+        // Renamed while waiting: the notice says the name the sidebar shows.
+        let durable = Arc::make_mut(&mut app.durable);
+        let channel = durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.title == "destination")
+            .unwrap();
+        channel.title = "renamed".into();
+        drop(app.reconcile_shared_views());
+        drain(&mut app);
+        assert!(held_notice(&app).unwrap().contains("renamed"));
+
+        // Dismissing it is not undone by the reconcile that follows.
+        app.notices
+            .resolve(crate::app::NoticeKey::SessionHeld(card));
+        drop(app.reconcile_shared_views());
+        drain(&mut app);
+        assert_eq!(held_notice(&app), None);
+
+        // The holding pane left, so the promise no longer holds.
+        app.status = Some(
+            crate::app::TransientNotice::warning("standing")
+                .with_key(crate::app::NoticeKey::SessionHeld(card)),
+        );
+        drain(&mut app);
+        for view in &mut app.workspace_model.views {
+            view.panes.retain(|pane| pane.id != held);
+            view.revision += 1;
+        }
+        drop(app.reconcile_shared_views());
+        drain(&mut app);
+        assert_eq!(held_notice(&app), None);
+        assert!(app.card_state(card).unwrap().existence.is_open());
     }
 
     #[test]

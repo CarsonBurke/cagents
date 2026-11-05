@@ -197,12 +197,14 @@ fn attaching_a_session_with_an_idle_local_card_replaces_that_card() {
     assert!(!app.card_state(card).unwrap().existence.is_open());
 }
 
-/// Closing a card a pane holds the session of lets go of it and its draft, and
-/// the pane shows.
+/// Closing a card a pane holds the session of lets go of it, sends its text to
+/// that pane, and leaves the session running there.
 #[test]
-fn closing_a_held_card_shows_the_attached_pane_without_its_draft() {
+fn closing_a_held_card_shows_the_attached_pane_with_its_draft() {
     let (mut app, mut view, attached, _directory) = local_only_chat();
     let card = app.workspace.focused().unwrap();
+    // Off screen, so its text is in the saved drafts rather than a composer.
+    app.cards.remove(&card);
     app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(card, "unsent".into())]));
     hold_in_view(&mut app, &mut view, &attached);
     assert!(app.another_pane_holds_session(card));
@@ -212,6 +214,7 @@ fn closing_a_held_card_shows_the_attached_pane_without_its_draft() {
     assert_eq!(open_panes_of(&app, &attached.kind), [attached.id]);
     assert!(app.shared_views.blocked.is_empty());
     assert!(!app.shared_chat_has_local_work(card));
+    assert_eq!(app.chat_ui.draft_for_test(attached.id), Some("unsent"));
 }
 
 /// `pane` is in the daemon's view, whether or not this window has acted on it.
@@ -254,10 +257,10 @@ fn deleting_a_channel_only_closes_sessions_no_other_pane_holds() {
             .find(|channel| channel.id == old)
             .unwrap();
         assert_eq!(
-            app.channel_conversation_count(channel),
+            app.channel_conversation_count(channel, &[old]),
             usize::from(!held_elsewhere)
         );
-        let notes = app.channel_held_elsewhere_notes(channel);
+        let notes = app.channel_held_elsewhere_notes(channel, &[old]);
         assert_eq!(notes.len(), usize::from(held_elsewhere), "{notes:?}");
         assert!(notes.iter().all(|note| note.contains("keeps running in")));
         drop(app.delete_channel(old));
@@ -271,6 +274,88 @@ fn deleting_a_channel_only_closes_sessions_no_other_pane_holds() {
             assert_eq!(app.workspace_model.views[1].panes[0].id, attached.id);
         }
     }
+}
+
+/// The pane is going too, so nothing is left to hold the session: it closes
+/// with its card rather than running on with no pane anywhere.
+#[test]
+fn deleting_the_channel_that_also_holds_the_session_closes_it() {
+    let (mut app, _view, attached, _directory) = local_only_chat();
+    let card = app.workspace.focused().unwrap();
+    let old = channel_holding(&app, card);
+    let mut own = app.workspace_model.views[0].clone();
+    hold_in_view(&mut app, &mut own, &attached);
+    assert!(app.another_pane_holds_session(card));
+
+    let channel = app
+        .durable
+        .channels
+        .iter()
+        .find(|channel| channel.id == old)
+        .unwrap();
+    assert_eq!(app.channel_conversation_count(channel, &[old]), 1);
+    assert!(app.channel_held_elsewhere_notes(channel, &[old]).is_empty());
+
+    drop(app.delete_channel(old));
+    assert!(
+        app.durable.channels.iter().any(|channel| channel.id == old),
+        "the channel waits for the session's close"
+    );
+}
+
+#[test]
+fn deleting_a_card_and_the_channel_holding_its_session_together_closes_it() {
+    let (mut app, mut view, attached, _directory) = local_only_chat();
+    let card = app.workspace.focused().unwrap();
+    let old = channel_holding(&app, card);
+    let Scope::Channel(destination) = view.scope.clone() else {
+        unreachable!()
+    };
+    hold_in_view(&mut app, &mut view, &attached);
+
+    let going = [old, destination];
+    let channel = app
+        .durable
+        .channels
+        .iter()
+        .find(|channel| channel.id == old)
+        .unwrap();
+    assert_eq!(app.channel_conversation_count(channel, &going), 1);
+    assert!(app.channel_held_elsewhere_notes(channel, &going).is_empty());
+
+    drop(app.delete_channels(going.to_vec()));
+    assert!(
+        app.durable.channels.iter().any(|channel| channel.id == old),
+        "the channel waits for the session's close"
+    );
+}
+
+#[test]
+fn deleting_a_held_cards_channel_sends_its_draft_to_the_attached_pane() {
+    let (mut app, mut view, attached, _directory) = local_only_chat();
+    let card = app.workspace.focused().unwrap();
+    let old = channel_holding(&app, card);
+    // Off screen, so its text is in the saved drafts rather than a composer.
+    app.cards.remove(&card);
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(card, "unsent".into())]));
+    hold_in_view(&mut app, &mut view, &attached);
+
+    // The confirmation has to promise what the deletion does.
+    let channel = app
+        .durable
+        .channels
+        .iter()
+        .find(|channel| channel.id == old)
+        .unwrap();
+    let notes = app.channel_held_elsewhere_notes(channel, &[old]);
+    assert!(
+        notes[0].contains("your unsent text goes with it"),
+        "{notes:?}"
+    );
+
+    drop(app.delete_channel(old));
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+    assert_eq!(app.chat_ui.draft_for_test(attached.id), Some("unsent"));
 }
 
 #[test]

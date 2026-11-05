@@ -281,6 +281,9 @@ pub struct State {
     /// Deletions under way. Each runs behind its channel's row rather than a
     /// dialog, so the rest of the window stays usable meanwhile.
     deleting: HashSet<ChannelId>,
+    /// The rest of the selection a bulk deletion is working through, so the
+    /// first channel knows the others are going too.
+    deleting_together: Vec<ChannelId>,
     /// Exact local targets retained until the matching close worker completes.
     closing: HashMap<ChannelId, ChannelCloseAttempt>,
     /// Deletions that failed, with why, until retried or declined.
@@ -436,6 +439,11 @@ impl State {
             .get(&id)
             .expect("channel close worker")
             .operation
+    }
+
+    /// Whether `id` is being deleted, or is about to be with a selection.
+    pub(super) fn is_going(&self, id: ChannelId) -> bool {
+        self.deleting.contains(&id) || self.deleting_together.contains(&id)
     }
 
     pub(super) fn is_deleting(&self, id: ChannelId) -> bool {
@@ -1224,8 +1232,8 @@ impl Cagents {
         };
         let title = channel_display_title(channel, self.sidebar_model.project(channel.project_id))
             .into_owned();
-        let chats = self.channel_conversation_count(channel);
-        let held_elsewhere = self.channel_held_elsewhere_notes(channel);
+        let chats = self.channel_conversation_count(channel, &[id]);
+        let held_elsewhere = self.channel_held_elsewhere_notes(channel, &[id]);
         if chats == 0 && held_elsewhere.is_empty() && !always_confirm {
             return self.delete_channel(id);
         }
@@ -1240,8 +1248,12 @@ impl Cagents {
     }
 
     /// The open conversations - chats and terminals - that deleting
-    /// `channel` closes with it.
-    pub(super) fn channel_conversation_count(&self, channel: &ProjectChannel) -> usize {
+    /// `channel` closes with it, when the channels in `going` go as well.
+    pub(super) fn channel_conversation_count(
+        &self,
+        channel: &ProjectChannel,
+        going: &[ChannelId],
+    ) -> usize {
         channel
             .cards
             .iter()
@@ -1250,13 +1262,17 @@ impl Cagents {
                     state.id == **card
                         && state.existence.is_open()
                         && matches!(&state.kind, CardKind::Chat(_) | CardKind::Terminal(_))
-                }) && !self.another_pane_holds_session(**card)
+                }) && !self.another_pane_holds_session_beyond(**card, going)
             })
             .count()
     }
 
     /// What deleting `channel` leaves running because another pane holds it.
-    pub(super) fn channel_held_elsewhere_notes(&self, channel: &ProjectChannel) -> Vec<String> {
+    pub(super) fn channel_held_elsewhere_notes(
+        &self,
+        channel: &ProjectChannel,
+        going: &[ChannelId],
+    ) -> Vec<String> {
         channel
             .cards
             .iter()
@@ -1264,12 +1280,18 @@ impl Cagents {
                 self.card_state(**card)
                     .is_some_and(|state| state.existence.is_open())
             })
-            .filter_map(|card| self.session_held_elsewhere_note(*card))
+            .filter_map(|card| self.session_held_elsewhere_note(*card, going))
             .collect()
     }
 
     pub(super) fn delete_channels(&mut self, ids: Vec<ChannelId>) -> Task<Message> {
-        Task::batch(ids.into_iter().map(|id| self.delete_channel(id)))
+        self.channel_ui.deleting_together = ids.clone();
+        let tasks = ids
+            .into_iter()
+            .map(|id| self.delete_channel(id))
+            .collect::<Vec<_>>();
+        self.channel_ui.deleting_together.clear();
+        Task::batch(tasks)
     }
 
     /// Removes a channel along with everything that existed only inside it.
@@ -1333,7 +1355,16 @@ impl Cagents {
             return Task::batch([leave, retry]);
         }
         // A session another pane holds is not this channel's to end; its card
-        // leaves with the channel and the session stays with that pane.
+        // leaves with the channel, its text goes to that pane, and the session
+        // stays there.
+        for card in &cards {
+            if self
+                .card_state(*card)
+                .is_some_and(|state| state.existence.is_open())
+            {
+                self.carry_draft_of_card_held_elsewhere(*card);
+            }
+        }
         let sessions: Vec<_> = self
             .durable
             .cards

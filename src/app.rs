@@ -433,6 +433,13 @@ impl NoticeLog {
             .any(|entry| entry.notice.key.as_ref() == Some(&key))
     }
 
+    /// Whether `key` has a report standing whose words differ from `message`.
+    fn says_otherwise(&self, key: &NoticeKey, message: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.notice.key.as_ref() == Some(key) && entry.notice.message != message)
+    }
+
     /// Withdraws whatever `key` last reported, because its condition no
     /// longer holds.
     fn resolve(&mut self, key: NoticeKey) {
