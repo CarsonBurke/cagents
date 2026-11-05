@@ -1062,6 +1062,220 @@ done
     );
 }
 
+/// A provider can take seconds to start after its run is accepted. Its owner
+/// interrupting then withdraws the prompt, since the provider has no turn to
+/// interrupt, and the agent stays usable.
+/// Holds the fixture provider in initialization until the test creates
+/// `initialize-release` beside its home.
+fn hold_provider_initialization(root: &Path) {
+    let provider = root.join("bin/claude");
+    let script = std::fs::read_to_string(&provider).unwrap();
+    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+    let held = r#"      case "$frame" in
+        *'"subtype":"initialize"'*)
+          while [ ! -e "$HOME/../initialize-release" ]; do sleep 0.01; done
+          ;;
+      esac
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+    assert_eq!(script.matches(original).count(), 1);
+    std::fs::write(&provider, script.replace(original, held)).unwrap();
+}
+
+/// Waits until the run's dispatcher has bound its provider and released the
+/// agent's gate to await readiness, before any prompt reaches the provider.
+fn await_undelivered(host: &SharedHost, accepted: &Accepted) {
+    let gate = agent_gate(host, accepted.agent.id);
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    while !gate
+        .lock()
+        .unwrap()
+        .is_some_and(|claim| claim.run == accepted.run.id && !claim.withdrawn)
+    {
+        assert!(
+            Instant::now() < hang_guard,
+            "dispatch never awaited the provider"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn assert_withdrawn(host: &SharedHost, run: RunId) -> Run {
+    let withdrawn = registry(host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent_run(run)
+        .unwrap();
+    assert_eq!(withdrawn.state, State::Cancelled);
+    assert_eq!(
+        withdrawn.result.diagnostic.as_deref(),
+        Some(UNDELIVERED_CANCELLATION)
+    );
+    withdrawn
+}
+
+#[test]
+fn cancelled_automation_waits_for_its_starting_provider_before_release() {
+    if isolated("cancelled_automation_waits_for_its_starting_provider_before_release").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    hold_provider_initialization(&root);
+    let Destination::New(spec) = request.destination.clone() else {
+        unreachable!()
+    };
+    let automation = crate::host::automations::service::create(
+        &host,
+        crate::automations::Definition {
+            name: "Slow start fixture".into(),
+            prompt: request.prompt.clone(),
+            agent: spec,
+            schedule: crate::automations::Schedule {
+                pattern: crate::automations::SchedulePattern::Daily { hour: 3, minute: 0 },
+                timezone: "UTC".into(),
+            },
+            session_mode: crate::automations::SessionMode::Fresh,
+            precheck: None,
+        },
+    )
+    .unwrap();
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .claim_automation(
+            automation.id,
+            automation.execution_revision,
+            None,
+            crate::automations::Trigger::Manual {
+                request: uuid::Uuid::new_v4(),
+            },
+            None,
+            true,
+            now(),
+        )
+        .unwrap()
+        .accepted
+        .unwrap();
+    dispatch_accepted(&host, accepted.clone()).unwrap();
+    await_undelivered(&host, &accepted);
+    cancel_agent_run(&host, &accepted.run).unwrap();
+    let cancelled = assert_withdrawn(&host, accepted.run.id);
+    // The broker retries Busy instead of blocking the automation on a
+    // provider that cannot be released until its startup settles.
+    assert_eq!(
+        reconcile_agent_run(&host, &cancelled, true).unwrap(),
+        Reconciliation::Busy
+    );
+
+    std::fs::write(root.join("initialize-release"), "").unwrap();
+    assert_eq!(
+        reconcile_settled(&host, &cancelled, true),
+        Reconciliation::Closed
+    );
+    assert!(
+        !root.join("prompts").exists(),
+        "the withdrawn prompt never reached the provider"
+    );
+}
+
+#[test]
+fn stopping_a_starting_agent_from_its_chat_withdraws_its_prompt() {
+    if isolated("stopping_a_starting_agent_from_its_chat_withdraws_its_prompt").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    hold_provider_initialization(&root);
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    await_undelivered(&host, &accepted);
+    let HostedSession::Chat(session) = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatAttach {
+            session: session.clone(),
+        },
+    )
+    .unwrap();
+    let stopped = super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatCommand {
+            chat_id: session.id,
+            command: Command::Interrupt,
+        },
+    );
+    assert!(
+        matches!(stopped, Ok(ServerResponse::Accepted)),
+        "{stopped:?}"
+    );
+    assert_withdrawn(&host, accepted.run.id);
+
+    std::fs::write(root.join("initialize-release"), "").unwrap();
+    let gate = agent_gate(&host, accepted.agent.id);
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    while gate.lock().unwrap().is_some() {
+        assert!(Instant::now() < hang_guard, "dispatch never settled");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !root.join("prompts").exists(),
+        "the withdrawn prompt never reached the provider"
+    );
+}
+
+#[test]
+fn interrupting_a_run_whose_provider_is_starting_withdraws_its_prompt() {
+    if isolated("interrupting_a_run_whose_provider_is_starting_withdraws_its_prompt").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    hold_provider_initialization(&root);
+    let owner = Authority::default();
+    let accepted = submit(&host, &owner, request.clone()).unwrap();
+    let agent = accepted.agent.id;
+    await_undelivered(&host, &accepted);
+    let reply = process(
+        &host,
+        owner.clone(),
+        Operation::Control {
+            agent,
+            command: Control::Interrupt {
+                including_subagents: false,
+            },
+        },
+    )
+    .unwrap();
+    assert!(matches!(reply, Reply::Requests(requests) if requests.is_empty()));
+    assert_withdrawn(&host, accepted.run.id);
+
+    std::fs::write(root.join("initialize-release"), "").unwrap();
+    let mut follow_up = request;
+    follow_up.destination = Destination::Existing(agent);
+    follow_up.idempotency_key = "follow-up".into();
+    let next = submit(&host, &owner, follow_up).unwrap();
+    let next = settled(&host, next.run.id);
+    assert_eq!(next.state, State::Succeeded, "{next:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("prompts")).unwrap(),
+        "prompt\n",
+        "only the follow-up reached the provider"
+    );
+}
+
 #[test]
 fn interactive_work_claims_automation_agent_before_cleanup_or_reuse() {
     if isolated("interactive_work_claims_automation_agent_before_cleanup_or_reuse").is_some() {
