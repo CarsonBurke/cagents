@@ -129,6 +129,48 @@ fn the_process_scan_finds_working_directories_and_open_files() {
 }
 
 #[test]
+fn the_process_scan_finds_mapped_files_after_the_descriptor_closes() {
+    use std::os::unix::fs::symlink;
+
+    let (root, worktree) = tree();
+    let proc = root.path().join("proc");
+    let process = proc.join("7");
+    std::fs::create_dir_all(process.join("fd")).unwrap();
+    std::fs::create_dir(process.join("map_files")).unwrap();
+    std::fs::write(process.join("comm"), "mapped-writer\n").unwrap();
+    for link in ["cwd", "root", "exe"] {
+        symlink(root.path().join("other"), process.join(link)).unwrap();
+    }
+    let mapping = process.join("map_files/1000-2000");
+    symlink(root.path().join("other/notes"), &mapping).unwrap();
+    assert_eq!(occupant(&proc, &worktree, 0).unwrap(), None);
+
+    // Linux keeps this link after mmap's originating descriptor is closed.
+    let file = worktree.join("child/notes");
+    std::fs::write(&file, "mapped draft").unwrap();
+    std::fs::remove_file(&mapping).unwrap();
+    symlink(&file, &mapping).unwrap();
+    assert!(
+        std::fs::read_dir(process.join("fd"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    let expected = Some((7, "mapped-writer".into()));
+    assert_eq!(occupant(&proc, &worktree, 0).unwrap(), expected);
+    assert_eq!(occupant(&proc, &worktree, 7).unwrap(), None);
+
+    std::fs::remove_file(&file).unwrap();
+    std::fs::remove_file(&mapping).unwrap();
+    let mut deleted = file.into_os_string();
+    deleted.push(" (deleted)");
+    symlink(deleted, &mapping).unwrap();
+    assert_eq!(occupant(&proc, &worktree, 0).unwrap(), expected);
+    std::fs::remove_file(mapping).unwrap();
+    assert_eq!(occupant(&proc, &worktree, 0).unwrap(), None);
+}
+
+#[test]
 fn hosted_and_durable_work_inside_the_worktree_refuses_its_removal() {
     let (root, worktree) = tree();
     let host = host();

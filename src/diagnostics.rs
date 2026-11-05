@@ -173,7 +173,9 @@ pub fn state_path() -> io::Result<PathBuf> {
                 .map(|p| p.join(".local/state"))
         })
         .ok_or_else(|| io::Error::other("state directory unavailable"))?;
-    Ok(base.join(crate::instance::STORAGE_NAME).join("diagnostics"))
+    Ok(base
+        .join(crate::instance::storage_name())
+        .join("diagnostics"))
 }
 
 pub fn initialize(product: Product, version: &'static str) {
@@ -1396,7 +1398,7 @@ mod process_tests {
             return;
         }
         let file = PathBuf::from(path)
-            .join(crate::instance::STORAGE_NAME)
+            .join(crate::instance::storage_name())
             .join("diagnostics")
             .join(Product::Ui.filename(0));
         use std::os::unix::fs::PermissionsExt;
@@ -1527,7 +1529,7 @@ mod process_tests {
         );
         let report = inspect_at(
             root.path()
-                .join(crate::instance::STORAGE_NAME)
+                .join(crate::instance::storage_name())
                 .join("diagnostics"),
         )
         .unwrap();
@@ -1646,7 +1648,7 @@ mod process_tests {
         assert!(!String::from_utf8_lossy(&output.stderr).contains("RECOVERED_SECRET"));
         let report = inspect_at(
             root.path()
-                .join(crate::instance::STORAGE_NAME)
+                .join(crate::instance::storage_name())
                 .join("diagnostics"),
         )
         .unwrap();
@@ -1686,7 +1688,7 @@ mod process_tests {
         assert!(!output.status.success());
         let report = inspect_at(
             root.path()
-                .join(crate::instance::STORAGE_NAME)
+                .join(crate::instance::storage_name())
                 .join("diagnostics"),
         )
         .unwrap();
