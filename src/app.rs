@@ -17717,9 +17717,9 @@ impl Application for Cagents {
                     && !modifiers.alt()
                     && !modifiers.logo()
                     && let Some(card) = self.focused_repository_card_with_find()
-                    && (native_region.is_none()
-                        || native_widget == Some(repository_widget::find_focus_id(card)))
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.find_input_is_focused())
+                    // Find stays live while the editor behind it has focus, as
+                    // long as the key comes from inside this pane.
+                    && (native_region.is_none() || self.input_trace.keyboard_card() == Some(card))
                 {
                     return cosmic::task::message(Message::Repository(if modifiers.shift() {
                         RepositoryAction::FindPrevious { card }
@@ -27699,6 +27699,43 @@ mod tests {
             )
         ));
         drop(app.update(action));
+    }
+
+    /// F3 steps through an open Find from the editor behind it, as from the
+    /// field itself, but never from a field outside the pane.
+    #[test]
+    fn find_next_follows_keys_from_inside_its_pane_only() {
+        use crate::input_trace::{InputTrace, KeyboardRegion};
+        use workspace_widget::FocusedPane;
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let (mut app, card, _) = completion_intent_fixture_text("tail tail\n", true);
+        drop(app.update(Message::Repository(RepositoryAction::OpenFind { card })));
+        for pane in [FocusedPane::Editor, FocusedPane::PaneTextInput] {
+            app.input_trace = InputTrace::with_keyboard_region(KeyboardRegion {
+                pane,
+                card: Some(card),
+            });
+            navigate_find_key(&mut app, false);
+        }
+        app.input_trace = InputTrace::with_keyboard_region(FocusedPane::TextInput.into());
+        let key = keyboard::Key::Named(keyboard::key::Named::F3);
+        let task = app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F3),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured: false,
+        });
+        assert_eq!(task.units(), 0);
     }
 
     #[test]
