@@ -153,6 +153,40 @@ class EnclosingCheckout(unittest.TestCase):
             self.assertIsNone(scope["enclosing_checkout"](str(deep)))
 
 
+class TemporaryDirectory(unittest.TestCase):
+    def scope(self):
+        tree = ast.parse(offload.REMOTE_AGENT)
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.FunctionDef) and node.name == "temporary_directory")
+        import hashlib, stat
+        scope = {"os": os, "stat": stat, "hashlib": hashlib}
+        exec(compile(ast.Module([function], []), "agent", "exec"), scope)
+        return scope["temporary_directory"]
+
+    def test_the_base_stays_within_the_fixtures_budget(self):
+        temporary_directory = self.scope()
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as root:
+            short = Path(root, "c")
+            os.environ["CAGENTS_OFFLOAD_TEMPORARY_ROOT"] = str(short)
+            self.addCleanup(os.environ.pop, "CAGENTS_OFFLOAD_TEMPORARY_ROOT")
+            self.assertEqual(temporary_directory("/h/.cache/cagents-offload/ab/slot-2"),
+                             str(short / "ab-2"))
+            long = temporary_directory("/h/.cache/cagents-offload/a-very-long-repository/slot-2")
+            self.assertLessEqual(len(long), max(28, len(str(short)) + 9))
+            self.assertRegex(long, r"/[0-9a-f]{6}-2$")
+            self.assertEqual(os.stat(short).st_mode & 0o777, 0o700)
+
+    def test_another_users_directory_is_not_used(self):
+        temporary_directory = self.scope()
+        with tempfile.TemporaryDirectory() as root:
+            shared = Path(root, "shared")
+            shared.mkdir(mode=0o755)
+            shared.chmod(0o755)
+            os.environ["CAGENTS_OFFLOAD_TEMPORARY_ROOT"] = str(shared)
+            self.addCleanup(os.environ.pop, "CAGENTS_OFFLOAD_TEMPORARY_ROOT")
+            self.assertEqual(temporary_directory("/h/x/slot-0"), "/h/x/slot-0/tmp")
+
+
 class Settings(unittest.TestCase):
     def test_only_build_affecting_settings_without_local_paths_are_forwarded(self):
         environment = {
@@ -211,20 +245,19 @@ done
 [ "$1" != unreachable ] || exit 255
 [ "$1" != silent ] || exec sleep 600
 [ "$1" != broken ] || exit 1
-if [ "$1" = marked ] && case $2 in rsync) false ;; esac; then
+if [ "$1" = marked ]; then
     # A host with a stray Git marker above its temporary directory.
     shift
     cd "$HOME"
-    env -i HOME="$HOME" PATH="$PATH" CARGO_HOME="$CARGO_HOME" \
-        RUSTUP_HOME="$RUSTUP_HOME" sh -c "$*" | sed -u 's|^slot [0-9]* [^ ]*|& /stray/.git|'
-    exit
+    exec env -i HOME="$HOME" PATH="$PATH" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
+        CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/stray/cof" sh -c "mkdir -p '$HOME/stray/.git'; $*"
 fi
 shift
 cd "$HOME"
 # Like sshd, start from a clean environment: nothing of this one reaches the
 # build host except what the command carries.
 exec env -i HOME="$HOME" PATH="$PATH" CARGO_HOME="$CARGO_HOME" \
-    RUSTUP_HOME="$RUSTUP_HOME" sh -c "$*"
+    RUSTUP_HOME="$RUSTUP_HOME" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
 """
 
 
@@ -328,13 +361,14 @@ class StandInHost(unittest.TestCase):
         self.assertTrue((slot / "target").is_dir())
 
     def test_temporary_files_go_in_the_slot_and_do_not_outlive_the_next_command(self):
-        # Short enough for the Unix sockets tests bind under it, and on disk.
-        tmp = Path(f"/var/tmp/cof-{os.getuid()}/crate-0")
-        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        # The stand-in host's private temporary root; on a real host it is
+        # /var/tmp/cof-<uid>.
+        tmp = self.host_home / "cof"
         (self.crate / "build.rs").write_text(textwrap.dedent(f"""
             fn main() {{
                 let dir = std::env::temp_dir();
-                assert_eq!(dir, std::path::Path::new({json.dumps(str(tmp))}));
+                assert_eq!(dir.parent(), Some(std::path::Path::new({json.dumps(str(tmp))})));
+                assert!(dir.to_str().unwrap().ends_with("-0"), "{{}}", dir.display());
                 std::fs::write(dir.join("left-behind"), "").unwrap();
                 println!("cargo:rerun-if-changed=build.rs");
             }}
@@ -342,11 +376,12 @@ class StandInHost(unittest.TestCase):
         env = self.remote_env()
         result = self.gate_run("check", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((tmp / "left-behind").exists())
+        [slot_tmp] = tmp.iterdir()
+        self.assertTrue((slot_tmp / "left-behind").exists())
         (self.crate / "src/main.rs").write_text('fn main() { println!("changed"); }\n')
         result = self.gate_run("check", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((tmp / "left-behind").exists())
+        self.assertFalse((slot_tmp / "left-behind").exists())
 
     def test_a_failing_build_keeps_cargos_exit_status(self):
         (self.crate / "src/main.rs").write_text("fn main() { missing(); }\n")
@@ -382,16 +417,22 @@ class StandInHost(unittest.TestCase):
 
     def test_tests_stop_under_a_stray_git_marker_and_other_commands_do_not(self):
         env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "marked"}
-        result = self.gate_run("test", env=env)
+        # Every slot is busy: the refusal must not wait for one.
+        slots = self.host_home / ".cache/cagents-offload/crate"
+        held = []
+        for index in range(2):
+            (slots / f"slot-{index}").mkdir(parents=True)
+            held.append(open(slots / f"slot-{index}/lock", "a"))
+            fcntl.flock(held[-1], fcntl.LOCK_EX)
+        result = self.gate_run("test", env=env, timeout=30)
+        for lock in held:
+            lock.close()
         self.assertEqual(result.returncode, 78, result.stderr)
-        self.assertIn("cargo-gate: /stray/.git on marked puts the tests inside a Git checkout;",
+        self.assertIn(f"cargo-gate: {self.host_home}/stray/.git on marked puts the tests inside a Git checkout;",
                       result.stderr)
+        self.assertNotIn("waiting", result.stderr)
         self.assertNotIn("building here", result.stderr)
         self.assertFalse((self.root / "local-build").exists())
-        # The slot is free again.
-        slot = self.host_home / ".cache/cagents-offload/crate/slot-0/lock"
-        with open(slot, "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         result = self.gate_run("check", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("building here", result.stderr)
@@ -485,10 +526,11 @@ class RemoteRun(unittest.TestCase):
         with tempfile.TemporaryDirectory() as base:
             lease = subprocess.Popen(
                 ["python3", "-c", offload.REMOTE_AGENT, "lease", base, "1", "key", "0", ""],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof"))})
             self.addCleanup(lease.stdout.close)
             self.addCleanup(lease.kill)
-            self.assertRegex(lease.stdout.readline(), r"^slot 0 ")
+            self.assertRegex(lease.stdout.readline(), r'^slot \{"index": 0, ')
             with open(Path(base, "slot-0", "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
                 lease.stdin.close()
@@ -512,6 +554,27 @@ class RemoteRun(unittest.TestCase):
                 self.assertTrue(stale.exists())
             self.assertEqual(prune.wait(timeout=10), 0)
             self.assertFalse(stale.exists())
+
+    def test_a_slot_is_handed_out_only_after_a_lingering_command_ends(self):
+        # The previous lease's connection dropped while its command's did not.
+        with tempfile.TemporaryDirectory() as base:
+            Path(base, "slot-0").mkdir()
+            with open(Path(base, "slot-0", "running"), "a") as running:
+                fcntl.flock(running, fcntl.LOCK_EX)
+                lease = subprocess.Popen(
+                    ["python3", "-c", offload.REMOTE_AGENT, "lease", base, "1", "key", "0", ""],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                    env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof"))})
+                self.addCleanup(lease.stdout.close)
+                self.addCleanup(lease.kill)
+                lines = offload.Lines(lease.stdout)
+                with self.assertRaises(TimeoutError):
+                    lines.next(1)
+            line = lines.next(10)
+            self.assertEqual(json.loads(line.removeprefix("slot ")),
+                             {"index": 0, "path": os.path.realpath(Path(base, "slot-0"))})
+            lease.stdin.close()
+            self.assertEqual(lease.wait(timeout=10), 0)
 
     def test_closing_the_connection_ends_the_command_and_its_children(self):
         with tempfile.TemporaryDirectory() as base:
