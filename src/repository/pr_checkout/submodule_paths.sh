@@ -7,7 +7,7 @@ root=$1
 shift
 tab=$(printf '\t')
 refuse() {
-    printf '%s\n' "Git could not inspect submodule $path; worktree was kept" >&2
+    printf '%s\n' "Git could not inspect submodule; worktree was kept. Check access permissions or initialization, then retry: $path" >&2
     exit 1
 }
 [ -d "$root" ] && [ -r "$root" ] && [ -x "$root" ] || {

@@ -944,6 +944,12 @@ fn recursive_submodule_census_refuses_unreadable_populated_children_at_preparati
                     .unwrap_err()
             };
             assert_eq!(failure.kind, PrCheckoutFailureKind::Refused, "{failure:?}");
+            assert!(
+                failure.detail.contains("Git could not inspect submodule")
+                    && failure.detail.contains("worktree was kept")
+                    && failure.detail.contains("permissions"),
+                "refusal must explain the child access failure and recovery: {failure:?}"
+            );
             permissions.restore();
             assert_eq!(fs::read(worktree.join("file")).unwrap(), b"old\n");
             assert_eq!(fs::read(worktree.join("other")).unwrap(), b"unchanged\n");
