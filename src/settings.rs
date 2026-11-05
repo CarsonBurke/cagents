@@ -233,9 +233,8 @@ impl LinkOpenGesture {
 /// process inside a card, except where the action's scope leaves it to a
 /// focused terminal (see `workspace_widget::ShortcutScope`).
 ///
-/// Workspace defaults include `Ctrl+W` to close a pane and `Alt+R` to cycle
-/// its width, including while a terminal has focus. These chords belong to
-/// the workspace rather than the program inside it. A default that changes
+/// Workspace close defaults to `Ctrl+Shift+W`. Shell editing and application
+/// keys reach a terminal unless its action explicitly intercepts them. A default that changes
 /// bumps [`SHORTCUT_DEFAULTS_REVISION`] and records the chords it
 /// replaces in [`RETIRED_SHORTCUT_DEFAULTS`], so a file still holding them
 /// moves to the new ones.
@@ -281,6 +280,8 @@ pub struct KeyboardShortcuts {
     pub focus_pane_9: Vec<String>,
     pub toggle_projects: Vec<String>,
     pub rename_pane: Vec<String>,
+    /// Action names whose keys go directly to the terminal instead of the workspace.
+    pub terminal_passthrough_actions: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -289,7 +290,7 @@ impl Default for KeyboardShortcuts {
             new_terminal: vec!["Ctrl+Shift+T".to_owned()],
             new_channel: vec!["Ctrl+Shift+G".to_owned()],
             clone_pane: vec!["Ctrl+Shift+D".to_owned()],
-            close_focused_column: vec!["Ctrl+W".to_owned()],
+            close_focused_column: vec!["Ctrl+Shift+W".to_owned()],
             search_projects: vec!["Ctrl+Shift+F".to_owned()],
             find_in_pane: vec!["Ctrl+F".to_owned()],
             previous_column: vec!["Ctrl+PageUp".to_owned()],
@@ -324,6 +325,24 @@ impl Default for KeyboardShortcuts {
             focus_pane_9: vec!["Alt+9".to_owned()],
             toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
             rename_pane: vec!["F2".to_owned()],
+            terminal_passthrough_actions: [
+                "rename_pane",
+                "new_native_thread",
+                "find_in_pane",
+                "cycle_pane_width",
+                "focus_pane_1",
+                "focus_pane_2",
+                "focus_pane_3",
+                "focus_pane_4",
+                "focus_pane_5",
+                "focus_pane_6",
+                "focus_pane_7",
+                "focus_pane_8",
+                "focus_pane_9",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         }
     }
 }
@@ -601,6 +620,35 @@ pub fn shortcut_chord_refusal(binding: ShortcutBinding) -> Option<&'static str> 
                 .any(|chord| parse_shortcut(chord).is_ok_and(|fixed| fixed == binding))
         })
         .map(|fixed| fixed.refusal)
+}
+
+/// A configured workspace chord may remain useful outside text controls,
+/// while a focused editor keeps its native history and word movement keys.
+pub fn native_text_editing_advisory(
+    action: &str,
+    binding: ShortcutBinding,
+) -> Option<&'static str> {
+    let arrow = matches!(
+        binding.key,
+        ShortcutKey::ArrowLeft | ShortcutKey::ArrowRight
+    );
+    let character = match binding.key {
+        ShortcutKey::Character(ch) => Some(ch),
+        _ => None,
+    };
+    if !binding.logo
+        && !binding.alt
+        && binding.control
+        && (arrow
+            || character == Some('z')
+            || (action != "find_in_pane" && character == Some('f') && !binding.shift)
+            || (!binding.shift && matches!(character, Some('a' | 'c' | 'v' | 'x' | 'y'))))
+        || (!binding.logo && !binding.control && binding.alt && arrow)
+    {
+        Some("Reserved while editing text")
+    } else {
+        None
+    }
 }
 
 /// Legacy actions that must retain a route back to the workspace.
@@ -1383,7 +1431,7 @@ struct V2TomlSettings {
 /// `shortcut_defaults_revision`; one without it predates the first change of
 /// defaults and is at revision 1. Loading a file at an older revision moves
 /// every action still bound to that revision's default onto this build's.
-pub const SHORTCUT_DEFAULTS_REVISION: u32 = 5;
+pub const SHORTCUT_DEFAULTS_REVISION: u32 = 6;
 
 /// The first revision, and the one a file without a recorded revision is at.
 const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
@@ -1407,6 +1455,7 @@ struct RetiredShortcutDefault {
 /// Revision 3 adds the conventional new-tab chord to native threads.
 /// Revision 4 restores `Ctrl+W` to close a pane and `Alt+R` to cycle its width.
 /// Revision 5 separates project search from find in the focused pane.
+/// Revision 6 restores the shell-safe close chord and per-action terminal delivery.
 const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
     RetiredShortcutDefault {
         action: "new_terminal",
@@ -1463,6 +1512,11 @@ const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
         retired_in: 5,
         chords: &["Ctrl+F"],
     },
+    RetiredShortcutDefault {
+        action: "close_focused_column",
+        retired_in: 6,
+        chords: &["Ctrl+W"],
+    },
 ];
 
 /// Column navigation's defaults while each action took a single chord, before
@@ -1502,7 +1556,10 @@ fn parsed_chords(value: &toml::Value) -> Option<Vec<ShortcutBinding>> {
 fn bound_chords(shortcuts: &toml::Table, excluded: &[&str]) -> Vec<ShortcutBinding> {
     shortcuts
         .iter()
-        .filter(|(action, _)| !excluded.contains(&action.as_str()))
+        .filter(|(action, _)| {
+            action.as_str() != "terminal_passthrough_actions"
+                && !excluded.contains(&action.as_str())
+        })
         .filter_map(|(_, chords)| chords.as_array())
         .flatten()
         .filter_map(toml::Value::as_str)
@@ -2581,7 +2638,10 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
         foreign.extend(
             shortcuts
                 .keys()
-                .filter(|key| !SHORTCUT_ACTIONS.contains(&key.as_str()))
+                .filter(|key| {
+                    key.as_str() != "terminal_passthrough_actions"
+                        && !SHORTCUT_ACTIONS.contains(&key.as_str())
+                })
                 .map(|key| Foreign {
                     path: vec![
                         Segment::Key("keyboard_shortcuts".into()),
@@ -2830,8 +2890,7 @@ fn keep_foreign_settings(current: &toml::Table, document: &mut toml::Value) {
     // chord is not kept, so the file binds this build's chords for it instead,
     // which other kept actions must then give up in turn.
     let shortcuts = Segment::Key("keyboard_shortcuts".into());
-    let is_action =
-        |target: &[Segment]| matches!(target, [table, Segment::Key(_)] if *table == shortcuts);
+    let is_action = |target: &[Segment]| matches!(target, [table, Segment::Key(action)] if *table == shortcuts && action != "terminal_passthrough_actions");
     let mut unkept: Vec<&[Segment]> = Vec::new();
     let bound = loop {
         let bound: Vec<ShortcutBinding> = document
@@ -2840,10 +2899,11 @@ fn keep_foreign_settings(current: &toml::Table, document: &mut toml::Value) {
             .into_iter()
             .flatten()
             .filter(|(action, _)| {
-                !kept.iter().any(|(target, _)| {
-                    !unkept.contains(&target.as_slice())
-                        && *target == [shortcuts.clone(), Segment::Key((*action).clone())]
-                })
+                action.as_str() != "terminal_passthrough_actions"
+                    && !kept.iter().any(|(target, _)| {
+                        !unkept.contains(&target.as_slice())
+                            && *target == [shortcuts.clone(), Segment::Key((*action).clone())]
+                    })
             })
             .filter_map(|(_, chords)| chords.as_array())
             .flatten()
@@ -3899,7 +3959,7 @@ next_column = ["Alt+W", "Alt+Right"]
         );
         assert_eq!(
             file["keyboard_shortcuts"]["close_focused_column"],
-            vec!["Ctrl+W"].into()
+            vec!["Ctrl+Shift+W"].into()
         );
         assert_eq!(load(&path).unwrap(), desired);
     }
@@ -3957,11 +4017,7 @@ next_column = ["Alt+W", "Alt+Right"]
                 shortcuts.insert("cycle_pane_width".into(), width.clone().into());
                 fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
                 let loaded = load(&path).unwrap();
-                let expected_close = if matches!(revision, 2 | 3) && close == ["Ctrl+Shift+W"] {
-                    vec!["Ctrl+W"]
-                } else {
-                    close
-                };
+                let expected_close = close;
                 let expected_width = if matches!(revision, 2 | 3) && width == ["Ctrl+Shift+R"] {
                     vec!["Alt+R"]
                 } else {
@@ -4048,11 +4104,11 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(shortcuts.next_column, ["Alt+W"]);
         assert!(shortcuts.cycle_pane_width.is_empty());
         assert_eq!(shortcuts.previous_column, ["Ctrl+PageUp"]);
-        assert_eq!(shortcuts.close_focused_column, ["Ctrl+W"]);
+        assert_eq!(shortcuts.close_focused_column, ["Ctrl+Shift+W"]);
 
         // Once upgraded, an old default chosen again is a choice too.
         let mut desired = loaded.clone();
-        desired.keyboard_shortcuts.close_focused_column = vec!["Ctrl+Shift+W".into()];
+        desired.keyboard_shortcuts.close_focused_column = vec!["Ctrl+W".into()];
         save_merged(&path, &loaded, &desired).unwrap();
         assert_eq!(load(&path).unwrap(), desired);
     }
@@ -4067,7 +4123,7 @@ next_column = ["Alt+W", "Alt+Right"]
         let loaded = load(&path).unwrap();
         let shortcuts = &loaded.keyboard_shortcuts;
         assert_eq!(shortcuts.clone_pane, ["Ctrl+Shift+D"]);
-        assert_eq!(shortcuts.close_focused_column, ["Ctrl+W"]);
+        assert_eq!(shortcuts.close_focused_column, ["Ctrl+Shift+W"]);
         assert_eq!(shortcuts.review_toggle_viewed, ["Ctrl+PageDown"]);
         assert_eq!(shortcuts.next_column, ["Alt+W", "Alt+Right"]);
         // The rest move.
@@ -4101,7 +4157,7 @@ new_thread = "Alt+Shift+G"
         .unwrap();
         let shortcuts = load(&path).unwrap().keyboard_shortcuts;
         assert_eq!(shortcuts.new_terminal, ["Ctrl+Shift+T"]);
-        assert_eq!(shortcuts.close_focused_column, ["Ctrl+W"]);
+        assert_eq!(shortcuts.close_focused_column, ["Ctrl+Shift+W"]);
         assert_eq!(shortcuts.search_projects, ["Ctrl+Shift+F"]);
         // A single string predates chord lists, when Alt+Q alone was the
         // default; a list holding it alone was a choice, since lists shipped
@@ -5020,7 +5076,17 @@ new_thread = "Alt+Shift+G"
     #[test]
     fn shortcut_action_names_are_the_serialized_ones() {
         let table = toml::Table::try_from(KeyboardShortcuts::default()).unwrap();
-        assert!(table.keys().eq(SHORTCUT_ACTIONS.iter()));
+        assert!(
+            table
+                .keys()
+                .filter(|key| key.as_str() != "terminal_passthrough_actions")
+                .eq(SHORTCUT_ACTIONS.iter())
+        );
+        assert_eq!(
+            table["terminal_passthrough_actions"],
+            toml::Value::try_from(KeyboardShortcuts::default().terminal_passthrough_actions)
+                .unwrap()
+        );
     }
 
     /// Each shortcut action this build cannot use falls back alone, however
@@ -5156,8 +5222,10 @@ new_thread = "Alt+Shift+G"
         let bindings: Vec<ShortcutBinding> = file["keyboard_shortcuts"]
             .as_table()
             .unwrap()
-            .values()
-            .flat_map(|chords| chords.as_array().unwrap())
+            .iter()
+            // This metadata stores action IDs, not additional chord bindings.
+            .filter(|(name, _)| name.as_str() != "terminal_passthrough_actions")
+            .flat_map(|(_, chords)| chords.as_array().unwrap())
             .map(|chord| parse_shortcut(chord.as_str().unwrap()).unwrap())
             .collect();
         for (index, binding) in bindings.iter().enumerate() {
@@ -5480,5 +5548,49 @@ new_thread = "Alt+Shift+G"
             Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert!(!target.join("settings.toml").exists());
+    }
+    #[test]
+    fn revision_six_migrates_only_unchanged_close_and_preserves_explicit_terminal_policy() {
+        for (close, expected) in [
+            (vec!["Ctrl+W"], vec!["Ctrl+Shift+W"]),
+            (vec!["Ctrl+Alt+W"], vec!["Ctrl+Alt+W"]),
+            (vec!["Ctrl+W", "Alt+W"], vec!["Ctrl+W", "Alt+W"]),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = path_in(&directory);
+            let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+            document.insert("shortcut_defaults_revision".into(), 5.into());
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.insert("close_focused_column".into(), close.into());
+            shortcuts.insert(
+                "terminal_passthrough_actions".into(),
+                vec!["rename_pane", "close_focused_column"].into(),
+            );
+            fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+            let loaded = load(&path).unwrap();
+            assert_eq!(loaded.keyboard_shortcuts.close_focused_column, expected);
+            assert_eq!(
+                loaded.keyboard_shortcuts.terminal_passthrough_actions,
+                ["rename_pane", "close_focused_column"]
+            );
+            save(&path, &loaded).unwrap();
+            assert_eq!(load(&path).unwrap(), loaded);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+        document.insert("shortcut_defaults_revision".into(), 5.into());
+        document["keyboard_shortcuts"]
+            .as_table_mut()
+            .unwrap()
+            .remove("terminal_passthrough_actions");
+        fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+        assert_eq!(
+            load(&path)
+                .unwrap()
+                .keyboard_shortcuts
+                .terminal_passthrough_actions,
+            KeyboardShortcuts::default().terminal_passthrough_actions
+        );
     }
 }

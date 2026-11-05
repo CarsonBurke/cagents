@@ -2617,6 +2617,7 @@ impl Cagents {
         start: Element<'a, Message>,
         end: Option<Element<'a, Message>>,
         window_controls: bool,
+        region_id: &'static str,
     ) -> Element<'a, Message> {
         let focused = self
             .core
@@ -2653,6 +2654,7 @@ impl Cagents {
             }
         }
         widget::container(header)
+            .id(widget::Id::new(region_id))
             .center_y(design::HEADER_CONTENT_HEIGHT)
             .width(Length::Fill)
             .class(cosmic::theme::Container::Background)
@@ -2818,6 +2820,7 @@ impl Cagents {
                 iced::widget::Space::new().into(),
                 Some(actions.into()),
                 true,
+                "workspace.header-controls",
             )
         } else {
             let (_, tab_width) = self.tab_strip_geometry();
@@ -2854,6 +2857,7 @@ impl Cagents {
                 tabs.into(),
                 Some(actions.into()),
                 !self.context_inspector_open,
+                "workspace.header-controls",
             )
         };
         let mut rows = vec![header];
@@ -3415,7 +3419,12 @@ impl Cagents {
             .spacing(space::XXS)
             .align_y(Alignment::Center)
             .into();
-            let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
+            let heading = self.native_header(
+                self.sidebar_toggle(),
+                Some(end),
+                true,
+                "workspace.inspector-header-controls",
+            );
             return widget::column::with_children(vec![
                 heading,
                 crate::interaction::focused_escape(
@@ -3508,7 +3517,12 @@ impl Cagents {
         .spacing(space::XXS)
         .align_y(Alignment::Center)
         .into();
-        let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
+        let heading = self.native_header(
+            self.sidebar_toggle(),
+            Some(end),
+            true,
+            "workspace.inspector-header-controls",
+        );
         let tabs = widget::row::with_children(vec![
             tabs.into(),
             crate::ui_controls::button::secondary("Channel work")
@@ -3632,6 +3646,7 @@ impl Cagents {
             .width(Length::Fill)
             .height(Length::Fill),
         )
+        .id(widget::Id::new("workspace.inspector-controls"))
         .class(cosmic::theme::Container::Background)
         .width(width)
         .height(Length::Fill)

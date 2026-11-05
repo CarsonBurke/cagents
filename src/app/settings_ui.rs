@@ -1000,6 +1000,9 @@ const RAIL_WIDTH: f32 = 42.0 * design::GRID_UNIT;
 /// keys move beneath it: room for a short name, such as "Close pane", or about
 /// half of a long one on each of two lines.
 const SHORTCUT_LABEL_MIN_WIDTH: f32 = 120.0;
+/// Holds a Terminal checkbox or a "Scoped" caption, so every row keeps the
+/// policy column aligned.
+const SHORTCUT_POLICY_WIDTH: f32 = 96.0;
 
 /// The settings pane's body. Its layout follows the card's width, which the
 /// user sets per card, not the window's.
@@ -1359,7 +1362,7 @@ fn keyboard_groups<'a>(
             );
         }
         if !rows.is_empty() {
-            groups.push(settings_group(group, "Action · Keys · Source", rows).compact());
+            groups.push(settings_group(group, "Action · Keys · Source · Terminal", rows).compact());
         }
     }
     groups
@@ -1402,9 +1405,35 @@ fn shortcut_input<'a>(
                 .into()
         })
         .collect();
-    // Record, Reset and Source end the row as one unit: they never part
-    // across lines, Source keeps its column in every row, and it stays on
-    // the keys' line when they move beneath the action's name.
+    // Record, Reset, Source and the Terminal policy end the row as one unit:
+    // they never part across lines, each keeps its column in every row, and
+    // they stay on the keys' line when those move beneath the action's name.
+    let scope = workspace_widget::shortcut_descriptor(action).scope;
+    let policy: Element<'a, Message> = if scope.applies_to(workspace_widget::FocusedPane::Terminal)
+        || scope == workspace_widget::ShortcutScope::OutsideTerminal
+    {
+        crate::interaction::tooltip(
+            crate::ui_controls::field::checkbox(
+                draft
+                    .terminal_passthrough_actions
+                    .iter()
+                    .any(|id| id == action.id()),
+            )
+            .label("Terminal")
+            .on_toggle(move |enabled| Message::ShortcutTerminalPassthrough {
+                action: action.id().to_owned(),
+                enabled,
+            }),
+            "Send these keys to the terminal instead of running this workspace action",
+        )
+        .into()
+    } else {
+        crate::interaction::tooltip(
+            design::caption("Scoped"),
+            "Applies in its own pane; terminals keep these keys",
+        )
+        .into()
+    };
     controls.push(
         widget::row::with_children(vec![
             widget::row::with_children(vec![
@@ -1427,6 +1456,9 @@ fn shortcut_input<'a>(
             .spacing(2)
             .into(),
             design::caption(source).width(64).into(),
+            widget::container(policy)
+                .width(SHORTCUT_POLICY_WIDTH)
+                .into(),
         ])
         .spacing(space::S)
         .align_y(Alignment::Center)
@@ -1478,6 +1510,13 @@ fn shortcut_input<'a>(
             .spacing(2.0)
             .label_gap(space::S);
     let mut children = vec![row.into()];
+    if chords.iter().any(|chord| {
+        settings::parse_shortcut(chord).is_ok_and(|binding| {
+            settings::native_text_editing_advisory(action.id(), binding).is_some()
+        })
+    }) {
+        children.push(design::caption("Reserved while editing text").into());
+    }
     if let Some(reason) = &error {
         children.push(
             design::caption(reason.clone())
@@ -1505,6 +1544,123 @@ fn shortcut_input<'a>(
 mod keyboard_table_tests {
     use super::*;
 
+    fn click_actual_terminal_policy(app: &Cagents, field: SettingsField) -> Option<Message> {
+        use iced::{
+            Event, Rectangle, Size,
+            advanced::{clipboard, mouse, widget::Operation},
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        #[derive(Default)]
+        struct TerminalCheckbox(Option<Rectangle>);
+        impl Operation for TerminalCheckbox {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+                if text == "Terminal" {
+                    self.0 = Some(bounds);
+                }
+            }
+        }
+        let action = field.shortcut_action().unwrap();
+        let value = app
+            .settings_draft
+            .keyboard_shortcuts
+            .shortcut_values()
+            .into_iter()
+            .find(|(candidate, _)| *candidate == action)
+            .unwrap()
+            .1;
+        let row = shortcut_input(
+            field.label(),
+            value,
+            field,
+            &app.settings_draft.keyboard_shortcuts,
+            &app.settings_invalid,
+        );
+        let element = settings_group("Keyboard", "", vec![row])
+            .compact()
+            .view("Keyboard", "")
+            .unwrap();
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = UserInterface::build(
+            element,
+            Size::new(960.0, 200.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let mut checkbox = TerminalCheckbox::default();
+        ui.operate(&renderer, &mut checkbox);
+        let bounds = checkbox.0?;
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(bounds.center()),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        // Select the actual checkbox message, never synthesize its callback.
+        messages
+            .into_iter()
+            .find(|message| matches!(message, Message::ShortcutTerminalPassthrough { .. }))
+    }
+
+    #[test]
+    fn actual_terminal_checkbox_click_persists_policy_and_changes_the_terminal_matcher() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        let f2 = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::F2),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::F2),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F2),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        for (enabled, expected) in [
+            (false, Some(workspace_widget::GlobalShortcut::RenamePane)),
+            (true, None),
+        ] {
+            let message = click_actual_terminal_policy(&app, SettingsField::ShortcutRenamePane)
+                .expect("actual rendered terminal checkbox must emit its message");
+            assert!(
+                matches!(&message, Message::ShortcutTerminalPassthrough { action, enabled: actual } if action == "rename_pane" && *actual == enabled)
+            );
+            let task = app.update(message);
+            super::super::tests::settle_settings_task(&mut app, task);
+            let saved = settings::load(&path).unwrap();
+            assert_eq!(
+                saved
+                    .keyboard_shortcuts
+                    .terminal_passthrough_actions
+                    .iter()
+                    .any(|action| action == "rename_pane"),
+                enabled
+            );
+            assert_eq!(saved.keyboard_shortcuts, app.settings.keyboard_shortcuts);
+            assert_eq!(
+                workspace_widget::global_shortcut(
+                    &f2,
+                    &saved.keyboard_shortcuts,
+                    workspace_widget::FocusedPane::Terminal
+                ),
+                expected
+            );
+        }
+        assert!(
+            click_actual_terminal_policy(&app, SettingsField::ShortcutChatModel).is_none(),
+            "a scoped chat action must not offer a misleading terminal toggle"
+        );
+    }
+
     #[test]
     fn default_shortcut_rows_keep_every_control_visible_and_in_order() {
         use iced::{
@@ -1520,6 +1676,9 @@ mod keyboard_table_tests {
             buttons: Vec<Rectangle>,
             source: Option<Rectangle>,
             label_bounds: Option<Rectangle>,
+            advisory: Option<Rectangle>,
+            terminal: Option<Rectangle>,
+            scoped: Option<Rectangle>,
         }
         impl Operation for Controls {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -1534,10 +1693,13 @@ mod keyboard_table_tests {
                 self.buttons.push(bounds);
             }
             fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
-                if matches!(text, "Default" | "User") {
-                    self.source = Some(bounds);
-                } else if text.starts_with(self.label) {
-                    self.label_bounds = Some(bounds);
+                match text {
+                    "Default" | "User" => self.source = Some(bounds),
+                    "Reserved while editing text" => self.advisory = Some(bounds),
+                    "Terminal" => self.terminal = Some(bounds),
+                    "Scoped" => self.scoped = Some(bounds),
+                    _ if text.starts_with(self.label) => self.label_bounds = Some(bounds),
+                    _ => {}
                 }
             }
         }
@@ -1581,10 +1743,16 @@ mod keyboard_table_tests {
                     &renderer,
                     &mut controls,
                 );
-                assert_eq!(
-                    controls.buttons.len(),
-                    settings::parse_chords(value).len() + 2
+                // Each chip, Record and even the disabled Reset expose their
+                // native button bounds; the Terminal checkbox may follow.
+                let keys = settings::parse_chords(value).len() + 2;
+                assert!(
+                    controls.buttons.len() == keys
+                        || (controls.terminal.is_some() && controls.buttons.len() == keys + 1),
+                    "{field:?} at{width}: {:?}",
+                    controls.buttons
                 );
+                let buttons = &controls.buttons[..keys];
                 for bounds in &controls.buttons {
                     assert!(
                         bounds.width > 0.0 && bounds.height > 0.0,
@@ -1597,7 +1765,7 @@ mod keyboard_table_tests {
                 }
                 // Chips may wrap in a narrow pane, but in reading order: each
                 // follows the previous one on its line or starts a lower line.
-                for pair in controls.buttons.windows(2) {
+                for pair in buttons.windows(2) {
                     let same_line = (pair[0].center_y() - pair[1].center_y()).abs() < 4.1;
                     assert!(
                         if same_line {
@@ -1605,18 +1773,16 @@ mod keyboard_table_tests {
                         } else {
                             pair[1].y >= pair[0].y + pair[0].height - 0.1
                         },
-                        "{field:?} at{width}: controls out of order {:?}",
-                        controls.buttons
+                        "{field:?} at{width}: controls out of order {buttons:?}"
                     );
                 }
                 // Record and Reset stay together after the last chip.
-                let [.., record, reset] = controls.buttons[..] else {
+                let [.., record, reset] = buttons[..] else {
                     unreachable!("every row has Record and Reset");
                 };
                 assert!(
                     (record.center_y() - reset.center_y()).abs() < 0.1,
-                    "{field:?} at{width}: Record and Reset separated {:?}",
-                    controls.buttons
+                    "{field:?} at{width}: Record and Reset separated {buttons:?}"
                 );
                 let label = controls
                     .label_bounds
@@ -1632,39 +1798,221 @@ mod keyboard_table_tests {
                     "{field:?} at{width}: label {label:?} meets {:?}",
                     controls.buttons
                 );
-                if width == 560.0 {
-                    let center = controls.buttons[0].center_y();
+                // Source and the Terminal policy follow Reset on its line.
+                let source = controls.source.expect("Source remains visible");
+                let policy = controls
+                    .terminal
+                    .or(controls.scoped)
+                    .expect("every row states its Terminal policy");
+                for bounds in [source, policy] {
+                    assert!(bounds.width > 0.0 && bounds.height > 0.0);
                     assert!(
-                        label.x + label.width <= controls.buttons[0].x + 0.1,
-                        "{field:?} at{width}: keys left the name's line {label:?} {:?}",
-                        controls.buttons
+                        bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.1,
+                        "{field:?} at{width}: clipped {bounds:?}"
                     );
                     assert!(
-                        controls
-                            .buttons
-                            .iter()
-                            .all(|bounds| (bounds.center_y() - center).abs() < 4.1),
-                        "{field:?} at{width}: controls wrapped {:?}",
-                        controls.buttons
+                        (bounds.center_y() - reset.center_y()).abs() < 4.1,
+                        "{field:?} at{width}: {bounds:?} left Reset {reset:?}"
                     );
                 }
-                let source = controls.source.expect("Source remains visible");
-                assert!(source.width > 0.0 && source.height > 0.0);
-                assert!(source.x >= 0.0 && source.x + source.width <= width + 0.1);
                 assert!(
                     reset.x + reset.width <= source.x + 0.1
-                        && (source.center_y() - reset.center_y()).abs() < 4.1,
-                    "{field:?} at{width}: Source {source:?} left Reset {reset:?}"
+                        && source.x + source.width <= policy.x + 0.1,
+                    "{field:?} at{width}: Reset {reset:?}, Source {source:?}, policy {policy:?}"
                 );
-                if width == 560.0 {
+                if let Some(caption) = controls.advisory {
                     assert!(
-                        node.size().height <= 64.0,
-                        "{field:?} atwide table must stay compact: {:?}",
-                        node.size()
+                        caption.height > 0.0
+                            && caption.y + caption.height <= node.size().height + 0.1
+                            && buttons
+                                .iter()
+                                .all(|button| button.y + button.height <= caption.y + 0.1),
+                        "{field:?} at{width}: the editing advisory must stay below the row"
                     );
+                }
+                if width == 560.0 {
+                    if matches!(
+                        field,
+                        SettingsField::ShortcutMovePaneLeft
+                            | SettingsField::ShortcutMovePaneRight
+                            | SettingsField::ShortcutReopenPane
+                    ) {
+                        assert!(
+                            controls.advisory.is_some(),
+                            "{field:?}: the editing advisory must remain visible"
+                        );
+                    }
                 }
             }
         }
+        // A configured alias list may exceed a line. Its chips wrap, and the
+        // source and Terminal policy stay visible after Record and Reset.
+        let aliases = (b'a'..=b'z')
+            .map(|key| format!("Ctrl+Alt+Shift+{}", char::from(key)))
+            .collect::<Vec<_>>();
+        assert!(
+            aliases
+                .iter()
+                .all(|value| settings::parse_shortcut(value).is_ok())
+        );
+        let value = settings::format_chords(&aliases);
+        let field = SettingsField::ShortcutRenamePane;
+        let row = shortcut_input(
+            field.label(),
+            &value,
+            field,
+            &draft.keyboard_shortcuts,
+            &invalid,
+        );
+        let mut element = settings_group("Keyboard", "", vec![row])
+            .compact()
+            .view("Keyboard", "")
+            .unwrap();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::new(560.0, 0.0), Size::new(560.0, 1000.0)),
+        );
+        let mut controls = Controls {
+            label: field.label(),
+            ..Controls::default()
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut controls);
+        let source = controls
+            .source
+            .expect("configured row keeps its source caption");
+        let terminal = controls
+            .terminal
+            .expect("configured row keeps its actual Terminal checkbox");
+        for bounds in controls.buttons.iter().chain([&source, &terminal]) {
+            assert!(bounds.width > 0.0 && bounds.height > 0.0, "{bounds:?}");
+            assert!(
+                bounds.x >= 0.0 && bounds.x + bounds.width <= 560.1,
+                "{bounds:?}"
+            );
+        }
+        assert!(source.x + source.width <= terminal.x + 0.1);
+        for bounds in &controls.buttons[aliases.len()..aliases.len() + 2] {
+            assert!(bounds.width > 0.0 && bounds.height > 0.0, "{bounds:?}");
+            assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= source.x + 0.1);
+        }
+    }
+
+    #[test]
+    fn long_alias_row_keeps_record_reset_and_every_removal_reachable() {
+        use iced::{
+            Event, Rectangle, Size,
+            advanced::{
+                clipboard, mouse,
+                widget::{Operation, operation::Focusable},
+            },
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        #[derive(Default)]
+        struct Geometry {
+            buttons: Vec<Rectangle>,
+            label: Option<Rectangle>,
+        }
+        impl Operation for Geometry {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                self.buttons.push(bounds);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+                if text.starts_with(SettingsField::ShortcutRenamePane.label()) {
+                    assert!(self.label.replace(bounds).is_none());
+                }
+            }
+        }
+        let aliases = (b'a'..=b'z')
+            .map(|key| format!("Ctrl+Alt+Shift+{}", char::from(key)))
+            .collect::<Vec<_>>();
+        let value = settings::format_chords(&aliases);
+        let draft = SettingsDraft::from_settings(&AppSettings::default());
+        let invalid = HashMap::new();
+        let field = SettingsField::ShortcutRenamePane;
+        let action = field.shortcut_action().unwrap();
+        let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
+        let row = shortcut_input(
+            field.label(),
+            &value,
+            field,
+            &draft.keyboard_shortcuts,
+            &invalid,
+        );
+        let element = settings_group("Keyboard", "", vec![row])
+            .compact()
+            .view("Keyboard", "")
+            .unwrap();
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let viewport = Size::new(560.0, 2_000.0);
+        let mut ui = UserInterface::build(element, viewport, Cache::new(), &mut renderer);
+        let mut geometry = Geometry::default();
+        ui.operate(&renderer, &mut geometry);
+        let label = geometry.label.expect("actual visible action label");
+        assert!(label.width > 0.0 && label.height > 0.0);
+        // Every chip, then Record and Reset, is visible inside the pane.
+        for bounds in &geometry.buttons {
+            assert!(bounds.width > 0.0 && bounds.height > 0.0, "{bounds:?}");
+            assert!(
+                bounds.x >= 0.0 && bounds.x + bounds.width <= viewport.width + 0.1,
+                "{bounds:?}"
+            );
+            assert!(
+                label.y + label.height <= bounds.y + 0.1,
+                "a long alias list moves beneath the name: {label:?} {bounds:?}"
+            );
+        }
+        let record = geometry.buttons[aliases.len()];
+        let reset = geometry.buttons[aliases.len() + 1];
+        assert!(record.x + record.width <= reset.x + 0.1);
+        let click = |ui: &mut UserInterface<'_, Message, cosmic::Theme, cosmic::Renderer>,
+                     renderer: &mut cosmic::Renderer,
+                     bounds: Rectangle| {
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(bounds.center()),
+                renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            messages
+        };
+        let messages = click(&mut ui, &mut renderer, record);
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::Palette(palette_ui::Action::Record(actual))] if *actual == field
+        ));
+        let messages = click(&mut ui, &mut renderer, reset);
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::SettingsDraftChanged { field: actual, value }]
+                if *actual == field && *value == default
+        ));
+        // The last chip wraps onto a later line rather than scrolling out of
+        // view, so it is removed with a plain click.
+        let last = geometry.buttons[aliases.len() - 1];
+        let messages = click(&mut ui, &mut renderer, last);
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::SettingsDraftChanged { field: actual, value }]
+                if *actual == field
+                    && settings::parse_chords(value).as_slice() == &aliases[..aliases.len() - 1]
+        ));
     }
 
     #[test]

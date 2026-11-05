@@ -733,3 +733,187 @@ fn full_event_inbox_preserves_mixed_pre_effect_refusals_and_completion() {
     mock.no_reconnect();
     mock.stop();
 }
+
+#[test]
+fn refused_owned_press_keeps_attachment_and_cannot_authorize_repeat_or_cleanup() {
+    for (code, message, retryable) in [
+        (
+            ProtocolErrorCode::QueueFull,
+            "fixture admission refusal",
+            true,
+        ),
+        (
+            ProtocolErrorCode::TerminalUnavailable,
+            "the terminal worker has closed",
+            true,
+        ),
+        (
+            ProtocolErrorCode::TerminalUnavailable,
+            "terminal output has completed",
+            false,
+        ),
+    ] {
+        let mut mock = MockHost::begin(false);
+        mock.attach();
+        let epoch = mock.handle.cleanup_epoch().unwrap();
+        let press = KeyInput {
+            action: KeyAction::Press,
+            key: TerminalKey::Enter,
+            modifiers: KeyModifiers::default(),
+            text: None,
+            unshifted_codepoint: None,
+        };
+        let admitted = mock
+            .handle
+            .tracked_key(press.clone(), mock.proof.clone(), epoch)
+            .unwrap();
+        let down = mock.request();
+        assert!(
+            matches!(down.request, ClientRequest::Key { terminal_id, input }
+            if terminal_id == mock.session.id && input == press)
+        );
+        mock.handle
+            .repeat_key(
+                KeyInput {
+                    action: KeyAction::Repeat,
+                    ..press.clone()
+                },
+                mock.proof.clone(),
+                epoch,
+                admitted.clone(),
+            )
+            .unwrap();
+        let cleanup = mock
+            .handle
+            .cleanup_key(
+                KeyInput {
+                    action: KeyAction::Release,
+                    ..press.clone()
+                },
+                mock.proof.clone(),
+                epoch,
+                admitted.clone(),
+            )
+            .unwrap();
+        mock.send(
+            Some(down.request_id),
+            ServerMessage::Error(ProtocolError::new(code, message, retryable)),
+        );
+        assert!(matches!(
+            mock.handle.events().recv_timeout(Duration::from_secs(2)).unwrap(),
+            TerminalEvent::InputRejected { operation: "send original terminal key", message }
+                if message.contains("input was not accepted") || message.contains("this input was not sent")
+        ));
+        assert_eq!(admitted.state(), 2, "refusal precedes its published event");
+        assert!(!cleanup.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(mock.handle.cleanup_epoch(), Some(epoch));
+        assert_eq!(mock.handle.proof(), Some(mock.proof.clone()));
+        mock.no_reconnect();
+        // FIFO requires both dependent keys to be discarded before this real
+        // control appears; neither the refused down nor its up is replayed.
+        mock.handle.focus(false).unwrap();
+        let next = mock.request();
+        assert!(
+            matches!(next.request, ClientRequest::Focus { terminal_id, focused: false }
+            if terminal_id == mock.session.id)
+        );
+        mock.response(next.request_id, ServerResponse::Accepted);
+        mock.no_reconnect();
+        mock.stop();
+    }
+}
+
+#[test]
+fn refused_owned_repeat_preserves_original_press_and_same_attachment_cleanup() {
+    for (code, message, retryable) in [
+        (
+            ProtocolErrorCode::QueueFull,
+            "fixture admission refusal",
+            true,
+        ),
+        (
+            ProtocolErrorCode::TerminalUnavailable,
+            "the terminal worker has closed",
+            true,
+        ),
+        (
+            ProtocolErrorCode::TerminalUnavailable,
+            "terminal output has completed",
+            false,
+        ),
+    ] {
+        let mut mock = MockHost::begin(false);
+        mock.attach();
+        let epoch = mock.handle.cleanup_epoch().unwrap();
+        let press = KeyInput {
+            action: KeyAction::Press,
+            key: TerminalKey::Enter,
+            modifiers: KeyModifiers::default(),
+            text: None,
+            unshifted_codepoint: None,
+        };
+        let admitted = mock
+            .handle
+            .tracked_key(press.clone(), mock.proof.clone(), epoch)
+            .unwrap();
+        let down = mock.request();
+        assert!(
+            matches!(down.request, ClientRequest::Key { terminal_id, input }
+            if terminal_id == mock.session.id && input == press)
+        );
+        mock.response(down.request_id, ServerResponse::Accepted);
+        let repeat = KeyInput {
+            action: KeyAction::Repeat,
+            ..press.clone()
+        };
+        mock.handle
+            .repeat_key(repeat.clone(), mock.proof.clone(), epoch, admitted.clone())
+            .unwrap();
+        let repeated = mock.request();
+        assert!(
+            matches!(repeated.request, ClientRequest::Key { terminal_id, input }
+            if terminal_id == mock.session.id && input == repeat)
+        );
+        mock.send(
+            Some(repeated.request_id),
+            ServerMessage::Error(ProtocolError::new(code, message, retryable)),
+        );
+        assert!(matches!(
+            mock.handle.events().recv_timeout(Duration::from_secs(2)).unwrap(),
+            TerminalEvent::InputRejected { operation: "send original terminal key", message }
+                if message.contains("input was not accepted") || message.contains("this input was not sent")
+        ));
+        assert_eq!(
+            admitted.state(),
+            1,
+            "refused repeat cannot revoke the admitted down"
+        );
+        assert_eq!(mock.handle.cleanup_epoch(), Some(epoch));
+        let release = KeyInput {
+            action: KeyAction::Release,
+            ..press
+        };
+        let cleanup = mock
+            .handle
+            .cleanup_key(release.clone(), mock.proof.clone(), epoch, admitted)
+            .unwrap();
+        let up = mock.request();
+        assert!(
+            matches!(up.request, ClientRequest::Key { terminal_id, input }
+            if terminal_id == mock.session.id && input == release)
+        );
+        mock.response(up.request_id, ServerResponse::Accepted);
+        assert!(cleanup.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(mock.handle.cleanup_epoch(), Some(epoch));
+        assert_eq!(mock.handle.proof(), Some(mock.proof.clone()));
+        mock.handle.focus(false).unwrap();
+        let next = mock.request();
+        assert!(
+            matches!(next.request, ClientRequest::Focus { terminal_id, focused: false }
+            if terminal_id == mock.session.id)
+        );
+        mock.response(next.request_id, ServerResponse::Accepted);
+        mock.no_reconnect();
+        mock.stop();
+    }
+}

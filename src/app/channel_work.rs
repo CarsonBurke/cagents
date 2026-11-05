@@ -3263,6 +3263,7 @@ mod tests {
                 .iter()
                 .any(|chord| chord == "Alt+Y")
         );
+        assert!(!app.settings_pending.contains_key(&field));
 
         drop(app.update(Message::Palette(palette_ui::Action::Record(field))));
         app.settings_reset_confirm = true;
@@ -3273,7 +3274,8 @@ mod tests {
             .keyboard_shortcuts
             .command_palette
             .clone();
-        let pending = app.settings_pending.get(&field).cloned();
+        let accepted = app.settings.keyboard_shortcuts.command_palette.clone();
+        let pending = app.settings_pending.clone();
         drop(app.update(Message::KeyEvent {
             event,
             captured: false,
@@ -3286,7 +3288,8 @@ mod tests {
             app.settings_draft.keyboard_shortcuts.command_palette,
             before
         );
-        assert_eq!(app.settings_pending.get(&field).cloned(), pending);
+        assert_eq!(app.settings.keyboard_shortcuts.command_palette, accepted);
+        assert_eq!(app.settings_pending, pending);
         drop(app.update(Message::CancelResetSettings));
         assert!(!app.modal_is_open());
     }

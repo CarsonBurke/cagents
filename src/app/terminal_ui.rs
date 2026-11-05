@@ -535,7 +535,7 @@ pub(super) struct Context {
     pub point: iced::Point,
 }
 
-fn input_id(card: CardId) -> iced::widget::Id {
+pub(super) fn input_id(card: CardId) -> iced::widget::Id {
     iced::widget::Id::from(format!("terminal-find-{card}"))
 }
 

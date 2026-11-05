@@ -21,7 +21,7 @@ use super::{
     BrowserRestoreState, DelegateRequest, DelegateRequestId, InputMethodState, PhysicalViewport,
     SurfacePlacement,
     fallback::{FallbackSurface, WaylandSubsurfaceFactory},
-    handle::{CoalescedCommands, Command, CommandMailbox, EventBus},
+    handle::{CoalescedCommands, Command, CommandMailbox, EventBus, OwnedKeyInput},
     input,
     lifecycle::LifecycleMachine,
 };
@@ -200,6 +200,34 @@ fn lock_registry() -> std::sync::MutexGuard<'static, EngineRegistry> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Servo's blur operation has no WebViewId and clears every webview. Track
+/// the exact session whose focus this engine requested before emitting it.
+#[derive(Debug)]
+struct FocusOwner<T: Copy>(Cell<Option<T>>);
+
+impl<T: Copy> Default for FocusOwner<T> {
+    fn default() -> Self {
+        Self(Cell::new(None))
+    }
+}
+
+impl<T: Copy + Eq> FocusOwner<T> {
+    fn request(&self, session: T, focused: bool) -> bool {
+        if focused {
+            if self.0.get() == Some(session) {
+                return false;
+            }
+            self.0.set(Some(session));
+            true
+        } else if self.0.get() == Some(session) {
+            self.0.set(None);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// The shared Servo runtime and every browser card it serves.
 struct Engine {
     generation: u64,
@@ -209,6 +237,7 @@ struct Engine {
     /// engine thread that unwinds then gets the same ordering `run` applies by
     /// hand on its way out.
     cards: Vec<Card>,
+    focus_owner: Rc<FocusOwner<servo::WebViewId>>,
     /// One runtime for every card, kept for the life of this thread.
     ///
     /// `servo::Servo` is `!Send`/`!Sync` — it is `Rc<ServoInner>` over
@@ -267,6 +296,7 @@ impl Engine {
         let mut engine = Engine {
             generation,
             cards: Vec::new(),
+            focus_owner: Rc::new(FocusOwner::default()),
             servo: None,
             import: None,
             registrations: Some(registrations),
@@ -393,6 +423,7 @@ impl Engine {
         } = registration;
         let restore = restore.normalized();
         self.cards.push(Card {
+            focus_owner: self.focus_owner.clone(),
             mailbox,
             events,
             lifecycle: LifecycleMachine::new(visible),
@@ -480,6 +511,7 @@ impl Engine {
         let Ok(command) = card.mailbox.receiver().try_recv() else {
             return;
         };
+        card.mailbox.refill_after_receive();
         if let Command::Import(request) = command {
             if self.import.is_some() {
                 let _ = request
@@ -587,6 +619,7 @@ enum CardRequest {
 }
 
 struct Card {
+    focus_owner: Rc<FocusOwner<servo::WebViewId>>,
     mailbox: Arc<CommandMailbox>,
     events: Arc<EventBus>,
     restore: BrowserRestoreState,
@@ -672,6 +705,7 @@ impl Card {
             Command::Hibernate => self.hibernate(),
             Command::Restore => return self.restore_resources(),
             Command::Input(event) => self.forward_input(event),
+            Command::OwnedKey(key) => self.forward_owned_key(key),
             Command::ClipboardText { id, result } => {
                 if let Some(request) = self
                     .session
@@ -769,13 +803,7 @@ impl Card {
         }
         if let Some(focused) = commands.focused {
             self.focused = focused;
-            if let Some(session) = &self.session {
-                if focused {
-                    session.webview.focus();
-                } else {
-                    session.webview.blur();
-                }
-            }
+            self.synchronize_session_focus();
         }
         for event in [
             commands.pointer_motion,
@@ -790,10 +818,43 @@ impl Card {
         request
     }
 
+    fn synchronize_session_focus(&self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        // Coalesced card messages and restore requests arrive from independent
+        // mailboxes. Cached per-card focus alone is not current UI authority.
+        let focused = self.focused && self.mailbox.wants_focus();
+        if self.focus_owner.request(session.webview.id(), focused) {
+            if focused {
+                session.webview.focus();
+            } else {
+                session.webview.blur();
+            }
+        }
+    }
+
     fn forward_input(&mut self, event: BrowserInput) {
         if !self.visible || self.session.is_none() {
             return;
         }
+        self.deliver_input(event);
+    }
+
+    fn forward_owned_key(&mut self, key: OwnedKeyInput) {
+        if self.session.is_none() {
+            return;
+        }
+        let Some(input) = self.mailbox.take_current_key_input(key) else {
+            return;
+        };
+        // Native focus admitted this down/up before blur. Coalesced visibility
+        // may overtake the FIFO, but both keys still belong to this live
+        // session. A destroyed/recreated session has a different generation.
+        self.deliver_input(input);
+    }
+
+    fn deliver_input(&mut self, event: BrowserInput) {
         let session = self.session.as_ref().expect("session checked");
         let id = session
             .webview
@@ -886,6 +947,7 @@ impl Card {
             return;
         }
         self.session = Some(session);
+        self.mailbox.begin_key_session();
         let _ = self.lifecycle.resources_created(self.visible);
         self.events.semantic(BrowserEvent::Ready {
             backend: BackendSelection {
@@ -894,11 +956,7 @@ impl Card {
         });
         self.events
             .semantic(BrowserEvent::LifecycleChanged(self.lifecycle.state()));
-        if self.focused
-            && let Some(session) = &self.session
-        {
-            session.webview.focus();
-        }
+        self.synchronize_session_focus();
     }
 
     fn fail_initialization(&mut self, error: BrowserError) {
@@ -922,7 +980,11 @@ impl Card {
     }
 
     fn destroy_session(&mut self) {
+        self.mailbox.end_key_session();
         if let Some(session) = self.session.take() {
+            if self.focus_owner.request(session.webview.id(), false) {
+                session.webview.blur();
+            }
             session.store_navigation(&mut self.restore);
             session.shutdown();
         }
@@ -1530,6 +1592,7 @@ mod tests {
     fn card_with_teardown(visible: bool) -> (Card, Receiver<()>) {
         let (teardown, teardown_done) = crossbeam_channel::bounded(0);
         let card = Card {
+            focus_owner: Rc::new(FocusOwner::default()),
             mailbox: CommandMailbox::new(),
             events: EventBus::new(),
             restore: restore_state(),
@@ -1545,6 +1608,106 @@ mod tests {
             closed: false,
         };
         (card, teardown_done)
+    }
+
+    #[test]
+    fn stale_session_blur_never_clears_the_new_engine_focus() {
+        let focus = FocusOwner::<u64>::default();
+        assert!(focus.request(1, true));
+        assert!(focus.request(2, true));
+        assert!(
+            !focus.request(1, false),
+            "Servo blur is global: old session must not emit it"
+        );
+        assert_eq!(focus.0.get(), Some(2));
+        assert!(focus.request(2, false));
+        assert!(
+            !focus.request(2, false),
+            "ordinary redraw must not duplicate blur"
+        );
+        assert!(focus.request(3, true));
+        assert!(
+            !focus.request(2, false),
+            "destroying an old generation must not blur its replacement"
+        );
+        assert_eq!(focus.0.get(), Some(3));
+    }
+
+    #[test]
+    fn coalesced_hide_keeps_same_session_fifo_keys_and_retirement_rejects_them() {
+        use super::super::{ButtonState, input::iced_key};
+        use cosmic::iced::keyboard::{
+            self,
+            key::{Code, Physical},
+        };
+        // No compositor/Servo is involved: exercise the exact generation
+        // selector used by forward_owned_key after a session-presence check.
+        let mut card = sessionless_card(true);
+        card.mailbox.begin_key_session();
+        let physical = Physical::Code(Code::KeyA);
+        let key = keyboard::Key::Character("a".into());
+        let input = |state| {
+            iced_key(
+                state,
+                &key,
+                physical,
+                keyboard::Location::Standard,
+                keyboard::Modifiers::empty(),
+                false,
+                false,
+            )
+        };
+        // Metadata may already have a wake before down was admitted. Hiding
+        // can then overtake down/up without retiring their original session.
+        card.mailbox
+            .update_coalesced(|state| state.presented = Some(false))
+            .unwrap();
+        card.mailbox
+            .press_key(
+                physical,
+                input(ButtonState::Pressed),
+                input(ButtonState::Released),
+            )
+            .unwrap();
+        card.mailbox.release_pressed_keys();
+        let mut observed = Vec::new();
+        while let Ok(command) = card.mailbox.receiver().try_recv() {
+            card.mailbox.refill_after_receive();
+            match command {
+                Command::WakeCoalesced => {
+                    card.apply_coalesced(card.mailbox.drain_coalesced());
+                }
+                Command::OwnedKey(key) => {
+                    assert!(!card.visible);
+                    if let Some(input) = card.mailbox.take_current_key_input(key) {
+                        observed.push(input);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            observed,
+            vec![input(ButtonState::Pressed), input(ButtonState::Released)]
+        );
+        // destroy_session retires even if there is no compositor fixture, so
+        // queued old key events cannot become input to a future adoption.
+        card.mailbox
+            .release_key(physical, input(ButtonState::Released))
+            .unwrap();
+        card.mailbox
+            .press_key(
+                physical,
+                input(ButtonState::Pressed),
+                input(ButtonState::Released),
+            )
+            .unwrap();
+        let Command::OwnedKey(old_down) = card.mailbox.receiver().try_recv().unwrap() else {
+            panic!()
+        };
+        card.destroy_session();
+        card.mailbox.begin_key_session();
+        assert!(card.mailbox.take_current_key_input(old_down).is_none());
     }
 
     #[test]
@@ -1735,6 +1898,7 @@ mod tests {
         drop(Engine {
             generation: 0,
             cards: vec![card],
+            focus_owner: Rc::new(FocusOwner::default()),
             servo: None,
             import: None,
             registrations: Some(engine_registrations),

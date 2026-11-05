@@ -2678,8 +2678,16 @@ impl Runtime {
                     composer_editor_style,
                 )))
                 .on_action(move |event| action(Action::Composer(target, event)))
+                .on_history(&self.composer_history_owner, move |command| {
+                    action(Action::ComposerHistory(target, command))
+                })
                 .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
                 .key_binding(move |press| {
+                    // Native editors ask custom bindings on every mounted
+                    // widget, including an inactive composer.
+                    if !matches!(press.status, text_editor::Status::Focused { .. }) {
+                        return None;
+                    }
                     if press.modifiers.command()
                         && matches!(press.key, keyboard::Key::Named(keyboard::key::Named::End))
                     {
@@ -5852,13 +5860,15 @@ mod tests {
                 assert!(messages.is_empty(), "switching disables draft controls");
             } else {
                 // Clicking outside COSMIC's native editor first emits its
-                // ordinary ClearSelection. The following release must admit
-                // exactly one chooser, without editing/submitting the draft.
+                // ordinary ClearSelection and the history observation that
+                // follows it. The release must admit exactly one chooser,
+                // without editing/submitting the draft.
                 assert!(
                     matches!(messages.as_slice(), [
                         Message::ChatUi(Action::Composer(editor, text_editor::Action::ClearSelection)),
+                        Message::ChatUi(Action::ComposerHistory(observed, command)),
                         Message::ChatUi(Action::Attach(found)),
-                    ] if *editor == target && *found == target),
+                    ] if *editor == target && *observed == target && !command.changes_text() && *found == target),
                     "attachment control emitted unexpected messages: {messages:?}; bounds={rect:?}; cursor={cursor:?}; viewport={viewport:?}; captured={captured:?}"
                 );
             }
@@ -12462,6 +12472,198 @@ mod tests {
         let mut unfocused = key(Named::ArrowUp, Modifiers::empty());
         unfocused.status = text_editor::Status::Active;
         assert!(!queue_key(&unfocused, true));
+    }
+
+    #[test]
+    fn mounted_chat_composers_dispatch_only_the_actual_keyboard_focus_owner() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use iced::keyboard::{
+            Key,
+            key::{Code, Named, Physical},
+        };
+        let (mut first, _first_handle) = frame_cost::live_runtime(&[]);
+        let (mut second, _second_handle) = frame_cost::live_runtime(&[]);
+        first.replace_draft(text_editor::Content::with_text("first draft"));
+        second.replace_draft(text_editor::Content::with_text("second draft"));
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        fn pane<'a>(
+            runtime: &'a Runtime,
+            shortcuts: &'a crate::settings::KeyboardShortcuts,
+        ) -> Element<'a, Message> {
+            runtime.view(
+                None,
+                false,
+                false,
+                shortcuts,
+                400.0,
+                Place {
+                    channel: None,
+                    name: "Fixture".into(),
+                    branch: None,
+                },
+                true,
+                None,
+                vec![],
+            )
+        }
+        let sidebar = widget::Id::new("chat.registry.sidebar");
+        let mut element: Element<'_, Message> = widget::row::with_children(vec![
+            widget::container(pane(&first, &shortcuts))
+                .width(400)
+                .height(600)
+                .into(),
+            widget::container(pane(&second, &shortcuts))
+                .width(400)
+                .height(600)
+                .into(),
+            widget::text_input("Sidebar", "query")
+                .id(sidebar.clone())
+                .on_input(|_| Message::ChatUi(Action::CopyLiteral(String::new())))
+                .width(240)
+                .into(),
+        ])
+        .into();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = iced::Rectangle::with_size(iced::Size::new(1100.0, 620.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        // The first presented frame shares both transcripts' geometry with
+        // their runtimes directly; only navigation becomes a model message.
+        // Establish that lifecycle before testing which composer owns
+        // keyboard actions, without allowing unrelated chat messages through
+        // the keyboard assertions below.
+        let mut presented = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Window(iced::window::Event::RedrawRequested(
+                std::time::Instant::now(),
+            )),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut presented),
+            &viewport,
+        );
+        assert!(
+            presented.is_empty(),
+            "unexpected initial frame messages: {presented:?}"
+        );
+        for runtime in [&first, &second] {
+            assert!(
+                runtime.observed_scroll.borrow().contains_key(&None),
+                "the first frame observes each transcript's geometry"
+            );
+        }
+        for (target, expected) in [
+            (sidebar, None),
+            (
+                card_control_id(first.target.card, "chat-composer"),
+                Some(first.target),
+            ),
+            (
+                card_control_id(second.target.card, "chat-composer"),
+                Some(second.target),
+            ),
+        ] {
+            let mut focus = iced::advanced::widget::operation::focusable::focus::<()>(target);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+            // Native unfocus queues ClearSelection even for an already
+            // unfocused editor. Let that exact focus lifecycle run before
+            // asking which editor owns the next keyboard action.
+            let mut focus_messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Window(iced::window::Event::RedrawRequested(
+                    std::time::Instant::now(),
+                )),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut focus_messages),
+                &viewport,
+            );
+            let mut cleared = Vec::new();
+            let mut observed = Vec::new();
+            for message in &focus_messages {
+                match message {
+                    Message::ChatUi(Action::Composer(
+                        target,
+                        text_editor::Action::ClearSelection,
+                    )) => {
+                        cleared.push(*target);
+                    }
+                    Message::ChatUi(Action::ComposerHistory(target, command))
+                        if !command.changes_text() =>
+                    {
+                        observed.push(*target)
+                    }
+                    _ => panic!("unexpected focus lifecycle message: {message:?}"),
+                }
+            }
+            let nonowners = [first.target, second.target]
+                .into_iter()
+                .filter(|target| Some(*target) != expected)
+                .collect::<Vec<_>>();
+            assert_eq!(cleared, nonowners);
+            assert_eq!(observed, nonowners);
+            for (key, code, latest) in [
+                (Named::End, Code::End, true),
+                (Named::Enter, Code::Enter, false),
+            ] {
+                let event = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: Key::Named(key),
+                    modified_key: Key::Named(key),
+                    physical_key: Physical::Code(code),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL,
+                    text: None,
+                    repeat: false,
+                });
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                let actions: Vec<_> = messages
+                    .iter()
+                    .filter_map(|message| match message {
+                        Message::ChatUi(Action::Latest(target)) if latest => Some(*target),
+                        Message::ChatUi(Action::Submit(target, PromptMode::Send)) if !latest => {
+                            Some(*target)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(actions, expected.into_iter().collect::<Vec<_>>());
+                assert!(
+                    messages.iter().all(|message| match message {
+                        Message::ChatUi(
+                            Action::Composer(target, _)
+                            | Action::ComposerCursor(target, _)
+                            | Action::Submit(target, _)
+                            | Action::Latest(target)
+                            | Action::ComposerHistory(target, _),
+                        ) => Some(*target) == expected,
+                        _ => false,
+                    }),
+                    "inactive composers and sidebar fields must not publish another chat action: {messages:?}"
+                );
+            }
+        }
     }
 
     fn press(modifiers: keyboard::Modifiers, focused: bool) -> text_editor::KeyPress {

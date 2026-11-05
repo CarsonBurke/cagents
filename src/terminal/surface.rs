@@ -25,6 +25,10 @@ pub struct TerminalSurface {
 }
 
 impl TerminalSurface {
+    pub(crate) fn same_attachment(&self, other: &Self) -> bool {
+        self.handle.same_attachment(&other.handle)
+    }
+
     /// Marks a terminal this client just started, so its first layout sizes
     /// the PTY at once rather than as a resize that waits to settle.
     pub fn spawned(self) -> Self {
@@ -109,6 +113,36 @@ impl TerminalSurface {
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
         self.handle.key(key)
+    }
+
+    pub(crate) fn cleanup_epoch(&self) -> Option<u64> {
+        self.handle.cleanup_epoch()
+    }
+    pub(crate) fn tracked_key(
+        &self,
+        input: KeyInput,
+        proof: HostSessionProof,
+        epoch: u64,
+    ) -> Result<super::hosted::KeyAdmission, TerminalSendError> {
+        self.handle.tracked_key(input, proof, epoch)
+    }
+    pub(crate) fn repeat_key(
+        &self,
+        input: KeyInput,
+        proof: HostSessionProof,
+        epoch: u64,
+        predecessor: super::hosted::KeyAdmission,
+    ) -> Result<(), TerminalSendError> {
+        self.handle.repeat_key(input, proof, epoch, predecessor)
+    }
+    pub(crate) fn cleanup_key(
+        &self,
+        input: KeyInput,
+        proof: HostSessionProof,
+        epoch: u64,
+        predecessor: super::hosted::KeyAdmission,
+    ) -> Result<Receiver<bool>, TerminalSendError> {
+        self.handle.cleanup_key(input, proof, epoch, predecessor)
     }
 
     pub fn mouse(&self, mouse: MouseInput) -> Result<(), TerminalSendError> {

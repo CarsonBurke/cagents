@@ -3117,6 +3117,11 @@ where
         let state = tree.state.downcast_mut::<State<Highlighter>>();
 
         operation.focusable(self.id.as_ref(), layout.bounds(), state);
+        operation.custom(
+            self.id.as_ref(),
+            layout.bounds(),
+            &mut crate::input_trace::TextEditing,
+        );
     }
 
     fn overlay<'b>(

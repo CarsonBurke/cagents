@@ -1276,7 +1276,7 @@ impl Cagents {
                         {
                             return self.handle_terminal_find(terminal_ui::Action::Open(card));
                         }
-                        Task::none()
+                        self.update(Message::FocusProjectSearch)
                     }
                 }
             }
