@@ -319,11 +319,6 @@ mod inspector_widget {
                         current = Some(next);
                     }
                 }
-                node = element.as_widget_mut().layout(
-                    &mut self.tree,
-                    &self.renderer,
-                    &layout::Limits::new(Size::ZERO, bounds),
-                );
             }
             element.as_widget_mut().operate(
                 &mut self.tree,
@@ -346,6 +341,13 @@ mod inspector_widget {
                 &Rectangle::with_size(bounds),
             );
             let invalid = shell.is_layout_invalid();
+            shell.revalidate_layout(|| {
+                node = element.as_widget_mut().layout(
+                    &mut self.tree,
+                    &self.renderer,
+                    &layout::Limits::new(Size::ZERO, bounds),
+                );
+            });
             self.renderer.reset(Rectangle::with_size(bounds));
             element.as_widget().draw(
                 &self.tree,

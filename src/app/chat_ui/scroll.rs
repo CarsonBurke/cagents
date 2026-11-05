@@ -1066,6 +1066,15 @@ struct Row {
     bounds: Rectangle,
 }
 
+fn reading_row_visible(bounds: Rectangle, top: f32, viewport_height: f32) -> bool {
+    let bottom = bounds.y + bounds.height;
+    // Native scroll translations round to whole pixels. A preceding row's
+    // bottom sliver must not become the reader for the next width change.
+    // Allow one relative epsilon for endpoint arithmetic in long transcripts.
+    let rounding = 0.5 + f32::EPSILON * top.abs().max(bottom.abs());
+    bottom - top > rounding && bounds.y < top + viewport_height
+}
+
 struct Reflow {
     geometry: Geometry,
     rows: Vec<Row>,
@@ -1141,10 +1150,9 @@ impl Context {
         // Preserve the first visible surviving exchange, not the transcript's
         // total height: a page may arrive while the live answer also grows.
         let visible = || {
-            old_rows.iter().filter(|row| {
-                row.bounds.y + row.bounds.height > top
-                    && row.bounds.y < top + previous.viewport.height
-            })
+            old_rows
+                .iter()
+                .filter(|row| reading_row_visible(row.bounds, top, previous.viewport.height))
         };
         let overlap = visible()
             .filter(|row| row.id.starts_with("virtual-chunk-"))
@@ -1200,10 +1208,8 @@ impl Context {
         let Some(saved) = &self.reflow else {
             return;
         };
-        let visible = |row: &&Row| {
-            row.bounds.y + row.bounds.height > saved.top
-                && row.bounds.y < saved.top + saved.geometry.viewport.height
-        };
+        let visible =
+            |row: &&Row| reading_row_visible(row.bounds, saved.top, saved.geometry.viewport.height);
         let fine = saved
             .rows
             .iter()
@@ -1407,8 +1413,7 @@ impl Anchor {
                     .iter()
                     .find(|row| {
                         row.id.starts_with("virtual-chunk-")
-                            && row.bounds.y + row.bounds.height > top
-                            && row.bounds.y < top + previous.viewport.height
+                            && reading_row_visible(row.bounds, top, previous.viewport.height)
                     })
                     .and_then(|row| context.paths.get(&row.id))
                     .cloned()
@@ -5890,6 +5895,143 @@ mod tests {
         anchor.layout_following(None, &measured, geometry, Some(top), follow_end);
         assert_eq!(anchor.contexts[0].top, Some(top));
         anchor
+    }
+
+    const PRECEDING_FINE: &str = "virtual-chunk-0000000000000029";
+
+    fn contiguous_fine_rows(preceding_height: f32) -> Vec<(&'static str, Rectangle)> {
+        rows(&[
+            (PRECEDING_FINE, 236_000.0, preceding_height),
+            (REFLOW_FINE, 236_000.0 + preceding_height, 800.0),
+        ])
+    }
+
+    fn contiguous_fine_reader() -> Anchor {
+        let mut anchor = Anchor::default();
+        let measured = contiguous_fine_rows(600.0);
+        let geometry = width_reflow_geometry(720.0, 240_000.0);
+        anchor.layout_following(None, &measured, geometry, None, false);
+        // One f32 tick into the reading row, matching a long native transcript.
+        let top = f32::from_bits(measured[1].1.y.to_bits() + 1);
+        anchor.layout_following(None, &measured, geometry, Some(top), false);
+        anchor.contexts[0].paths = HashMap::from([
+            (PRECEDING_FINE.into(), vec![1]),
+            (REFLOW_FINE.into(), vec![2]),
+        ]);
+        anchor
+    }
+
+    #[test]
+    fn width_reflow_rounding_sliver_does_not_replace_the_contiguous_reading_row() {
+        let mut anchor = contiguous_fine_reader();
+        let narrow = contiguous_fine_rows(600.4);
+        let narrow_geometry = width_reflow_geometry(400.0, 240_000.0);
+        let current_top = anchor.contexts[0].top;
+        anchor.layout_following(None, &narrow, narrow_geometry, current_top, false);
+        anchor.contexts[0].finish_reflow(
+            &narrow,
+            &HashSet::from([REFLOW_FINE.to_owned()]),
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(
+            anchor.contexts[0].reflow.is_none(),
+            "ready geometry must release the first width's bookmark"
+        );
+
+        // Iced's native State::translation rounds to whole pixels. The next
+        // measured top exposes less than half a pixel of the preceding row.
+        let native_top = anchor.contexts[0].top.unwrap().round();
+        let displacement = narrow[1].1.y - native_top;
+        assert!(displacement > 0.0 && displacement < 0.5);
+        anchor.layout_following(None, &narrow, narrow_geometry, Some(native_top), false);
+
+        let redocked = contiguous_fine_rows(659.2);
+        anchor.layout_following(
+            None,
+            &redocked,
+            width_reflow_geometry(720.0, 240_000.0),
+            Some(native_top),
+            false,
+        );
+        assert_eq!(
+            anchor.contexts[0].reflow.as_ref().unwrap().path,
+            [2],
+            "a rounded bottom sliver cannot replace the reading source path"
+        );
+        assert!(
+            (redocked[1].1.y - anchor.contexts[0].top.unwrap() - displacement).abs() <= 0.015625,
+            "the original row retains its displacement when the predecessor grows three lines"
+        );
+        anchor.contexts[0].finish_reflow(
+            &redocked,
+            &HashSet::from([REFLOW_FINE.to_owned()]),
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(
+            anchor.contexts[0].reflow.is_none(),
+            "completion must use the same reading row as capture and positioning"
+        );
+    }
+
+    #[test]
+    fn width_reflow_preserves_a_contiguous_predecessor_with_one_visible_pixel() {
+        let mut anchor = contiguous_fine_reader();
+        let measured = contiguous_fine_rows(600.0);
+        let top = measured[1].1.y - 1.0;
+        anchor.layout_following(
+            None,
+            &measured,
+            width_reflow_geometry(720.0, 240_000.0),
+            Some(top),
+            false,
+        );
+        let resized = contiguous_fine_rows(659.2);
+        anchor.layout_following(
+            None,
+            &resized,
+            width_reflow_geometry(400.0, 240_000.0),
+            Some(top),
+            false,
+        );
+        assert_eq!(anchor.contexts[0].reflow.as_ref().unwrap().path, [1]);
+        assert_eq!(
+            anchor.contexts[0].top,
+            Some(top),
+            "a genuinely visible predecessor retains its internal reading offset"
+        );
+        anchor.contexts[0].finish_reflow(
+            &resized,
+            &HashSet::from([PRECEDING_FINE.to_owned()]),
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(anchor.contexts[0].reflow.is_none());
+    }
+
+    #[test]
+    fn reading_row_visibility_allows_native_rounding_and_large_endpoint_precision() {
+        let top = 236_600.0_f32;
+        let half_pixel_end = top + 0.5;
+        let endpoint_tick = f32::from_bits(half_pixel_end.to_bits() + 1);
+        for bottom in [half_pixel_end, endpoint_tick] {
+            let bounds = Rectangle {
+                y: top - 600.0,
+                height: bottom - (top - 600.0),
+                ..Rectangle::default()
+            };
+            assert!(!reading_row_visible(bounds, top, 400.0));
+        }
+        let bounds = Rectangle {
+            y: top - 600.0,
+            height: 601.0,
+            ..Rectangle::default()
+        };
+        assert!(reading_row_visible(bounds, top, 400.0));
     }
 
     #[test]
