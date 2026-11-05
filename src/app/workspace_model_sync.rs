@@ -861,7 +861,12 @@ impl Cagents {
         if self.durable.workspace_model_identity == Some(identity) {
             return;
         }
+        // A pending automatic composer is a window navigation intent, not
+        // authority from the old registry. The new scope must initialize
+        // before that exact still-selected intent can open anything.
+        let deferred_default = self.shared_views.deferred_default.take();
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
+        self.shared_views.deferred_default = deferred_default;
         self.clear_closed_chat_drafts();
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);

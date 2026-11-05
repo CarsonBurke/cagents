@@ -743,7 +743,7 @@ impl Cagents {
             return (
                 true,
                 if !has_terminal {
-                    self.add_default_pane(path, self.settings.default_worktree_pane)
+                    self.ensure_default_pane()
                 } else {
                     Task::none()
                 },
@@ -800,7 +800,7 @@ impl Cagents {
         let offset = self.worktree_offsets.get(&path).copied();
         let scope = self.install_workspace_scope(scoped, path.clone(), offset);
         let terminal = if create_if_empty && !has_terminal {
-            self.add_default_pane(path, self.settings.default_worktree_pane)
+            self.ensure_default_pane()
         } else {
             Task::none()
         };

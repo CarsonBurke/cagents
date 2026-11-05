@@ -80,7 +80,7 @@ pub(super) struct State {
     observed_chats: HashMap<CardId, crate::chat::Session>,
     applying: bool,
     pub creating_default: bool,
-    pub deferred_default: Option<PathBuf>,
+    pub deferred_default: Option<(Scope, PathBuf)>,
     pub defaults: HashMap<CardId, TerminalSession>,
     default_requests: HashSet<CardId>,
     pub blocked: HashSet<Scope>,
@@ -90,6 +90,12 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn scope_initialized(&self, scope: &Scope) -> bool {
+        self.initialized.contains(scope)
+            && !self.seeding.contains(scope)
+            && !self.blocked.contains(scope)
+    }
+
     /// Treats `scope` as already seeded with `panes`, as an acknowledged seed
     /// leaves it.
     #[cfg(test)]
@@ -1455,9 +1461,11 @@ impl Cagents {
         // Held reported titles stay held: publishing them on every view
         // acknowledgment would publish each title again as its own echo.
         self.save_workspace();
-        if let Some(path) = self.shared_views.deferred_default.take() {
-            if self.active_workspace.as_ref() == Some(&path) && self.workspace.cards().is_empty() {
-                tasks.push(self.add_default_pane(path, settings::DefaultPane::Terminal));
+        if let Some((scope, path)) = self.shared_views.deferred_default.take() {
+            if self.active_workspace.as_ref() == Some(&path)
+                && self.default_pane_scope(&path).as_ref() == Some(&scope)
+            {
+                tasks.push(self.ensure_default_pane());
             }
         }
         self.reproject_notification_unread();
@@ -2111,7 +2119,7 @@ impl Cagents {
     }
 
     fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) -> Task<Message> {
-        let camera = self.workspace.camera().offset();
+        let anchor = self.workspace.capture_viewport_anchor();
         let focus = self.workspace.focused();
         let mut updates = Vec::new();
         let visible = visible.iter().copied().collect::<HashSet<_>>();
@@ -2205,14 +2213,18 @@ impl Cagents {
         if let Some(focus) = focus.filter(|id| self.workspace.card(*id).is_some()) {
             let _ = self.workspace.focus_without_scrolling(focus);
         }
-        self.workspace.record_programmatic_scroll(camera);
+        // Inserting before the selected pane changes its strip coordinate.
+        // Keep the content being read under the same editor, without issuing
+        // a new keyboard-focus request or reusing an old scroll coordinate.
+        let anchored = self.workspace.restore_viewport_anchor(anchor);
         let lifecycle = self.lifecycle_sweep();
-        Task::batch(
-            updates
-                .into_iter()
-                .map(|update| self.apply_viewport(update, false, false))
-                .chain(std::iter::once(lifecycle)),
-        )
+        let mut tasks = updates
+            .into_iter()
+            .map(|update| self.apply_viewport(update, false, false))
+            .collect::<Vec<_>>();
+        tasks.push(self.apply_viewport(anchored, true, false));
+        tasks.push(lifecycle);
+        Task::batch(tasks)
     }
 }
 
@@ -2282,6 +2294,8 @@ mod tests {
     mod history_start;
     mod published_card_edits;
     mod startup_admission;
+    mod window_selection;
+    mod window_startup;
 
     use super::*;
     use crate::model::{
