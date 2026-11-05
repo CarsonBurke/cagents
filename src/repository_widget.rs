@@ -3157,6 +3157,30 @@ impl RepositoryRuntime {
         }
     }
 
+    /// Drives a document load as the shell would, including the re-read the
+    /// runtime starts when its watch invalidates a read, and reports whether
+    /// the real file worker answered. Other follow-up tasks are dropped.
+    #[cfg(test)]
+    pub(crate) async fn settle_document_read(&mut self, task: Task<RepositoryAction>) -> bool {
+        retained_save_tests::finish(self, task).await.answered()
+    }
+
+    /// Whether `action` is a file-read completion for the selected document.
+    /// Shell-level drivers check this before applying the action.
+    #[cfg(test)]
+    pub(crate) fn accepts_document_read(&self, action: &RepositoryAction) -> bool {
+        matches!(action,
+            RepositoryAction::FileLoadedAt { identity, .. }
+                | RepositoryAction::DocumentReloaded { identity, .. }
+                if self.accepts_selected(identity))
+    }
+
+    /// Whether an accepted read left the document loading behind a re-read.
+    #[cfg(test)]
+    pub(crate) fn rereading_document(&self) -> bool {
+        matches!(self.document, DocumentState::Loading { .. }) && self.document_reading
+    }
+
     /// Apply only navigation for this exact pane recipe. Shared projections can
     /// replace the recipe but cannot replace another window's local selection.
     pub(crate) fn restore_navigation(&mut self, navigation: &crate::model::RepositoryNavigation) {

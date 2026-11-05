@@ -90,6 +90,22 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Treats `scope` as already seeded with `panes`, as an acknowledged seed
+    /// leaves it.
+    #[cfg(test)]
+    pub(super) fn initialize(&mut self, scope: Scope, panes: Vec<Pane>) {
+        self.baseline.insert(scope.clone(), panes);
+        self.initialized.insert(scope);
+    }
+
+    /// View edits published and not yet acknowledged, oldest first.
+    #[cfg(test)]
+    pub(super) fn pending_changes(&self) -> impl DoubleEndedIterator<Item = (&Scope, &Change)> {
+        self.pending
+            .iter()
+            .map(|(_, scope, change)| (scope, change))
+    }
+
     pub(super) fn has_observed_chat(&self, card: CardId) -> bool {
         self.observed_chats.contains_key(&card)
     }
@@ -6228,6 +6244,200 @@ mod tests {
                 app.card_state(pane.id).unwrap().existence.is_open(),
                 "{changed}"
             );
+            assert!(!app.channel_ui.is_deleting(source));
+            assert!(
+                !std::iter::from_fn(|| rx.try_recv().ok())
+                    .any(|edit| matches!(edit, ModelEdit::DeleteChannel { .. })),
+                "{changed}"
+            );
+            drop(close);
+        }
+    }
+
+    #[test]
+    fn retained_channel_close_accepts_its_projected_retirement_before_the_receipt() {
+        for watcher_first in [false, true] {
+            for sibling in [false, true] {
+                let (mut app, source, _, pane) = retained_chat_move_fixture();
+                if sibling {
+                    let mut other = pane.clone();
+                    other.id = CardId::new();
+                    other.kind = CardKind::Browser(BrowserSession {
+                        id: BrowserId::new(),
+                        current_url: "https://example.com".parse().unwrap(),
+                        history: vec![],
+                        history_index: 0,
+                        scroll_x: 0.,
+                        scroll_y: 0.,
+                        fidelity: BrowserRestoreFidelity::UrlOnly,
+                    });
+                    app.workspace_model.views[0].panes.push(other);
+                    drop(app.reconcile_shared_views());
+                }
+                let (tx, rx) = async_channel::unbounded();
+                app.workspace_model_tx = tx;
+                let close = app.delete_channel(source);
+                let operation = app.channel_ui.close_operation(source);
+                assert!(!operation.is_nil());
+                while rx.try_recv().is_ok() {}
+
+                if watcher_first {
+                    let view = app
+                        .workspace_model
+                        .views
+                        .iter_mut()
+                        .find(|view| view.scope == Scope::Channel(source))
+                        .unwrap();
+                    view.apply(&Change::Remove { id: pane.id }).unwrap();
+                    view.revision += 1;
+                    drop(app.reconcile_shared_views());
+                    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+                    assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+                    let channel = app
+                        .durable
+                        .channels
+                        .iter()
+                        .find(|channel| channel.id == source)
+                        .unwrap();
+                    assert!(!channel.cards.contains(&pane.id));
+                    assert_eq!(channel.cards.len(), usize::from(sibling));
+                    assert!(app.channel_ui.is_deleting(source));
+                }
+
+                drop(
+                    app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(
+                        source,
+                        operation,
+                        Ok(()),
+                    )),
+                );
+                if !watcher_first {
+                    let view = app
+                        .workspace_model
+                        .views
+                        .iter_mut()
+                        .find(|view| view.scope == Scope::Channel(source))
+                        .unwrap();
+                    view.apply(&Change::Remove { id: pane.id }).unwrap();
+                    view.revision += 1;
+                    drop(app.reconcile_shared_views());
+                }
+                assert!(
+                    !app.durable
+                        .channels
+                        .iter()
+                        .any(|channel| channel.id == source),
+                    "watcher_first={watcher_first}, sibling={sibling}"
+                );
+                assert!(!app.channel_ui.is_deleting(source));
+                assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+                assert_eq!(
+                    std::iter::from_fn(|| rx.try_recv().ok())
+                        .filter(
+                            |edit| matches!(edit, ModelEdit::DeleteChannel { id } if *id == source)
+                        )
+                        .count(),
+                    1,
+                    "one successful close deletes its channel once"
+                );
+                // The registry deletes this view with the channel. A close
+                // whose projection beat its receipt must still have a known
+                // deleted origin after that last canonical record is gone.
+                app.workspace_model
+                    .views
+                    .retain(|view| view.scope != Scope::Channel(source));
+                assert_eq!(
+                    app.closed_card_home(pane.id),
+                    Some(super::super::channel_ui::ClosedCardHome::Strip),
+                    "watcher_first={watcher_first}, sibling={sibling}"
+                );
+                drop(close); // No provider request is polled by this ordering fixture.
+            }
+        }
+    }
+
+    #[test]
+    fn retained_channel_close_requires_source_retirement_without_replacement_or_new_members() {
+        for changed in [
+            "missing retirement",
+            "wrong retirement scope",
+            "replacement",
+            "new member",
+            "moved",
+        ] {
+            let (mut app, source, destination, pane) = retained_chat_move_fixture();
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            let close = app.delete_channel(source);
+            let operation = app.channel_ui.close_operation(source);
+            while rx.try_recv().is_ok() {}
+
+            if changed == "moved" {
+                views::transfer(
+                    &mut app.workspace_model.views,
+                    &Scope::Channel(source),
+                    pane.id,
+                    &Scope::Channel(destination),
+                    None,
+                )
+                .unwrap();
+            } else {
+                let view = app
+                    .workspace_model
+                    .views
+                    .iter_mut()
+                    .find(|view| view.scope == Scope::Channel(source))
+                    .unwrap();
+                view.apply(&Change::Remove { id: pane.id }).unwrap();
+                view.revision += 1;
+                if matches!(changed, "missing retirement" | "wrong retirement scope") {
+                    view.retired.retain(|id| *id != pane.id);
+                }
+                if changed == "wrong retirement scope" {
+                    app.workspace_model
+                        .views
+                        .iter_mut()
+                        .find(|view| view.scope == Scope::Channel(destination))
+                        .unwrap()
+                        .retired
+                        .push(pane.id);
+                }
+            }
+            drop(app.reconcile_shared_views());
+            if changed == "replacement" {
+                let CardKind::Chat(session) = &mut app.card_state_mut(pane.id).unwrap().kind else {
+                    unreachable!()
+                };
+                session.id = TerminalId::new();
+            }
+            let new_member = (changed == "new member").then(CardId::new);
+            if let Some(id) = new_member {
+                Arc::make_mut(&mut app.durable)
+                    .channels
+                    .iter_mut()
+                    .find(|channel| channel.id == source)
+                    .unwrap()
+                    .cards
+                    .push(id);
+            }
+            let current = app.card_state(pane.id).unwrap().clone();
+            drop(
+                app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(
+                    source,
+                    operation,
+                    Ok(()),
+                )),
+            );
+            let channel = app
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == source)
+                .unwrap_or_else(|| panic!("{changed}: stale close deleted its channel"));
+            if let Some(id) = new_member {
+                assert!(channel.cards.contains(&id));
+            }
+            assert_eq!(app.card_state(pane.id).unwrap(), &current, "{changed}");
             assert!(!app.channel_ui.is_deleting(source));
             assert!(
                 !std::iter::from_fn(|| rx.try_recv().ok())

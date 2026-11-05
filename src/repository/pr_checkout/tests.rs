@@ -829,6 +829,245 @@ fn hidden_nested_checkout(fixture: &Fixture, linked: bool) -> (PathBuf, PathBuf)
     (worktree, leaf)
 }
 
+struct RestoredDirectoryPermissions {
+    path: PathBuf,
+    permissions: fs::Permissions,
+}
+
+impl RestoredDirectoryPermissions {
+    fn capture(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            permissions: fs::metadata(path).unwrap().permissions(),
+        }
+    }
+
+    fn restore(&self) {
+        fs::set_permissions(&self.path, self.permissions.clone()).unwrap();
+    }
+}
+
+impl Drop for RestoredDirectoryPermissions {
+    fn drop(&mut self) {
+        // Also restore during an assertion panic so TempDir can remove the
+        // fixture, including when the native executor's interceptor panics.
+        let _ = fs::set_permissions(&self.path, self.permissions.clone());
+    }
+}
+
+fn deny_populated_directory_access(path: &Path) {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        fs::read_dir(path)
+            .err()
+            .expect("permission fixture must actually deny directory reads; run as an ordinary UID")
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        fs::read(path.join("tracked")).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied,
+        "privileged access must not count as exercising the unreadable-child regression"
+    );
+}
+
+#[test]
+fn recursive_submodule_census_refuses_unreadable_populated_children_at_preparation_and_effect() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::recursive_submodule_census_refuses_unreadable_populated_children_at_preparation_and_effect"
+    )) {
+        return;
+    }
+    for nested in [false, true] {
+        for late in [false, true] {
+            let fixture = Fixture::new(true);
+            let (worktree, leaf) = hidden_nested_checkout(&fixture, false);
+            let child = worktree.join("module");
+            let selected = if nested { &leaf } else { &child };
+            fs::write(worktree.join("secret"), "preserve ignored root bytes\n").unwrap();
+            let permissions = RestoredDirectoryPermissions::capture(selected);
+            let heads: Vec<_> = [&worktree, &child, &leaf]
+                .into_iter()
+                .map(|path| git_text(path, &["rev-parse", "HEAD"]))
+                .collect();
+            let configurations: Vec<_> = [&worktree, &child, &leaf]
+                .into_iter()
+                .map(|path| {
+                    let git_dir = git_text(path, &["rev-parse", "--absolute-git-dir"]);
+                    let config = Path::new(&git_dir).join("config");
+                    let bytes = fs::read(&config).unwrap();
+                    (config, bytes)
+                })
+                .collect();
+            let stash = git_text(&leaf, &["rev-parse", "refs/stash"]);
+            let new = fixture.advance(|root| fs::write(root.join("file"), "PR\n").unwrap());
+            let request = fixture.request(new);
+            // Preparation and all Rust preflight checks see a readable, clean
+            // hierarchy before the late native reference-transaction command.
+            let plan = fixture.prepare(&request);
+            let inject = {
+                let selected = selected.to_owned();
+                move || {
+                    fs::write(selected.join("tracked"), "preserve tracked child work\n").unwrap();
+                    fs::write(
+                        selected.join("private-note"),
+                        "preserve untracked child work\n",
+                    )
+                    .unwrap();
+                    deny_populated_directory_access(&selected);
+                }
+            };
+            let failure = if late {
+                let injected = Arc::new(Mutex::new(false));
+                let observed = injected.clone();
+                let mut inject = Some(inject);
+                fixture.intercept(move |command| {
+                    if is_effect(command)
+                        && let Some(inject) = inject.take()
+                    {
+                        inject();
+                        *observed.lock().unwrap() = true;
+                    }
+                });
+                let failure = fixture.apply(&plan).unwrap_err();
+                assert!(
+                    *injected.lock().unwrap(),
+                    "denial must be injected at the final native effect, after Rust preflight"
+                );
+                failure
+            } else {
+                inject();
+                fixture
+                    .service
+                    .prepare_existing_pr_checkout(&request, &CancellationToken::default())
+                    .unwrap_err()
+            };
+            assert_eq!(failure.kind, PrCheckoutFailureKind::Refused, "{failure:?}");
+            assert!(
+                failure.detail.contains("Git could not inspect submodule")
+                    && failure.detail.contains("worktree was kept")
+                    && failure.detail.contains("permissions"),
+                "refusal must explain the child access failure and recovery: {failure:?}"
+            );
+            permissions.restore();
+            assert_eq!(fs::read(worktree.join("file")).unwrap(), b"old\n");
+            assert_eq!(fs::read(worktree.join("other")).unwrap(), b"unchanged\n");
+            assert_eq!(
+                fs::read(worktree.join("secret")).unwrap(),
+                b"preserve ignored root bytes\n"
+            );
+            for path in [&child, &leaf] {
+                let expected: &[u8] = if path == selected {
+                    b"preserve tracked child work\n"
+                } else {
+                    b"original child\n"
+                };
+                assert_eq!(fs::read(path.join("tracked")).unwrap(), expected);
+            }
+            assert_eq!(
+                fs::read(selected.join("private-note")).unwrap(),
+                b"preserve untracked child work\n"
+            );
+            for (path, head) in [&worktree, &child, &leaf].into_iter().zip(heads) {
+                assert_eq!(git_text(path, &["rev-parse", "HEAD"]), head);
+            }
+            for (path, bytes) in configurations {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+            assert_eq!(git_text(&leaf, &["rev-parse", "refs/stash"]), stash);
+        }
+    }
+}
+
+#[test]
+fn recursive_submodule_census_admits_deinitialized_clean_children() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::recursive_submodule_census_admits_deinitialized_clean_children"
+    )) {
+        return;
+    }
+    for nested in [false, true] {
+        let fixture = Fixture::new(true);
+        let (worktree, leaf) = hidden_nested_checkout(&fixture, false);
+        let child = worktree.join("module");
+        let selected = if nested { &leaf } else { &child };
+        let git_dirs: Vec<_> = [&worktree, &child, &leaf]
+            .into_iter()
+            .map(|path| PathBuf::from(git_text(path, &["rev-parse", "--absolute-git-dir"])))
+            .collect();
+        let child_heads: Vec<_> = [&child, &leaf]
+            .into_iter()
+            .map(|path| git_text(path, &["rev-parse", "HEAD"]))
+            .collect();
+        let stash = git_text(&leaf, &["rev-parse", "refs/stash"]);
+        let (parent, name) = if nested {
+            (&child, "nested")
+        } else {
+            (&worktree, "module")
+        };
+        run_git(parent, &["submodule", "deinit", "--force", "--", name]);
+        assert!(fs::read_dir(selected).unwrap().next().is_none());
+        assert!(!selected.join(".git").exists());
+        assert!(
+            git_text(
+                &worktree,
+                &["status", "--porcelain=v1", "--ignore-submodules=none"]
+            )
+            .is_empty(),
+            "the deinitialized control must be genuinely Git-clean"
+        );
+        let configurations: Vec<_> = git_dirs
+            .iter()
+            .map(|path| fs::read(path.join("config")).unwrap())
+            .collect();
+        let new = fixture.advance(|root| fs::write(root.join("file"), "PR\n").unwrap());
+        let plan = fixture.prepare(&fixture.request(new.clone()));
+        assert_eq!(fixture.apply(&plan).unwrap().head(), &new);
+        assert_eq!(fs::read(worktree.join("file")).unwrap(), b"PR\n");
+        // Direct deinit removes the nested core.worktree directory. Give
+        // these ref-only reads an existing worktree without editing config.
+        for (git_dir, head) in git_dirs.iter().skip(1).zip(child_heads) {
+            assert_eq!(
+                git_text(
+                    &worktree,
+                    &[
+                        "--git-dir",
+                        git_dir.to_str().unwrap(),
+                        "--work-tree",
+                        worktree.to_str().unwrap(),
+                        "rev-parse",
+                        "HEAD"
+                    ]
+                ),
+                head
+            );
+        }
+        assert_eq!(
+            git_text(
+                &worktree,
+                &[
+                    "--git-dir",
+                    git_dirs[2].to_str().unwrap(),
+                    "--work-tree",
+                    worktree.to_str().unwrap(),
+                    "rev-parse",
+                    "refs/stash"
+                ]
+            ),
+            stash
+        );
+        for (git_dir, bytes) in git_dirs.iter().zip(configurations) {
+            assert_eq!(fs::read(git_dir.join("config")).unwrap(), bytes);
+        }
+        assert!(
+            fs::read_dir(selected).unwrap().next().is_none(),
+            "advancing the root must not initialize a deliberately deinitialized child"
+        );
+    }
+}
+
 #[test]
 fn recursive_submodule_census_refuses_hidden_work_at_preparation_and_effect() {
     if isolated_fixture_case(concat!(
