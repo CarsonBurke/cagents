@@ -1192,7 +1192,9 @@ impl Cagents {
                             project_id,
                             target.repository,
                             WorktreeDraft {
-                                base: branch.trim_start_matches("refs/heads/").to_owned(),
+                                // Sidebar branches are exact local names, already
+                                // stripped once when their repository row is built.
+                                base: format!("refs/heads/{branch}"),
                                 ..Default::default()
                             },
                             None,
@@ -2661,16 +2663,27 @@ mod tests {
     }
 
     fn removal_editor(app: &mut Cagents, target: &Target, dirty: bool) -> (CardId, LspDocumentId) {
+        removal_editor_at(app, target, dirty, "main.rs")
+    }
+
+    fn removal_editor_at(
+        app: &mut Cagents,
+        target: &Target,
+        dirty: bool,
+        file: &str,
+    ) -> (CardId, LspDocumentId) {
+        let card = removal_pane(app, target, dirty, file);
+        let doc = app.lsp_document(card).unwrap();
+        assert_eq!(app.lsp.status(doc), LspStatus::Starting);
+        (card, doc)
+    }
+
+    fn removal_pane(app: &mut Cagents, target: &Target, dirty: bool, file: &str) -> CardId {
         let card = CardId::new();
         let mut runtime = if dirty {
             repository_widget::RepositoryRuntime::dirty_fixture(card)
         } else {
-            repository_widget::RepositoryRuntime::open_fixture(
-                card,
-                "main.rs",
-                "replacement buffer\n",
-            )
-            .0
+            repository_widget::RepositoryRuntime::open_fixture(card, file, "replacement buffer\n").0
         };
         let selected = runtime.selected_path().unwrap().to_owned();
         let view = RepositoryView {
@@ -2702,14 +2715,35 @@ mod tests {
             1,
             &"buffer\n".into(),
         ));
-        let doc = app.lsp_document(card).unwrap();
-        assert_eq!(app.lsp.status(doc), LspStatus::Starting);
-        (card, doc)
+        card
+    }
+
+    /// A pane refused language tools for another pane's file can still take
+    /// them once that owner's worktree is gone.
+    #[test]
+    fn a_pane_refused_language_tools_recovers_after_the_owner_is_removed() {
+        removal_callback_test(|| {
+            let (mut app, _root, target) = removal_lsp_app();
+            let (owner, _) = removal_editor(&mut app, &target, false);
+            let capture = app.capture_worktree_removal(&target);
+            let refused = removal_pane(&mut app, &target, false, "main.rs");
+            assert_eq!(app.lsp_document(refused), None);
+            drop(app.update(Message::ProjectUi(Action::Deleted {
+                target,
+                capture,
+                result: Ok(()),
+            })));
+            assert_eq!(app.lsp_document(owner), None);
+            drop(app.update(Message::ContextInspector(
+                InspectorAction::RestartLanguageServer(refused),
+            )));
+            assert!(app.lsp_document(refused).is_some());
+        });
     }
 
     #[test]
-    fn worktree_removal_callback_retires_only_original_documents_and_preserves_same_path_successor()
-    {
+    fn worktree_removal_callback_retires_only_original_documents_and_preserves_same_worktree_successor()
+     {
         removal_callback_test(|| {
             let (mut app, _root, target) = removal_lsp_app();
             let (original, old_doc) = removal_editor(&mut app, &target, false);
@@ -2731,7 +2765,8 @@ mod tests {
                 )),
             );
             let capture = app.capture_worktree_removal(&target);
-            let (successor, new_doc) = removal_editor(&mut app, &target, false);
+            // Another file: one file's language tools have one owning pane.
+            let (successor, new_doc) = removal_editor_at(&mut app, &target, false, "lib.rs");
             let before = app.card_state(successor).unwrap().clone();
             let scope = app.durable.card_scopes[&successor].clone();
             let action = Action::Deleted {

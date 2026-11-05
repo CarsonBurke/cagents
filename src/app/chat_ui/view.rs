@@ -67,11 +67,22 @@ fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, 
 ///
 /// Named because the composer's height is computed from the draft rather than
 /// fixed, so the two constants have to agree with what the editor draws.
-const COMPOSER_LINE_HEIGHT: f32 = 18.0;
+/// iced's default line height, 1.4 em, at the editor's prose size.
+const COMPOSER_LINE_HEIGHT: f32 = design::TEXT_PROSE * 1.4;
 const COMPOSER_PADDING: f32 = crate::tab_strip::EDGE_INSET + space::S;
 // Icon hit targets include their own centered inset; align the visible glyph.
 const COMPOSER_TOOLBAR_PADDING: f32 =
     COMPOSER_PADDING - (design::PRIMARY_CONTROL_SIZE - design::ROW_ICON_SIZE as f32) / 2.0;
+/// The editor's vertical inset in the composer row.
+///
+/// A single line of text is then as tall as a control with a small margin on
+/// either side, so the row is no taller than its buttons need.
+const COMPOSER_INSET_Y: f32 =
+    (design::PRIMARY_CONTROL_SIZE + 2.0 * space::XS - COMPOSER_LINE_HEIGHT) / 2.0;
+/// How far a composer control sits above the row's foot: centered on a single
+/// line of text, and beside the last line of a longer one.
+const COMPOSER_CONTROL_INSET: f32 =
+    COMPOSER_INSET_Y + (COMPOSER_LINE_HEIGHT - design::PRIMARY_CONTROL_SIZE) / 2.0;
 
 /// The widest a user's message is drawn.
 ///
@@ -239,6 +250,12 @@ const COMPLETION_CEILING: f32 = 7.0 * COMPLETION_ROW;
 
 /// The completion list's inset from its own edge.
 const COMPLETION_INSET: f32 = space::XS;
+/// The `+` menu's width, which fits a row's name beside a few words of what
+/// it does.
+const COMPOSER_MENU_WIDTH: f32 = 340.0;
+/// The `+` menu's list scrolls past ten rows, where a provider's commands
+/// and skills would otherwise cover the conversation.
+const COMPOSER_MENU_CEILING: f32 = 10.0 * COMPLETION_ROW;
 
 /// The completion list's scrollable, named so the keyboard can scroll it.
 const COMPLETION_LIST: &str = "chat-completion";
@@ -680,36 +697,96 @@ fn completion_row<'a>(
     highlighted: bool,
     message: Option<Message>,
 ) -> Element<'a, Message> {
-    widget::button::custom(
-        widget::row::with_children(vec![
-            design::body(row.label())
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-            design::caption(row.description)
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .width(Length::Fill)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ))
-                .into(),
-            design::caption(match row.kind {
-                completion::Kind::Command => "Command",
-                completion::Kind::Skill => "Skill",
-                completion::Kind::File => "File",
-            })
-            .class(cosmic::theme::Text::Custom(design::muted_text))
-            .into(),
-        ])
-        .spacing(step::GAP_S)
-        .align_y(Alignment::Center),
+    menu_row(
+        None,
+        row.label(),
+        row.description,
+        Some(completion_kind(row.kind)),
+        highlighted,
     )
-    .class(crate::ui_controls::control_style(highlighted, None))
+    .on_press_maybe(message)
+    .into()
+}
+
+fn completion_kind(kind: completion::Kind) -> &'static str {
+    match kind {
+        completion::Kind::Command => "Command",
+        completion::Kind::Skill => "Skill",
+        completion::Kind::File => "File",
+    }
+}
+
+/// A one-line row of a composer list: an optional icon, a name, what it
+/// does in muted text cut to the room left, and what kind of thing it is.
+fn menu_row<'a>(
+    icon: Option<Icon>,
+    label: impl Into<Cow<'a, str>> + 'a,
+    description: impl Into<Cow<'a, str>> + 'a,
+    kind: Option<&'a str>,
+    highlighted: bool,
+) -> widget::button::Button<'a, Message> {
+    let mut cells: Vec<Element<'a, Message>> = Vec::new();
+    cells.extend(icon.map(|icon| {
+        widget::icon(icon.handle())
+            .size(design::COMPACT_ICON_SIZE)
+            .into()
+    }));
+    cells.push(
+        design::body(label)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
+    );
+    cells.push(
+        design::caption(description)
+            .class(cosmic::theme::Text::Custom(design::muted_text))
+            .width(Length::Fill)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .ellipsize(iced::widget::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            ))
+            .into(),
+    );
+    cells.extend(kind.map(|kind| {
+        design::caption(kind)
+            .class(cosmic::theme::Text::Custom(design::muted_text))
+            .into()
+    }));
+    widget::button::custom(
+        widget::row::with_children(cells)
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center),
+    )
+    .class(menu_row_style(highlighted))
     .padding(iced::Padding::from([0.0, step::GAP_S]))
     .height(Length::Fixed(COMPLETION_ROW))
     .width(Length::Fill)
-    .on_press_maybe(message)
-    .into()
+}
+
+/// A list row's surfaces, with the ring buttons draw for keyboard focus, so
+/// the row Tab reached does not read as the one under the pointer.
+fn menu_row_style(highlighted: bool) -> cosmic::theme::Button {
+    let cosmic::theme::Button::Custom {
+        active,
+        disabled,
+        hovered,
+        pressed,
+    } = crate::ui_controls::control_style(highlighted, None)
+    else {
+        unreachable!("control_style draws a custom button");
+    };
+    let ring = |mut style: widget::button::Style, focused: bool, theme: &cosmic::Theme| {
+        if focused {
+            style.outline_width = design::BORDER_WIDTH;
+            style.outline_color = design::accent_color(theme);
+        }
+        style
+    };
+    cosmic::theme::Button::Custom {
+        active: Box::new(move |focused, theme| ring(active(focused, theme), focused, theme)),
+        disabled,
+        hovered: Box::new(move |focused, theme| ring(hovered(focused, theme), focused, theme)),
+        pressed: Box::new(move |focused, theme| ring(pressed(focused, theme), focused, theme)),
+    }
 }
 
 /// The height of one completion row and of the list showing `count` of them.
@@ -1690,12 +1767,7 @@ impl Runtime {
         }
         let target = self.target;
         // Nothing is sent past a first message still waiting to go.
-        let available = !transitioning
-            && !self.closed_elsewhere
-            && !self.disconnected
-            && !self.snapshot.exited
-            && self.pending.is_none()
-            && self.queued.is_none();
+        let available = self.composer_available(transitioning);
         let snapshot = &self.snapshot;
         // One theme lookup and one settings value per frame, rather than one
         // per rendered message.
@@ -2620,7 +2692,7 @@ impl Runtime {
         // which counting newlines could not see. The ceiling keeps a very
         // long paste from squeezing the transcript out, past which the editor
         // scrolls as before.
-        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_PADDING;
+        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_INSET_Y;
         let suggestion = if available && !transitioning {
             self.prompt_suggestion()
         } else {
@@ -2629,8 +2701,8 @@ impl Runtime {
         let key_suggestion = suggestion.cloned();
         let placeholder = suggestion.map_or(placeholder, |suggestion| suggestion.text.as_str());
         let suggestion_hint: Element<'_, Message> = if suggestion.is_some() {
-            widget::text("Tab to use suggestion")
-                .size(design::TEXT_CAPTION)
+            widget::container(widget::text("Tab to use suggestion").size(design::TEXT_CAPTION))
+                .padding(iced::Padding::from([0.0, COMPOSER_PADDING]).bottom(space::XS))
                 .into()
         } else {
             iced::widget::Space::new().height(0).into()
@@ -2642,7 +2714,10 @@ impl Runtime {
             // text would still run underneath it.
             widget::container(
                 widget::scrollable(widget::container(body(self.composer.text())).padding(
-                    crate::design::with_vertical_rail(iced::Padding::from(COMPOSER_PADDING)),
+                    crate::design::with_vertical_rail(iced::Padding::from([
+                        COMPOSER_INSET_Y,
+                        space::XS,
+                    ])),
                 ))
                 .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
                     crate::design::scrollbar(),
@@ -2671,9 +2746,10 @@ impl Runtime {
                 // The editor scrolls once the draft passes the ceiling, and
                 // its thumb floats over the text's right edge, so the gutter
                 // is reserved here as well as in the read-only branch.
-                .padding(design::with_vertical_rail(iced::Padding::from(
-                    COMPOSER_PADDING,
-                )))
+                .padding(design::with_vertical_rail(iced::Padding::from([
+                    COMPOSER_INSET_Y,
+                    space::XS,
+                ])))
                 .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
                     composer_editor_style,
                 )))
@@ -2765,46 +2841,6 @@ impl Runtime {
                 })
                 .into()
         };
-        let mut actions = Vec::new();
-        if snapshot.capabilities.branch || snapshot.capabilities.compact {
-            actions.push(self.composer_actions(available));
-        }
-        if !snapshot.capabilities.interrupt_modes.is_empty() {
-            let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
-            let next = if mode == "wait" { "immediate" } else { "wait" };
-            actions.push(
-                crate::ui_controls::icon_button(
-                    Icon::Jump,
-                    if mode == "wait" {
-                        "Steering: after turn"
-                    } else {
-                        "Steering: after tools"
-                    },
-                )
-                .on_press_maybe(available.then(|| {
-                    action(Action::Command(
-                        target,
-                        Command::SetInterruptMode { mode: next.into() },
-                    ))
-                }))
-                .into(),
-            );
-        }
-        if self.accepts_draft_attachments() {
-            let editable = !transitioning
-                && (!snapshot.exited || self.has_connected_saved_history(snapshot))
-                && !self.closed_elsewhere
-                && !self.disconnected
-                && self.pending.is_none()
-                && self.queued.is_none()
-                && self.attachment_chooser_pending.is_none();
-            actions.push(
-                crate::ui_controls::icon_button(Icon::Attachment, "Attach files")
-                    .id(card_control_id(target.card, "chat-attach"))
-                    .on_press_maybe(editable.then(|| action(Action::Attach(target))))
-                    .into(),
-            );
-        }
         // Commands are reached by typing `/`, which is how every agent surface
         // a user arrives from works and what the composer already answers to.
         // A dropdown listing them duplicated that path in a control that was
@@ -2848,7 +2884,16 @@ impl Runtime {
         }
         // The primary action anchors the trailing edge. Tooltips and
         // accessible names carry the delivery mode and keyboard chord.
-        for (slot, mode) in modes.iter().enumerate().rev() {
+        // While the agent works, an empty draft has nothing to send, so Stop
+        // stands alone in the trailing slot rather than beside a Send that
+        // could never be pressed. Typing brings the follow-up's send controls
+        // back next to it.
+        let offered = if snapshot.busy && !has_draft {
+            &[][..]
+        } else {
+            modes
+        };
+        for (slot, mode) in offered.iter().enumerate().rev() {
             let (name, tooltip) = submit_control(*mode, slot, enter_sends);
             submissions.push(
                 crate::ui_controls::icon_button(name, tooltip)
@@ -2864,37 +2909,27 @@ impl Runtime {
                     .into(),
             );
         }
-        // Very narrow panes keep every icon's hit target intact.
-        let toolbar: Element<'_, Message> = if content_width < 360.0 {
-            widget::column::with_children(vec![
-                widget::flex_row(actions)
-                    .spacing(step::GAP_XS as u16)
-                    .align_items(Alignment::Center)
-                    .into(),
-                widget::container(
-                    widget::row::with_children(submissions)
-                        .spacing(step::GAP_XS)
-                        .align_y(Alignment::Center),
-                )
-                .width(Length::Fill)
-                .align_x(Alignment::End)
-                .into(),
-            ])
-            .spacing(space::XS)
-            .into()
-        } else {
-            actions.push(iced::widget::Space::new().width(Length::Fill).into());
-            actions.extend(submissions);
-            widget::row::with_children(actions)
-                .spacing(step::GAP_XS)
-                .align_y(Alignment::Center)
+        // One row: `+`, the draft, then what sends or stops it. The controls
+        // hold the row's foot, so a draft that grows keeps them beside its
+        // last line, and the inset centers them on a single line of text.
+        let control = |control: Element<'a, Message>| -> Element<'a, Message> {
+            widget::container(control)
+                .padding(iced::Padding::ZERO.bottom(COMPOSER_CONTROL_INSET))
                 .into()
         };
-        // The editor and its controls are one object: a single raised surface
-        // with the controls tucked inside its lower edge, so the composer
-        // reads as one place to type rather than a field with a toolbar
-        // bolted under it.
-        content.push(
+        let (plus, menu) = match self.composer_actions(transitioning) {
+            Some((plus, menu)) => (Some(plus), menu),
+            None => (None, None),
+        };
+        let mut row: Vec<Element<'_, Message>> = Vec::new();
+        row.extend(plus.map(control));
+        row.push(editor);
+        row.extend(submissions.into_iter().map(control));
+        // The editor and its controls are one object: a single raised
+        // surface, so the composer reads as one place to type rather than a
+        // field with a toolbar bolted under it. The `+` menu opens above it,
+        // over the timeline, leaving the composer where it is.
+        content.push(crate::interaction::composer_popover(
             widget::container(
                 widget::column::with_children(vec![
                     widget::column::with_children(self.queue_view().into_iter().chain(
@@ -2907,16 +2942,16 @@ impl Runtime {
                     ))
                     .spacing(step::GAP_XS)
                     .into(),
-                    editor,
-                    suggestion_hint,
-                    widget::container(toolbar)
-                        .padding(
-                            iced::Padding::from([0.0, COMPOSER_TOOLBAR_PADDING]).bottom(space::S),
-                        )
+                    widget::row::with_children(row)
+                        .spacing(step::GAP_XS)
+                        .align_y(Alignment::End)
+                        .padding([0.0, COMPOSER_TOOLBAR_PADDING])
                         .into(),
+                    suggestion_hint,
                 ])
                 .width(Length::Fill),
             )
+            .id(card_control_id(target.card, "chat-composer-surface"))
             .class(design::surface(
                 Some(if self.drop_hover {
                     design::accent_wash
@@ -2926,9 +2961,10 @@ impl Runtime {
                 [design::RADIUS_M; 4],
                 true,
             ))
-            .width(Length::Fill)
-            .into(),
-        );
+            .width(Length::Fill),
+            menu,
+            action(Action::ComposerActions(target, false)),
+        ));
         let usage = &snapshot.usage;
         // Prefer a wider chat over hiding its status and settings behind a
         // scrollbar. Narrow panes keep the primary status on one line and move
@@ -3282,13 +3318,33 @@ impl Runtime {
         )
     }
 
-    fn composer_actions(&self, available: bool) -> Element<'_, Message> {
+    /// The `+` at the composer's leading edge, and the menu it opens while it
+    /// is open.
+    ///
+    /// Attaching, steering timing and the conversation commands are each used
+    /// now and then, so they share one entry point instead of each holding a
+    /// toolbar slot beside the draft. `None` when the conversation offers none
+    /// of them.
+    fn composer_actions(
+        &self,
+        transitioning: bool,
+    ) -> Option<(Element<'_, Message>, Option<Element<'_, Message>>)> {
         let target = self.target;
         let snapshot = &self.snapshot;
+        let rows = self.composer_action_rows(transitioning);
+        if rows.is_empty() && !self.composer_menu_searchable() {
+            return None;
+        }
         let open = self.composer_actions || self.branch_picker;
+        let available = self.composer_available(transitioning);
         let enabled =
             available && snapshot.ready && !snapshot.busy && snapshot.read_only_reason.is_none();
-        let anchor = crate::ui_controls::icon_button(Icon::Plus, "Conversation actions")
+        let label = if rows.iter().any(|(row, _)| *row == ComposerRow::Attach) {
+            "Attach files and more actions"
+        } else {
+            "More actions"
+        };
+        let anchor = crate::ui_controls::icon_button(Icon::Plus, label)
             .id(card_control_id(target.card, "chat-actions"))
             .selected(open)
             .on_press(action(Action::ComposerActions(target, !open)));
@@ -3343,51 +3399,153 @@ impl Runtime {
                     .spacing(step::GAP_S)
                     .into()
             } else {
-                let mut choices: Vec<Element<'_, Message>> = Vec::new();
-                if snapshot.capabilities.branch {
-                    choices.push(
-                        crate::ui_controls::button::secondary("Fork conversation…")
-                            .icon(Icon::Branch)
-                            .id(card_control_id(target.card, "chat-actions-fork"))
-                            .width(Length::Fill)
-                            .on_press_maybe(
-                                enabled.then(|| action(Action::BranchPicker(target, true))),
-                            )
-                            .into(),
-                    );
-                }
-                if snapshot.capabilities.compact {
-                    choices.push(
-                        crate::ui_controls::button::secondary("Compact conversation")
-                            .icon(Icon::Compress)
-                            .id(card_control_id(target.card, "chat-actions-compact"))
-                            .name(
-                                "Compact the conversation: summarize earlier turns to free context",
-                            )
-                            .width(Length::Fill)
-                            .on_press_maybe(
-                                enabled.then(|| action(Action::Command(target, Command::Compact))),
-                            )
-                            .into(),
-                    );
-                }
-                widget::column::with_children(choices)
-                    .spacing(step::GAP_S)
-                    .into()
+                self.composer_menu_view(transitioning)
             };
-            widget::scrollable(content).height(Length::Shrink).into()
+            widget::container(content).width(COMPOSER_MENU_WIDTH).into()
         });
-        crate::ui_controls::popover(
-            anchor,
-            popup.map(|content: Element<'_, Message>| {
-                widget::container(content)
-                    .width(320)
-                    .max_height(260.0)
-                    .into()
-            }),
-            widget::popover::Position::Top,
-            action(Action::ComposerActions(target, false)),
+        Some((anchor.into(), popup))
+    }
+
+    /// The `+` menu's own list: a search when there are commands or skills
+    /// to find, then the composer's actions, then the commands and skills
+    /// the search matches.
+    fn composer_menu_view(&self, transitioning: bool) -> Element<'_, Message> {
+        let target = self.target;
+        let snapshot = &self.snapshot;
+        let entries = self.composer_menu(transitioning);
+        // Enter in the search takes the first entry that can be pressed, so
+        // that one is marked as the completion list marks its choice.
+        let chosen = entries.iter().position(|(_, enabled)| *enabled);
+        let rows: Vec<Element<'_, Message>> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, (entry, enabled))| match entry {
+                MenuEntry::Row(row) => {
+                    let pressed = enabled.then(|| action(self.composer_row_action(row)));
+                    let (icon, label, description, name): (_, Cow<'_, str>, Cow<'_, str>, _) =
+                        match row {
+                            ComposerRow::Attach => (
+                                Icon::Attachment,
+                                "Attach files or images…".into(),
+                                "Add to this draft".into(),
+                                None,
+                            ),
+                            ComposerRow::Plan => {
+                                let back = self.plan_toggle().unwrap_or(PLAN_MODE);
+                                if back == PLAN_MODE {
+                                    (
+                                        Icon::List,
+                                        "Plan mode".into(),
+                                        "Explore and plan before making changes".into(),
+                                        None,
+                                    )
+                                } else {
+                                    (
+                                        Icon::List,
+                                        "Leave plan mode".into(),
+                                        format!("Return to {}", permission_mode_label(back)).into(),
+                                        None,
+                                    )
+                                }
+                            }
+                            ComposerRow::Steering => {
+                                let wait = snapshot.interrupt_mode.as_deref() == Some("wait");
+                                if wait {
+                                    (
+                                        Icon::Jump,
+                                        "Steering: after turn".into(),
+                                        "Switch to after tools".into(),
+                                        Some(
+                                            "Steering: after turn. Press to steer after tools instead",
+                                        ),
+                                    )
+                                } else {
+                                    (
+                                        Icon::Jump,
+                                        "Steering: after tools".into(),
+                                        "Switch to after the turn".into(),
+                                        Some(
+                                            "Steering: after tools. Press to steer after the turn instead",
+                                        ),
+                                    )
+                                }
+                            }
+                            ComposerRow::Fork => (
+                                Icon::Branch,
+                                "Fork conversation…".into(),
+                                "Branch from an earlier turn".into(),
+                                None,
+                            ),
+                            ComposerRow::Compact => (
+                                Icon::Compress,
+                                "Compact conversation".into(),
+                                "Summarize earlier turns".into(),
+                                Some(
+                                    "Compact the conversation: summarize earlier turns to free context",
+                                ),
+                            ),
+                        };
+                    let highlighted = chosen == Some(index);
+                    let mut button =
+                        menu_row(Some(icon), label.clone(), description, None, highlighted)
+                        .id(card_control_id(target.card, row.id()))
+                        .on_press_maybe(pressed);
+                    button = button.name(name.map_or(label, Cow::Borrowed));
+                    button.into()
+                }
+                MenuEntry::Named(name) => {
+                    let insertion = name.insertion.clone().into_owned();
+                    let kind = completion_kind(name.kind);
+                    let highlighted = chosen == Some(index);
+                    menu_row(None, name.label(), name.description, Some(kind), highlighted)
+                        .name(format!("{kind}: {}", name.label()))
+                        .on_press_maybe(
+                            enabled.then(|| action(Action::ComposerName(target, insertion))),
+                        )
+                        .into()
+                }
+            })
+            .collect();
+        let empty = rows.is_empty();
+        let list = widget::scrollable(
+            widget::column::with_children(rows)
+                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
         )
+        .height(Length::Shrink);
+        let mut content: Vec<Element<'_, Message>> = Vec::new();
+        if self.composer_menu_searchable() {
+            content.push(
+                crate::ui_controls::field::search(
+                    "Search actions, commands and skills",
+                    self.composer_actions_query.as_str(),
+                )
+                .id(card_control_id(target.card, COMPOSER_SEARCH))
+                .width(Length::Fill)
+                .on_input(move |query| action(Action::ComposerActionsQuery(target, query)))
+                // Enter takes the first match that can be pressed.
+                .on_submit(move |_| action(Action::ComposerActionsSubmit(target)))
+                .into(),
+            );
+        }
+        if empty {
+            content.push(
+                widget::container(
+                    design::caption("Nothing matches")
+                        .class(cosmic::theme::Text::Custom(design::muted_text)),
+                )
+                .padding([space::XS, step::GAP_S])
+                .into(),
+            );
+        } else {
+            content.push(
+                widget::container(list)
+                    .max_height(COMPOSER_MENU_CEILING)
+                    .into(),
+            );
+        }
+        widget::column::with_children(content)
+            .spacing(space::XS)
+            .into()
     }
 
     /// The model, reasoning effort, and permission mode, at the status line's
@@ -5745,7 +5903,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn saved_history_composer_exposes_attachment_control_without_enabling_send() {
+    fn saved_history_composer_offers_attachment_in_its_actions_without_enabling_send() {
         use iced::advanced::{
             Layout, Shell, clipboard, layout, mouse,
             widget::{Operation, Tree, operation::Focusable},
@@ -5794,6 +5952,13 @@ mod tests {
             assert!(runtime.has_connected_saved_history(&runtime.snapshot));
             assert!(!runtime.snapshot.capabilities.attachments);
             let target = runtime.target;
+            // Attaching is one of the `+` menu's choices, and opening the
+            // menu starts keyboard focus on it.
+            runtime.composer_actions = true;
+            assert_eq!(
+                runtime.composer_action_rows(transitioning),
+                [(ComposerRow::Attach, !transitioning)]
+            );
             let mut element = runtime.view(
                 None,
                 transitioning,
@@ -5816,50 +5981,55 @@ mod tests {
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, viewport.size()),
             );
+            let mut overlay = element
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    iced::Vector::ZERO,
+                )
+                .expect("the open actions menu draws over the transcript");
+            let menu = overlay.as_overlay_mut().layout(&renderer, viewport.size());
             let mut bounds = Bounds {
                 id: card_control_id(target.card, "chat-attach"),
                 rect: None,
             };
-            element
-                .as_widget_mut()
-                .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            overlay
+                .as_overlay_mut()
+                .operate(Layout::new(&menu), &renderer, &mut bounds);
             let rect = bounds
                 .rect
-                .expect("the composer mounts its attachment control");
+                .expect("the actions menu offers its attachment control");
             assert!(rect.width > 0.0 && rect.height > 0.0 && rect.y < viewport.height);
             let cursor =
                 mouse::Cursor::Available(iced::Point::new(rect.center_x(), rect.center_y()));
             let mut messages = vec![];
-            let mut captured = vec![];
             for event in [
                 mouse::Event::ButtonPressed(mouse::Button::Left),
                 mouse::Event::ButtonReleased(mouse::Button::Left),
             ] {
                 let mut shell = Shell::new(&mut messages);
-                element.as_widget_mut().update(
-                    &mut tree,
+                overlay.as_overlay_mut().update(
                     &iced::Event::Mouse(event),
-                    Layout::new(&node),
+                    Layout::new(&menu),
                     cursor,
                     &renderer,
                     &mut clipboard::Null,
                     &mut shell,
-                    &viewport,
                 );
-                captured.push(shell.is_event_captured());
             }
             if transitioning {
                 assert!(messages.is_empty(), "switching disables draft controls");
             } else {
-                // Clicking outside COSMIC's native editor first emits its
-                // ordinary ClearSelection. The following release must admit
-                // exactly one chooser, without editing/submitting the draft.
+                // The press admits exactly one chooser, without editing or
+                // submitting the draft beneath the menu.
                 assert!(
                     matches!(messages.as_slice(), [
-                        Message::ChatUi(Action::Composer(editor, text_editor::Action::ClearSelection)),
                         Message::ChatUi(Action::Attach(found)),
-                    ] if *editor == target && *found == target),
-                    "attachment control emitted unexpected messages: {messages:?}; bounds={rect:?}; cursor={cursor:?}; viewport={viewport:?}; captured={captured:?}"
+                    ] if *found == target),
+                    "attachment control emitted unexpected messages: {messages:?}; bounds={rect:?}"
                 );
             }
         }
@@ -10549,7 +10719,7 @@ mod tests {
     fn composer_stays_inset_with_and_without_a_conversation_title() {
         use iced::advanced::{
             Layout, layout,
-            widget::{Operation, Tree, operation},
+            widget::{Operation, Tree},
         };
         struct Probe {
             id: widget::Id,
@@ -10559,12 +10729,7 @@ mod tests {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 visit(self);
             }
-            fn focusable(
-                &mut self,
-                id: Option<&widget::Id>,
-                bounds: iced::Rectangle,
-                _: &mut dyn operation::Focusable,
-            ) {
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
                 if id == Some(&self.id) {
                     self.bounds = Some(bounds);
                 }
@@ -10599,7 +10764,7 @@ mod tests {
                     &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 700.0)),
                 );
                 let mut probe = Probe {
-                    id: card_control_id(runtime.target.card, "chat-composer"),
+                    id: card_control_id(runtime.target.card, "chat-composer-surface"),
                     bounds: None,
                 };
                 element.as_widget_mut().operate(
@@ -10608,7 +10773,7 @@ mod tests {
                     &renderer,
                     &mut probe,
                 );
-                let bounds = probe.bounds.expect("composer editor");
+                let bounds = probe.bounds.expect("composer surface");
                 assert_eq!(bounds.x, step::GAP_M);
                 assert_eq!(bounds.width, width - 2.0 * step::GAP_M);
             }
@@ -10632,17 +10797,10 @@ mod tests {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 visit(self);
             }
-            fn focusable(
-                &mut self,
-                id: Option<&widget::Id>,
-                bounds: iced::Rectangle,
-                _: &mut dyn operation::Focusable,
-            ) {
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
                 if id == Some(&self.composer) {
                     self.editor = Some(bounds);
                 }
-            }
-            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
                 if id == Some(&scroll::item_id("0-answer")) {
                     self.answer = Some(bounds);
                 }
@@ -10720,7 +10878,7 @@ mod tests {
                     &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 700.0)),
                 );
                 let mut probe = Probe {
-                    composer: card_control_id(runtime.target.card, "chat-composer"),
+                    composer: card_control_id(runtime.target.card, "chat-composer-surface"),
                     transcript: card_control_id(runtime.target.card, "chat-transcript"),
                     editor: None,
                     viewport: None,
@@ -11514,7 +11672,7 @@ mod tests {
                 let body = if raw_code {
                     let code = prose::code_text(
                         code_source.clone(),
-                        Arc::from([]),
+                        None,
                         design::TEXT_BODY.into(),
                         iced::Font::MONOSPACE,
                         target,
@@ -13628,6 +13786,138 @@ mod tests {
                     bounds.y0 >= 0.0 && bounds.y1 <= 600.0 && bounds.y1 > bounds.y0,
                     "{width}: inline panels must not push the composer out of the window: {bounds:?}"
                 );
+            }
+        }
+    }
+
+    /// The composer is one row, `+ | draft | send/stop`, at every width, and
+    /// a busy conversation with nothing typed offers Stop rather than a Send
+    /// that could never be pressed.
+    #[test]
+    fn composer_is_one_row_and_offers_stop_while_busy_with_an_empty_draft() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        for width in [280.0_f32, 670.0] {
+            for busy in [false, true] {
+                for draft in ["", "Fix the test", "first line\nsecond line"] {
+                    let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+                    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+                    snapshot.busy = busy;
+                    snapshot.capabilities.attachments = true;
+                    snapshot.capabilities.compact = true;
+                    runtime.replace_draft(text_editor::Content::with_text(draft));
+                    let mut element = runtime.view(
+                        None,
+                        false,
+                        true,
+                        &shortcuts,
+                        width,
+                        Place {
+                            name: "Fixture".into(),
+                            channel: None,
+                            branch: None,
+                        },
+                        true,
+                        None,
+                        vec![],
+                    );
+                    let mut tree = Tree::new(element.as_widget());
+                    let node = element.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 700.0)),
+                    );
+                    let accessible = element.as_widget().a11y_nodes(
+                        Layout::new(&node),
+                        &tree,
+                        iced::mouse::Cursor::Unavailable,
+                    );
+                    let controls: Vec<_> = accessible
+                        .root()
+                        .iter()
+                        .chain(accessible.children())
+                        .filter_map(|node| {
+                            let label = node.node().label()?;
+                            [
+                                "Attach files and more actions",
+                                "Message",
+                                "Send message",
+                                "Cancel active turn",
+                                "Steer the active turn",
+                                "Queue for the next turn",
+                            ]
+                            .iter()
+                            .any(|name| label.starts_with(name))
+                            .then(|| (label.to_owned(), node.node().bounds().unwrap()))
+                        })
+                        .collect();
+                    let state = format!("{width}px busy={busy} draft={draft:?}");
+                    let find = |name: &str| {
+                        controls
+                            .iter()
+                            .find(|(label, _)| label.starts_with(name))
+                            .map(|(_, bounds)| *bounds)
+                    };
+                    let plus = find("Attach files and more actions")
+                        .unwrap_or_else(|| panic!("{state}: `+` leads the row: {controls:?}"));
+                    let editor = controls
+                        .iter()
+                        .find(|(label, _)| label == "Message")
+                        .map(|(_, bounds)| *bounds)
+                        .unwrap_or_else(|| panic!("{state}: the draft: {controls:?}"));
+                    let send = find("Send message")
+                        .or_else(|| find("Steer the active turn"))
+                        .or_else(|| find("Queue for the next turn"));
+                    let stop = find("Cancel active turn");
+                    let trailing = match (busy, draft.is_empty()) {
+                        (false, _) => {
+                            assert!(stop.is_none(), "{state}: idle has nothing to stop");
+                            send.unwrap_or_else(|| panic!("{state}: Send: {controls:?}"))
+                        }
+                        (true, true) => {
+                            assert!(
+                                send.is_none(),
+                                "{state}: an empty draft offers no send: {controls:?}"
+                            );
+                            stop.unwrap_or_else(|| panic!("{state}: Stop: {controls:?}"))
+                        }
+                        (true, false) => {
+                            let stop = stop.unwrap_or_else(|| {
+                                panic!("{state}: Stop stays beside a follow-up: {controls:?}")
+                            });
+                            let send = send.unwrap_or_else(|| {
+                                panic!("{state}: the follow-up can be sent: {controls:?}")
+                            });
+                            assert!(stop.x1 <= send.x0, "{state}: Stop precedes send");
+                            send
+                        }
+                    };
+                    // One row: `+` before the draft, the trailing control after
+                    // it, and both beside the draft's last line.
+                    assert!(plus.x1 <= editor.x0, "{state}: {plus:?} {editor:?}");
+                    assert!(editor.x1 <= trailing.x0, "{state}: {editor:?} {trailing:?}");
+                    for control in [plus, trailing] {
+                        assert!(
+                            control.y0 >= editor.y0 && control.y1 <= editor.y1,
+                            "{state}: controls sit inside the draft's row: {control:?} {editor:?}"
+                        );
+                    }
+                    if !draft.contains('\n') {
+                        // A single line reserves no toolbar row beneath it.
+                        assert!(
+                            editor.y1 - editor.y0
+                                <= f64::from(design::PRIMARY_CONTROL_SIZE + 2.0 * space::XS),
+                            "{state}: {editor:?}"
+                        );
+                        let middle = (editor.y0 + editor.y1) / 2.0;
+                        assert!(
+                            ((plus.y0 + plus.y1) / 2.0 - middle).abs() < 1.0
+                                && ((trailing.y0 + trailing.y1) / 2.0 - middle).abs() < 1.0,
+                            "{state}: controls center on a single line"
+                        );
+                    }
+                }
             }
         }
     }

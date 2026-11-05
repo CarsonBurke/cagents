@@ -102,7 +102,21 @@ pub(super) fn selected_account(spec: &Spec) -> Result<Account, String> {
             .accounts(homes.as_ref())
             .into_iter()
             .find(|account| account.provider == spec.provider && account.id() == *id)
-            .ok_or_else(|| "The selected provider account was removed".into()),
+            .ok_or_else(|| {
+                // A home a lost account list no longer names is not removed:
+                // the daemon restores it if its provider confirms the login.
+                let kept = id
+                    .as_str()
+                    .split_once('/')
+                    .and_then(|(_, key)| uuid::Uuid::parse_str(key).ok())
+                    .zip(homes.as_ref())
+                    .is_some_and(|(key, homes)| homes.is_unregistered(&accounts, spec.provider, key));
+                if kept {
+                    "The selected provider account isn't in the account list, but its files are still on this device. cagents restores it if its provider still reports a sign-in to it, so try again shortly; otherwise choose another account.".into()
+                } else {
+                    "The selected provider account was removed".into()
+                }
+            }),
         None => {
             let preferred = accounts.project_default_account(
                 &spec.target.repository,
@@ -321,10 +335,30 @@ const UNDELIVERED_CANCELLATION: &str = "Cancelled before the provider received t
 /// Waits, without the agent's gate, until a bound provider can take its
 /// first prompt.
 fn await_provider_ready(handle: &chat::runtime::Handle) -> Result<(), (State, String)> {
+    await_provider_ready_until(handle, Instant::now() + Duration::from_secs(30))
+}
+
+fn await_provider_ready_until(
+    handle: &chat::runtime::Handle,
+    deadline: Instant,
+) -> Result<(), (State, String)> {
     let before = |message| (State::Failed, message);
-    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let snapshot = provider_launch_snapshot(handle)?;
+        // A retained snapshot is a helper RPC, and one call can miss its
+        // deadline on a busy host while the helper stays healthy. Reading a
+        // snapshot sends no prompt, so keep polling within the launch budget.
+        // Stop at once when the attachment itself records a failure or exit.
+        let snapshot = match provider_launch_snapshot(handle) {
+            Ok(snapshot) => snapshot,
+            Err(unconfirmed) => {
+                if handle.failure().is_some() || handle.is_completed() || Instant::now() >= deadline
+                {
+                    return Err(unconfirmed);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+        };
         if snapshot.exited || handle.is_completed() {
             return Err(before("Provider exited before accepting the prompt".into()));
         }

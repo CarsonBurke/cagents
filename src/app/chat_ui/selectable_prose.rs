@@ -669,7 +669,7 @@ impl Selectable {
                 if selected || found {
                     part.highlight = Some(iced::advanced::text::Highlight {
                         background: if selected {
-                            design::accent_color(&cosmic::theme::active())
+                            design::selection_wash(&cosmic::theme::active())
                         } else {
                             design::accent_wash(&cosmic::theme::active())
                         }
@@ -1061,7 +1061,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 paragraph,
                 &[selection],
                 translation,
-                design::accent_color(theme),
+                design::selection_wash(theme),
             );
         }
         // Decorations remain visible over opaque selection/Find backgrounds.
@@ -1442,7 +1442,7 @@ mod tests {
                 let color = if find {
                     design::accent_wash(&cosmic::theme::active())
                 } else {
-                    design::accent_color(&cosmic::theme::active())
+                    design::selection_wash(&cosmic::theme::active())
                 }
                 .into_rgba8();
                 for part in 0..count {
@@ -1523,7 +1523,7 @@ mod tests {
         let selected = if find {
             design::accent_wash(&cosmic::theme::active())
         } else {
-            design::accent_color(&cosmic::theme::active())
+            design::selection_wash(&cosmic::theme::active())
         }
         .into_rgba8();
         for (byte, x, y) in probes {

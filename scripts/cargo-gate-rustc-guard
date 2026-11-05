@@ -1,0 +1,22 @@
+#!/bin/sh
+# RUSTC_WRAPPER inside `scripts/cargo-gate exec COMMAND`, where Rust compiles
+# on the build host: COMMAND's `cargo` leads back to the gate, and a Cargo
+# reached any other way (by path, $CARGO, `rustup run` or `mise exec`) would
+# compile on this host. Through this wrapper, rustc refuses to compile a
+# crate; Cargo's queries of it (`-vV`, `--print`) pass, and the wrapper the
+# caller had, if any, still runs.
+compiles=false
+for argument do
+    case $argument in
+        --crate-name) compiles=true ;;
+        --print|--print=*) compiles=false; break ;;
+    esac
+done
+if [ "$compiles" = true ]; then
+    printf '%s\n' "cargo-gate: Cargo inside \`cargo-gate exec\` was reached other than by the name \`cargo\` (by path, \$CARGO, rustup run or mise exec) and would compile on this host; run \`cargo\` by name so it builds on the build host, or set CAGENTS_BUILD_REMOTE=local" >&2
+    exit 1
+fi
+if [ -n "${CAGENTS_BUILD_EXEC_RUSTC_WRAPPER-}" ]; then
+    exec "$CAGENTS_BUILD_EXEC_RUSTC_WRAPPER" "$@"
+fi
+exec "$@"
