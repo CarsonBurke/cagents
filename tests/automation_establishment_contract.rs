@@ -429,8 +429,9 @@ impl Fixture {
             .as_ref()
             .ok_or("startup failure lost its original diagnostic")?;
         require(
-            diagnostic.contains("os error 2"),
-            format!("missing executable did not report its original ENOENT: {diagnostic}"),
+            diagnostic
+                == "Provider executable claude is not executable in the preserved launch environment",
+            format!("missing executable lost its launch-validation diagnostic: {diagnostic}"),
         )?;
         require(
             failed_detail.firing.diagnostic.as_ref() == Some(diagnostic),
