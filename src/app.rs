@@ -22534,17 +22534,18 @@ mod tests {
             };
             let mut runtime = RepositoryRuntime::new_directory(descriptor.clone());
             runtime.set_auto_save(false);
-            let read = task_app_message(repository_task(runtime.update(
-                RepositoryAction::OpenFile {
-                    card,
-                    path: "notes.txt".into(),
-                },
-            )));
-            let Message::Repository(read) = read else {
-                panic!("actual file read callback");
-            };
-            assert!(matches!(&read, RepositoryAction::FileLoadedAt { .. }));
-            drop(runtime.update(read));
+            let open = runtime.update(RepositoryAction::OpenFile {
+                card,
+                path: "notes.txt".into(),
+            });
+            assert!(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(runtime.settle_document_read(open)),
+                "actual file read callback"
+            );
             assert_eq!(runtime.editor_text().as_deref(), Some("A\n"));
             app.card_state_mut(card).unwrap().kind = CardKind::Repository(descriptor);
             app.cards
@@ -28752,19 +28753,7 @@ mod tests {
         drop(app.apply_viewport(update, false, false));
         assert!(app.card_holds_keyboard(pane));
         let placeholder = app.card_header_widget_id(pane);
-        let mut messages = cosmic::iced::runtime::task::into_stream(load).unwrap();
-        let executor = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut tasks = Vec::new();
-        let mut completed_read = false;
-        while let Some(action) = executor.block_on(messages.next()) {
-            if let cosmic::iced::runtime::Action::Output(action) = action {
-                completed_read |= matches!(&action, RepositoryAction::FileLoadedAt { .. });
-                tasks.push(app.update(Message::Repository(action)));
-            }
-        }
+        let (completed_read, tasks) = settle_repository_read(&mut app, pane, load);
         assert!(
             completed_read,
             "the actual file worker must answer the open"
@@ -28821,16 +28810,11 @@ mod tests {
         let update = app.workspace.resize_viewport(500.0);
         drop(app.apply_viewport(update, false, false));
         assert!(!app.card_holds_keyboard(pane));
-        let mut messages = cosmic::iced::runtime::task::into_stream(load).unwrap();
-        let executor = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        while let Some(action) = executor.block_on(messages.next()) {
-            if let cosmic::iced::runtime::Action::Output(action) = action {
-                drop(app.update(Message::Repository(action)));
-            }
-        }
+        let (completed_read, _) = settle_repository_read(&mut app, pane, load);
+        assert!(
+            completed_read,
+            "the actual file worker must answer the load"
+        );
         app.window_width = 1900.0;
         let update = app.workspace.resize_viewport(1200.0);
         let ready = app.apply_viewport(update, false, false);
@@ -30522,17 +30506,18 @@ mod tests {
                 selected_file: None,
             });
             runtime.set_auto_save(false);
-            let read = task_app_message(repository_task(runtime.update(
-                RepositoryAction::OpenFile {
-                    card,
-                    path: "file.txt".into(),
-                },
-            )));
-            let Message::Repository(read) = read else {
-                panic!("actual file read callback")
-            };
-            assert!(matches!(&read, RepositoryAction::FileLoadedAt { .. }));
-            drop(runtime.update(read));
+            let open = runtime.update(RepositoryAction::OpenFile {
+                card,
+                path: "file.txt".into(),
+            });
+            assert!(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(runtime.settle_document_read(open)),
+                "actual file read callback"
+            );
             drop(runtime.update(RepositoryAction::EditorAction {
                 card,
                 action: repository_widget::EditorAction::Edit(
@@ -30570,6 +30555,60 @@ mod tests {
             // Completion is intentionally not routed into card-close effects;
             // this regression owns Save admission/publication from the close dialog.
         }
+    }
+
+    /// Drives a repository load through the app as the shell would. A read
+    /// the runtime discards because its watch saw an event, including one
+    /// from before the read was armed, is followed by the re-read it starts.
+    /// Returns whether the real file worker answered, and the remaining
+    /// follow-up tasks for the test to run or drop.
+    pub(super) fn settle_repository_read(
+        app: &mut Cagents,
+        card: CardId,
+        load: iced::Task<RepositoryAction>,
+    ) -> (bool, Vec<Task<Message>>) {
+        // A fixture whose file keeps changing fails instead of hanging.
+        const REREAD_LIMIT: usize = 16;
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        fn runtime(app: &Cagents, card: CardId) -> &RepositoryRuntime {
+            match app.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => runtime,
+                _ => panic!("the repository runtime must stay attached"),
+            }
+        }
+        let mut answered = false;
+        let mut rereads = 0;
+        let mut remaining = Vec::new();
+        let mut pending = vec![repository_task(load)];
+        while let Some(task) = pending.pop() {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                continue;
+            };
+            while let Some(action) = executor.block_on(stream.next()) {
+                let iced::runtime::Action::Output(cosmic::Action::App(Message::Repository(action))) =
+                    action
+                else {
+                    continue;
+                };
+                let read = runtime(app, card).accepts_document_read(&action);
+                answered |= read;
+                let follow_up = app.update(Message::Repository(action));
+                if read && runtime(app, card).rereading_document() {
+                    rereads += 1;
+                    assert!(
+                        rereads <= REREAD_LIMIT,
+                        "the document kept changing while it was read"
+                    );
+                    pending.push(follow_up);
+                } else {
+                    remaining.push(follow_up);
+                }
+            }
+        }
+        (answered, remaining)
     }
 
     pub(super) fn task_app_message(task: Task<Message>) -> Message {
@@ -31839,6 +31878,37 @@ mod tests {
             number,
             url: Url::parse(&format!("https://github.com/o/r/pull/{number}")).unwrap(),
         })
+    }
+
+    #[test]
+    fn a_visible_pull_request_browser_refreshes_beside_the_focused_chat() {
+        let (mut app, _) = pull_request_test_app(&[]);
+        app.active_workspace = Some("/repo".into());
+        let (browser, _) = app.add_pull_requests_card("/repo".into());
+        if let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&browser) {
+            crate::pull_request_review::tests::ready_due_browser(&mut pane.review);
+        }
+        drop(app.new_native_chat(crate::agent::Provider::Codex, Some("/repo".into())));
+        assert_ne!(app.workspace.focused(), Some(browser));
+        app.workspace.resize_viewport(2400.0);
+        app.workspace.native_scroll(0.0, 2400.0);
+        assert_eq!(
+            app.workspace.visibility(browser),
+            Some(VisibilityClass::Visible)
+        );
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        drop(app.update_refresh(refresh_ui::Action::Tick));
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get(&browser) else {
+            panic!("PR browser")
+        };
+        // A started refresh cancels the prior generation's request: the new
+        // page response must not be accepted by the prior browser surface.
+        assert!(matches!(
+            pane.review.list(),
+            crate::pull_request_review::ListState::Ready(_)
+        ));
+        assert!(pane.review.browser_is_refreshing());
     }
 
     #[test]

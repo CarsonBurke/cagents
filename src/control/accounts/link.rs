@@ -23,22 +23,7 @@ pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 pub(super) fn parse_home(value: &str) -> Result<String, String> {
-    // The destination's established linker trims text-field input. Refuse an
-    // ambiguous CLI operand rather than silently selecting a different home.
-    if value.trim() != value {
-        return Err("Use an account home without leading or trailing whitespace".into());
-    }
-    if value
-        .strip_prefix("~/")
-        .is_some_and(|relative| Path::new(relative).is_absolute())
-    {
-        return Err("Use one slash after ~ so the account home stays relative to the selected device's home".into());
-    }
-    if value.contains('\0') || !(Path::new(value).is_absolute() || value.starts_with("~/")) {
-        return Err(
-            "Use an absolute account home on the selected device, or a quoted '~/path'".into(),
-        );
-    }
+    crate::account::validate_linked_home_operand(value)?;
     // Expansion and physical-home validation belong to the selected daemon.
     // In particular, a remote ~/ path must not use this client's HOME.
     Ok(value.into())
