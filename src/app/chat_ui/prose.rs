@@ -75,10 +75,11 @@ struct Runs {
     highlighted: bool,
     runs: Box<[Run]>,
     styles: Box<[Style]>,
-    /// The whole block drawn, once something draws it whole. A block short
-    /// enough to be one paragraph is drawn whole every time its row is built,
-    /// and a paragraph shapes again whenever its spans are new ones.
-    all: std::sync::OnceLock<Arc<[Span<'static, markdown::Uri>]>>,
+    /// The whole block drawn, for as long as a row drawing it holds it. A
+    /// block short enough to be one paragraph is drawn whole every time its
+    /// row is built, and a paragraph shapes again whenever its spans are new
+    /// ones; a row scrolled away lets them go.
+    all: std::sync::Mutex<Option<std::sync::Weak<[Span<'static, markdown::Uri>]>>>,
 }
 
 /// Runs draw the same where they end at the same bytes in the same styles,
@@ -126,13 +127,7 @@ impl Highlight {
     }
 
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of_val(&*self.0.runs)
-            + std::mem::size_of_val(&*self.0.styles)
-            + self.0.all.get().map_or(0, |all| {
-                all.iter()
-                    .map(|span| std::mem::size_of_val(span) + span.text.len())
-                    .sum()
-            })
+        std::mem::size_of_val(&*self.0.runs) + std::mem::size_of_val(&*self.0.styles)
     }
 
     /// The spans that draw all of `text`, the block this highlights; the
@@ -142,13 +137,22 @@ impl Highlight {
         if text.len() > CodeBlock::PARAGRAPH {
             return self.spans(text, 0..text.len());
         }
-        let all = self.0.all.get_or_init(|| self.spans(text, 0..text.len()));
-        debug_assert_eq!(
-            all.iter().map(|span| span.text.len()).sum::<usize>(),
-            text.len(),
-            "a highlight draws the one block it was made for"
-        );
-        all.clone()
+        let mut all = self
+            .0
+            .all
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(drawn) = all.as_ref().and_then(std::sync::Weak::upgrade) {
+            debug_assert_eq!(
+                drawn.iter().map(|span| span.text.len()).sum::<usize>(),
+                text.len(),
+                "a highlight draws the one block it was made for"
+            );
+            return drawn;
+        }
+        let drawn = self.spans(text, 0..text.len());
+        *all = Some(Arc::downgrade(&drawn));
+        drawn
     }
 
     /// The spans that draw `range` of `text`, the block this highlights:
@@ -3036,8 +3040,8 @@ mod tests {
     }
 
     /// A paragraph shapes again whenever its spans are new ones, so a short
-    /// block draws whole from the same spans each time its row is built, and
-    /// from new ones once its text grows.
+    /// block draws whole from the same spans each time its row is built, for
+    /// as long as a row holds them, and from new ones once its text grows.
     #[test]
     fn a_block_draws_whole_from_the_same_spans_until_it_grows() {
         let theme = crate::settings::EditorSyntaxTheme::Auto;
@@ -3053,6 +3057,12 @@ mod tests {
                 assert!(
                     Arc::ptr_eq(&first, &block.highlight(dark).clone().all(code)),
                     "{language:?} dark: {dark}, shared"
+                );
+                let drawn = Arc::downgrade(&first);
+                drop(first);
+                assert!(
+                    drawn.upgrade().is_none(),
+                    "{language:?} dark: {dark}, kept by no row"
                 );
             }
             let grown = "let a = 1;\nlet b = 2;\n";
