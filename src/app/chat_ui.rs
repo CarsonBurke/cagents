@@ -11627,8 +11627,9 @@ impl Cagents {
                             runtime.composer_row_action(row),
                             // A row that closes the menu takes the search
                             // with it, so typing returns to the draft; a
-                            // chooser or the fork picker takes focus itself.
-                            !matches!(row, ComposerRow::Attach | ComposerRow::Fork),
+                            // chooser or the fork picker takes focus itself,
+                            // and steering leaves the menu open.
+                            matches!(row, ComposerRow::Plan | ComposerRow::Compact),
                         ),
                         MenuEntry::Named(name) => (
                             Action::ComposerName(target, name.insertion.into_owned()),
@@ -11645,10 +11646,13 @@ impl Cagents {
                 if !refocus {
                     return task;
                 }
-                return task.chain(
+                // Not after the action's reply: typing meanwhile belongs in
+                // the draft too.
+                return Task::batch([
+                    task,
                     iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
                         .map(cosmic::Action::App),
-                );
+                ]);
             }
             Action::ComposerName(target, insertion) => {
                 let transitioning = self.chat_ui.phases.contains_key(&target.card);
