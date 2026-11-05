@@ -929,9 +929,10 @@ impl State {
             | Action::Effort(..)
             | Action::Reuse(..)
             | Action::Precheck(..) => self.draft.is_some(),
-            Action::Provider(index) => self.draft.as_ref().is_some_and(|draft| {
-                *index < PROVIDERS.len() && *index != draft.provider
-            }),
+            Action::Provider(index) => self
+                .draft
+                .as_ref()
+                .is_some_and(|draft| *index < PROVIDERS.len() && *index != draft.provider),
             Action::Target(index) => self
                 .draft
                 .as_ref()
@@ -6918,8 +6919,7 @@ mod tests {
         let Some(Effect::Request { sequence, .. }) = state.update(Action::Received {
             sequence,
             result: std::sync::Arc::new(Ok(Response::Automation(other.clone()))),
-        })
-        else {
+        }) else {
             panic!("read the new subject's history");
         };
         state.update(Action::Received {
@@ -7026,9 +7026,13 @@ mod tests {
             result: std::sync::Arc::new(Ok(Response::Detail(detail))),
         });
         assert_eq!(state.error.as_deref(), Some(refusal));
-        assert!(matches!(state.update(Action::CancelRun), Some(Effect::Request {
-            request: Request::Cancel { .. }, ..
-        })));
+        assert!(matches!(
+            state.update(Action::CancelRun),
+            Some(Effect::Request {
+                request: Request::Cancel { .. },
+                ..
+            })
+        ));
         assert!(state.error.is_none());
     }
 
