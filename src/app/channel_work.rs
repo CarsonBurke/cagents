@@ -21,6 +21,9 @@ pub(super) struct Navigation {
     pub(super) generation: uuid::Uuid,
     pub(super) workspace: u64,
     pub(super) surface: Surface,
+    /// Enter activated the entry, so focus stays on it when Work replaces it.
+    /// A pointer leaves focus alone, and a press it abandons publishes nothing.
+    pub(super) keep_focus: bool,
 }
 
 pub(super) struct State {
@@ -35,7 +38,6 @@ pub(super) struct State {
     main: bool,
     generation: uuid::Uuid,
     restore_card: Option<CardId>,
-    entry_pointer_press: bool,
     deferred: Option<Deferred>,
     navigation_view: Option<ui::ViewOwner>,
 }
@@ -50,7 +52,6 @@ impl Default for State {
             main: false,
             generation: uuid::Uuid::new_v4(),
             restore_card: None,
-            entry_pointer_press: false,
             deferred: None,
             navigation_view: None,
         }
@@ -112,7 +113,7 @@ impl Cagents {
         self.channel_work.main && self.channel_work.view.is_open()
     }
 
-    fn channel_home(&self) -> Option<Home> {
+    pub(super) fn channel_home(&self) -> Option<Home> {
         if self.channel_work_is_main() {
             return self.channel_work.view.home();
         }
@@ -138,16 +139,11 @@ impl Cagents {
             } else {
                 Surface::Work
             },
+            keep_focus: false,
         })
     }
 
-    /// A press that started from the pointer has moved no keyboard focus.
-    pub(super) fn note_channel_work_entry_pointer_press(&mut self) {
-        self.channel_work.entry_pointer_press = true;
-    }
-
     pub(super) fn channel_navigation(&mut self, navigation: Navigation) -> Task<Message> {
-        let from_pointer = std::mem::take(&mut self.channel_work.entry_pointer_press);
         if navigation.generation != self.channel_work.generation
             || navigation.workspace != self.workspace_view_generation
             || self.channel_home() != Some(navigation.home)
@@ -157,7 +153,7 @@ impl Cagents {
         match navigation.surface {
             Surface::Work => {
                 let open = self.open_channel_work(navigation.home.channel);
-                if from_pointer {
+                if !navigation.keep_focus {
                     return open;
                 }
                 // Opening replaces the entry that held focus. Keep the keyboard
@@ -2383,10 +2379,8 @@ mod tests {
                 // against that frame, not a local copy of the form.
                 let (_, entry) = labelled(&mut frame, &renderer, "Channel work for Original");
                 let navigation = click(&mut frame, &mut renderer, entry.center());
-                let [
-                    cosmic::Action::App(Message::ChannelWorkEntryPointerPress),
-                    cosmic::Action::App(Message::ChannelWorkNavigation(destination)),
-                ] = navigation.as_slice()
+                let [cosmic::Action::App(Message::ChannelWorkNavigation(destination))] =
+                    navigation.as_slice()
                 else {
                     panic!("actual dirty navigation callback: {navigation:?}");
                 };
@@ -4416,8 +4410,20 @@ mod tests {
         assert!(entry_node_selected(&mounted(&app, Cache::new(), &mut renderer, 700.0)).is_empty());
     }
 
-    #[test]
-    fn opening_work_from_the_entry_keeps_keyboard_focus_on_it() {
+    fn enter_key() -> iced::Event {
+        key(
+            keyboard::Key::Named(keyboard::key::Named::Enter),
+            keyboard::key::Code::Enter,
+            None,
+        )
+    }
+
+    /// Runs `open` and reports whether focus landed on the entry Work mounted.
+    fn entry_holds_focus_after(
+        app: &mut Cagents,
+        renderer: &mut cosmic::Renderer,
+        open: Message,
+    ) -> bool {
         use iced::advanced::widget::{Operation, operation};
         #[derive(Default)]
         struct Focused(Vec<widget::Id>);
@@ -4436,58 +4442,131 @@ mod tests {
                 }
             }
         }
-        let mut renderer = super::super::tests::headless_renderer();
-        for from_pointer in [false, true] {
-            let (mut app, _) = main_fixture();
-            let owner = app.channel_work.view.owner().unwrap();
-            drop(app.update_channel_work(ui::Action::Close(owner)));
-            let open = entry_press(&app, &mut renderer, 900.0);
-            if from_pointer {
-                drop(app.update(Message::ChannelWorkEntryPointerPress));
-            }
-            let task = app.update(open);
-            assert!(app.channel_work_is_main());
-            let mut ui = native(&app, Cache::new(), &mut renderer, 900.0);
-            let mut stream = iced::runtime::task::into_stream(task).unwrap();
+        let task = app.update(open);
+        assert!(app.channel_work_is_main());
+        let mut ui = native(app, Cache::new(), renderer, 900.0);
+        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
             let executor = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             while let Some(action) = executor.block_on(stream.next()) {
                 if let iced::runtime::Action::Widget(mut operation) = action {
-                    ui.operate(&renderer, &mut operation);
+                    ui.operate(renderer, &mut operation);
                 }
             }
-            let mut focused = Focused::default();
-            ui.operate(&renderer, &mut focused);
-            let expected = channel_work_entry_id(app.channel_work.generation);
-            assert_eq!(
-                focused
-                    .0
-                    .iter()
-                    .any(|id| iced_accessibility::IdEq::eq(id, &expected)),
-                !from_pointer,
-                "focus after opening, from pointer {from_pointer}: {:?}",
-                focused.0
-            );
         }
+        let mut focused = Focused::default();
+        ui.operate(renderer, &mut focused);
+        let expected = channel_work_entry_id(app.channel_work.generation);
+        focused
+            .0
+            .iter()
+            .any(|id| iced_accessibility::IdEq::eq(id, &expected))
+    }
+
+    /// Focuses the closed entry the way Tab would and presses Enter on it.
+    fn enter_on_entry(
+        app: &Cagents,
+        ui: &mut Native<'_>,
+        renderer: &mut cosmic::Renderer,
+    ) -> Vec<Message> {
+        let navigation = app.channel_work_entry_navigation().unwrap();
+        ui.operate(
+            renderer,
+            &mut iced::advanced::widget::operation::focusable::focus::<()>(channel_work_entry_id(
+                navigation.generation,
+            )),
+        );
+        events(
+            ui,
+            renderer,
+            &[enter_key()],
+            iced::mouse::Cursor::Unavailable,
+        )
     }
 
     #[test]
-    fn a_pointer_press_on_the_entry_is_raised_before_its_navigation() {
+    fn enter_on_the_entry_keeps_keyboard_focus_and_a_click_leaves_it_alone() {
+        let mut renderer = super::super::tests::headless_renderer();
+
+        let (mut app, _) = main_fixture();
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update_channel_work(ui::Action::Close(owner)));
+        let press = entry_press(&app, &mut renderer, 900.0);
+        assert!(!entry_holds_focus_after(&mut app, &mut renderer, press));
+
+        let (mut app, _) = main_fixture();
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update_channel_work(ui::Action::Close(owner)));
+        let mut ui = mounted(&app, Cache::new(), &mut renderer, 900.0);
+        let messages = enter_on_entry(&app, &mut ui, &mut renderer);
+        let _ = ui.into_cache();
+        // Exactly one activation: the button under the wrapper must not also
+        // answer the Enter that the wrapper claimed.
+        let [enter @ Message::ChannelWorkNavigation(_)] =
+            <[Message; 1]>::try_from(messages).unwrap_or_else(|messages| panic!("{messages:?}"))
+        else {
+            unreachable!()
+        };
+        assert!(entry_holds_focus_after(&mut app, &mut renderer, enter));
+    }
+
+    #[test]
+    fn a_press_dragged_off_the_entry_does_not_change_the_next_enter() {
+        let (mut app, _) = main_fixture();
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update_channel_work(ui::Action::Close(owner)));
+        let mut renderer = super::super::tests::headless_renderer();
+        let mut ui = mounted(&app, Cache::new(), &mut renderer, 900.0);
+        let on_entry = bounds(&ui, "Channel work for Original").center();
+        let pressed = events(
+            &mut ui,
+            &mut renderer,
+            &[
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: on_entry }),
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            ],
+            iced::mouse::Cursor::Available(on_entry),
+        );
+        let away = iced::Point::new(on_entry.x, on_entry.y + 300.0);
+        let released = events(
+            &mut ui,
+            &mut renderer,
+            &[
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: away }),
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+            ],
+            iced::mouse::Cursor::Available(away),
+        );
+        assert!(
+            pressed
+                .iter()
+                .chain(&released)
+                .all(|message| !matches!(message, Message::ChannelWorkNavigation(_))),
+            "an abandoned press must not navigate: {pressed:?} {released:?}"
+        );
+
+        let messages = enter_on_entry(&app, &mut ui, &mut renderer);
+        let _ = ui.into_cache();
+        let enter = messages
+            .into_iter()
+            .find(|message| matches!(message, Message::ChannelWorkNavigation(_)))
+            .expect("Enter activates the entry after the abandoned press");
+        assert!(entry_holds_focus_after(&mut app, &mut renderer, enter));
+    }
+
+    #[test]
+    fn a_click_on_the_entry_publishes_only_its_navigation() {
         let (app, _) = main_fixture();
         let mut renderer = super::super::tests::headless_renderer();
         let mut ui = native(&app, Cache::new(), &mut renderer, 900.0);
         let point = bounds(&ui, "Channel work for Original").center();
         let messages = click(&mut ui, &mut renderer, point);
         assert!(
-            matches!(
-                messages.as_slice(),
-                [
-                    Message::ChannelWorkEntryPointerPress,
-                    Message::ChannelWorkNavigation(_),
-                ]
-            ),
+            matches!(messages.as_slice(), [Message::ChannelWorkNavigation(_)]),
             "{messages:?}"
         );
     }
@@ -4510,10 +4589,9 @@ mod tests {
             let point = bounds(&ui, "Channel work for Original").center();
             let messages = click(&mut ui, renderer, point);
             assert!(
-                !messages.iter().any(|message| matches!(
-                    message,
-                    Message::ChannelWorkNavigation(_) | Message::ChannelWorkEntryPointerPress
-                )),
+                !messages
+                    .iter()
+                    .any(|message| matches!(message, Message::ChannelWorkNavigation(_))),
                 "{messages:?}"
             );
             let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);

@@ -677,7 +677,7 @@ fn a_refused_in_flight_retirement_reopens_into_the_original_home() {
 
     assert_eq!(fixture.app.durable.channels.len(), 1);
     assert_eq!(fixture.app.durable.active_channel, Some(fixture.channel));
-    assert_eq!(fixture.app.channel_home().unwrap().0, fixture.home);
+    assert_eq!(fixture.app.channel_home().unwrap(), fixture.home);
     assert_eq!(fixture.active_channel().cards, vec![fixture.resumed().id]);
     assert!(fixture.app.channel_ui.revived.is_empty());
     assert!(
@@ -763,7 +763,7 @@ fn a_definitively_failed_retirement_keeps_reopen_available_for_retry() {
     assert_eq!(fixture.app.recently_closed.len(), 1);
     assert_eq!(fixture.app.durable.channels.len(), 1);
     fixture.reopen_pane();
-    assert_eq!(fixture.app.channel_home().unwrap().0, fixture.home);
+    assert_eq!(fixture.app.channel_home().unwrap(), fixture.home);
     assert_eq!(fixture.active_channel().cards, vec![fixture.resumed().id]);
 }
 

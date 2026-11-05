@@ -98,9 +98,10 @@ pub struct ToggleViewTab<'a, Message> {
     pub hint: Cow<'a, str>,
     /// Draws only the icon, for a bar that has run out of room for the label.
     pub icon_only: bool,
-    /// Raised when a pointer starts a press, ahead of the press message, so
-    /// the caller can tell a pointer from the keyboard.
-    pub on_pointer_press: Message,
+    /// Replaces the press message when Enter activates the focused control,
+    /// so the caller can keep the keyboard where it was without tracking
+    /// what a pointer is doing.
+    pub on_enter: Message,
 }
 
 /// See [`ToggleViewTab`]. Without a press message it is plainly inert: no hover
@@ -113,14 +114,23 @@ pub fn toggle_view_tab<'a, Message: Clone + 'a>(
         icon,
         hint,
         icon_only,
-        on_pointer_press,
+        on_enter,
     } = toggle;
     let enabled = tab.on_press.is_some();
     let (button, _) = tab_control(tab, false, Some(icon), true, !icon_only);
     if enabled {
-        tooltip(
-            crate::interaction::hover(button.on_press_down(on_pointer_press)),
-            hint,
+        crate::interaction::focused_key(
+            tooltip(crate::interaction::hover(button), hint),
+            move |event| {
+                matches!(
+                    event,
+                    iced::keyboard::Event::KeyPressed {
+                        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                        ..
+                    }
+                )
+                .then(|| on_enter.clone())
+            },
         )
     } else {
         button.into()
@@ -274,7 +284,7 @@ mod tests {
             icon: widget::Space::new().width(16).height(16).into(),
             hint: "Close".into(),
             icon_only,
-            on_pointer_press: (),
+            on_enter: (),
         })
     }
 

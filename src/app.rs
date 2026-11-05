@@ -4682,7 +4682,6 @@ pub enum Message {
     WorkUi(crate::work_ui::Action),
     ChannelWork(crate::channel_work_ui::Action),
     ChannelWorkNavigation(channel_work::Navigation),
-    ChannelWorkEntryPointerPress,
     ChannelWorkPoll,
     ChannelWorkEscape,
     AutomationApproval(automation_approval::Action),
@@ -17687,10 +17686,6 @@ impl Application for Cagents {
             Message::WorkUi(action) => self.update_work_ui(action),
             Message::ChannelWork(action) => self.update_channel_work(action),
             Message::ChannelWorkNavigation(navigation) => self.channel_navigation(navigation),
-            Message::ChannelWorkEntryPointerPress => {
-                self.note_channel_work_entry_pointer_press();
-                Task::none()
-            }
             Message::ChannelWorkEscape => self.escape_channel_work(),
             Message::ChannelWorkPoll => self.channel_work.view.refresh().map_or_else(Task::none, |effect| self.channel_work_effect(effect)),
             Message::GitUi(action) => self.update_git(action),

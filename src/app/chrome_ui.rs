@@ -2957,7 +2957,10 @@ impl Cagents {
                     "Channel work".into()
                 },
                 icon_only: self.channel_work_entry_is_icon_only(),
-                on_pointer_press: Message::ChannelWorkEntryPointerPress,
+                on_enter: Message::ChannelWorkNavigation(channel_work::Navigation {
+                    keep_focus: true,
+                    ..navigation
+                }),
             }),
         ))
     }
