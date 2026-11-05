@@ -108,6 +108,22 @@ verbosity_turn() {
     emit_record "$(jq -cn --arg turn "$turn" '{type:"user",uuid:("verbosity-shell-result-"+$turn),message:{role:"user",content:[{type:"tool_result",tool_use_id:("shell-"+$turn),content:"Shell fixture complete"}]}}')"
 }
 
+# Optional scripted tool calls: each line of fixture-tools.jsonl is
+# {"name":..., "input":{...}, "result":"...", "is_error":bool}, emitted as a
+# tool call and its result on every turn, so a rendering check can choose the
+# exact calls and outputs it needs.
+tools_file=$config/fixture-tools.jsonl
+tools_turn() {
+    call=0
+    while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        call=$((call + 1))
+        id="tool-$turn-$call"
+        emit_record "$(printf '%s' "$spec" | jq -c --arg id "$id" '{type:"assistant",uuid:("fixture-"+$id),message:{id:("fixture-"+$id),role:"assistant",content:[{type:"tool_use",id:$id,name:.name,input:.input}]}}')"
+        emit_record "$(printf '%s' "$spec" | jq -c --arg id "$id" '{type:"user",uuid:("fixture-"+$id+"-result"),message:{role:"user",content:[{type:"tool_result",tool_use_id:$id,is_error:(.is_error // false),content:(.result // "")}]}}')"
+    done < "$tools_file"
+}
+
 # Optional provider-produced image for image preview/viewer acceptance: each
 # turn returns this PNG as a base64 block. Native launches drop CAGENTS_*
 # variables, so the provider home's fixture-image.png is the default.
@@ -200,6 +216,7 @@ while IFS= read -r frame; do
                     continue
                 fi
                 if [ "$verbosity" = 1 ]; then verbosity_turn; fi
+                if [ -f "$tools_file" ]; then tools_turn; fi
                 if [ -f "$fixture_image" ]; then image_turn; fi
                 # A Markdown file in the config directory can stand in for the
                 # answer, so rendering and long-transcript checks need no live
