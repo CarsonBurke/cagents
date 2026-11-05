@@ -42,7 +42,7 @@ impl Process {
 
 /// A process reaped between opening and reading its stat file fails the read
 /// with ESRCH. It is as absent as one whose entry is already gone.
-fn exited_as_absent(error: io::Error) -> io::Error {
+pub(crate) fn exited_as_absent(error: io::Error) -> io::Error {
     if error.raw_os_error() == Some(libc::ESRCH) {
         io::Error::new(io::ErrorKind::NotFound, error)
     } else {
@@ -295,11 +295,12 @@ impl Record {
         let mut children = std::collections::BTreeSet::new();
         for task in fs::read_dir(format!("/proc/{}/task", self.holder.pid))? {
             let task = task?;
-            let raw = match fs::read_to_string(task.path().join("children")) {
-                Ok(raw) => raw,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
+            let raw =
+                match fs::read_to_string(task.path().join("children")).map_err(exited_as_absent) {
+                    Ok(raw) => raw,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
             children.extend(
                 raw.split_whitespace()
                     .filter_map(|pid| pid.parse::<i32>().ok()),
