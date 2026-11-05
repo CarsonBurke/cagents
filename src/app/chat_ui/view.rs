@@ -3413,11 +3413,9 @@ impl Runtime {
         let target = self.target;
         let snapshot = &self.snapshot;
         let entries = self.composer_menu(transitioning);
-        // While searching, Enter takes the first entry that can be pressed,
-        // so that one is marked as the completion list marks its choice.
-        let chosen = (!self.composer_actions_query.trim().is_empty())
-            .then(|| entries.iter().position(|(_, enabled)| *enabled))
-            .flatten();
+        // Enter in the search takes the first entry that can be pressed, so
+        // that one is marked as the completion list marks its choice.
+        let chosen = entries.iter().position(|(_, enabled)| *enabled);
         let rows: Vec<Element<'_, Message>> = entries
             .into_iter()
             .enumerate()
@@ -3429,7 +3427,7 @@ impl Runtime {
                             ComposerRow::Attach => (
                                 Icon::Attachment,
                                 "Attach files or images…".into(),
-                                "Add files or images to this draft".into(),
+                                "Add to this draft".into(),
                                 None,
                             ),
                             ComposerRow::Plan => {
@@ -3456,7 +3454,7 @@ impl Runtime {
                                     (
                                         Icon::Jump,
                                         "Steering: after turn".into(),
-                                        "Press to steer after tools instead".into(),
+                                        "Switch to after tools".into(),
                                         Some(
                                             "Steering: after turn. Press to steer after tools instead",
                                         ),
@@ -3465,7 +3463,7 @@ impl Runtime {
                                     (
                                         Icon::Jump,
                                         "Steering: after tools".into(),
-                                        "Press to steer after the turn instead".into(),
+                                        "Switch to after the turn".into(),
                                         Some(
                                             "Steering: after tools. Press to steer after the turn instead",
                                         ),
@@ -3475,13 +3473,13 @@ impl Runtime {
                             ComposerRow::Fork => (
                                 Icon::Branch,
                                 "Fork conversation…".into(),
-                                "Start another chat from an earlier turn".into(),
+                                "Branch from an earlier turn".into(),
                                 None,
                             ),
                             ComposerRow::Compact => (
                                 Icon::Compress,
                                 "Compact conversation".into(),
-                                "Summarize earlier turns to free context".into(),
+                                "Summarize earlier turns".into(),
                                 Some(
                                     "Compact the conversation: summarize earlier turns to free context",
                                 ),

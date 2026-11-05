@@ -3646,12 +3646,22 @@ impl Runtime {
                 .composer
                 .lines()
                 .all(|line| line.text.trim().is_empty());
-        self.names_matching(self.composer_actions_query.trim(), blank)
+        self.names_matching(&self.composer_actions_search(), blank)
     }
 
-    /// Whether the `+` menu has commands or skills to search among. It does
-    /// not depend on the draft, so the search keeps its place while words
-    /// typed into the draft set the commands aside, and while a query
+    /// The menu's search as it is matched: a slash or skill sigil typed out
+    /// of habit is not part of any name.
+    fn composer_actions_search(&self) -> String {
+        self.composer_actions_query
+            .trim()
+            .trim_start_matches([completion::COMMAND_SIGIL, '$'])
+            .to_lowercase()
+    }
+
+    /// Whether the `+` menu has commands or skills to search among, which
+    /// with the composer's own `/resume` is every chat it is offered in. It
+    /// does not depend on the draft, so the search keeps its place while
+    /// words typed into the draft set the commands aside, and while a query
     /// narrows the list to nothing, so it can be undone.
     pub(super) fn composer_menu_searchable(&self) -> bool {
         !self.names_matching("", true).is_empty()
@@ -3678,7 +3688,7 @@ impl Runtime {
     /// The `+` menu in the order it lists its entries, narrowed by its
     /// search, each with whether it can be pressed now.
     pub(super) fn composer_menu(&self, transitioning: bool) -> Vec<(MenuEntry<'_>, bool)> {
-        let query = self.composer_actions_query.trim().to_lowercase();
+        let query = self.composer_actions_search();
         // Every word searched for starts a word of what the row does.
         let found = |row: ComposerRow| {
             query.split_whitespace().all(|word| {
@@ -3710,7 +3720,14 @@ impl Runtime {
     fn name_in_draft(&mut self, insertion: &str, kind: completion::Kind) {
         let caret = self.composer.cursor().position;
         let at_caret = self.spaced_name(caret, insertion);
-        let lead = kind == completion::Kind::Skill && {
+        // A message that opens with a command or a shell escape is read as
+        // that, so a skill is never put ahead of it.
+        let opened = self
+            .composer
+            .text()
+            .trim_start()
+            .starts_with([completion::COMMAND_SIGIL, '!']);
+        let lead = kind == completion::Kind::Skill && !opened && {
             let offset = self
                 .composer
                 .lines()
@@ -11601,17 +11618,37 @@ impl Cagents {
                 if runtime.target != target || !runtime.composer_actions {
                     return Task::none();
                 }
-                let chosen = runtime
+                let Some((chosen, refocus)) = runtime
                     .composer_menu(transitioning)
                     .into_iter()
                     .find(|(_, enabled)| *enabled)
                     .map(|(entry, _)| match entry {
-                        MenuEntry::Row(row) => runtime.composer_row_action(row),
-                        MenuEntry::Named(name) => {
-                            Action::ComposerName(target, name.insertion.into_owned())
-                        }
-                    });
-                return chosen.map_or_else(Task::none, |chosen| self.handle_chat_ui(chosen));
+                        MenuEntry::Row(row) => (
+                            runtime.composer_row_action(row),
+                            // A row that closes the menu takes the search
+                            // with it, so typing returns to the draft; a
+                            // chooser or the fork picker takes focus itself.
+                            !matches!(row, ComposerRow::Attach | ComposerRow::Fork),
+                        ),
+                        MenuEntry::Named(name) => (
+                            Action::ComposerName(target, name.insertion.into_owned()),
+                            false,
+                        ),
+                    })
+                else {
+                    return Task::none();
+                };
+                // Through the app's own dispatch, so every guard a pressed row
+                // passes, such as a remote device refusing local files, holds
+                // for Enter too.
+                let task = self.update(Message::ChatUi(chosen));
+                if !refocus {
+                    return task;
+                }
+                return task.chain(
+                    iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
+                        .map(cosmic::Action::App),
+                );
             }
             Action::ComposerName(target, insertion) => {
                 let transitioning = self.chat_ui.phases.contains_key(&target.card);
@@ -27126,6 +27163,9 @@ mod tests {
         );
         drop(app.handle_chat_ui(Action::ComposerActionsQuery(target, "re".into())));
         assert_eq!(entries(&app)[0].0, "/review");
+        // A slash typed out of habit is not part of the name searched for.
+        drop(app.handle_chat_ui(Action::ComposerActionsQuery(target, "/Rev".into())));
+        assert_eq!(entries(&app), [("/review".to_owned(), true)]);
         // Reopening starts a new search.
         drop(app.handle_chat_ui(Action::ComposerActions(target, false)));
         drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
@@ -27185,7 +27225,19 @@ mod tests {
             runtime.composer.text(),
             "/release-notes summarize\nthe change."
         );
+        // A message opening with a command stays one: the skill goes at the
+        // caret, where the hint says it is sent as words.
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text("/review the change"));
+        runtime.composer_action(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        drop(app.handle_chat_ui(Action::ComposerName(target, "/release-notes".into())));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "/review the change /release-notes "
+        );
         // Punctuation the draft opens with is set apart from the name.
+        let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.replace_draft(text_editor::Content::with_text("(quick) notes"));
         drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
         drop(app.handle_chat_ui(Action::ComposerName(target, "/release-notes".into())));
