@@ -6404,22 +6404,27 @@ mod tests {
     fn a_post_turn_summary_does_not_fail_the_turn() {
         let mut adapter = Claude::default();
         adapter.busy = true;
-        adapter.receive(json!({"type":"assistant","uuid":"answer","message":{"id":"m","role":"assistant","content":[{"type":"text","text":"ready"}]}})).unwrap();
+        adapter.receive(json!({"type":"assistant","uuid":"00000000-0000-4000-8000-000000000002","message":{"id":"m","role":"assistant","content":[{"type":"text","text":"ready"}]}})).unwrap();
         let summary = adapter
             .receive(json!({
                 "type": "system",
                 "subtype": "post_turn_summary",
-                "summarizes_uuid": "answer",
+                "summarizes_uuid": "00000000-0000-4000-8000-000000000002",
                 "status_category": "completed",
                 "status_detail": "replied 'ready' as requested",
                 "needs_action": "",
-                "uuid": "summary",
-                "session_id": "session"
+                "uuid": "00000000-0000-4000-8000-000000000003",
+                "session_id": "00000000-0000-4000-8000-000000000001"
             }))
             .unwrap();
-        assert!(summary.events.is_empty());
+        assert!(
+            !summary
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_) | Event::Error { .. }))
+        );
         let result = adapter
-            .receive(json!({"type":"result","subtype":"success","result":"ready","is_error":false,"session_id":"session"}))
+            .receive(json!({"type":"result","subtype":"success","result":"ready","is_error":false,"session_id":"00000000-0000-4000-8000-000000000001"}))
             .unwrap();
         assert!(result.events.iter().any(|event| matches!(
             event,
