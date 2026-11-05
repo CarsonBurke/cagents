@@ -337,6 +337,32 @@ mod tests {
     }
     use super::*;
 
+    #[test]
+    fn pane_menu_hints_follow_configured_focused_target_only() {
+        use widget::menu::Action as _;
+        let id = CardId::new();
+        let mut shortcuts = crate::settings::KeyboardShortcuts::default();
+        shortcuts.close_focused_column = vec!["Ctrl+Alt+F5".into()];
+        let bindings = pane_menu_bindings(id, true, &shortcuts);
+        let (key, action) = bindings
+            .iter()
+            .find(|(_, action)| matches!(action.1, PaneMenuCommand::Close))
+            .unwrap();
+        assert!(key.matches(
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+            &keyboard::Key::Named(keyboard::key::Named::F5),
+            None
+        ));
+        assert!(matches!(action.message(), Message::CloseCard(target) if target == id));
+        assert!(pane_menu_bindings(id, false, &shortcuts).is_empty());
+        shortcuts.close_focused_column.clear();
+        assert!(
+            !pane_menu_bindings(id, true, &shortcuts)
+                .values()
+                .any(|action| matches!(action.1, PaneMenuCommand::Close))
+        );
+    }
+
     /// Retain the actual Settings pane while rename and palette modals change.
     /// Apply runtime operations to every real control in this same tree.
     fn rename_fixture_view(app: &Cagents) -> Element<'_, Message> {
@@ -1436,6 +1462,32 @@ enum PaneMenuCommand {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PaneMenu(CardId, PaneMenuCommand);
+
+// These shortcuts act on the focused pane. Do not advertise them on an
+// unrelated tab's context menu as if they targeted that tab.
+fn pane_menu_bindings(
+    id: CardId,
+    focused: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
+) -> HashMap<widget::menu::KeyBind, PaneMenu> {
+    if !focused {
+        return HashMap::new();
+    }
+    crate::interaction::menu_shortcuts([
+        (
+            shortcuts.rename_pane.as_slice(),
+            PaneMenu(id, PaneMenuCommand::Rename),
+        ),
+        (
+            shortcuts.clone_pane.as_slice(),
+            PaneMenu(id, PaneMenuCommand::Clone),
+        ),
+        (
+            shortcuts.close_focused_column.as_slice(),
+            PaneMenu(id, PaneMenuCommand::Close),
+        ),
+    ])
+}
 
 impl widget::menu::Action for PaneMenu {
     type Message = Message;
@@ -3241,38 +3293,24 @@ impl Cagents {
             let mut entries: Vec<widget::menu::Item<PaneMenu, String>> = vec![
                 widget::menu::Item::Button(
                     "Rename…".into(),
-                    None,
+                    Some(Icon::Rename.handle()),
                     PaneMenu(id, PaneMenuCommand::Rename),
                 ),
                 widget::menu::Item::Button(
                     "Clone pane".into(),
-                    None,
+                    Some(Icon::Duplicate.handle()),
                     PaneMenu(id, PaneMenuCommand::Clone),
                 ),
+                widget::menu::Item::Divider,
                 widget::menu::Item::Button(
                     "Copy path".into(),
-                    None,
+                    Some(Icon::CopyPath.handle()),
                     PaneMenu(id, PaneMenuCommand::CopyPath),
                 ),
                 widget::menu::Item::Button(
                     "Reveal in Projects".into(),
-                    None,
+                    Some(Icon::OpenFolder.handle()),
                     PaneMenu(id, PaneMenuCommand::Reveal),
-                ),
-                widget::menu::Item::Button(
-                    "Close other panes".into(),
-                    None,
-                    PaneMenu(id, PaneMenuCommand::CloseOthers),
-                ),
-                widget::menu::Item::Button(
-                    "Close panes to the right".into(),
-                    None,
-                    PaneMenu(id, PaneMenuCommand::CloseToRight),
-                ),
-                widget::menu::Item::Button(
-                    "Close pane".into(),
-                    None,
-                    PaneMenu(id, PaneMenuCommand::Close),
                 ),
             ];
             if self.chat_switch_available(id) && self.chat_switch_ready(id) {
@@ -3315,7 +3353,28 @@ impl Cagents {
                     PaneMenu(id, PaneMenuCommand::MoveToChannel),
                 ));
             }
-            widget::menu::items(&HashMap::new(), entries)
+            entries.push(widget::menu::Item::Divider);
+            entries.extend([
+                widget::menu::Item::Button(
+                    "Close other panes".into(),
+                    Some(Icon::Close.handle()),
+                    PaneMenu(id, PaneMenuCommand::CloseOthers),
+                ),
+                widget::menu::Item::Button(
+                    "Close panes to the right".into(),
+                    Some(Icon::Close.handle()),
+                    PaneMenu(id, PaneMenuCommand::CloseToRight),
+                ),
+                widget::menu::Item::Button(
+                    "Close pane".into(),
+                    Some(Icon::Close.handle()),
+                    PaneMenu(id, PaneMenuCommand::Close),
+                ),
+            ]);
+            widget::menu::items(
+                &pane_menu_bindings(id, focused, &self.settings.keyboard_shortcuts),
+                entries,
+            )
         })
     }
 

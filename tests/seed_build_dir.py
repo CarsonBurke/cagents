@@ -10,6 +10,11 @@ import time
 import unittest
 
 
+CARGO_TAG = (
+    "Signature: 8a477f597d28d172789f06886806bc55\n"
+    "# This file is a cache directory tag created by cargo.\n"
+    "# For information about cache directory tags see https://bford.info/cachedir/\n"
+)
 SEED = Path(__file__).resolve().parents[1] / "scripts/seed-build-dir"
 
 
@@ -93,15 +98,22 @@ class SeedBuildDirApplicability(unittest.TestCase):
                 break
         return subprocess.CompletedProcess(blocks, result.returncode, stdout, stderr)
 
+    def other_shell_scripts(self, root):
+        """The scripts the shell-syntax step checks besides the seeder's, as a
+        head that predates the seeder still has them."""
+        (root / "scripts").mkdir()
+        for line in self.syntax_block.splitlines():
+            words = line.split()
+            if len(words) == 3 and words[:2] in (["sh", "-n"], ["bash", "-n"]):
+                if words[2] != self.source and words[2].startswith("scripts/"):
+                    (root / words[2]).write_text("#!/bin/sh\nexit 0\n")
+
     def assert_not_executed(self, root):
         self.assertFalse((root / "calls.json").exists())
 
     def test_old_head_without_seeder_passes_all_seeder_workflow_steps(self):
         root = self.case("old-head")
-        (root / "scripts").mkdir()
-        # Other shell-syntax inputs remain present at this historical head.
-        for name in ("run-development", "check-format"):
-            (root / "scripts" / name).write_text("#!/bin/sh\nexit 0\n")
+        self.other_shell_scripts(root)
         result = self.invoke(root, whole_seeder_path=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Not applicable: build directory seeding (source and fixture both absent at this head)\n",
@@ -112,9 +124,7 @@ class SeedBuildDirApplicability(unittest.TestCase):
 
     def test_shell_syntax_step_also_accepts_a_head_without_the_seeder(self):
         root = self.case("old-shell-syntax")
-        (root / "scripts").mkdir()
-        for name in ("run-development", "check-format"):
-            (root / "scripts" / name).write_text("#!/bin/sh\nexit 0\n")
+        self.other_shell_scripts(root)
         result = self.invoke(root, blocks=[self.syntax_block])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_not_executed(root)
@@ -251,6 +261,8 @@ class SeedBuildDir(unittest.TestCase):
             self.assertTrue((self.destination / profile / ".fingerprint/zstd-sys-1/lib-zstd").is_file())
             # Incremental caches belong to the checkout's own crates.
             self.assertFalse((self.destination / profile / "incremental").exists())
+        # Cargo tags only directories it creates; the pruner needs the tag.
+        self.assertEqual((self.destination / "CACHEDIR.TAG").read_text(), CARGO_TAG)
         leftovers = [path.name for path in self.destination.iterdir() if path.name.startswith(".seeding")]
         self.assertEqual(leftovers, [])
         # Seeded once, it is a build directory like any other.
@@ -279,10 +291,20 @@ class SeedBuildDir(unittest.TestCase):
 
     def test_a_built_directory_is_left_alone(self):
         (self.destination / "debug/.fingerprint").mkdir(parents=True)
+        (self.destination / ".seed-lock").touch()
         result = self.seed()
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         self.assertFalse((self.destination / "debug/deps").exists())
         self.assertFalse((self.destination / "dev-runtime").exists())
+        # Seeded before seeding tagged directories, it still gets the tag.
+        self.assertEqual((self.destination / "CACHEDIR.TAG").read_text(), CARGO_TAG)
+        # A directory Cargo built itself, such as the main checkout's, is not
+        # made prunable.
+        (self.destination / "CACHEDIR.TAG").unlink()
+        (self.destination / ".seed-lock").unlink()
+        result = self.seed()
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertFalse((self.destination / "CACHEDIR.TAG").exists())
 
     def test_nothing_to_copy_or_opted_out_does_nothing(self):
         for name, run in (
@@ -310,7 +332,9 @@ class SeedBuildDir(unittest.TestCase):
             result = self.seed()
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("cannot reflink", result.stderr)
-            self.assertEqual(sorted(path.name for path in self.destination.iterdir()), [".seed-lock"])
+            # Unbuilt, but tagged: Cargo will not tag a directory it did not create.
+            self.assertEqual(sorted(path.name for path in self.destination.iterdir()),
+                             [".seed-lock", "CACHEDIR.TAG"])
 
 
 if __name__ == "__main__":

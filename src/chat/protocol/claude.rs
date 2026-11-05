@@ -516,6 +516,9 @@ struct Claude {
     /// so the notification that follows it does not show it again.
     handed_back: VecDeque<String>,
     background_agents: HashSet<String>,
+    /// Agents whose settled run `SendMessage` started again: their tool row
+    /// still shows the earlier outcome, which the next receipt must replace.
+    restarted_agents: VecDeque<String>,
     /// The agent ID Claude Code gave each agent it runs in the background,
     /// with the Agent tool call that started it, oldest first. A task's frames
     /// name the agent by this ID, and after `SendMessage` resumes it, by no
@@ -1492,6 +1495,9 @@ impl Claude {
         } else {
             Vec::new()
         };
+        if fresh_live_carrier && role == Role::User && child.is_none() && !model_only(frame) {
+            self.settle_live_notifications(frame, step);
+        }
         // Explicit meta context is model-only. The wire isSynthetic marker is
         // broader: it also covers intentionally visible compact summaries.
         if delivered.is_empty() && frame["isMeta"].as_bool() == Some(true) {
@@ -1945,6 +1951,226 @@ impl Claude {
         }
         Ok(())
     }
+    fn agent_tool(&self, tool: &str) -> bool {
+        self.unique_tool_named(tool, "Agent")
+    }
+
+    fn unique_tool_named(&self, tool: &str, expected: &str) -> bool {
+        let mut candidates = self.tools.iter().filter(|(key, _)| key.id == tool);
+        candidates.next().is_some_and(
+            |(_, item)| matches!(&item.content, ItemContent::Tool { name, .. } if name == expected),
+        ) && candidates.next().is_none()
+    }
+
+    /// Notifications have no transcript scope. Resolve only one existing Agent,
+    /// and never let a contradictory tool hint retarget a known task owner.
+    fn task_agent(
+        &self,
+        task: &str,
+        reported: Option<&str>,
+        started: bool,
+    ) -> Result<Option<String>, ()> {
+        let launched = self
+            .agent_calls
+            .iter()
+            .find(|(agent, _)| agent == task)
+            .map(|(_, tool)| tool.as_str());
+        let bindings = || {
+            self.agent_task_calls
+                .iter()
+                .filter(|(_, known)| known == task)
+        };
+        let owner = launched
+            .or_else(|| {
+                bindings()
+                    .find(|(tool, _)| self.agent_tool(tool))
+                    .map(|(tool, _)| tool.as_str())
+            })
+            .or_else(|| bindings().next().map(|(tool, _)| tool.as_str()));
+        if let Some(owner) = owner {
+            if (self.tools.keys().any(|key| key.id == owner) && !self.agent_tool(owner))
+                || bindings().any(|(tool, _)| {
+                    tool != owner
+                        && (self.agent_tool(tool)
+                            || (launched.is_none() && !self.agent_tool(owner)))
+                })
+            {
+                return Err(());
+            }
+            // SendMessage names its own call when it restarts an Agent. That
+            // alias is valid on the start, on its already recorded task, or
+            // when it is that SendMessage call: a resumed run's start need not
+            // name it, but its receipt does.
+            if reported.is_some_and(|tool| {
+                tool != owner
+                    && (self.agent_tool(tool)
+                        || (!started
+                            && !self.unique_tool_named(tool, "SendMessage")
+                            && !bindings().any(|(known, _)| known == tool)))
+            }) {
+                return Err(());
+            }
+            // A task can arrive before its Agent tool. Retain its bounded
+            // lifecycle binding without inventing that Agent's presentation.
+            return Ok(Some(owner.to_owned()));
+        }
+        let Some(tool) = reported.filter(|tool| self.agent_tool(tool)) else {
+            return Ok(None);
+        };
+        // A launch acknowledgement's agentId need not match the task ID that
+        // later reports on it. While the reported Agent is still running in the
+        // background, that acknowledgement alone does not contradict its tool.
+        if !started
+            && (self
+                .agent_task_calls
+                .iter()
+                .any(|(known, bound)| known == tool && bound != task)
+                || (!self.background_agents.contains(tool)
+                    && self
+                        .agent_calls
+                        .iter()
+                        .any(|(bound, known)| known == tool && bound != task)))
+        {
+            return Err(());
+        }
+        Ok(Some(tool.to_owned()))
+    }
+
+    /// Shared live-text/system lifecycle reducer. A terminal receipt preserves
+    /// an earlier stop; only an actual task_started can restart that owner.
+    fn update_task_agent(
+        &mut self,
+        task: &str,
+        owner: Option<&str>,
+        started: bool,
+        ended: Option<ToolStatus>,
+        status: ToolStatus,
+        step: &mut Step,
+    ) -> ToolStatus {
+        let Some(tool) = owner else { return status };
+        let background = self.background_agents.contains(tool)
+            || self
+                .agent_calls
+                .iter()
+                .any(|(agent, known)| agent == task && known == tool);
+        let status = if started {
+            self.ended_agents.retain(|(known, _)| known != tool);
+            if self
+                .tools
+                .get(&ScopedId::new(None, tool))
+                .and_then(|item| item.content.status())
+                .is_some_and(|status| status != ToolStatus::Running)
+            {
+                if !self.restarted_agents.iter().any(|known| known == tool) {
+                    self.restarted_agents.push_back(tool.into());
+                    if self.restarted_agents.len() > MAX_TOOLS {
+                        self.restarted_agents.pop_front();
+                    }
+                }
+            }
+            ToolStatus::Running
+        } else if ended.is_some() && self.ended_agent(tool) == Some(ToolStatus::Stopped) {
+            ToolStatus::Stopped
+        } else {
+            status
+        };
+        if !started && ended.is_some() {
+            self.tasks.retain(|running| running != task);
+            if self.ended_agent(tool) != Some(ToolStatus::Stopped) {
+                self.ended_agents.retain(|(known, _)| known != tool);
+                self.ended_agents.push_back((tool.into(), status));
+                if self.ended_agents.len() > MAX_TOOLS {
+                    self.ended_agents.pop_front();
+                }
+            }
+        }
+        // The child's own result already settled this Agent with its exact
+        // diagnostic. Repeating the same terminal status would clear it.
+        let settled = !started
+            && ended.is_some()
+            && !self.background_agents.contains(tool)
+            && !self.restarted_agents.iter().any(|known| known == tool)
+            && self
+                .tools
+                .get(&ScopedId::new(None, tool))
+                .and_then(|item| item.content.status())
+                == Some(status);
+        if !settled
+            && (self.agent_tool(tool) || background)
+            && (background || started || ended.is_some())
+        {
+            step.events.push(Event::Subagent {
+                model: None,
+                waiting: None,
+                detail: None,
+                id: tool.into(),
+                kind: String::new(),
+                description: String::new(),
+                status: Some(status),
+                background: background.then_some(true),
+            });
+            if background && status == ToolStatus::Running {
+                self.background_agents.insert(tool.into());
+            } else if status != ToolStatus::Running {
+                self.background_agents.remove(tool);
+                self.restarted_agents.retain(|known| known != tool);
+            }
+        }
+        status
+    }
+
+    fn settle_live_notifications(&mut self, frame: &Value, step: &mut Step) {
+        let Some(content) = recorded_notification(frame) else {
+            return;
+        };
+        // A result is opaque and may quote an unclosed notification opener.
+        // Keep the outcome parser's fallback only when both that result and
+        // its outer notification close; truncated live reports stay inert.
+        let closed_result = content
+            .split_once(NOTIFICATION_OPEN)
+            .and_then(|(_, outer)| outer.trim_end().strip_suffix("</task-notification>"))
+            .and_then(|inner| inner.split_once("<result>"))
+            .is_some_and(|(_, result)| result.trim_end().ends_with("</result>"));
+        if notification_elements(&content).is_empty() && !closed_result {
+            return;
+        }
+        for (reported, task, status) in notification_outcomes(&content) {
+            if task.is_empty() {
+                continue;
+            }
+            // Only an Agent's notice settles its task. Other tasks, such as a
+            // Monitor, notify while they still run, and an unmatched advisory
+            // remains a Delivery rather than an invented task.
+            let Ok(Some(owner)) = self.task_agent(
+                &task,
+                (!reported.is_empty()).then_some(reported.as_str()),
+                false,
+            ) else {
+                continue;
+            };
+            let id = format!("claude-task:{task}");
+            let key = ScopedId::new(None, &id);
+            let status =
+                self.update_task_agent(&task, Some(&owner), false, Some(status), status, step);
+            self.tasks.retain(|running| running != &task);
+            let represented = self.agent_tool(&owner);
+            if let Some(item) = self.tools.get_mut(&key)
+                && let ItemContent::Tool {
+                    status: current, ..
+                } = &mut item.content
+            {
+                *current = status;
+                if represented {
+                    if self.visible_task_rows.remove(&id) {
+                        step.events.push(Event::ItemsRemoved { ids: vec![id] });
+                    }
+                } else if self.visible_task_rows.contains(&id) {
+                    step.events.push(Event::Item(item.clone()));
+                }
+            }
+        }
+    }
+
     fn agent_call(&mut self, agent: &str, tool: &str) {
         self.agent_calls.retain(|(known, _)| known != agent);
         self.agent_calls.push_back((agent.into(), tool.into()));
@@ -4838,6 +5064,25 @@ impl Claude {
             ))),
             "task_started" | "task_progress" | "task_notification" | "task_updated" => {
                 let task = required(frame, "task_id")?;
+                let started = string(frame, "subtype") == "task_started";
+                let Ok(known_tool) = self.task_agent(task, frame["tool_use_id"].as_str(), started)
+                else {
+                    // Contradictory advisory identities do not retarget an
+                    // existing owner or make the conversation fail.
+                    return Ok(());
+                };
+                let known_tool = known_tool.or_else(|| {
+                    // Preserve unresolved local-agent lifecycle metadata and
+                    // its fallback task row before the Agent tool arrives.
+                    (started && string(frame, "task_type") == "local_agent")
+                        .then(|| {
+                            frame["tool_use_id"]
+                                .as_str()
+                                .filter(|tool| !tool.is_empty())
+                                .map(str::to_owned)
+                        })
+                        .flatten()
+                });
                 let id = format!("claude-task:{task}");
                 let previous = self.tools.get(&ScopedId::new(None, &id)).cloned();
                 let mut item = previous.unwrap_or(Item {
@@ -4903,82 +5148,25 @@ impl Claude {
                         *status
                     });
                 }
-                let parent = frame["tool_use_id"]
-                    .as_str()
-                    .filter(|parent| self.background_agents.contains(*parent))
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        self.agent_calls
-                            .iter()
-                            .find(|(agent, _)| agent == task)
-                            .map(|(_, tool)| tool.clone())
-                    });
-                // Keep task identity even after removing a stopped agent from
-                // the running set: its tool result can arrive afterwards.
-                let known_tool = parent.clone().or_else(|| {
-                    self.agent_task_calls
-                        .iter()
-                        .find(|(_, known)| known == task)
-                        .map(|(tool, _)| tool.clone())
-                });
                 // Lifecycle bookkeeping and notification summaries still need
                 // the synthetic tool. Only its duplicate presentation is hidden.
                 let represented = known_tool
                     .as_deref()
                     .or_else(|| frame["tool_use_id"].as_str())
-                    .is_some_and(|tool| {
-                        // Task notifications do not identify a transcript. A
-                        // unique nested Agent is valid prior correlation, but
-                        // an opaque ID shared by multiple scopes is ambiguous.
-                        let mut candidates = self.tools.iter().filter(|(key, _)| key.id == tool);
-                        let candidate = candidates.next();
-                        candidate.is_some_and(|(_, item)| matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent"))
-                            && candidates.next().is_none()
-                    });
-                if let Some(tool) = &known_tool {
-                    if string(frame, "subtype") == "task_started" {
-                        self.ended_agents.retain(|(known, _)| known != tool);
-                    } else if let Some(ended) = ended
-                        && self.ended_agent(tool) != Some(ToolStatus::Stopped)
-                    {
-                        self.ended_agents.retain(|(known, _)| known != tool);
-                        self.ended_agents.push_back((tool.clone(), ended));
-                        if self.ended_agents.len() > MAX_TOOLS {
-                            self.ended_agents.pop_front();
-                        }
-                    }
-                }
-                if let Some(parent) = parent {
-                    let status = item.content.status().unwrap_or(ToolStatus::Running);
-                    step.events.push(Event::Subagent {
-                        model: None,
-                        waiting: None,
-                        detail: None,
-                        id: parent.clone(),
-                        kind: String::new(),
-                        description: String::new(),
-                        status: Some(status),
-                        background: Some(true),
-                    });
-                    if status == ToolStatus::Running {
-                        self.background_agents.insert(parent);
-                    } else {
-                        self.background_agents.remove(&parent);
-                    }
-                } else if (ended == Some(ToolStatus::Stopped)
-                    || string(frame, "subtype") == "task_started")
-                    && let Some(tool) = known_tool
+                    .is_some_and(|tool| self.agent_tool(tool));
+                let status = self.update_task_agent(
+                    task,
+                    known_tool.as_deref(),
+                    started,
+                    ended,
+                    item.content.status().unwrap_or(ToolStatus::Running),
+                    step,
+                );
+                if let ItemContent::Tool {
+                    status: current, ..
+                } = &mut item.content
                 {
-                    step.events.push(Event::Subagent {
-                        model: None,
-                        waiting: None,
-                        detail: None,
-                        id: tool,
-                        kind: String::new(),
-                        description: String::new(),
-                        status: Some(ended.unwrap_or(ToolStatus::Running)),
-                        background: None,
-                    });
+                    *current = status;
                 }
                 self.tool(None, item.clone());
                 if represented {
@@ -7869,6 +8057,35 @@ mod tests {
             "{:?}",
             state.outcome
         );
+    }
+
+    #[test]
+    fn a_foreground_agent_restarted_by_send_message_settles_from_its_next_receipt() {
+        let frames = vec![
+            json!({"type":"stream_event","uuid":"restart-parent-start","event":{"type":"message_start","message":{"id":"restart-parent"}}}),
+            scoped_call(None, "launch-restart", "restart-child", "Agent", json!({})),
+            json!({"type":"system","subtype":"task_started","task_id":"restart-task","tool_use_id":"restart-child","task_type":"local_agent"}),
+            json!({"type":"user","uuid":"restart-first-result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"restart-child","content":"First report.","is_error":false}]}}),
+            // SendMessage resumes the same agent after its row settled.
+            json!({"type":"system","subtype":"task_started","task_id":"restart-task","task_type":"local_agent"}),
+            json!({"type":"system","subtype":"task_notification","uuid":"restart-notification","task_id":"restart-task","status":"completed","summary":"Second report"}),
+            json!({"type":"result","uuid":"restart-parent-result","subtype":"success","is_error":false}),
+        ];
+        let (_, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(Claude {
+                busy: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "restart-child")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Succeeded);
+        assert!(!state.is_working());
     }
 
     #[test]
@@ -12002,6 +12219,459 @@ mod tests {
             );
         }
         assert_eq!(adapter.visible_task_rows.len(), 3);
+    }
+
+    fn notification_agent(adapter: &mut Claude, tool: &str, task: &str, background: bool) {
+        adapter.receive(json!({"type":"assistant","uuid":format!("launch-{tool}"),"message":{"id":format!("message-{tool}"),"content":[{"type":"tool_use","id":tool,"name":"Agent","input":{"run_in_background":background}}]}})).unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"})).unwrap();
+    }
+
+    fn notification_frame(uuid: &str, tool: &str, task: &str, status: &str) -> Value {
+        json!({"type":"user","uuid":uuid,"origin":{"kind":"task-notification"},"message":{"role":"user","content":format!("<task-notification>\n<task-id>{task}</task-id>\n<tool-use-id>{tool}</tool-use-id>\n<status>{status}</status>\n<summary>Agent finished</summary>\n<result>Exact report</result>\n</task-notification>")}})
+    }
+
+    fn notification_agent_statuses(step: &Step, tool: &str) -> Vec<ToolStatus> {
+        step.events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Subagent { id, status, .. } if id == tool => *status,
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn live_recorded_notifications_settle_the_bound_agent_without_a_second_delivery() {
+        for (status, expected) in [
+            ("completed", ToolStatus::Succeeded),
+            ("failed", ToolStatus::Failed),
+        ] {
+            for explicit_origin in [false, true] {
+                let mut adapter = Claude::default();
+                notification_agent(&mut adapter, "tool-one", "task-one", true);
+                notification_agent(&mut adapter, "tool-two", "task-two", true);
+                assert!(
+                    adapter.agent_calls.is_empty(),
+                    "no async-ID acknowledgement yet"
+                );
+                let mut frame = notification_frame("text-finished", "tool-one", "task-one", status);
+                if !explicit_origin {
+                    frame.as_object_mut().unwrap().remove("origin");
+                }
+                let expected_delivery = delivery(&frame);
+                let step = adapter.receive(frame).unwrap();
+                assert_eq!(notification_agent_statuses(&step, "tool-one"), [expected]);
+                assert!(notification_agent_statuses(&step, "tool-two").is_empty());
+                assert_eq!(
+                    items(&step),
+                    expected_delivery,
+                    "one original Delivery, no fallback duplicate"
+                );
+                assert!(!adapter.tasks.iter().any(|id| id == "task-one"));
+                assert!(adapter.tasks.iter().any(|id| id == "task-two"));
+                assert!(!adapter.background_agents.contains("tool-one"));
+                assert!(adapter.background_agents.contains("tool-two"));
+                assert_eq!(adapter.ended_agent("tool-one"), Some(expected));
+                assert_eq!(
+                    adapter.tools[&ScopedId::new(None, "claude-task:task-one")]
+                        .content
+                        .status(),
+                    Some(expected)
+                );
+                assert!(adapter.visible_task_rows.is_empty());
+            }
+        }
+    }
+
+    /// After `SendMessage` resumes a settled background Agent, the new run's
+    /// start need not name a call, but its receipt names the `SendMessage`
+    /// call rather than the Agent's own.
+    #[test]
+    fn a_resumed_background_agent_settles_from_a_receipt_naming_send_message() {
+        for text_receipt in [false, true] {
+            let mut adapter = Claude::default();
+            notification_agent(&mut adapter, "agent-call", "agent-task", true);
+            adapter
+                .receive(notification_frame(
+                    "first-receipt",
+                    "agent-call",
+                    "agent-task",
+                    "completed",
+                ))
+                .unwrap();
+            assert_eq!(
+                adapter.ended_agent("agent-call"),
+                Some(ToolStatus::Succeeded)
+            );
+            adapter.receive(json!({"type":"assistant","uuid":"resume-call","message":{"id":"resume-message","content":[{"type":"tool_use","id":"send-call","name":"SendMessage","input":{"to":"agent-task","message":"Check again"}}]}})).unwrap();
+            let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"agent-task","task_type":"local_agent"})).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&started, "agent-call"),
+                [ToolStatus::Running]
+            );
+            let receipt = if text_receipt {
+                notification_frame("second-receipt", "send-call", "agent-task", "failed")
+            } else {
+                json!({"type":"system","subtype":"task_notification","uuid":"second-receipt","task_id":"agent-task","tool_use_id":"send-call","status":"failed","summary":"Agent failed"})
+            };
+            let settled = adapter.receive(receipt).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&settled, "agent-call"),
+                [ToolStatus::Failed],
+                "text receipt: {text_receipt}"
+            );
+            assert_eq!(adapter.ended_agent("agent-call"), Some(ToolStatus::Failed));
+            assert!(adapter.restarted_agents.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_send_message_alias_never_settles_the_agent_it_resumed_for_another_task() {
+        let mut adapter = Claude::default();
+        notification_agent(&mut adapter, "call-a", "task-a", true);
+        notification_agent(&mut adapter, "call-b", "task-b", true);
+        adapter.receive(json!({"type":"assistant","uuid":"resume-b","message":{"id":"resume-b","content":[{"type":"tool_use","id":"send-b","name":"SendMessage","input":{"to":"task-b","message":"Again"}}]}})).unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task-b","task_type":"local_agent"})).unwrap();
+        let step = adapter
+            .receive(notification_frame(
+                "receipt-a",
+                "send-b",
+                "task-a",
+                "completed",
+            ))
+            .unwrap();
+        assert_eq!(
+            notification_agent_statuses(&step, "call-a"),
+            [ToolStatus::Succeeded]
+        );
+        assert!(notification_agent_statuses(&step, "call-b").is_empty());
+        assert!(adapter.background_agents.contains("call-b"));
+        assert_eq!(adapter.ended_agent("call-b"), None);
+    }
+
+    #[test]
+    fn a_live_quoted_report_settles_only_its_closed_outer_notification() {
+        let quoting = "<task-notification>\n<task-id>task-one</task-id>\n<tool-use-id>tool-one</tool-use-id>\n<status>completed</status>\n<summary>Agent finished</summary>\n<result>The log shows:\n<task-notification>\n<task-id>task-two</task-id>\n<tool-use-id>tool-two</tool-use-id>\n<status>failed</status>\n</result>\n</task-notification>";
+        let quoted_close = quoting.replace("</result>", "</task-notification>\n</result>");
+        for (label, content, settled) in [
+            ("closed", quoting.to_owned(), true),
+            (
+                "outer-open",
+                quoting
+                    .strip_suffix("</task-notification>")
+                    .unwrap()
+                    .to_owned(),
+                false,
+            ),
+            ("result-open", quoting.replace("</result>", ""), false),
+            (
+                "only-quoted-close",
+                quoted_close
+                    .strip_suffix("</task-notification>")
+                    .unwrap()
+                    .to_owned(),
+                false,
+            ),
+        ] {
+            let mut adapter = Claude::default();
+            notification_agent(&mut adapter, "tool-one", "task-one", true);
+            notification_agent(&mut adapter, "tool-two", "task-two", true);
+            let frame = json!({"type":"user","uuid":label,"origin":{"kind":"task-notification"},"message":{"content":content}});
+            let expected_delivery = delivery(&frame);
+            assert!(matches!(
+                expected_delivery.as_slice(),
+                [ItemContent::Delivery { .. }]
+            ));
+            let step = adapter.receive(frame).unwrap();
+            assert_eq!(
+                items(&step),
+                expected_delivery,
+                "{label}: original Delivery exactly once"
+            );
+            assert_eq!(
+                notification_agent_statuses(&step, "tool-one"),
+                if settled {
+                    vec![ToolStatus::Succeeded]
+                } else {
+                    Vec::new()
+                },
+                "{label}"
+            );
+            assert!(
+                notification_agent_statuses(&step, "tool-two").is_empty(),
+                "{label}: quoted identity is inert"
+            );
+            assert_eq!(
+                adapter.background_agents.contains("tool-one"),
+                !settled,
+                "{label}"
+            );
+            assert_eq!(
+                adapter.tasks.iter().any(|id| id == "task-one"),
+                !settled,
+                "{label}"
+            );
+            assert_eq!(
+                adapter.ended_agent("tool-one"),
+                settled.then_some(ToolStatus::Succeeded),
+                "{label}"
+            );
+            assert!(adapter.background_agents.contains("tool-two"), "{label}");
+            assert!(adapter.tasks.iter().any(|id| id == "task-two"), "{label}");
+            assert_eq!(adapter.ended_agent("tool-two"), None, "{label}");
+            assert!(adapter.visible_task_rows.is_empty(), "{label}");
+        }
+    }
+
+    #[test]
+    fn task_only_completed_and_failed_notifications_settle_before_async_id_ack() {
+        for (status, expected) in [
+            ("completed", ToolStatus::Succeeded),
+            ("failed", ToolStatus::Failed),
+        ] {
+            for background in [false, true] {
+                let mut adapter = Claude::default();
+                notification_agent(&mut adapter, "tool-one", "task-one", background);
+                assert!(adapter.agent_calls.is_empty());
+                let step = adapter.receive(json!({"type":"system","subtype":"task_notification","uuid":"task-only","task_id":"task-one","status":status})).unwrap();
+                assert_eq!(notification_agent_statuses(&step, "tool-one"), [expected]);
+                assert!(step.events.iter().any(|event| matches!(event, Event::Subagent { id, background: reported, .. } if id == "tool-one" && *reported == background.then_some(true))));
+                assert!(!adapter.background_agents.contains("tool-one"));
+                assert!(adapter.tasks.is_empty());
+                assert_eq!(adapter.ended_agent("tool-one"), Some(expected));
+                assert!(adapter.visible_task_rows.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn notification_settlement_ignores_partial_human_unmatched_and_conflicting_identities() {
+        let full = notification_frame("negative", "tool-one", "task-one", "completed");
+        let mut human = full.clone();
+        human["origin"]["kind"] = json!("human");
+        let mut partial = full.clone();
+        partial["message"]["content"] = json!(
+            "<task-notification><task-id>task-one</task-id><tool-use-id>tool-one</tool-use-id><status>completed</status>"
+        );
+        let mut quoted = full.clone();
+        quoted.as_object_mut().unwrap().remove("origin");
+        quoted["message"]["content"] = json!(format!(
+            "Ordinary quoted text: {}",
+            full["message"]["content"].as_str().unwrap()
+        ));
+        let mut child = full.clone();
+        child["parent_tool_use_id"] = json!("tool-two");
+        let frames = [
+            human,
+            partial,
+            quoted,
+            child,
+            notification_frame("missing-task", "tool-one", "", "completed"),
+            notification_frame("unknown", "foreign-tool", "foreign-task", "failed"),
+            notification_frame("wrong-task", "tool-one", "foreign-task", "completed"),
+            notification_frame("foreign-hint", "foreign-tool", "task-one", "completed"),
+            notification_frame("wrong-tool", "tool-two", "task-one", "completed"),
+            json!({"type":"system","subtype":"task_notification","task_id":"task-one","tool_use_id":"tool-two","status":"completed"}),
+        ];
+        for frame in frames {
+            let mut adapter = Claude::default();
+            notification_agent(&mut adapter, "tool-one", "task-one", true);
+            notification_agent(&mut adapter, "tool-two", "task-two", true);
+            let step = adapter.receive(frame).unwrap();
+            assert!(notification_agent_statuses(&step, "tool-one").is_empty());
+            assert!(notification_agent_statuses(&step, "tool-two").is_empty());
+            assert_eq!(
+                adapter.tasks.iter().cloned().collect::<Vec<_>>(),
+                ["task-one", "task-two"]
+            );
+            assert_eq!(adapter.background_agents.len(), 2);
+            assert!(adapter.ended_agents.is_empty());
+            assert_eq!(
+                adapter.tools[&ScopedId::new(None, "claude-task:task-one")]
+                    .content
+                    .status(),
+                Some(ToolStatus::Running)
+            );
+        }
+        for parent in [None, Some("nested-parent")] {
+            let mut adapter = Claude::default();
+            notification_agent(&mut adapter, "tool-one", "task-one", true);
+            adapter
+                .receive(scoped_call(
+                    parent,
+                    "colliding-call",
+                    "tool-one",
+                    if parent.is_none() { "Read" } else { "Agent" },
+                    json!({}),
+                ))
+                .unwrap();
+            let step = adapter
+                .receive(notification_frame(
+                    "collision",
+                    "tool-one",
+                    "task-one",
+                    "completed",
+                ))
+                .unwrap();
+            assert!(notification_agent_statuses(&step, "tool-one").is_empty());
+            assert!(adapter.tasks.iter().any(|id| id == "task-one"));
+            assert!(adapter.ended_agents.is_empty());
+        }
+        let mut adapter = Claude::default();
+        notification_agent(&mut adapter, "tool-one", "task-one", true);
+        let step = adapter
+            .receive(
+                json!({"type":"user","uuid":"ordinary","message":{"content":"ordinary user text"}}),
+            )
+            .unwrap();
+        assert_eq!(
+            items(&step),
+            [ItemContent::Text {
+                text: "ordinary user text".into(),
+                thinking: false,
+                phase: Phase::Final
+            }]
+        );
+        assert!(adapter.background_agents.contains("tool-one"));
+    }
+
+    #[test]
+    fn notification_settlement_refuses_foreign_sessions_before_mutation() {
+        for mut frame in [
+            notification_frame("foreign-text", "tool-one", "task-one", "completed"),
+            json!({"type":"system","subtype":"task_notification","task_id":"task-one","status":"failed"}),
+        ] {
+            let mut adapter = Claude {
+                session_id: Some("00000000-0000-4000-8000-000000000001".into()),
+                ..Claude::default()
+            };
+            notification_agent(&mut adapter, "tool-one", "task-one", true);
+            frame["session_id"] = json!("00000000-0000-4000-8000-000000000002");
+            assert!(
+                adapter
+                    .receive(frame)
+                    .unwrap_err()
+                    .contains("different session ID")
+            );
+            assert!(adapter.background_agents.contains("tool-one"));
+            assert!(adapter.tasks.iter().any(|id| id == "task-one"));
+            assert!(adapter.ended_agents.is_empty());
+        }
+    }
+
+    #[test]
+    fn history_notification_rendering_does_not_settle_live_owners() {
+        let mut adapter = Claude::default();
+        notification_agent(&mut adapter, "tool-one", "task-one", true);
+        let frame = notification_frame("old-history", "tool-one", "task-one", "completed");
+        let expected = delivery(&frame);
+        let record = HistoryRecord {
+            frame: frame.clone(),
+            tool_calls: HashMap::new(),
+        };
+        let mut step = Step::default();
+        adapter.history_message(&record, &mut step).unwrap();
+        assert_eq!(items(&step), expected);
+        assert!(notification_agent_statuses(&step, "tool-one").is_empty());
+        assert!(adapter.background_agents.contains("tool-one"));
+        assert!(adapter.ended_agents.is_empty());
+        let repeated = adapter.receive(frame).unwrap();
+        assert!(notification_agent_statuses(&repeated, "tool-one").is_empty());
+        assert!(adapter.background_agents.contains("tool-one"));
+        assert!(adapter.ended_agents.is_empty());
+    }
+
+    #[test]
+    fn live_monitor_events_leave_their_running_task_row_running() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"monitor-call","task_type":"local_bash"})).unwrap();
+        let event = adapter
+            .receive(json!({
+                "type": "user",
+                "uuid": "event",
+                "message": {"role": "user", "content": "<task-notification>\n<task-id>b1</task-id>\n<summary>Monitor event: \"queue\"</summary>\n<event>6329:queued</event>\n</task-notification>"}
+            }))
+            .unwrap();
+        assert!(
+            !event
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(item) if item.id == "claude-task:b1"))
+        );
+        let row = &adapter.tools[&ScopedId::new(None, "claude-task:b1")];
+        assert_eq!(row.content.status(), Some(ToolStatus::Running));
+    }
+
+    #[test]
+    fn unresolved_terminal_notifications_keep_the_existing_fallback_task_row() {
+        let mut adapter = Claude::default();
+        let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task-one","tool_use_id":"not-yet-seen","task_type":"local_agent"})).unwrap();
+        assert!(
+            started.events.iter().any(
+                |event| matches!(event, Event::Item(item) if item.id == "claude-task:task-one")
+            )
+        );
+        let stopped = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task-one","status":"stopped"})).unwrap();
+        assert!(stopped.events.iter().any(|event| matches!(event, Event::Item(item) if item.id == "claude-task:task-one" && item.content.status() == Some(ToolStatus::Stopped))));
+        assert!(notification_agent_statuses(&stopped, "not-yet-seen").is_empty());
+        let failed = adapter
+            .receive(notification_frame(
+                "late-failed",
+                "not-yet-seen",
+                "task-one",
+                "failed",
+            ))
+            .unwrap();
+        assert!(failed.events.iter().any(|event| matches!(event, Event::Item(item) if item.id == "claude-task:task-one" && item.content.status() == Some(ToolStatus::Stopped))));
+        assert!(adapter.visible_task_rows.contains("claude-task:task-one"));
+        assert_eq!(
+            adapter.ended_agent("not-yet-seen"),
+            Some(ToolStatus::Stopped)
+        );
+    }
+
+    #[test]
+    fn text_task_stops_survive_failed_notices_late_ack_and_restart() {
+        for system_failure in [false, true] {
+            let mut adapter = Claude::default();
+            notification_agent(&mut adapter, "tool-one", "task-one", true);
+            adapter
+                .receive(notification_frame(
+                    "stopped", "tool-one", "task-one", "stopped",
+                ))
+                .unwrap();
+            let failure = if system_failure {
+                json!({"type":"system","subtype":"task_notification","uuid":"failed","task_id":"task-one","status":"failed"})
+            } else {
+                notification_frame("failed", "tool-one", "task-one", "failed")
+            };
+            let failed = adapter.receive(failure.clone()).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&failed, "tool-one"),
+                [ToolStatus::Stopped]
+            );
+            let ack = json!({"type":"user","uuid":"late-ack","tool_use_result":{"status":"async_launched","agentId":"task-one"},"message":{"content":[{"type":"tool_result","tool_use_id":"tool-one","content":"Launched"}]}});
+            let late = adapter.receive(ack.clone()).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&late, "tool-one"),
+                [ToolStatus::Stopped]
+            );
+            assert!(!adapter.background_agents.contains("tool-one"));
+            let restart = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task-one","tool_use_id":"tool-one","task_type":"local_agent"})).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&restart, "tool-one"),
+                [ToolStatus::Running]
+            );
+            let acknowledged = adapter.receive(ack).unwrap();
+            assert_eq!(
+                notification_agent_statuses(&acknowledged, "tool-one"),
+                [ToolStatus::Running]
+            );
+            let duplicate = adapter.receive(failure).unwrap();
+            assert!(notification_agent_statuses(&duplicate, "tool-one").is_empty());
+            assert!(adapter.background_agents.contains("tool-one"));
+            assert!(adapter.ended_agents.is_empty());
+        }
     }
 
     #[test]
