@@ -11,7 +11,8 @@ use std::{
 
 const EXITED_RETENTION: Duration = Duration::from_secs(10 * 60);
 // Match the existing five-second durable-notification retry cadence. Only an
-// uncertain expired pin census arms this deadline; it grants no cleanup.
+// uncertain or deferred expired pin census arms this deadline; it grants no
+// cleanup.
 const RETENTION_RETRY: Duration = Duration::from_secs(5);
 
 pub(super) struct Lifecycle {

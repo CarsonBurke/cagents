@@ -2,7 +2,7 @@ use std::{
     io::{self, Read},
     net::Shutdown,
     os::unix::net::UnixStream,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, RwLockWriteGuard, TryLockError},
     thread,
     time::{Duration, Instant},
 };
@@ -669,6 +669,52 @@ impl Drop for ExplicitCloseGuard {
     }
 }
 
+/// Close outlasts a slow commit or shared request here, then asks for a retry.
+const CLOSE_FENCE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Take the writer only while it is free and read the saved pin under it. A
+/// queued writer would hold back every client's input behind the slowest shared
+/// request, and a held one must not wait out another thread's durable commit.
+fn close_fence<'gate>(
+    host: &SharedHost,
+    gate: &'gate RwLock<()>,
+    terminal: crate::model::TerminalId,
+) -> Result<(RwLockWriteGuard<'gate, ()>, Result<Option<String>, String>), ProtocolError> {
+    let registry = super::agent_execution::registry(host);
+    let deadline = Instant::now() + CLOSE_FENCE_BUDGET;
+    loop {
+        let admission = match gate.try_write() {
+            Ok(admission) => Some(admission),
+            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        if let Some(admission) = admission {
+            let registry = match &registry {
+                Ok(registry) => registry,
+                Err(cause) => return Ok((admission, Err(cause.clone()))),
+            };
+            let pin = match registry.try_lock() {
+                Ok(registry) => Some(registry.retention_pin_generation(terminal)),
+                Err(TryLockError::Poisoned(poisoned)) => {
+                    Some(poisoned.into_inner().retention_pin_generation(terminal))
+                }
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(pin) = pin {
+                return Ok((admission, pin));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "Cagents is busy; retry closing this terminal",
+                true,
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// The caller dropped its shared reader. Drain earlier publications and reserve
 /// this exact owner under the writer BEFORE any destructive close or cache release.
 fn reserve_terminal_close(
@@ -680,7 +726,7 @@ fn reserve_terminal_close(
     generation: Result<Option<String>, String>,
 ) -> Result<TerminalCloseRetirement, ProtocolError> {
     let gate = control_gate(host);
-    let _admission = gate.write().unwrap_or_else(|p| p.into_inner());
+    let (_admission, current) = close_fence(host, &gate, terminal)?;
     ensure_terminal_close_open(host)?;
     let unavailable =
         |message| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true);
@@ -689,7 +735,7 @@ fn reserve_terminal_close(
             "Saved terminal ownership was unknown before close: {cause}"
         ))
     })?;
-    let current = retention_pin_generation(host, terminal).map_err(|cause| {
+    let current = current.map_err(|cause| {
         unavailable(format!(
             "Saved terminal ownership cannot be revalidated before close: {cause}"
         ))
@@ -785,8 +831,6 @@ fn finish_terminal_close(
         }
         crate::terminal::TerminalRetirement::Retained(error) => Err(error),
     };
-    let gate = control_gate(host);
-    let _admission = gate.write().unwrap_or_else(|p| p.into_inner());
     let error = |message| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true);
     if let Err(message) = result {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -799,17 +843,18 @@ fn finish_terminal_close(
         }
         return Err(error(message));
     }
+    let gate = control_gate(host);
+    let (mut admission, current) = close_fence(host, &gate, close.terminal)?;
     ensure_terminal_close_open(host)?;
     // None is a known unpinned local window, not an unavailable Registry.
     // The writer also drains publications that passed their initial check
-    // before our reservation. It fences local/shared edits through the final
-    // removal and conditional generation DELETE.
+    // before our reservation. It fences local/shared edits through removal.
     let captured = close.generation.as_ref().map_err(|cause| {
         error(format!(
             "Saved terminal ownership was unknown before close: {cause}"
         ))
     })?;
-    let current = retention_pin_generation(host, close.terminal).map_err(|cause| {
+    let current = current.map_err(|cause| {
         error(format!(
             "Saved terminal ownership cannot be revalidated: {cause}"
         ))
@@ -826,6 +871,9 @@ fn finish_terminal_close(
         ));
     }
     if let Ok(Some(generation)) = &close.generation {
+        // This fsync runs outside the writer. The DELETE fences itself on the
+        // generation, and the fresh read below refuses any newer publication.
+        drop(admission);
         let result = super::agent_execution::registry(host).and_then(|registry| {
             registry
                 .lock()
@@ -846,6 +894,19 @@ fn finish_terminal_close(
             }
             return Err(error(message));
         }
+        let (fenced, current) = close_fence(host, &gate, close.terminal)?;
+        admission = fenced;
+        ensure_terminal_close_open(host)?;
+        let current = current.map_err(|cause| {
+            error(format!(
+                "Saved terminal ownership cannot be revalidated: {cause}"
+            ))
+        })?;
+        if current.is_some() {
+            return Err(error(
+                "Saved terminal ownership changed during close; retry the retained result".into(),
+            ));
+        }
     }
     let retired = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -862,6 +923,7 @@ fn finish_terminal_close(
     };
     let retired =
         retired.ok_or_else(|| error("The exact closed terminal is no longer available".into()))?;
+    drop(admission);
     drop(retired);
     crate::daemon::wake();
     Ok(())
@@ -1211,22 +1273,36 @@ pub(super) fn process_request(
                 ));
             }
             if presence.application == crate::notifications::Application::Cagents {
-                let registry = {
+                let (registry, unchanged) = {
                     let state = host.lock().unwrap_or_else(|p| p.into_inner());
                     state.ensure_retention_available(&presence.sessions)?;
-                    state.execution_registry.clone()
+                    (
+                        state.execution_registry.clone(),
+                        state.notification_sessions_unchanged(&presence),
+                    )
                 };
                 // The shared control reader spans selection and publication;
                 // automatic cleanup takes its writer before reserving an ID.
                 // Disconnect is not card closure, so these pins are durable.
                 if let Some(registry) = registry {
-                    registry
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .pin_window_terminals(&presence.sessions)
-                        .map_err(|message| {
-                            ProtocolError::new(ProtocolErrorCode::Internal, message, true)
-                        })?;
+                    let internal =
+                        |message| ProtocolError::new(ProtocolErrorCode::Internal, message, true);
+                    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+                    // Windows republish on any workspace change. Only a new
+                    // claim, or a pin that a close removed, needs this fsync.
+                    let mut pinned = unchanged;
+                    for terminal in &presence.sessions {
+                        pinned = pinned
+                            && registry
+                                .retention_pin_generation(*terminal)
+                                .map_err(internal)?
+                                .is_some();
+                    }
+                    if !pinned {
+                        registry
+                            .pin_window_terminals(&presence.sessions)
+                            .map_err(internal)?;
+                    }
                 }
                 // Missing Registry keeps the old UI delivery behavior. The
                 // automatic census separately refuses unknown ownership.
@@ -2911,6 +2987,86 @@ pub(in crate::host) mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn close_waits_beside_other_clients_input_instead_of_ahead_of_it() {
+        let (host, _directory, session, handle) = retention_client_host("close-fence");
+        let id = session.id;
+        process_request(
+            &host,
+            1,
+            ClientRequest::NotificationPresence {
+                presence: terminal_presence(id),
+            },
+        )
+        .unwrap();
+        let pin = retention_pin_generation(&host, id);
+        assert!(pin.as_ref().unwrap().is_some());
+        handle.shutdown().unwrap();
+        let gate = control_gate(&host);
+        let registry = super::super::agent_execution::registry(&host).unwrap();
+        let input_can_enter = || {
+            (0..500).any(|_| {
+                thread::sleep(Duration::from_millis(1));
+                gate.try_read().is_ok()
+            })
+        };
+        let slow_request = gate.read().unwrap();
+        let worker = {
+            let (host, handle) = (host.clone(), handle.clone());
+            thread::spawn(move || finish_test_terminal_close(&host, id, &handle, pin))
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            input_can_enter(),
+            "close queued ahead of other clients' input"
+        );
+        let slow_commit = registry.lock().unwrap();
+        drop(slow_request);
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            input_can_enter(),
+            "close held the writer while another thread committed"
+        );
+        drop(slow_commit);
+        worker.join().unwrap().unwrap();
+        assert!(!host.lock().unwrap().terminals.contains_key(&id));
+        assert_eq!(retention_pin_generation(&host, id), Ok(None));
+    }
+
+    #[test]
+    fn republishing_an_unchanged_window_commits_only_to_restore_its_claim() {
+        let (host, _directory, session, _handle) = retention_client_host("republish");
+        let id = session.id;
+        host.lock().unwrap().register_client(7);
+        process_request(
+            &host,
+            7,
+            ClientRequest::WatchNotifications {
+                presence: terminal_presence(id),
+            },
+        )
+        .unwrap();
+        let publish = |presence| {
+            process_request(&host, 1, ClientRequest::NotificationPresence { presence }).unwrap();
+        };
+        let claimed = retention_pin_generation(&host, id);
+        assert!(claimed.as_ref().unwrap().is_some());
+        publish(terminal_presence(id));
+        assert_eq!(retention_pin_generation(&host, id), claimed);
+
+        // A close removed this claim while the window still reports the card.
+        super::super::agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .forget_retention_pin(id, claimed.as_ref().unwrap().as_ref().unwrap())
+            .unwrap();
+        publish(terminal_presence(id));
+        let restored = retention_pin_generation(&host, id);
+        assert!(restored.as_ref().unwrap().is_some());
+        assert_ne!(restored, claimed);
     }
 
     #[test]

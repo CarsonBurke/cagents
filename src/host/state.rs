@@ -602,6 +602,15 @@ impl HostState {
         activation
     }
 
+    pub(super) fn notification_sessions_unchanged(
+        &self,
+        presence: &crate::notifications::Presence,
+    ) -> bool {
+        self.notification_watchers.values().any(|current| {
+            current.destination() == presence.destination() && current.sessions == presence.sessions
+        })
+    }
+
     pub(super) fn notification_presence(&mut self, presence: crate::notifications::Presence) {
         for (&client, current) in &mut self.notification_watchers {
             if current.destination() == presence.destination() {
