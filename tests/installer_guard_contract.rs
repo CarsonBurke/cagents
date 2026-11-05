@@ -1370,10 +1370,13 @@ fn staged_candidate_startup_authenticates_the_inherited_coordinator_fence() {
 
 #[test]
 fn staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner() {
+    // The User child is another process with its own mutex. Hold this one for
+    // its whole run: a sibling's fixture window is also named cagents-ui, and
+    // a production-profile lease refuses any other live process of that name.
+    let _fixture = OS_FIXTURE.lock().unwrap();
     if !user_fixture::enter() {
         return;
     }
-    let _fixture = OS_FIXTURE.lock().unwrap();
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let prefix = root.path().join("install");
     let old = prefix.join("versions/old/bin");
