@@ -366,9 +366,12 @@ itself, and skips the gate when the set is [already
 current](#up-to-date-launches).
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
-command still run under `flock /var/tmp/cagents-cargo.lock` takes exactly one
-slot. A gated command started under such a lock runs at once in the slot its
-caller holds. Set `CAGENTS_BUILD_SLOTS` to override the count.
+command still run under `flock --close /var/tmp/cagents-cargo.lock` takes exactly
+one slot. Without `--close`, every process the command starts inherits the lock,
+so a test's daemon that outlives it blocks everyone until that daemon exits. Killing
+a `flock --close` frees the slot even if its command keeps running. A gated command
+started under a running `flock` on a slot runs at once in that slot; a slot that any
+other process holds is waited for. Set `CAGENTS_BUILD_SLOTS` to override the count.
 
 Admission waits are unbounded by default. To give one invocation a budget,
 set `CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS` to a positive integer, for example
@@ -391,6 +394,14 @@ shared two-second grace period, then kills and reaps remaining descendants,
 including children that created a separate session. Successful commands may leave background cache
 services running without holding a slot. The regression contract uses private
 locks and owned fixture processes only: `python3 tests/cargo_gate.py -v`.
+
+`scripts/lock-holders [LOCK...]` shows who holds each lock under
+`/var/tmp/cagents-*.lock*`, whether they or their descendants are using CPU, and who
+is waiting. It warns when no holder is a build or a session, which usually means a
+leftover process inherited the lock, and it notes a lock whose holders used no CPU
+during its one-second sample. A leftover that looks like a build, or a script that
+doesn't, can still fool the warning, so read the holders it lists. It only reads
+`/proc`, so ending a process stays your decision.
 
 The feature lanes coexist in one build directory: a no-op check of one lane
 stays a no-op after building the others. With a per-checkout build directory,
@@ -439,7 +450,9 @@ Only settings that change what Cargo, rustc or the tests do reach the host:
 `CARGO_INCREMENTAL` and other `CAGENTS_` settings, except `CAGENTS_BUILD_*` and names that look like
 credentials (containing `TOKEN`, `KEY`, `SECRET`, `PASS`, `AUTH`,
 `CREDENTIAL` or `COOKIE`). They travel on the connection's standard input,
-not its command line. This user's Cargo `[profile]` settings are applied
+not its command line, along with this shell's open-file limit, which the
+command gets up to the host's hard limit; an ssh session's usual 1024 fails
+descriptor-heavy suites that pass here. This user's Cargo `[profile]` settings are applied
 there; its build settings, such as `jobs` and `build-dir`, describe this host
 and are not. Each slot's commands get a private `TMPDIR`,
 `$XDG_RUNTIME_DIR/cof/<repository>-<N>` (mode 0700) on the host, short enough
@@ -645,6 +658,10 @@ scripts/cargo-gate test --locked --no-default-features --features host --all-tar
 scripts/cargo-gate test --locked --no-default-features --features ui --all-targets
 ```
 
+An SSH login has a soft limit of 1024 open files, and whatever it starts, with
+`nohup` or `setsid` included, inherits that. A UI test run can exceed it and fail
+with `Too many open files`, so run `ulimit -n 65536` first.
+
 HOST fixtures that exec retained actors require
 `CAGENTS_TEST_RETAINED_ACTOR_HELPER` to name a `cagentsd` built from the same
 checkout and source state as the tests. Build it immediately before testing,
@@ -836,7 +853,7 @@ Each task keeps everything in one directory outside Git ancestry. Avoid `/tmp`,
 `/var/tmp` and `~/.cache`, where Codex sandboxes can leave an empty `.git` that
 fixtures refuse.
 
-Build before taking the native lock, and never wait for Cargo while holding it: every other native session queues behind you. `build` takes one `scripts/cargo-gate` slot. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
+Build before taking the native lock, and never wait for Cargo while holding it: every other native session queues behind you. `build` takes one `scripts/cargo-gate` slot. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
 
 ```sh
 export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/my-task
@@ -885,6 +902,8 @@ harness, it provides:
   (override with `CAGENTS_EVIDENCE_NATIVE_LOCK`). Stop as soon as you have the
   evidence. A session gives the lock up after `--limit` seconds even if its
   owner has gone. `build` uses `/var/tmp/cagents-fw16-cargo.lock` the same way.
+- **Who holds the lock.** `scripts/lock-holders /var/tmp/cagents-fw16-native.lock` shows
+  the holder and whether it is doing anything, when `start` seems stuck.
 - **Cleanup.** `stop` stops the fixture daemon, then ends any process that
   inherited the task's private runtime directory. That path is the proof of
   ownership, so nothing else on the host is touched.

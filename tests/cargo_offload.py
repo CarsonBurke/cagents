@@ -12,6 +12,7 @@ import ast
 import fcntl
 import json
 import os
+import resource
 from pathlib import Path
 import shutil
 import signal
@@ -277,8 +278,10 @@ if [ "$1" = marked ]; then
 fi
 shift
 cd "$HOME"
-# Like sshd, start from a clean environment: nothing of this one reaches the
-# build host except what the command carries.
+# Like sshd, start from a clean environment and a session's own open-file
+# limit: nothing of this one reaches the build host except what the command
+# carries.
+ulimit -Sn 256
 exec env -i HOME="$HOME" PATH="$PATH" CARGO_HOME="$CARGO_HOME" \
     RUSTUP_HOME="$RUSTUP_HOME" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
 """
@@ -405,6 +408,23 @@ class StandInHost(unittest.TestCase):
         result = self.gate_run("check", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((slot_tmp / "left-behind").exists())
+
+    def test_the_build_gets_this_shells_open_file_limit(self):
+        (self.crate / "build.rs").write_text(textwrap.dedent("""
+            fn main() {
+                let limits = std::fs::read_to_string("/proc/self/limits").unwrap();
+                let line = limits.lines().find(|l| l.starts_with("Max open files")).unwrap();
+                assert_eq!(line.split_whitespace().nth(3), Some("512"), "{line}");
+                println!("cargo:rerun-if-changed=build.rs");
+            }
+        """))
+        hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        result = subprocess.run(
+            [str(self.gate), "check"], cwd=self.crate, env=self.remote_env(),
+            capture_output=True, text=True, timeout=120,
+            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (512, hard)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("building here", result.stderr)
 
     def test_a_failing_build_keeps_cargos_exit_status(self):
         (self.crate / "src/main.rs").write_text("fn main() { missing(); }\n")
@@ -610,7 +630,7 @@ class RemoteRun(unittest.TestCase):
                 ["python3", "-c", offload.REMOTE_AGENT, "run", base, ".",
                  "sh", "-c", f"sleep 120 & echo $! >{marker}; wait"],
                 stdin=subprocess.PIPE, start_new_session=True)
-            agent.stdin.write(b"{}\n")
+            agent.stdin.write(b'{"environment": {}}\n')
             agent.stdin.flush()
             deadline = time.monotonic() + 10
             while not marker.exists() or not marker.read_text().strip():
@@ -634,9 +654,35 @@ class RemoteRun(unittest.TestCase):
                  "sh", "-c", 'test "$PROBE" = x && exit 7'],
                 stdin=subprocess.PIPE)
             self.addCleanup(agent.stdin.close)
-            agent.stdin.write(b'{"PROBE": "x"}\n')
+            agent.stdin.write(b'{"environment": {"PROBE": "x"}}\n')
             agent.stdin.flush()
             self.assertEqual(agent.wait(timeout=15), 7)
+
+    def test_the_command_gets_the_open_file_limit_it_was_asked_for(self):
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        above = hard + 1 if hard != resource.RLIM_INFINITY else None
+        for wanted, expected in ((64, 64), (above, hard), (-1, hard)):
+            if wanted is None:
+                continue
+            with self.subTest(wanted=wanted), tempfile.TemporaryDirectory() as base:
+                Path(base, "src").mkdir()
+                # The connection stays open, as it does while the gate waits.
+                # The agent starts below every requested limit, as an ssh
+                # session's 1024 does, so each request must change it.
+                agent = subprocess.Popen(
+                    ["python3", "-c", offload.REMOTE_AGENT, "run", base, ".",
+                     "sh", "-c", "ulimit -Sn"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (32, hard)))
+                self.addCleanup(agent.stdout.close)
+                self.addCleanup(agent.stdin.close)
+                agent.stdin.write(json.dumps({"environment": {}, "open_files": wanted}).encode()
+                                  + b"\n")
+                agent.stdin.flush()
+                self.assertEqual(agent.wait(timeout=15), 0)
+                reported = agent.stdout.read().decode().strip()
+                self.assertEqual(reported, "unlimited" if expected == resource.RLIM_INFINITY
+                                 else str(expected))
 
 
 class Prune(unittest.TestCase):

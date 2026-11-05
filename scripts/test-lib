@@ -49,6 +49,21 @@ def outside_admission():
                 line.startswith("lock:") and "FLOCK" in line.split()
                 for line in details.splitlines()):
             refuse("an inherited descriptor holds build admission; run outside its parent wrapper")
+    # `flock --close` keeps the lock from this process but still holds it.
+    ancestor = os.getppid()
+    while ancestor > 1:
+        try:
+            if Path(f"/proc/{ancestor}/comm").read_text(errors="replace").strip() == "flock":
+                for path in Path(f"/proc/{ancestor}/fd").iterdir():
+                    info = path.stat()
+                    if (info.st_dev, info.st_ino) in locks and any(
+                            line.startswith("lock:") and "FLOCK" in line.split()
+                            for line in Path(f"/proc/{ancestor}/fdinfo", path.name).read_text().splitlines()):
+                        refuse("a parent flock holds build admission; run outside it")
+            status = Path(f"/proc/{ancestor}/status").read_text(errors="replace")
+        except OSError:
+            return
+        ancestor = next(int(line.split()[1]) for line in status.splitlines() if line.startswith("PPid:"))
 
 
 def identity(path):

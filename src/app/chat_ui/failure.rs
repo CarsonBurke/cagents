@@ -12,6 +12,194 @@ enum Source {
     Snapshot,
 }
 
+/// Child originals are read only through their published owned-source proof.
+/// Resident details remain an explicitly bounded diagnostic preview.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct CopyPlan {
+    parts: Vec<(Source, Option<chat::TextCopySource>, String)>,
+}
+
+fn child_source<'a>(snapshot: &'a Snapshot, source: &Source) -> Option<&'a str> {
+    match source {
+        Source::ChildItem(child, id) => snapshot
+            .subagents
+            .iter()
+            .find(|agent| &agent.id == child)?
+            .items
+            .iter()
+            .find(|item| &item.id == id)
+            .and_then(|item| match &item.content {
+                ItemContent::Text { text, .. } => Some(text.as_str()),
+                ItemContent::Delivery { body, .. } => Some(body.as_str()),
+                ItemContent::Tool { output, .. } => Some(output.as_str()),
+                _ => None,
+            }),
+        Source::ChildDetail(child) => snapshot
+            .subagents
+            .iter()
+            .find(|agent| &agent.id == child)
+            .map(|agent| agent.detail.as_str()),
+        _ => None,
+    }
+}
+
+fn child_copy_source(snapshot: &Snapshot, child: &str, id: &str) -> Option<chat::TextCopySource> {
+    let index = snapshot
+        .subagents
+        .iter()
+        .find(|agent| agent.id == child)?
+        .items
+        .iter()
+        .position(|item| item.id == id)?;
+    snapshot
+        .text_copy_sources
+        .children
+        .get(child)?
+        .get(index)?
+        .clone()
+        .filter(|source| source.scope == (chat::TextCopyScope::Subagent { id: child.into() }))
+}
+
+impl CopyPlan {
+    pub(super) fn is_current(&self, snapshot: &Snapshot) -> bool {
+        self.parts
+            .iter()
+            .all(|(identity, source, text)| match (identity, source) {
+                (Source::ChildItem(child, item), Some(source)) => {
+                    child_copy_source(snapshot, child, item).as_ref() == Some(source)
+                        && child_source(snapshot, identity) == Some(text.as_str())
+                }
+                (_, None) => child_source(snapshot, identity) == Some(text.as_str()),
+                _ => false,
+            })
+    }
+
+    pub(super) fn is_current_or_withdrawn(&self, snapshot: &Snapshot) -> bool {
+        self.parts.iter().all(|(identity, source, preview)| {
+            if child_source(snapshot, identity) != Some(preview.as_str()) {
+                return false;
+            }
+            match (identity, source) {
+                (Source::ChildItem(child, item), Some(captured)) => {
+                    child_copy_source(snapshot, child, item)
+                        .as_ref()
+                        .is_none_or(|current| current == captured)
+                }
+                (_, None) => true,
+                _ => false,
+            }
+        })
+    }
+
+    pub(super) fn read(
+        &self,
+        handle: &ClientHandle,
+        current: impl Fn() -> bool,
+    ) -> Result<String, String> {
+        self.read_with(current, |source| handle.copy_text(source.clone()))
+    }
+
+    fn read_with(
+        &self,
+        current: impl Fn() -> bool,
+        mut read: impl FnMut(&chat::TextCopySource) -> Result<String, String>,
+    ) -> Result<String, String> {
+        let mut originals = Vec::new();
+        let mut bytes = 0usize;
+        let started = Instant::now();
+        for (_, source, literal) in &self.parts {
+            // Do not keep admitting independent reads after the user has
+            // copied something else, or accumulate per-source timeouts forever.
+            // An in-flight read retains the client's existing bounded timeout.
+            if !current() || started.elapsed() >= Duration::from_secs(30) {
+                return Err("Diagnostic copy was superseded or exceeded its read window".into());
+            }
+            let text = match source {
+                Some(source) => read(source)?,
+                None => literal.clone(),
+            };
+            if !current() {
+                return Err("Diagnostic copy was superseded".into());
+            }
+            if !originals.contains(&text) {
+                bytes = bytes.saturating_add(text.len()).saturating_add(7);
+                if bytes > chat::TEXT_COPY_LIMIT_BYTES {
+                    return Err("Diagnostic originals exceed the clipboard limit".into());
+                }
+                originals.push(text);
+            }
+        }
+        Ok(originals.join("\n\n---\n\n"))
+    }
+}
+
+#[cfg(test)]
+mod retained_original_tests {
+    use super::*;
+
+    #[test]
+    fn worker_assembles_distinct_originals_and_stops_after_superseding_copy() {
+        let first = format!(
+            "first request-id\r\n{}\nTAIL λ",
+            "猫 original A\n".repeat(20_000)
+        );
+        let second = "second request-id\nDistinct original B\n".to_owned();
+        let cache = uuid::Uuid::new_v4();
+        let plan = CopyPlan {
+            parts: (1..=3)
+                .map(|token| {
+                    (
+                        Source::ChildItem("child".into(), token.to_string()),
+                        Some(chat::TextCopySource {
+                            cache,
+                            scope: chat::TextCopyScope::Subagent { id: "child".into() },
+                            token,
+                            revision: 1,
+                            bytes: if token == 2 {
+                                second.len()
+                            } else {
+                                first.len()
+                            } as u64,
+                        }),
+                        "bounded preview".into(),
+                    )
+                })
+                .collect(),
+        };
+        let mut reads = Vec::new();
+        let actual = plan
+            .read_with(
+                || true,
+                |source| {
+                    reads.push(source.token);
+                    Ok(if source.token == 2 {
+                        second.clone()
+                    } else {
+                        first.clone()
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(reads, vec![1, 2, 3]);
+        assert_eq!(actual, format!("{first}\n\n---\n\n{second}"));
+        let current = std::cell::Cell::new(true);
+        let mut reads = 0;
+        let result = plan.read_with(
+            || current.get(),
+            |_| {
+                reads += 1;
+                current.set(false);
+                Ok(first.clone())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            reads, 1,
+            "a superseded worker cannot keep reading every source"
+        );
+    }
+}
+
 /// A notice kept in the transcript after its live source has gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Note {
@@ -457,7 +645,7 @@ impl State {
                         &context,
                         &causes,
                     );
-                    latest = Some((context, text));
+                    latest = Some((context, text, item.id.as_str()));
                 }
             }
             if (matches!(
@@ -468,9 +656,26 @@ impl State {
                 && Failure::parse(provider, &child.detail).is_some()))
                 && !child.detail.trim().is_empty()
             {
+                // A bare status line such as "Turn failed" names no cause of
+                // its own. While the latest proven error is still the child's
+                // last item, nothing after it can be that cause: one failure.
+                let explained = latest.as_ref().and_then(|(_, _, id)| {
+                    (Failure::parse(provider, &child.detail).is_none()
+                        && child.items.last().is_some_and(|last| last.id == *id))
+                    .then(|| Source::ChildItem(child.id.clone(), (*id).to_owned()))
+                });
+                if let Some(cause) = explained
+                    && let Some(incident) = state
+                        .incidents
+                        .iter_mut()
+                        .find(|incident| incident.sources.contains(&cause))
+                {
+                    incident.sources.push(Source::ChildDetail(child.id.clone()));
+                    continue;
+                }
                 // Only a detail containing the exact latest proven error may
                 // join that historical incident. No inference from quoted text.
-                let context = if let Some((context, body)) = latest
+                let context = if let Some((context, body, _)) = latest
                     && child.detail.ends_with(body)
                 {
                     context
@@ -729,6 +934,131 @@ struct Preview {
 }
 
 impl Runtime {
+    pub(super) fn failure_plan_still_shown(&self, key: &str, plan: &CopyPlan) -> bool {
+        self.failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.key == key)
+            .is_some_and(|incident| {
+                self.diagnostic_sources(incident)
+                    .eq(plan.parts.iter().map(|(captured, _, _)| captured))
+            })
+    }
+    pub(super) fn failure_originals_retained(&self, key: &str) -> Option<bool> {
+        let incident = self
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.key == key)?;
+        let mut retained = false;
+        let mut complete = true;
+        for source in &incident.sources {
+            if let Source::ChildItem(child, id) = source {
+                let item = self
+                    .snapshot
+                    .subagents
+                    .iter()
+                    .find(|agent| &agent.id == child)
+                    .and_then(|agent| agent.items.iter().find(|item| &item.id == id));
+                // A short failure is resident in full; only a preview
+                // depends on its retained original.
+                if item.is_some_and(|item| {
+                    chat::failure::provider_error_text(Provider::Codex, item)
+                        .is_some_and(chat::failure::is_preview)
+                }) {
+                    retained = true;
+                    complete &= child_copy_source(&self.snapshot, child, id).is_some();
+                }
+            } else if !matches!(source, Source::ChildDetail(_)) {
+                complete = false;
+            }
+        }
+        retained.then_some(complete)
+    }
+
+    /// The sources a reader sees and copies for an incident. A child's bare
+    /// status line ("Turn failed") that joined the error explaining it is
+    /// left out: the error is the diagnostic, and the status restates it.
+    fn diagnostic_sources<'a>(
+        &'a self,
+        incident: &'a Incident,
+    ) -> impl Iterator<Item = &'a Source> {
+        incident.sources.iter().filter(move |source| {
+            let Source::ChildDetail(child) = source else {
+                return true;
+            };
+            let restates = child_source(&self.snapshot, source).is_some_and(|detail| {
+                Failure::parse(self.session.launch.provider, detail).is_none()
+            }) && incident
+                .sources
+                .iter()
+                .any(|other| matches!(other, Source::ChildItem(owner, _) if owner == child));
+            !restates
+        })
+    }
+
+    pub(super) fn failure_copy_plan(&self, key: &str) -> Result<Option<CopyPlan>, String> {
+        let Some(incident) = self
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.key == key)
+        else {
+            return Ok(None);
+        };
+        let retained = incident.sources.iter().any(|source| match source {
+            Source::ChildItem(child, id) => self
+                .snapshot
+                .subagents
+                .iter()
+                .find(|agent| &agent.id == child)
+                .and_then(|agent| agent.items.iter().find(|item| &item.id == id))
+                .is_some_and(|item| {
+                    chat::failure::provider_error_text(Provider::Codex, item).is_some()
+                }),
+            _ => false,
+        });
+        if !retained {
+            return Ok(None);
+        }
+        let mut parts = Vec::new();
+        for identity in self.diagnostic_sources(incident) {
+            let text = child_source(&self.snapshot, identity)
+                .ok_or("Original diagnostic unavailable in this view")?;
+            let source = match identity {
+                Source::ChildItem(child, id) => {
+                    let item = self
+                        .snapshot
+                        .subagents
+                        .iter()
+                        .find(|agent| &agent.id == child)
+                        .and_then(|agent| agent.items.iter().find(|item| &item.id == id))
+                        .ok_or("Original diagnostic item is unavailable")?;
+                    match chat::failure::provider_error_text(Provider::Codex, item) {
+                        Some(text) => match child_copy_source(&self.snapshot, child, id) {
+                            Some(source) => Some(source),
+                            // The resident text is the whole original.
+                            None if !chat::failure::is_preview(text) => None,
+                            None => {
+                                return Err(
+                                    "Original diagnostic unavailable: it is no longer retained"
+                                        .into(),
+                                );
+                            }
+                        },
+                        None => None,
+                    }
+                }
+                Source::ChildDetail(_) => None,
+                _ => return Err("Original diagnostic unavailable in this view".into()),
+            };
+            // Capture only the bounded resident preview, including for paged
+            // originals, so withdrawal errors cannot attach to a replacement.
+            parts.push((identity.clone(), source, text.into()));
+        }
+        Ok(Some(CopyPlan { parts }))
+    }
+
     pub(super) fn reconcile_failure_ui(&mut self) -> bool {
         if self.failure_ui.local_error.as_deref() == self.error.as_deref() {
             return false;
@@ -812,7 +1142,7 @@ impl Runtime {
             return;
         };
         let mut sources = Vec::new();
-        for source in &incident.sources {
+        for source in self.diagnostic_sources(incident) {
             if let Some(text) = self.failure_source(source)
                 && !sources.contains(&text)
             {
@@ -925,7 +1255,7 @@ impl Runtime {
             .iter()
             .find(|incident| incident.key == key)?;
         let mut details = Vec::new();
-        for source in &incident.sources {
+        for source in self.diagnostic_sources(incident) {
             if let Some(text) = self.failure_source(source)
                 && !details.contains(&text)
             {
@@ -1016,7 +1346,15 @@ impl Runtime {
                     .max_height(240)
                     .into(),
                 );
-                if omitted {
+                let retained = self.failure_originals_retained(&incident.key);
+                if let Some(available) = retained {
+                    let caption = if !available {
+                        "Shortened preview. The full diagnostic is no longer available to copy."
+                    } else {
+                        "Shortened preview. Copy details copies the full diagnostic."
+                    };
+                    rows.push(design::caption(caption).width(Length::Fill).into());
+                } else if omitted {
                     rows.push(design::caption("Diagnostic preview is limited to 8 KiB. Copy details includes the complete originals.").width(Length::Fill).into());
                 }
             }
@@ -1538,6 +1876,63 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn a_bare_failed_status_joins_the_child_error_that_is_still_its_last_item() {
+        let provider = Provider::Codex;
+        let raw = "You've hit your session limit · resets 3:40pm\nrequest-id: child";
+        let child = |items: Vec<chat::Item>| chat::Subagent {
+            id: "child".into(),
+            kind: "Quinn".into(),
+            description: String::new(),
+            model: None,
+            status: chat::ToolStatus::Failed,
+            waiting: false,
+            detail: "Turn failed".into(),
+            background: true,
+            items: items.into_iter().map(Arc::new).collect(),
+        };
+        let (mut runtime, handle) = live_fixture(provider, Vec::new());
+        publish(&mut runtime, &handle, |next| {
+            next.subagents = vec![child(vec![
+                text("work", chat::Role::Assistant, "Original child work"),
+                provider_error(provider, "codex-notice:limit", raw),
+            ])];
+        });
+        let [incident] = runtime.failure_ui.incidents.as_slice() else {
+            panic!("one failure is one card");
+        };
+        assert_eq!(
+            incident.sources,
+            vec![
+                Source::ChildItem("child".into(), "codex-notice:limit".into()),
+                Source::ChildDetail("child".into()),
+            ]
+        );
+        // The status restates the error, so details and Copy hold the error.
+        let key = incident.key.clone();
+        assert_eq!(runtime.failure_details(&key).as_deref(), Some(raw));
+        runtime.cache_failure_preview(&key);
+        assert_eq!(runtime.failure_preview(&key), Some((raw, false)));
+        let plan = runtime.failure_copy_plan(&key).unwrap().unwrap();
+        assert!(
+            plan.parts
+                .iter()
+                .all(|(source, _, _)| !matches!(source, Source::ChildDetail(_)))
+        );
+        // A failed read of that plan still reports on the shown card.
+        assert!(runtime.failure_plan_still_shown(&key, &plan));
+
+        // Later work means the status may describe something else, so the
+        // bare status keeps its own notice rather than borrowing that cause.
+        publish(&mut runtime, &handle, |next| {
+            next.subagents = vec![child(vec![
+                provider_error(provider, "codex-notice:limit", raw),
+                text("later", chat::Role::Assistant, "Later child work"),
+            ])];
+        });
+        assert_eq!(runtime.failure_ui.incidents.len(), 2);
     }
 
     #[test]
