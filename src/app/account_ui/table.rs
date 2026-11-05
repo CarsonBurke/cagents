@@ -1138,7 +1138,7 @@ fn menu<'a>(
             design::caption(if account.account.is_linked() {
                 "This only removes the home from cagents. Its login, sessions and files stay where they are.".to_owned()
             } else {
-                "This build keeps this account registered, with its login, conversations and files unchanged. It cannot safely delete a managed account.".to_owned()
+                "Managed accounts can't be removed yet. This one stays, with its login, conversations and files unchanged.".to_owned()
             })
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .into(),
@@ -1264,7 +1264,7 @@ fn menu<'a>(
                     if account.account.is_linked() {
                         "Forget this home without changing its files"
                     } else {
-                        "Managed account removal is unavailable; its login, conversations and files are kept"
+                        "Managed accounts can't be removed yet; its login, conversations and files are kept"
                     },
                     action(Action::Remove(id.clone())),
                 )
@@ -1799,7 +1799,7 @@ mod tests {
                 let caption = if enabled {
                     "This only removes the home from cagents. Its login, sessions and files stay where they are."
                 } else {
-                    "This build keeps this account registered, with its login, conversations and files unchanged. It cannot safely delete a managed account."
+                    "Managed accounts can't be removed yet. This one stays, with its login, conversations and files unchanged."
                 };
                 let bounds = texts
                     .0
