@@ -33,8 +33,8 @@ pub enum CompletedCloseOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct QueuedCardClose {
-    card: CardId,
-    unasked: bool,
+    pub(super) card: CardId,
+    pub(super) unasked: bool,
 }
 
 fn target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
@@ -105,6 +105,7 @@ impl Cagents {
                 .queued_card_closes
                 .iter()
                 .any(|queued| queued.card == card)
+            || self.chat_close_asked(card)
             || self.chat_close_owned(card)
             || self
                 .dirty_repository_close
@@ -261,6 +262,9 @@ impl Cagents {
                 return close_focus(0);
             }
             return self.start_terminal_close(allow_active);
+        }
+        if !unasked && let Some(asked) = self.chat_close_question(card) {
+            return asked;
         }
         self.request_card_removal(card)
     }

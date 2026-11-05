@@ -7345,6 +7345,27 @@ impl Cagents {
             .find_map(|runtime| runtime.restart_blocker())
     }
     /// Whether closing or a close-after-return already owns this card.
+    /// The conversation a close of `card` would stop while it is working, or
+    /// while this window cannot tell: it is still attaching, failed to attach
+    /// to a start made elsewhere, or still holds the draft that start came from.
+    pub(super) fn chat_working_session(&self, card: CardId) -> Option<TerminalId> {
+        let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| &state.kind) else {
+            return None;
+        };
+        if session.is_unstarted() || self.chat_close_owned(card) {
+            return None;
+        }
+        let working = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => {
+                runtime.is_draft() || runtime.snapshot.busy || self.chat_start_pending(card)
+            }
+            Some(CardRuntime::Loading) => self.chat_start_pending(card),
+            Some(CardRuntime::Failed(_)) => self.chat_ui.peer_started.contains_key(&card),
+            _ => false,
+        };
+        working.then_some(session.id)
+    }
+
     pub(super) fn chat_close_owned(&self, card: CardId) -> bool {
         matches!(
             self.chat_ui.phases.get(&card),

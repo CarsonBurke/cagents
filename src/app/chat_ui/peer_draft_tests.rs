@@ -660,3 +660,95 @@ fn losing_a_race_with_no_session_change_still_warns() {
 
     assert!(warned_of_refused_update(&peer));
 }
+
+/// A window that attached to a chat another window is running.
+fn working_chat(peer: &mut Peer) {
+    attached_with_update_pending(peer);
+    let CardRuntime::Chat(runtime) = peer.app.cards.get_mut(&peer.card).unwrap() else {
+        panic!("expected a chat runtime");
+    };
+    Arc::make_mut(&mut runtime.snapshot).busy = true;
+}
+
+fn card_open(peer: &Peer) -> bool {
+    peer.app
+        .card_state(peer.card)
+        .is_some_and(|state| state.existence.is_open())
+        && peer.app.workspace.pending_close().is_none()
+        && !peer.app.chat_close_owned(peer.card)
+}
+
+/// Closing a pane ends it for every window, so one that is working asks first,
+/// and keeping it changes nothing.
+#[test]
+fn closing_a_working_chat_asks_and_keeping_it_changes_nothing() {
+    let mut peer = peer();
+    working_chat(&mut peer);
+
+    drop(peer.app.update(Message::CloseCard(peer.card)));
+    assert!(peer.app.chat_close_dialog_visible());
+    assert!(card_open(&peer));
+
+    drop(peer.app.update(Message::CancelChatClose));
+    assert!(!peer.app.chat_close_dialog_visible());
+    assert!(card_open(&peer));
+}
+
+#[test]
+fn stopping_a_working_chat_closes_it_once_confirmed() {
+    let mut peer = peer();
+    working_chat(&mut peer);
+    drop(peer.app.update(Message::CloseCard(peer.card)));
+    assert!(peer.app.chat_close_dialog_visible());
+
+    drop(peer.app.update(Message::ConfirmChatClose));
+
+    assert!(!peer.app.chat_close_dialog_visible());
+    assert!(!card_open(&peer));
+}
+
+/// The window may still be attaching, in which case it cannot know the chat is
+/// idle.
+#[test]
+fn closing_a_chat_this_window_is_attaching_to_asks() {
+    let mut peer = peer();
+    attach_started(&mut peer);
+
+    drop(peer.app.update(Message::CloseCard(peer.card)));
+
+    assert!(peer.app.chat_close_dialog_visible());
+    assert!(card_open(&peer));
+}
+
+#[test]
+fn a_close_with_nothing_working_does_not_ask() {
+    let mut draft = peer();
+    drop(draft.app.update(Message::CloseCard(draft.card)));
+    assert!(!draft.app.chat_close_dialog_visible());
+
+    let mut idle = peer();
+    attached_with_update_pending(&mut idle);
+    drop(idle.app.update(Message::CloseCard(idle.card)));
+    assert!(!idle.app.chat_close_dialog_visible());
+}
+
+/// A question about a conversation that has since been closed or replaced has
+/// no answer left, and must not hold the window's keyboard behind it.
+#[test]
+fn the_question_ends_when_the_other_window_replaces_the_conversation() {
+    let mut peer = peer();
+    working_chat(&mut peer);
+    drop(peer.app.update(Message::CloseCard(peer.card)));
+    assert!(peer.app.chat_close_dialog_visible());
+
+    let replacement = draft_session(peer._directory.path());
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(replacement),
+    ));
+
+    assert!(!peer.app.chat_close_dialog_visible());
+    assert!(!peer.app.chat_close_asked(peer.card));
+}
