@@ -10,7 +10,10 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::Write,
-    os::unix::{fs::PermissionsExt, net::UnixListener},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::{fs::PermissionsExt, net::UnixListener},
+    },
     path::{Path, PathBuf},
 };
 
@@ -129,6 +132,280 @@ fn current_projection_rebinds_real_paired_native_owner_without_relaunch() {
         || !provider.is_current(),
         "ordinary close did not retire original provider",
     );
+}
+
+#[test]
+fn failed_reattachment_keeps_original_provider_exit_diagnostic() {
+    if isolated("failed_reattachment_keeps_original_provider_exit_diagnostic") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let raw = fixture.raw();
+    let pair = fixture.worker.holder_identity().unwrap().clone();
+    fs::write(fixture.root.join("fail-reattach-initialize"), b"fail").unwrap();
+    // Exercise the actual restore poll and its first returned failure, before
+    // any chat snapshot can be installed or used to recover the diagnosis.
+    let refusal = restore(&fixture.host, CLIENT, &fixture.source).unwrap_err();
+    assert!(refusal.contains("Cannot reattach the retained native conversation"));
+    assert!(refusal.contains("status 7"), "{refusal}");
+    assert!(refusal.contains("reattach capacity fixture"), "{refusal}");
+    assert!(refusal.contains("redacted credential-bearing stderr line"));
+    assert!(!refusal.contains("NATIVE_REATTACH_PRIVATE_CANARY"));
+    assert!(!refusal.contains('\u{1b}'));
+    assert!(
+        refusal.contains(
+            "Provider ownership was preserved; no replacement was started or prompt resent"
+        )
+    );
+    assert!(!refusal.contains("cleanup is unconfirmed"));
+    {
+        let state = fixture.host.lock().unwrap();
+        assert!(!state.chats.contains_key(&fixture.source.id));
+        assert!(!state.chat_spawning.contains_key(&fixture.source.id));
+        assert!(!state.native_closing.contains_key(&fixture.source.id));
+        assert_eq!(
+            state.native_adoption_failures.get(&fixture.source),
+            Some(refusal.as_str())
+        );
+    }
+    assert_failed_reattachment_custody(&fixture, &raw, &pair);
+}
+
+#[test]
+fn fatal_reattachment_rpc_waits_for_diagnostic_before_first_failure() {
+    if isolated("fatal_reattachment_rpc_waits_for_diagnostic_before_first_failure") {
+        return;
+    }
+    fatal_reattachment_rpc(true);
+}
+
+#[test]
+fn fatal_reattachment_rpc_without_exit_diagnostic_still_returns_failure() {
+    if isolated("fatal_reattachment_rpc_without_exit_diagnostic_still_returns_failure") {
+        return;
+    }
+    fatal_reattachment_rpc(false);
+}
+
+struct ResumeNativeDiagnostic(Option<crossbeam_channel::Sender<()>>);
+
+impl ResumeNativeDiagnostic {
+    fn resume(&mut self) {
+        if let Some(resume) = self.0.take() {
+            let _ = resume.send(());
+        }
+    }
+}
+
+impl Drop for ResumeNativeDiagnostic {
+    fn drop(&mut self) {
+        self.resume();
+    }
+}
+
+fn fatal_reattachment_rpc(exit: bool) {
+    let fixture = Fixture::new();
+    let raw = fixture.raw();
+    let pair = fixture.worker.holder_identity().unwrap().clone();
+    let rpc_error = format!(
+        "FATAL_REATTACH_RPC_BEGIN:{}:FATAL_REATTACH_RPC_END",
+        "é".repeat(4096)
+    );
+    fs::write(fixture.root.join("fatal-reattach-initialize"), &rpc_error).unwrap();
+    let provider = unsafe { libc::syscall(libc::SYS_pidfd_open, fixture.native.root.pid, 0) };
+    assert!(provider >= 0);
+    let provider = unsafe { OwnedFd::from_raw_fd(provider as i32) };
+    if exit {
+        fs::write(fixture.root.join("fatal-reattach-exit"), b"exit").unwrap();
+    }
+    let refusal = thread::scope(|scope| {
+        let (entered, observing) = crossbeam_channel::bounded(1);
+        let (resume, waiting) = crossbeam_channel::bounded(1);
+        let restoring = scope.spawn(|| {
+            let _hook =
+                crate::chat::runtime::before_native_failure_diagnostic_for_test(move |probe| {
+                    if entered.send(probe).is_ok() {
+                        // A lost reader must not strand this actual actor.
+                        let _ = waiting.recv_timeout(Duration::from_secs(10));
+                    }
+                });
+            restore(&fixture.host, CLIENT, &fixture.source).unwrap_err()
+        });
+        // Declared inside the scope so assertion unwinding releases the worker
+        // before the scope joins the restoring thread.
+        let mut release = ResumeNativeDiagnostic(Some(resume));
+        let probe = observing.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut event = libc::pollfd {
+            fd: provider.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut event, 1, if exit { 5000 } else { 0 }) };
+        assert_eq!(
+            ready,
+            if exit { 1 } else { 0 },
+            "original provider exit ordering"
+        );
+        assert_eq!(event.revents & libc::POLLIN != 0, exit);
+        assert_eq!(event.revents & (libc::POLLERR | libc::POLLNVAL), 0);
+        for _ in 0..3 {
+            assert!(
+                probe.failure().is_none(),
+                "raw fatal RPC escaped the handoff"
+            );
+            let snapshot = probe.snapshot();
+            assert!(snapshot.error.is_none(), "raw fatal RPC entered snapshot");
+            assert!(!snapshot.exited);
+            assert!(!probe.is_completed());
+            assert!(!restoring.is_finished());
+            assert!(
+                fixture
+                    .host
+                    .lock()
+                    .unwrap()
+                    .native_adoption_failures
+                    .get(&fixture.source)
+                    .is_none()
+            );
+            thread::yield_now();
+        }
+        release.resume();
+        let refusal = restoring.join().unwrap();
+        let first = probe.failure().expect("diagnostic handoff never settled");
+        let snapshot = probe.snapshot();
+        assert!(snapshot.exited);
+        assert!(probe.is_completed());
+        let final_error = snapshot
+            .error
+            .expect("deferred snapshot failure never published");
+        for message in [&first, &final_error] {
+            assert!(message.contains(&rpc_error));
+            if exit {
+                assert!(message.contains("status 7"));
+                assert!(message.contains("reattach capacity fixture"));
+                assert!(message.contains("redacted credential-bearing stderr line"));
+            } else {
+                assert!(!message.contains("Native provider exited"));
+            }
+            assert!(!message.contains("NATIVE_REATTACH_PRIVATE_CANARY"));
+            assert!(!message.contains('\u{1b}'));
+        }
+        refusal
+    });
+    assert!(refusal.contains(&rpc_error));
+    assert!(refusal.contains("Provider ownership was preserved"));
+    assert!(refusal.contains("no replacement was started or prompt resent"));
+    assert!(!refusal.contains("cleanup is unconfirmed"));
+    let cached = fixture
+        .host
+        .lock()
+        .unwrap()
+        .native_adoption_failures
+        .get(&fixture.source)
+        .unwrap()
+        .to_owned();
+    assert!(cached.len() <= AdoptionFailures::MESSAGE_BYTES);
+    assert!(cached.contains("FATAL_REATTACH_RPC_BEGIN:"));
+    assert!(!cached.contains("FATAL_REATTACH_RPC_END"));
+    assert!(cached.contains("Provider ownership was preserved"));
+    assert!(cached.contains("no replacement was started or prompt resent"));
+    for message in [&refusal, &cached] {
+        if exit {
+            assert!(message.contains("status 7"));
+            assert!(message.contains("reattach capacity fixture"));
+            assert!(message.contains("redacted credential-bearing stderr line"));
+        } else {
+            assert!(!message.contains("Native provider exited"));
+        }
+        assert!(!message.contains("NATIVE_REATTACH_PRIVATE_CANARY"));
+        assert!(!message.contains('\u{1b}'));
+    }
+    let mut altered = fixture.source.clone();
+    altered.launch.recipe.arguments.push("--different".into());
+    assert!(
+        fixture
+            .host
+            .lock()
+            .unwrap()
+            .native_adoption_failures
+            .get(&altered)
+            .is_none()
+    );
+    assert_failed_reattachment_custody(&fixture, &raw, &pair);
+}
+
+fn assert_failed_reattachment_custody(
+    fixture: &Fixture,
+    raw: &TerminalSession,
+    pair: &crate::terminal::holder::Record,
+) {
+    assert_eq!(&fixture.raw(), raw);
+    assert_eq!(fixture.worker.holder_identity(), Some(pair));
+    assert!(pair.root.is_current());
+    assert!(
+        fixture.native.root.is_current(),
+        "original wait custody lost"
+    );
+    assert!(fixture.native.holder.is_current());
+    assert_eq!(
+        registry::evidence(
+            &registry::socket(
+                &registry::directory(Kind::Native).unwrap(),
+                fixture.source.id
+            ),
+            Kind::Native
+        )
+        .unwrap(),
+        Some(fixture.native.clone())
+    );
+    let (retained, _) =
+        crate::chat::native_holder::inspect(&fixture.native, &fixture.proof).unwrap();
+    assert_eq!(retained.source.launch, fixture.original.source.launch);
+    assert_eq!(retained.server_process, fixture.original.server_process);
+    assert_eq!(retained.server_identity, fixture.original.server_identity);
+    assert_eq!(retained.confirmed_thread.as_deref(), Some(THREAD));
+    assert_eq!(retained.paired_holder.as_ref(), Some(pair));
+    assert!(retained.execution_environment == fixture.original.execution_environment);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("provider-launches")).unwrap(),
+        "launch\n"
+    );
+    let requests = fs::read_to_string(fixture.root.join("provider-requests")).unwrap();
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|method| *method == "initialize")
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|method| *method == "thread/start")
+            .count(),
+        1
+    );
+    assert!(!requests.lines().any(|method| method == "thread/resume"));
+    assert!(!requests.lines().any(|method| method.starts_with("turn/")));
+    let (mut holder, _) =
+        crate::chat::native_holder::adopt(&fixture.native, &fixture.source, &fixture.proof)
+            .unwrap();
+    holder.close().unwrap();
+    assert!(
+        !fixture.native.root.is_current(),
+        "exact Close did not reap original"
+    );
+    let projected = fixture
+        .host
+        .lock()
+        .unwrap()
+        .native_terminal_projection(fixture.source.id)
+        .unwrap();
+    fixture
+        .worker
+        .close_with_receipt(&projected, &fixture.proof)
+        .unwrap();
+    assert!(!pair.root.is_current());
 }
 
 #[test]
@@ -1291,6 +1568,45 @@ fn provider() {
                 .open(root.join("provider-requests"))
                 .unwrap();
             writeln!(log, "{method}").unwrap();
+            if method == "initialize" && root.join("fatal-reattach-initialize").exists() {
+                let message = fs::read_to_string(root.join("fatal-reattach-initialize")).unwrap();
+                eprintln!("Authorization: Bearer NATIVE_REATTACH_PRIVATE_CANARY");
+                eprintln!("\x1b[31mreattach capacity fixture\x1b[0m");
+                std::io::stderr().flush().unwrap();
+                websocket
+                    .send(tungstenite::Message::Text(
+                        json!({"id":id,"error":{"code":-32000,"message":message}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .unwrap();
+                if root.join("fatal-reattach-exit").exists() {
+                    unsafe { libc::_exit(7) };
+                }
+                continue;
+            }
+            if method == "initialize" && root.join("fail-reattach-initialize").exists() {
+                eprintln!("Authorization: Bearer NATIVE_REATTACH_PRIVATE_CANARY");
+                eprintln!("\x1b[31mreattach capacity fixture\x1b[0m");
+                std::io::stderr().flush().unwrap();
+                let original = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+                assert!(original >= 0);
+                let delayed_eof = unsafe { libc::fork() };
+                assert!(delayed_eof >= 0);
+                if delayed_eof == 0 {
+                    // Keep the inherited websocket open until the original is
+                    // kernel-exited, so its first diagnostic cannot be live.
+                    // After fork use only async-signal-safe libc operations.
+                    let mut event = libc::pollfd {
+                        fd: original as i32,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ready = unsafe { libc::poll(&mut event, 1, 5000) };
+                    unsafe { libc::_exit(if ready > 0 { 0 } else { 1 }) };
+                }
+                unsafe { libc::_exit(7) };
+            }
             let result = match method {
                 "initialize" => {
                     json!({"userAgent":"cagents/0.157.1 (Linux)", "codexHome":std::env::var("CODEX_HOME").unwrap()})

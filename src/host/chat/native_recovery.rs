@@ -101,6 +101,30 @@ fn restored_thread_ready(handle: &Handle, expected: Option<&str>) -> Result<bool
     }
 }
 
+fn reattachment_failure(error: &str, cleanup: Option<&str>) -> String {
+    // Put the custody result and bounded cleanup detail before the failure
+    // handoff, whose native diagnosis precedes arbitrary provider RPC text.
+    // The existing 4 KiB cache then retains both without copying a raw tail.
+    let context = match cleanup {
+        None => "Provider ownership was preserved; no replacement was started or prompt resent"
+            .to_owned(),
+        Some(cleanup) => {
+            const CLEANUP_BYTES: usize = 512;
+            let end = cleanup.floor_char_boundary(CLEANUP_BYTES);
+            let omitted = if end < cleanup.len() {
+                " [later cleanup details omitted]"
+            } else {
+                ""
+            };
+            format!(
+                "Local attachment cleanup is unconfirmed; no replacement was started or prompt resent\nCleanup details: {}{omitted}",
+                &cleanup[..end]
+            )
+        }
+    };
+    format!("Cannot reattach the retained native conversation. {context}\n{error}")
+}
+
 /// Diagnostic data only: it never authorizes attaching, launching or cleanup.
 /// Keep hashes rather than another copy of launch environments for every alias.
 #[derive(Default)]
@@ -391,12 +415,8 @@ fn restore_authenticated(
         // storage makes its rollout unavailable. Preserve its owner without
         // claiming a live attachment or recreating the missing account.
         return match handle.close() {
-            Ok(()) => Err(format!(
-                "Cannot reattach the retained native conversation: {error}. Provider ownership was preserved; no replacement was started or prompt resent"
-            )),
-            Err(cleanup) => Err(format!(
-                "Cannot reattach the retained native conversation: {error}. Local attachment cleanup is unconfirmed: {cleanup}; no replacement was started or prompt resent"
-            )),
+            Ok(()) => Err(reattachment_failure(&error, None)),
+            Err(cleanup) => Err(reattachment_failure(&error, Some(&cleanup))),
         };
     }
     let paired = (|| {
@@ -621,6 +641,50 @@ mod tests {
             failures.get(&source).is_none(),
             "successful restore/cleanup clears the refusal"
         );
+    }
+
+    #[test]
+    fn bounded_adoption_failure_keeps_diagnosis_and_cleanup_before_long_rpc_text() {
+        let source = crate::chat::fresh_session(
+            Provider::Codex,
+            TerminalId::new(),
+            "/var/tmp".into(),
+            &crate::account::Account::system(Provider::Codex),
+        )
+        .unwrap();
+        let key = AdoptionFailures::source_key(&source).unwrap();
+        let diagnostic = format!(
+            "Native provider exited with status 7\nProvider stderr tail (earlier bytes omitted; stderr capture incomplete; stderr read failed; invalid UTF-8 replaced for display):\n{}",
+            "é".repeat(512)
+        );
+        let raw = format!("Codex RPC error: {}RAW_RPC_END", "é".repeat(4096));
+        let failure = format!("{diagnostic}\n{raw}");
+        let cleanup = format!(
+            "original holder refused Close: {}CLEANUP_END",
+            "界".repeat(1024)
+        );
+        for cleanup in [None, Some(cleanup.as_str())] {
+            let reason = reattachment_failure(&failure, cleanup);
+            let mut failures = AdoptionFailures::default();
+            failures.remember(source.id, vec![key], &reason);
+            let cached = failures.get(&source).unwrap();
+            assert!(cached.len() <= AdoptionFailures::MESSAGE_BYTES);
+            assert!(cached.contains(&diagnostic));
+            assert!(cached.contains("no replacement was started or prompt resent"));
+            assert!(cached.contains("Codex RPC error: é"));
+            assert!(!cached.contains("RAW_RPC_END"));
+            if cleanup.is_some() {
+                assert!(cached.contains("Local attachment cleanup is unconfirmed"));
+                assert!(cached.contains("original holder refused Close:"));
+                assert!(cached.contains("[later cleanup details omitted]"));
+                assert!(!cached.contains("CLEANUP_END"));
+            } else {
+                assert!(cached.contains("Provider ownership was preserved"));
+            }
+            let mut altered = source.clone();
+            altered.launch.recipe.arguments.push("--different".into());
+            assert!(failures.get(&altered).is_none());
+        }
     }
 
     #[test]
