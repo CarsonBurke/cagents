@@ -2418,11 +2418,12 @@ mod tests {
                 shell.request_redraw();
                 // A focused obscured editor can request IME during redraw.
                 // Its rendering must progress without taking modal input.
-                let input_method: cosmic::iced::InputMethod = cosmic::iced::InputMethod::Enabled {
-                    cursor: Rectangle::with_size(Size::UNIT),
-                    purpose: cosmic::iced::input_method::Purpose::Normal,
-                    preedit: None,
-                };
+                let input_method: cosmic::iced::advanced::InputMethod =
+                    cosmic::iced::advanced::InputMethod::Enabled {
+                        cursor: Rectangle::with_size(Size::UNIT),
+                        purpose: cosmic::iced::advanced::input_method::Purpose::Normal,
+                        preedit: None,
+                    };
                 shell.request_input_method(&input_method);
                 shell.capture_event();
             } else {
@@ -2571,7 +2572,10 @@ mod tests {
             cosmic::iced::window::RedrawRequest::NextFrame
         );
         assert!(!shell.is_event_captured());
-        assert_eq!(shell.input_method(), &cosmic::iced::InputMethod::Disabled);
+        assert_eq!(
+            shell.input_method(),
+            &cosmic::iced::advanced::InputMethod::Disabled
+        );
         drop(shell);
         assert_eq!(messages, ["background rendering completion"]);
 
