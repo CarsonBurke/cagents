@@ -250,6 +250,12 @@ const COMPLETION_CEILING: f32 = 7.0 * COMPLETION_ROW;
 
 /// The completion list's inset from its own edge.
 const COMPLETION_INSET: f32 = space::XS;
+/// The `+` menu's width, which fits a row's name beside a few words of what
+/// it does.
+const COMPOSER_MENU_WIDTH: f32 = 340.0;
+/// The `+` menu's list scrolls past ten rows, where a provider's commands
+/// and skills would otherwise cover the conversation.
+const COMPOSER_MENU_CEILING: f32 = 10.0 * COMPLETION_ROW;
 
 /// The completion list's scrollable, named so the keyboard can scroll it.
 const COMPLETION_LIST: &str = "chat-completion";
@@ -691,36 +697,96 @@ fn completion_row<'a>(
     highlighted: bool,
     message: Option<Message>,
 ) -> Element<'a, Message> {
-    widget::button::custom(
-        widget::row::with_children(vec![
-            design::body(row.label())
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-            design::caption(row.description)
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .width(Length::Fill)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ))
-                .into(),
-            design::caption(match row.kind {
-                completion::Kind::Command => "Command",
-                completion::Kind::Skill => "Skill",
-                completion::Kind::File => "File",
-            })
-            .class(cosmic::theme::Text::Custom(design::muted_text))
-            .into(),
-        ])
-        .spacing(step::GAP_S)
-        .align_y(Alignment::Center),
+    menu_row(
+        None,
+        row.label(),
+        row.description,
+        Some(completion_kind(row.kind)),
+        highlighted,
     )
-    .class(crate::ui_controls::control_style(highlighted, None))
+    .on_press_maybe(message)
+    .into()
+}
+
+fn completion_kind(kind: completion::Kind) -> &'static str {
+    match kind {
+        completion::Kind::Command => "Command",
+        completion::Kind::Skill => "Skill",
+        completion::Kind::File => "File",
+    }
+}
+
+/// A one-line row of a composer list: an optional icon, a name, what it
+/// does in muted text cut to the room left, and what kind of thing it is.
+fn menu_row<'a>(
+    icon: Option<Icon>,
+    label: impl Into<Cow<'a, str>> + 'a,
+    description: impl Into<Cow<'a, str>> + 'a,
+    kind: Option<&'a str>,
+    highlighted: bool,
+) -> widget::button::Button<'a, Message> {
+    let mut cells: Vec<Element<'a, Message>> = Vec::new();
+    cells.extend(icon.map(|icon| {
+        widget::icon(icon.handle())
+            .size(design::COMPACT_ICON_SIZE)
+            .into()
+    }));
+    cells.push(
+        design::body(label)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
+    );
+    cells.push(
+        design::caption(description)
+            .class(cosmic::theme::Text::Custom(design::muted_text))
+            .width(Length::Fill)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .ellipsize(iced::widget::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            ))
+            .into(),
+    );
+    cells.extend(kind.map(|kind| {
+        design::caption(kind)
+            .class(cosmic::theme::Text::Custom(design::muted_text))
+            .into()
+    }));
+    widget::button::custom(
+        widget::row::with_children(cells)
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center),
+    )
+    .class(menu_row_style(highlighted))
     .padding(iced::Padding::from([0.0, step::GAP_S]))
     .height(Length::Fixed(COMPLETION_ROW))
     .width(Length::Fill)
-    .on_press_maybe(message)
-    .into()
+}
+
+/// A list row's surfaces, with the ring buttons draw for keyboard focus, so
+/// the row Tab reached does not read as the one under the pointer.
+fn menu_row_style(highlighted: bool) -> cosmic::theme::Button {
+    let cosmic::theme::Button::Custom {
+        active,
+        disabled,
+        hovered,
+        pressed,
+    } = crate::ui_controls::control_style(highlighted, None)
+    else {
+        unreachable!("control_style draws a custom button");
+    };
+    let ring = |mut style: widget::button::Style, focused: bool, theme: &cosmic::Theme| {
+        if focused {
+            style.outline_width = design::BORDER_WIDTH;
+            style.outline_color = design::accent_color(theme);
+        }
+        style
+    };
+    cosmic::theme::Button::Custom {
+        active: Box::new(move |focused, theme| ring(active(focused, theme), focused, theme)),
+        disabled,
+        hovered: Box::new(move |focused, theme| ring(hovered(focused, theme), focused, theme)),
+        pressed: Box::new(move |focused, theme| ring(pressed(focused, theme), focused, theme)),
+    }
 }
 
 /// The height of one completion row and of the list showing `count` of them.
@@ -3266,7 +3332,7 @@ impl Runtime {
         let target = self.target;
         let snapshot = &self.snapshot;
         let rows = self.composer_action_rows(transitioning);
-        if rows.is_empty() {
+        if rows.is_empty() && !self.composer_menu_searchable() {
             return None;
         }
         let open = self.composer_actions || self.branch_picker;
@@ -3333,64 +3399,153 @@ impl Runtime {
                     .spacing(step::GAP_S)
                     .into()
             } else {
-                let choices = rows.into_iter().map(|(row, enabled)| {
-                    let id = card_control_id(target.card, row.id());
-                    let button = match row {
-                        ComposerRow::Attach => {
-                            crate::ui_controls::button::secondary("Attach files or images…")
-                                .icon(Icon::Attachment)
-                                .on_press_maybe(enabled.then(|| action(Action::Attach(target))))
-                        }
-                        ComposerRow::Steering => {
-                            let wait = snapshot.interrupt_mode.as_deref() == Some("wait");
-                            crate::ui_controls::button::secondary(if wait {
-                                "Steering: after turn"
-                            } else {
-                                "Steering: after tools"
-                            })
-                            .icon(Icon::Jump)
-                            .name(if wait {
-                                "Steering: after turn. Press to steer after tools instead"
-                            } else {
-                                "Steering: after tools. Press to steer after the turn instead"
-                            })
-                            .on_press_maybe(enabled.then(|| {
-                                action(Action::Command(
-                                    target,
-                                    Command::SetInterruptMode {
-                                        mode: if wait { "immediate" } else { "wait" }.into(),
-                                    },
-                                ))
-                            }))
-                        }
-                        ComposerRow::Fork => {
-                            crate::ui_controls::button::secondary("Fork conversation…")
-                                .icon(Icon::Branch)
-                                .on_press_maybe(
-                                    enabled.then(|| action(Action::BranchPicker(target, true))),
-                                )
-                        }
-                        ComposerRow::Compact => crate::ui_controls::button::secondary(
-                            "Compact conversation",
-                        )
-                        .icon(Icon::Compress)
-                        .name("Compact the conversation: summarize earlier turns to free context")
-                        .on_press_maybe(
-                            enabled.then(|| action(Action::Command(target, Command::Compact))),
-                        ),
-                    };
-                    button.id(id).width(Length::Fill).into()
-                });
-                widget::column::with_children(choices)
-                    .spacing(step::GAP_S)
-                    .into()
+                self.composer_menu_view(transitioning)
             };
-            widget::container(widget::scrollable(content).height(Length::Shrink))
-                .width(320)
-                .max_height(260.0)
-                .into()
+            widget::container(content).width(COMPOSER_MENU_WIDTH).into()
         });
         Some((anchor.into(), popup))
+    }
+
+    /// The `+` menu's own list: a search when there are commands or skills
+    /// to find, then the composer's actions, then the commands and skills
+    /// the search matches.
+    fn composer_menu_view(&self, transitioning: bool) -> Element<'_, Message> {
+        let target = self.target;
+        let snapshot = &self.snapshot;
+        let entries = self.composer_menu(transitioning);
+        // Enter in the search takes the first entry that can be pressed, so
+        // that one is marked as the completion list marks its choice.
+        let chosen = entries.iter().position(|(_, enabled)| *enabled);
+        let rows: Vec<Element<'_, Message>> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, (entry, enabled))| match entry {
+                MenuEntry::Row(row) => {
+                    let pressed = enabled.then(|| action(self.composer_row_action(row)));
+                    let (icon, label, description, name): (_, Cow<'_, str>, Cow<'_, str>, _) =
+                        match row {
+                            ComposerRow::Attach => (
+                                Icon::Attachment,
+                                "Attach files or images…".into(),
+                                "Add to this draft".into(),
+                                None,
+                            ),
+                            ComposerRow::Plan => {
+                                let back = self.plan_toggle().unwrap_or(PLAN_MODE);
+                                if back == PLAN_MODE {
+                                    (
+                                        Icon::List,
+                                        "Plan mode".into(),
+                                        "Explore and plan before making changes".into(),
+                                        None,
+                                    )
+                                } else {
+                                    (
+                                        Icon::List,
+                                        "Leave plan mode".into(),
+                                        format!("Return to {}", permission_mode_label(back)).into(),
+                                        None,
+                                    )
+                                }
+                            }
+                            ComposerRow::Steering => {
+                                let wait = snapshot.interrupt_mode.as_deref() == Some("wait");
+                                if wait {
+                                    (
+                                        Icon::Jump,
+                                        "Steering: after turn".into(),
+                                        "Switch to after tools".into(),
+                                        Some(
+                                            "Steering: after turn. Press to steer after tools instead",
+                                        ),
+                                    )
+                                } else {
+                                    (
+                                        Icon::Jump,
+                                        "Steering: after tools".into(),
+                                        "Switch to after the turn".into(),
+                                        Some(
+                                            "Steering: after tools. Press to steer after the turn instead",
+                                        ),
+                                    )
+                                }
+                            }
+                            ComposerRow::Fork => (
+                                Icon::Branch,
+                                "Fork conversation…".into(),
+                                "Branch from an earlier turn".into(),
+                                None,
+                            ),
+                            ComposerRow::Compact => (
+                                Icon::Compress,
+                                "Compact conversation".into(),
+                                "Summarize earlier turns".into(),
+                                Some(
+                                    "Compact the conversation: summarize earlier turns to free context",
+                                ),
+                            ),
+                        };
+                    let highlighted = chosen == Some(index);
+                    let mut button =
+                        menu_row(Some(icon), label.clone(), description, None, highlighted)
+                        .id(card_control_id(target.card, row.id()))
+                        .on_press_maybe(pressed);
+                    button = button.name(name.map_or(label, Cow::Borrowed));
+                    button.into()
+                }
+                MenuEntry::Named(name) => {
+                    let insertion = name.insertion.clone().into_owned();
+                    let kind = completion_kind(name.kind);
+                    let highlighted = chosen == Some(index);
+                    menu_row(None, name.label(), name.description, Some(kind), highlighted)
+                        .name(format!("{kind}: {}", name.label()))
+                        .on_press_maybe(
+                            enabled.then(|| action(Action::ComposerName(target, insertion))),
+                        )
+                        .into()
+                }
+            })
+            .collect();
+        let empty = rows.is_empty();
+        let list = widget::scrollable(
+            widget::column::with_children(rows)
+                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+        )
+        .height(Length::Shrink);
+        let mut content: Vec<Element<'_, Message>> = Vec::new();
+        if self.composer_menu_searchable() {
+            content.push(
+                crate::ui_controls::field::search(
+                    "Search actions, commands and skills",
+                    self.composer_actions_query.as_str(),
+                )
+                .id(card_control_id(target.card, COMPOSER_SEARCH))
+                .width(Length::Fill)
+                .on_input(move |query| action(Action::ComposerActionsQuery(target, query)))
+                // Enter takes the first match that can be pressed.
+                .on_submit(move |_| action(Action::ComposerActionsSubmit(target)))
+                .into(),
+            );
+        }
+        if empty {
+            content.push(
+                widget::container(
+                    design::caption("Nothing matches")
+                        .class(cosmic::theme::Text::Custom(design::muted_text)),
+                )
+                .padding([space::XS, step::GAP_S])
+                .into(),
+            );
+        } else {
+            content.push(
+                widget::container(list)
+                    .max_height(COMPOSER_MENU_CEILING)
+                    .into(),
+            );
+        }
+        widget::column::with_children(content)
+            .spacing(space::XS)
+            .into()
     }
 
     /// The model, reasoning effort, and permission mode, at the status line's
