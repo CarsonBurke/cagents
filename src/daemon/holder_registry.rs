@@ -506,35 +506,26 @@ pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
     Ok(records)
 }
 
-/// Whether a running holder registered this terminal on this boot, for a caller
+/// Whether a running process holds a record for this terminal, for a caller
 /// that holds no authority over the registry. Unlike discovery this creates and
-/// removes nothing. A record that can't be read is an error, not an absence.
+/// removes nothing. Holders don't carry the terminal's environment markers, so
+/// this record is the only evidence of one. Any live record counts: a holder of
+/// another version, application or kind can't be adopted, but it is still alive.
+/// A record that can't be read is an error, not an absence.
 #[cfg(feature = "ui")]
-pub(crate) fn holds_terminal(terminal: TerminalId, boot: &BootId, kind: Kind) -> io::Result<bool> {
+pub(crate) fn holds_terminal(terminal: TerminalId, kind: Kind) -> io::Result<bool> {
     let directory = directory(kind).map_err(io::Error::other)?;
     crate::secure_file::reject_symlink_components(&directory)?;
-    holds_terminal_in(&directory, terminal, boot, kind)
+    holds_terminal_in(&directory, terminal)
 }
 
 #[cfg(feature = "ui")]
-fn holds_terminal_in(
-    directory: &Path,
-    terminal: TerminalId,
-    boot: &BootId,
-    kind: Kind,
-) -> io::Result<bool> {
-    let path = socket(directory, terminal).with_extension("json");
-    let record = match read(&path) {
-        Ok(record) => record,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    Ok(record.kind == kind
-        && record.supported_version()
-        && record.application == crate::instance::APPLICATION_ID
-        && record.path(directory) == path
-        && &record.boot == boot
-        && record.holder.is_current())
+fn holds_terminal_in(directory: &Path, terminal: TerminalId) -> io::Result<bool> {
+    match read(&socket(directory, terminal).with_extension("json")) {
+        Ok(record) => Ok(record.holder.is_current()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
@@ -829,27 +820,21 @@ mod tests {
     fn checking_for_a_holder_changes_nothing_in_the_registry() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("holders");
-        let boot = crate::daemon::read_boot_id().unwrap();
         let unknown = TerminalId::new();
-        assert!(!holds_terminal_in(&directory, unknown, &boot, Kind::Terminal).unwrap());
+        assert!(!holds_terminal_in(&directory, unknown).unwrap());
         assert!(!directory.exists(), "a read must not create the registry");
 
         crate::secure_file::prepare_private_directory(&directory).unwrap();
         let live = record();
         live.create(&directory).unwrap();
-        assert!(holds_terminal_in(&directory, live.terminal, &boot, Kind::Terminal).unwrap());
-        assert!(!holds_terminal_in(&directory, unknown, &boot, Kind::Terminal).unwrap());
-        assert!(!holds_terminal_in(&directory, live.terminal, &boot, Kind::Native).unwrap());
-        let other_boot = BootId::new("another-boot");
-        assert!(
-            !holds_terminal_in(&directory, live.terminal, &other_boot, Kind::Terminal).unwrap()
-        );
+        assert!(holds_terminal_in(&directory, live.terminal).unwrap());
+        assert!(!holds_terminal_in(&directory, unknown).unwrap());
 
         // Discovery prunes a dead holder's record. This caller has no such authority.
         let mut dead = record();
         dead.holder.start += 1;
         dead.create(&directory).unwrap();
-        assert!(!holds_terminal_in(&directory, dead.terminal, &boot, Kind::Terminal).unwrap());
+        assert!(!holds_terminal_in(&directory, dead.terminal).unwrap());
         assert!(dead.path(&directory).exists());
 
         let unreadable = TerminalId::new();
@@ -858,7 +843,35 @@ mod tests {
             "not a record",
         )
         .unwrap();
-        assert!(holds_terminal_in(&directory, unreadable, &boot, Kind::Terminal).is_err());
+        assert!(holds_terminal_in(&directory, unreadable).is_err());
+    }
+
+    /// Adoption can turn these down; none of them makes the holder less alive.
+    #[cfg(feature = "ui")]
+    #[test]
+    fn a_live_holder_counts_whatever_its_record_says_about_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("holders");
+        crate::secure_file::prepare_private_directory(&directory).unwrap();
+        let foreign: [fn(&mut Record); 4] = [
+            |record| record.version = u32::MAX,
+            |record| record.application = "another.application".into(),
+            |record| record.kind = Kind::Native,
+            |record| record.boot = BootId::new("another-boot"),
+        ];
+        for change in foreign {
+            let mut record = record();
+            change(&mut record);
+            record.create(&directory).unwrap();
+            assert!(holds_terminal_in(&directory, record.terminal).unwrap());
+
+            // The same record with its holder gone is no longer evidence of one.
+            let mut gone = record.clone();
+            gone.terminal = TerminalId::new();
+            gone.holder.start += 1;
+            gone.create(&directory).unwrap();
+            assert!(!holds_terminal_in(&directory, gone.terminal).unwrap());
+        }
     }
 
     fn endpoint_with_byte_length(root: &Path, length: usize) -> PathBuf {

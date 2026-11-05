@@ -957,6 +957,20 @@ fn a_kept_terminal_says_why_and_allows_a_fresh_explicit_close() {
     assert!(app.terminal_close.as_ref().unwrap().pending);
 }
 
+/// A refusal takes over from the wait, and the pane can be closed again.
+#[test]
+fn a_pane_says_its_close_is_being_checked_only_until_the_answer() {
+    let (mut app, card, _, _) = live_app();
+    assert!(!app.terminal_close_in_progress(card));
+    let _ = app.update(Message::CloseCard(card));
+    assert!(app.terminal_close_in_progress(card));
+    report_close(
+        &mut app,
+        terminal_close::CloseOutcome::Kept("The pane was kept.".into()),
+    );
+    assert!(!app.terminal_close_in_progress(card));
+}
+
 /// A lost connection used to stop Close before it asked anything, so a pane
 /// whose daemon came back without its terminal could never be removed.
 #[test]

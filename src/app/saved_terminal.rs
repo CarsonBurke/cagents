@@ -805,6 +805,7 @@ impl Cagents {
         } else {
             reconnect.on_press(action(Command::Reconnect))
         };
+        let closing = self.terminal_close_in_progress(card);
         let mut controls = vec![reconnect.into()];
         if dormant {
             let label = if entry.source.agent_resume_recipe().is_some() {
@@ -837,11 +838,11 @@ impl Cagents {
                         .then(|| action(Command::NewTerminal)),
                 )
                 .into(),
-            crate::ui_controls::button::secondary("Close")
+            crate::ui_controls::button::secondary(if closing { "Checking…" } else { "Close" })
                 .id(control_id("close"))
                 .name("Close saved terminal pane")
                 .on_press_maybe(
-                    allows_command(&entry.authority, Command::Close)
+                    (!closing && allows_command(&entry.authority, Command::Close))
                         .then(|| action(Command::Close)),
                 )
                 .into(),

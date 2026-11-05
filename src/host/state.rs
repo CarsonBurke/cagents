@@ -6443,6 +6443,94 @@ for line in sys.stdin:
     }
 
     #[test]
+    pub(super) fn restore_does_not_relaunch_beside_a_process_in_the_saved_unit() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
+        let host = Arc::new(crate::host::state::HostLock::new(test_host()));
+        let capability = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        prepare_upgrade_with(&host, capability, || Ok(store)).unwrap();
+        finish_upgrade(&host).unwrap();
+
+        let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
+        let mut checkpoint = store.load().unwrap().unwrap();
+        let conversation = "aaaaaaaa-1111-4222-8333-444444444444";
+        let mut recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        recipe.program = "claude".into();
+        recipe.arguments = vec!["--resume".into(), conversation.into()];
+        let mut launch = recipe.clone();
+        launch.program = "/usr/bin/systemd-run".into();
+        launch.arguments = vec![
+            "--user".into(),
+            "--scope".into(),
+            "--unit=saved-unit".into(),
+            "claude".into(),
+            "--resume".into(),
+            conversation.into(),
+        ];
+        checkpoint
+            .terminals
+            .push(crate::upgrade::handoff::Terminal {
+                source: TerminalSession {
+                    owned_codex_listener: None,
+                    recovery_origin: None,
+                    predecessor: None,
+                    id: TerminalId::new(),
+                    launch,
+                    transcript_path: None,
+                    resume_hint: crate::model::agent_recovery::hint_from_launch(&recipe),
+                    continuity: TerminalContinuity::DetachedSameBoot {
+                        host_session_id: checkpoint.proof.host_session_id.clone(),
+                        boot_id: checkpoint.proof.boot_id.clone(),
+                        host_incarnation: checkpoint.proof.host_incarnation.clone(),
+                    },
+                },
+                previous_sources: Vec::new(),
+                relaunches: Vec::new(),
+                recipe,
+                options: TerminalSpawnOptions::default(),
+            });
+        store.save(&checkpoint).unwrap();
+
+        // Its environment was cleared, so only the unit ties it to the terminal.
+        let process = directory.path().join("proc/43");
+        fs::create_dir_all(&process).unwrap();
+        fs::write(process.join("stat"), "43 (sleep) S 1").unwrap();
+        fs::write(process.join("cmdline"), b"sleep\01800\0").unwrap();
+        fs::write(process.join("environ"), b"").unwrap();
+        fs::write(
+            process.join("cgroup"),
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/saved-unit.scope\n",
+        )
+        .unwrap();
+
+        let replacement = Arc::new(crate::host::state::HostLock::new(test_host()));
+        let refusal =
+            restore_upgrade_from(&replacement, store, &directory.path().join("proc"), None)
+                .unwrap_err();
+        assert!(
+            refusal.contains("may still have a live process (43)"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("saved-unit"), "{refusal}");
+        assert!(
+            replacement
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .terminals
+                .is_empty(),
+            "nothing may relaunch beside it"
+        );
+    }
+
+    #[test]
     pub(super) fn committed_upgrade_fences_control_and_retains_checkpoint_until_close() {
         if !upgrade_fixture_in_fresh_process() {
             return;

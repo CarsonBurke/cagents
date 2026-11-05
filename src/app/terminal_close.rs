@@ -99,6 +99,17 @@ impl Cagents {
         Task::none()
     }
 
+    /// Close was taken for this pane and hasn't settled, with no dialog to say
+    /// so. The check can wait about five seconds behind a recovery.
+    pub(super) fn terminal_close_in_progress(&self, card: CardId) -> bool {
+        self.terminal_close.as_ref().is_some_and(|intent| {
+            intent.card == card && intent.pending && !intent.active && intent.detail.is_none()
+        }) || self
+            .queued_card_closes
+            .iter()
+            .any(|queued| queued.card == card)
+    }
+
     pub(super) fn terminal_close_dialog_visible(&self) -> bool {
         self.terminal_close
             .as_ref()
@@ -255,7 +266,7 @@ impl Cagents {
         }
         if self.pending_terminal_spawn(card) {
             self.status = Some(TransientNotice::warning(
-                "Terminal is still starting. The card is kept until the daemon supplies its identity; then close it again.",
+                "This terminal is still starting, so the pane was kept. Close it again once it has started.",
             ));
             return Task::none();
         }
@@ -283,7 +294,7 @@ impl Cagents {
                 active: false,
                 dont_ask_again: false,
                 detail: (uncertain && !probe_only).then(|| {
-                    "Daemon unreachable; the card is retained. Reconnect before closing.".into()
+                    "Cagents lost contact with its daemon, so this terminal may still be running. The pane was kept. Use Retry or Reconnect on the pane if it offers them, then close it again.".into()
                 }),
                 focus: 0,
                 restore_keyboard_nav: self.core.keyboard_nav(),
@@ -344,7 +355,7 @@ impl Cagents {
             }
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
-                    "Could not release the completed terminal: {error}. Its card is retained; retry Close."
+                    "Could not release the completed terminal: {error}. The pane was kept. Try Close again."
                 )));
                 Task::none()
             }
@@ -597,7 +608,7 @@ impl Cagents {
         }
         if !self.terminal_close_attempts.insert(intent.terminal) {
             self.terminal_close.as_mut().unwrap().detail = Some(
-                "A close was already attempted. The card is retained until its outcome is known."
+                "A close was already attempted, so the pane was kept until Cagents knows how it ended."
                     .into(),
             );
             self.core.set_keyboard_nav(false);
@@ -1055,6 +1066,9 @@ mod tests {
             unasked: true,
         };
         assert_eq!(app.queued_card_closes.front(), Some(&queued_intent));
+        // Both clicks were taken, and neither pane has a dialog to say so.
+        assert!(app.terminal_close_in_progress(first));
+        assert!(app.terminal_close_in_progress(queued));
 
         // This is the same completion transition used by TerminalWake.
         app.retire_ended_terminal(queued, 0, None, false);

@@ -332,10 +332,17 @@ pub(crate) fn surviving_process(
                     } else {
                         SurvivorLink::Unit(unit.to_owned())
                     },
-                    format!(
-                        "terminal {} still has a live process ({pid}); preserving it",
-                        session.id
-                    ),
+                    if marked {
+                        format!(
+                            "terminal {} still has a live process ({pid}); preserving it",
+                            session.id
+                        )
+                    } else {
+                        format!(
+                            "terminal {} may still have a live process ({pid}) in {unit}, the systemd unit it was launched in; preserving it",
+                            session.id
+                        )
+                    },
                 )));
             }
         }

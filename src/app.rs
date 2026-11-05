@@ -10321,11 +10321,18 @@ impl Cagents {
                                 );
                             }
                             controls.push(
-                                crate::ui_controls::button::secondary("Close")
+                                {
+                                    let closing = self.terminal_close_in_progress(id);
+                                    crate::ui_controls::button::secondary(if closing {
+                                        "Checking…"
+                                    } else {
+                                        "Close"
+                                    })
                                     .id(card_control_id(id, "failed.close"))
                                     .name(format!("Close {}", labels.type_label))
-                                    .on_press(Message::CloseCard(id))
-                                    .into(),
+                                    .on_press_maybe((!closing).then_some(Message::CloseCard(id)))
+                                    .into()
+                                },
                             );
                             controls
                         })

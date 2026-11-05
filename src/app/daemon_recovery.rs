@@ -320,13 +320,10 @@ const LEASE_WAIT: Duration = if cfg!(test) {
 };
 
 /// A holder that this daemon didn't adopt is alive, and unlisted, by design.
-fn registered_holder(
-    terminal: crate::model::TerminalId,
-    boot: &crate::model::BootId,
-) -> Result<bool, String> {
+fn registered_holder(terminal: crate::model::TerminalId) -> Result<bool, String> {
     use crate::daemon::holder_registry::{Kind, holds_terminal};
     for kind in [Kind::Terminal, Kind::Native] {
-        if holds_terminal(terminal, boot, kind).map_err(|error| error.to_string())? {
+        if holds_terminal(terminal, kind).map_err(|error| error.to_string())? {
             return Ok(true);
         }
     }
@@ -337,7 +334,7 @@ fn prove_not_hosted_at(
     session: &TerminalSession,
     socket: &Path,
     proc_root: &Path,
-    holder: impl FnOnce(crate::model::TerminalId, &crate::model::BootId) -> Result<bool, String>,
+    holder: impl FnOnce(crate::model::TerminalId) -> Result<bool, String>,
 ) -> Result<(), String> {
     session
         .continuity
@@ -405,9 +402,9 @@ fn prove_not_hosted_at(
     // is not evidence that the daemon holding the runtime's lease answered.
     let owner = crate::daemon::replacement_owner(socket, &current).map_err(|_| UNREACHABLE)?;
     let cannot_confirm = || {
-        "Cagents can't confirm this terminal has stopped, so the pane was kept. Close it again in a moment.".to_owned()
+        "Cagents can't confirm this terminal has stopped, so the pane was kept. Try Close again in a moment. If this keeps happening, leave the pane in place.".to_owned()
     };
-    if holder(session.id, &current.boot_id).map_err(|_| cannot_confirm())? {
+    if holder(session.id).map_err(|_| cannot_confirm())? {
         return Err(UNADOPTED.into());
     }
     // Check even when the saved boot is over. No process outlives its boot, but
@@ -441,7 +438,7 @@ fn survivor_refusal(survivor: &crate::upgrade::SurvivingProcess) -> String {
             "{process} is still running this terminal's conversation, so the pane was kept. Stop it, then close the pane again."
         ),
         SurvivorLink::Unit(unit) => format!(
-            "{process} is running in {unit}, the systemd unit this terminal was launched in, so the pane was kept. If it came from this terminal, stop it, then close the pane again."
+            "{process} is running in {unit}, the systemd unit this terminal was launched in, so the pane was kept. If it came from this terminal, stop it, then close the pane again. Otherwise the pane stays until that process exits."
         ),
     }
 }
@@ -1340,7 +1337,7 @@ mod tests {
         })
     }
 
-    fn no_holder(_: crate::model::TerminalId, _: &crate::model::BootId) -> Result<bool, String> {
+    fn no_holder(_: crate::model::TerminalId) -> Result<bool, String> {
         Ok(false)
     }
 
@@ -1571,8 +1568,8 @@ mod tests {
             ..Default::default()
         };
         let server = inventory(&socket, current, served);
-        let refusal = prove_not_hosted_at(&saved, &socket, directory.path(), |terminal, read| {
-            assert_eq!((terminal, read), (id, &boot));
+        let refusal = prove_not_hosted_at(&saved, &socket, directory.path(), |terminal| {
+            assert_eq!(terminal, id);
             Ok(true)
         })
         .unwrap_err();
@@ -1586,7 +1583,7 @@ mod tests {
             ..Default::default()
         };
         let server = inventory(&socket, proof("after-restart"), served);
-        let refusal = prove_not_hosted_at(&saved, &socket, directory.path(), |_, _| {
+        let refusal = prove_not_hosted_at(&saved, &socket, directory.path(), |_| {
             Err("unreadable".into())
         })
         .unwrap_err();
