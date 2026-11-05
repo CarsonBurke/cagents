@@ -926,9 +926,6 @@ pub enum Action {
     LinkCancel,
     LinkReady {
         key: uuid::Uuid,
-        /// The home was already linked: a repeated request recovered its
-        /// existing registration instead of adding one.
-        recovered: bool,
         result: Result<Registry, String>,
     },
     /// The new account's home and CLI are ready, or could not be.
@@ -2553,14 +2550,15 @@ impl Cagents {
                 }
                 Task::none()
             }
-            Action::LinkReady {
-                key,
-                recovered,
-                result,
-            } => {
+            Action::LinkReady { key, result } => {
                 self.account_ui.table.linking = false;
                 match result {
                     Ok(registry) => {
+                        // A repeated link returns the registration the reader
+                        // already sees. A restored archive was hidden, so it
+                        // reads as added.
+                        let recovered = self.account_ui.registry.find(key).is_some()
+                            && !self.account_ui.registry.is_archived(key);
                         self.account_ui.set_registry(registry);
                         self.account_ui.table.link = None;
                         self.status = Some(
@@ -3348,7 +3346,6 @@ impl Cagents {
         }
         self.account_ui.table.linking = true;
         let key = uuid::Uuid::new_v4();
-        let requested = key;
         if crate::device::is_remote() {
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
@@ -3365,11 +3362,7 @@ impl Cagents {
                     Ok((registry, linked)) => (linked, Ok(registry)),
                     Err(error) => (key, Err(error)),
                 };
-                Message::AccountUi(Action::LinkReady {
-                    key,
-                    recovered: result.is_ok() && key != requested,
-                    result,
-                })
+                Message::AccountUi(Action::LinkReady { key, result })
             });
         }
         let store = self.account_ui.store.clone();
@@ -3419,11 +3412,7 @@ impl Cagents {
                 Ok((registry, linked)) => (linked, Ok(registry)),
                 Err(error) => (key, Err(error)),
             };
-            Message::AccountUi(Action::LinkReady {
-                key,
-                recovered: result.is_ok() && key != requested,
-                result,
-            })
+            Message::AccountUi(Action::LinkReady { key, result })
         })
     }
 
@@ -7936,25 +7925,48 @@ mod app_tests {
     /// have added another account.
     #[test]
     fn a_recovered_link_says_the_home_is_already_listed() {
-        for (recovered, expected) in [
-            (false, "Existing account home added."),
-            (true, "That account home is already listed."),
-        ] {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let link = |registry: &mut Registry, key| {
+            registry.link(Provider::Codex, key, home.clone(), None, None, 1)
+        };
+        let notice = |before: Registry, after: Registry, key| {
             let mut app = context_inspector_test_app(false);
+            app.account_ui.set_registry(before);
             let _ = app.update(Message::AccountUi(Action::LinkStart(Provider::Codex)));
             let _ = app.update(Message::AccountUi(Action::LinkReady {
-                key: uuid::Uuid::new_v4(),
-                recovered,
-                result: Ok(Registry::default()),
+                key,
+                result: Ok(after),
             }));
             assert!(app.account_ui.table.link.is_none());
-            let notices = app
-                .notices
+            app.notices
                 .recent()
-                .map(|entry| entry.notice.message.as_str())
-                .collect::<Vec<_>>();
-            assert_eq!(notices, [expected]);
-        }
+                .map(|entry| entry.notice.message.clone())
+                .collect::<Vec<_>>()
+        };
+        let empty = Registry::default();
+        let mut listed = empty.clone();
+        let key = link(&mut listed, uuid::Uuid::new_v4()).unwrap();
+        assert_eq!(
+            notice(empty, listed.clone(), key),
+            ["Existing account home added."]
+        );
+        let mut repeated = listed.clone();
+        assert_eq!(link(&mut repeated, uuid::Uuid::new_v4()), Ok(key));
+        assert_eq!(
+            notice(listed.clone(), repeated, key),
+            ["That account home is already listed."]
+        );
+        // An archived home is hidden, so restoring it reads as added.
+        let mut archived = listed;
+        assert!(archived.archive_duplicate(key, &Account::system(Provider::Codex)));
+        let mut restored = archived.clone();
+        assert_eq!(link(&mut restored, uuid::Uuid::new_v4()), Ok(key));
+        assert_eq!(
+            notice(archived, restored, key),
+            ["Existing account home added."]
+        );
     }
 
     /// A failed link says why, and stops saying it once the reader gives up
@@ -7965,7 +7977,6 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::LinkStart(Provider::Claude)));
         let _ = app.update(Message::AccountUi(Action::LinkReady {
             key: uuid::Uuid::new_v4(),
-            recovered: false,
             result: Err("no credentials in that directory".into()),
         }));
         let notices = app
