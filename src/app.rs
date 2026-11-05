@@ -14537,6 +14537,10 @@ impl Application for Cagents {
                     | chat_ui::Action::Dropped(..),
                 )
                 | Message::TerminalDropped { .. } => {
+                    // The refusal answers the `+` menu's choice as a chooser would.
+                    if let Message::ChatUi(chat_ui::Action::Attach(target)) = &message {
+                        self.close_composer_actions(*target);
+                    }
                     self.status = Some(TransientNotice::warning(
                         "File attachments require transfer to the selected device; use files already on that device",
                     ));
