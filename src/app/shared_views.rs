@@ -3918,6 +3918,47 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_settles_an_unsaved_strip_order_before_taking_its_baseline() {
+        let (mut app, source, _, pane) = channel_move_fixture();
+        let mut next = pane.clone();
+        next.id = CardId::new();
+        if let CardKind::Browser(browser) = &mut next.kind {
+            browser.id = BrowserId::new();
+        }
+        app.workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(source))
+            .unwrap()
+            .panes
+            .push(next.clone());
+        drop(app.reconcile_shared_views());
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let _ = app.workspace.reorder(next.id, 0).unwrap();
+        // The next echo projects the view over the strip before the snapshot,
+        // so the baseline cannot hide a difference the snapshot introduced.
+        drop(app.reconcile_shared_views());
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            vec![pane.id, next.id]
+        );
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == source)
+                .unwrap()
+                .cards,
+            vec![pane.id, next.id]
+        );
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|edit| matches!(edit, ModelEdit::ChangeView { .. }))
+        );
+    }
+
+    #[test]
     fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
         let (mut app, channel, _, pane) = fixture();
         let repository = PathBuf::from("/repo/.git");
