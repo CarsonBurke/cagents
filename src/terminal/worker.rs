@@ -6776,7 +6776,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let holders = directory
             .path()
-            .join(crate::instance::RUNTIME_SUBDIRECTORY)
+            .join(crate::instance::runtime_subdirectory())
             .join("holders");
         let mut cleanup = Cleanup {
             daemon: None,
@@ -8902,7 +8902,7 @@ mod tests {
                     .env_clear().env(CHILD, mode).env("HOME", directory.path())
                     .env("XDG_DATA_HOME", directory.path().join("data"))
                     .env("PATH", "/usr/bin:/bin")
-                    .env("CODEX_HOME", directory.path().join("data").join(crate::instance::STORAGE_NAME).join("accounts/codex/12345678-1234-4234-8234-123456789abc"))
+                    .env("CODEX_HOME", directory.path().join("data").join(crate::instance::storage_name()).join("accounts/codex/12345678-1234-4234-8234-123456789abc"))
                     .status().unwrap().success());
             }
             return;

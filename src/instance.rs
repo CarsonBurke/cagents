@@ -2058,8 +2058,62 @@ pub const RUNTIME_SUBDIRECTORY: &str = if IS_DEVELOPMENT {
     "cagents"
 };
 
+/// Selects one of several side-by-side development instances, each with its
+/// own storage and daemon. `scripts/run-development --instance` sets it; a
+/// production build ignores it.
+pub const DEVELOPMENT_INSTANCE_ENV: &str = "CAGENTS_DEVELOPMENT_INSTANCE";
+const DEVELOPMENT_INSTANCE_MAX: usize = 24;
+
+fn development_instance_name(value: Option<&std::ffi::OsStr>) -> Result<Option<String>, String> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match value.to_str() {
+        Some(name)
+            if name.len() <= DEVELOPMENT_INSTANCE_MAX
+                && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') =>
+        {
+            Ok(Some(name.to_owned()))
+        }
+        _ => Err(format!(
+            "{DEVELOPMENT_INSTANCE_ENV} must be 1-{DEVELOPMENT_INSTANCE_MAX} ASCII letters, \
+             digits or hyphens, starting with a letter or digit"
+        )),
+    }
+}
+
+/// The directory name under the data, config, state and runtime roots that
+/// holds this instance's files: `STORAGE_NAME` / `RUNTIME_SUBDIRECTORY`, with a
+/// development instance's name appended. An invalid name stops the process
+/// rather than falling back to the shared development state.
+fn namespace() -> &'static str {
+    static NAMESPACE: OnceLock<String> = OnceLock::new();
+    NAMESPACE.get_or_init(|| {
+        if !IS_DEVELOPMENT {
+            return STORAGE_NAME.to_owned();
+        }
+        match development_instance_name(env::var_os(DEVELOPMENT_INSTANCE_ENV).as_deref()) {
+            Ok(Some(name)) => format!("{STORAGE_NAME}-{name}"),
+            Ok(None) => STORAGE_NAME.to_owned(),
+            Err(message) => panic!("{message}"),
+        }
+    })
+}
+
+/// Names this instance's data, configuration and state directories.
+pub fn storage_name() -> &'static str {
+    namespace()
+}
+
+/// Names this instance's directory under `XDG_RUNTIME_DIR`, which holds the
+/// daemon socket and its lock.
+pub fn runtime_subdirectory() -> &'static str {
+    namespace()
+}
+
 pub fn project_dirs() -> Option<ProjectDirs> {
-    ProjectDirs::from("dev", "cagents", STORAGE_NAME)
+    ProjectDirs::from("dev", "cagents", storage_name())
 }
 
 /// This instance's settings file, which the UI owns and the CLI only reads.
@@ -2072,6 +2126,33 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use tempfile::tempdir;
+
+    #[test]
+    fn development_instance_names_are_short_path_safe_words() {
+        use std::ffi::OsStr;
+        assert_eq!(development_instance_name(None), Ok(None));
+        assert_eq!(development_instance_name(Some(OsStr::new(""))), Ok(None));
+        for name in ["pr2064", "a", "Steward-3", "x23456789012345678901234"] {
+            assert_eq!(
+                development_instance_name(Some(OsStr::new(name))),
+                Ok(Some(name.to_owned()))
+            );
+        }
+        for name in [
+            "-leading",
+            "has space",
+            "../escape",
+            "dot.name",
+            "under_score",
+            "x234567890123456789012345",
+            "é",
+        ] {
+            assert!(
+                development_instance_name(Some(OsStr::new(name))).is_err(),
+                "{name}"
+            );
+        }
+    }
 
     use super::*;
 
