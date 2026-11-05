@@ -17,6 +17,7 @@ use crate::{
     persistence::{
         SnapshotBase, StateStore, StoreError, StoredGenerations, TranscriptPruneReport,
         TranscriptRetention,
+        observed_notices::{Notice as ObservedNotice, Scope as ObservedNoticeScope},
     },
 };
 
@@ -184,9 +185,10 @@ pub struct SessionSaveHealthEvent {
     pub revision: u64,
     pub health: SessionSaveHealth,
     pub last_successful_flush_at_unix_ms: Option<i64>,
-    /// Writes storage refused by construction, set aside so they cannot hold
-    /// the rest of the lane hostage. Orthogonal to `health`: a lane that saves
-    /// everything else is healthy while still reporting these.
+    /// Ordinary writes storage refused, plus retained diagnostic saves whose
+    /// attempts failed (including automatic retries still in progress).
+    /// Orthogonal to `health`: local diagnostics cannot make the ordinary
+    /// workspace/descriptor lane unhealthy or veto a custody barrier.
     pub quarantined: Vec<QuarantinedWrite>,
 }
 
@@ -208,6 +210,11 @@ pub enum WriteSubject {
     CardIdentity {
         card: CardId,
         kind: ReplacedIdentity,
+    },
+    /// Locally observed diagnostics for one conversation. These bytes do not
+    /// change a pane descriptor or prevent unrelated workspace saves.
+    ObservedNotices {
+        card: CardId,
     },
     Project {
         id: ProjectId,
@@ -257,6 +264,7 @@ impl WriteSubject {
                 card,
                 kind: ReplacedIdentity::Chat,
             } => format!("the new conversation in pane {card}"),
+            Self::ObservedNotices { card } => format!("observed chat notices in pane {card}"),
             Self::Project { id, .. } => format!("project {id}"),
             Self::Worktree { id, .. } => format!("worktree {id}"),
         }
@@ -382,6 +390,7 @@ enum ConversionCheckpoint {
     },
     IdentityReplacement(IdentityReplacement),
     ChatRecovery(ChatRecoveryWrite),
+    ObservedNotices(ObservedNoticesWrite),
     RetainedChatCopy {
         copy: crate::persistence::RetainedChatCopy,
         // The first failure is reported once. Data-only retries retain their
@@ -393,6 +402,115 @@ enum ConversionCheckpoint {
         recovery: crate::persistence::TerminalPaneAdoption,
         reply: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
     },
+}
+
+/// A refused local diagnostic save, separate from actor/descriptor failures.
+/// Repeating content or unproven anchor updates cannot authorize them; only
+/// transient storage failures promise recovery through the same retry.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{message}")]
+pub(crate) struct ObservedNoticeSaveFailure {
+    pub message: String,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ObservedNoticesWrite {
+    card: CardId,
+    scope: ObservedNoticeScope,
+    notices: Arc<[ObservedNotice]>,
+    reservations: Vec<Arc<ObservedNoticeReservation>>,
+    last_failure: Option<Refusal>,
+    automatic_attempts: u32,
+    // Keep every caller waiting through retryable I/O and partial commits.
+    // Only full durable success or a final refusal completes these receipts.
+    replies: Vec<std::sync::mpsc::SyncSender<Result<(), ObservedNoticeSaveFailure>>>,
+}
+
+/// Admission is conservative: even repeated offers of shared bodies reserve
+/// their full cost until their accepted payload commits. Refusing a new offer
+/// never discards bytes the writer already accepted.
+#[derive(Debug, Default)]
+struct ObservedNoticeBudget {
+    scopes: HashMap<ObservedNoticeScope, usize>,
+    total: usize,
+}
+
+#[derive(Debug)]
+struct ObservedNoticeReservation {
+    budget: Arc<Mutex<ObservedNoticeBudget>>,
+    scope: ObservedNoticeScope,
+    bytes: usize,
+}
+
+impl ObservedNoticeReservation {
+    fn reserve(
+        budget: &Arc<Mutex<ObservedNoticeBudget>>,
+        scope: &ObservedNoticeScope,
+        notices: &[ObservedNotice],
+    ) -> Result<Arc<Self>, String> {
+        use crate::persistence::observed_notices::{
+            MAX_CONVERSATION_BYTES, MAX_GLOBAL_BYTES, MAX_NOTICES,
+        };
+        if notices.len() > MAX_NOTICES {
+            return Err("Too many capacity-error details were offered in one save".into());
+        }
+        // Bound payload bodies plus scope/queue/merge overhead. Length reads
+        // are constant time; admission never hashes or scans bodies on the UI.
+        let bytes = notices
+            .iter()
+            .try_fold(64 * 1024usize, |total, notice| {
+                total
+                    .checked_add(notice.text.len())?
+                    .checked_add(
+                        notice
+                            .message
+                            .as_ref()
+                            .map_or(0, String::len)
+                            .checked_mul(2)?,
+                    )?
+                    .checked_add(
+                        notice
+                            .after
+                            .as_ref()
+                            .map_or(0, String::len)
+                            .checked_mul(2)?,
+                    )?
+                    .checked_add(2 * std::mem::size_of::<ObservedNotice>())
+            })
+            .ok_or_else(|| "Capacity-error details exceed the pending save limit".to_owned())?;
+        let mut state = budget
+            .lock()
+            .map_err(|_| "Diagnostic save accounting is unavailable")?;
+        let scope_bytes = state.scopes.get(scope).copied().unwrap_or(0);
+        let accepted_scope = scope_bytes.checked_add(bytes)
+            .filter(|bytes| *bytes <= MAX_CONVERSATION_BYTES)
+            .ok_or_else(|| "Capacity-error details could not be queued: pending details would exceed this conversation's 32 MiB save limit".to_owned())?;
+        let accepted_total = state.total.checked_add(bytes)
+            .filter(|bytes| *bytes <= MAX_GLOBAL_BYTES)
+            .ok_or_else(|| "Capacity-error details could not be queued: pending details would exceed the 128 MiB save limit".to_owned())?;
+        state.scopes.insert(scope.clone(), accepted_scope);
+        state.total = accepted_total;
+        Ok(Arc::new(Self {
+            budget: Arc::clone(budget),
+            scope: scope.clone(),
+            bytes,
+        }))
+    }
+}
+
+impl Drop for ObservedNoticeReservation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.budget.lock() {
+            if let Some(bytes) = state.scopes.get_mut(&self.scope) {
+                *bytes = bytes.saturating_sub(self.bytes);
+                if *bytes == 0 {
+                    state.scopes.remove(&self.scope);
+                }
+            }
+            state.total = state.total.saturating_sub(self.bytes);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -445,8 +563,24 @@ struct QueueState {
     worktrees: HashMap<WorktreeId, WorktreeState>,
     identity_replacements: HashMap<CardId, IdentityReplacement>,
     retry_requested: bool,
+    observed_notice_budget: Arc<Mutex<ObservedNoticeBudget>>,
     checkpoints: Vec<std::sync::mpsc::SyncSender<std::result::Result<(), String>>>,
     shutdown: bool,
+}
+
+impl QueueState {
+    fn ordinary_work_pending(&self) -> bool {
+        self.latest.is_some()
+            || self
+                .conversions
+                .iter()
+                .any(|checkpoint| !matches!(checkpoint, ConversionCheckpoint::ObservedNotices(_)))
+            || !self.identity_replacements.is_empty()
+            || !self.projects.is_empty()
+            || !self.worktrees.is_empty()
+            || !self.checkpoints.is_empty()
+            || self.retry_requested
+    }
 }
 
 pub struct SessionRuntime {
@@ -499,8 +633,24 @@ impl SessionRuntime {
         database_path: impl AsRef<Path>,
         boot_id: BootId,
     ) -> Result<(Self, Option<WorkspaceState>), SessionError> {
+        Self::open_with_options(
+            database_path,
+            boot_id,
+            crate::persistence::StoreOptions::default(),
+        )
+    }
+
+    pub(crate) fn open_with_options(
+        database_path: impl AsRef<Path>,
+        boot_id: BootId,
+        options: crate::persistence::StoreOptions,
+    ) -> Result<(Self, Option<WorkspaceState>), SessionError> {
         let database_path = database_path.as_ref().to_path_buf();
-        let store = Arc::new(StateStore::open(&database_path, boot_id)?);
+        let store = Arc::new(StateStore::open_with_options(
+            &database_path,
+            boot_id,
+            options,
+        )?);
         // A card storage cannot decode is dropped with a warning rather than
         // failing the open: the writer thread below must exist even then, or
         // one unreadable card would disable saving for the whole run.
@@ -820,6 +970,41 @@ impl SessionRuntime {
         Ok(receiver)
     }
 
+    /// Accept locally observed diagnostic bytes before their UI can close.
+    /// Ordinary descriptor/checkpoint writes have priority; the independent
+    /// receipt succeeds only after every offered byte commits. Retryable I/O
+    /// retains both the bytes and receipt until success or bounded refusal.
+    pub(crate) fn preserve_observed_notices(
+        &self,
+        card: CardId,
+        scope: ObservedNoticeScope,
+        notices: Arc<[ObservedNotice]>,
+    ) -> Result<std::sync::mpsc::Receiver<Result<(), ObservedNoticeSaveFailure>>, String> {
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        let (lock, changed) = &*self.queue;
+        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        if queue.shutdown {
+            return Err("Session writer is shutting down".into());
+        }
+        let reservation =
+            ObservedNoticeReservation::reserve(&queue.observed_notice_budget, &scope, &notices)?;
+        queue
+            .conversions
+            .push_back(ConversionCheckpoint::ObservedNotices(
+                ObservedNoticesWrite {
+                    card,
+                    scope,
+                    notices,
+                    reservations: vec![reservation],
+                    last_failure: None,
+                    automatic_attempts: 0,
+                    replies: vec![reply],
+                },
+            ));
+        changed.notify_one();
+        Ok(receiver)
+    }
+
     /// Queue a grant-bound attachment and await the same one-shot durable
     /// receipt as ordinary recovery. Descriptor arguments come only from it.
     #[cfg(feature = "ui")]
@@ -1018,8 +1203,10 @@ impl SessionRuntime {
         &self.database_path
     }
 
-    /// A writer-lane barrier. Failure leaves pending writes retryable and never
-    /// tears down the session, so an update veto can safely resume this window.
+    /// A barrier for ordinary workspace and catalog writes. Observed diagnostic
+    /// bytes have their own receipts and cannot veto a descriptor handoff.
+    /// Failure leaves pending writes retryable and never tears down the session,
+    /// so an update veto can safely resume this window.
     pub fn request_flush(
         &self,
     ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
@@ -1085,6 +1272,12 @@ struct PendingWrites {
     /// tombstones, remain exactly as submitted.
     chat_rebindings: HashMap<CardId, (crate::chat::Session, crate::chat::Session)>,
     retained_chat_copies: HashMap<CardId, crate::persistence::RetainedChatCopy>,
+    /// Failed diagnostic saves retry independently of ordered pane changes.
+    observed_notices: HashMap<ObservedNoticeScope, ObservedNoticesWrite>,
+    observed_notice_offers: HashMap<ObservedNoticeScope, VecDeque<ObservedNoticesWrite>>,
+    observed_notice_order: VecDeque<ObservedNoticeScope>,
+    observed_notice_errors: Vec<StoreError>,
+    observed_notice_attempt_limit: u32,
 }
 
 /// When storage first refused a subject, and why it refuses it now.
@@ -1122,6 +1315,7 @@ struct Quarantine {
     identity_replacements: HashMap<CardId, (IdentityReplacement, Refusal)>,
     projects: HashMap<ProjectId, (ProjectState, Refusal)>,
     worktrees: HashMap<WorktreeId, (WorktreeState, Refusal)>,
+    observed_notices: HashMap<ObservedNoticeScope, (ObservedNoticesWrite, Refusal)>,
 }
 
 impl Refusal {
@@ -1235,6 +1429,7 @@ impl Quarantine {
             && self.identity_replacements.is_empty()
             && self.projects.is_empty()
             && self.worktrees.is_empty()
+            && self.observed_notices.is_empty()
     }
 
     /// Why the window's own state is not fully saved, when a refusal is the
@@ -1420,6 +1615,21 @@ impl Quarantine {
                 .into_iter()
                 .map(|(replacement, refusal)| entry(identity_subject(replacement), refusal, 0)),
         );
+        let mut observed = self.observed_notices.values().collect::<Vec<_>>();
+        observed.sort_by_key(|(write, refusal)| {
+            (
+                write.card,
+                refusal.at_unix_ms,
+                refusal.category.selection_rank(),
+            )
+        });
+        report.extend(observed.into_iter().map(|(write, refusal)| {
+            entry(
+                WriteSubject::ObservedNotices { card: write.card },
+                refusal,
+                0,
+            )
+        }));
         let mut projects = self.projects.values().collect::<Vec<_>>();
         projects
             .sort_by(|(left, _), (right, _)| (&left.name, left.id).cmp(&(&right.name, right.id)));
@@ -1447,6 +1657,16 @@ impl Quarantine {
 }
 
 trait SessionStore {
+    fn preserve_observed_notices(
+        &self,
+        _scope: &ObservedNoticeScope,
+        _notices: &[ObservedNotice],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::InvalidState(
+            "This store does not support observed chat notices".into(),
+        ))
+    }
+
     fn recover_terminal_ownership(
         &self,
         _state: &WorkspaceState,
@@ -1557,6 +1777,14 @@ trait SessionStore {
 }
 
 impl SessionStore for StateStore {
+    fn preserve_observed_notices(
+        &self,
+        scope: &ObservedNoticeScope,
+        notices: &[ObservedNotice],
+    ) -> Result<(), StoreError> {
+        StateStore::preserve_observed_notices(self, scope, notices)
+    }
+
     fn preserve_chat_copy(
         &self,
         copy: &crate::persistence::RetainedChatCopy,
@@ -1669,6 +1897,14 @@ impl SessionStore for StateStore {
 }
 
 impl SessionStore for Arc<StateStore> {
+    fn preserve_observed_notices(
+        &self,
+        scope: &ObservedNoticeScope,
+        notices: &[ObservedNotice],
+    ) -> Result<(), StoreError> {
+        StateStore::preserve_observed_notices(self, scope, notices)
+    }
+
     fn preserve_chat_copy(
         &self,
         copy: &crate::persistence::RetainedChatCopy,
@@ -1801,6 +2037,11 @@ impl PendingWrites {
             quarantine: Quarantine::default(),
             chat_rebindings: HashMap::new(),
             retained_chat_copies: HashMap::new(),
+            observed_notices: HashMap::new(),
+            observed_notice_offers: HashMap::new(),
+            observed_notice_order: VecDeque::new(),
+            observed_notice_errors: Vec::new(),
+            observed_notice_attempt_limit: PERSIST_MAX_AUTOMATIC_ATTEMPTS,
         }
     }
 
@@ -1812,8 +2053,21 @@ impl PendingWrites {
     /// project, and a project still retrying keeps the lane unsettled on its
     /// own.
     fn is_settled(&self) -> bool {
-        self.workspace.is_none()
+        self.ordinary_writes_settled()
             && self.conversions.is_empty()
+            && self.observed_notices.is_empty()
+            && self.observed_notice_offers.is_empty()
+    }
+
+    /// Local diagnostic bytes have no authority over pane descriptors, actor
+    /// transitions or terminal custody. Keep their retry health independent of
+    /// the existing barrier and clean-shutdown promises for ordinary state.
+    fn ordinary_writes_settled(&self) -> bool {
+        self.workspace.is_none()
+            && self
+                .conversions
+                .iter()
+                .all(|checkpoint| matches!(checkpoint, ConversionCheckpoint::ObservedNotices(_)))
             && self.projects.is_empty()
             && self.identity_replacements.is_empty()
             && self
@@ -1840,14 +2094,36 @@ impl PendingWrites {
 
     /// The quarantine as the health lane reports it.
     fn quarantined(&self) -> Vec<QuarantinedWrite> {
-        self.quarantine
-            .report(&self.worktrees, &self.project_generations)
+        let mut report = self
+            .quarantine
+            .report(&self.worktrees, &self.project_generations);
+        let mut retrying = self
+            .observed_notices
+            .iter()
+            .filter_map(|(scope, write)| {
+                if self.quarantine.observed_notices.contains_key(scope) {
+                    return None;
+                }
+                write.last_failure.map(|failure| QuarantinedWrite {
+                    subject: WriteSubject::ObservedNotices { card: write.card },
+                    category: failure.category,
+                    refused_at_unix_ms: failure.at_unix_ms,
+                    held_back: 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        retrying.sort_by_key(|write| (write.refused_at_unix_ms, write.category.selection_rank()));
+        report.extend(retrying);
+        report
     }
 
     /// Offers every refused write to storage once more, for the reader who
     /// asked to retry. A subject with a newer write pending is already being
     /// retried by that write, so its refused one is not reinstated.
     fn rearm_quarantine(&mut self) {
+        for write in self.observed_notices.values_mut() {
+            write.automatic_attempts = 0;
+        }
         if let Some(snapshot) = self
             .quarantine
             .workspace
@@ -1863,6 +2139,20 @@ impl PendingWrites {
             self.identity_replacements
                 .entry(*card)
                 .or_insert_with(|| replacement.clone());
+        }
+        for (scope, (write, _)) in &self.quarantine.observed_notices {
+            if !self.observed_notices.contains_key(scope)
+                && !self.observed_notice_offers.contains_key(scope)
+            {
+                self.observed_notice_order.push_back(scope.clone());
+            }
+            self.observed_notices
+                .entry(scope.clone())
+                .or_insert_with(|| {
+                    let mut retry = write.clone();
+                    retry.automatic_attempts = 0;
+                    retry
+                });
         }
         for (id, (project, _)) in &self.quarantine.projects {
             self.projects.entry(*id).or_insert_with(|| project.clone());
@@ -1890,7 +2180,8 @@ impl PendingWrites {
                 }
                 ConversionCheckpoint::RetainedChatCopy { copy, .. } => Some(copy.workspace),
                 ConversionCheckpoint::IdentityReplacement(_)
-                | ConversionCheckpoint::ChatRecovery(_) => None,
+                | ConversionCheckpoint::ChatRecovery(_)
+                | ConversionCheckpoint::ObservedNotices(_) => None,
             })
             .or_else(|| self.workspace.as_ref().map(|snapshot| snapshot.id))
     }
@@ -2002,15 +2293,218 @@ impl PendingWrites {
         });
     }
 
+    /// Accepted journal offers move here without touching storage or bodies.
+    /// The ordinary lane can finish and acknowledge custody before any I/O.
+    fn stage_observed_notices(&mut self, write: ObservedNoticesWrite) {
+        if !self.observed_notices.contains_key(&write.scope)
+            && !self.observed_notice_offers.contains_key(&write.scope)
+        {
+            self.observed_notice_order.push_back(write.scope.clone());
+        }
+        self.observed_notice_offers
+            .entry(write.scope.clone())
+            .or_default()
+            .push_back(write);
+    }
+
+    /// Service one transaction, rotating scopes between quanta. A scope's
+    /// waiting receipts survive transient failures and committed prefixes.
+    fn flush_observed_notices(&mut self, store: &impl SessionStore) {
+        self.observed_notice_errors.clear();
+        let Some(scope) = self.observed_notice_order.pop_front() else {
+            return;
+        };
+        let incoming = self
+            .observed_notice_offers
+            .get_mut(&scope)
+            .and_then(VecDeque::pop_front);
+        if self
+            .observed_notice_offers
+            .get(&scope)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.observed_notice_offers.remove(&scope);
+        }
+        if let Some(write) = incoming.or_else(|| self.observed_notices.remove(&scope)) {
+            let mut errors = Vec::new();
+            self.save_observed_notices(store, write, &mut errors);
+            self.observed_notice_errors = errors;
+        }
+        if self.observed_notices.contains_key(&scope)
+            || self.observed_notice_offers.contains_key(&scope)
+        {
+            self.observed_notice_order.push_back(scope);
+        }
+    }
+
+    /// Keep all uncommitted observations when a stale or empty producer offers
+    /// the same scope. Differing anchors must reach storage, which alone can
+    /// validate their update proof; identical endpoints keep the highest token
+    /// actually observed. A smaller snapshot never
+    /// supersedes failed bytes. This work stays off the UI thread.
+    fn save_observed_notices(
+        &mut self,
+        store: &impl SessionStore,
+        mut write: ObservedNoticesWrite,
+        errors: &mut Vec<StoreError>,
+    ) {
+        let mut pending = self.observed_notices.remove(&write.scope);
+        let mut refused = self.quarantine.observed_notices.remove(&write.scope);
+        for held in pending
+            .iter_mut()
+            .chain(refused.iter_mut().map(|(held, _)| held))
+        {
+            write.replies.append(&mut held.replies);
+        }
+        if let Some(pending) = &pending {
+            write.automatic_attempts = write.automatic_attempts.max(pending.automatic_attempts);
+        }
+        write.last_failure = write
+            .last_failure
+            .or_else(|| pending.as_ref().and_then(|write| write.last_failure))
+            .or_else(|| refused.as_ref().map(|(_, refusal)| *refusal));
+        if pending.is_some() || refused.is_some() {
+            for reservation in refused
+                .iter()
+                .flat_map(|(write, _)| &write.reservations)
+                .chain(pending.iter().flat_map(|write| &write.reservations))
+            {
+                if !write
+                    .reservations
+                    .iter()
+                    .any(|held| Arc::ptr_eq(held, reservation))
+                {
+                    write.reservations.push(Arc::clone(reservation));
+                }
+            }
+            let mut merged = Vec::<ObservedNotice>::new();
+            for notice in refused
+                .iter()
+                .flat_map(|(write, _)| write.notices.iter())
+                .chain(pending.iter().flat_map(|write| write.notices.iter()))
+                .chain(write.notices.iter())
+            {
+                if let Some(saved) = merged.iter_mut().find(|saved| {
+                    saved.message == notice.message
+                        && saved.text == notice.text
+                        && saved.after == notice.after
+                }) {
+                    saved.revision = saved.revision.max(notice.revision);
+                } else {
+                    merged.push(notice.clone());
+                }
+            }
+            write.notices = merged.into();
+        }
+        // One transaction per service quantum, then yield to newly offered
+        // descriptor/checkpoint work and rotate to another conversation.
+        let offered = write
+            .notices
+            .len()
+            .min(crate::persistence::observed_notices::MAX_NOTICES);
+        let result = store.preserve_observed_notices(&write.scope, &write.notices[..offered]);
+        match result {
+            Ok(()) => {
+                superseded(
+                    refused.map(|(write, _)| WriteSubject::ObservedNotices { card: write.card }),
+                );
+                drop(pending);
+                if offered < write.notices.len() {
+                    write.notices = write.notices[offered..].to_vec().into();
+                    write.automatic_attempts = 0;
+                    self.observed_notices.insert(write.scope.clone(), write);
+                } else {
+                    write.reservations.clear();
+                    for reply in write.replies.drain(..) {
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+            }
+            Err(error) => {
+                if error.refuses_content() {
+                    for reply in write.replies.drain(..) {
+                        let _ = reply.send(Err(ObservedNoticeSaveFailure {
+                            message: error.to_string(),
+                            retryable: false,
+                        }));
+                    }
+                    let subject = WriteSubject::ObservedNotices { card: write.card };
+                    let refusal = record_refusal(
+                        refused.as_ref().map(|(_, refusal)| *refusal),
+                        subject,
+                        &error,
+                    );
+                    write.last_failure = Some(refusal);
+                    self.quarantine
+                        .observed_notices
+                        .insert(write.scope.clone(), (write, refusal));
+                } else {
+                    let current = Refusal::new(&error);
+                    write.last_failure = Some(Refusal {
+                        at_unix_ms: write
+                            .last_failure
+                            .map_or(current.at_unix_ms, |first| first.at_unix_ms),
+                        ..current
+                    });
+                    write.automatic_attempts = write.automatic_attempts.saturating_add(1);
+                    if write.automatic_attempts >= self.observed_notice_attempt_limit {
+                        self.park_observed_notice(write);
+                    } else {
+                        self.observed_notices.insert(write.scope.clone(), write);
+                    }
+                    errors.push(error);
+                }
+            }
+        }
+    }
+
+    /// An exhausted diagnostic retry must not exhaust future pane autosaves.
+    /// Retain its complete remaining payload until Retry Saving or a newer
+    /// observation reoffers it, with only redacted failure data in the notice.
+    fn park_observed_notice(&mut self, mut write: ObservedNoticesWrite) {
+        let Some(refusal) = write.last_failure else {
+            // Only a failed operation enters this pending set.
+            self.observed_notices.insert(write.scope.clone(), write);
+            return;
+        };
+        for reply in write.replies.drain(..) {
+            let _ = reply.send(Err(ObservedNoticeSaveFailure {
+                message: format!(
+                    "Capacity-error details could not be saved: {}. {}",
+                    refusal.category.label(),
+                    refusal.category.guidance(),
+                ),
+                retryable: true,
+            }));
+        }
+        tracing::warn!(
+            subject = ?WriteSubject::ObservedNotices { card: write.card },
+            category = refusal.category.label(),
+            "diagnostic bytes remain unsaved after bounded retries; retaining them for Retry Saving"
+        );
+        self.quarantine
+            .observed_notices
+            .insert(write.scope.clone(), (write, refusal));
+    }
+
+    fn park_observed_notices(&mut self) {
+        for (_, write) in std::mem::take(&mut self.observed_notices) {
+            self.park_observed_notice(write);
+        }
+        self.observed_notice_order
+            .retain(|scope| self.observed_notice_offers.contains_key(scope));
+    }
+
     /// Writes the conversion checkpoints in order, then the coalesced
-    /// autosave, stopping at the first write that failed for a reason that may
-    /// clear. That write goes back where it came from, so neither a retry nor
-    /// shutdown can reorder the queue.
+    /// autosave, stopping at the first pane write whose failure may clear.
+    /// That write goes back where it came from, so neither a retry nor shutdown
+    /// can reorder the queue.
     ///
     /// A checkpoint storage refused by construction does not stop the ones
-    /// after it. Each snapshot is the whole window and storage validates it on
-    /// its own, so a later one is not built on the refused one; it is what
-    /// replaces the refused content.
+    /// after it. Diagnostic bytes also retry independently without holding back
+    /// unrelated pane changes. Each snapshot is the whole window and storage
+    /// validates it on its own, so a later one is not built on the refused one;
+    /// it is what replaces the refused content.
     fn flush_checkpoints(&mut self, store: &impl SessionStore) -> Result<(), StoreError> {
         loop {
             let autosave = self.conversions.is_empty();
@@ -2108,6 +2602,9 @@ impl PendingWrites {
                     // A failed reviewed action is one-shot. It cannot become
                     // an unreviewed later transfer after an I/O retry.
                     let _ = reply.send(result);
+                }
+                ConversionCheckpoint::ObservedNotices(write) => {
+                    self.stage_observed_notices(write);
                 }
                 ConversionCheckpoint::RetainedChatCopy { copy, reply } => {
                     match store.preserve_chat_copy(&copy) {
@@ -2253,6 +2750,14 @@ impl PendingWrites {
     /// fail every later attempt on behalf of writes that would land.
     fn flush(&mut self, store: &impl SessionStore) -> Vec<StoreError> {
         let mut errors = Vec::new();
+        // Extract inert diagnostic work even when a preceding ordinary write
+        // remains blocked. Staging is cheap; journal I/O is a later phase.
+        for checkpoint in std::mem::take(&mut self.conversions) {
+            match checkpoint {
+                ConversionCheckpoint::ObservedNotices(write) => self.stage_observed_notices(write),
+                other => self.conversions.push_back(other),
+            }
+        }
         for (card_id, mut replacement) in std::mem::take(&mut self.identity_replacements) {
             self.quarantine.continue_refused(&mut replacement);
             match replacement.apply(store) {
@@ -2520,9 +3025,12 @@ fn persistence_loop(
     health: &mut HealthPublisher,
     config: PersistenceConfig,
 ) -> WriterExit {
+    writes.observed_notice_attempt_limit = config.max_automatic_attempts;
     let mut due: Option<Instant> = None;
     let mut oldest_change: Option<Instant> = None;
     let mut retry_delay = config.retry_initial;
+    let mut observed_retry_delay = config.retry_initial;
+    let mut observed_retry_at: Option<Instant> = None;
     let mut attempts_this_cycle = 0_u32;
     let mut retry_exhausted = false;
     let mut rebases_remaining = PERSIST_REBASES_PER_BATCH;
@@ -2568,7 +3076,13 @@ fn persistence_loop(
             || !state.worktrees.is_empty()
             || !state.identity_replacements.is_empty();
         if !state.conversions.is_empty() {
-            if let Some(previous) = writes.workspace.take() {
+            // Only an ordinary checkpoint fences an older autosave. Inert
+            // notice admission must preserve normal snapshot coalescing.
+            let ordinary_checkpoint = state
+                .conversions
+                .iter()
+                .any(|checkpoint| !matches!(checkpoint, ConversionCheckpoint::ObservedNotices(_)));
+            if ordinary_checkpoint && let Some(previous) = writes.workspace.take() {
                 writes
                     .conversions
                     .push_back(ConversionCheckpoint::Snapshot(previous));
@@ -2586,7 +3100,7 @@ fn persistence_loop(
             merge_identity_replacement(&mut writes.identity_replacements, replacement);
         }
         let retry_requested = std::mem::take(&mut state.retry_requested);
-        let retry_answered_after = retry_requested.then_some(health.revision);
+        let mut retry_answered_after = retry_requested.then_some(health.revision);
         if retry_requested && !(writes.is_settled() && writes.quarantine.is_empty()) {
             // An explicit retry is also the one way a refused write is offered
             // to storage again: the reader may have fixed what storage refused.
@@ -2597,6 +3111,8 @@ fn persistence_loop(
             // restores the recovery the failed cycle may have spent.
             rebases_remaining = PERSIST_REBASES_PER_BATCH;
             retry_delay = config.retry_initial;
+            observed_retry_delay = config.retry_initial;
+            observed_retry_at = None;
             due = Some(Instant::now());
         } else {
             due = schedule_flush_after_changes(
@@ -2625,29 +3141,20 @@ fn persistence_loop(
         if should_persist {
             let errors = flush_rebasing_stale_bases(&mut writes, &store, &mut rebases_remaining);
             record_flush_errors(&last_error, &errors);
-            health.quarantine(writes.quarantined());
-            if writes.is_settled() {
+            let ordinary_failure = (!errors.is_empty()).then(|| select_failure_category(&errors));
+            let ordinary_settled = writes.ordinary_writes_settled();
+            if ordinary_settled {
+                // This health drives existing custody/handoff guards. Only the
+                // ordinary lane may make it retrying, exhausted or recovered.
                 health.flushed();
-                // Commits accumulate in the WAL, which SQLite never shrinks on
-                // its own; this costs one `stat` per flush and only does real
-                // work once the sidecar has grown past its threshold.
-                store.checkpoint_wal_if_large();
-                due = None;
-                oldest_change = None;
-                retry_delay = config.retry_initial;
                 attempts_this_cycle = 0;
                 rebases_remaining = PERSIST_REBASES_PER_BATCH;
                 retry_exhausted = false;
+                retry_delay = config.retry_initial;
             } else {
                 attempts_this_cycle = attempts_this_cycle.saturating_add(1);
                 retry_exhausted = attempts_this_cycle >= config.max_automatic_attempts;
                 failure = Some(select_failure_category(&errors));
-                // A failing write lane used to be entirely silent: the error
-                // reached `last_error` for the UI alone, so a window that had
-                // stopped saving left nothing in the log to explain it after
-                // the fact. One line per attempt would be a flood, so only the
-                // first failure of a cycle and the attempt that gives up are
-                // recorded.
                 if attempts_this_cycle == 1 || retry_exhausted {
                     crate::diagnostics::record(crate::diagnostics::Event::PersistenceFailed {
                         category: failure.unwrap_or(SaveFailureCategory::Database).into(),
@@ -2661,28 +3168,82 @@ fn persistence_loop(
                     );
                 }
                 health.failed(&errors, retry_exhausted);
+                if retry_exhausted && !writes.observed_notices.is_empty() {
+                    writes.park_observed_notices();
+                }
+            }
+            // Publish ordinary recovery/refusal before journal I/O can hold
+            // the shared connection and delay an existing custody guard.
+            health.quarantine(writes.quarantined());
+            // An unchanged refusal still answers an explicit retry. Publish
+            // that acknowledgement before its ordinary barrier can release
+            // the reader, independently of any following journal I/O.
+            if let Some(revision) = retry_answered_after.take() {
+                health.answer_retry(revision);
+            }
+            for checkpoint in checkpoints {
+                let result = if !writes.ordinary_writes_settled() {
+                    Err(save_refusal(ordinary_failure))
+                } else if let Some(category) = writes.quarantine.window_state() {
+                    // A barrier vouches for the window's state - a terminal handoff
+                    // releases the daemon's replay evidence on the strength of it -
+                    // so a refused snapshot fails it. A refused catalog row does
+                    // not: waiting cannot save it, and the window state is whole.
+                    let refusal = window_state_refusal(category, &writes.quarantined());
+                    tracing::warn!(%refusal, "a save barrier was refused");
+                    Err(refusal)
+                } else {
+                    Ok(())
+                };
+                let _ = checkpoint.send(result);
+            }
+            // A descriptor/custody receipt has already been answered. Check
+            // for newly queued critical work before at most one journal I/O.
+            let ordinary_waiting = queue
+                .0
+                .lock()
+                .map(|queued| queued.ordinary_work_pending() || (queued.shutdown && !shutdown))
+                .unwrap_or(true);
+            let journal_attempted =
+                !ordinary_waiting && observed_retry_at.is_none_or(|when| Instant::now() >= when);
+            if journal_attempted {
+                writes.flush_observed_notices(&store);
+            } else {
+                writes.observed_notice_errors.clear();
+            }
+            let journal_errors = std::mem::take(&mut writes.observed_notice_errors);
+            if !journal_errors.is_empty() {
+                observed_retry_at = Some(Instant::now() + observed_retry_delay);
+                observed_retry_delay = observed_retry_delay.saturating_mul(2).min(config.retry_max);
+            } else if journal_attempted {
+                observed_retry_at = None;
+                observed_retry_delay = config.retry_initial;
+            }
+            // The subject-scoped notice carries journal failure/retry state;
+            // it never enters the ordinary health channel above.
+            health.quarantine(writes.quarantined());
+            if writes.is_settled() {
+                store.checkpoint_wal_if_large();
+                due = None;
+                oldest_change = None;
+                retry_delay = config.retry_initial;
+                observed_retry_delay = config.retry_initial;
+                observed_retry_at = None;
+            } else if ordinary_settled {
+                // Keep the journal's own backoff even when a custody barrier
+                // wakes the ordinary lane. Successful progress yields first.
+                due = Some(
+                    observed_retry_at
+                        .filter(|when| *when > Instant::now())
+                        .unwrap_or_else(Instant::now),
+                );
+            } else {
                 due = (!retry_exhausted).then(|| Instant::now() + retry_delay);
                 retry_delay = retry_delay.saturating_mul(2).min(config.retry_max);
             }
         }
         if let Some(revision) = retry_answered_after {
             health.answer_retry(revision);
-        }
-        for checkpoint in checkpoints {
-            let result = if !writes.is_settled() {
-                Err(save_refusal(failure))
-            } else if let Some(category) = writes.quarantine.window_state() {
-                // A barrier vouches for the window's state - a terminal handoff
-                // releases the daemon's replay evidence on the strength of it -
-                // so a refused snapshot fails it. A refused catalog row does
-                // not: waiting cannot save it, and the window state is whole.
-                let refusal = window_state_refusal(category, &writes.quarantined());
-                tracing::warn!(%refusal, "a save barrier was refused");
-                Err(refusal)
-            } else {
-                Ok(())
-            };
-            let _ = checkpoint.send(result);
         }
 
         if shutdown {
@@ -2707,16 +3268,20 @@ fn persistence_loop(
                 // budget; the steady-state backoff already paces that wait.
                 thread::sleep(retry_delay.min(remaining));
                 let errors = flush_rebasing_stale_bases(&mut writes, &store, &mut shutdown_rebases);
+                writes.flush_observed_notices(&store);
+                let journal_errors = std::mem::take(&mut writes.observed_notice_errors);
                 if !errors.is_empty() {
                     failure = Some(select_failure_category(&errors));
+                } else if !journal_errors.is_empty() {
+                    failure = Some(select_failure_category(&journal_errors));
                 }
                 record_flush_errors(&last_error, &errors);
-                health.quarantine(writes.quarantined());
-                if writes.is_settled() {
+                if writes.ordinary_writes_settled() {
                     health.flushed();
                 } else {
                     health.failed(&errors, false);
                 }
+                health.quarantine(writes.quarantined());
                 retry_delay = retry_delay.saturating_mul(2).min(config.retry_max);
             }
             let refused = writes.quarantined();
@@ -2740,7 +3305,7 @@ fn persistence_loop(
             // refused catalog row does not undo that: it is lost either way,
             // and nothing a recovery reconciles depends on it.
             let mut clean_marker = false;
-            if writes.is_settled() && writes.quarantine.window_state().is_none() {
+            if writes.ordinary_writes_settled() && writes.quarantine.window_state().is_none() {
                 match store.shutdown() {
                     Ok(()) => clean_marker = true,
                     Err(error) => {
@@ -2755,7 +3320,15 @@ fn persistence_loop(
                 .saturating_add(writes.conversions.len())
                 .saturating_add(writes.projects.len())
                 .saturating_add(writes.worktrees.len())
-                .saturating_add(writes.identity_replacements.len());
+                .saturating_add(writes.identity_replacements.len())
+                .saturating_add(writes.observed_notices.len())
+                .saturating_add(
+                    writes
+                        .observed_notice_offers
+                        .values()
+                        .map(VecDeque::len)
+                        .sum::<usize>(),
+                );
             let complete = clean_marker && unsaved == 0 && refused.is_empty();
             let final_flush = crate::diagnostics::Event::FinalFlush {
                 complete,
@@ -2971,6 +3544,10 @@ mod tests {
         /// Counts every write the lane offered, whatever its outcome.
         attempts: Arc<AtomicUsize>,
         shutdown_failure: bool,
+        observed_notice_attempts: Arc<Mutex<Vec<(ObservedNoticeScope, Vec<ObservedNotice>)>>>,
+        operation_order: Arc<Mutex<Vec<&'static str>>>,
+        workspace_titles: Arc<Mutex<Vec<Option<String>>>>,
+        after_notice: Option<Box<dyn Fn(usize) + Send + Sync>>,
     }
 
     impl FakeStore {
@@ -2982,6 +3559,10 @@ mod tests {
                 shutdowns: Arc::new(AtomicUsize::new(0)),
                 attempts: Arc::new(AtomicUsize::new(0)),
                 shutdown_failure: false,
+                observed_notice_attempts: Arc::new(Mutex::new(Vec::new())),
+                operation_order: Arc::new(Mutex::new(Vec::new())),
+                workspace_titles: Arc::new(Mutex::new(Vec::new())),
+                after_notice: None,
             }
         }
 
@@ -2993,6 +3574,10 @@ mod tests {
                 shutdowns: Arc::new(AtomicUsize::new(0)),
                 attempts: Arc::new(AtomicUsize::new(0)),
                 shutdown_failure: false,
+                observed_notice_attempts: Arc::new(Mutex::new(Vec::new())),
+                operation_order: Arc::new(Mutex::new(Vec::new())),
+                workspace_titles: Arc::new(Mutex::new(Vec::new())),
+                after_notice: None,
             }
         }
 
@@ -3025,6 +3610,24 @@ mod tests {
     }
 
     impl SessionStore for FakeStore {
+        fn preserve_observed_notices(
+            &self,
+            scope: &ObservedNoticeScope,
+            notices: &[ObservedNotice],
+        ) -> Result<(), StoreError> {
+            self.operation_order.lock().unwrap().push("notices");
+            self.observed_notice_attempts
+                .lock()
+                .unwrap()
+                .push((scope.clone(), notices.to_vec()));
+            let result = self.write();
+            if let Some(after_notice) = &self.after_notice {
+                let count = self.observed_notice_attempts.lock().unwrap().len();
+                after_notice(count);
+            }
+            result
+        }
+
         fn preserve_chat_copy(
             &self,
             copy: &crate::persistence::RetainedChatCopy,
@@ -3075,9 +3678,14 @@ mod tests {
 
         fn save_workspace(
             &self,
-            _state: &WorkspaceState,
+            state: &WorkspaceState,
             _base: SnapshotBase<'_>,
         ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+            self.operation_order.lock().unwrap().push("workspace");
+            self.workspace_titles
+                .lock()
+                .unwrap()
+                .push(state.cards.first().map(|card| card.title.clone()));
             self.write()?;
             Ok(crate::persistence::WorkspaceCommit::default())
         }
@@ -4665,6 +5273,1024 @@ mod tests {
 
     fn empty_writes() -> PendingWrites {
         PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new())
+    }
+
+    fn flush_with_observed(
+        writes: &mut PendingWrites,
+        store: &impl SessionStore,
+    ) -> Vec<StoreError> {
+        let errors = writes.flush(store);
+        writes.flush_observed_notices(store);
+        errors
+    }
+
+    fn observed_notice_scope(home: &Path) -> ObservedNoticeScope {
+        ObservedNoticeScope::resolve_local(
+            &crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                session_id: Some("11111111-1111-4111-8111-111111111111".into()),
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: home.to_path_buf(),
+                    environment: BTreeMap::from([(
+                        "CLAUDE_CONFIG_DIR".into(),
+                        home.to_string_lossy().into_owned(),
+                    )]),
+                    unset_environment: Default::default(),
+                },
+            },
+            "session-writer-test-owner".into(),
+        )
+        .unwrap()
+    }
+
+    fn observed_notice(index: usize) -> ObservedNotice {
+        ObservedNotice {
+            message: Some(format!("prompt-{index}")),
+            after: Some(format!("item-{index}")),
+            text: format!("Selected model is at capacity. Please try a different model.\nExact details {index} 🦀  ").into(),
+            revision: 0,
+        }
+    }
+
+    fn observed_notice_checkpoint(
+        card: CardId,
+        scope: ObservedNoticeScope,
+        notices: Vec<ObservedNotice>,
+    ) -> (
+        ConversionCheckpoint,
+        std::sync::mpsc::Receiver<Result<(), ObservedNoticeSaveFailure>>,
+    ) {
+        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+        (
+            ConversionCheckpoint::ObservedNotices(ObservedNoticesWrite {
+                card,
+                scope,
+                notices: notices.into(),
+                reservations: Vec::new(),
+                last_failure: None,
+                automatic_attempts: 0,
+                replies: vec![reply],
+            }),
+            receipt,
+        )
+    }
+
+    #[test]
+    fn observed_notices_commit_after_ordinary_open_and_closed_snapshots() {
+        let directory = tempdir().unwrap();
+        let scope = observed_notice_scope(directory.path());
+        let open = workspace();
+        let card = open.cards[0].id;
+        let mut closed = open.clone();
+        closed.cards.clear();
+        let notices = vec![observed_notice(0)];
+        let (checkpoint, receipt) =
+            observed_notice_checkpoint(card, scope.clone(), notices.clone());
+        let store = FakeStore::new([]);
+        let mut writes = empty_writes();
+        writes.conversions = VecDeque::from([
+            ConversionCheckpoint::Snapshot(Arc::new(open)),
+            checkpoint,
+            ConversionCheckpoint::Snapshot(Arc::new(closed)),
+        ]);
+
+        assert_eq!(
+            receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        receipt.recv().unwrap().unwrap();
+        assert_eq!(
+            *store.operation_order.lock().unwrap(),
+            ["workspace", "workspace", "notices"]
+        );
+        assert_eq!(
+            *store.observed_notice_attempts.lock().unwrap(),
+            [(scope, notices)]
+        );
+        assert!(writes.is_settled());
+    }
+
+    #[test]
+    fn observed_notices_io_failure_keeps_bytes_without_holding_back_autosave() {
+        let directory = tempdir().unwrap();
+        let scope = observed_notice_scope(directory.path());
+        let state = workspace();
+        let notices = vec![observed_notice(0)];
+        let (checkpoint, receipt) =
+            observed_notice_checkpoint(state.cards[0].id, scope.clone(), notices.clone());
+        let store = FakeStore::new([
+            FakeWrite::Succeed,
+            FakeWrite::FailDiskFull,
+            FakeWrite::Succeed,
+        ]);
+        let mut writes = empty_writes();
+        writes.conversions.push_back(checkpoint);
+        writes.workspace = Some(Arc::new(state));
+
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        assert_eq!(writes.observed_notice_errors.len(), 1);
+        assert_eq!(
+            receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        assert_eq!(
+            *store.operation_order.lock().unwrap(),
+            ["workspace", "notices"]
+        );
+        assert!(writes.ordinary_writes_settled());
+        assert!(!writes.is_settled());
+        assert_eq!(
+            &*writes.observed_notices[&scope].notices,
+            notices.as_slice()
+        );
+        assert_eq!(writes.observed_notices[&scope].replies.len(), 1);
+        writes.rearm_quarantine();
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        assert!(writes.is_settled());
+        receipt.recv().unwrap().unwrap();
+        let attempts = store.observed_notice_attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0], attempts[1]);
+        assert_eq!(
+            receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn observed_notices_refusal_is_reported_and_retried_independently() {
+        let directory = tempdir().unwrap();
+        let scope = observed_notice_scope(directory.path());
+        let state = workspace();
+        let card = state.cards[0].id;
+        let notices = vec![observed_notice(0)];
+        let (checkpoint, receipt) =
+            observed_notice_checkpoint(card, scope.clone(), notices.clone());
+        let store = FakeStore::new([FakeWrite::Succeed, FakeWrite::Refuse, FakeWrite::Succeed]);
+        let mut writes = empty_writes();
+        writes.conversions.push_back(checkpoint);
+        writes.workspace = Some(Arc::new(state));
+
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        let refusal = receipt.recv().unwrap().unwrap_err();
+        assert!(!refusal.retryable);
+        assert!(refusal.message.contains("injected refusal"));
+        assert!(writes.is_settled());
+        assert_eq!(writes.quarantine.window_state(), None);
+        let refused = writes.quarantined();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].subject, WriteSubject::ObservedNotices { card });
+        assert!(!refused[0].subject.is_window_state());
+        assert_eq!(refused[0].category, SaveFailureCategory::InvalidData);
+        assert_eq!(
+            &*writes.quarantine.observed_notices[&scope].0.notices,
+            notices.as_slice()
+        );
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        assert_eq!(store.attempts.load(Ordering::Relaxed), 2);
+        writes.rearm_quarantine();
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        assert!(writes.quarantine.is_empty());
+        assert_eq!(store.attempts.load(Ordering::Relaxed), 3);
+        let attempts = store.observed_notice_attempts.lock().unwrap();
+        assert_eq!(attempts[0], attempts[1]);
+    }
+
+    #[test]
+    fn observed_notices_empty_offers_cannot_erase_failed_bytes_or_anchor_update_proofs() {
+        for initial_failure in [FakeWrite::FailDiskFull, FakeWrite::Refuse] {
+            let directory = tempdir().unwrap();
+            let scope = observed_notice_scope(directory.path());
+            let card = CardId::new();
+            let original = observed_notice(0);
+            let next = observed_notice(1);
+            let mut stale = original.clone();
+            stale.after = Some("later-item".into());
+            let mut proof = stale.clone();
+            proof.revision = 1;
+            let store =
+                FakeStore::new([initial_failure, FakeWrite::FailDiskFull, FakeWrite::Succeed]);
+            let mut writes = empty_writes();
+            let (first, first_receipt) =
+                observed_notice_checkpoint(card, scope.clone(), vec![original.clone()]);
+            writes.conversions.push_back(first);
+            flush_with_observed(&mut writes, &store);
+            if matches!(initial_failure, FakeWrite::Refuse) {
+                assert!(first_receipt.recv().unwrap().is_err());
+            } else {
+                assert_eq!(
+                    first_receipt.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                );
+            }
+            let (newer, newer_receipt) = observed_notice_checkpoint(
+                card,
+                scope.clone(),
+                vec![stale.clone(), proof.clone(), next.clone()],
+            );
+            writes.conversions.push_back(newer);
+            assert!(flush_with_observed(&mut writes, &store).is_empty());
+            assert_eq!(writes.observed_notice_errors.len(), 1);
+            assert_eq!(
+                newer_receipt.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            );
+            let (empty, empty_receipt) =
+                observed_notice_checkpoint(card, scope.clone(), Vec::new());
+            writes.conversions.push_back(empty);
+            assert!(flush_with_observed(&mut writes, &store).is_empty());
+            empty_receipt.recv().unwrap().unwrap();
+            newer_receipt.recv().unwrap().unwrap();
+            if !matches!(initial_failure, FakeWrite::Refuse) {
+                first_receipt.recv().unwrap().unwrap();
+            }
+
+            let attempts = store.observed_notice_attempts.lock().unwrap();
+            assert_eq!(attempts.len(), 3);
+            // The writer preserves conflicting offers for the store's CAS
+            // validation; it cannot invent or discard anchor-update proof.
+            assert_eq!(
+                attempts[1].1,
+                [original.clone(), proof.clone(), next.clone()]
+            );
+            assert_eq!(attempts[2].1, [original, proof, next]);
+            assert!(writes.is_settled());
+            assert!(writes.quarantine.is_empty());
+        }
+    }
+
+    #[test]
+    fn observed_notices_backlog_replays_bounded_batches_and_retains_only_failed_suffix() {
+        let directory = tempdir().unwrap();
+        let scope = observed_notice_scope(directory.path());
+        let card = CardId::new();
+        let first = (0..32).map(observed_notice).collect::<Vec<_>>();
+        let last = (32..34).map(observed_notice).collect::<Vec<_>>();
+        let store = FakeStore::new([
+            FakeWrite::FailDiskFull,
+            FakeWrite::Succeed,
+            FakeWrite::FailDiskFull,
+            FakeWrite::Succeed,
+        ]);
+        let mut writes = empty_writes();
+        let (checkpoint, first_receipt) =
+            observed_notice_checkpoint(card, scope.clone(), first.clone());
+        writes.conversions.push_back(checkpoint);
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        assert_eq!(writes.observed_notice_errors.len(), 1);
+        assert_eq!(
+            first_receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        let (checkpoint, next_receipt) =
+            observed_notice_checkpoint(card, scope.clone(), last.clone());
+        writes.conversions.push_back(checkpoint);
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        assert!(writes.observed_notice_errors.is_empty());
+        assert_eq!(
+            next_receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        assert_eq!(writes.observed_notice_errors.len(), 1);
+        assert_eq!(&*writes.observed_notices[&scope].notices, last.as_slice());
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        first_receipt.recv().unwrap().unwrap();
+        next_receipt.recv().unwrap().unwrap();
+        let attempts = store.observed_notice_attempts.lock().unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|(_, notes)| notes.len())
+                .collect::<Vec<_>>(),
+            [32, 32, 2, 2]
+        );
+        assert_eq!(attempts[0].1, first);
+        assert_eq!(attempts[2].1, last);
+        assert_eq!(attempts[2], attempts[3]);
+        assert!(writes.is_settled());
+    }
+
+    #[test]
+    fn observed_notices_retry_exhaustion_does_not_veto_descriptor_barrier() {
+        let directory = tempdir().unwrap();
+        let scope = observed_notice_scope(directory.path());
+        let card = CardId::new();
+        let notices = vec![observed_notice(0)];
+        let (checkpoint, receipt) = observed_notice_checkpoint(card, scope, notices.clone());
+        let (barrier_reply, barrier_receipt) = std::sync::mpsc::sync_channel(1);
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                conversions: VecDeque::from([checkpoint]),
+                checkpoints: vec![barrier_reply],
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let store = FakeStore::new([FakeWrite::FailDiskFull, FakeWrite::Succeed]);
+        let attempts = Arc::clone(&store.observed_notice_attempts);
+        let operation_order = Arc::clone(&store.operation_order);
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || {
+            run_persistence_worker(
+                store,
+                empty_writes(),
+                worker_queue,
+                Arc::new(Mutex::new(None)),
+                HealthPublisher::new(health_tx),
+                fast_persistence_config(1),
+            )
+        });
+        let refusal = receipt
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert!(refusal.retryable);
+        assert!(
+            refusal
+                .message
+                .contains(SaveFailureCategory::DiskFull.label())
+        );
+        barrier_receipt
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let saved = health_until(&health_rx, |event| {
+            event
+                .quarantined
+                .iter()
+                .any(|write| write.subject == WriteSubject::ObservedNotices { card })
+        });
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+
+        let (lock, changed) = &*queue;
+        // A journal-only exhausted cycle cannot suppress future autosaves.
+        // No explicit barrier or Retry Saving is submitted for this snapshot.
+        lock.lock().unwrap().latest = Some(Arc::new(workspace()));
+        changed.notify_one();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while operation_order.lock().unwrap().last() != Some(&"workspace") {
+            assert!(
+                Instant::now() < deadline,
+                "ordinary autosave was suppressed by journal exhaustion"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+        assert_eq!(*operation_order.lock().unwrap(), ["notices", "workspace"]);
+        assert_eq!(saved.quarantined.len(), 1);
+        assert_eq!(
+            saved.quarantined[0].subject,
+            WriteSubject::ObservedNotices { card }
+        );
+        assert_eq!(saved.quarantined[0].category, SaveFailureCategory::DiskFull);
+
+        lock.lock().unwrap().retry_requested = true;
+        changed.notify_one();
+        health_until(&health_rx, |event| event.quarantined.is_empty());
+        let attempts = attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].1, notices);
+        assert_eq!(attempts[0], attempts[1]);
+        drop(attempts);
+        assert_eq!(
+            receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        );
+        lock.lock().unwrap().shutdown = true;
+        changed.notify_one();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn observed_notices_io_failure_does_not_prevent_workspace_generation_recovery() {
+        let directory = tempdir().unwrap();
+        let scope = observed_notice_scope(directory.path());
+        let state = workspace();
+        let (checkpoint, receipt) =
+            observed_notice_checkpoint(state.cards[0].id, scope, vec![observed_notice(0)]);
+        let store = FakeStore::new([
+            FakeWrite::FailStale,
+            FakeWrite::Succeed,
+            FakeWrite::FailDiskFull,
+        ]);
+        let mut writes = empty_writes();
+        writes.conversions.push_back(checkpoint);
+        writes.workspace = Some(Arc::new(state));
+        let mut rebases_remaining = 1;
+        assert!(flush_rebasing_stale_bases(&mut writes, &store, &mut rebases_remaining).is_empty());
+        writes.flush_observed_notices(&store);
+        assert_eq!(
+            receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        assert_eq!(rebases_remaining, 0);
+        assert_eq!(store.rebases.load(Ordering::Relaxed), 1);
+        assert!(writes.ordinary_writes_settled());
+        assert!(!writes.is_settled());
+        assert_eq!(writes.observed_notice_errors.len(), 1);
+        assert_eq!(
+            *store.operation_order.lock().unwrap(),
+            ["workspace", "workspace", "notices"]
+        );
+    }
+
+    #[test]
+    fn observed_notices_earlier_retries_do_not_spend_a_later_workspace_retry_budget() {
+        let directory = tempdir().unwrap();
+        let scope = observed_notice_scope(directory.path());
+        let card = CardId::new();
+        let (checkpoint, receipt) =
+            observed_notice_checkpoint(card, scope, vec![observed_notice(0)]);
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                conversions: VecDeque::from([checkpoint]),
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let mut store = FakeStore::new([
+            FakeWrite::FailDiskFull,
+            FakeWrite::FailDiskFull,
+            FakeWrite::FailDiskFull,
+            FakeWrite::FailDiskFull,
+            FakeWrite::FailDiskFull,
+            FakeWrite::Succeed,
+        ]);
+        let offer_queue = Arc::clone(&queue);
+        store.after_notice = Some(Box::new(move |attempt| {
+            if attempt == 2 {
+                // Offered during a journal-only retry, before the next queue
+                // drain: the new ordinary batch must get all three attempts.
+                let (lock, changed) = &*offer_queue;
+                lock.lock().unwrap().latest = Some(Arc::new(workspace()));
+                changed.notify_one();
+            }
+        }));
+        let order = Arc::clone(&store.operation_order);
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || {
+            // Zero-time fake retries make the mixed operation ordering exact;
+            // the real SQLite Busy regression exercises actual backoff.
+            let mut config = fast_persistence_config(3);
+            config.retry_initial = Duration::ZERO;
+            config.retry_max = Duration::ZERO;
+            run_persistence_worker(
+                store,
+                empty_writes(),
+                worker_queue,
+                Arc::new(Mutex::new(None)),
+                HealthPublisher::new(health_tx),
+                config,
+            )
+        });
+        assert!(
+            receipt
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_err()
+        );
+        health_until(&health_rx, |event| {
+            matches!(event.health, SessionSaveHealth::Recovered { .. })
+        });
+        assert_eq!(
+            *order.lock().unwrap(),
+            [
+                "notices",
+                "notices",
+                "workspace",
+                "notices",
+                "workspace",
+                "workspace"
+            ]
+        );
+        let (lock, changed) = &*queue;
+        lock.lock().unwrap().shutdown = true;
+        changed.notify_one();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn observed_notices_admission_refuses_scope_and_global_overflow_without_erasing_holds() {
+        use crate::persistence::observed_notices::{MAX_CONVERSATION_BYTES, MAX_GLOBAL_BYTES};
+        let directory = tempdir().unwrap();
+        let scope = observed_notice_scope(directory.path());
+        let notices = vec![observed_notice(0)];
+        let budget = Arc::new(Mutex::new(ObservedNoticeBudget::default()));
+        let held = ObservedNoticeReservation::reserve(&budget, &scope, &notices).unwrap();
+        let bytes = held.bytes;
+        assert_eq!(budget.lock().unwrap().total, bytes);
+        {
+            let mut state = budget.lock().unwrap();
+            state
+                .scopes
+                .insert(scope.clone(), MAX_CONVERSATION_BYTES - bytes + 1);
+            state.total = MAX_CONVERSATION_BYTES - bytes + 1;
+        }
+        assert!(
+            ObservedNoticeReservation::reserve(&budget, &scope, &notices)
+                .unwrap_err()
+                .contains("32 MiB")
+        );
+        assert_eq!(
+            budget.lock().unwrap().total,
+            MAX_CONVERSATION_BYTES - bytes + 1
+        );
+        {
+            let mut state = budget.lock().unwrap();
+            state.scopes.insert(scope.clone(), bytes);
+            state.total = MAX_GLOBAL_BYTES - bytes + 1;
+        }
+        assert!(
+            ObservedNoticeReservation::reserve(&budget, &scope, &notices)
+                .unwrap_err()
+                .contains("128 MiB")
+        );
+        assert_eq!(budget.lock().unwrap().total, MAX_GLOBAL_BYTES - bytes + 1);
+        // Restore the simulated existing reservations to the real held one.
+        budget.lock().unwrap().total = bytes;
+        drop(held);
+        let state = budget.lock().unwrap();
+        assert_eq!(state.total, 0);
+        assert!(state.scopes.is_empty());
+    }
+
+    #[test]
+    fn observed_notices_admission_holds_survive_quarantine_and_release_after_commit() {
+        let directory = tempdir().unwrap();
+        let scope = observed_notice_scope(directory.path());
+        let notices = vec![observed_notice(0)];
+        let budget = Arc::new(Mutex::new(ObservedNoticeBudget::default()));
+        let held = ObservedNoticeReservation::reserve(&budget, &scope, &notices).unwrap();
+        let bytes = held.bytes;
+        let (mut checkpoint, receipt) = observed_notice_checkpoint(CardId::new(), scope, notices);
+        let ConversionCheckpoint::ObservedNotices(write) = &mut checkpoint else {
+            unreachable!()
+        };
+        write.reservations.push(held);
+        let store = FakeStore::new([
+            FakeWrite::Refuse,
+            FakeWrite::FailDiskFull,
+            FakeWrite::Succeed,
+        ]);
+        let mut writes = empty_writes();
+        writes.conversions.push_back(checkpoint);
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        assert!(receipt.recv().unwrap().is_err());
+        assert_eq!(budget.lock().unwrap().total, bytes);
+        writes.rearm_quarantine();
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        assert_eq!(writes.observed_notice_errors.len(), 1);
+        assert_eq!(budget.lock().unwrap().total, bytes);
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        assert_eq!(budget.lock().unwrap().total, 0);
+        assert!(budget.lock().unwrap().scopes.is_empty());
+    }
+
+    #[test]
+    fn observed_notices_loaded_anchor_proof_recovers_after_unversioned_offer_and_io_failure() {
+        let directory = tempdir().unwrap();
+        let scope = observed_notice_scope(directory.path());
+        let original = observed_notice(0);
+        let store =
+            StateStore::open(directory.path().join("notices.db"), BootId::new("boot")).unwrap();
+        store
+            .preserve_observed_notices(&scope, &[original.clone()])
+            .unwrap();
+        let mut proof = store.load_observed_notices(&scope).unwrap().remove(0);
+        assert_eq!(proof.revision, 1);
+        proof.after = Some("newly-observed-closing-item".into());
+        let mut unversioned = proof.clone();
+        unversioned.revision = 0;
+        let card = CardId::new();
+        let mut writes = empty_writes();
+        let (first, first_receipt) =
+            observed_notice_checkpoint(card, scope.clone(), vec![original]);
+        writes.conversions.push_back(first);
+        assert!(
+            flush_with_observed(&mut writes, &FakeStore::new([FakeWrite::FailDiskFull]),)
+                .is_empty()
+        );
+        assert_eq!(
+            first_receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        let (newer, receipt) =
+            observed_notice_checkpoint(card, scope.clone(), vec![unversioned, proof.clone()]);
+        writes.conversions.push_back(newer);
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        assert!(writes.observed_notice_errors.is_empty());
+        receipt.recv().unwrap().unwrap();
+        first_receipt.recv().unwrap().unwrap();
+        let saved = store.load_observed_notices(&scope).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].message, proof.message);
+        assert_eq!(saved[0].text, proof.text);
+        assert_eq!(saved[0].after, proof.after);
+        assert_eq!(saved[0].revision, 2);
+        assert!(writes.quarantine.is_empty());
+        assert!(writes.is_settled());
+
+        // An old proof cannot promise recovery merely by repeating Retry.
+        // Preserve the refused bytes and report the actual CAS classification.
+        let mut stale = saved[0].clone();
+        stale.revision = 1;
+        stale.after = Some("unproven-later-item".into());
+        let (checkpoint, refused_receipt) =
+            observed_notice_checkpoint(card, scope.clone(), vec![stale.clone()]);
+        writes.conversions.push_back(checkpoint);
+        assert!(flush_with_observed(&mut writes, &store).is_empty());
+        let refusal = refused_receipt.recv().unwrap().unwrap_err();
+        assert!(!refusal.retryable);
+        assert!(!refusal.message.is_empty());
+        assert_eq!(store.load_observed_notices(&scope).unwrap(), saved);
+        assert_eq!(
+            writes.quarantine.observed_notices[&scope]
+                .0
+                .notices
+                .as_ref(),
+            [stale]
+        );
+    }
+
+    #[test]
+    fn observed_notices_blocked_io_does_not_hold_checkpoint_receipts_or_next_descriptor_batch() {
+        let directory = tempdir().unwrap();
+        let other_directory = tempdir().unwrap();
+        let state = workspace();
+        let (first, first_receipt) = observed_notice_checkpoint(
+            state.cards[0].id,
+            observed_notice_scope(directory.path()),
+            vec![observed_notice(0)],
+        );
+        let (second, second_receipt) = observed_notice_checkpoint(
+            CardId::new(),
+            observed_notice_scope(other_directory.path()),
+            vec![observed_notice(1)],
+        );
+        let (initial_reply, initial_barrier) = std::sync::mpsc::sync_channel(1);
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                latest: Some(Arc::new(state)),
+                conversions: VecDeque::from([first, second]),
+                checkpoints: vec![initial_reply],
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = Mutex::new(release_rx);
+        let mut store = FakeStore::new([]);
+        store.after_notice = Some(Box::new(move |attempt| {
+            entered_tx.send(attempt).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }));
+        let order = Arc::clone(&store.operation_order);
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || {
+            let mut publisher = HealthPublisher::new(health_tx);
+            publisher.failed(
+                &[StoreError::Io(std::io::Error::from_raw_os_error(
+                    libc::ENOSPC,
+                ))],
+                false,
+            );
+            run_persistence_worker(
+                store,
+                empty_writes(),
+                worker_queue,
+                Arc::new(Mutex::new(None)),
+                publisher,
+                fast_persistence_config(3),
+            )
+        });
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+        // Recovery must reach the existing health guard while the first
+        // diagnostic transaction is still blocked on its release handshake.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(event) = health_rx.try_recv()
+                && matches!(event.health, SessionSaveHealth::Recovered { .. })
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "journal I/O delayed ordinary recovery health"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        // The first diagnostic transaction remains blocked in the store.
+        initial_barrier
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        let (next_reply, next_barrier) = std::sync::mpsc::sync_channel(1);
+        let (lock, changed) = &*queue;
+        {
+            let mut queued = lock.lock().unwrap();
+            queued.latest = Some(Arc::new(workspace()));
+            queued.checkpoints.push(next_reply);
+        }
+        changed.notify_one();
+        release_tx.send(()).unwrap();
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
+        // Before starting the second scope's transaction, the writer drained
+        // and acknowledged the ordinary work that arrived during the first.
+        next_barrier
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["workspace", "notices", "workspace", "notices"]
+        );
+        release_tx.send(()).unwrap();
+        first_receipt
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        second_receipt
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        lock.lock().unwrap().shutdown = true;
+        changed.notify_one();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn observed_notices_blocked_io_cannot_delay_an_explicit_retry_acknowledgement() {
+        let directory = tempdir().unwrap();
+        let (notice, receipt) = observed_notice_checkpoint(
+            CardId::new(),
+            observed_notice_scope(directory.path()),
+            vec![observed_notice(0)],
+        );
+        let (barrier_reply, barrier) = std::sync::mpsc::sync_channel(1);
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                conversions: VecDeque::from([notice]),
+                retry_requested: true,
+                checkpoints: vec![barrier_reply],
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release) = std::sync::mpsc::sync_channel(1);
+        let release = Mutex::new(release);
+        let mut store = FakeStore::new([]);
+        store.after_notice = Some(Box::new(move |_| {
+            entered_tx.send(()).unwrap();
+            release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }));
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let publisher = HealthPublisher::new(health_tx);
+        let before = latest_health(&health_rx);
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || {
+            run_persistence_worker(
+                store,
+                empty_writes(),
+                worker_queue,
+                Arc::new(Mutex::new(None)),
+                publisher,
+                fast_persistence_config(3),
+            )
+        });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        barrier
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        // Journal I/O remains blocked, so an acknowledgement left after it
+        // could not have arrived. The ordinary barrier must already fence it.
+        let answered = latest_health(&health_rx);
+        assert!(answered.revision > before.revision);
+        assert_eq!(answered.health, SessionSaveHealth::Healthy);
+        assert!(answered.quarantined.is_empty());
+        assert_eq!(
+            receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        release_tx.send(()).unwrap();
+        receipt
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        queue.0.lock().unwrap().shutdown = true;
+        queue.1.notify_one();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn observed_notices_rotate_conversations_between_bounded_transactions() {
+        let directory = tempdir().unwrap();
+        let other_directory = tempdir().unwrap();
+        let scope = observed_notice_scope(directory.path());
+        let other_scope = observed_notice_scope(other_directory.path());
+        let card = CardId::new();
+        let (first, first_receipt) =
+            observed_notice_checkpoint(card, scope.clone(), (0..32).map(observed_notice).collect());
+        let (tail, tail_receipt) = observed_notice_checkpoint(
+            card,
+            scope.clone(),
+            vec![observed_notice(32), observed_notice(33)],
+        );
+        let (other, other_receipt) = observed_notice_checkpoint(
+            CardId::new(),
+            other_scope.clone(),
+            vec![observed_notice(34)],
+        );
+        let mut writes = empty_writes();
+        writes.conversions = VecDeque::from([first, tail, other]);
+        let store = FakeStore::new([]);
+        assert!(writes.flush(&store).is_empty());
+        assert!(store.observed_notice_attempts.lock().unwrap().is_empty());
+        writes.flush_observed_notices(&store);
+        first_receipt.recv().unwrap().unwrap();
+        assert_eq!(
+            other_receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        writes.flush_observed_notices(&store);
+        other_receipt.recv().unwrap().unwrap();
+        assert_eq!(
+            tail_receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        writes.flush_observed_notices(&store);
+        tail_receipt.recv().unwrap().unwrap();
+        let attempts = store.observed_notice_attempts.lock().unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|(scope, notes)| (scope.clone(), notes.len()))
+                .collect::<Vec<_>>(),
+            [(scope.clone(), 32), (other_scope, 1), (scope, 2)]
+        );
+        assert!(writes.is_settled());
+    }
+
+    #[test]
+    fn observed_notices_admission_keeps_ordinary_autosave_coalescing() {
+        let directory = tempdir().unwrap();
+        let mut older = workspace();
+        older.cards[0].title = "Obsolete autosave".into();
+        let mut latest = older.clone();
+        latest.cards[0].title = "Latest autosave".into();
+        let (checkpoint, receipt) = observed_notice_checkpoint(
+            latest.cards[0].id,
+            observed_notice_scope(directory.path()),
+            vec![observed_notice(0)],
+        );
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                latest: Some(Arc::new(latest)),
+                conversions: VecDeque::from([checkpoint]),
+                shutdown: true,
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let store = FakeStore::new([]);
+        let order = Arc::clone(&store.operation_order);
+        let titles = Arc::clone(&store.workspace_titles);
+        let mut writes = empty_writes();
+        writes.workspace = Some(Arc::new(older));
+        let (health_tx, _health_rx) = async_channel::unbounded();
+        run_persistence_worker(
+            store,
+            writes,
+            queue,
+            Arc::new(Mutex::new(None)),
+            HealthPublisher::new(health_tx),
+            fast_persistence_config(3),
+        );
+        receipt.recv().unwrap().unwrap();
+        assert_eq!(*order.lock().unwrap(), ["workspace", "notices"]);
+        assert_eq!(
+            *titles.lock().unwrap(),
+            [Some("Latest autosave".to_owned())]
+        );
+    }
+
+    #[test]
+    fn observed_notices_real_busy_keeps_ordinary_health_and_barriers_usable() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("journal-busy.db");
+        let scope = observed_notice_scope(directory.path());
+        let state = workspace();
+        let card = state.cards[0].id;
+        let notice = observed_notice(0);
+        let (mut runtime, _) = SessionRuntime::open_with_options(
+            &path,
+            BootId::new("boot"),
+            crate::persistence::StoreOptions {
+                busy_timeout: Duration::from_millis(1),
+            },
+        )
+        .unwrap();
+        // Establish real durable descriptor state before only the independent
+        // journal meets a lock; a missing descriptor is never waived here.
+        runtime.snapshot(Arc::new(state));
+        runtime.flush(Duration::from_secs(5)).unwrap();
+        let health = runtime.health_receiver();
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let receipt = runtime
+            .preserve_observed_notices(card, scope.clone(), vec![notice.clone()].into())
+            .unwrap();
+        let budget = Arc::clone(&runtime.queue.0.lock().unwrap().observed_notice_budget);
+        let reserved_bytes = budget.lock().unwrap().total;
+        let next_event = |accept: &dyn Fn(&SessionSaveHealthEvent) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(event) = health.try_recv() {
+                    assert!(
+                        matches!(
+                            event.health,
+                            SessionSaveHealth::Healthy | SessionSaveHealth::Recovered { .. }
+                        ),
+                        "journal-only Busy cannot close the existing handoff health guard: {event:?}"
+                    );
+                    if accept(&event) {
+                        break event;
+                    }
+                }
+                assert!(Instant::now() < deadline, "missing journal health evidence");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let journal_busy = |event: &SessionSaveHealthEvent| {
+            event.quarantined.iter().any(|write| {
+                write.subject == WriteSubject::ObservedNotices { card }
+                    && write.category == SaveFailureCategory::Busy
+            })
+        };
+        let first = next_event(&journal_busy);
+        assert!(
+            first
+                .quarantined
+                .iter()
+                .all(|write| !write.subject.is_window_state())
+        );
+        assert_eq!(
+            receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        // The real database write lock remains held, but descriptor custody is
+        // current and its ordinary flush barrier can be requested and honored.
+        runtime
+            .request_flush()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert!(runtime.last_error().is_none());
+        assert!(runtime.retry_save());
+        let rearmed = next_event(&|event| event.revision > first.revision && journal_busy(event));
+        assert_eq!(
+            rearmed.quarantined[0].refused_at_unix_ms,
+            first.quarantined[0].refused_at_unix_ms
+        );
+        assert_eq!(budget.lock().unwrap().total, reserved_bytes);
+        assert_eq!(
+            receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+        receipt
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        next_event(&|event| event.quarantined.is_empty());
+        assert_eq!(budget.lock().unwrap().total, 0);
+        let saved = runtime
+            .operation_store()
+            .load_observed_notices(&scope)
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].text, notice.text);
+        assert_eq!(saved[0].revision, 1);
+        runtime.shutdown();
     }
 
     #[test]

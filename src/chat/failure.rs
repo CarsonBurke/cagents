@@ -130,6 +130,7 @@ impl<'a> Failure<'a> {
         } else if contains(&[
             "overloaded_error",
             "provider is at capacity",
+            "selected model is at capacity",
             "server is overloaded",
             "temporarily overloaded",
         ]) {
@@ -168,6 +169,10 @@ impl<'a> Failure<'a> {
             FailureKind::Authentication => (
                 format!("{name} sign-in needs attention"),
                 "Check the selected account and sign in again.",
+            ),
+            FailureKind::Capacity if lower.contains("selected model is at capacity") => (
+                "Selected model is at capacity".into(),
+                "Choose a different model or try again later.",
             ),
             FailureKind::Capacity => (
                 format!("{name} is temporarily at capacity"),
@@ -297,6 +302,29 @@ fn reported_reset(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_model_capacity_error_keeps_its_exact_diagnostics_and_category() {
+        let raw = "Selected model is at capacity. Please try a different model.";
+        for provider in Provider::ALL {
+            let failure = Failure::parse(provider, raw).expect("reported capacity diagnostic");
+            assert_eq!(failure.kind, FailureKind::Capacity);
+            assert_eq!(failure.details, raw);
+            assert_eq!(failure.details.as_ptr(), raw.as_ptr());
+            assert!(failure.reset.is_none());
+            assert_eq!(failure.summary, "Selected model is at capacity");
+            assert!(failure.action.contains("different model"));
+        }
+        assert!(Failure::parse(Provider::Claude, "Selected model capacity: 128K tokens").is_none());
+        let authentication = format!("Authentication failed. {raw}");
+        assert_eq!(
+            Failure::parse(Provider::Claude, &authentication)
+                .unwrap()
+                .kind,
+            FailureKind::Authentication,
+            "the existing sign-in classification still takes precedence"
+        );
+    }
 
     #[test]
     fn explicit_provenance_requires_full_provider_tuple_and_preserves_original_item_identity() {

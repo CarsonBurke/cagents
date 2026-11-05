@@ -1802,6 +1802,9 @@ impl Cagents {
                 if self.refused_terminal_recovery_target().is_some() {
                     ring.push(Cow::Borrowed("session-recovery.open"));
                 }
+                if self.capacity_notice_retry_available() {
+                    ring.push(Cow::Borrowed("capacity-notices.retry"));
+                }
                 ring
             }
         }
@@ -2205,6 +2208,7 @@ impl Cagents {
                 .save_health
                 .as_ref()
                 .is_some_and(SaveHealthState::is_visible)
+            || self.observed_capacity_notice_problem().is_some()
     }
 
     /// Wakes the shell when the earliest confirmation is due to retire, and
@@ -2304,7 +2308,14 @@ impl Cagents {
         // From the log, not `self.status`: `update` drains that slot into the
         // log on every message, so reading it here would almost always see
         // `None` and fall back to a warning glyph for an error.
-        let recorded_severity = self.notices.severity().max(health_severity);
+        let capacity_severity = self
+            .observed_capacity_notice_problem()
+            .map(|_| NoticeSeverity::Error);
+        let recorded_severity = self
+            .notices
+            .severity()
+            .max(health_severity)
+            .max(capacity_severity);
         Some(recorded_severity.unwrap_or(NoticeSeverity::Warning))
     }
 
@@ -2474,6 +2485,42 @@ impl Cagents {
         .into()
     }
 
+    fn capacity_notice_retry_available(&self) -> bool {
+        self.observed_capacity_notice_problem()
+            .is_some_and(|(_, retry)| retry)
+            && !self.save_health.as_ref().is_some_and(|health| {
+                health.offers_retry()
+                    || matches!(health.health, SessionSaveHealth::WriterUnavailable)
+            })
+    }
+
+    pub(super) fn observed_capacity_notice_view(&self) -> Option<Element<'_, Message>> {
+        let (guidance, _) = self.observed_capacity_notice_problem()?;
+        let severity = NoticeSeverity::Error;
+        let mut body = vec![
+            super::notice_body("Earlier capacity errors need attention"),
+            super::notice_surface_detail(severity, guidance),
+        ];
+        if self.capacity_notice_retry_available() {
+            body.push(super::notice_surface_action(
+                severity,
+                "Retry saving",
+                "Retry saving earlier capacity-error details",
+                widget::Id::new("capacity-notices.retry"),
+                Message::RetrySessionSave,
+            ));
+        }
+        Some(super::notice_surface(
+            severity,
+            widget::column::with_children(body)
+                .spacing(space::XS)
+                .width(Length::Fill)
+                .into(),
+            None,
+            false,
+        ))
+    }
+
     fn notice_control(&self) -> Option<Element<'_, Message>> {
         let severity = self
             .notice_control_severity()
@@ -2496,7 +2543,7 @@ impl Cagents {
         }));
         let content =
             (self.chrome_ui.popup == Some(Popup::Notices) && !self.modal_is_open()).then(|| {
-                let mut notices = Vec::with_capacity(self.notices.len() + 1);
+                let mut notices = Vec::with_capacity(self.notices.len() + 2);
                 for entry in self.notices.recent() {
                     let severity = entry.notice.severity;
                     let mut lines = vec![super::notice_body(&entry.notice.message)];
@@ -2539,6 +2586,7 @@ impl Cagents {
                         self.session_recovery_action(),
                     ));
                 }
+                notices.extend(self.observed_capacity_notice_view());
                 let mut heading_children = vec![
                     design::heading("Application notices")
                         .width(Length::Fill)
