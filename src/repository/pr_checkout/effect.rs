@@ -350,6 +350,11 @@ fn transaction<E: ProcessExecutor>(
         )
         .map_err(|error| error.to_string())?;
         fs::write(
+            private.join("check-submodule-paths"),
+            include_bytes!("submodule_paths.sh"),
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
             private.join("check-new-paths"),
             include_bytes!("check_new_paths.sh"),
         )
@@ -408,6 +413,7 @@ fn transaction<E: ProcessExecutor>(
             complete_inventory::resolved_git_executable(&service.git)?,
         )
         .env("CAGENTS_PR_PRIVATE", private)
+        .env("CAGENTS_PR_SUBMODULE_HELPERS", private)
         .env("CAGENTS_PR_MODE", if probe { "probe" } else { "effect" })
         .env("CAGENTS_PR_WORKTREE", &plan.worktree.path)
         .env("CAGENTS_PR_GITDIR", &plan.git_dir.path)
