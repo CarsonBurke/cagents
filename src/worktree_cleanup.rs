@@ -850,6 +850,21 @@ impl WindowProtections {
 mod tests {
     use super::*;
 
+    /// A sibling test's fork holds a copy of every descriptor until its exec, so a
+    /// released lock can stay held for a moment under parallel load.
+    fn acquire_once_released(runtime: &Path, directory: &Path, exclusive: bool) -> Protection {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match acquire(runtime, directory, exclusive) {
+                Ok(protection) => return protection,
+                Err(error) if std::time::Instant::now() >= deadline => {
+                    panic!("{} stayed protected: {error}", directory.display())
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+    }
+
     fn fixture_directory() -> tempfile::TempDir {
         // Positive fixtures need physical paths even when TMPDIR names a symlink.
         // Keep the TempDir guard; the lease API still rejects symlink components.
@@ -1273,7 +1288,7 @@ mod tests {
         assert!(protection.protects_root(&root).unwrap());
         assert!(acquire(runtime.path(), &directory, true).is_err());
         drop(protection);
-        assert!(acquire(runtime.path(), &directory, true).is_ok());
+        acquire_once_released(runtime.path(), &directory, true);
     }
 
     #[test]
@@ -1288,8 +1303,8 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         assert!(protect_root_operation_in_runtime(runtime.path(), &root).is_err());
         // Rejection must release the replacement's temporary acquisition.
-        assert!(acquire(runtime.path(), &directory, true).is_ok());
-        assert!(acquire(runtime.path(), &moved, true).is_ok());
+        acquire_once_released(runtime.path(), &directory, true);
+        acquire_once_released(runtime.path(), &moved, true);
     }
 
     #[test]
@@ -1437,8 +1452,8 @@ mod tests {
         assert!(acquire(runtime.path(), &moved, true).is_err());
         child.stdin.take().unwrap().write_all(b"retire\n").unwrap();
         assert!(child.wait().unwrap().success());
-        assert!(acquire(runtime.path(), &directory, true).is_ok());
-        assert!(acquire(runtime.path(), &moved, true).is_ok());
+        acquire_once_released(runtime.path(), &directory, true);
+        acquire_once_released(runtime.path(), &moved, true);
     }
 
     #[test]
@@ -1452,7 +1467,7 @@ mod tests {
         );
         assert!(acquire(runtime.path(), directory.path(), false).is_err());
         drop(exclusive);
-        assert!(acquire(runtime.path(), directory.path(), false).is_ok());
+        acquire_once_released(runtime.path(), directory.path(), false);
     }
 
     #[test]
