@@ -151,7 +151,9 @@ stop_agent() {
 # Optional scripted tool calls: each line of fixture-tools.jsonl is
 # {"name":..., "input":{...}, "result":"...", "is_error":bool}, emitted as a
 # tool call and its result on every turn, so a rendering check can choose the
-# exact calls and outputs it needs.
+# exact calls and outputs it needs. A spec with "stream": SECONDS first
+# streams its input as Claude does, in input_json_delta fragments that many
+# seconds apart, so the native UI's partial states can be observed.
 tools_file=$config/fixture-tools.jsonl
 tools_turn() {
     call=0
@@ -159,6 +161,18 @@ tools_turn() {
         [ -n "$spec" ] || continue
         call=$((call + 1))
         id="tool-$turn-$call"
+        delay=$(printf '%s' "$spec" | jq -r '.stream // empty')
+        if [ -n "$delay" ]; then
+            jq -cn --arg id "fixture-$id" '{type:"stream_event",event:{type:"message_start",message:{id:$id,role:"assistant"}}}'
+            printf '%s' "$spec" | jq -c --arg id "$id" '{type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:$id,name:.name,input:{}}}}'
+            printf '%s' "$spec" | jq -c '.input | tojson | [range(0; length; 12) as $at | .[$at:$at + 12]] | .[]' |
+                while IFS= read -r delta; do
+                    jq -cn --argjson delta "$delta" '{type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"input_json_delta",partial_json:$delta}}}'
+                    sleep "$delay"
+                done
+            jq -cn '{type:"stream_event",event:{type:"content_block_stop",index:0}}'
+            jq -cn '{type:"stream_event",event:{type:"message_stop"}}'
+        fi
         emit_record "$(printf '%s' "$spec" | jq -c --arg id "$id" '{type:"assistant",uuid:("fixture-"+$id),message:{id:("fixture-"+$id),role:"assistant",content:[{type:"tool_use",id:$id,name:.name,input:.input}]}}')"
         emit_record "$(printf '%s' "$spec" | jq -c --arg id "$id" '{type:"user",uuid:("fixture-"+$id+"-result"),message:{role:"user",content:[{type:"tool_result",tool_use_id:$id,is_error:(.is_error // false),content:(.result // "")}]}}')"
     done < "$tools_file"

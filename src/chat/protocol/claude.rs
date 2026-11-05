@@ -4173,6 +4173,106 @@ fn tool_content(name: &str, input: &Value, cwd: &Path) -> ItemContent {
         },
     }
 }
+/// A streaming tool call as the view is shown it while its input arrives.
+///
+/// How a call is presented depends on its whole input, which only exists once
+/// its block stops. A row that read "Called Bash" while a command streamed and
+/// "Ran cargo test" once it stopped would change what it says it did, so a call
+/// whose name settles its verb takes that form from its first fragment, filled
+/// with whatever of its input has arrived. An edit's verb depends on what it
+/// replaces, so it is an edit not yet described; any other call is shown as
+/// the tool call it stays.
+fn streamed(item: &Item, cwd: &Path) -> Item {
+    let ItemContent::Tool { name, input, .. } = &item.content else {
+        return item.clone();
+    };
+    let action = match name.as_str() {
+        "Bash" => CommandAction::Run,
+        "Read" => CommandAction::Read,
+        "Grep" => CommandAction::Search,
+        "Glob" => CommandAction::List,
+        "Edit" | "MultiEdit" | "Write" => {
+            return Item {
+                content: ItemContent::Changes {
+                    changes: Vec::new(),
+                    status: ToolStatus::Running,
+                },
+                ..item.clone()
+            };
+        }
+        _ => return item.clone(),
+    };
+    let content = match tool_content(name, &partial_json(input), cwd) {
+        content @ ItemContent::Command { .. } => content,
+        _ => command_content(
+            String::new(),
+            String::new(),
+            cwd.to_string_lossy().into_owned(),
+            action,
+        ),
+    };
+    Item {
+        content,
+        ..item.clone()
+    }
+}
+
+/// The value a prefix of a JSON document describes so far: a string cut off
+/// part-way holds what has arrived of it, and a member whose value has not
+/// begun is left out. `Value::Null` where nothing of it can be read yet.
+fn partial_json(prefix: &str) -> Value {
+    let mut closers = Vec::new();
+    // Where the prefix can be cut to leave only whole members, and what is
+    // open there: just inside a container, or before a separating comma.
+    let mut whole = (0, Vec::new());
+    let mut string = false;
+    // Where an escape that has not finished began.
+    let mut escape: Option<usize> = None;
+    for (index, byte) in prefix.bytes().enumerate() {
+        if string {
+            match escape {
+                // `\u` is followed by four hex digits; any other escape is
+                // one character.
+                Some(at) if index == at + 1 && byte == b'u' => {}
+                Some(at) if index == at + 1 || index == at + 5 => escape = None,
+                Some(_) => {}
+                None if byte == b'\\' => escape = Some(index),
+                None if byte == b'"' => string = false,
+                None => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => string = true,
+            b'{' | b'[' => {
+                closers.push(if byte == b'{' { b'}' } else { b']' });
+                whole = (index + 1, closers.clone());
+            }
+            b'}' | b']' => {
+                closers.pop();
+            }
+            b',' => whole = (index, closers.clone()),
+            _ => {}
+        }
+    }
+    let close = |text: &str, closers: &[u8]| {
+        let mut text = text.to_owned();
+        text.extend(closers.iter().rev().map(|&byte| byte as char));
+        serde_json::from_str(&text).ok()
+    };
+    let attempt = if string {
+        // A value cut off inside an escape keeps what came before it.
+        close(
+            &format!("{}\"", &prefix[..escape.unwrap_or(prefix.len())]),
+            &closers,
+        )
+    } else {
+        close(prefix, &closers)
+    };
+    attempt
+        .or_else(|| close(&prefix[..whole.0], &whole.1))
+        .unwrap_or(Value::Null)
+}
 fn command_content(
     label: String,
     command: String,
@@ -4559,7 +4659,7 @@ impl Claude {
                 if !matches!(&item.content, ItemContent::Tool { .. })
                     || !self.completed_tool(Some(&parent), &item.id)
                 {
-                    step.events.push(Event::Item(item.clone()));
+                    step.events.push(Event::Item(streamed(&item, &self.cwd)));
                 }
                 self.blocks
                     .insert((ScopedId::new(Some(&parent), &message), index), item);
@@ -4646,7 +4746,7 @@ impl Claude {
                             );
                         }
                         input.push_str(value);
-                        step.events.push(Event::Item(item.clone()));
+                        step.events.push(Event::Item(streamed(item, &self.cwd)));
                     }
                     (_, other) => step.events.push(Event::Error {
                         message: format!("Unsupported Claude stream delta {other}"),
@@ -4705,8 +4805,11 @@ impl Claude {
                             self.edit_tools
                                 .insert(ScopedId::new(Some(&parent), &item.id), name.clone());
                         }
-                        if !matches!(content, ItemContent::Tool { .. }) {
-                            item.content = content;
+                        // The view last saw the call as it streamed, which a
+                        // plain tool call already matches.
+                        let shown = streamed(&item, &self.cwd).content;
+                        item.content = content;
+                        if item.content != shown {
                             step.events.push(Event::Item(item.clone()));
                         }
                         self.tool(Some(&parent), item);
@@ -9952,7 +10055,7 @@ mod tests {
         let (first, second) = encoded.split_at(encoded.len() / 2);
         let partial = streamed.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":first}}))).unwrap();
         assert!(
-            matches!(&items(&partial)[..], [ItemContent::Tool { name, input, .. }] if name == "Edit" && input == first)
+            matches!(&items(&partial)[..], [ItemContent::Changes { changes, status: ToolStatus::Running }] if changes.is_empty())
         );
         streamed.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":second}}))).unwrap();
         let stopped = streamed
@@ -11125,45 +11228,149 @@ mod tests {
         );
     }
 
+    /// A streaming call is shown as the step it will be from its first
+    /// fragment, so its row never says "Called Bash" and then "Ran ls".
     #[test]
-    fn streamed_tool_input_accumulates_before_it_is_classified() {
-        let mut adapter = Claude {
-            cwd: PathBuf::from("/workspace"),
-            ..Claude::default()
+    fn a_streaming_tool_call_keeps_its_verb_while_its_input_arrives() {
+        let command = |command: &str, label: &str, action| ItemContent::Command {
+            label: label.into(),
+            command: command.into(),
+            working_directory: "/workspace".into(),
+            action,
+            status: ToolStatus::Running,
+            exit_code: None,
+            duration_ms: None,
+            output: String::new(),
         };
-        adapter
-            .receive(stream(
-                json!({"type":"message_start","message":{"id":"msg-1"}}),
-            ))
-            .unwrap();
-        adapter.receive(stream(json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":"Bash"}}))).unwrap();
-        let partial = adapter.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls"}}))).unwrap();
-        assert_eq!(
-            items(&partial),
-            vec![ItemContent::Tool {
-                name: "Bash".into(),
-                input: "{\"command\":\"ls".into(),
-                output: String::new(),
-                status: ToolStatus::Running,
-            }]
-        );
-        adapter.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"}"}}))).unwrap();
-        let stopped = adapter
-            .receive(stream(json!({"type":"content_block_stop","index":0})))
-            .unwrap();
-        assert_eq!(
-            items(&stopped),
-            vec![ItemContent::Command {
-                label: String::new(),
-                command: "ls".into(),
-                working_directory: "/workspace".into(),
-                action: CommandAction::Run,
-                status: ToolStatus::Running,
-                exit_code: None,
-                duration_ms: None,
-                output: String::new(),
-            }]
-        );
+        let undescribed = ItemContent::Changes {
+            changes: Vec::new(),
+            status: ToolStatus::Running,
+        };
+        let tool = |input: &str| ItemContent::Tool {
+            name: "mcp__linear__get_issue".into(),
+            input: input.into(),
+            output: String::new(),
+            status: ToolStatus::Running,
+        };
+        for (name, fragments, shown) in [
+            (
+                "Bash",
+                vec![
+                    "",
+                    "{\"comm",
+                    "and\":\"git st",
+                    "atus\",\"descr",
+                    "iption\":\"Show status\"}",
+                ],
+                vec![
+                    command("", "", CommandAction::Run),
+                    command("", "", CommandAction::Run),
+                    command("git st", "", CommandAction::Run),
+                    command("git status", "", CommandAction::Run),
+                    command("git status", "Show status", CommandAction::Run),
+                ],
+            ),
+            (
+                "Read",
+                vec!["", "{\"file_path\":\"src/li", "b.rs\"}"],
+                vec![
+                    command("", "", CommandAction::Read),
+                    command("src/li", "src/li", CommandAction::Read),
+                    command("src/lib.rs", "src/lib.rs", CommandAction::Read),
+                ],
+            ),
+            (
+                "Edit",
+                vec![
+                    "",
+                    "{\"file_path\":\"a.rs\",\"old_string\":\"a\",",
+                    "\"new_string\":\"b\"}",
+                ],
+                vec![undescribed.clone(), undescribed.clone(), undescribed],
+            ),
+            (
+                "mcp__linear__get_issue",
+                vec!["", "{\"id\":\"ENG-1", "\"}"],
+                vec![
+                    tool(""),
+                    tool("{\"id\":\"ENG-1"),
+                    tool("{\"id\":\"ENG-1\"}"),
+                ],
+            ),
+        ] {
+            let mut adapter = Claude {
+                cwd: PathBuf::from("/workspace"),
+                ..Claude::default()
+            };
+            adapter
+                .receive(stream(
+                    json!({"type":"message_start","message":{"id":"msg-1"}}),
+                ))
+                .unwrap();
+            let mut seen = Vec::new();
+            for fragment in &fragments {
+                let event = if fragment.is_empty() {
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":name}})
+                } else {
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":fragment}})
+                };
+                seen.extend(items(&adapter.receive(stream(event)).unwrap()));
+            }
+            assert_eq!(seen, shown, "{name}");
+            let stopped = items(
+                &adapter
+                    .receive(stream(json!({"type":"content_block_stop","index":0})))
+                    .unwrap(),
+            );
+            // A call already shown as what it is has nothing left to say
+            // when its input ends; an edit, which could not say what it
+            // would do, says it now.
+            match (name, &stopped[..]) {
+                ("Edit", [ItemContent::Changes { changes, .. }]) => assert_eq!(changes.len(), 1),
+                (_, []) if name != "Edit" => {}
+                (_, stopped) => panic!("{name} stopped as {stopped:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_prefix_of_streamed_json_reads_as_what_has_arrived() {
+        for (prefix, value) in [
+            ("", Value::Null),
+            ("{", json!({})),
+            ("{\"comm", json!({})),
+            ("{\"command\"", json!({})),
+            ("{\"command\":", json!({})),
+            ("{\"command\":\"", json!({"command": ""})),
+            ("{\"command\":\"ls -", json!({"command": "ls -"})),
+            ("{\"command\":\"ls\",", json!({"command": "ls"})),
+            (
+                "{\"command\":\"ls\",\"timeout\":12",
+                json!({"command": "ls", "timeout": 12}),
+            ),
+            (
+                "{\"command\":\"ls\",\"run_in_background\":tr",
+                json!({"command": "ls"}),
+            ),
+            // An escape cut off part-way keeps what preceded it.
+            ("{\"command\":\"echo \\", json!({"command": "echo "})),
+            ("{\"command\":\"echo \\u00", json!({"command": "echo "})),
+            (
+                "{\"command\":\"echo \\u00e9",
+                json!({"command": "echo \u{e9}"}),
+            ),
+            (
+                "{\"command\":\"echo \\\"hi\\\" ",
+                json!({"command": "echo \"hi\" "}),
+            ),
+            ("{\"command\":\"a, {b}\"", json!({"command": "a, {b}"})),
+            (
+                "{\"edits\":[{\"old\":\"a\"},{\"ol",
+                json!({"edits": [{"old": "a"}, {}]}),
+            ),
+        ] {
+            assert_eq!(partial_json(prefix), value, "{prefix}");
+        }
     }
 
     /// Deliver one API message in the order Claude Code writes it: each

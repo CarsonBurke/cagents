@@ -474,6 +474,9 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
             }
         }
         ItemContent::Changes { changes, .. } => match changes.as_slice() {
+            // An edit whose input is still arriving: what it changes, and so
+            // whether it adds or edits a file, is not known yet.
+            [] => "Preparing an edit",
             [single] => single.path.as_str(),
             _ => "File changes",
         },
@@ -559,6 +562,7 @@ pub(super) fn step_verb(content: &ItemContent) -> &'static str {
             chat::CommandAction::Run => "Ran",
         },
         ItemContent::Changes { changes, .. } => match changes.as_slice() {
+            [] => "",
             [single] => match single.kind {
                 chat::ChangeKind::Added => "Added",
                 chat::ChangeKind::Deleted => "Deleted",
@@ -1468,5 +1472,18 @@ mod tests {
         };
         assert_eq!(step_label(&content), "src/app.rs");
         assert_eq!(step_verb(&content), "Renamed");
+    }
+
+    /// An edit whose input is still arriving has not said whether it adds or
+    /// edits a file, so its row names neither rather than guessing one and
+    /// changing its mind.
+    #[test]
+    fn an_edit_not_yet_described_does_not_guess_its_verb() {
+        let content = ItemContent::Changes {
+            changes: Vec::new(),
+            status: ToolStatus::Running,
+        };
+        assert_eq!(step_verb(&content), "");
+        assert_eq!(step_label(&content), "Preparing an edit");
     }
 }
