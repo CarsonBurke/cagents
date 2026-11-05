@@ -425,6 +425,25 @@ impl DiffLayout {
         }
     }
 
+    /// Re-lays both layouts with rows of `height`, keeping measured
+    /// annotation blocks until they are measured again at the new height.
+    pub fn set_row_height(&mut self, height: f32) {
+        if self.row_height == height {
+            return;
+        }
+        self.row_height = height;
+        for (offsets, folded) in self.offsets.iter_mut().zip(&self.folded) {
+            let annotations: Vec<(usize, f32)> = offsets
+                .annotations()
+                .iter()
+                .map(|(row, extra)| (*row, *extra))
+                .collect();
+            let leading = offsets.leading_height();
+            *offsets = RowOffsets::uniform(folded.len(), height);
+            offsets.annotate(leading, &annotations);
+        }
+    }
+
     pub fn rows(&self, mode: DiffMode) -> &RowOffsets {
         &self.offsets[layout_index(mode)]
     }

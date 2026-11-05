@@ -4187,14 +4187,17 @@ impl Application for Editor {
                     }
                     let options = self.settings.editor_find_options;
                     let preserve = self.settings.editor_replace_preserve_case;
-                    let find_tasks = self
+                    let runtime_tasks = self
                         .tabs
                         .iter_mut()
                         .map(|tab| {
-                            repository_task(
-                                tab.runtime
-                                    .update_find_preferences(tab.id, options, preserve),
-                            )
+                            Task::batch([
+                                repository_task(
+                                    tab.runtime
+                                        .update_find_preferences(tab.id, options, preserve),
+                                ),
+                                repository_task(tab.runtime.refresh_diff_presentation(tab.id)),
+                            ])
                         })
                         .collect::<Vec<_>>();
                     let shortcuts =
@@ -4204,7 +4207,7 @@ impl Application for Editor {
                         self.appearance(),
                         self.save_settings(),
                         preference_task(shortcuts),
-                        Task::batch(find_tasks),
+                        Task::batch(runtime_tasks),
                     ])
                 }
                 Message::ShortcutChanged(action, value) => {
@@ -4357,10 +4360,17 @@ impl Application for Editor {
                     }
                     self.settings.terminal_line_height = line_height;
                     self.line_height_draft = line_height.to_string();
-                    for tab in &mut self.tabs {
-                        tab.runtime.set_line_height(line_height);
-                    }
-                    self.save_settings()
+                    // Diff rows are editor lines: move each mounted
+                    // comparison to the row its reader was on.
+                    let relaid = self
+                        .tabs
+                        .iter_mut()
+                        .map(|tab| {
+                            tab.runtime.set_line_height(line_height);
+                            repository_task(tab.runtime.refresh_diff_presentation(tab.id))
+                        })
+                        .collect::<Vec<_>>();
+                    Task::batch([self.save_settings(), Task::batch(relaid)])
                 }
                 Message::SyntaxTheme(theme) => {
                     self.settings.editor_syntax_theme = theme;
