@@ -31,8 +31,11 @@ import time
 
 root = Path(os.environ["TEST_ROOT"])
 config = json.loads((root / "control.json").read_text())
-cargo = Path(sys.argv[0]).name == "cargo"
-phase = "compiler" if cargo else (
+program = Path(sys.argv[0]).name
+cargo = program == "cargo"
+phase = ("metadata" if cargo and sys.argv[1:2] == ["metadata"] else
+    "compiler" if cargo else "disk" if program == "df" else
+    "prune" if program == "prune-cargo-build-dirs" else
     "list-ignored" if "--ignored" in sys.argv else
     "list-all" if "--list" in sys.argv else "test")
 
@@ -45,7 +48,7 @@ def held():
         return False
 
 def record(**extra):
-    event = dict(phase=phase, pid=os.getpid(), arguments=sys.argv[1:],
+    event = dict(phase=phase, program=program, pid=os.getpid(), arguments=sys.argv[1:],
                  cwd=os.getcwd(), held=held(),
                  protected={name: os.environ[name] for name in
                             ("HOME", "CODEX_HOME", "CAGENTS_AGENT_AUTHORITY")})
@@ -72,7 +75,29 @@ if config.get("hold") == phase:
     if not (root / "release").exists():
         raise SystemExit(95)
 
-if cargo:
+if phase == "metadata":
+    if config.get("metadata_exit"):
+        raise SystemExit(config["metadata_exit"])
+    metadata = dict(target_directory=str(root / "owned-target"))
+    if not config.get("metadata_omit_build_directory"):
+        metadata["build_directory"] = config.get("metadata_build_directory", str(root / "owned-build"))
+    print(json.dumps(metadata, separators=(",", ":")))
+    raise SystemExit(0)
+
+if phase == "disk":
+    free = config.get("free_gib", 4)
+    if (root / "pruned").exists():
+        free = config.get("after_prune_free_gib", free)
+    print("Filesystem 1024-blocks Used Available Capacity Mounted on")
+    print("fixture", config.get("size_gib", 100) * 1048576, 0,
+          free * 1048576, "1%", "/fixture-owned")
+    raise SystemExit(0)
+
+if phase == "prune":
+    (root / "pruned").touch()
+    raise SystemExit(config.get("prune_exit", 0))
+
+if phase == "compiler":
     artifact = dict(reason="compiler-artifact", manifest_path=str(root / "Cargo.toml"),
                     target=dict(name="cagents", kind=["lib"]),
                     profile=dict(test=True), executable=str(root / "libtest"))
@@ -140,8 +165,9 @@ class TestLib(unittest.TestCase):
         scripts.mkdir()
         for name in ("test-lib", "cargo-gate", "cargo-gate-command.py"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
-        if (ROOT / "scripts/seed-build-dir").exists():
-            shutil.copy2(ROOT / "scripts/seed-build-dir", scripts / "seed-build-dir")
+        for name in ("seed-build-dir", "build-disk-guard"):
+            if (ROOT / "scripts" / name).exists():
+                shutil.copy2(ROOT / "scripts" / name, scripts / name)
         (self.root / "Cargo.toml").write_text("# private fake Cargo manifest\n")
         (self.root / "bin").mkdir()
         for path in (self.root / "bin/cargo", self.root / "libtest"):
@@ -156,7 +182,7 @@ class TestLib(unittest.TestCase):
             "CODEX_HOME": str(self.root / "private-codex"),
             "CAGENTS_AGENT_AUTHORITY": "fixture-agent-authority",
             "CAGENTS_BUILD_LOCK": str(self.lock), "CAGENTS_BUILD_SLOTS": "1",
-            "CAGENTS_BUILD_SEED": "0",
+            "CAGENTS_BUILD_SEED": "0", "CAGENTS_BUILD_FREE_FLOOR_GIB": "0",
             "CARGO_BUILD_JOBS": "1", "TEST_ROOT": str(self.root),
             "TMPDIR": str(self.root / "tmp"), "LC_ALL": "C",
         }
@@ -197,7 +223,7 @@ class TestLib(unittest.TestCase):
         return [event for event in events if phase is None or event["phase"] == phase]
 
     def clear(self):
-        for name in ("events.jsonl", "release"):
+        for name in ("events.jsonl", "release", "pruned", "slot.lock.prune"):
             (self.root / name).unlink(missing_ok=True)
         for path in self.root.glob("*.ready"):
             path.unlink()
@@ -222,6 +248,26 @@ class TestLib(unittest.TestCase):
     def assert_no_test(self):
         self.assertEqual(self.events("test"), [])
 
+    def disk_policy(self):
+        # Neither a real disk query nor an installed host pruner can be used.
+        for name in ("df", "prune-cargo-build-dirs"):
+            path = self.root / "bin" / name
+            path.write_text(TOOL)
+            path.chmod(0o700)
+        environment = self.env.copy()
+        environment.pop("CAGENTS_BUILD_FREE_FLOOR_GIB")
+        return environment
+
+    def assert_one_build_then_direct_harness(self):
+        events = self.events()
+        self.assertEqual(len(self.events("metadata")), 1)
+        compiler = self.events("compiler")
+        self.assertEqual(len(compiler), 1)
+        after = events[events.index(compiler[0]) + 1:]
+        self.assertEqual({event["phase"] for event in after}, {"list-all", "list-ignored", "test"})
+        self.assertTrue(all(event["program"] == "libtest" for event in after), after)
+        self.assertTrue(all(not event["held"] for event in after), after)
+
     def test_isolated_lane_arguments_cwd_profile_and_admission_release(self):
         for lane, profile in (("cli", None), ("host", "dev-runtime"), ("ui", "test")):
             with self.subTest(lane=lane):
@@ -238,8 +284,11 @@ class TestLib(unittest.TestCase):
                     expected += ["--features", lane]
                 self.assertEqual(compiler["arguments"], expected + extra)
                 self.assertTrue(compiler["held"], events)
+                metadata = self.events("metadata")[0]
+                self.assertEqual(metadata["arguments"], ["metadata", "--format-version", "1", "--no-deps"])
+                self.assertEqual(events[:2], [metadata, compiler])
                 self.assertEqual({event["phase"] for event in events},
-                                 {"compiler", "list-all", "list-ignored", "test"})
+                                 {"metadata", "compiler", "list-all", "list-ignored", "test"})
                 for event in events:
                     self.assertEqual(event["cwd"], str(self.root))
                     self.assertEqual(event["protected"], {key: self.env[key] for key in PROTECTED})
@@ -247,7 +296,55 @@ class TestLib(unittest.TestCase):
                         self.assertFalse(event["held"], event)
                 self.assertEqual(self.events("test")[0]["arguments"],
                                  ["--exact", "module::one", "--test-threads", "2"])
+                self.assert_one_build_then_direct_harness()
                 self.assertFalse(self.held())
+
+    def test_disk_guard_refuses_before_compile_or_test_with_private_tools(self):
+        environment = self.disk_policy()
+        for size, free, floor, prune_exit in ((100, 4, 5, 0), (2000, 63, 64, 0), (100, 4, 5, 17)):
+            with self.subTest(size=size, free=free, floor=floor, prune_exit=prune_exit):
+                self.clear()
+                self.configure(size_gib=size, free_gib=free, prune_exit=prune_exit)
+                result = self.invoke("cli", "module::one", env=environment)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(f"below the {floor} GiB floor", result.stderr)
+                events = self.events()
+                self.assertEqual([event["phase"] for event in events], ["metadata", "disk", "prune", "disk"])
+                self.assertTrue(all(not event["held"] for event in events), events)
+                self.assertEqual(self.events("prune")[0]["arguments"],
+                                 ["--apply", "--orphan-grace", "0", "--max-idle", "36500"])
+                self.assertEqual(self.events("disk")[0]["arguments"], ["-Pk", "--", str(self.root)])
+                self.assertFalse(Path(str(self.lock) + ".queue").exists(), "guard must refuse before admission")
+                self.assert_no_test()
+                self.assertFalse(self.held())
+
+    def test_private_reclaim_can_allow_one_build_before_direct_tests(self):
+        environment = self.disk_policy()
+        self.configure(size_gib=100, free_gib=4, after_prune_free_gib=5)
+        result = self.invoke("cli", "module::one", env=environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("reclaiming removed worktrees", result.stderr)
+        self.assertNotIn("refusing to build", result.stderr)
+        self.assertEqual([event["phase"] for event in self.events()[:5]],
+                         ["metadata", "disk", "prune", "disk", "compiler"])
+        self.assertTrue(self.events("compiler")[0]["held"])
+        self.assert_one_build_then_direct_harness()
+
+    def test_failed_empty_or_target_only_metadata_bypasses_disk_guard(self):
+        environment = self.disk_policy()
+        for config in ({"metadata_exit": 37}, {"metadata_build_directory": ""},
+                       {"metadata_omit_build_directory": True}):
+            with self.subTest(config=config):
+                self.clear()
+                # The fake disk would refuse this build if the guard ran.
+                self.configure(size_gib=100, free_gib=0, **config)
+                result = self.invoke("cli", "module::one", env=environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.events("disk"), [])
+                self.assertEqual(self.events("prune"), [])
+                self.assertEqual([event["phase"] for event in self.events()[:2]], ["metadata", "compiler"])
+                self.assertTrue(self.events("compiler")[0]["held"])
+                self.assert_one_build_then_direct_harness()
 
     def test_artifact_must_be_unique_matching_absolute_and_runnable(self):
         for variant in ("missing", "duplicate", "wrong-manifest", "wrong-name", "wrong-kind",
@@ -260,7 +357,7 @@ class TestLib(unittest.TestCase):
                 result = self.invoke("cli", "module::one")
                 self.assertNotEqual(result.returncode, 0, result.stderr)
                 self.assertIn("test-lib:", result.stderr)
-                self.assertEqual(len(self.events()), 1)
+                self.assertEqual([event["phase"] for event in self.events()], ["metadata", "compiler"])
                 self.assert_no_test()
                 self.assertFalse(self.held())
 
@@ -344,7 +441,7 @@ class TestLib(unittest.TestCase):
         self.assertEqual(result.returncode, 41, result.stderr)
         for text in ("plain compiler output", "rendered warning", "compiler stderr"):
             self.assertIn(text, result.stderr)
-        self.assertEqual(len(self.events()), 1)
+        self.assertEqual([event["phase"] for event in self.events()], ["metadata", "compiler"])
         self.assert_no_test()
         self.assertFalse(self.held())
 
@@ -440,9 +537,10 @@ class TestLib(unittest.TestCase):
             process = self.start("cli", "module::one")
             # No descriptor is inherited: this is a legitimate independent
             # owner, not an enclosing lease that would deadlock the wrapper.
-            time.sleep(0.15)
+            self.wait_for(lambda: Path(str(self.lock) + ".queue").exists(), "metadata then queued admission")
             self.assertIsNone(process.poll())
-            self.assertEqual(self.events(), [])
+            self.assertEqual([event["phase"] for event in self.events()], ["metadata"])
+            self.assertTrue(self.events("metadata")[0]["held"], "the independent owner still holds admission")
             fcntl.flock(holder, fcntl.LOCK_UN)
             _stdout, stderr = process.communicate("", timeout=10)
         self.assertEqual(process.returncode, 0, stderr)
@@ -452,9 +550,10 @@ class TestLib(unittest.TestCase):
         with self.lock.open("a") as unlocked, self.lock.open("a") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX)
             process = self.start("cli", "module::one", pass_fds=(unlocked.fileno(),))
-            time.sleep(0.15)
+            self.wait_for(lambda: Path(str(self.lock) + ".queue").exists(), "metadata then queued admission")
             self.assertIsNone(process.poll(), "unlocked inherited fd falsely treated as its owner's lock")
-            self.assertEqual(self.events(), [])
+            self.assertEqual([event["phase"] for event in self.events()], ["metadata"])
+            self.assertTrue(self.events("metadata")[0]["held"], "the independent owner still holds admission")
             fcntl.flock(holder, fcntl.LOCK_UN)
             _stdout, stderr = process.communicate("", timeout=10)
         self.assertEqual(process.returncode, 0, stderr)

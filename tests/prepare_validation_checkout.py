@@ -654,6 +654,7 @@ class ScriptContractsApplicability(unittest.TestCase):
             f"Not applicable: {name} (source and fixture both absent at this head)"
             for name, _, _ in self.pairs
         ] + ["Not applicable: build directory seeding (source and fixture both absent at this head)",
+             "Not applicable: build disk guard and gate install (source and fixture both absent at this head)",
              "Not applicable: focused lib tests (source and fixture both absent at this head)"])
         self.assertEqual(self.calls(root), [])
         self.assertEqual(list(root.iterdir()), [])
@@ -666,6 +667,7 @@ class ScriptContractsApplicability(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [f"Checking: {name}" for name, _, _ in self.pairs]
                          + ["Not applicable: build directory seeding (source and fixture both absent at this head)",
+             "Not applicable: build disk guard and gate install (source and fixture both absent at this head)",
              "Not applicable: focused lib tests (source and fixture both absent at this head)"])
         self.assertEqual(self.calls(root), self.expected_calls(0, 1))
 
