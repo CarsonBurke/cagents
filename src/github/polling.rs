@@ -93,6 +93,12 @@ pub fn rate_limit(host: &str) -> Option<RateLimit> {
 }
 
 pub fn failed(host: &str, error: &GitHubError) {
+    // Cancelling superseded work (a new query, a closed view) says nothing
+    // about the host's health.
+    if matches!(error, GitHubError::Process(failure) if failure.kind == ProcessFailureKind::Cancelled)
+    {
+        return;
+    }
     let mut budgets = BUDGETS.lock().unwrap_or_else(|e| e.into_inner());
     let budget = budgets.entry(host.to_ascii_lowercase()).or_default();
     budget.failures = budget.failures.saturating_add(1);
@@ -181,5 +187,61 @@ mod tests {
         succeeded(host);
         assert!(!ready(host, false));
         BUDGETS.lock().unwrap().remove(host);
+    }
+
+    #[test]
+    fn cancelled_work_does_not_back_off_the_host() {
+        let host = "polling-cancel.invalid";
+        for _ in 0..3 {
+            failed(
+                host,
+                &GitHubError::Process(ProcessFailure {
+                    kind: ProcessFailureKind::Cancelled,
+                    program: "gh".into(),
+                    exit_code: None,
+                    signal: None,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    message: "cancelled".into(),
+                    started: true,
+                }),
+            );
+        }
+        assert!(ready(host, false));
+        assert!(!BUDGETS.lock().unwrap().contains_key(host));
+    }
+
+    #[test]
+    fn any_completed_request_clears_a_transient_backoff() {
+        struct Healthy;
+        impl ProcessExecutor for Healthy {
+            fn execute(
+                &self,
+                _: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                Ok(ProcessOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    signal: None,
+                    stdout: br#"{"data":{"viewer":{"login":"octo"}}}"#.to_vec(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+        let repository =
+            GitHubRepoKey::new("polling-recover.invalid", None, "owner", "repo").unwrap();
+        failed(&repository.host, &GitHubError::Inspection("offline".into()));
+        assert!(!ready(&repository.host, false));
+        // A surface other than the one that backed off completes a request.
+        GitHubService::new("gh", Arc::new(Healthy))
+            .graphql(
+                &repository,
+                "query{viewer{login}}",
+                Vec::new(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(ready(&repository.host, false));
     }
 }

@@ -2204,10 +2204,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .execute(command, cancellation)
             .map_err(GitHubError::from)
             .and_then(|output| self.checked_output(output, repository));
-        if let Err(error) = &result {
-            polling::failed(&repository.host, error);
-        }
-        result
+        charge_host(repository, result)
     }
 
     fn checked_output(
@@ -3088,6 +3085,19 @@ fn decode_value<T: DeserializeOwned>(value: &serde_json::Value) -> Result<T, Git
     T::deserialize(value).map_err(|error| {
         GitHubError::Inspection(format!("Invalid GitHub conversation response: {error}"))
     })
+}
+
+/// Every gh call shares the host budget, so any completed request is evidence
+/// the host recovered, not only the surface that backed off.
+fn charge_host<T>(
+    repository: &GitHubRepoKey,
+    result: Result<T, GitHubError>,
+) -> Result<T, GitHubError> {
+    match &result {
+        Ok(_) => polling::succeeded(&repository.host),
+        Err(error) => polling::failed(&repository.host, error),
+    }
+    result
 }
 
 fn parse_graphql(output: &[u8]) -> Result<serde_json::Value, GitHubError> {
