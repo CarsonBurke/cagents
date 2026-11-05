@@ -326,8 +326,11 @@ implementation alone does not establish native hotpatch acceptance.
 
 ### Sharing a host between several checkouts
 
-When several agents build on one host, run Cargo through the build gate
-rather than a single global lock:
+Rust compiles on the [build host](#building-on-another-host); this section
+describes how the gate admits builds on the host that compiles, whether that is
+the build host itself or this one with `CAGENTS_BUILD_REMOTE=local`. When
+several agents build on one host, run Cargo through the build gate rather than
+a single global lock:
 
 ```sh
 scripts/cargo-gate check --locked --no-default-features --features ui --bin cagents-ui
@@ -384,9 +387,11 @@ admission timeout. Commands already inside a held slot still run directly.
 
 To gate a script that runs several Cargo commands, replace
 `flock /var/tmp/cagents-cargo.lock COMMAND` with
-`scripts/cargo-gate exec COMMAND`. It holds one slot until the command exits,
-and gated commands inside it run in that slot. Gating each Cargo command
-instead keeps test runs out of the slot.
+`scripts/cargo-gate exec COMMAND`. Where Rust compiles on [another
+host](#building-on-another-host), each Cargo command in it goes there on its
+own. Building here, it holds one slot until the command exits, and gated
+commands inside it run in that slot; gating each Cargo command instead keeps
+test runs out of the slot.
 
 Cancelling a held command keeps its slot until the command and its descendants
 have exited. The Linux Python 3 supervisor sends TERM, allows the command one
@@ -412,38 +417,70 @@ a cold check took 35 s for the CLI, 53 s for the host, 62 s for the UI and
 
 ### Building on another host
 
-`scripts/cargo-gate` runs `build`, `check`, `clippy`, `test` and `doc` on the
-build host named by `CAGENTS_BUILD_REMOTE` (default `fw16`, reached with
-`ssh`), through `scripts/cargo-offload`, without taking a slot here. The host
-has a few build slots under `~/.cache/cagents-offload/<repository>/slot-N`
-(`CAGENTS_BUILD_REMOTE_SLOTS`, default 3), each with its own checkout and
-target directory, and Cargo runs there with `CAGENTS_BUILD_REMOTE_JOBS` jobs
-(default 6). A build copies the checkout's tracked and untracked, not ignored,
-files into a free slot and removes the slot's other files. It prefers the slot
-this worktree used last, then one another worktree has built in. A slot's
-checkout path never changes, so a worktree reuses what any other built in that
-slot and recompiles only what differs. Output streams back and the exit status
-is Cargo's; cancelling the gate ends the command's processes on the host
-before the slot is free again. `build` then copies the executables Cargo
-reported into this checkout's target directory, where `scripts/run-development`
-and other callers expect them, and `doc` copies `target/doc` back. The version
-stamp is worked out here and passed as `CAGENTS_BUILD_METADATA`, since the
-host's copy has no Git history. `CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS`
-bounds the wait for a slot on the host as it does one here; the build there
-has no timeout.
+Rust compiles on the build host named by `CAGENTS_BUILD_REMOTE` (default
+`fw16`, reached with `ssh`), never here: `scripts/cargo-gate` sends every Cargo
+command that compiles there through `scripts/cargo-offload`, without taking a
+slot here. Commands that compile nothing, such as `metadata`, `tree` or
+`clean`, run here at once. Under `scripts/cargo-gate exec COMMAND`, a `cargo`
+first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
+script of builds, such as the development runner or
+`scripts/build-ceditor-product`, builds there too. On the build host itself,
+or with `CAGENTS_BUILD_REMOTE=local`, commands build here through the local
+slots above.
 
-The command runs here instead, after one line saying why, when the host is
-unreachable (it is not tried again for a minute), does not answer within
-`CAGENTS_BUILD_REMOTE_ANSWER_SECONDS` (default 30), has less than
+The host has a few build slots under
+`~/.cache/cagents-offload/<repository>/slot-N` (`CAGENTS_BUILD_REMOTE_SLOTS`,
+default 3), each with its own checkout and target directory, and Cargo runs
+there with `CAGENTS_BUILD_REMOTE_JOBS` jobs (default 6). A build copies the
+checkout's tracked and untracked, not ignored, files into a free slot and
+removes the slot's other files. It prefers the slot this worktree used last,
+then one another worktree has built in. A slot's checkout path never changes,
+so a worktree reuses what any other built in that slot and recompiles only
+what differs. A slot is admitted as the gate admits builds here: beside other
+running builds, only when the host's available memory, less what those builds
+are expected to take beyond what they already hold, covers this build's
+expected peak, and while the host's memory pressure (`some avg10` in
+`/proc/pressure/memory`) is below 10%; a lone build always starts. One build's
+steps share one ssh connection, which ends with it. Output streams back and
+the exit status is Cargo's; cancelling the gate ends the command's processes
+on the host before the slot is free again. Commands there run without core
+dumps, which the host's `systemd-coredump` would otherwise store; set
+`CAGENTS_BUILD_REMOTE_CORE_DUMPS=1` to keep them.
+
+What callers here use comes back. `build`, `rustc`, `run`, and `test` or
+`bench` with `--no-run` copy the executables Cargo reported to where Cargo here
+would have put them: its target directory, or, for test harnesses, its build
+directory. Cargo's JSON messages (`--message-format=json...`) name this host's
+paths. `run` builds there and runs the program here, with Cargo's `CARGO_*`
+settings. `doc` copies `target/doc` back, per `--target`, and `--open` opens it
+here. `--timings` copies the report back. `fix` and `clippy --fix` apply their
+fixes here, to the files they changed there, after the same uncommitted-change
+checks Cargo makes. Path options inside the checkout, such as
+`--manifest-path`, `--target-dir` and `--artifact-dir`, are translated, and a
+`CAGENTS_` setting naming a file in the checkout or its target, such as
+`CAGENTS_TEST_RETAINED_ACTOR_HELPER`, names the host's copy of it there; a
+path outside the checkout is refused with status 78, as are commands that
+cannot run there faithfully, each saying why and naming
+`CAGENTS_BUILD_REMOTE=local`. The version stamp is worked out here and passed
+as `CAGENTS_BUILD_METADATA`, since the host's copy has no Git history.
+
+While the host is unreachable, does not answer within
+`CAGENTS_BUILD_REMOTE_ANSWER_SECONDS` (default 30), or has less than
 `CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB` free (default 40; it first discards the
-leased slot's own build output), or the command's inputs or results are on
-this host: `run`, `bench`, `test --no-run`, `doc --open`, `doc --target`,
-`build --message-format`, `--fix`, `--timings`, options naming paths or
-configuration such as `--manifest-path`, `--target-dir`, `--config` and `-Z`,
-or a `CAGENTS_` setting naming a path, such as
-`CAGENTS_TEST_RETAINED_ACTOR_HELPER` for the HOST tests that execute retained
-actors. Commands under `cargo-gate exec` also build here. Set
-`CAGENTS_BUILD_REMOTE=local` to build here always.
+leased slot's own build output), the command waits and tries again every
+`CAGENTS_BUILD_REMOTE_RETRY_SECONDS` (default 15), saying why once and then
+once a minute. It never builds here instead. `CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS`
+bounds that wait, and the wait for a slot there, as it does a wait here; on
+expiry the command exits 124 naming the cause. The build there has no
+timeout. Set `CAGENTS_BUILD_REMOTE=local` to build here.
+
+A checkout's gate defers to the installed one, `/var/tmp/cagents-cargo-gate`
+(`CAGENTS_BUILD_INSTALLED_GATE`; empty disables this), when the installed
+`gate_version` is newer, so a worktree that has fallen behind `main` still
+builds the way `main` does. Raise `gate_version` in `scripts/cargo-gate` with
+any change to the gate or its helpers, and install it with
+`scripts/install-cargo-gate`, which refuses to install an older version over
+a newer one.
 
 Only settings that change what Cargo, rustc or the tests do reach the host:
 `RUST_*`, `RUSTFLAGS`, `RUSTDOCFLAGS`, `CARGO_TERM_*`, `CARGO_PROFILE_*`,
@@ -464,8 +501,7 @@ deliberately refuses any enclosing `.git`, and fixtures refuse roots inside
 the home directory. The runtime directory exists while the host has a login
 session for the user, which the connection itself provides; without one,
 temporary files fall back to the slot, and `test` stops with status 78 if a
-marker is above it. HOST tests that execute retained actors still run here,
-since `CAGENTS_TEST_RETAINED_ACTOR_HELPER` names a file on this host. While a
+marker is above it. While a
 `.git` sits in any of its ancestors on the host, `test` stops with status 78
 and names it, since fixtures that check Git ancestry fail under one and
 building here instead would hide the leak; remove the marker, or set
