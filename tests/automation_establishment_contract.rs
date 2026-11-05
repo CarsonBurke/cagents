@@ -6,6 +6,16 @@
 //! delegation remain unchanged. Only the child's XDG directories, provider
 //! homes and PATH are fixture-owned. This exercises the User protocol fixture,
 //! not production CLI admission, because no CLI command is invoked.
+//!
+//! Ignored by default because admission requires an actual ordinary User
+//! terminal created by the native app. From that terminal, explicitly run:
+//!
+//! ```sh
+//! cargo test --locked --no-default-features --features host \
+//!     --test automation_establishment_contract -- --ignored --exact \
+//!     failed_first_reuse_start_releases_and_new_firings_establish_then_reuse_one_provider \
+//!     --nocapture --test-threads=1
+//! ```
 #[path = "support/precheck_receipt_guardian.rs"]
 #[allow(dead_code)]
 mod guardian;
@@ -733,6 +743,7 @@ fn unexpected_fixture_actor(stage: &str, _root: &std::path::Path) {
 }
 
 #[test]
+#[ignore = "requires an actual ordinary User terminal; see module documentation"]
 fn failed_first_reuse_start_releases_and_new_firings_establish_then_reuse_one_provider() {
     let authority = Authority::from_environment();
     assert_eq!(
