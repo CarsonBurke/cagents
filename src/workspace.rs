@@ -610,6 +610,7 @@ impl ViewportUpdate {
 pub struct ViewportAnchor {
     position: Option<ViewportPoint>,
     destination: Option<ViewportPoint>,
+    destination_reveals_focus: bool,
     camera: Camera,
 }
 
@@ -1216,6 +1217,18 @@ impl Workspace {
     /// active camera destination follows its intended pane in target geometry;
     /// the current position follows the visible pane in presentation geometry.
     pub fn capture_viewport_anchor(&self) -> ViewportAnchor {
+        let destination = self
+            .camera
+            .is_animating()
+            .then(|| {
+                ViewportPoint::capture(
+                    &self.geometry,
+                    self.camera.target(),
+                    self.viewport_width,
+                    self.focused,
+                )
+            })
+            .flatten();
         ViewportAnchor {
             position: ViewportPoint::capture(
                 self.presentation_geometry(),
@@ -1223,18 +1236,9 @@ impl Workspace {
                 self.viewport_width,
                 None,
             ),
-            destination: self
-                .camera
-                .is_animating()
-                .then(|| {
-                    ViewportPoint::capture(
-                        &self.geometry,
-                        self.camera.target(),
-                        self.viewport_width,
-                        self.focused,
-                    )
-                })
-                .flatten(),
+            destination,
+            destination_reveals_focus: destination
+                .is_some_and(|point| Some(point.card.id) == self.focused),
             camera: self.camera,
         }
     }
@@ -1249,9 +1253,18 @@ impl Workspace {
             .position
             .and_then(|point| point.resolve(self.presentation_geometry()));
         let destination = if anchor.camera.is_animating() {
-            anchor
-                .destination
-                .and_then(|point| point.resolve(&self.geometry))
+            anchor.destination.and_then(|point| {
+                let target = point.resolve(&self.geometry)?;
+                if anchor.destination_reveals_focus {
+                    // A navigation destination reveals its selected pane.
+                    // Scaling a negative reading fraction after that pane
+                    // grows can otherwise leave most of it offscreen.
+                    self.geometry
+                        .focus_offset(point.card.id, self.viewport_width, target)
+                } else {
+                    Some(target)
+                }
+            })
         } else {
             position
         };
@@ -1964,6 +1977,43 @@ mod tests {
             assert_eq!(workspace.pending_widget_focus, None);
             workspace.tick(Duration::from_millis(16));
             assert!(workspace.camera().offset() > before.offset() + offset_shift);
+        }
+    }
+
+    #[test]
+    fn a_resized_navigation_destination_still_reveals_its_selected_pane() {
+        for fraction in [1.0, 0.4] {
+            let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.6); 4], 500.0);
+            let destination = workspace.order().last().unwrap();
+            workspace.focus(destination).unwrap();
+            workspace.tick(Duration::from_millis(16));
+            workspace.take_widget_focus_request();
+            let before = workspace.camera();
+            assert_eq!(before.target(), 700.0);
+            let anchor = workspace.capture_viewport_anchor();
+            workspace
+                .set_card_width(destination, CardWidth::Fraction(fraction))
+                .unwrap();
+
+            workspace.restore_viewport_anchor(anchor);
+            let pane = workspace.geometry().card(destination).unwrap();
+            assert_eq!(workspace.camera().offset(), before.offset());
+            assert_eq!(workspace.camera().velocity(), before.velocity());
+            assert_eq!(workspace.pending_widget_focus, None);
+            let target = workspace.camera().target();
+            assert!(pane.start >= target && pane.end <= target + 500.0);
+            if fraction == 1.0 {
+                assert_eq!(target, 900.0);
+            }
+            for _ in 0..600 {
+                if !workspace.camera().is_animating() {
+                    break;
+                }
+                workspace.tick(Duration::from_millis(16));
+            }
+            assert!(!workspace.camera().is_animating());
+            assert!(pane.start >= workspace.camera().offset());
+            assert!(pane.end <= workspace.camera().offset() + 500.0);
         }
     }
 
