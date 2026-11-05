@@ -238,6 +238,11 @@ impl Cagents {
             return self.reconcile_workspace_model();
         };
         let mut retry = None;
+        // Another client may have published the very change refused here,
+        // as when two windows report the same conversation from the daemon.
+        // Nothing the reader asked for was lost then.
+        let mut satisfied = false;
+        let mut differing = Vec::new();
         if let Change::Update { before, pane } = &change
             && before.id == pane.id
             && self
@@ -262,6 +267,21 @@ impl Cagents {
                     .iter()
                     .find(|current| current.id == pane.id)
                     .unwrap();
+                satisfied = Pane {
+                    title: current.title.clone(),
+                    user_title: current.user_title.clone(),
+                    width_fraction: current.width_fraction,
+                    ..pane.clone()
+                } == *current;
+                if pane.kind != current.kind {
+                    differing.push("kind");
+                }
+                if pane.scope != current.scope {
+                    differing.push("scope");
+                }
+                if pane.pending_terminal_start != current.pending_terminal_start {
+                    differing.push("pending start");
+                }
                 let mut presentation = current.clone();
                 let later = &self.shared_views.pending[index + 1..];
                 let superseded = |field: fn(&Pane, &Pane) -> bool| {
@@ -296,7 +316,11 @@ impl Cagents {
                 }
             }
         }
-        tracing::warn!(?scope, %operation, %error, "refused source-sensitive pane intent; host applied no fields");
+        if satisfied {
+            tracing::debug!(?scope, %operation, "a refused pane update was already in the shared view");
+        } else {
+            tracing::warn!(?scope, %operation, %error, ?differing, "refused source-sensitive pane intent; host applied no fields");
+        }
         self.shared_views.pending.remove(index);
         let source_basis = self.shared_views.source_bases.remove(&operation);
         if let Some((operation, scope, revision, change)) = retry {
@@ -315,9 +339,11 @@ impl Cagents {
                 change,
             });
         }
-        self.notices.record(TransientNotice::warning(
-            "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
-        ));
+        if !satisfied {
+            self.notices.record(TransientNotice::warning(
+                "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
+            ));
+        }
         self.reconcile_workspace_model()
     }
 
@@ -3195,6 +3221,7 @@ mod tests {
             "foreign-watch-first",
             "uncaptured",
             "later-title",
+            "already-published",
         ] {
             let (mut app, source, _, before) = channel_move_fixture();
             let (tx, rx) = async_channel::unbounded();
@@ -3243,6 +3270,13 @@ mod tests {
             };
             browser.current_url = "https://authoritative.example".parse().unwrap();
             current.scope = Some("/authoritative-source".into());
+            if control == "already-published" {
+                // Another client published the same session first, as two
+                // windows attached to one conversation both do.
+                current.kind = desired.kind.clone();
+                current.scope = desired.scope.clone();
+                current.pending_terminal_start = desired.pending_terminal_start;
+            }
             let expected = current.clone();
             if control == "missing" {
                 model.views[0].panes.clear();
@@ -3276,10 +3310,12 @@ mod tests {
                     .iter()
                     .any(|(id, _, _)| *id == operation)
             );
-            assert!(
+            assert_eq!(
                 app.notices
                     .recent()
-                    .any(|entry| entry.notice.message.contains("session update was refused"))
+                    .any(|entry| entry.notice.message.contains("session update was refused")),
+                control != "already-published",
+                "{control}: a refusal warns only when the session intent was lost"
             );
             if matches!(
                 control,
