@@ -1591,11 +1591,7 @@ impl Cagents {
         else {
             return "another channel".to_owned();
         };
-        let project = self
-            .sidebar_model
-            .projects
-            .iter()
-            .find(|project| project.id == channel.project_id);
+        let project = self.sidebar_model.project(channel.project_id);
         format!(
             "\u{201c}{}\u{201d}",
             super::channel_ui::channel_display_title(channel, project)

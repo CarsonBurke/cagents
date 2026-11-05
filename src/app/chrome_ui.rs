@@ -2814,6 +2814,25 @@ impl Cagents {
 
     fn channel_home_bar(&self) -> Option<Element<'_, Message>> {
         let (home, title) = self.channel_home()?;
+        // A channel its first prompt has not named reads as the sidebar labels it.
+        let title = if title.is_empty() {
+            self.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == home.channel)
+                .map_or_else(
+                    || "New channel".to_owned(),
+                    |channel| {
+                        super::channel_ui::channel_display_title(
+                            channel,
+                            self.sidebar_model.project(channel.project_id),
+                        )
+                        .into_owned()
+                    },
+                )
+        } else {
+            title
+        };
         let generation = self.channel_home_generation();
         let workspace = self.workspace_view_generation;
         let work = self.channel_work_is_main();
@@ -2850,13 +2869,7 @@ impl Cagents {
             .align_y(Alignment::Center);
         let identity = widget::column::with_children(vec![
             design::caption("CHANNEL").into(),
-            design::heading(if title.is_empty() {
-                "Untitled channel".to_owned()
-            } else {
-                title
-            })
-            .width(Length::Fill)
-            .into(),
+            design::heading(title).width(Length::Fill).into(),
         ])
         .spacing(space::XXS)
         .width(Length::Fill);
