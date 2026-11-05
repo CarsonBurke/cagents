@@ -2393,7 +2393,7 @@ mod tests {
                 mouse::Cursor::Unavailable,
             );
             let after = renderer.screenshot(Size::new(400, 120), 1.0, iced::Color::WHITE);
-            let accent = design::accent_color(&cosmic::theme::active()).into_rgba8();
+            let accent = design::selection_wash(&cosmic::theme::active()).into_rgba8();
             let painted = |pixels: &[u8], bounds: Rectangle| {
                 let y = (bounds.y + 1.0) as usize;
                 (bounds.x.ceil() as usize..(bounds.x + bounds.width).floor() as usize).any(|x| {
@@ -2504,7 +2504,7 @@ mod tests {
                 &viewport,
             );
             let pixels = renderer.screenshot(Size::new(600, 1400), 1.0, iced::Color::WHITE);
-            let selected = design::accent_color(&cosmic::theme::active()).into_rgba8();
+            let selected = design::selection_wash(&cosmic::theme::active()).into_rgba8();
             for block in &read.blocks {
                 let y = (block.bounds.y + 1.0) as usize;
                 let painted = (block.bounds.x.ceil() as usize
