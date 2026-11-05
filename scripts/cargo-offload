@@ -217,12 +217,14 @@ def say(*words):
 
 def temporary_directory(slot):
     """A short private directory for the slot's temporary files, or one in
-    the slot when another user holds the short one's name. Tests bind Unix
-    sockets several levels under it, within 108 bytes, so the HOST fixtures
-    want a base of at most 28 bytes (docs/development.md)."""
+    the slot when the short one is unsafe. Tests bind Unix sockets several
+    levels under it, within 108 bytes, so the HOST fixtures want a base of at
+    most 28 bytes (docs/development.md). It is in the home directory because
+    agent sandboxes leave `.git` placeholders in /tmp, /var/tmp and ~/.cache,
+    and recovery placement refuses any enclosing `.git` by design."""
     # The variable is for tests standing in for the build host; ssh does not
     # pass it on.
-    private = os.environ.get("CAGENTS_OFFLOAD_TEMPORARY_ROOT") or f"/var/tmp/cof-{os.getuid()}"
+    private = os.environ.get("CAGENTS_OFFLOAD_TEMPORARY_ROOT") or os.path.expanduser("~/.cof")
     try:
         os.mkdir(private, 0o700)
     except FileExistsError:
