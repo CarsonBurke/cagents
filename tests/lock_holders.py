@@ -92,8 +92,9 @@ class LockHolders(unittest.TestCase):
         self.assertIn(f"holder {holder.pid} flock", report)
         self.assertIn("idle", report)
         self.assertNotIn("isn't a recognized", report)
-        self.assertIn("note: nothing holding this used CPU", report)
-        self.assertNotIn("leftover", report)
+        self.assertIn("note: nothing holding this used CPU during the one-second sample", report)
+        self.assertIn("Run this again", report)
+        self.assertNotIn("leftover", self.notes(report))
 
     def test_a_leftover_that_inherited_the_lock_is_named_and_left_running(self):
         pid_file = self.root / "daemon"
@@ -106,17 +107,29 @@ class LockHolders(unittest.TestCase):
         self.assertTrue(self.holds(), "the fixture must reproduce the inherited lock")
         report = self.report()
         self.assertIn(f"holder {daemon} sleep", report)
-        self.assertIn("isn't a recognized build or session", report)
-        self.assertIn("idle during the sample", report)
-        self.assertIn("could have inherited the lock", report)
+        notes = self.notes(report)
+        self.assertIn("no holder is a recognized build or session", notes)
+        self.assertIn("idle during the sample", notes)
+        self.assertIn("could have inherited the lock", notes)
         # It can't tell this from a script between its own steps, so never concludes.
-        self.assertIn("this can't tell which", report)
-        self.assertIn("Everyone queued waits", report)
-        self.assertIn("ask its owner", report)
+        self.assertIn("this can't tell which", notes)
+        self.assertIn("Everyone queued waits until every holder releases it", notes)
+        self.assertIn("commands and directories above", notes)
+        self.assertIn("ask the owner", notes)
         self.assertNotIn("took this lock", report)
-        self.assertNotRegex(report, "(?i)kill|probably|leftover|WARNING")
+        self.assertNotRegex(notes, "(?i)kill|probably|leftover|WARNING")
         os.kill(daemon, 0)
         self.assertTrue(self.holds())
+
+    def test_the_help_does_not_present_process_age_as_hold_time(self):
+        output = subprocess.run([sys.executable, "-I", "-B", str(TOOL), "--help"],
+                                capture_output=True, text=True, check=True).stdout
+        self.assertIn("Process age isn't hold time", output)
+
+    @staticmethod
+    def notes(report):
+        """Only what the tool says: a holder's directory could contain any word."""
+        return "\n".join(line for line in report.splitlines() if line.startswith("  note:"))
 
     def python_holder(self, body):
         """An unrecognized holder that takes the lock itself, then runs BODY."""
@@ -137,15 +150,36 @@ class LockHolders(unittest.TestCase):
             rf"holder {holder.pid} .*process age \d+:\d\d:\d\d, so it took this lock at most "
             "that long ago",
         )
-        self.assertIn("idle during the sample. It took this lock itself.", report)
-        self.assertNotIn("inherited", report)
-        self.assertNotRegex(report, "(?i)kill|leftover")
+        notes = self.notes(report)
+        self.assertIn("idle during the sample. The holder took this lock itself.", notes)
+        self.assertNotIn("inherited", notes)
+        self.assertNotRegex(notes, "(?i)kill|leftover")
+
+    def test_a_taker_does_not_speak_for_a_holder_that_inherited_from_it(self):
+        pid_file = self.root / "child"
+        taker = self.python_holder(f"""
+            child = os.fork()
+            if child == 0:
+                open({str(pid_file)!r}, "w").write(str(os.getpid()))
+                time.sleep(60)
+                os._exit(0)
+            time.sleep(60)
+        """)
+        self.wait_for(lambda: pid_file.exists() and pid_file.read_text(), "child")
+        child = int(pid_file.read_text())
+        self.pids.append(child)
+        report = self.report()
+        self.assertRegex(report, rf"holder {taker.pid} .*at most that long ago")
+        self.assertNotRegex(report, rf"holder {child} .*at most that long ago")
+        notes = self.notes(report)
+        self.assertIn(f"{taker.pid} took this lock; another holder could have inherited it", notes)
+        self.assertNotIn("The holder took this lock itself", notes)
 
     def test_a_busy_unrecognized_holder_is_said_to_be_busy(self):
         self.python_holder("while True: pass")
         self.wait_for(self.holds, "holder")
         report = self.report()
-        self.assertIn("isn't a recognized build or session, and it was busy during the sample", report)
+        self.assertIn("no holder is a recognized build or session, and they were busy during", report)
 
     def test_a_running_locker_that_handed_the_lock_on_is_not_said_to_hold_it(self):
         # The parent took the lock, gave its descriptor to a child and closed its own.
@@ -159,11 +193,10 @@ class LockHolders(unittest.TestCase):
             lock.close()
             time.sleep(60)
         """)
-        self.wait_for(pid_file.exists, "child")
-        self.wait_for(lambda: pid_file.read_text(), "child's pid")
+        self.wait_for(lambda: pid_file.exists() and pid_file.read_text(), "child")
         child = int(pid_file.read_text())
         self.pids.append(child)
-        self.wait_for(lambda: self.report().count("holder ") == 1, "the parent letting go")
+        self.wait_for(lambda: self.report().count("  holder ") == 1, "the parent letting go")
         report = self.report()
         self.assertIn(f"holder {child} ", report)
         self.assertNotIn("took this lock", report)
@@ -177,8 +210,9 @@ class LockHolders(unittest.TestCase):
         report = self.report()
         self.assertIn(f"holder {shell.pid} ", report)
         self.assertNotIn("took this lock", report)
-        self.assertIn("this can't tell which", report)
-        self.assertNotRegex(report, "(?i)kill|leftover")
+        notes = self.notes(report)
+        self.assertIn("this can't tell which", notes)
+        self.assertNotRegex(notes, "(?i)kill|leftover")
 
     def test_a_holders_figure_is_labeled_as_its_process_age(self):
         self.start("flock", str(self.lock), "sleep", "60")

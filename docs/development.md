@@ -409,8 +409,8 @@ owner can say. Nor does a recognized name clear one: a leftover that looks like 
 build gets at most the idle note, so read the holders it lists. Process age isn't
 hold time: a process can start long before it takes a lock, or after the lock was
 taken if it inherited it. The kernel doesn't record when a lock was taken, but a
-holder that took the lock itself is marked, and took it at most its age ago. It only
-reads `/proc`, so ending a process stays your decision.
+holder that took the lock itself is marked, and took it at most its age ago. The tool
+only reads `/proc`, so ending a process stays your decision.
 
 The feature lanes coexist in one build directory: a no-op check of one lane
 stays a no-op after building the others. With a per-checkout build directory,

@@ -50,7 +50,7 @@ def stat_fields(pid):
 def scan(paths):
     """Who holds or awaits these files, from every process's descriptors and /proc/locks."""
     blocked = {(pid, inode) for pid, inode, waiting in lock_records() if waiting}
-    holders, waiters = {}, {}
+    holders, waiters, takers = {}, {}, {}
     for pid in processes():
         directory = f"/proc/{pid}/fd"
         try:
@@ -69,12 +69,16 @@ def scan(paths):
             info = read(f"/proc/{pid}/fdinfo/{descriptor}") or ""
             # The kernel lists a lock under each descriptor sharing it, so this
             # finds a holder that inherited the lock from one long gone.
-            if any(l.startswith("lock:") and "FLOCK" in l for l in info.splitlines()):
+            locks = [l.split() for l in info.splitlines() if l.startswith("lock:") and "FLOCK" in l]
+            if locks:
                 holders.setdefault(target, set()).add(pid)
+                # Each line names the process that took the lock.
+                if any(len(fields) > 5 and fields[5] == str(pid) for fields in locks):
+                    takers.setdefault(target, set()).add(pid)
             # A stopped waiter gives up its request until it continues.
             elif (pid, inode) in blocked or read(f"/proc/{pid}/wchan") == "do_signal_stop":
                 waiters.setdefault(target, set()).add(pid)
-    return holders, waiters
+    return holders, waiters, takers
 
 
 def lock_records():
@@ -176,14 +180,8 @@ def main(arguments):
         print("a lock was taken.")
         return 0
     locks = arguments or default_locks()
-    holders, waiters = scan({os.path.realpath(lock) for lock in locks})
+    holders, waiters, takers = scan({os.path.realpath(lock) for lock in locks})
     recorded = hidden_lockers()
-    # The pid that took each lock. An inode number alone can match another file, so
-    # these only count for a process already found holding this lock.
-    takers = {}
-    for pid, inode, waiting in lock_records():
-        if not waiting:
-            takers.setdefault(inode, set()).add(pid)
     before, _ = cpu_ticks()
     time.sleep(SAMPLE_SECONDS)
     after, parents = cpu_ticks()
@@ -192,8 +190,7 @@ def main(arguments):
         held = {pid for pid in holders.get(path, set()) if stat_fields(pid)}
         waiting = waiters.get(path, set())
         try:
-            inode = os.stat(path).st_ino
-            hidden = recorded.get(inode) if not held else None
+            hidden = recorded.get(os.stat(path).st_ino) if not held else None
         except OSError:
             print(f"{lock}: does not exist")
             continue
@@ -201,7 +198,7 @@ def main(arguments):
             print(f"{lock}: free")
             continue
         print(f"{lock}:")
-        took_it = held & takers.get(inode, set())
+        took_it = held & takers.get(path, set())
         for pid in sorted(held):
             print(f"  holder {describe(pid, before, after, parents, pid in took_it)}")
         if hidden:
@@ -211,16 +208,23 @@ def main(arguments):
         if held and not any(looks_legitimate(p) for p in family):
             # A taker that has gone proves nothing: `exec 9>LOCK; flock 9` leaves a
             # healthy shell holding the lock of a process that has exited.
-            origin = (
-                "It took this lock itself" if took_it else
-                "It could be between steps of its own, or could have inherited the lock from "
-                "another process; this can't tell which"
-            )
+            if held == took_it and len(held) == 1:
+                origin = "The holder took this lock itself."
+            elif took_it:
+                origin = (
+                    f"{' and '.join(map(str, sorted(took_it)))} took this lock; another holder "
+                    "could have inherited it, and would keep it after they exit."
+                )
+            else:
+                origin = (
+                    "A holder could be a script working through its own steps, or could have "
+                    "inherited the lock from another process; this can't tell which."
+                )
             print(
-                f"  note: this isn't a recognized build or session, and it was "
-                f"{'idle' if idle else 'busy'} during the sample. {origin}. Everyone queued "
-                "waits until it releases the lock. Its command and directory above show whose "
-                "it may be; ask its owner before acting on it."
+                f"  note: no holder is a recognized build or session, and they were "
+                f"{'idle' if idle else 'busy'} during the sample. {origin} Everyone queued "
+                "waits until every holder releases it. The commands and directories above show "
+                "whose it may be; ask the owner before acting on it."
             )
         # The head of a gate's queue is idle by design while it waits for a slot.
         elif held and idle and not lock.endswith(".queue"):
