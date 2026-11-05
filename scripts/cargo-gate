@@ -213,38 +213,46 @@ release() {
     exec 9>&-
 }
 
-# Runs a shell function while this shell holds the slot. Descriptors 8 and 9
+# Runs a command while this shell holds the slot. Descriptors 8 and 9
 # stay here, so a lingering child such as a compiler cache server cannot keep
-# the slot; a signal to the gate reaches the command, and the slot is released
-# only once it has exited. CAGENTS_BUILD_SLOT_HELD names this gate, so gated
-# commands inside run in its slot only while it is still running. An
-# asynchronous command starts with SIGINT and SIGQUIT ignored; restore them so
-# an interrupted command and its children stop.
+# the slot. On cancellation the supervisor drains the command's descendants
+# before returning. CAGENTS_BUILD_SLOT_HELD names this gate, so nested commands
+# use its slot. A private receipt forwards signals without signalling a helper
+# PID that wait might just have reaped; the helper also handles direct signals.
 held() {
-    (
-        trap - INT QUIT
-        CAGENTS_BUILD_SLOT_HELD=$$
-        export CAGENTS_BUILD_SLOT_HELD
-        "$@"
-    ) 0<&0 8>&- 9>&- &
+    command_state=$(mktemp -d "${TMPDIR:-/tmp}/cagents-cargo-command.XXXXXXXX") || return "$?"
+    cancelled=0
+    interrupted=false
+    trap 'interrupt 2' INT
+    trap 'interrupt 15' TERM
+    trap 'interrupt 1' HUP
+    trap 'interrupt 3' QUIT
+    # POSIX shells may replace async stdin with /dev/null before applying
+    # redirections. Save the caller's stdin on the now-free queue descriptor.
+    exec 8<&0
+    CAGENTS_BUILD_SLOT_HELD=$$ python3 "$(dirname "$0")/cargo-gate-command.py" \
+        "$command_state/cancelled" "$@" 0<&8 8>&- 9>&- &
     child=$!
-    trap 'kill -s TERM "$child" 2>/dev/null' INT TERM HUP
+    exec 8<&-
     status=0
-    wait "$child" || status=$?
-    while kill -0 "$child" 2>/dev/null; do
+    while :; do
+        interrupted=false
         status=0
         wait "$child" || status=$?
+        [ "$interrupted" = true ] || break
     done
-    trap - INT TERM HUP
+    trap - INT TERM HUP QUIT
+    rm -rf "$command_state"
+    [ "$cancelled" -eq 0 ] || status=$((128 + cancelled))
     return "$status"
 }
 
-run_cargo() {
-    exec cargo "$@"
-}
-
-run_command() {
-    exec "$@"
+interrupt() {
+    interrupted=true
+    if [ "$cancelled" -eq 0 ]; then
+        cancelled=$1
+        printf '%s\n' "$cancelled" >"$command_state/cancelled"
+    fi
 }
 
 # The build half of `test`, `bench` or `run`. Arguments after `--` belong to
@@ -257,9 +265,10 @@ build_phase() {
         [ "$ended" = true ] || set -- "$@" "$argument"
     done
     if [ "$subcommand" = run ]; then
-        exec cargo build "$@"
+        held cargo build "$@"
+    else
+        held cargo "$subcommand" --no-run "$@"
     fi
-    exec cargo "$subcommand" --no-run "$@"
 }
 
 # Whether a gate that is still running admitted this command, which inherits
@@ -319,7 +328,7 @@ fi
 if [ "$mode" = exec ]; then
     acquire
     status=0
-    held run_command "$@" || status=$?
+    held "$@" || status=$?
     release
     exit "$status"
 fi
@@ -343,11 +352,11 @@ done
 acquire
 status=0
 if [ "$runs_separately" = true ]; then
-    held build_phase "$@" || status=$?
+    build_phase "$@" || status=$?
     release
     [ "$status" -eq 0 ] || exit "$status"
     exec cargo "$subcommand" "$@"
 fi
-held run_cargo "$subcommand" "$@" || status=$?
+held cargo "$subcommand" "$@" || status=$?
 release
 exit "$status"
