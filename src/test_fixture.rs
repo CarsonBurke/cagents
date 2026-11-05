@@ -383,4 +383,23 @@ mod tests {
             assert!(!fixture.path().starts_with(home));
         }
     }
+
+    #[test]
+    #[ignore = "requires externally selected unsafe TMPDIR with real HOME/CODEX_HOME preserved; run explicitly with --ignored"]
+    fn refuses_selected_unsafe_root_before_creating_fixture() {
+        let root = std::env::temp_dir();
+        let protected = protected_roots().expect("preserve valid inherited account homes");
+        // Refuse a mistaken safe-root invocation before the API could create a
+        // directory. This case needs no fixture bootstrap or environment edits.
+        assert!(
+            validate_root(&root, &protected).is_err(),
+            "select an unsafe TMPDIR externally for this ignored negative case"
+        );
+        let error = tempdir()
+            .expect_err("unsafe selected TMPDIR must refuse fixture creation")
+            .to_string();
+        assert!(error.contains("unsafe test fixture root"), "{error}");
+        assert!(error.contains("set TMPDIR"), "{error}");
+        assert!(error.contains(&root.display().to_string()), "{error}");
+    }
 }
