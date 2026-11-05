@@ -171,6 +171,7 @@ fn pending_converted_cleanup_preserves_independent_terminal_worker() {
             source: source.clone(),
             requested: source.clone(),
             context: context.clone(),
+            failed_close: None,
         },
     );
     drop(lease);

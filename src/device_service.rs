@@ -1685,6 +1685,8 @@ fn request_as(
 }
 
 #[cfg(test)]
+mod no_start_entry_tests;
+#[cfg(test)]
 mod request_tests;
 
 #[cfg(any(feature = "ui", feature = "host"))]

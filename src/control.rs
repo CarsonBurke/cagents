@@ -19,10 +19,17 @@ use thiserror::Error;
 
 mod accounts;
 pub use accounts::AccountCommand;
+#[cfg(test)]
+mod agent_start_authority_tests;
 mod agents;
+
+#[cfg(test)]
+mod automation_work_authority_tests;
 mod channel_work;
 mod channels;
 mod chat;
+#[cfg(test)]
+mod project_channel_authority_tests;
 pub use chat::ChatCommand;
 mod format;
 pub use agents::AgentCommand;
@@ -31,6 +38,8 @@ mod completions;
 pub use automations::AutomationCommand;
 mod sessions;
 mod terminal_list;
+#[cfg(test)]
+mod terminal_start_authority_tests;
 pub use sessions::SessionsArgs;
 mod messages;
 pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
@@ -66,6 +75,9 @@ use crate::{
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+// A live close may outlast a slow commit or shared request at the daemon's fence
+// before its own teardown. Timing out earlier would call that wait unresponsive.
+const TERMINAL_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
 // Close is acknowledged only after interruption and process teardown. Allow
 // those grace periods plus time to schedule the worker and deliver its reply.
 const CHAT_CLOSE_TIMEOUT: Duration = crate::chat::INTERRUPT_TIMEOUT
@@ -630,10 +642,14 @@ impl ControlClient {
     pub fn connect(socket_path: &Path) -> Result<Self, ControlError> {
         #[cfg(feature = "ui")]
         let health_request = crate::daemon_health::begin();
+        let deadline = Instant::now() + Self::handshake_timeout();
         let result = (|| {
-            let stream =
-                connect_control_socket(socket_path, IO_TIMEOUT).map_err(ControlError::Connect)?;
-            Self::from_stream(stream)
+            let stream = connect_control_socket(
+                socket_path,
+                IO_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .map_err(ControlError::Connect)?;
+            Self::from_stream_inner(stream, deadline, deadline.min(Instant::now() + IO_TIMEOUT))
         })();
         #[cfg(feature = "ui")]
         crate::daemon_health::connection(socket_path, &result, health_request);
@@ -641,26 +657,32 @@ impl ControlClient {
     }
 
     pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
-        Self::from_stream_inner(stream, None)
+        let deadline = Instant::now() + Self::handshake_timeout();
+        Self::from_stream_inner(stream, deadline, deadline.min(Instant::now() + IO_TIMEOUT))
+    }
+
+    fn handshake_timeout() -> Duration {
+        if crate::device::is_remote() {
+            Duration::from_secs(30)
+        } else {
+            IO_TIMEOUT
+        }
     }
 
     pub(crate) fn from_stream_with_deadline(
         stream: UnixStream,
         deadline: Instant,
     ) -> Result<Self, ControlError> {
-        Self::from_stream_inner(stream, Some(deadline))
+        Self::from_stream_inner(stream, deadline, deadline)
     }
 
     fn from_stream_inner(
         stream: UnixStream,
-        deadline: Option<Instant>,
+        deadline: Instant,
+        write_deadline: Instant,
     ) -> Result<Self, ControlError> {
         stream
-            .set_read_timeout(Some(if crate::device::is_remote() {
-                Duration::from_secs(30)
-            } else {
-                IO_TIMEOUT
-            }))
+            .set_read_timeout(Some(Self::handshake_timeout()))
             .map_err(ControlError::Configure)?;
         stream
             .set_write_timeout(Some(IO_TIMEOUT))
@@ -669,10 +691,14 @@ impl ControlClient {
             stream,
             next_request_id: 1,
         };
-        let proof = client.handshake(deadline)?;
+        let proof = client.handshake(deadline, write_deadline)?;
         client
             .stream
             .set_read_timeout(Some(IO_TIMEOUT))
+            .map_err(ControlError::Configure)?;
+        client
+            .stream
+            .set_write_timeout(Some(IO_TIMEOUT))
             .map_err(ControlError::Configure)?;
         Ok(Self {
             stream: client.stream,
@@ -1107,8 +1133,16 @@ impl ControlClient {
 
     pub fn close_terminal(&mut self, terminal_id: TerminalId) -> Result<(), ControlError> {
         self.attach_and_synchronize(terminal_id)?;
-        let action =
-            self.expect_accepted(ClientRequest::ShutdownTerminal { terminal_id }, terminal_id);
+        let action = self
+            .request_attached_with_deadline(
+                ClientRequest::ShutdownTerminal { terminal_id },
+                terminal_id,
+                Instant::now() + TERMINAL_CLOSE_TIMEOUT,
+            )
+            .and_then(|response| match response {
+                ServerResponse::Accepted => Ok(()),
+                response => Err(unexpected_response("request acceptance", &response)),
+            });
         match action {
             // Accepted confirms retirement, which already removed this
             // subscription. Detaching that retired ID would hide success.
@@ -1147,12 +1181,13 @@ impl ControlClient {
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         self.attach_and_synchronize(terminal_id)?;
         let action = self
-            .request_attached(
+            .request_attached_with_deadline(
                 ClientRequest::CloseTerminalChecked {
                     terminal_id,
                     allow_active,
                 },
                 terminal_id,
+                Instant::now() + TERMINAL_CLOSE_TIMEOUT,
             )
             .and_then(|response| match response {
                 ServerResponse::TerminalCloseChecked {
@@ -1242,7 +1277,17 @@ impl ControlClient {
         &mut self,
         policy: crate::update::impact::Policy,
     ) -> Result<crate::update::impact::DaemonImpact, ControlError> {
-        match self.request_strict(ClientRequest::UpgradeImpact { policy })? {
+        self.upgrade_impact_with_deadline(policy, Instant::now() + Duration::from_secs(30))
+    }
+
+    /// Preview may scan a large owned inventory. Its complete operation has a
+    /// separate budget; individual reads and unsolicited traffic cannot renew it.
+    pub(crate) fn upgrade_impact_with_deadline(
+        &mut self,
+        policy: crate::update::impact::Policy,
+        deadline: Instant,
+    ) -> Result<crate::update::impact::DaemonImpact, ControlError> {
+        match self.request_with_deadline(ClientRequest::UpgradeImpact { policy }, deadline)? {
             ServerResponse::UpgradeImpact(impact) => Ok(impact),
             response => Err(unexpected_response("update impact", &response)),
         }
@@ -1597,7 +1642,25 @@ impl ControlClient {
         request: ClientRequest,
         deadline: Instant,
     ) -> Result<ServerResponse, ControlError> {
-        let result = self.request_inner(request, None, Some(deadline));
+        self.request_until(request, None, deadline)
+    }
+
+    fn request_attached_with_deadline(
+        &mut self,
+        request: ClientRequest,
+        terminal_id: TerminalId,
+        deadline: Instant,
+    ) -> Result<ServerResponse, ControlError> {
+        self.request_until(request, Some(terminal_id), deadline)
+    }
+
+    fn request_until(
+        &mut self,
+        request: ClientRequest,
+        streaming_terminal: Option<TerminalId>,
+        deadline: Instant,
+    ) -> Result<ServerResponse, ControlError> {
+        let result = self.request_inner(request, streaming_terminal, Some(deadline));
         let read_restored = self.restore_read_timeout();
         let write_restored = self
             .stream
@@ -1836,7 +1899,11 @@ struct HandshakeClient {
 }
 
 impl HandshakeClient {
-    fn handshake(&mut self, deadline: Option<Instant>) -> Result<HostSessionProof, ControlError> {
+    fn handshake(
+        &mut self,
+        deadline: Instant,
+        write_deadline: Instant,
+    ) -> Result<HostSessionProof, ControlError> {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         let request = ClientEnvelope {
@@ -1848,25 +1915,22 @@ impl HandshakeClient {
                 resume: Vec::new(),
             },
         };
-        match deadline {
-            Some(deadline) => write_frame(
-                &mut DeadlineWriter {
-                    stream: &mut self.stream,
-                    deadline,
-                },
-                &request,
-            )?,
-            None => write_frame(&mut self.stream, &request)?,
-        }
-        let timeout = self.stream.read_timeout().ok().flatten();
-        let envelope: ServerEnvelope = match deadline {
-            Some(deadline) => read_frame(&mut DeadlineReader {
+        // Defaults keep the original five-second write budget, including when
+        // remote handshakes allow longer reads. Explicit callers retain their
+        // own complete operation deadline for both directions.
+        write_frame(
+            &mut DeadlineWriter {
                 stream: &mut self.stream,
-                deadline,
-            }),
-            None => read_frame(&mut self.stream),
-        }
-        .map_err(|error| reply_error(error, timeout))?
+                deadline: write_deadline,
+            },
+            &request,
+        )?;
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        let envelope: ServerEnvelope = read_frame(&mut DeadlineReader {
+            stream: &mut self.stream,
+            deadline,
+        })
+        .map_err(|error| reply_error(error, Some(timeout)))?
         .ok_or(ControlError::ConnectionClosed)?;
         if envelope.version != PROTOCOL_VERSION {
             return Err(ControlError::UnsupportedVersion {
@@ -2142,6 +2206,8 @@ static NO_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 
 pub(crate) fn daemon_autostart_disabled() -> bool {
     NO_START.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("CAGENTS_NO_START")
+            .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 struct StartPolicy(bool);
@@ -2200,6 +2266,17 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    run_from_with_staged_lookup(arguments, crate::install_guard::staged_owner_bin)
+}
+
+fn run_from_with_staged_lookup<I, T>(
+    arguments: I,
+    mut staged_lookup: impl FnMut(&Path, bool) -> io::Result<Option<PathBuf>>,
+) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
     let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
     let wants_json = arguments
         .iter()
@@ -2227,29 +2304,88 @@ where
         emit_success(cli.json, completions::execute(shell));
         return ExitCode::SUCCESS;
     }
+    if matches!(
+        &cli.command,
+        TopCommand::Daemon {
+            command: DaemonCommand::ProtocolVersion
+        }
+    ) {
+        return match execute_daemon(DaemonCommand::ProtocolVersion) {
+            Ok(output) => {
+                emit_success(cli.json, output);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                emit_error(cli.json, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // These operations govern the whole daemon, not a hosted session's own
     // actors. Refuse before staged-owner routing, SSH preparation, autostart or
     // local installer effects. Presence is enough: malformed/non-Unicode
     // authority must never silently become a User connection.
-    if matches!(
-        &cli.command,
+    let user_only_message = match &cli.command {
         TopCommand::Daemon {
-            command: DaemonCommand::Start
+            command:
+                DaemonCommand::Bridge
+                | DaemonCommand::Start
                 | DaemonCommand::Stop { .. }
                 | DaemonCommand::Preflight
                 | DaemonCommand::PrepareUpgrade { .. }
                 | DaemonCommand::Upgrade { .. }
                 | DaemonCommand::AbandonUpgrade { .. }
                 | DaemonCommand::StopForRebuild { .. },
+        } => Some(
+            "Daemon lifecycle commands require your own terminal; hosted sessions cannot start, stop or upgrade the daemon",
+        ),
+        TopCommand::CoordinateInstall { .. } | TopCommand::RestartWindows { .. } => {
+            Some("Installation and window restart commands require your own terminal")
         }
-    ) && std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some()
+        TopCommand::Account {
+            command:
+                AccountCommand::Link { .. }
+                | AccountCommand::Default { .. }
+                | AccountCommand::Remove { .. },
+        } => Some("Account changes require your own terminal"),
+        _ => None,
+    };
+    if std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some()
+        && let Some(message) = user_only_message
     {
         emit_error(
             cli.json,
             &AppError::new(
                 "permission_denied",
-                "Daemon lifecycle commands require your own terminal; hosted sessions cannot start, stop or upgrade the daemon",
+                format!(
+                    "{message}. Cagents terminals are hosted sessions. A person must run this command from a system terminal outside cagents."
+                ),
+            ),
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // These implementations operate on this installation's files or pidfds.
+    // Refuse a remote target before selecting/preparing it or touching local
+    // recovery state; the selected remote must never imply local consent.
+    if (cli.device.as_deref().is_some_and(|name| name != "local") || crate::device::is_remote())
+        && matches!(
+            &cli.command,
+            TopCommand::Daemon {
+                command: DaemonCommand::Bridge
+                    | DaemonCommand::Upgrade { .. }
+                    | DaemonCommand::AbandonUpgrade { .. }
+                    | DaemonCommand::StopForRebuild { .. },
+            } | TopCommand::CoordinateInstall { .. }
+                | TopCommand::RestartWindows { .. }
+        )
+    {
+        emit_error(
+            cli.json,
+            &AppError::new(
+                "daemon_local_only",
+                "This operation manages the local installation; omit --device or select local",
             ),
         );
         return ExitCode::FAILURE;
@@ -2338,12 +2474,45 @@ where
         );
         return ExitCode::FAILURE;
     }
-    if !crate::device::is_remote() && routes_to_staged_owner(&cli.command) {
+    // Retain legacy write scope before installer recovery or an older CLI can
+    // handle the command. Legacy reads keep their original routing; a scoped
+    // legacy write uses this client's selected host.
+    let project_channel_context =
+        legacy_model_command_mutates(&cli.command).then(ProjectChannelContext::capture);
+    if let Some(context) = &project_channel_context
+        && let Err(error) = context.admit_remote()
+    {
+        emit_error(cli.json, &error);
+        return ExitCode::FAILURE;
+    }
+    // Preserve the original caller before operational recovery or delegation
+    // to a staged CLI whose caller-scoped service transport may predate this policy.
+    let service_context = (matches!(
+        &cli.command,
+        TopCommand::Automation { .. }
+            | TopCommand::Work { .. }
+            | TopCommand::Channel {
+                command: ChannelCommand::Work { .. }
+            }
+    ) || matches!(
+        &cli.command,
+        TopCommand::Agent { command } if !matches!(command, AgentCommand::Console { .. })
+    ))
+    .then(ServiceRequestContext::capture);
+    if let Some(context) = &service_context
+        && let Err(error) = context.admit_remote()
+    {
+        emit_error(cli.json, &error);
+        return ExitCode::FAILURE;
+    }
+    if !crate::device::is_remote()
+        && routes_to_staged_owner_as(&cli.command, project_channel_context.as_ref())
+        && !service_context
+            .as_ref()
+            .is_some_and(|context| context.scoped())
+    {
         let recover = !no_start && staged_command_requires_daemon(&cli.command);
-        match crate::install_guard::staged_owner_bin(
-            &std::env::current_exe().unwrap_or_default(),
-            recover,
-        ) {
+        match staged_lookup(&std::env::current_exe().unwrap_or_default(), recover) {
             Ok(Some(bin)) => {
                 use std::os::unix::process::CommandExt;
                 let mut command =
@@ -2399,7 +2568,7 @@ where
             return ExitCode::FAILURE;
         }
     }
-    match execute(cli.command) {
+    match execute_with_model_context(cli.command, project_channel_context, service_context) {
         Ok(output) => {
             let code = output.exit_code();
             emit_success(cli.json, output);
@@ -2462,6 +2631,14 @@ pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
 }
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
+    execute_with_model_context(command, None, None)
+}
+
+fn execute_with_model_context(
+    command: TopCommand,
+    project_channel_context: Option<ProjectChannelContext>,
+    service_context: Option<ServiceRequestContext>,
+) -> Result<CommandOutput, AppError> {
     match command {
         TopCommand::Completions { shell } => Ok(completions::execute(shell)),
         TopCommand::Diagnostics => {
@@ -2484,9 +2661,18 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
             })
         }
         TopCommand::Linear(command) => linear::execute(command),
-        TopCommand::Automation { command } => automations::execute(command),
-        TopCommand::Work { command } => work::execute(command),
-        TopCommand::Agent { command } => agents::execute(command),
+        TopCommand::Automation { command } => match service_context {
+            Some(context) => automations::execute_with_context(command, &context),
+            None => automations::execute(command),
+        },
+        TopCommand::Work { command } => match service_context {
+            Some(context) => work::execute_with_context(command, &context),
+            None => work::execute(command),
+        },
+        TopCommand::Agent { command } => match service_context {
+            Some(context) => agents::execute_with_context(command, &context),
+            None => agents::execute(command),
+        },
         TopCommand::Whoami => sessions::whoami(),
         TopCommand::Account { command } => accounts::execute(command),
         TopCommand::Chat { command } => chat::execute(command),
@@ -2551,9 +2737,24 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
             source,
         } => launch_ui(new_window, window.as_deref(), source.as_deref()),
         TopCommand::Daemon { command } => execute_daemon(command),
-        TopCommand::Terminal { command } => execute_terminal(command),
-        TopCommand::Project { command } => execute_project(command),
-        TopCommand::Channel { command } => execute_channel(command),
+        TopCommand::Terminal { command } => match project_channel_context {
+            Some(context) => execute_terminal_as(command, &context),
+            None => execute_terminal(command),
+        },
+        TopCommand::Project { command } => match project_channel_context {
+            Some(context) => execute_project_as(command, &context),
+            None => execute_project(command),
+        },
+        TopCommand::Channel {
+            command: ChannelCommand::Work { command },
+        } => match service_context {
+            Some(context) => channel_work::execute_with_context(command, &context),
+            None => channel_work::execute(command),
+        },
+        TopCommand::Channel { command } => match project_channel_context {
+            Some(context) => execute_channel_as(command, &context),
+            None => execute_channel(command),
+        },
         TopCommand::UpdateWorker { job_id } => {
             crate::update::run_worker(&job_id).map_err(|error| AppError::new("update", error))?;
             Ok(CommandOutput {
@@ -3323,22 +3524,28 @@ pub enum StopReport {
 }
 
 fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError> {
-    let socket = control_daemon_socket()?;
-    let mut client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
-    // Inside a hosted session the daemon lets these commands change only the
-    // terminals that session controls. Reads stay open to every caller.
-    let authority = Authority::from_environment();
-    if authority.token().is_some()
-        && matches!(
-            command,
-            TerminalCommand::Spawn { .. }
-                | TerminalCommand::Write { .. }
-                | TerminalCommand::Close { .. }
-        )
-    {
-        client.authenticate(authority).map_err(protocol_error)?;
+    if terminal_command_mutates(&command) {
+        return execute_terminal_as(command, &ProjectChannelContext::capture());
     }
+    // Keep the four global read verbs on their existing unauthenticated route.
+    let socket = control_daemon_socket()?;
+    let client = ControlClient::connect(&socket)
+        .map_err(|error| AppError::new("daemon_connection", error))?;
+    terminal_output(command, client)
+}
+
+fn execute_terminal_as(
+    command: TerminalCommand,
+    context: &ProjectChannelContext,
+) -> Result<CommandOutput, AppError> {
+    let client = context.connect(true)?;
+    terminal_output(command, client)
+}
+
+fn terminal_output(
+    command: TerminalCommand,
+    mut client: ControlClient,
+) -> Result<CommandOutput, AppError> {
     match command {
         TerminalCommand::List { all, exited } => {
             let terminals = client.list().map_err(protocol_error)?;
@@ -3468,6 +3675,165 @@ fn protocol_error(error: ControlError) -> AppError {
     }
 }
 
+/// Agents, Automation, Workboard and channel work share endpoint selection, while
+/// retaining their business-envelope and connection-authentication contracts.
+#[derive(Clone)]
+struct ServiceRequestContext {
+    authority: Authority,
+    remote: bool,
+}
+
+impl ServiceRequestContext {
+    fn capture() -> Self {
+        Self {
+            authority: Authority::from_environment(),
+            remote: crate::device::is_remote(),
+        }
+    }
+
+    fn scoped(&self) -> bool {
+        self.authority.token().is_some()
+    }
+
+    fn admit_remote(&self) -> Result<(), AppError> {
+        if self.scoped() && self.remote {
+            return Err(AppError::new(
+                "permission_denied",
+                "Agent, automation and work commands from an agent session require your own terminal on the remote device",
+            ));
+        }
+        Ok(())
+    }
+
+    fn connect(&self) -> Result<ControlClient, AppError> {
+        self.admit_remote()?;
+        let socket = if self.scoped() {
+            daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?
+        } else {
+            control_daemon_socket()?
+        };
+        ControlClient::connect(&socket).map_err(|error| AppError::new("daemon_connection", error))
+    }
+}
+
+/// Caller scope for legacy terminal and shared-model CLI mutations. ChannelWork carries
+/// its own explicit authority and never enters this connection path.
+struct ProjectChannelContext {
+    authority: Authority,
+    remote: bool,
+    no_start: bool,
+}
+
+impl ProjectChannelContext {
+    fn capture() -> Self {
+        Self {
+            authority: Authority::from_environment(),
+            remote: crate::device::is_remote(),
+            no_start: daemon_autostart_disabled(),
+        }
+    }
+
+    fn connect(&self, mutation: bool) -> Result<ControlClient, AppError> {
+        self.connect_with(
+            mutation,
+            || {
+                if mutation && self.authority.token().is_some() {
+                    daemon_socket_path().map_err(|error| AppError::new("socket_path", error))
+                } else {
+                    // Preserve --no-start absence and ownership checks for
+                    // ordinary Users and intentionally global reads alike.
+                    control_daemon_socket()
+                }
+            },
+            control_daemon_socket,
+            ControlClient::connect,
+        )
+    }
+
+    fn admit_remote(&self) -> Result<(), AppError> {
+        if self.authority.token().is_some() && self.remote {
+            return Err(AppError::new(
+                "permission_denied",
+                "Project, channel and terminal commands from an agent session require your own terminal on the remote device",
+            ));
+        }
+        Ok(())
+    }
+
+    fn connect_with(
+        &self,
+        mutation: bool,
+        existing: impl FnOnce() -> Result<PathBuf, AppError>,
+        ready: impl FnOnce() -> Result<PathBuf, AppError>,
+        connect: impl FnOnce(&Path) -> Result<ControlClient, ControlError>,
+    ) -> Result<ControlClient, AppError> {
+        let scoped = self.authority.token().is_some();
+        self.admit_remote()?;
+        let socket = if (scoped && mutation) || self.no_start {
+            existing()?
+        } else {
+            ready()?
+        };
+        let mut client =
+            connect(&socket).map_err(|error| AppError::new("daemon_connection", error))?;
+        // Lists are deliberately global reads, including for an invalid or
+        // empty inherited capability. Only legacy mutations bind the stream.
+        if scoped && mutation {
+            client
+                .authenticate(self.authority.clone())
+                .map_err(protocol_error)?;
+        }
+        Ok(client)
+    }
+}
+
+fn legacy_model_command_mutates(command: &TopCommand) -> bool {
+    match command {
+        TopCommand::Terminal { command } => terminal_command_mutates(command),
+        TopCommand::Project { command } => project_command_mutates(command),
+        TopCommand::Channel { command } => channel_command_mutates(command) == Some(true),
+        _ => false,
+    }
+}
+
+fn routes_to_staged_owner_as(
+    command: &TopCommand,
+    context: Option<&ProjectChannelContext>,
+) -> bool {
+    routes_to_staged_owner(command)
+        && !(legacy_model_command_mutates(command)
+            && context.is_some_and(|context| context.authority.token().is_some()))
+}
+
+fn terminal_command_mutates(command: &TerminalCommand) -> bool {
+    match command {
+        TerminalCommand::Spawn { .. }
+        | TerminalCommand::Write { .. }
+        | TerminalCommand::Close { .. } => true,
+        TerminalCommand::List { .. }
+        | TerminalCommand::Show { .. }
+        | TerminalCommand::Snapshot { .. }
+        | TerminalCommand::Wait { .. } => false,
+    }
+}
+
+fn project_command_mutates(command: &ProjectCommand) -> bool {
+    match command {
+        ProjectCommand::Open { .. } | ProjectCommand::Close { .. } => true,
+        ProjectCommand::List => false,
+    }
+}
+
+fn channel_command_mutates(command: &ChannelCommand) -> Option<bool> {
+    match command {
+        ChannelCommand::Spawn { .. }
+        | ChannelCommand::Move { .. }
+        | ChannelCommand::Close { .. } => Some(true),
+        ChannelCommand::List { .. } => Some(false),
+        ChannelCommand::Work { .. } => None,
+    }
+}
+
 /// Runs a shared-project verb against the daemon's registry.
 ///
 /// A project is a registry row rather than a window instruction, exactly as a
@@ -3477,6 +3843,25 @@ fn protocol_error(error: ControlError) -> AppError {
 /// `EditWorkspaceModel`, which carry whichever [`ModelEdit`] the verb means, so
 /// the wire protocol and the daemon's handler are untouched.
 fn execute_project(command: ProjectCommand) -> Result<CommandOutput, AppError> {
+    let context = ProjectChannelContext::capture();
+    execute_project_as(command, &context)
+}
+
+fn execute_project_as(
+    command: ProjectCommand,
+    context: &ProjectChannelContext,
+) -> Result<CommandOutput, AppError> {
+    // Remote path discovery can itself resolve a bridge; refuse its captured
+    // local-session scope before filesystem or device discovery as well.
+    context.admit_remote()?;
+    execute_project_with(command, |mutation| context.connect(mutation))
+}
+
+fn execute_project_with(
+    command: ProjectCommand,
+    connect: impl FnOnce(bool) -> Result<ControlClient, AppError>,
+) -> Result<CommandOutput, AppError> {
+    let mutation = project_command_mutates(&command);
     // Reject invalid filesystem paths before starting a daemon. The shared
     // registry then takes precedence over fresh Git discovery for open folders.
     let selected = match &command {
@@ -3485,9 +3870,7 @@ fn execute_project(command: ProjectCommand) -> Result<CommandOutput, AppError> {
         }
         ProjectCommand::List => None,
     };
-    let socket = control_daemon_socket()?;
-    let mut client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
+    let mut client = connect(mutation)?;
     let model = selected
         .map(|_| client.read_workspace_model())
         .transpose()
@@ -3677,6 +4060,24 @@ fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
         ChannelCommand::Work { command } => return channel_work::execute(command),
         command => command,
     };
+    let context = ProjectChannelContext::capture();
+    execute_channel_as(command, &context)
+}
+
+fn execute_channel_as(
+    command: ChannelCommand,
+    context: &ProjectChannelContext,
+) -> Result<CommandOutput, AppError> {
+    context.admit_remote()?;
+    execute_channel_with(command, |mutation| context.connect(mutation))
+}
+
+fn execute_channel_with(
+    command: ChannelCommand,
+    connect: impl FnOnce(bool) -> Result<ControlClient, AppError>,
+) -> Result<CommandOutput, AppError> {
+    let mutation = channel_command_mutates(&command)
+        .expect("ChannelWork is dispatched before legacy channel execution");
     // Reject invalid filesystem paths before starting a daemon. The shared
     // registry then takes precedence over fresh Git discovery for open folders.
     let selected = match &command {
@@ -3686,9 +4087,7 @@ fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
         } => Some(project_directory(Some(path.clone()))?),
         _ => None,
     };
-    let socket = control_daemon_socket()?;
-    let mut client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
+    let mut client = connect(mutation)?;
     let model = selected
         .map(|_| client.read_workspace_model())
         .transpose()
@@ -4135,10 +4534,25 @@ mod tests {
                     .lines()
                     .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                     .collect::<Vec<_>>();
-                assert_eq!(errors.len(), if case == "user" { 0 } else { 14 });
+                assert_eq!(errors.len(), if case == "user" { 6 } else { 26 });
                 assert!(errors.iter().all(|error| {
-                    error["ok"] == false && error["error"]["kind"] == "permission_denied"
+                    error["ok"] == false
+                        && error["error"]["kind"]
+                            == if case == "user" {
+                                "daemon_local_only"
+                            } else {
+                                "permission_denied"
+                            }
                 }));
+                if case != "user" {
+                    assert!(errors.iter().all(|error| {
+                        let message = error["error"]["message"].as_str().unwrap();
+                        message.contains("Cagents terminals are hosted sessions.")
+                            && message.contains(
+                                "A person must run this command from a system terminal outside cagents.",
+                            )
+                    }));
+                }
             }
             return;
         };
@@ -4149,6 +4563,22 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let before = std::fs::symlink_metadata(&socket).unwrap();
         let pinned = proof("fixture-host", "fixture-boot", "fixture-incarnation");
+        for no_start in [false, true] {
+            let mut argv = vec![
+                "cagents",
+                "--json",
+                "--device",
+                "unknown-must-not-be-selected",
+            ];
+            if no_start {
+                argv.push("--no-start");
+            }
+            argv.extend(["daemon", "protocol-version"]);
+            assert_eq!(
+                run_from_with_staged_lookup(argv, |_, _| panic!("local protocol query routed")),
+                ExitCode::SUCCESS
+            );
+        }
 
         fn accept(listener: &UnixListener) -> UnixStream {
             let mut event = libc::pollfd {
@@ -4190,21 +4620,68 @@ mod tests {
         }
 
         if case != "user" {
-            let commands: [&[&str]; 7] = [
-                &["start"],
-                &["stop", "--require-empty"],
-                &["preflight"],
-                &["prepare-upgrade", "--yes", "--no-relaunch-agents"],
-                &["upgrade", "--yes"],
-                &["abandon-upgrade", "--yes"],
-                &["stop-for-rebuild", "--including-subagents"],
+            let commands: [&[&str]; 13] = [
+                &["daemon", "start"],
+                &["daemon", "stop", "--require-empty"],
+                &["daemon", "preflight"],
+                &["daemon", "prepare-upgrade", "--yes", "--no-relaunch-agents"],
+                &["daemon", "upgrade", "--yes"],
+                &["daemon", "abandon-upgrade", "--yes"],
+                &["daemon", "stop-for-rebuild", "--including-subagents"],
+                &["daemon", "bridge"],
+                &[
+                    "coordinate-install",
+                    "--prefix",
+                    "/missing-prefix",
+                    "--installer",
+                    "/missing-installer",
+                ],
+                &["restart-windows", "--instance", "missing-instance"],
+                &["account", "default", "claude", "automatic"],
+                &["account", "link", "codex", "/missing-home"],
+                &["account", "remove", "claude/system", "--yes"],
             ];
             for device in ["local", "fixture-device-must-not-be-selected"] {
                 for command in commands {
-                    let mut argv = vec!["cagents", "--json", "--device", device, "daemon"];
+                    let mut argv = vec!["cagents", "--json", "--device", device];
                     argv.extend_from_slice(command);
-                    assert_eq!(run_from(argv), ExitCode::FAILURE);
+                    assert_eq!(
+                        run_from_with_staged_lookup(argv, |_, _| panic!(
+                            "scoped initiator reached staged routing"
+                        )),
+                        ExitCode::FAILURE
+                    );
                 }
+            }
+            // Test the bridge's own admission as well as public CLI dispatch.
+            // The private EOF peer keeps a missing guard a bounded failure;
+            // no-start prevents even a broken entry from spawning a daemon.
+            {
+                let _policy =
+                    StartPolicy(NO_START.swap(true, std::sync::atomic::Ordering::Relaxed));
+                let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop = stopped.clone();
+                let observed = listener.try_clone().unwrap();
+                let peer = thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        match observed.accept() {
+                            Ok((stream, _)) => {
+                                drop(stream);
+                                return true;
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                            Err(error) => panic!("private bridge peer: {error}"),
+                        }
+                        assert!(Instant::now() < deadline);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    false
+                });
+                let result = crate::device::serve_stdio();
+                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                assert!(!peer.join().unwrap(), "scoped bridge connected");
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
             }
             assert!(
                 matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
@@ -4338,6 +4815,32 @@ mod tests {
             assert_eq!(run_from(argv), ExitCode::SUCCESS);
         }
         server.join().unwrap();
+        for command in [
+            vec!["daemon", "upgrade", "--yes"],
+            vec!["daemon", "abandon-upgrade", "--yes"],
+            vec!["daemon", "stop-for-rebuild", "--including-subagents"],
+            vec!["daemon", "bridge"],
+            vec![
+                "coordinate-install",
+                "--prefix",
+                "/missing-prefix",
+                "--installer",
+                "/missing-installer",
+            ],
+            vec!["restart-windows", "--instance", "missing-instance"],
+        ] {
+            let mut argv = vec![
+                "cagents",
+                "--json",
+                "--device",
+                "unknown-must-not-be-selected",
+            ];
+            argv.extend(command);
+            assert_eq!(
+                run_from_with_staged_lookup(argv, |_, _| panic!("local-only operation routed")),
+                ExitCode::FAILURE
+            );
+        }
     }
 
     #[test]
@@ -4634,6 +5137,10 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.details.unwrap()["outcome"], "inventory_changed");
+    }
+
+    mod handshake_deadline_tests {
+        include!("control/handshake_deadline_tests.rs");
     }
 
     fn saturated_control_listener(
@@ -6214,6 +6721,9 @@ mod tests {
             if peer_case == "disconnect" {
                 return;
             }
+            if peer_case == "late-closed" {
+                thread::sleep(IO_TIMEOUT + Duration::from_millis(500));
+            }
             let message = match peer_case.as_str() {
                 "remote-error" => ServerMessage::Error(ProtocolError::new(
                     ProtocolErrorCode::TerminalUnavailable,
@@ -6252,7 +6762,7 @@ mod tests {
             }
             write_frame(&mut server_stream, &envelope).unwrap();
             let mut next = 4;
-            if peer_case != "closed" {
+            if !matches!(peer_case.as_str(), "closed" | "late-closed") {
                 assert_eq!(
                     request(&mut server_stream, &pinned, next),
                     ClientRequest::Detach { terminal_id: id },
@@ -6313,6 +6823,16 @@ mod tests {
         for checked in [false, true] {
             assert_eq!(
                 public_terminal_close_exchange(checked, "closed").unwrap(),
+                terminal::ipc::TerminalCloseResult::Closed
+            );
+        }
+    }
+
+    #[test]
+    fn live_terminal_closes_outlast_the_ordinary_reply_timeout() {
+        for checked in [false, true] {
+            assert_eq!(
+                public_terminal_close_exchange(checked, "late-closed").unwrap(),
                 terminal::ipc::TerminalCloseResult::Closed
             );
         }
@@ -6437,6 +6957,300 @@ mod tests {
     }
 
     #[test]
+    fn terminal_close_keeps_confirmed_completion_when_the_connection_ends() {
+        for checked in [false, true] {
+            for ending in ["detached", "shutdown", "eof", "closed-write"] {
+                let (result, reusable) =
+                    terminal_close_completion_fixture(checked, "closed", ending);
+                assert!(result.is_ok(), "{checked}/{ending}: {result:?}");
+                assert_eq!(reusable, ending == "detached");
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_close_preserves_unconfirmed_outcomes_and_other_detach_errors() {
+        for outcome in ["active", "unknown", "refused"] {
+            let (result, _) = terminal_close_completion_fixture(true, outcome, "eof");
+            if outcome == "refused" {
+                assert!(matches!(
+                    result,
+                    Err(ControlError::Remote {
+                        code: ProtocolErrorCode::TerminalUnavailable,
+                        ..
+                    })
+                ));
+            } else {
+                assert!(result.is_err(), "{outcome} must not become confirmed Close");
+            }
+        }
+        for ending in [
+            "proof",
+            "version",
+            "request-id",
+            "unexpected",
+            "refused",
+            "timeout",
+            "malformed",
+        ] {
+            let (result, _) = terminal_close_completion_fixture(true, "active", ending);
+            match ending {
+                "proof" => assert!(matches!(result, Err(ControlError::ProofMismatch))),
+                "version" => assert!(matches!(
+                    result,
+                    Err(ControlError::UnsupportedVersion { .. })
+                )),
+                "request-id" => assert!(matches!(
+                    result,
+                    Err(ControlError::RequestIdMismatch { .. })
+                )),
+                "unexpected" => assert!(matches!(
+                    result,
+                    Err(ControlError::UnexpectedResponse { .. })
+                )),
+                "refused" => assert!(matches!(
+                    result,
+                    Err(ControlError::Remote {
+                        code: ProtocolErrorCode::QueueFull,
+                        ..
+                    })
+                )),
+                "timeout" => assert!(matches!(result, Err(ControlError::ReplyTimeout { .. }))),
+                "malformed" => assert!(matches!(
+                    result,
+                    Err(ControlError::Frame(FrameError::InvalidPayload(_)))
+                )),
+                _ => unreachable!(),
+            }
+        }
+        let (result, _) = terminal_close_completion_fixture(false, "refused", "eof");
+        assert!(matches!(
+            result,
+            Err(ControlError::Remote {
+                code: ProtocolErrorCode::TerminalUnavailable,
+                ..
+            })
+        ));
+        let (result, _) = terminal_close_completion_fixture(false, "write", "eof");
+        assert!(
+            result.is_err(),
+            "ordinary writes still require successful Detach"
+        );
+        for outcome in ["active", "unknown"] {
+            let (result, _) = terminal_close_completion_fixture(true, outcome, "detached");
+            assert!(result.is_ok(), "unchanged non-Closed result: {result:?}");
+        }
+    }
+
+    /// A private framed peer exercises the public client, including attachment
+    /// replay and correlation. It starts no daemon, terminal or provider.
+    fn terminal_close_completion_fixture(
+        checked: bool,
+        outcome: &'static str,
+        ending: &'static str,
+    ) -> (Result<(), ControlError>, bool) {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        server_stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let pinned = proof("close-completion", "boot", "incarnation");
+        let terminal = TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            LaunchRecipe::shell("/fixture".into()).unwrap(),
+            None,
+        );
+        let id = terminal.session.id;
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(connect.request_id, pinned.clone(), pinned.clone()),
+            )
+            .unwrap();
+            let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(
+                matches!(attach.request, ClientRequest::Attach { terminal_id, .. } if terminal_id == id)
+            );
+            let send = |stream: &mut UnixStream, request_id, message| {
+                write_frame(
+                    stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: pinned.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            };
+            send(
+                &mut server_stream,
+                Some(attach.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Attached { terminal },
+                },
+            );
+            send(
+                &mut server_stream,
+                None,
+                ServerMessage::Synchronized {
+                    terminal_id: id,
+                    generation: 0,
+                    event_sequence: 0,
+                },
+            );
+            let answer_list = |stream: &mut UnixStream| {
+                let list: ClientEnvelope = read_frame(stream).unwrap().unwrap();
+                assert_eq!(list.request, ClientRequest::List);
+                send(
+                    stream,
+                    Some(list.request_id),
+                    ServerMessage::Response {
+                        response: ServerResponse::Listed {
+                            terminals: Vec::new(),
+                        },
+                    },
+                );
+            };
+            let close: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(if outcome == "write" {
+                matches!(close.request, ClientRequest::Input { terminal_id, ref bytes } if terminal_id == id && bytes == b"fixture")
+            } else if checked {
+                matches!(close.request, ClientRequest::CloseTerminalChecked { terminal_id, allow_active: true } if terminal_id == id)
+            } else {
+                matches!(close.request, ClientRequest::ShutdownTerminal { terminal_id } if terminal_id == id)
+            });
+            let message = if outcome == "refused" {
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    "original close refused",
+                    true,
+                ))
+            } else if checked {
+                ServerMessage::Response {
+                    response: ServerResponse::TerminalCloseChecked {
+                        terminal_id: id,
+                        outcome: match outcome {
+                            "closed" => terminal::ipc::TerminalCloseResult::Closed,
+                            "active" => terminal::ipc::TerminalCloseResult::Active,
+                            "unknown" => terminal::ipc::TerminalCloseResult::Unknown(
+                                "original custody remains".into(),
+                            ),
+                            _ => unreachable!(),
+                        },
+                    },
+                }
+            } else {
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                }
+            };
+            if ending == "closed-write" {
+                // Retire the peer's read direction before the client can
+                // receive success and attempt Detach; keep writing that reply.
+                server_stream.shutdown(std::net::Shutdown::Read).unwrap();
+            }
+            send(&mut server_stream, Some(close.request_id), message);
+            if outcome == "closed" {
+                // Confirmed retirement already removed this subscription, so
+                // the client must not send Detach however the connection ends.
+                match ending {
+                    "shutdown" => send(&mut server_stream, None, ServerMessage::HostShuttingDown),
+                    "detached" => answer_list(&mut server_stream),
+                    _ => {}
+                }
+                return;
+            }
+            let detach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(detach.request, ClientRequest::Detach { terminal_id: id });
+            if ending == "eof" {
+                return;
+            }
+            if ending == "timeout" {
+                // A close's own deadline restores IO_TIMEOUT before this Detach.
+                wait.recv_timeout(IO_TIMEOUT + Duration::from_secs(3))
+                    .unwrap();
+                return;
+            }
+            if ending == "malformed" {
+                server_stream.write_all(&[0, 0, 0, 1, 255]).unwrap();
+                return;
+            }
+            let mut reply = ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(detach.request_id),
+                proof: pinned.clone(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::Detached,
+                },
+            };
+            match ending {
+                "shutdown" => {
+                    reply.request_id = None;
+                    reply.message = ServerMessage::HostShuttingDown;
+                }
+                "proof" => reply.proof = proof("replacement", "boot", "incarnation"),
+                "version" => reply.version += 1,
+                "request-id" => reply.request_id = Some(detach.request_id + 1),
+                "unexpected" => {
+                    reply.message = ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    }
+                }
+                "refused" => {
+                    reply.message = ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::QueueFull,
+                        "detach refused",
+                        true,
+                    ))
+                }
+                "detached" => {}
+                _ => unreachable!(),
+            }
+            write_frame(&mut server_stream, &reply).unwrap();
+            if ending == "detached" {
+                answer_list(&mut server_stream);
+            }
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        if ending == "timeout" {
+            client
+                .stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+        }
+        let result = if checked {
+            client.close_terminal_checked(id, true).map(|actual| {
+                assert_eq!(
+                    actual,
+                    match outcome {
+                        "closed" => terminal::ipc::TerminalCloseResult::Closed,
+                        "active" => terminal::ipc::TerminalCloseResult::Active,
+                        "unknown" => terminal::ipc::TerminalCloseResult::Unknown(
+                            "original custody remains".into()
+                        ),
+                        _ => unreachable!(),
+                    }
+                );
+            })
+        } else if outcome == "write" {
+            client.write(id, b"fixture".to_vec())
+        } else {
+            client.close_terminal(id)
+        };
+        if ending == "timeout" {
+            release.send(()).unwrap();
+        }
+        let reusable = ending == "detached" && client.list().unwrap().is_empty();
+        server.join().unwrap();
+        (result, reusable)
+    }
+
+    #[test]
     fn completed_terminal_release_allows_paired_actor_teardown() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pinned = proof("session", "boot", "incarnation");
@@ -6551,6 +7365,166 @@ mod tests {
         assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
         drop(client);
         server.join().unwrap();
+    }
+
+    fn preview_impact(pinned: HostSessionProof) -> crate::update::impact::DaemonImpact {
+        crate::update::impact::DaemonImpact {
+            capability: crate::terminal_ipc::ShutdownCapability {
+                proof: pinned,
+                token: "preview-only".into(),
+                inventory_generation: 1,
+                live_terminals: 0,
+                background_subagents: 0,
+                background_identity: String::new(),
+                expires_at_unix_ms: 1,
+            },
+            policy: crate::update::impact::Policy::WhenIdle,
+            sessions: Vec::new(),
+            blockers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn upgrade_impact_accepts_slow_preview_without_changing_normal_rpc_timeout() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let expected = preview_impact(pinned.clone());
+        let response = expected.clone();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, pinned.clone(), pinned.clone()),
+            )
+            .unwrap();
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::UpgradeImpact {
+                    policy: crate::update::impact::Policy::WhenIdle
+                }
+            );
+            assert_eq!(request.proof, Some(pinned.clone()));
+            // This is deliberately beyond the generic RPC's five-second budget.
+            thread::sleep(IO_TIMEOUT + Duration::from_millis(100));
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: pinned,
+                    message: ServerMessage::Response {
+                        response: ServerResponse::UpgradeImpact(response),
+                    },
+                },
+            )
+            .unwrap();
+            // A preview never causes a checkpoint, replay or other operation.
+            assert!(
+                read_frame::<ClientEnvelope>(&mut server_stream)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        assert_eq!(
+            client
+                .upgrade_impact(crate::update::impact::Policy::WhenIdle)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+        assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn upgrade_preview_total_deadline_and_exact_reply_fences_are_preserved() {
+        for case in 0..5 {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let pinned = proof("session", "boot", "incarnation");
+            let server = thread::spawn(move || {
+                let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(1, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                let mut envelope = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: pinned.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::UpgradeImpact(preview_impact(pinned)),
+                    },
+                };
+                match case {
+                    0 => {
+                        // Repeated valid unsolicited traffic cannot renew the operation.
+                        envelope.request_id = None;
+                        envelope.message = ServerMessage::NotificationsChanged;
+                        for _ in 0..50 {
+                            if write_frame(&mut server_stream, &envelope).is_err() {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    1 => {
+                        let bytes = postcard::to_stdvec(&envelope).unwrap();
+                        server_stream
+                            .write_all(&(bytes.len() as u32).to_be_bytes())
+                            .unwrap();
+                        for byte in bytes {
+                            if server_stream.write_all(&[byte]).is_err() {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    2 => {
+                        envelope.request_id = Some(request.request_id + 1);
+                        let _ = write_frame(&mut server_stream, &envelope);
+                    }
+                    3 => {
+                        envelope.proof.host_incarnation = HostIncarnation::new("replacement");
+                        let _ = write_frame(&mut server_stream, &envelope);
+                    }
+                    _ => return,
+                }
+                // Timing out with unread response bytes can reset a Unix
+                // socket when the client closes it. Inspect the first byte
+                // directly: even an incomplete replay must fail this guard,
+                // rather than being hidden by a frame reader's later reset.
+                let mut replay = [0];
+                match server_stream.read(&mut replay) {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                    result => panic!("no automatic request replay (case {case}): {result:?}"),
+                }
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            let started = Instant::now();
+            let error = client
+                .upgrade_impact_with_deadline(
+                    crate::update::impact::Policy::WhenIdle,
+                    started + Duration::from_millis(80),
+                )
+                .unwrap_err();
+            match case {
+                0 | 1 => assert!(matches!(error, ControlError::ReplyTimeout { .. })),
+                2 => assert!(matches!(error, ControlError::RequestIdMismatch { .. })),
+                3 => assert!(matches!(error, ControlError::ProofMismatch)),
+                _ => assert!(matches!(error, ControlError::ConnectionClosed)),
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+            assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
+            drop(client);
+            server.join().unwrap();
+        }
     }
 
     #[test]
@@ -6707,16 +7681,46 @@ mod tests {
 
     #[test]
     fn ui_launch_handshake_waits_for_saved_pane_recovery() {
+        // The announcement is already in the pipe when the base window starts,
+        // and `ready` is released only after that window has passed, so only
+        // the recovery allowance can admit it.
+        let window = Duration::from_millis(20);
+        let directory = tempfile::tempdir().unwrap();
+        let announced = directory.path().join("announced");
         let mut child = Command::new("sh")
             .args([
                 "-c",
-                "printf 'recovering: 1\\n'; sleep 0.1; printf 'ready\\n'",
+                "printf 'recovering: 1\\n'; : > \"$1\"; read -r _; printf 'ready\\n'",
+                "fixture",
             ])
+            .arg(&announced)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
         let mut stdout = child.stdout.take().unwrap();
-        let result = read_ui_launch_handshake(&mut stdout, Duration::from_millis(20));
+        let mut release = child.stdin.take().unwrap();
+        let hang_guard = Instant::now() + Duration::from_secs(60);
+        while !announced.exists() {
+            assert!(
+                Instant::now() < hang_guard,
+                "fixture never announced recovery"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Start the clock before the releaser so a descheduled test thread
+        // cannot shorten the measured interval below the release delay.
+        let started = Instant::now();
+        let releaser = thread::spawn(move || {
+            thread::sleep(window * 2);
+            release.write_all(b"\n").unwrap();
+        });
+        let result = read_ui_launch_handshake(&mut stdout, window);
+        assert!(
+            started.elapsed() > window,
+            "ready arrived inside the base window"
+        );
+        releaser.join().unwrap();
         child.wait().unwrap();
         result.unwrap();
     }
@@ -6746,7 +7750,9 @@ mod tests {
                 .spawn()
                 .unwrap();
             let mut stdout = child.stdout.take().unwrap();
-            let result = read_ui_launch_handshake(&mut stdout, Duration::from_secs(1));
+            // A hang guard: each response is complete before EOF, so only
+            // its content decides the result.
+            let result = read_ui_launch_handshake(&mut stdout, Duration::from_secs(60));
             child.wait().unwrap();
             assert_eq!(result.is_ok(), valid);
         }
@@ -6763,7 +7769,9 @@ mod tests {
             .spawn()
             .unwrap();
         let mut stdout = child.stdout.take().unwrap();
-        let result = read_ui_launch_handshake(&mut stdout, Duration::from_secs(1));
+        // Hang guards: the incomplete-recovery line ends the read, and the
+        // late acknowledgement follows it on its own.
+        let result = read_ui_launch_handshake(&mut stdout, Duration::from_secs(60));
         assert!(
             result
                 .as_ref()
@@ -6772,7 +7780,7 @@ mod tests {
                 .starts_with(UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX)
         );
         finish_ui_launch(child, result, Some(stdout)).unwrap_err();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !marker.is_file() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }

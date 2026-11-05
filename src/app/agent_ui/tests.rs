@@ -22,9 +22,6 @@ fn hosted_omp() -> CardState {
 fn restored_omp_attaches_for_background_metadata_without_opening_or_replaying() {
     let mut app = super::super::tests::context_inspector_test_app(false);
     let original = hosted_omp();
-    let CardKind::Terminal(session) = &original.kind else {
-        unreachable!()
-    };
     // A real restored control stays selected while the Omp owner is offscreen.
     // Rebuilding a one-card workspace selects its first card before any
     // attachment, so an empty-focus oracle would not test this contract.
@@ -58,11 +55,8 @@ fn restored_omp_attaches_for_background_metadata_without_opening_or_replaying() 
     // The existing attach-only reducer must not relaunch a session that no
     // longer exists. Its original identity remains for a later explicit open.
     let notices = app.notices.entries.len();
-    drop(app.update(Message::RestoredAgentAttached {
-        card: original.id,
-        terminal: session.id,
-        result: Ok(None),
-    }));
+    super::super::saved_terminal::tests::complete_inspection(&mut app, original.id, Ok(None));
+    assert!(app.saved_terminal_ready(original.id));
     assert_eq!(app.terminal_starts_in_flight(), 0);
     assert!(app.restored_agent_attaches.is_empty());
     assert_eq!(app.card_state(original.id).unwrap().kind, original.kind);

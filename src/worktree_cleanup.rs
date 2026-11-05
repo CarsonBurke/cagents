@@ -105,6 +105,15 @@ impl FencedTarget {
     }
 }
 
+/// Refusal for an older client that still requests automatic removal.
+#[cfg(feature = "host")]
+fn automatic_retention_reason(path: &Path) -> String {
+    format!(
+        "Kept {}: merged worktrees are no longer deleted automatically. Choose Delete worktree and confirm to remove it.",
+        path.display()
+    )
+}
+
 #[cfg(any(feature = "host", feature = "ui"))]
 fn exact_merged_head(request: &RemovalRequest, pr: &crate::github::PullRequest) -> bool {
     pr.state.0 == "MERGED"
@@ -172,10 +181,24 @@ fn checked_record(request: &RemovalRequest) -> Result<crate::repository::Worktre
         return Err("Worktree source repository changed".into());
     }
     let status = service
-        .status(&request.path, &cancellation)
+        .status_for_removal(&request.path, &cancellation)
         .map_err(|error| error.to_string())?;
     if status.untracked_omitted || status.dirty.is_dirty() || !status.entries.is_empty() {
         return Err("Worktree has changes or untracked files".into());
+    }
+    let ignored = service
+        .notable_ignored_files(&request.path, &cancellation)
+        .map_err(|error| error.to_string())?;
+    if !ignored.is_empty() {
+        return Err(format!(
+            "Kept: ignored files {}",
+            ignored
+                .iter()
+                .take(5)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     Ok(record.clone())
 }
@@ -204,19 +227,17 @@ impl PreparedRemoval {
     }
 
     /// Caller retains the daemon's exclusive admission gate through this call.
+    /// Advisory leases cannot fence later writes by unrelated programs.
+    /// Automatic cleanup retains the checkout for explicit confirmation.
     pub(crate) fn remove(
         self,
-        check_quiescence: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,
+        _check_quiescence: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,
     ) -> Result<crate::repository::RemovedWorktree, String> {
-        let request = self.request;
-        remove_fenced(
-            self.target,
-            WindowPolicy::RequireOne,
-            check_quiescence,
-            || checked_record(&request).map(drop),
-            false,
-            std::time::Duration::from_secs(30),
-        )
+        let Self {
+            request,
+            target: _target,
+        } = self;
+        Err(automatic_retention_reason(&request.path))
     }
 }
 
@@ -814,6 +835,13 @@ impl WindowProtections {
 mod tests {
     use super::*;
 
+    fn fixture_directory() -> tempfile::TempDir {
+        // Positive fixtures need physical paths even when TMPDIR names a symlink.
+        // Keep the TempDir guard; the lease API still rejects symlink components.
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        tempfile::tempdir_in(parent).unwrap()
+    }
+
     fn fixture_git(root: &Path) -> std::process::Command {
         let mut command = std::process::Command::new("git");
         command
@@ -934,6 +962,50 @@ mod tests {
         request.path = worktree.clone();
         request.head_oid = git(&worktree, &["rev-parse", "HEAD"]);
         checked_record(&request).unwrap();
+        std::fs::write(repository.join(".git/info/exclude"), ".env\ntarget/\n").unwrap();
+        let service = crate::repository::RepositoryService::system("git");
+        let cancellation = crate::process::CancellationToken::new();
+        let before = service.list_worktrees(&repository, &cancellation).unwrap();
+        let admin = service.git_dir(&worktree, &cancellation).unwrap();
+        let head_before = std::fs::read(admin.join("HEAD")).unwrap();
+        for late_user_file in [true, false] {
+            let prepared = PreparedRemoval {
+                request: request.clone(),
+                target: FencedTarget::capture(&repository, &worktree, Some(request.branch.clone()))
+                    .unwrap(),
+            };
+            let file = if late_user_file {
+                worktree.join(".env")
+            } else {
+                std::fs::create_dir_all(worktree.join("target/nested")).unwrap();
+                worktree.join("target/nested/generated")
+            };
+            std::fs::write(&file, "late external data").unwrap();
+            let refusal = prepared
+                .remove(|_| panic!("automatic retention must not request destructive admission"))
+                .unwrap_err();
+            assert!(refusal.contains("no longer deleted automatically"));
+            assert!(refusal.contains("Delete worktree and confirm"));
+            assert_eq!(std::fs::read(&file).unwrap(), b"late external data");
+            assert_eq!(std::fs::read(admin.join("HEAD")).unwrap(), head_before);
+            assert_eq!(
+                service.list_worktrees(&repository, &cancellation).unwrap(),
+                before
+            );
+            assert_eq!(
+                git(&repository, &["rev-parse", "refs/heads/feature"]),
+                request.head_oid
+            );
+            if late_user_file {
+                assert!(
+                    matches!(PreparedRemoval::prepare(request.clone()), Err(reason) if reason.contains("ignored files .env")),
+                    "fresh ignored-data refusal must happen before the GitHub read"
+                );
+            } else {
+                checked_record(&request).unwrap();
+            }
+            std::fs::remove_file(&file).unwrap();
+        }
         std::fs::write(worktree.join("tracked"), "changed").unwrap();
         assert!(checked_record(&request).is_err());
         git(&worktree, &["restore", "tracked"]);
@@ -1027,8 +1099,8 @@ mod tests {
     #[test]
     fn independent_editor_startup_descriptors_protect_files_and_restored_folders_before_readiness()
     {
-        let runtime = tempfile::tempdir().unwrap();
-        let worktree = tempfile::tempdir().unwrap();
+        let runtime = fixture_directory();
+        let worktree = fixture_directory();
         std::fs::write(worktree.path().join(".git"), "gitdir: fixture").unwrap();
         let nested = worktree.path().join("nested");
         std::fs::create_dir(&nested).unwrap();
@@ -1048,8 +1120,8 @@ mod tests {
     #[test]
     fn root_operation_protection_uses_path_pins_for_write_search_only_parents() {
         use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
-        let runtime = tempfile::tempdir().unwrap();
-        let tree = tempfile::tempdir().unwrap();
+        let runtime = fixture_directory();
+        let tree = fixture_directory();
         let directory = tree.path().join("parent");
         std::fs::create_dir(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o300)).unwrap();
@@ -1066,8 +1138,8 @@ mod tests {
 
     #[test]
     fn root_operation_protection_holds_the_original_directory() {
-        let runtime = tempfile::tempdir().unwrap();
-        let tree = tempfile::tempdir().unwrap();
+        let runtime = fixture_directory();
+        let tree = fixture_directory();
         let directory = tree.path().join("checkout");
         std::fs::create_dir(&directory).unwrap();
         let root = crate::fs_safety::Root::open(&directory).unwrap();
@@ -1080,8 +1152,8 @@ mod tests {
 
     #[test]
     fn root_operation_protection_rejects_replacement_at_the_original_path() {
-        let runtime = tempfile::tempdir().unwrap();
-        let tree = tempfile::tempdir().unwrap();
+        let runtime = fixture_directory();
+        let tree = fixture_directory();
         let directory = tree.path().join("checkout");
         let moved = tree.path().join("moved");
         std::fs::create_dir(&directory).unwrap();
@@ -1150,8 +1222,8 @@ mod tests {
 
     #[test]
     fn sync_retains_moved_directory_inode_lease_until_scope_leaves() {
-        let runtime = tempfile::tempdir().unwrap();
-        let fixture = tempfile::tempdir().unwrap();
+        let runtime = fixture_directory();
+        let fixture = fixture_directory();
         let original = fixture.path().join("original");
         let moved = fixture.path().join("moved");
         let present = fixture.path().join("present");
@@ -1207,8 +1279,8 @@ mod tests {
     #[cfg(any(feature = "ui", feature = "host"))]
     fn inherited_shared_protection_outlives_parent_guard_and_directory_replacement() {
         use std::io::{BufRead, Write};
-        let runtime = tempfile::tempdir().unwrap();
-        let tree = tempfile::tempdir().unwrap();
+        let runtime = fixture_directory();
+        let tree = fixture_directory();
         let directory = tree.path().join("checkout");
         std::fs::create_dir(&directory).unwrap();
         let parent = acquire(runtime.path(), &directory, false).unwrap();
@@ -1245,8 +1317,8 @@ mod tests {
 
     #[test]
     fn child_shared_protection_never_downgrades_an_exclusive_guard() {
-        let runtime = tempfile::tempdir().unwrap();
-        let directory = tempfile::tempdir().unwrap();
+        let runtime = fixture_directory();
+        let directory = fixture_directory();
         let exclusive = acquire(runtime.path(), directory.path(), true).unwrap();
         assert_eq!(
             exclusive.retained_child_files().unwrap_err().kind(),
@@ -1259,8 +1331,8 @@ mod tests {
 
     #[test]
     fn directory_protection_blocks_removal_until_every_window_releases_it() {
-        let runtime = tempfile::tempdir().unwrap();
-        let directory = tempfile::tempdir().unwrap();
+        let runtime = fixture_directory();
+        let directory = fixture_directory();
         let first = acquire(runtime.path(), directory.path(), false).unwrap();
         let second = acquire(runtime.path(), directory.path(), false).unwrap();
         assert_eq!(
@@ -1290,8 +1362,8 @@ mod tests {
 
     #[test]
     fn missing_scope_keeps_other_scopes_ready_without_message_driven_io() {
-        let runtime = tempfile::tempdir().unwrap();
-        let present = tempfile::tempdir().unwrap();
+        let runtime = fixture_directory();
+        let present = fixture_directory();
         let missing = present.path().join("missing");
         let paths = vec![present.path().to_owned(), missing.clone()];
         let mut window = WindowProtections::default();
@@ -1395,8 +1467,8 @@ mod tests {
 
     #[test]
     fn failed_scope_retries_after_backoff_and_restores_readiness() {
-        let runtime = tempfile::tempdir().unwrap();
-        let directory = tempfile::tempdir().unwrap();
+        let runtime = fixture_directory();
+        let directory = fixture_directory();
         let paths = vec![directory.path().to_owned()];
         let mut window = WindowProtections::default();
         let now = std::time::Instant::now();
@@ -1432,8 +1504,8 @@ mod tests {
 
     #[test]
     fn device_switch_revokes_readiness_without_exposing_retained_local_editors() {
-        let runtime = tempfile::tempdir().unwrap();
-        let directory = tempfile::tempdir().unwrap();
+        let runtime = fixture_directory();
+        let directory = fixture_directory();
         let guard = acquire(runtime.path(), directory.path(), false).unwrap();
         let path = guard.directory.clone();
         let marker = runtime.path().join("ready");
@@ -1461,8 +1533,8 @@ mod tests {
 
     #[test]
     fn nested_editors_protect_containing_worktrees() {
-        let runtime = tempfile::tempdir().unwrap();
-        let directory = tempfile::tempdir().unwrap();
+        let runtime = fixture_directory();
+        let directory = fixture_directory();
         std::fs::write(directory.path().join(".git"), "gitdir: ignored").unwrap();
         let nested = directory.path().join("nested/folder");
         std::fs::create_dir_all(&nested).unwrap();
@@ -1479,8 +1551,8 @@ mod tests {
 
     #[test]
     fn canonical_aliases_share_one_stable_protection_file() {
-        let runtime = tempfile::tempdir().unwrap();
-        let directory = tempfile::tempdir().unwrap();
+        let runtime = fixture_directory();
+        let directory = fixture_directory();
         let first = acquire(runtime.path(), directory.path(), false).unwrap();
         assert_eq!(
             acquire(runtime.path(), &directory.path().join("."), true)

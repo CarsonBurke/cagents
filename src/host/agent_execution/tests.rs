@@ -1,3 +1,4 @@
+mod automation_removal;
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
 #[cfg(target_os = "linux")]
@@ -36,7 +37,9 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         return None;
     }
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path();
+    // Ordinary fixture paths must agree with canonical project keys even when
+    // the caller's temporary directory has a symlinked parent.
+    let root = directory.path().canonicalize().unwrap();
     for path in [
         "bin",
         "home/.claude",
@@ -81,7 +84,7 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
                 "absent"
             },
         )
-        .env("CAGENTS_EXECUTION_FIXTURE", root)
+        .env("CAGENTS_EXECUTION_FIXTURE", &root)
         .env("HOME", root.join("home"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CONFIG_HOME", root.join("config"))
@@ -462,6 +465,7 @@ fn blocking_owning_close_preserves_a_replacement_installed_during_provider_join(
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
     let spec = ProcessSpec {
+        stdout_noise: None,
         execution: None,
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -867,32 +871,36 @@ fn assert_upgrade_environment(host: &SharedHost, agent: AgentId) {
             "selected {name} must still be compared"
         );
     }
-    let (busy, _) = record.handle.update_activity();
     use crate::update::impact::{Disposition, Policy};
-    for (policy, expected) in [
-        (
-            Policy::WhenIdle,
-            if busy {
-                Disposition::WaitsForIdle
-            } else {
-                Disposition::Resumes
-            },
-        ),
-        (
-            Policy::Interrupt,
-            if busy {
-                Disposition::Interrupted
-            } else {
-                Disposition::Resumes
-            },
-        ),
-    ] {
-        let impact = state.upgrade_impact(policy).unwrap();
-        let impact = impact
-            .sessions
-            .iter()
-            .find(|impact| impact.id == session)
-            .unwrap();
+    // The provider can finish draining between two reads of its activity, so
+    // judge the impact only against activity that held across it.
+    let handle = record.handle.clone();
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    let (busy, impacts) = loop {
+        let (busy, _) = handle.update_activity();
+        let impacts = [Policy::WhenIdle, Policy::Interrupt].map(|policy| {
+            let impact = state.upgrade_impact(policy).unwrap();
+            let impact = impact
+                .sessions
+                .into_iter()
+                .find(|impact| impact.id == session)
+                .unwrap();
+            (policy, impact)
+        });
+        if handle.update_activity().0 == busy {
+            break (busy, impacts);
+        }
+        assert!(
+            Instant::now() < hang_guard,
+            "provider activity never settled"
+        );
+    };
+    for (policy, impact) in impacts {
+        let expected = match (policy, busy) {
+            (_, false) => Disposition::Resumes,
+            (Policy::WhenIdle, true) => Disposition::WaitsForIdle,
+            (Policy::Interrupt, true) => Disposition::Interrupted,
+        };
         assert_eq!(impact.disposition, expected, "{}", impact.reason);
     }
 }
@@ -967,7 +975,7 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
     dispatch_accepted(&host, next.clone()).unwrap();
     let done = settled(&host, next.run.id);
     assert_eq!(
-        reconcile_agent_run(&host, &done, true).unwrap(),
+        reconcile_settled(&host, &done, true),
         Reconciliation::Closed
     );
     assert_eq!(
@@ -1056,8 +1064,222 @@ done
         "interrupt\n"
     );
     assert_eq!(
-        reconcile_agent_run(&host, &finished, true).unwrap(),
+        reconcile_settled(&host, &finished, true),
         Reconciliation::Closed
+    );
+}
+
+/// A provider can take seconds to start after its run is accepted. Its owner
+/// interrupting then withdraws the prompt, since the provider has no turn to
+/// interrupt, and the agent stays usable.
+/// Holds the fixture provider in initialization until the test creates
+/// `initialize-release` beside its home.
+fn hold_provider_initialization(root: &Path) {
+    let provider = root.join("bin/claude");
+    let script = std::fs::read_to_string(&provider).unwrap();
+    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+    let held = r#"      case "$frame" in
+        *'"subtype":"initialize"'*)
+          while [ ! -e "$HOME/../initialize-release" ]; do sleep 0.01; done
+          ;;
+      esac
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+    assert_eq!(script.matches(original).count(), 1);
+    std::fs::write(&provider, script.replace(original, held)).unwrap();
+}
+
+/// Waits until the run's dispatcher has bound its provider and released the
+/// agent's gate to await readiness, before any prompt reaches the provider.
+fn await_undelivered(host: &SharedHost, accepted: &Accepted) {
+    let gate = agent_gate(host, accepted.agent.id);
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    while !gate
+        .lock()
+        .unwrap()
+        .is_some_and(|claim| claim.run == accepted.run.id && !claim.withdrawn)
+    {
+        assert!(
+            Instant::now() < hang_guard,
+            "dispatch never awaited the provider"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn assert_withdrawn(host: &SharedHost, run: RunId) -> Run {
+    let withdrawn = registry(host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent_run(run)
+        .unwrap();
+    assert_eq!(withdrawn.state, State::Cancelled);
+    assert_eq!(
+        withdrawn.result.diagnostic.as_deref(),
+        Some(UNDELIVERED_CANCELLATION)
+    );
+    withdrawn
+}
+
+#[test]
+fn cancelled_automation_waits_for_its_starting_provider_before_release() {
+    if isolated("cancelled_automation_waits_for_its_starting_provider_before_release").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    hold_provider_initialization(&root);
+    let Destination::New(spec) = request.destination.clone() else {
+        unreachable!()
+    };
+    let automation = crate::host::automations::service::create(
+        &host,
+        crate::automations::Definition {
+            name: "Slow start fixture".into(),
+            prompt: request.prompt.clone(),
+            agent: spec,
+            schedule: crate::automations::Schedule {
+                pattern: crate::automations::SchedulePattern::Daily { hour: 3, minute: 0 },
+                timezone: "UTC".into(),
+            },
+            session_mode: crate::automations::SessionMode::Fresh,
+            precheck: None,
+        },
+    )
+    .unwrap();
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .claim_automation(
+            automation.id,
+            automation.execution_revision,
+            None,
+            crate::automations::Trigger::Manual {
+                request: uuid::Uuid::new_v4(),
+            },
+            None,
+            true,
+            now(),
+        )
+        .unwrap()
+        .accepted
+        .unwrap();
+    dispatch_accepted(&host, accepted.clone()).unwrap();
+    await_undelivered(&host, &accepted);
+    cancel_agent_run(&host, &accepted.run).unwrap();
+    let cancelled = assert_withdrawn(&host, accepted.run.id);
+    // The broker retries Busy instead of blocking the automation on a
+    // provider that cannot be released until its startup settles.
+    assert_eq!(
+        reconcile_agent_run(&host, &cancelled, true).unwrap(),
+        Reconciliation::Busy
+    );
+
+    std::fs::write(root.join("initialize-release"), "").unwrap();
+    assert_eq!(
+        reconcile_settled(&host, &cancelled, true),
+        Reconciliation::Closed
+    );
+    assert!(
+        !root.join("prompts").exists(),
+        "the withdrawn prompt never reached the provider"
+    );
+}
+
+#[test]
+fn stopping_a_starting_agent_from_its_chat_withdraws_its_prompt() {
+    if isolated("stopping_a_starting_agent_from_its_chat_withdraws_its_prompt").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    hold_provider_initialization(&root);
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    await_undelivered(&host, &accepted);
+    let HostedSession::Chat(session) = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatAttach {
+            session: session.clone(),
+        },
+    )
+    .unwrap();
+    let stopped = super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatCommand {
+            chat_id: session.id,
+            command: Command::Interrupt,
+        },
+    );
+    assert!(
+        matches!(stopped, Ok(ServerResponse::Accepted)),
+        "{stopped:?}"
+    );
+    assert_withdrawn(&host, accepted.run.id);
+
+    std::fs::write(root.join("initialize-release"), "").unwrap();
+    let gate = agent_gate(&host, accepted.agent.id);
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    while gate.lock().unwrap().is_some() {
+        assert!(Instant::now() < hang_guard, "dispatch never settled");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !root.join("prompts").exists(),
+        "the withdrawn prompt never reached the provider"
+    );
+}
+
+#[test]
+fn interrupting_a_run_whose_provider_is_starting_withdraws_its_prompt() {
+    if isolated("interrupting_a_run_whose_provider_is_starting_withdraws_its_prompt").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    hold_provider_initialization(&root);
+    let owner = Authority::default();
+    let accepted = submit(&host, &owner, request.clone()).unwrap();
+    let agent = accepted.agent.id;
+    await_undelivered(&host, &accepted);
+    let reply = process(
+        &host,
+        owner.clone(),
+        Operation::Control {
+            agent,
+            command: Control::Interrupt {
+                including_subagents: false,
+            },
+        },
+    )
+    .unwrap();
+    assert!(matches!(reply, Reply::Requests(requests) if requests.is_empty()));
+    assert_withdrawn(&host, accepted.run.id);
+
+    std::fs::write(root.join("initialize-release"), "").unwrap();
+    let mut follow_up = request;
+    follow_up.destination = Destination::Existing(agent);
+    follow_up.idempotency_key = "follow-up".into();
+    let next = submit(&host, &owner, follow_up).unwrap();
+    let next = settled(&host, next.run.id);
+    assert_eq!(next.state, State::Succeeded, "{next:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("prompts")).unwrap(),
+        "prompt\n",
+        "only the follow-up reached the provider"
     );
 }
 
@@ -1126,7 +1348,7 @@ fn interactive_work_claims_automation_agent_before_cleanup_or_reuse() {
     )
     .unwrap();
     assert_eq!(
-        reconcile_agent_run(&host, &done, false).unwrap(),
+        reconcile_settled(&host, &done, false),
         Reconciliation::Idle,
         "presentation alone is not takeover"
     );
@@ -1328,11 +1550,24 @@ fn claim_fixture(host: &SharedHost, automation: &crate::automations::Automation)
         .unwrap()
 }
 
+/// Reconciles a settled run as the automation broker does: the registry can
+/// record a run's result before its provider reports itself idle, and the
+/// broker retries `Busy` on its next pass.
+fn reconcile_settled(host: &SharedHost, run: &Run, retire: bool) -> Reconciliation {
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    loop {
+        match reconcile_agent_run(host, run, retire).unwrap() {
+            Reconciliation::Busy => {
+                assert!(Instant::now() < hang_guard, "provider stayed busy");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            reconciliation => return reconciliation,
+        }
+    }
+}
+
 fn release_fixture(host: &SharedHost, run: &Run) {
-    assert_eq!(
-        reconcile_agent_run(host, run, false).unwrap(),
-        Reconciliation::Idle
-    );
+    assert_eq!(reconcile_settled(host, run, false), Reconciliation::Idle);
     let registry = registry(host).unwrap();
     let mut registry = registry.lock().unwrap();
     let firing = registry
@@ -1667,6 +1902,7 @@ fn retained_old_alias_preflights_current_agent_before_real_holder_release() {
         std::fs::File::open(directory).unwrap(),
     ))));
     let process = ProcessSpec {
+        stdout_noise: None,
         execution: Some(context.clone()),
         messages: None,
         transport: TransportSpec::OwnedUnixWebSocket { socket },
@@ -3486,6 +3722,154 @@ fn a_relaunched_parent_keeps_its_agents_and_a_rival_keeps_its_own() {
     close(&host, &rival_next_authority, rival_child.agent.id).unwrap();
     exit(second);
     exit(rival_next);
+}
+
+#[test]
+fn full_mailbox_replies_are_retryable_without_reclassifying_invalid_requests() {
+    use crate::{
+        agent_execution::{
+            AcceptanceError, Lineage,
+            mailbox::{
+                Inbox, MAX_PENDING, Message, Outgoing, Party, Receipt, State as Delivery, To,
+            },
+        },
+        model::MessageId,
+        terminal::ipc::{ClientRequest, ProtocolErrorCode, ServerResponse},
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let host = crate::host::service::test_host();
+    host.lock()
+        .unwrap()
+        .install_model(Registry::at(&directory.path().join("mailbox.sqlite3")).unwrap());
+    let store = registry(&host).unwrap();
+    let recipient = Party {
+        lineage: Some(Lineage(TerminalId::new())),
+        session: None,
+        title: Some("Busy recipient".into()),
+    };
+    let message = |from, to, created_ms| Message {
+        id: MessageId::new(),
+        from,
+        to,
+        reply_to: None,
+        body: "Retain this fixture message".into(),
+        wait_until_ms: None,
+        state: Delivery::Pending,
+        created_ms,
+    };
+    let incoming = message(recipient.clone(), Party::user(), 0);
+    store.lock().unwrap().post_message(&incoming).unwrap();
+    for at in 0..MAX_PENDING {
+        store
+            .lock()
+            .unwrap()
+            .post_message(&message(Party::user(), recipient.clone(), at as u64))
+            .unwrap();
+    }
+    let query = Inbox {
+        all: false,
+        replies_to: None,
+    };
+    let pending = || {
+        store
+            .lock()
+            .unwrap()
+            .peek_messages(recipient.lineage, &query)
+            .unwrap()
+    };
+    let before = pending();
+    let outgoing = Outgoing {
+        to: To::Sender(incoming.id.to_string()),
+        body: "A reply must wait for an actual mailbox slot".into(),
+        wait_ms: None,
+    };
+    // Synthetic User scope resolves normally in this temporary registry. This
+    // fixture neither removes inherited authority nor proves a deployed caller.
+    assert!(matches!(
+        process_request(
+            &host,
+            Authority::default(),
+            Operation::SendMessage(outgoing.clone())
+        ),
+        Err(AcceptanceError::MailboxFull(_))
+    ));
+    let invoke = |authority, outgoing| {
+        crate::host::client::process_request(
+            &host,
+            1,
+            ClientRequest::Agent {
+                authority,
+                operation: Operation::SendMessage(outgoing),
+            },
+        )
+        .map(|(reply, _, _)| reply)
+    };
+    let refusal = invoke(Authority::default(), outgoing.clone()).unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::QueueFull);
+    assert!(refusal.retryable);
+    assert!(refusal.message.contains(&recipient.short().unwrap()));
+    assert!(refusal.message.contains(&MAX_PENDING.to_string()));
+    assert!(refusal.message.contains("once it has read them"));
+
+    let mut empty = outgoing.clone();
+    empty.body.clear();
+    let mut unknown = outgoing.clone();
+    unknown.to = To::Session(TerminalId::new().to_string());
+    let mut foreign_reply = outgoing.clone();
+    foreign_reply.to = To::Sender(MessageId::new().to_string());
+    for (authority, outgoing) in [
+        (Authority::default(), empty),
+        (Authority::default(), unknown),
+        (Authority::default(), foreign_reply),
+        // A fresh unregistered fixture token must not disclose queue capacity.
+        (
+            Authority::session(uuid::Uuid::new_v4().to_string()),
+            outgoing.clone(),
+        ),
+    ] {
+        let refusal = invoke(authority, outgoing).unwrap_err();
+        assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
+        assert!(!refusal.retryable);
+    }
+    assert_eq!(pending(), before, "no refusal inserts or consumes mail");
+    assert_eq!(
+        store.lock().unwrap().message(incoming.id).unwrap(),
+        Some(incoming.clone())
+    );
+    // Only an exact recipient receipt frees a slot. The service has no courier
+    // or provider here; explicit resubmission must durably fill just that slot.
+    store
+        .lock()
+        .unwrap()
+        .acknowledge_messages(
+            recipient.lineage,
+            None,
+            &Receipt {
+                ids: vec![before[0].id],
+            },
+            now(),
+        )
+        .unwrap();
+    let ServerResponse::Agent(Reply::Sent(sent)) =
+        invoke(Authority::default(), outgoing.clone()).unwrap()
+    else {
+        panic!("one exact read must permit one explicit reply");
+    };
+    assert_eq!(sent.message.reply_to, Some(incoming.id));
+    let after = pending();
+    assert_eq!(after.len(), MAX_PENDING);
+    assert!(after.contains(&sent.message));
+    assert!(before[1..].iter().all(|message| after.contains(message)));
+    let refusal = invoke(Authority::default(), outgoing.clone()).unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::QueueFull);
+    assert!(refusal.retryable);
+    assert_eq!(pending(), after);
+
+    host.lock().unwrap().execution_registry = None;
+    let refusal = invoke(Authority::default(), outgoing).unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
+    assert!(!refusal.retryable);
 }
 
 #[test]

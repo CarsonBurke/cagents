@@ -87,7 +87,10 @@ struct Daemon {
 
 impl Daemon {
     fn start(fail_first: bool) -> Self {
-        Self::configured(fail_first, None)
+        Self::configured(fail_first, None, false)
+    }
+    fn lost_start_reply() -> Self {
+        Self::configured(false, None, true)
     }
     fn preflight() -> (
         Self,
@@ -107,9 +110,13 @@ impl Daemon {
             rejected,
             rejection,
         };
-        (Self::configured(false, Some(script)), observation, release)
+        (
+            Self::configured(false, Some(script), false),
+            observation,
+            release,
+        )
     }
-    fn configured(fail_first: bool, preflight: Option<Preflight>) -> Self {
+    fn configured(fail_first: bool, preflight: Option<Preflight>, lose_first_reply: bool) -> Self {
         let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(socket).unwrap();
@@ -204,10 +211,15 @@ impl Daemon {
                                     snapshot: crate::chat::Snapshot {
                                         ready: true,
                                         session_id: session.launch.session_id.clone(),
+                                        native_continuity: session.native_continuity.clone(),
                                         ..Default::default()
                                     },
                                     session,
                                 }
+                            }
+                            ClientRequest::ChatPrepareResume { source } => {
+                                assert!(admitted.lock().unwrap().contains(&source));
+                                ServerResponse::ChatResumePrepared { session: source }
                             }
                             ClientRequest::ChatStart { mut session, .. } => {
                                 let count = {
@@ -274,11 +286,22 @@ impl Daemon {
                                     }
                                 }
                                 pending.lock().unwrap().remove(&session.id);
+                                // The real HOST publishes installed Claude
+                                // continuity at successful admission, while a
+                                // pending request remains ReconnectOnly.
+                                session.native_continuity = crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
                                 admitted.lock().unwrap().push(session.clone());
+                                if lose_first_reply && count == 1 {
+                                    // Admission succeeded; only its reply is lost.
+                                    // Retrying must discover this owner, not start twice.
+                                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                                    break;
+                                }
                                 ServerResponse::ChatAttached {
                                     snapshot: crate::chat::Snapshot {
                                         ready: true,
                                         session_id: session.launch.session_id.clone(),
+                                        native_continuity: session.native_continuity.clone(),
                                         ..Default::default()
                                     },
                                     session,
@@ -550,6 +573,23 @@ fn failed_history_start_can_retry() {
         .id;
     assert!(!app.chat_start_pending(card));
     assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+    let CardKind::Chat(source) = app.card_state(card).unwrap().kind.clone() else {
+        unreachable!()
+    };
+    assert_eq!(
+        app.chat_retry_intent(card, &source),
+        crate::chat::Intent::RetryStart
+    );
+    let mut changed = source.clone();
+    changed
+        .launch
+        .recipe
+        .arguments
+        .push("--different-conversation-config".into());
+    assert_eq!(
+        app.chat_retry_intent(card, &changed),
+        crate::chat::Intent::Restore
+    );
     // Exercise the same Retry action the Failed card exposes. No direct
     // removal of the failed runtime may manufacture a fresh reservation.
     let retry = app.update(Message::RetryCard(card));
@@ -558,6 +598,41 @@ fn failed_history_start_can_retry() {
     assert!(!app.chat_start_pending(card));
     assert!(
         matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.session.proof.as_ref().is_some_and(HostSessionProof::is_complete))
+    );
+}
+
+#[test]
+fn history_retry_after_lost_start_reply_attaches_without_another_start() {
+    if isolated("history_retry_after_lost_start_reply_attaches_without_another_start") {
+        return;
+    }
+    let daemon = Daemon::lost_start_reply();
+    let (_root, mut app, _scope, task) = begin_history();
+    super::startup_admission::settle_observing(&mut app, task, |_, message| Some(message));
+    let card = app
+        .durable
+        .cards
+        .iter()
+        .find(|card| matches!(card.kind, CardKind::Chat(_)))
+        .unwrap()
+        .id;
+    assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+    assert_eq!(daemon.starts().len(), 1);
+    let retry = app.update(Message::RetryCard(card));
+    super::startup_admission::settle_observing(&mut app, retry, |_, message| Some(message));
+    assert_eq!(
+        daemon.starts().len(),
+        1,
+        "lost acknowledgement must not duplicate the provider start"
+    );
+    assert_eq!(daemon.attaches.lock().unwrap().len(), 1);
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("retry must attach the admitted exact owner")
+    };
+    assert_eq!(runtime.session, daemon.attaches.lock().unwrap()[0]);
+    assert_eq!(
+        app.chat_retry_intent(card, &runtime.session),
+        crate::chat::Intent::Restore
     );
 }
 
