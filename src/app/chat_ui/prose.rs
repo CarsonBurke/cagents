@@ -24,16 +24,19 @@ fn link(target: Target, uri: markdown::Uri) -> Message {
     action(Action::OpenSharedDocument(target, uri))
 }
 
-/// A fenced block ready to draw: all of its lines as one paragraph of spans,
-/// once per palette, in the order [`crate::diff_view::SyntaxLines`] uses.
+/// A fenced block ready to draw: its highlighting in each palette, in the
+/// order [`crate::diff_view::SyntaxLines`] uses.
 ///
 /// Built once when the block's text changes, so a frame costs a reference
-/// count rather than a pass over the block's lines. A block opened to be
-/// [extended](Self::extend) keeps where its last whole line left the
-/// highlighter, so the fence an answer is still writing costs a refresh the
-/// lines that arrived in it rather than every line it has.
+/// count rather than a pass over the block's lines. The highlighting is kept
+/// as [runs](Highlight) over the block's text rather than as spans: an answer
+/// holds every fence it has for as long as it is open, while only the rows on
+/// screen draw one. A block opened to be [extended](Self::extend) keeps where
+/// its last whole line left the highlighter, so the fence an answer is still
+/// writing costs a refresh the lines that arrived in it rather than every
+/// line it has.
 pub(super) struct CodeBlock {
-    spans: [Arc<[Span<'static, markdown::Uri>]>; 2],
+    palettes: [Highlight; 2],
     /// Where the block resumes if its text grows, for as long as it may.
     tail: Option<Tail>,
 }
@@ -46,39 +49,236 @@ struct Tail {
     /// The grammar's state after the whole lines; `None` for a block drawn
     /// plain.
     highlighter: Option<crate::diff_view::SnippetHighlighter>,
-    /// How many bytes of the block its whole lines are.
-    text: usize,
-    /// How many of each palette's spans draw them.
-    spans: [usize; 2],
+    /// The whole lines a highlighted block was continued from, which more of
+    /// the same fence starts with. Empty for a plain block, whose drawing
+    /// depends on nothing but the text it is given.
+    text: String,
+    /// How many of each palette's runs draw them.
+    runs: [usize; 2],
+}
+
+/// One palette's highlighting of a block: where each token of its text ends
+/// and the style it is set in, without the text itself.
+///
+/// A token costs a few bytes here rather than a span and a copy of its text
+/// (#1072). [`Self::spans`] turns a range of the block's text back into the
+/// spans the block always drew, for the rows that are being drawn. Line
+/// endings are not tokens: a run's text starts where the one before it ended,
+/// and spans are cut at each line. A plain block keeps no runs at all.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Highlight(Arc<Runs>);
+
+#[derive(Debug, Default)]
+struct Runs {
+    /// Whether the block is highlighted at all: an empty highlighted line
+    /// draws nothing but its ending, where a plain one draws an empty span.
+    highlighted: bool,
+    runs: Box<[Run]>,
+    styles: Box<[Style]>,
+    /// The whole block drawn, for as long as a row drawing it holds it. A
+    /// block short enough to be one paragraph is drawn whole every time its
+    /// row is built, and a paragraph shapes again whenever its spans are new
+    /// ones; a row scrolled away lets them go.
+    all: std::sync::Mutex<Option<std::sync::Weak<[Span<'static, markdown::Uri>]>>>,
+}
+
+/// Runs draw the same where they end at the same bytes in the same styles,
+/// whatever order a block streamed in pieces first met those styles in.
+impl PartialEq for Runs {
+    fn eq(&self, other: &Self) -> bool {
+        self.highlighted == other.highlighted
+            && self.runs.len() == other.runs.len()
+            && self.runs.iter().zip(&other.runs).all(|(run, theirs)| {
+                run.end == theirs.end
+                    && self.styles[usize::from(run.style)]
+                        == other.styles[usize::from(theirs.style)]
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Run {
+    end: u32,
+    style: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Style {
+    color: Option<iced::Color>,
+    font: Option<iced::Font>,
+}
+
+impl PartialEq for Highlight {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+impl Highlight {
+    pub(super) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Whether this highlighting is still held anywhere, asked later.
+    #[cfg(test)]
+    pub(super) fn watch(&self) -> impl Fn() -> bool + use<> {
+        let weak = Arc::downgrade(&self.0);
+        move || weak.strong_count() > 0
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.0.runs) + std::mem::size_of_val(&*self.0.styles)
+    }
+
+    /// The spans that draw all of `text`, the block this highlights; the
+    /// same ones each time for a block short enough to be [one
+    /// paragraph](CodeBlock::PARAGRAPH).
+    pub(super) fn all(&self, text: &str) -> Arc<[Span<'static, markdown::Uri>]> {
+        if text.len() > CodeBlock::PARAGRAPH {
+            return self.spans(text, 0..text.len());
+        }
+        let mut all = self
+            .0
+            .all
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(drawn) = all.as_ref().and_then(std::sync::Weak::upgrade) {
+            debug_assert_eq!(
+                drawn.iter().map(|span| span.text.len()).sum::<usize>(),
+                text.len(),
+                "a highlight draws the one block it was made for"
+            );
+            return drawn;
+        }
+        let drawn = self.spans(text, 0..text.len());
+        *all = Some(Arc::downgrade(&drawn));
+        drawn
+    }
+
+    /// The spans that draw `range` of `text`, the block this highlights:
+    /// each line's tokens in their styles, then its ending on its own. A line
+    /// the monospace face covers names that face, so shaping does not rank
+    /// every installed face for it. `range` starts and ends at lines.
+    pub(super) fn spans(
+        &self,
+        text: &str,
+        range: std::ops::Range<usize>,
+    ) -> Arc<[Span<'static, markdown::Uri>]> {
+        let Runs {
+            highlighted,
+            runs,
+            styles,
+            ..
+        } = &*self.0;
+        let mut spans = Vec::new();
+        let mut run = runs.partition_point(|run| (run.end as usize) <= range.start);
+        let mut start = range.start;
+        for source in text[range].split_inclusive('\n') {
+            let (line, ending) = if source.ends_with("\r\n") {
+                (&source[..source.len() - 2], "\r\n")
+            } else if source.ends_with('\n') {
+                (&source[..source.len() - 1], "\n")
+            } else {
+                (source, "")
+            };
+            let first = spans.len();
+            if !highlighted {
+                spans.push(Span::new(line.to_owned()));
+            } else {
+                let end = start + line.len();
+                let mut at = start;
+                while at < end {
+                    while runs.get(run).is_some_and(|run| (run.end as usize) <= at) {
+                        run += 1;
+                    }
+                    let (until, style) = runs.get(run).map_or((end, Style::default()), |run| {
+                        ((run.end as usize).min(end), styles[usize::from(run.style)])
+                    });
+                    let mut span = Span::new(text[at..until].to_owned());
+                    span.color = style.color;
+                    span.font = style.font;
+                    spans.push(span);
+                    at = until;
+                }
+            }
+            if monospace::covers(line) {
+                for span in &mut spans[first..] {
+                    span.font = Some(monospace::concrete(span.font.unwrap_or(CodeBlock::FONT)));
+                }
+            }
+            if !ending.is_empty() {
+                spans.push(Span::new(ending));
+            }
+            start += source.len();
+        }
+        spans.into()
+    }
+}
+
+/// A palette's runs as a block is written: the runs and the styles they
+/// name, each style once.
+#[derive(Default)]
+struct Writer {
+    runs: Vec<Run>,
+    styles: Vec<Style>,
+}
+
+impl Writer {
+    fn resume(highlight: &Highlight, runs: usize) -> Self {
+        Self {
+            runs: highlight.0.runs[..runs].to_vec(),
+            styles: highlight.0.styles.to_vec(),
+        }
+    }
+
+    /// Ends the run `span` starts at `end`, a byte of the block.
+    fn push(&mut self, end: usize, span: &Span<'_>) {
+        let style = Style {
+            color: span.color,
+            font: span.font,
+        };
+        let index = self
+            .styles
+            .iter()
+            .position(|known| *known == style)
+            .unwrap_or_else(|| {
+                self.styles.push(style);
+                self.styles.len() - 1
+            });
+        self.runs.push(Run {
+            end: u32::try_from(end).expect("a highlighted block is within the highlight limit"),
+            style: u16::try_from(index).expect("a theme has fewer styles than a block has bytes"),
+        });
+    }
+
+    fn finish(self) -> Highlight {
+        Highlight(Arc::new(Runs {
+            highlighted: true,
+            runs: self.runs.into(),
+            styles: self.styles.into(),
+            all: Default::default(),
+        }))
+    }
 }
 
 impl CodeBlock {
-    /// Owned span storage and logical text bytes. Plain palettes share their
-    /// Arc; count that backing only once. Highlighter state is not estimated.
-    pub(super) fn retained_span_bytes(&self) -> usize {
-        let bytes = |spans: &Arc<[Span<'static, markdown::Uri>]>| {
-            spans.len() * std::mem::size_of::<Span<'static, markdown::Uri>>()
-                + spans
-                    .iter()
-                    .map(|span| {
-                        let text: &str = span.text.as_ref();
-                        text.len()
-                    })
-                    .sum::<usize>()
-        };
-        bytes(&self.spans[0])
-            + if Arc::ptr_eq(&self.spans[0], &self.spans[1]) {
+    /// Owned highlighting storage. A plain block's palettes share one
+    /// backing; count it once. Highlighter state is not estimated.
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.palettes[0].retained_bytes()
+            + if self.palettes[0].ptr_eq(&self.palettes[1]) {
                 0
             } else {
-                bytes(&self.spans[1])
+                self.palettes[1].retained_bytes()
             }
+            + self.tail.as_ref().map_or(0, |tail| tail.text.capacity())
     }
 
     /// Share immutable prepared palettes across worker snapshots. Streaming
     /// highlighter continuations are never cloned or transferred this way.
     pub(super) fn settled_clone(&self) -> Self {
         Self {
-            spans: self.spans.clone(),
+            palettes: self.palettes.clone(),
             tail: None,
         }
     }
@@ -86,6 +286,10 @@ impl CodeBlock {
     /// The font a block's paragraph is set in. Its spans name their own only
     /// where highlighting or [`monospace`] chose one, relative to this.
     pub(super) const FONT: iced::Font = iced::Font::MONOSPACE;
+
+    /// The most bytes of a block drawn as one paragraph; a longer one is drawn
+    /// a row per line.
+    pub(super) const PARAGRAPH: usize = 2048;
 
     /// A block that will not change.
     pub(super) fn new(
@@ -105,14 +309,14 @@ impl CodeBlock {
         theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
         let mut block = Self {
-            spans: Default::default(),
+            palettes: Default::default(),
             tail: Some(Tail {
                 language: language.map(str::to_owned),
                 highlighter: language
                     .filter(|_| Self::highlighted(code))
                     .map(|language| crate::diff_view::SnippetHighlighter::new(language, theme)),
-                text: 0,
-                spans: [0; 2],
+                text: String::new(),
+                runs: [0; 2],
             }),
         };
         block.write(code);
@@ -136,15 +340,9 @@ impl CodeBlock {
             return false;
         };
         let wanted = language.is_some() && Self::highlighted(code);
-        let mut rest = code.get(..tail.text);
-        let unchanged = self.spans[0][..tail.spans[0]].iter().all(|span| {
-            rest = rest.and_then(|rest| rest.strip_prefix(span.text.as_ref()));
-            rest.is_some()
-        });
         if tail.language.as_deref() != language
             || tail.highlighter.is_some() != wanted
-            || !unchanged
-            || rest != Some("")
+            || !code.starts_with(tail.text.as_str())
         {
             return false;
         }
@@ -157,99 +355,68 @@ impl CodeBlock {
         self.tail = None;
     }
 
-    /// Draws everything in `code` past the block's whole lines.
+    /// Highlights everything in `code` past the block's whole lines.
     fn write(&mut self, code: &str) {
         let Some(tail) = &mut self.tail else {
             return;
         };
-        let palettes = if tail.highlighter.is_some() { 2 } else { 1 };
-        let mut spans: [Vec<Span<'static, markdown::Uri>>; 2] = Default::default();
-        for (index, spans) in spans.iter_mut().enumerate().take(palettes) {
-            spans.extend_from_slice(&self.spans[index][..tail.spans[index]]);
-        }
-        for source in code[tail.text..].split_inclusive('\n') {
+        let Some(highlighter) = &mut tail.highlighter else {
+            // A plain block has no runs in either palette, but what it drew
+            // whole was its old text.
+            self.palettes = Default::default();
+            return;
+        };
+        let mut palettes =
+            [0, 1].map(|index| Writer::resume(&self.palettes[index], tail.runs[index]));
+        let mut start = tail.text.len();
+        for source in code[start..].split_inclusive('\n') {
             let whole = source.ends_with('\n');
-            let syntax = tail.highlighter.as_mut().map(|highlighter| {
-                if whole {
-                    highlighter.line(source)
-                } else {
-                    highlighter.unfinished(source)
+            let syntax = if whole {
+                highlighter.line(source)
+            } else {
+                highlighter.unfinished(source)
+            };
+            let line = source
+                .strip_suffix("\r\n")
+                .or_else(|| source.strip_suffix('\n'))
+                .unwrap_or(source);
+            for (writer, syntax) in palettes.iter_mut().zip(&syntax) {
+                let mut end = start;
+                for span in crate::diff_view::syntax_spans(line, syntax) {
+                    end += span.text.len();
+                    writer.push(end, &span);
                 }
-            });
-            for (index, spans) in spans.iter_mut().enumerate().take(palettes) {
-                line(
-                    source,
-                    syntax.as_ref().map(|syntax| syntax[index].as_slice()),
-                    spans,
-                );
             }
+            start += source.len();
             if whole {
-                tail.text += source.len();
-                tail.spans = [spans[0].len(), spans[1].len()];
+                tail.text.push_str(source);
+                tail.runs = [palettes[0].runs.len(), palettes[1].runs.len()];
             }
         }
-        let [light, dark] = spans;
-        let light: Arc<[_]> = light.into();
+        self.palettes = palettes.map(Writer::finish);
+    }
+
+    /// The block's highlighting in the palette the current appearance uses.
+    pub(super) fn highlight(&self, dark: bool) -> &Highlight {
+        &self.palettes[usize::from(dark)]
+    }
+
+    /// All of `code` drawn in each palette, for text short enough to keep
+    /// drawn rather than draw from its runs every time it is shown.
+    pub(super) fn drawn(
+        language: Option<&str>,
+        code: &str,
+        theme: crate::settings::EditorSyntaxTheme,
+    ) -> [Arc<[Span<'static, markdown::Uri>]>; 2] {
+        let block = Self::new(language, code, theme);
+        let light = block.highlight(false).all(code);
         // A plain block is the same in both palettes.
-        let dark = if palettes == 2 {
-            dark.into()
+        let dark = if block.highlight(true).0.highlighted {
+            block.highlight(true).all(code)
         } else {
             light.clone()
         };
-        self.spans = [light, dark];
-    }
-
-    /// The block's spans in the palette the current appearance uses.
-    pub(super) fn spans(&self, dark: bool) -> &Arc<[Span<'static, markdown::Uri>]> {
-        &self.spans[usize::from(dark)]
-    }
-}
-
-/// Adds one source line of a block to `spans`, under `syntax` where the block
-/// is highlighted.
-fn line(
-    source: &str,
-    syntax: Option<&[crate::diff_view::SyntaxSpan]>,
-    spans: &mut Vec<Span<'static, markdown::Uri>>,
-) {
-    let (line, ending) = if let Some(line) = source.strip_suffix("\r\n") {
-        (line, "\r\n")
-    } else if let Some(line) = source.strip_suffix('\n') {
-        (line, "\n")
-    } else {
-        (source, "")
-    };
-    let start = spans.len();
-    match syntax {
-        Some(syntax) => spans.extend(
-            crate::diff_view::syntax_spans(line, syntax)
-                .into_iter()
-                .map(|span| {
-                    let span = span.to_static();
-                    Span {
-                        text: span.text,
-                        size: span.size,
-                        line_height: span.line_height,
-                        font: span.font,
-                        color: span.color,
-                        link: None,
-                        highlight: span.highlight,
-                        padding: span.padding,
-                        underline: span.underline,
-                        strikethrough: span.strikethrough,
-                    }
-                }),
-        ),
-        None => spans.push(Span::new(line.to_owned())),
-    }
-    // The same glyphs, found without ranking every installed face per word.
-    if monospace::covers(line) {
-        for span in &mut spans[start..] {
-            span.font = Some(monospace::concrete(span.font.unwrap_or(CodeBlock::FONT)));
-        }
-    }
-    if !ending.is_empty() {
-        spans.push(Span::new(ending));
+        [light, dark]
     }
 }
 
@@ -262,14 +429,14 @@ pub(super) fn fence_language(info: &str) -> Option<&str> {
         .find(|word| !word.is_empty())
 }
 
-pub(super) type PaletteMap = HashMap<u64, Arc<[Span<'static, markdown::Uri>]>>;
+pub(super) type PaletteMap = HashMap<u64, Highlight>;
 pub(super) type Palettes = [Arc<PaletteMap>; 2];
 pub(super) fn palettes(blocks: &HashMap<u64, CodeBlock>) -> Palettes {
     std::array::from_fn(|dark| {
         Arc::new(
             blocks
                 .iter()
-                .map(|(key, block)| (*key, block.spans(dark != 0).clone()))
+                .map(|(key, block)| (*key, block.highlight(dark != 0).clone()))
                 .collect(),
         )
     })
@@ -284,7 +451,7 @@ fn palette(cached: &CachedItem, dark: bool) -> Arc<PaletteMap> {
                 cached
                     .blocks
                     .iter()
-                    .map(|(key, block)| (*key, block.spans(dark).clone()))
+                    .map(|(key, block)| (*key, block.highlight(dark).clone()))
                     .collect(),
             )
         })
@@ -418,7 +585,7 @@ struct Renderer {
     path: Vec<u32>,
     find: Option<u64>,
     target: Target,
-    blocks: Arc<HashMap<u64, Arc<[Span<'static, markdown::Uri>]>>>,
+    blocks: Arc<PaletteMap>,
     revision: u64,
     dark: bool,
 }
@@ -852,23 +1019,16 @@ impl Renderer {
         source: &Arc<str>,
         reader_source: &super::reader_source::Source,
     ) -> Element<'static, Message> {
-        let spans = (code.len() <= CachedItem::HIGHLIGHT_LIMIT)
+        let highlight = (code.len() <= CachedItem::HIGHLIGHT_LIMIT)
             .then(|| {
                 self.blocks
                     .get(&fence_key(language.unwrap_or_default(), code))
             })
             .flatten()
-            .cloned()
-            .unwrap_or_else(|| {
-                if code.len() > 2048 {
-                    Arc::from([])
-                } else {
-                    vec![Span::new(code.as_ref().to_owned())].into()
-                }
-            });
+            .cloned();
         let text = code_text(
             source.clone(),
-            spans,
+            highlight,
             settings.code_size,
             CodeBlock::FONT,
             self.target,
@@ -989,7 +1149,7 @@ fn leaf_text(
 /// ranges. The logical block keeps source newlines intact for selection/copy.
 pub(super) fn code_text(
     text: Arc<str>,
-    spans: Arc<[Span<'static, markdown::Uri>]>,
+    highlight: Option<Highlight>,
     size: iced::Pixels,
     font: iced::Font,
     target: Target,
@@ -998,20 +1158,13 @@ pub(super) fn code_text(
     flow_cache: Option<flow_layout::Cache>,
     reader_source: Option<reader_source::Source>,
 ) -> Element<'static, Message> {
-    if text.len() <= 2048 {
-        let spans = if spans.is_empty() {
-            vec![Span::new(text.to_string())].into()
-        } else {
-            spans
-        };
+    if text.len() <= CodeBlock::PARAGRAPH {
+        let spans = highlight
+            .map(|highlight| highlight.all(&text))
+            .filter(|spans| !spans.is_empty())
+            .unwrap_or_else(|| vec![Span::new(text.to_string())].into());
         return leaf_text(spans, size, font, target, find, logical);
     }
-    let mut starts = Vec::with_capacity(spans.len() + 1);
-    starts.push(0usize);
-    for span in spans.iter() {
-        starts.push(starts.last().copied().unwrap() + span.text.len());
-    }
-    let starts: Arc<[usize]> = starts.into();
     let find = find.map(|_| find_navigation::render_revision(target));
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -1044,8 +1197,7 @@ pub(super) fn code_text(
                 .hash(&mut revision);
             let revision = revision.finish();
             let text = text.clone();
-            let spans = spans.clone();
-            let starts = starts.clone();
+            let highlight = highlight.clone();
             let find = find;
             let flow_cache = flow_cache.clone();
             let reader_source = reader_source.clone();
@@ -1080,8 +1232,7 @@ pub(super) fn code_text(
                 }
                 code_line(
                     text.clone(),
-                    spans.clone(),
-                    starts.clone(),
+                    highlight.clone(),
                     display,
                     size,
                     font,
@@ -1102,8 +1253,7 @@ pub(super) fn code_text(
 
 fn code_line(
     text: Arc<str>,
-    spans: Arc<[Span<'static, markdown::Uri>]>,
-    starts: Arc<[usize]>,
+    highlight: Option<Highlight>,
     range: std::ops::Range<usize>,
     size: iced::Pixels,
     font: iced::Font,
@@ -1129,7 +1279,7 @@ fn code_line(
                 .map_or(range.start, |logical| logical.start),
         )
             .hash(&mut key);
-        let flow = cache.code_entry(key.finish(), text, range, spans, starts, source);
+        let flow = cache.code_entry(key.finish(), text, range, highlight, source);
         return selectable_prose::flow_source_optional(
             size,
             font,
@@ -1139,44 +1289,11 @@ fn code_line(
             flow,
         );
     }
-    let styled = if spans.is_empty() {
-        vec![Span::new(text[range.clone()].to_owned())].into()
-    } else {
-        sliced_spans(&spans, &starts, range)
+    let styled = match highlight {
+        Some(highlight) => highlight.spans(&text, range),
+        None => vec![Span::new(text[range].to_owned())].into(),
     };
     leaf_text(styled, size, font, target, find.map(|_| ""), logical)
-}
-
-pub(super) fn sliced_spans(
-    spans: &[Span<'static, markdown::Uri>],
-    starts: &[usize],
-    range: std::ops::Range<usize>,
-) -> Arc<[Span<'static, markdown::Uri>]> {
-    let first = starts
-        .partition_point(|start| *start <= range.start)
-        .saturating_sub(1);
-    spans
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take_while(|(index, _)| starts[*index] < range.end)
-        .filter_map(|(index, span)| {
-            let start = range.start.saturating_sub(starts[index]);
-            let end = range.end.saturating_sub(starts[index]).min(span.text.len());
-            (start < end).then(|| Span {
-                text: span.text[start..end].to_owned().into(),
-                size: span.size,
-                line_height: span.line_height,
-                font: span.font,
-                color: span.color,
-                link: span.link.clone(),
-                highlight: span.highlight,
-                padding: span.padding,
-                underline: span.underline,
-                strikethrough: span.strikethrough,
-            })
-        })
-        .collect()
 }
 
 /// A bounded visual chunk. Copy and selection keep the original logical
@@ -1963,7 +2080,7 @@ mod tests {
             ] {
                 let mut actual = code_text(
                     Arc::from(source.as_str()),
-                    Arc::from([]),
+                    None,
                     size,
                     CodeBlock::FONT,
                     target,
@@ -2044,7 +2161,7 @@ mod tests {
             let flow_cache = flow_layout::Cache::default();
             let mut element = code_text(
                 source.clone(),
-                Arc::from([]),
+                None,
                 14.0.into(),
                 CodeBlock::FONT,
                 target,
@@ -2159,7 +2276,7 @@ mod tests {
             let cache = flow_layout::Cache::default();
             let mut element = code_text(
                 source.clone(),
-                Arc::from([]),
+                None,
                 14.0.into(),
                 CodeBlock::FONT,
                 Target {
@@ -2619,7 +2736,8 @@ mod tests {
                     CodeBlock::new(language, code, crate::settings::EditorSyntaxTheme::Auto);
                 for dark in [false, true] {
                     let rendered = block
-                        .spans(dark)
+                        .highlight(dark)
+                        .all(code)
                         .iter()
                         .map(|span| span.text.as_ref())
                         .collect::<String>();
@@ -2680,12 +2798,13 @@ mod tests {
 
     fn assert_draws(
         block: &CodeBlock,
+        code: &str,
         expected: &[Vec<Span<'static, markdown::Uri>>; 2],
         case: &str,
     ) {
         for dark in [false, true] {
             assert_eq!(
-                block.spans(dark).as_ref(),
+                block.highlight(dark).all(code).as_ref(),
                 expected[usize::from(dark)].as_slice(),
                 "{case}, dark: {dark}"
             );
@@ -2766,6 +2885,7 @@ mod tests {
                             if short(&code) || end == code.len() {
                                 assert_draws(
                                     &block,
+                                    prefix,
                                     &reference(language, prefix, theme),
                                     &format!("{name} {language:?} at {end}"),
                                 );
@@ -2786,6 +2906,7 @@ mod tests {
                 for language in [Some("rust"), Some("sh"), None] {
                     assert_draws(
                         &CodeBlock::new(language, &code, theme),
+                        &code,
                         &reference(language, &code, theme),
                         name,
                     );
@@ -2805,12 +2926,14 @@ mod tests {
         assert!(block.extend(Some("rust"), "let a = 1;\n/* open\n"));
         assert_draws(
             &block,
+            "let a = 1;\n/* open\n",
             &reference(Some("rust"), "let a = 1;\n/* open\n", theme),
             "the closed fence",
         );
         assert!(block.extend(Some("rust"), "let a = 1;\n/* open\nstill */ b();\n"));
         assert_draws(
             &block,
+            "let a = 1;\n/* open\nstill */ b();\n",
             &reference(Some("rust"), "let a = 1;\n/* open\nstill */ b();\n", theme),
             "a fence that carried on instead",
         );
@@ -2830,7 +2953,12 @@ mod tests {
             (None, "fn main() {\n    let x = 1;\n}\n"),
         ] {
             assert!(!block.extend(language, other), "{language:?} {other:?}");
-            assert_draws(&block, &reference(Some("rust"), code, theme), "refused");
+            assert_draws(
+                &block,
+                code,
+                &reference(Some("rust"), code, theme),
+                "refused",
+            );
         }
         let mut settled = CodeBlock::new(Some("rust"), code, theme);
         assert!(!settled.extend(Some("rust"), "fn main() {\n    let x = 1;\n}\n"));
@@ -2847,21 +2975,140 @@ mod tests {
         assert!(small.len() <= CachedItem::HIGHLIGHT_LIMIT && large.len() > small.len());
         let mut block = CodeBlock::open(Some("rust"), &small[..small.len() / 2], theme);
         assert!(block.extend(Some("rust"), &small));
-        assert!(block.spans(true).iter().any(|span| span.color.is_some()));
+        assert!(
+            block
+                .highlight(true)
+                .all(&small)
+                .iter()
+                .any(|span| span.color.is_some())
+        );
         assert!(!block.extend(Some("rust"), &large));
         let mut plain = CodeBlock::open(Some("rust"), &large, theme);
         assert_draws(
             &plain,
+            &large,
             &reference(Some("rust"), &large, theme),
             "over the limit",
         );
-        assert!(plain.spans(true).iter().all(|span| span.color.is_none()));
+        assert!(
+            plain
+                .highlight(true)
+                .all(&large)
+                .iter()
+                .all(|span| span.color.is_none())
+        );
         let larger = format!("{large}{line}let tail");
         assert!(plain.extend(Some("rust"), &larger));
         assert_draws(
             &plain,
+            &larger,
             &reference(Some("rust"), &larger, theme),
             "and growing",
+        );
+    }
+
+    /// A row draws a line of a block from the block's runs alone. Every line
+    /// drawn that way is what the whole block draws for it.
+    #[test]
+    fn each_line_of_a_block_draws_what_the_whole_block_draws_for_it() {
+        for theme in THEMES {
+            for (name, code) in sources() {
+                for language in [Some("rust"), None] {
+                    let block = CodeBlock::new(language, &code, theme);
+                    for dark in [false, true] {
+                        let highlight = block.highlight(dark);
+                        let mut lines = Vec::new();
+                        let mut start = 0;
+                        for line in code.split_inclusive('\n') {
+                            lines.extend(
+                                highlight
+                                    .spans(&code, start..start + line.len())
+                                    .iter()
+                                    .cloned(),
+                            );
+                            start += line.len();
+                        }
+                        assert_eq!(
+                            lines.as_slice(),
+                            highlight.all(&code).as_ref(),
+                            "{name} {language:?} dark: {dark}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A paragraph shapes again whenever its spans are new ones, so a short
+    /// block draws whole from the same spans each time its row is built, for
+    /// as long as a row holds them, and from new ones once its text grows.
+    #[test]
+    fn a_block_draws_whole_from_the_same_spans_until_it_grows() {
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        for language in [Some("rust"), None] {
+            let code = "let a = 1;\n";
+            let mut block = CodeBlock::open(language, code, theme);
+            for dark in [false, true] {
+                let first = block.highlight(dark).all(code);
+                assert!(
+                    Arc::ptr_eq(&first, &block.highlight(dark).all(code)),
+                    "{language:?} dark: {dark}"
+                );
+                assert!(
+                    Arc::ptr_eq(&first, &block.highlight(dark).clone().all(code)),
+                    "{language:?} dark: {dark}, shared"
+                );
+                let drawn = Arc::downgrade(&first);
+                drop(first);
+                assert!(
+                    drawn.upgrade().is_none(),
+                    "{language:?} dark: {dark}, kept by no row"
+                );
+            }
+            let grown = "let a = 1;\nlet b = 2;\n";
+            assert!(block.extend(language, grown));
+            for dark in [false, true] {
+                let drawn = block
+                    .highlight(dark)
+                    .all(grown)
+                    .iter()
+                    .map(|span| span.text.as_ref())
+                    .collect::<String>();
+                assert_eq!(drawn, grown, "{language:?} dark: {dark}");
+            }
+        }
+    }
+
+    /// An open answer keeps every fence it has, so a fence's highlighting
+    /// costs a few bytes for each byte of code rather than a span and a copy
+    /// of the text for every token (#1072). Spans exist only for the rows
+    /// being drawn.
+    #[test]
+    fn a_fence_keeps_both_palettes_for_less_than_drawing_one() {
+        let code = (0..1_000)
+            .map(|line| {
+                format!("fn block_{line}(x: u64) -> u64 {{ x.wrapping_mul({line}) ^ 7 }}\n")
+            })
+            .collect::<String>();
+        assert!(code.len() <= CachedItem::HIGHLIGHT_LIMIT);
+        let block = CodeBlock::new(
+            Some("rust"),
+            &code,
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let spans = block.highlight(true).all(&code).len();
+        assert!(
+            spans > 10 * 1_000,
+            "the fence is highlighted token by token"
+        );
+        // What one palette held as spans before #1072, not counting the copy
+        // of each token's text they owned.
+        let drawn = spans * std::mem::size_of::<Span<'static, markdown::Uri>>();
+        assert!(
+            4 * block.retained_bytes() <= drawn,
+            "{} bytes kept for {} bytes of code; {drawn} bytes drawn in {spans} spans",
+            block.retained_bytes(),
+            code.len()
         );
     }
 }

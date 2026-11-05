@@ -1707,8 +1707,14 @@ fn busy_report_ready_and_collapse_release_actual_worker_canonical_and_palette() 
             assert!(live.item_expanded("busy-report"));
             let cached = &live.presentation_cache()["busy-report"];
             assert!(!cached.placeholder && !cached.markdown.items().is_empty());
-            let palette = Arc::downgrade(cached.blocks.values().next().unwrap().spans(false));
-            assert!(palette.upgrade().is_some());
+            let palette = cached
+                .blocks
+                .values()
+                .next()
+                .unwrap()
+                .highlight(false)
+                .watch();
+            assert!(palette());
             assert!(
                 !live.preparation.contains("busy-report"),
                 "a finite Report Ready removes the Shared/canonical owner even while busy"
@@ -1728,8 +1734,8 @@ fn busy_report_ready_and_collapse_release_actual_worker_canonical_and_palette() 
         assert!(live.presentation_cache()["busy-report"].blocks.is_empty());
         assert!(!live.preparation.contains("busy-report"));
         assert!(
-            palette.upgrade().is_none(),
-            "actual shared syntax spans must be released"
+            !palette(),
+            "actual shared syntax highlighting must be released"
         );
         assert_eq!(
             copy_text(CopyPart::Text, &report.content),
