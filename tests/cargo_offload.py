@@ -168,7 +168,7 @@ class Clear(unittest.TestCase):
             nested = locked / "deep"
             nested.chmod(0)
             locked.chmod(0)
-            Path(root, "t").chmod(0o500)
+            Path(root, "t").chmod(0)
             Path(root).chmod(0o755)
             scope["clear"](str(Path(root, "t")))
             self.assertFalse(Path(root, "t").exists())
