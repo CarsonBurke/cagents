@@ -2472,6 +2472,11 @@ impl SourceControlModel {
     /// `HEAD` and only survives as long as `HEAD` does not move. That a page
     /// was asked for at all outlives the walk, and is carried whatever `HEAD`
     /// did.
+    /// Installed while the first read of a newly bound worktree runs.
+    pub fn is_placeholder(&self) -> bool {
+        matches!(self.data_state, SidebarDataState::Loading)
+    }
+
     pub fn carry_mutation_into(&self, next: &mut Self) {
         if self.key != next.key {
             return;
@@ -2487,7 +2492,9 @@ impl SourceControlModel {
             return;
         }
         next.mutation = self.mutation;
-        if self.mutation.is_some() {
+        // A rebind's empty placeholder holds no intent, only the absence of
+        // a read, so it must not blank the rows that read produced.
+        if self.mutation.is_some() && !self.is_placeholder() {
             // A read started before the queue cannot overwrite newer user
             // intent. The single read after drain supplies authoritative rows.
             next.groups = self.groups.clone();
@@ -22963,6 +22970,43 @@ pub(crate) mod tests {
         );
         assert!(!source.can_load_history(), "a short page ends the walk");
     }
+    #[test]
+    fn a_rebind_placeholder_does_not_blank_the_rows_its_read_returns() {
+        // Commit runs on A, the user visits B and returns: A is rebound
+        // with an empty placeholder that only knows Commit is running.
+        let mut placeholder = SourceControlModel::loading(main_key());
+        placeholder.set_mutation(Some(MutationKind::Commit));
+        let mut read = SourceControlModel::ready(main_key(), &snapshot());
+        let rows = read.groups().to_vec();
+        let staged = read.staged_count;
+        assert!(staged > 0 && !rows.is_empty());
+        placeholder.carry_mutation_into(&mut read);
+        assert_eq!(read.mutation, Some(MutationKind::Commit));
+        assert_eq!(read.groups(), rows.as_slice(), "the read's rows survive");
+        assert_eq!(read.staged_count, staged);
+
+        // A queued stage is laid onto those rows again, idempotently.
+        let selection = [PathSelection::new(repo_path("assets/logo.png"))];
+        read.optimistic_mutation(MutationKind::Stage, &selection);
+        read.optimistic_mutation(MutationKind::Stage, &selection);
+        let staged_rows = read
+            .groups()
+            .iter()
+            .filter(|group| group.area == ChangeArea::Staged)
+            .flat_map(|group| &group.rows)
+            .filter(|row| row.entry.path == repo_path("assets/logo.png"))
+            .count();
+        assert_eq!(staged_rows, 1);
+
+        // A Ready model still protects its pending rows from an older read.
+        let mut pending = SourceControlModel::ready(main_key(), &snapshot());
+        pending.set_mutation(Some(MutationKind::Stage));
+        pending.optimistic_mutation(MutationKind::Stage, &selection);
+        let mut older = SourceControlModel::ready(main_key(), &snapshot());
+        pending.carry_mutation_into(&mut older);
+        assert_eq!(older.groups(), pending.groups());
+    }
+
     #[test]
     fn untracked_starts_expanded_and_history_reloads_when_head_moves() {
         assert!(SidebarState::default().section_expanded(PanelSection::Untracked));

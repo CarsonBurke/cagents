@@ -5170,6 +5170,16 @@ enum QueuedGitMutation {
 }
 
 impl QueuedGitMutation {
+    /// The rows a stage or unstage moves, which the panel shows as pending.
+    fn moved_rows(&self) -> Option<&[crate::repository::PathSelection]> {
+        match self {
+            Self::Stage(selection)
+            | Self::StageApproved { selection, .. }
+            | Self::Unstage(selection) => Some(selection),
+            Self::Discard(_) | Self::Operation(_) => None,
+        }
+    }
+
     fn kind(&self) -> MutationKind {
         match self {
             Self::Stage(_) | Self::StageApproved { .. } => MutationKind::Stage,
@@ -18317,6 +18327,17 @@ impl Application for Cagents {
                 // belong to the binding, not to the page of Git output.
                 if let Some(previous) = self.sidebar_model.source_control.as_ref() {
                     previous.carry_mutation_into(&mut next);
+                    // A rebind's placeholder had no rows to carry, so the
+                    // queue's intent is laid onto the rows just read instead.
+                    if previous.is_placeholder()
+                        && let Some(mutation) = self.source_control_mutations.get(&key.canonical_path)
+                    {
+                        for queued in mutation.request.iter().chain(&mutation.pending) {
+                            if let Some(selection) = queued.moved_rows() {
+                                next.optimistic_mutation(queued.kind(), selection);
+                            }
+                        }
+                    }
                 }
                 self.sidebar_model.source_control = Some(next);
                 match snapshot {
@@ -18444,11 +18465,10 @@ impl Application for Cagents {
                 let failed = report.is_some();
                 if !failed
                     && let Some(rollback) = mutation.rollback.as_mut()
-                    && let Some(
-                        QueuedGitMutation::Stage(selection)
-                        | QueuedGitMutation::StageApproved { selection, .. }
-                        | QueuedGitMutation::Unstage(selection),
-                    ) = mutation.request.as_ref()
+                    && let Some(selection) = mutation
+                        .request
+                        .as_ref()
+                        .and_then(QueuedGitMutation::moved_rows)
                 {
                     rollback.optimistic_mutation(mutation.kind, selection);
                 }
@@ -18462,10 +18482,7 @@ impl Application for Cagents {
                 {
                     *source = rollback.clone();
                     for pending in &mutation.pending {
-                        if let QueuedGitMutation::Stage(selection)
-                        | QueuedGitMutation::StageApproved { selection, .. }
-                        | QueuedGitMutation::Unstage(selection) = pending
-                        {
+                        if let Some(selection) = pending.moved_rows() {
                             source.optimistic_mutation(pending.kind(), selection);
                         }
                     }
