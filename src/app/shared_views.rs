@@ -1875,7 +1875,14 @@ impl Cagents {
                     }
                 }
             }
+            // A terminal this window restored as its own saved terminal can be
+            // listed in a view later, through its own seed or once its folder
+            // is opened as a project. Shared, it may only attach, so it leaves
+            // the saved presentation, which no longer owns it, and hydrates on
+            // the attach-only path instead of loading with nothing to start it.
             self.shared_views.attached.insert(pane.id);
+            let leaves_saved = matches!(pane.kind, CardKind::Terminal(_))
+                && self.saved_terminals.entries.remove(&pane.id).is_some();
             if self.shared_upgrade_target_changed(pane) {
                 let (pending, saved_copy) = self.preserve_pending_shared_upgrade(pane.id);
                 tasks.push(pending);
@@ -1913,7 +1920,10 @@ impl Cagents {
                     .is_some_and(|card| matches!(card.residency, Residency::Hydrating { .. }));
             let failed_pending = pane.pending_terminal_start
                 && matches!(self.cards.get(&pane.id), Some(CardRuntime::Failed(_)));
-            if matches!(pane.kind, CardKind::Terminal(_)) && no_start && (waiting || failed_pending)
+            if matches!(pane.kind, CardKind::Terminal(_))
+                && ((no_start && (waiting || failed_pending))
+                    || (leaves_saved
+                        && matches!(self.cards.get(&pane.id), Some(CardRuntime::Loading))))
             {
                 let exposure = existing
                     .as_ref()
@@ -5397,6 +5407,61 @@ mod tests {
         );
         assert!(app.saved_terminal_current(id).is_some());
         assert!(!app.shared_views.attached.contains(&id));
+    }
+
+    /// A terminal restored as this window's own saved terminal can be listed
+    /// in a view later, by this window's own seed or once its folder is
+    /// opened as a project. Listed, it is shared and may only attach, so it
+    /// must leave the saved presentation and start on the attach-only path
+    /// rather than keep loading with nothing left to start it.
+    #[test]
+    fn saved_terminal_listed_in_a_view_later_hydrates_as_shared() {
+        // The registry knows the channel, so its view can be projected here.
+        let (mut app, a, _, _) = channel_move_fixture();
+        let channels = app.workspace_model.channels.clone();
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(session, None));
+        let id = app.workspace.focused().unwrap();
+        // Saved before the window last closed, its creation long settled.
+        Arc::make_mut(&mut app.durable)
+            .pending_terminal_creations
+            .remove(&id);
+        let identity = app.workspace_model.identity;
+        Arc::make_mut(&mut app.durable).workspace_model_identity = Some(identity);
+        app.shared_views = State::for_workspace(&app.durable);
+        app.workspace_model = crate::workspace_model::WorkspaceModel::default();
+        app.terminal_starts.lock().unwrap().clear();
+        app.cards.insert(id, CardRuntime::Loading);
+        app.card_state_mut(id).unwrap().residency = Residency::Hibernated;
+        app.lifecycle
+            .register(id, Exposure::Visible, Residency::Hibernated, Instant::now());
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        let mut model = crate::workspace_model::WorkspaceModel::default();
+        model.identity = identity;
+        model.sequence = 1;
+        model.channels = channels;
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Connected(model),
+        ));
+        assert!(app.saved_terminal_current(id).is_some());
+        assert_eq!(app.terminal_starts.lock().unwrap().get(&id), Some(&1));
+
+        let mut view = View::empty(a);
+        view.panes
+            .push(Pane::from_card(app.card_state(id).unwrap(), None).unwrap());
+        app.workspace_model.views = vec![view.clone()];
+        drop(app.project_shared_view(&view, &HashSet::from([id])));
+        assert!(app.shared_views.attached.contains(&id));
+        assert!(
+            !app.saved_terminals.entries.contains_key(&id),
+            "a listed terminal is no longer presented as this window's saved terminal"
+        );
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        assert_eq!(
+            app.terminal_starts.lock().unwrap().get(&id),
+            Some(&2),
+            "the attach-only start runs beside the inspection it replaces"
+        );
     }
 
     /// The shared counterpart: a held terminal the registry lists in a view
