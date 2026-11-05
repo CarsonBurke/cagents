@@ -230,7 +230,9 @@ instance can reach the caller's desktop. Agents should also set
 `CAGENTS_DEVELOPMENT_NESTED_ONLY=1`: the runner then refuses to start a UI
 without `--instance` unless it runs inside a session through
 `niri-harness --session NAME exec -- scripts/run-development ...`, so a failed
-nested session cannot put a UI on the user's desktop.
+nested session cannot put a UI on the user's desktop. It requires a session's
+private `nh-*` runtime directory and no `DISPLAY` or `WAYLAND_SOCKET`, which is
+what `niri-harness exec` provides.
 
 Stopping a harness session deletes its runtime directory, so stop an instance
 with `--stop-instance`, which stops its daemon first. `niri-harness stop` alone

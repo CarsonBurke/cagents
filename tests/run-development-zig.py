@@ -5,6 +5,7 @@ up-to-date build, without building the app."""
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -314,18 +315,45 @@ exit 83
         self.assertEqual(leftovers, [])
 
     def test_nested_only_refuses_the_callers_desktop_before_building(self):
-        result = subprocess.run(
-            [str(self.runner), "--browserless"], cwd=self.root,
-            env=dict(self.env, CAGENTS_DEVELOPMENT_NESTED_ONLY="1", XDG_RUNTIME_DIR="/run/user/1000"),
-            capture_output=True, text=True, timeout=10,
-        )
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("not a niri-harness session", result.stderr)
-        self.assertFalse(self.cargo_calls.exists(), "the refused launch built")
         session_runtime = self.root / "nh-fixture"
         session_runtime.mkdir()
-        self.assert_built("--browserless", CAGENTS_DEVELOPMENT_NESTED_ONLY="1",
-                          XDG_RUNTIME_DIR=str(session_runtime))
+        # What niri-harness exec leaves: its runtime and no X11 or inherited
+        # Wayland socket.
+        for name in ("DISPLAY", "WAYLAND_SOCKET"):
+            self.env.pop(name, None)
+        guarded = dict(CAGENTS_DEVELOPMENT_NESTED_ONLY="1", XDG_RUNTIME_DIR=str(session_runtime))
+        for name, changes in (
+            ("caller's runtime", {"XDG_RUNTIME_DIR": "/run/user/1000"}),
+            ("caller's X display", {"DISPLAY": ":0"}),
+            ("inherited Wayland socket", {"WAYLAND_SOCKET": "3"}),
+        ):
+            with self.subTest(desktop=name):
+                result = subprocess.run(
+                    [str(self.runner), "--browserless"], cwd=self.root,
+                    env={**self.env, **guarded, **changes},
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("not a niri-harness session", result.stderr)
+                self.assertFalse(self.cargo_calls.exists(), "the refused launch built")
+        self.assert_built("--browserless", **guarded)
+
+    def test_a_terminated_launch_leaves_no_stamps(self):
+        launch = subprocess.Popen(
+            [str(self.runner), "--browserless"], cwd=self.root,
+            env=dict(self.env, FAKE_BUILD_SECONDS="1"),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 5
+        while not self.cargo_calls.exists():
+            self.assertLess(time.monotonic(), deadline, "the launch never built")
+            time.sleep(0.02)
+        # The runner alone, as a supervisor stopping it would.
+        launch.send_signal(signal.SIGTERM)
+        self.assertEqual(launch.wait(timeout=10), 143)
+        leftovers = [path.name for path in (self.target / "dev-runtime").iterdir()
+                     if path.name.startswith(".run-development-started")]
+        self.assertEqual(leftovers, [])
 
     def test_the_other_lane_rebuilds_and_invalidates_this_one(self):
         self.assert_built("--browserless")

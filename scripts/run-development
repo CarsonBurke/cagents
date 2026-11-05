@@ -75,7 +75,8 @@ Environment:
   CAGENTS_ZIG      Absolute Zig path; zig env must report an executable named zig
   CAGENTS_DEVELOPMENT_NESTED_ONLY=1
                    Refuse to start a UI on the caller's own desktop: start it
-                   with --instance, or inside a session through niri-harness exec
+                   with --instance, or inside a session through niri-harness exec,
+                   which provides a private runtime and no DISPLAY
 USAGE
             exit 0
             ;;
@@ -114,8 +115,8 @@ else
     # the user's desktop. niri-harness exec gives each command a session's
     # private runtime directory and removes the caller's display variables.
     if [ "${CAGENTS_DEVELOPMENT_NESTED_ONLY:-}" = 1 ]; then
-        case ${XDG_RUNTIME_DIR:-} in
-            */nh-?*) ;;
+        case ${XDG_RUNTIME_DIR:-}:${DISPLAY:-}${WAYLAND_SOCKET:-} in
+            */nh-?*:) ;;
             *)
                 printf '%s\n' "CAGENTS_DEVELOPMENT_NESTED_ONLY is set and this is not a niri-harness session; use --instance NAME or niri-harness --session NAME exec -- scripts/run-development ..." >&2
                 exit 2
@@ -391,6 +392,10 @@ build_and_record() {
     started=$(mktemp "$products/.run-development-started.XXXXXX")
     built=$started.built
     rm -f -- "$record"
+    trap 'rm -f -- "$started" "$started.new" "$built"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 129' HUP
+    trap 'exit 143' TERM
     build_products flock -- "$products/.run-development.lock" || {
         status=$?
         rm -f -- "$started" "$built"
@@ -401,6 +406,7 @@ build_and_record() {
         mv -f -- "$started.new" "$record"
     fi
     rm -f -- "$started" "$started.new" "$built"
+    trap - EXIT HUP INT TERM
 }
 
 run_cli() {
@@ -431,10 +437,15 @@ stop_instance_session() {
     socket=$runtime/cagents-development-$instance/cagentsd.sock
     if [ -e "$socket" ]; then
         # Through the session's own environment, never the caller's desktop.
-        # A session that is no longer live refuses; the sweep below then ends
-        # the daemon with the rest of the session's processes.
-        if output=$(niri-harness exec --session "$harness_session" -- \
-            "$(instance_cli_path)" daemon stop-for-rebuild --including-subagents 2>&1); then
+        # niri-harness exec refuses a session that is no longer live; the
+        # sweep below then ends its daemon with the session's other processes.
+        if niri-harness exec --session "$harness_session" -- true 2>/dev/null; then
+            cli=$(instance_cli_path)
+            if ! output=$(niri-harness exec --session "$harness_session" -- \
+                "$cli" daemon stop-for-rebuild --including-subagents 2>&1); then
+                printf '%s\n' "$output" >&2
+                exit 1
+            fi
             remaining=100
             while [ -e "$socket" ]; do
                 if [ "$remaining" -eq 0 ]; then
@@ -444,9 +455,6 @@ stop_instance_session() {
                 remaining=$((remaining - 1))
                 sleep 0.05
             done
-        elif niri-harness exec --session "$harness_session" -- true 2>/dev/null; then
-            printf '%s\n' "$output" >&2
-            exit 1
         fi
     fi
     # The harness reports a runtime it could not remove; the sweep below
