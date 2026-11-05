@@ -3068,7 +3068,7 @@ mod tests {
         }
         let holders = directory
             .as_path()
-            .join(crate::instance::RUNTIME_SUBDIRECTORY)
+            .join(crate::instance::runtime_subdirectory())
             .join("holders");
         let boot = crate::daemon::read_boot_id().unwrap();
         let records = registry::discover(&holders, &boot).unwrap();
@@ -3085,7 +3085,7 @@ mod tests {
         assert!(record.root.is_current());
         let runtime = directory
             .as_path()
-            .join(crate::instance::RUNTIME_SUBDIRECTORY);
+            .join(crate::instance::runtime_subdirectory());
         let paths = crate::daemon::RuntimePaths {
             directory: runtime.clone(),
             socket: runtime.join(crate::terminal::ipc::SOCKET_FILE_NAME),

@@ -210,6 +210,7 @@ fn quiet_chat(root: &Path) -> Handle {
         }
     }
     let spec = ProcessSpec {
+        stdout_noise: None,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -505,6 +506,7 @@ fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
     // Genuine execed helper and owned root; this is not a Codex conversation fixture.
     let holder = chat::native_holder::spawn(
         ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),

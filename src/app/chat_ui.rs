@@ -14,6 +14,55 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+/// A bounded executor that the whole application shares. Each libtest thread
+/// is its own application, so a concurrent test can neither take nor release
+/// this test's capacity. Call it on the UI thread; a permit keeps its
+/// semaphore alive on whichever thread it drops.
+macro_rules! application_capacity {
+    ($permits:expr) => {{
+        #[cfg(not(test))]
+        let capacity = {
+            static CAPACITY: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+                std::sync::OnceLock::new();
+            CAPACITY
+                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new($permits)))
+                .clone()
+        };
+        #[cfg(test)]
+        let capacity = {
+            thread_local! {
+                static CAPACITY: Arc<tokio::sync::Semaphore> =
+                    Arc::new(tokio::sync::Semaphore::new($permits));
+            }
+            CAPACITY.with(Arc::clone)
+        };
+        capacity
+    }};
+}
+
+/// A zeroed atomic the whole application shares, such as which selection owns
+/// the keyboard, under the same per-test-thread rule as
+/// `application_capacity`. The returned reference may be stored and used from
+/// any thread. Each test thread leaks one cell.
+macro_rules! application_atomic {
+    ($vis:vis fn $name:ident() -> $atomic:ident) => {
+        $vis fn $name() -> &'static $atomic {
+            #[cfg(not(test))]
+            {
+                static VALUE: $atomic = $atomic::new(0);
+                &VALUE
+            }
+            #[cfg(test)]
+            {
+                thread_local! {
+                    static VALUE: &'static $atomic = Box::leak(Box::new($atomic::new(0)));
+                }
+                VALUE.with(|value| *value)
+            }
+        }
+    };
+}
+
 mod artifacts;
 mod attachment_draft;
 mod auth_recovery;
@@ -6604,7 +6653,7 @@ impl Cagents {
         };
         Task::batch([
             scope,
-            self.insert_chat_card_with_lifetime(session, None, ephemeral, None),
+            self.insert_chat_card_with_lifetime(session, None, ephemeral, None, None),
         ])
     }
 
@@ -6621,7 +6670,18 @@ impl Cagents {
         if session.is_unstarted() && session.launch.draft_model.is_none() {
             session.launch.draft_model = self.remembered_draft_model(session.launch.provider);
         }
-        self.insert_chat_card_with_lifetime(session, beside, false, draft_from)
+        self.insert_chat_card_with_lifetime(session, beside, false, draft_from, None)
+    }
+
+    /// Restore an existing conversation's manual pane name before its first
+    /// shared publication or provider attachment can report another title.
+    pub(super) fn insert_resumed_chat_card(
+        &mut self,
+        session: chat::Session,
+        beside: Option<CardId>,
+        user_title: Option<String>,
+    ) -> Task<Message> {
+        self.insert_chat_card_with_lifetime(session, beside, false, None, user_title)
     }
 
     fn insert_chat_card_with_lifetime(
@@ -6630,6 +6690,7 @@ impl Cagents {
         beside: Option<CardId>,
         ephemeral: bool,
         draft_from: Option<CardId>,
+        user_title: Option<String>,
     ) -> Task<Message> {
         let beside = beside.and_then(|source| {
             let index = self.workspace.order().position(|id| id == source)?;
@@ -6657,10 +6718,14 @@ impl Cagents {
         if ephemeral {
             self.chat_ui.default_chats.insert(card_id);
         }
+        let save_title = user_title.is_some();
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
-            title: chat_card_title(session.launch.provider).into(),
+            title: user_title
+                .as_deref()
+                .unwrap_or_else(|| chat_card_title(session.launch.provider))
+                .into(),
             width_fraction: self.new_pane_fraction(
                 beside
                     .and_then(|(source, _)| self.card_state(source))
@@ -6688,6 +6753,9 @@ impl Cagents {
         }
         durable.focused = Some(card_id);
         durable.cards.insert(durable_index, card.clone());
+        if let Some(title) = user_title {
+            self.chrome_ui.user_titles.insert(card_id, title);
+        }
         self.register_channel_card(card_id);
         let update = self
             .workspace
@@ -6716,11 +6784,17 @@ impl Cagents {
             self.open_chat(card_id, session, intent)
         };
         self.persist();
+        let title = if save_title {
+            self.save_settings_task(false)
+        } else {
+            Task::none()
+        };
         Task::batch([
             skills,
             self.apply_viewport(update, true, false),
             iced::widget::operation::focus(card_control_id(card_id, "chat-composer"))
                 .map(cosmic::Action::App),
+            title,
         ])
     }
 

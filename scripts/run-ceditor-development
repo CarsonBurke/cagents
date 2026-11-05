@@ -31,17 +31,27 @@ desktop_id=io.github.cagents.ceditor.Development
 install -d "$data_home/applications"
 install -Dm644 "$root/packaging/io.github.cagents.ceditor.svg" \
     "$data_home/icons/hicolor/scalable/apps/$desktop_id.svg"
+# Desktop-entry string escapes are decoded before Exec argument quoting.
+# Encode that outer layer too, so quoted paths retain their literal characters.
 desktop_exec=$(printf '%s' "$editor" | sed \
     -e 's/\\/\\\\/g' \
     -e 's/"/\\"/g' \
     -e 's/`/\\`/g' \
     -e 's/\$/\\$/g' \
-    -e 's/%/%%/g')
+    -e 's/%/%%/g' \
+    -e 's/\\/\\\\/g')
+# GLib checks the executable exists before expanding %% in Exec. For those
+# paths, use a fixed shell program and pass the artifact only as an argument.
+# The decoded shell program is exec "$@"; it never contains the artifact path.
+desktop_prefix=
+case $editor in
+    *%*) desktop_prefix='/bin/sh -c "exec \\"\\$@\\"" ceditor-development ' ;;
+esac
 {
     while IFS= read -r line || [ -n "$line" ]; do
         case $line in
             Name=*) printf '%s\n' 'Name=ceditor Development' ;;
-            Exec=*) printf 'Exec="%s" %%F\n' "$desktop_exec" ;;
+            Exec=*) printf 'Exec=%s"%s" %%F\n' "$desktop_prefix" "$desktop_exec" ;;
             Icon=*) printf 'Icon=%s\n' "$desktop_id" ;;
             StartupWMClass=*) printf 'StartupWMClass=%s\n' "$desktop_id" ;;
             MimeType=*) ;;

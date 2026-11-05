@@ -7680,6 +7680,7 @@ mod tests {
                 std::fs::File::open(&cwd).unwrap(),
             )));
             let spec = ProcessSpec {
+                stdout_noise: None,
                 execution: Some(Arc::new(context)),
                 messages: None,
                 transport: TransportSpec::History,
