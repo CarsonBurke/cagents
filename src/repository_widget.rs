@@ -1952,6 +1952,8 @@ struct WorkingDiffJob {
     revision: u64,
     ticket: u64,
     before: Arc<str>,
+    /// The [`RepositoryRuntime::diff_presentation`] its rows are styled in.
+    presentation: u64,
     cancellation: CancellationToken,
 }
 
@@ -1967,6 +1969,9 @@ struct WorkingDiffRefresh {
     next_ticket: u64,
     desired: Option<(u64, u64, Arc<str>)>,
     applied: Option<(u64, u64, Arc<str>)>,
+    /// The presentation the applied comparison was styled in. Its line
+    /// markers hold in any presentation; its rows are rebuilt in a new one.
+    presentation: u64,
     deadline: Option<Instant>,
     active: Option<WorkingDiffJob>,
     error: Option<String>,
@@ -2237,8 +2242,12 @@ pub struct RepositoryRuntime {
     file_list_refresh_queued: bool,
     background_file_refresh: bool,
     mutation_refresh_pending: bool,
-    /// Last comparison stays readable while Git refreshes this file.
+    /// Last comparison stays readable while Git refreshes this file, or
+    /// while it is rebuilt in a new presentation.
     stale_diff: Option<(PathBuf, DiffBasis, DiffState)>,
+    /// Advances whenever comparisons must be styled or measured again: a
+    /// syntax palette or editor font family change.
+    diff_presentation: u64,
     diff_hide_unchanged: bool,
     files: FileListState,
     selected: Option<RepositoryFile>,
@@ -2459,6 +2468,7 @@ impl RepositoryRuntime {
             background_file_refresh: false,
             mutation_refresh_pending: false,
             stale_diff: None,
+            diff_presentation: 0,
             diff_hide_unchanged: true,
             files: FileListState::Loading,
             selected: None,
@@ -2661,15 +2671,28 @@ impl RepositoryRuntime {
         self.discard_rendered_diffs();
     }
 
-    /// Drops every comparison built with a previous presentation, keeping
-    /// the reader's logical row for the rebuilt one.
+    /// Drops every comparison built with a previous presentation.
+    ///
+    /// The one on screen stays readable until its successor arrives, which
+    /// keeps what the reader unfolded and the row they are on, and keeps the
+    /// editor's added-line markers: those name source lines, which no
+    /// presentation changes. A working comparison already in flight is
+    /// styled the old way, so it is cancelled and started again.
     fn discard_rendered_diffs(&mut self) {
-        let anchor = self.current_diff_viewport();
+        self.diff_presentation = self.diff_presentation.wrapping_add(1);
+        if let Some(active) = &self.working_diff.active {
+            active.cancellation.cancel();
+        }
+        if let Some(path) = self.selected.as_ref().map(|file| file.path.clone())
+            && let Some(index) = self.diffs.iter().position(|(basis, state)| {
+                *basis == self.diff_basis && matches!(state, DiffState::Ready(..))
+            })
+        {
+            let (basis, state) = self.diffs.remove(index);
+            self.stale_diff = Some((path, basis, state));
+        }
         self.diffs.clear();
-        self.stale_diff = None;
-        self.working_diff.applied = None;
-        self.working_diff.additions.clear();
-        self.pending_diff_anchor = Some(anchor);
+        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
     }
 
     pub fn set_diff_hide_unchanged(&mut self, enabled: bool) -> Task<RepositoryAction> {
@@ -3142,6 +3165,32 @@ impl RepositoryRuntime {
         let (mut runtime, identity) = Self::open_fixture(card, "notes.txt", text);
         runtime.set_lsp_document(Some(LspDocumentId(0)));
         (runtime, identity)
+    }
+
+    /// An unstaged file with its comparison on screen, for callers that
+    /// change the settings comparisons are presented in.
+    #[cfg(test)]
+    pub(crate) fn shown_diff_fixture(card: CardId) -> Self {
+        let (mut runtime, _) = Self::open_fixture(card, "notes.txt", "added\nkept\n");
+        runtime.source_surface = SourceSurface::Diff;
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(RenderedDiff::Text {
+                model: crate::diff_view::build_diff("removed\nkept\n", "added\nkept\n"),
+                old_label: "Index".into(),
+                new_label: "Working tree".into(),
+            }),
+        );
+        runtime
+    }
+
+    /// Whether the comparison on screen has been requested and is loading.
+    #[cfg(test)]
+    pub(crate) fn requests_shown_diff(&self) -> bool {
+        matches!(
+            self.diff_state(&self.diff_basis),
+            Some(DiffState::Loading { .. })
+        )
     }
 
     /// The same, under a chosen file name.
@@ -5143,6 +5192,13 @@ impl RepositoryRuntime {
         ))
     }
 
+    /// Whether the live-buffer comparison wanted is the one applied, styled
+    /// in the current presentation.
+    fn working_diff_settled(&self) -> bool {
+        same_diff_revision(&self.working_diff.desired, &self.working_diff.applied)
+            && self.working_diff.presentation == self.diff_presentation
+    }
+
     fn working_annotations_current(&self) -> bool {
         self.editable_working_diff()
             && same_diff_revision(&self.working_diff.applied, &self.wanted_working_diff())
@@ -5177,7 +5233,7 @@ impl RepositoryRuntime {
         if self.working_diff.active.is_some()
             || self.working_diff.timer.is_some()
             || self.working_diff.desired.is_none()
-            || same_diff_revision(&self.working_diff.desired, &self.working_diff.applied)
+            || self.working_diff_settled()
         {
             return Task::none();
         }
@@ -5211,9 +5267,7 @@ impl RepositoryRuntime {
         let Some((_, revision, before)) = self.wanted_working_diff() else {
             return Task::none();
         };
-        if self.working_diff.active.is_some()
-            || same_diff_revision(&self.working_diff.desired, &self.working_diff.applied)
-        {
+        if self.working_diff.active.is_some() || self.working_diff_settled() {
             return Task::none();
         }
         let DocumentState::Editable(document) = &self.document else {
@@ -5229,6 +5283,7 @@ impl RepositoryRuntime {
         let after = document.content.text();
         if after.len() as u64 > MAX_DIFF_SIDE_BYTES {
             self.working_diff.applied = self.working_diff.desired.clone();
+            self.working_diff.presentation = self.diff_presentation;
             self.working_diff.error = Some("The unsaved buffer exceeds the diff size limit. Editing and safe saving remain available.".into());
             return Task::none();
         }
@@ -5240,6 +5295,7 @@ impl RepositoryRuntime {
             revision,
             ticket,
             before: Arc::clone(&before),
+            presentation: self.diff_presentation,
             cancellation: cancellation.clone(),
         });
         cosmic::task::future(async move {
@@ -5276,11 +5332,12 @@ impl RepositoryRuntime {
         if !matches_active {
             return Task::none();
         }
-        let cancelled = self
-            .working_diff
-            .active
-            .as_ref()
-            .is_some_and(|active| active.cancellation.is_cancelled());
+        // A job styled in a superseded presentation is cancelled when that
+        // presentation is dropped; checking both keeps a result already
+        // queued from installing the old palette or measurements.
+        let cancelled = self.working_diff.active.as_ref().is_some_and(|active| {
+            active.cancellation.is_cancelled() || active.presentation != self.diff_presentation
+        });
         self.working_diff.active = None;
         let mut installed = false;
         let completed = Some((identity.generation, revision, Arc::clone(&before)));
@@ -5304,6 +5361,7 @@ impl RepositoryRuntime {
                             .collect();
                     }
                     self.working_diff.applied = completed;
+                    self.working_diff.presentation = self.diff_presentation;
                     self.working_diff.error = None;
                     self.set_diff_state(
                         DiffBasis::IndexToWorktree,
@@ -5319,6 +5377,7 @@ impl RepositoryRuntime {
                 Ok(None) => {}
                 Err(error) => {
                     self.working_diff.applied = completed;
+                    self.working_diff.presentation = self.diff_presentation;
                     self.working_diff.error = Some(error);
                 }
             }
@@ -5693,16 +5752,17 @@ impl RepositoryRuntime {
         self.editor_font_size = size;
         if family_changed {
             self.discard_rendered_diffs();
-        } else {
-            self.update_diff_typography();
         }
+        self.update_diff_typography();
     }
 
-    /// Requests the comparison a presentation change dropped and moves the
-    /// mounted surface to its retained position.
+    /// Requests the comparisons a presentation change dropped, the Git one
+    /// on screen and the live buffer's, and moves the mounted surface to its
+    /// retained position.
     pub fn refresh_diff_presentation(&mut self, card: CardId) -> Task<RepositoryAction> {
         Task::batch([
             self.ensure_current_diff(card),
+            self.working_diff_task(card),
             self.restore_visible_scroll(),
         ])
     }
@@ -6701,9 +6761,6 @@ impl RepositoryRuntime {
                 );
                 if self.accepts_selected(&identity) && current_request {
                     let current = basis == self.diff_basis;
-                    if current {
-                        self.stale_diff = None;
-                    }
                     self.set_diff_state(basis, DiffState::ready(content));
                     if current {
                         self.diff_change =
@@ -7518,10 +7575,15 @@ impl RepositoryRuntime {
         let restores_current = basis == self.diff_basis && matches!(&state, DiffState::Ready(_, _));
         // The rows on screen before a rebuild, which a rebuild must not move:
         // display rows and pixel offsets both change meaning with the model.
+        // They may be a stale comparison kept on screen while this one loaded.
         let mut rebuilt = None;
         if restores_current
-            && let Some(previous) = self.diff_model()
-            && let Some(DiffState::Ready(_, previous_layout)) = self.diff_state(&basis)
+            && let Some(DiffState::Ready(
+                RenderedDiff::Text {
+                    model: previous, ..
+                },
+                previous_layout,
+            )) = self.displayed_diff_state()
             && let DiffState::Ready(RenderedDiff::Text { model, .. }, layout) = &mut state
         {
             // What the reader unfolded survives whatever the viewport awaits.
@@ -7544,6 +7606,9 @@ impl RepositoryRuntime {
         }
         if let DiffState::Ready(RenderedDiff::Text { model, .. }, layout) = &mut state {
             layout.set_folding(model, self.diff_hide_unchanged);
+        }
+        if restores_current {
+            self.stale_diff = None;
         }
         match self
             .diffs
@@ -8367,8 +8432,6 @@ impl RepositoryRuntime {
         )
     }
 
-    /// Reveals rows of fold `fold` while keeping the rows on screen where
-    /// they are: the viewport is anchored in model rows across the change.
     /// Opens just enough of the fold hiding model `row` to show it.
     fn reveal_diff_row(&mut self, row: usize) {
         let (basis, mode) = (self.diff_basis.clone(), self.diff_mode);
@@ -8384,6 +8447,8 @@ impl RepositoryRuntime {
         }
     }
 
+    /// Reveals rows of fold `fold` while keeping the rows on screen where
+    /// they are: the viewport is anchored in model rows across the change.
     fn expand_diff_fold(
         &mut self,
         fold: usize,
@@ -17706,13 +17771,15 @@ mod tests {
         assert!((runtime.diff_viewport.offset - 10.5 * 25.0).abs() < 0.01);
 
         // Another family has other advances: its rows are measured again,
-        // and the reader returns to the same logical row when they arrive.
+        // the old ones staying readable until they arrive, and the reader
+        // stays on the same logical row throughout.
         let family = Font {
             family: iced::font::Family::SansSerif,
             ..Font::MONOSPACE
         };
         runtime.set_editor_font(family, 20.0);
-        assert!(runtime.diff_model().is_none());
+        assert!(runtime.stale_diff.is_some());
+        assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_none());
         assert_eq!(reading(&runtime), read);
         drop(runtime.refresh_diff_presentation(card));
         let Some(DiffState::Loading { request, .. }) =
@@ -17750,7 +17817,8 @@ mod tests {
         let read = reading(&runtime);
 
         runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::Mocha);
-        assert!(runtime.diff_model().is_none());
+        // The old rows stay readable while their successor is requested.
+        assert!(runtime.diff_model().is_some());
         drop(runtime.refresh_diff_presentation(card));
         let Some(DiffState::Loading { request, .. }) =
             runtime.diff_state(&DiffBasis::IndexToWorktree)
@@ -17766,6 +17834,166 @@ mod tests {
         }));
         assert_eq!(reading(&runtime), read);
         assert!((runtime.diff_viewport.offset - 10.5 * DIFF_ROW_HEIGHT).abs() < 0.01);
+        assert!(runtime.stale_diff.is_none());
+    }
+
+    #[test]
+    fn a_presentation_change_keeps_what_was_unfolded_and_the_reading_row() {
+        let theme = |runtime: &mut RepositoryRuntime| {
+            runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::Ocean);
+        };
+        let family = |runtime: &mut RepositoryRuntime| {
+            runtime.set_editor_font(
+                Font {
+                    family: cosmic::iced::font::Family::Serif,
+                    ..runtime.editor_font
+                },
+                runtime.editor_font_size,
+            );
+        };
+        for change in [theme, family] {
+            let card = CardId::new();
+            let (mut runtime, identity) = diff_runtime(card);
+            runtime.diff_viewport.height = 300.0;
+            load_fresh_diff(&mut runtime, card, two_change_model());
+            drop(runtime.update(RepositoryAction::ExpandDiffFold {
+                identity: identity.clone(),
+                basis: DiffBasis::IndexToWorktree,
+                mode: DiffMode::Inline,
+                fold: 1,
+                run: 51..150,
+                expansion: FoldExpansion::Down,
+            }));
+            // The reader is inside the rows they unfolded.
+            let opened = runtime
+                .diff_layout()
+                .unwrap()
+                .folded(DiffMode::Inline)
+                .display(60);
+            drop(runtime.update(RepositoryAction::DiffViewport {
+                card,
+                offset: opened as f32 * DIFF_ROW_HEIGHT,
+                height: 300.0,
+                horizontal: 0.0,
+                user_initiated: true,
+            }));
+            let folded = runtime
+                .diff_layout()
+                .unwrap()
+                .folded(DiffMode::Inline)
+                .clone();
+            assert_eq!(folded.row(opened), DisplayRow::Code(60));
+            let reading = |runtime: &RepositoryRuntime| match runtime.current_diff_viewport().row {
+                Some(diff_layout::Anchor::Row { row, fraction }) => (row, (fraction * 1e3).round()),
+                other => panic!("a code row is being read: {other:?}"),
+            };
+            let read = reading(&runtime);
+
+            change(&mut runtime);
+            assert_eq!(
+                runtime.diff_layout().unwrap().folded(DiffMode::Inline),
+                &folded,
+                "the comparison on screen stays as it was while it reloads"
+            );
+            drop(runtime.refresh_diff_presentation(card));
+            let Some(DiffState::Loading { request, .. }) =
+                runtime.diff_state(&DiffBasis::IndexToWorktree)
+            else {
+                panic!("the comparison is requested again");
+            };
+            let request = *request;
+            drop(runtime.update(RepositoryAction::DiffLoaded {
+                identity,
+                basis: DiffBasis::IndexToWorktree,
+                request,
+                content: staged_text_diff(two_change_model()),
+            }));
+            assert!(runtime.stale_diff.is_none());
+            assert_eq!(
+                runtime.diff_layout().unwrap().folded(DiffMode::Inline),
+                &folded,
+                "the rebuilt comparison keeps what was unfolded"
+            );
+            assert_eq!(reading(&runtime), read);
+            assert_eq!(
+                runtime.diff_viewport.offset,
+                opened as f32 * DIFF_ROW_HEIGHT
+            );
+        }
+    }
+
+    #[test]
+    fn a_presentation_change_restyles_the_live_comparison_and_keeps_its_markers() {
+        let card = CardId::new();
+        let text = "added\nkept\n";
+        let (mut runtime, identity) = working_diff_runtime(card, "removed\nkept\n", text);
+        runtime.source_surface = SourceSurface::Editor;
+        runtime.working_diff.applied = None;
+        drop(runtime.working_diff_task(card));
+        let ticket = runtime.working_diff.timer.unwrap();
+        runtime.working_diff.deadline = Some(Instant::now());
+        drop(runtime.start_working_diff(card, ticket));
+        let active = runtime.working_diff.active.as_ref().unwrap();
+        let (revision, before) = (active.revision, Arc::clone(&active.before));
+        let cancellation = active.cancellation.clone();
+
+        // The palette changes while a job styled the old way is running.
+        runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::Mocha);
+        drop(runtime.refresh_diff_presentation(card));
+        assert!(cancellation.is_cancelled());
+        drop(runtime.finish_working_diff(
+            identity.clone(),
+            revision,
+            ticket,
+            Arc::clone(&before),
+            Ok(Some(crate::diff_view::build_diff(&before, text))),
+        ));
+        assert!(
+            runtime.working_diff.applied.is_none(),
+            "a comparison in the old palette is not installed"
+        );
+        let next = runtime
+            .working_diff
+            .timer
+            .expect("restarted in the new palette");
+        runtime.working_diff.deadline = Some(Instant::now());
+        drop(runtime.start_working_diff(card, next));
+        let active = runtime.working_diff.active.as_ref().unwrap();
+        assert_eq!(active.presentation, runtime.diff_presentation);
+        let revision = active.revision;
+        drop(runtime.finish_working_diff(
+            identity.clone(),
+            revision,
+            next,
+            Arc::clone(&before),
+            Ok(Some(crate::diff_view::build_diff(&before, text))),
+        ));
+        assert!(runtime.working_annotations_current());
+
+        // An applied comparison: its added-line markers name source lines,
+        // which no palette or font changes, so they stay while it rebuilds.
+        let family = Font {
+            family: cosmic::iced::font::Family::Serif,
+            ..runtime.editor_font
+        };
+        runtime.set_editor_font(family, runtime.editor_font_size);
+        drop(runtime.refresh_diff_presentation(card));
+        assert!(runtime.working_annotations_current());
+        assert_eq!(runtime.working_diff.additions, vec![0]);
+        let rebuild = runtime.working_diff.timer.expect("rows are measured again");
+        runtime.working_diff.deadline = Some(Instant::now());
+        drop(runtime.start_working_diff(card, rebuild));
+        let revision = runtime.working_diff.active.as_ref().unwrap().revision;
+        drop(runtime.finish_working_diff(
+            identity,
+            revision,
+            rebuild,
+            Arc::clone(&before),
+            Ok(Some(crate::diff_view::build_diff(&before, text))),
+        ));
+        assert!(runtime.working_annotations_current());
+        assert!(runtime.working_diff.timer.is_none());
+        assert!(runtime.working_diff.active.is_none());
     }
 
     #[test]

@@ -21704,6 +21704,30 @@ mod tests {
         assert_eq!(app.settings, AppSettings::default());
     }
 
+    /// A palette or font family change drops comparisons styled the old
+    /// way; whichever settings path makes it must request them again, or
+    /// the diff on screen reads "Nothing to compare".
+    #[test]
+    fn presentation_settings_request_the_comparison_on_screen_again() {
+        let fields = [
+            (SettingsField::EditorSyntaxTheme, "mocha"),
+            (SettingsField::EditorFontFamily, "DejaVu Serif"),
+        ];
+        for (field, value) in fields {
+            let mut app = context_inspector_test_app(false);
+            let card = CardId::new();
+            app.cards.insert(
+                card,
+                CardRuntime::Repository(Box::new(RepositoryRuntime::shown_diff_fixture(card))),
+            );
+            drop(app.apply_setting_input(field, value.into()));
+            let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+                unreachable!()
+            };
+            assert!(runtime.requests_shown_diff(), "{field:?}");
+        }
+    }
+
     #[test]
     fn resetting_settings_restores_autosave_for_an_already_open_editor() {
         if crate::repository_widget::retained_save_tests::isolated_test(
