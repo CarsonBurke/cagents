@@ -80,12 +80,23 @@ fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> boo
 }
 
 impl Cagents {
+    /// Carries the queue on when the pane whose turn it was stopped being closed
+    /// without settling, as when a retained chat's close fails. The panes behind
+    /// it would otherwise stay disabled on "Checking…" until the next launch.
+    pub(super) fn resume_stalled_close_queue(&mut self) -> Task<Message> {
+        match self.close_queue_turn {
+            Some(card) if !self.pane_close_owned(card) => self.next_queued_card_close(),
+            _ => Task::none(),
+        }
+    }
+
     pub(super) fn next_queued_card_close(&mut self) -> Task<Message> {
         // The dialog blocks workspace messages, so the panes behind it would be
         // dropped unasked. Dismissing it carries on with them.
         if self.terminal_close_dialog_visible() {
             return Task::none();
         }
+        self.close_queue_turn = None;
         let mut tasks = Vec::new();
         let mut kept = 0;
         while let Some(QueuedCardClose { card, unasked }) = self.queued_card_closes.pop_front() {
@@ -113,6 +124,7 @@ impl Cagents {
             // One that was turned away never will, so the rest would wait on it
             // forever, each still showing that its close is being checked.
             if self.pane_close_owned(card) {
+                self.close_queue_turn = Some(card);
                 break;
             }
             if self
@@ -124,11 +136,14 @@ impl Cagents {
         }
         // Each turned-away pane's own reason, if it has one, is already a notice.
         if kept > 0 {
-            self.status = Some(TransientNotice::warning(if kept == 1 {
+            let notice = TransientNotice::warning(if kept == 1 {
                 "A pane was kept. Close it again."
             } else {
                 "Some panes were kept. Close them again."
-            }));
+            });
+            if let Some(earlier) = self.status.replace(notice) {
+                self.notices.record(earlier);
+            }
         }
         Task::batch(tasks)
     }
@@ -1143,6 +1158,37 @@ mod tests {
                 .as_ref()
                 .is_some_and(|notice| notice.message.starts_with("A pane was kept"))
         );
+    }
+
+    /// Not every owner reports back: a retained chat's close can fail, or find
+    /// its session changed, with nothing to tell the queue.
+    #[test]
+    fn a_turn_abandoned_without_settling_still_advances_the_queue() {
+        let (mut app, first) = retry_close_fixture();
+        let turn = queued_terminal(&mut app, first);
+        let behind = queued_terminal(&mut app, first);
+        app.queued_card_closes.extend([
+            QueuedCardClose {
+                card: turn,
+                unasked: true,
+            },
+            QueuedCardClose {
+                card: behind,
+                unasked: true,
+            },
+        ]);
+        drop(app.next_queued_card_close());
+        assert!(app.terminal_close_pending(turn));
+        assert_eq!(app.close_queue_turn, Some(turn));
+
+        drop(app.update(Message::DismissStatus));
+        assert_eq!(app.queued_card_closes.len(), 1, "its owner still has it");
+
+        app.terminal_close = None;
+        drop(app.update(Message::DismissStatus));
+        assert!(app.queued_card_closes.is_empty());
+        assert!(app.terminal_close_pending(behind));
+        assert_eq!(app.close_queue_turn, Some(behind));
     }
 
     #[test]

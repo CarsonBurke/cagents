@@ -5349,6 +5349,7 @@ pub struct Cagents {
     automation_close_generation: u64,
     terminal_close: Option<terminal_close::CloseIntent>,
     queued_card_closes: VecDeque<terminal_close::QueuedCardClose>,
+    close_queue_turn: Option<CardId>,
     terminal_close_attempts: HashSet<TerminalId>,
     terminal_close_generation: u64,
     closed_terminal_cards: HashSet<CardId>,
@@ -14344,6 +14345,7 @@ impl Application for Cagents {
             automation_close_generation: 0,
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
+            close_queue_turn: None,
             terminal_close_attempts: HashSet::new(),
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
@@ -18095,7 +18097,11 @@ impl Application for Cagents {
         // Before the notices drain, so one raised by a committed draft is
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
-        let task = Task::batch([task, self.flush_settings_on_blur()]);
+        let task = Task::batch([
+            task,
+            self.flush_settings_on_blur(),
+            self.resume_stalled_close_queue(),
+        ]);
         if projection == Projection::Full {
             self.sync_worktree_protections();
         }
@@ -29750,6 +29756,7 @@ mod tests {
             automation_close_generation: 0,
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
+            close_queue_turn: None,
             terminal_close_attempts: HashSet::new(),
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
