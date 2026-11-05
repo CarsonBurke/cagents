@@ -3159,10 +3159,7 @@ impl Adapter for Codex {
                 // adapter never saw the turn start; only the parent's outcome
                 // needs the turn to be current.
                 if (current || self.is_child) && turn["error"].is_object() {
-                    let message = turn["error"]["message"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| UNREADABLE_ERROR.into());
+                    let message = error_text(&turn["error"], self.is_child);
                     // Codex repeats a child's final error notification in the
                     // turn's failed completion; one failure keeps one item.
                     let reported = self
@@ -3426,10 +3423,7 @@ impl Adapter for Codex {
                 }
             }
             "error" => {
-                let message = params["error"]["message"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| UNREADABLE_ERROR.into());
+                let message = error_text(&params["error"], self.is_child);
                 // A retry describes work still in progress. Putting it in
                 // Snapshot.error leaves a recovered turn marked as failed.
                 // Child diagnostics must likewise stay in their own timeline
@@ -3539,12 +3533,20 @@ fn session_notice(text: String) -> Event {
     })
 }
 
+/// The text of a provider error, shared by the error notification and the
+/// failed completion so a child's restated failure compares equal and is
+/// shown once. A child keeps the provider's exact value as its diagnostic;
+/// the parent's outcome reads as a sentence instead of raw JSON.
+fn error_text(error: &Value, is_child: bool) -> String {
+    match error["message"].as_str() {
+        Some(message) => message.to_owned(),
+        None if is_child => error.to_string(),
+        None => "Codex reported an error without a readable message".into(),
+    }
+}
+
 /// Only the provider's explicit error notification/turn field grants this
 /// provenance. Client-generated disconnect or RPC diagnostics remain notices.
-/// Shared by the error notification and the failed completion so a child's
-/// repeated failure compares equal and is shown once.
-const UNREADABLE_ERROR: &str = "Codex reported an error without a readable message";
-
 fn provider_error_notice(text: String) -> Event {
     let mut notice = session_notice(text);
     if let Event::Item(item) = &mut notice {
