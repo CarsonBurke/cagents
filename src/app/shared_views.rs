@@ -4047,8 +4047,8 @@ mod tests {
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         let _ = app.workspace.reorder(next.id, 0).unwrap();
-        // The next echo projects the view over the strip before the snapshot,
-        // so the baseline cannot hide a difference the snapshot introduced.
+        // The next echo projects the view over the mounted strip before the
+        // snapshot, so the snapshot has no reorder for the baseline to absorb.
         drop(app.reconcile_shared_views());
         assert_eq!(
             app.workspace.order().collect::<Vec<_>>(),

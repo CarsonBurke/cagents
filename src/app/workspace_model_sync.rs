@@ -144,7 +144,8 @@ fn observe_with_client(
             .map_err(|error| error.to_string())?;
         // View edits and proof-dependent title suggestions need complete
         // authoritative pane data: the cached view may precede their revision.
-        // Navigation also reads its settled registry ordering.
+        // Navigation also reads its settled registry ordering, and an agent
+        // invalidation carries no inventory of its own.
         if matches!(
             edit,
             ModelEdit::SeedView { .. }
