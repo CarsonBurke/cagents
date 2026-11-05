@@ -996,6 +996,10 @@ const RAIL_BREAKPOINT: f32 = 560.0;
 /// Card width below which two category columns no longer fit their labels,
 /// so the picker collapses to a single dropdown under the search field.
 const RAIL_WIDTH: f32 = 42.0 * design::GRID_UNIT;
+/// How narrow a shortcut's action name may become beside its keys before the
+/// keys move beneath it: room for a short name, such as "Close pane", or about
+/// half of a long one on each of two lines.
+const SHORTCUT_LABEL_MIN_WIDTH: f32 = 120.0;
 
 /// The settings pane's body. Its layout follows the card's width, which the
 /// user sets per card, not the window's.
@@ -1449,32 +1453,14 @@ fn shortcut_input<'a>(
         }
     }
     let row = widget::row::with_children(vec![
-        // Reserve Source first, then split the rest between the action and
-        // its keys so neither can take all of it. Key chips wrap within their
-        // column when a narrow pane cannot fit them on one line, with Record
-        // and Reset after the last chip, beside Source.
-        widget::row::with_children(vec![
-            design::body(format!("{label}{required}"))
-                .width(Length::FillPortion(1))
-                .into(),
-            // A cosmic flex row, unlike iced's wrapping row, exposes its
-            // controls to accessibility. It passes its own limits to each
-            // item, so the container loosens them: a chip keeps its label's
-            // width instead of stretching to the column's.
-            widget::container(
-                widget::flex_row(controls)
-                    .column_spacing(2)
-                    .row_spacing(2)
-                    .align_items(Alignment::Center)
-                    .justify_content(widget::JustifyContent::FlexEnd),
-            )
-            .width(Length::FillPortion(2))
+        // Source keeps its column. The keys and their Record and Reset
+        // buttons end the action's line while its name keeps readable room,
+        // and otherwise move beneath the name and wrap there, in order.
+        crate::ui_controls::labeled_controls(design::body(format!("{label}{required}")), controls)
+            .min_label(SHORTCUT_LABEL_MIN_WIDTH)
+            .spacing(2.0)
+            .label_gap(space::S)
             .into(),
-        ])
-        .spacing(space::S)
-        .align_y(Alignment::Center)
-        .width(Length::Fill)
-        .into(),
         design::caption(source).width(64).into(),
     ])
     .spacing(space::S)
@@ -1624,17 +1610,24 @@ mod keyboard_table_tests {
                 let label = controls
                     .label_bounds
                     .expect("the action label remains visible");
+                // The name sits before the controls on their line, or above
+                // them once they move beneath it; it never overlaps one.
                 assert!(
                     label.width > 0.0
-                        && controls
-                            .buttons
-                            .iter()
-                            .all(|bounds| label.x + label.width <= bounds.x + 0.1),
+                        && controls.buttons.iter().all(|bounds| {
+                            label.x + label.width <= bounds.x + 0.1
+                                || label.y + label.height <= bounds.y + 0.1
+                        }),
                     "{field:?} at{width}: label {label:?} meets {:?}",
                     controls.buttons
                 );
                 if width == 560.0 {
                     let center = controls.buttons[0].center_y();
+                    assert!(
+                        label.x + label.width <= controls.buttons[0].x + 0.1,
+                        "{field:?} at{width}: keys left the name's line {label:?} {:?}",
+                        controls.buttons
+                    );
                     assert!(
                         controls
                             .buttons
