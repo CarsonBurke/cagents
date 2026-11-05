@@ -8104,6 +8104,145 @@ mod tests {
     }
 
     #[test]
+    fn closed_stdin_uses_exact_exit_without_losing_readable_diagnostics() {
+        for (tail, expected) in [
+            ("os._exit(75)", "exit status: 75"),
+            ("os.kill(os.getpid(), signal.SIGTERM)", "signal: 15"),
+        ] {
+            let (_directory, handle) = closed_stdin_fixture(tail, |_| {});
+            let provider = handle.0.provider_process.lock().unwrap().clone().unwrap();
+            let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(3));
+            let failure = handle.failure().unwrap();
+            assert!(failure.starts_with("Provider exited with"), "{failure}");
+            assert!(failure.contains(expected), "{failure}");
+            assert!(failure.contains("Provider stdin: Broken pipe"), "{failure}");
+            assert!(
+                failure.contains("Last ignored output: wrapper diagnostic"),
+                "{failure}"
+            );
+            let error = snapshot.error.as_deref().unwrap();
+            assert!(error.contains(&failure), "{error}");
+            assert!(error.contains("fixture stderr tail"), "{error}");
+            assert!(error.len() < 17000, "stderr diagnosis must remain bounded");
+            assert!(
+                !provider.is_current(),
+                "the original provider must be retired"
+            );
+            assert!(
+                handle.owns_work(),
+                "a known failure still protects the conversation"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_stdin_preserves_live_and_successful_writer_failures_and_close() {
+        for (tail, cancel) in [
+            ("signal.pause()", false),
+            ("os._exit(0)", false),
+            ("signal.pause()", true),
+        ] {
+            let (ready, readiness) = crossbeam_channel::bounded(1);
+            let (_directory, handle) = closed_stdin_fixture(tail, move |update| {
+                if matches!(update, Update::Ready) {
+                    let _ = ready.try_send(());
+                }
+            });
+            let provider = handle.0.provider_process.lock().unwrap().clone().unwrap();
+            if cancel {
+                readiness.recv_timeout(Duration::from_secs(3)).unwrap();
+                // Cancellation can race the failed write and its bounded
+                // diagnostic drain; it still joins the same cleanup owner.
+                handle.close().unwrap();
+            }
+            let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(3));
+            let failure = handle.failure().unwrap();
+            assert!(
+                failure.starts_with("Provider stdin: Broken pipe"),
+                "{failure}"
+            );
+            if tail == "os._exit(0)" {
+                assert!(failure.contains("exit status: 0"), "{failure}");
+            } else {
+                assert!(!failure.contains("provider exited with"), "{failure}");
+            }
+            assert!(snapshot.error.as_deref().unwrap().contains(&failure));
+            assert!(handle.is_completed());
+            assert!(
+                handle.owns_work(),
+                "closed input is never a successful turn"
+            );
+            assert!(
+                !provider.is_current(),
+                "the original provider must be retired"
+            );
+        }
+    }
+
+    /// The provider closes input before its first frame. Only receipt of that
+    /// frame queues a write, so this always exercises EPIPE rather than racing
+    /// between EOF and a successfully flushed initialization. The two files
+    /// synchronize publication of fresh stdout/stderr with that queued write.
+    fn closed_stdin_fixture(
+        tail: &str,
+        notify: impl Fn(Update) + Send + Sync + 'static,
+    ) -> (tempfile::TempDir, LocalHandle) {
+        struct ClosedInput(std::path::PathBuf);
+        impl Adapter for ClosedInput {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture does not accept external commands".into())
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                assert_eq!(frame, json!({"closed": true}));
+                std::fs::write(self.0.join("release-input"), b"release").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !self.0.join("diagnostics-ready").exists() {
+                    if Instant::now() >= deadline {
+                        return Err("fixture diagnosis publication timed out".into());
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok(Step {
+                    writes: vec![json!({"undelivered": true})],
+                    events: vec![Event::Ready(true)],
+                    ..Step::default()
+                })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let body = format!(
+            "import os, pathlib, signal, sys, time\n\
+             os.close(0)\n\
+             print('{{\"closed\":true}}', flush=True)\n\
+             while not pathlib.Path('release-input').exists(): time.sleep(0.001)\n\
+             print('wrapper diagnostic', flush=True)\n\
+             print('fixture stderr began', file=sys.stderr, flush=True)\n\
+             pathlib.Path('diagnostics-ready').touch()\n\
+             sys.stderr.write('z' * 20000 + 'fixture stderr tail\\n')\n\
+             sys.stderr.flush()\n{tail}\n"
+        );
+        let spec = ProcessSpec {
+            stdout_noise: Some(|_| false),
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/python3".into(),
+            arguments: vec!["-c".into(), body],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(ClosedInput(directory.path().into()));
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, notify).unwrap();
+        (directory, handle)
+    }
+
+    #[test]
     fn pipe_eof_waits_for_exact_exit_but_preserves_unobservable_writers() {
         for (tail, expected) in [
             ("sleep 0.02; exit 0", None),
