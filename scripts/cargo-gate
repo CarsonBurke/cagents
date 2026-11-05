@@ -14,7 +14,7 @@ set -eu
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=3
+gate_version=4
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -99,9 +99,11 @@ Environment:
   CAGENTS_BUILD_REMOTE   Host that compiles (default fw16); `local` builds here
   CAGENTS_BUILD_REMOTE_SLOTS, CAGENTS_BUILD_REMOTE_JOBS,
   CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB
-                         Builds at once on that host (default 3), Cargo jobs
-                         for each (6), and the free space below which it
-                         builds nothing (40 GiB)
+                         Most slots on that host (default 8; further ones
+                         are made while disk allows, and builds start as
+                         memory and CPU allow), Cargo jobs for each (default:
+                         its CPUs shared among the running builds), and the
+                         free space below which it builds nothing (40 GiB)
   CAGENTS_BUILD_INSTALLED_GATE
                          The installed gate a checkout's older gate defers
                          to (default /var/tmp/cagents-cargo-gate); empty
@@ -165,6 +167,15 @@ if [ -n "${CAGENTS_BUILD_EXEC_SHIMS-}" ]; then
         fi
     done
     export PATH
+    # The guard against compiling here, below, is for Cargo that bypassed
+    # the shim; this gate's own Cargo gets the wrapper the caller had.
+    if [ "${RUSTC_WRAPPER-}" = "$CAGENTS_BUILD_EXEC_SHIMS/rustc-guard" ]; then
+        if [ -n "${CAGENTS_BUILD_EXEC_RUSTC_WRAPPER-}" ]; then
+            RUSTC_WRAPPER=$CAGENTS_BUILD_EXEC_RUSTC_WRAPPER
+        else
+            unset RUSTC_WRAPPER
+        fi
+    fi
 fi
 named=false
 case $1 in
@@ -741,9 +752,34 @@ if [ "$where" -eq 0 ]; then
     quoted=$(printf '%s' "$self" | sed "s/'/'\\\\''/g")
     printf "#!/bin/sh\nexec '%s' cargo \"\$@\"\n" "$quoted" >"$shims/cargo"
     chmod 755 "$shims/cargo"
+    # Cargo reached some other way, by path, through $CARGO, `rustup run` or
+    # `mise exec`, would compile here: rustc refuses, through this wrapper,
+    # to compile a crate. Cargo's queries of rustc (`-vV`, `--print`) pass.
+    CAGENTS_BUILD_EXEC_RUSTC_WRAPPER=${RUSTC_WRAPPER-}
+    cat >"$shims/rustc-guard" <<GUARD
+#!/bin/sh
+compiles=false
+for argument do
+    case \$argument in
+        --crate-name) compiles=true ;;
+        --print|--print=*) compiles=false; break ;;
+    esac
+done
+if [ "\$compiles" = true ]; then
+    printf '%s\\n' "cargo-gate: Cargo inside \\\`cargo-gate exec\\\` was reached other than by the name \\\`cargo\\\` (by path, \\\$CARGO, rustup run or mise exec) and would compile on this host; run \\\`cargo\\\` by name, so it builds on $build_host, or set CAGENTS_BUILD_REMOTE=local" >&2
+    exit 1
+fi
+GUARD
+    if [ -n "$CAGENTS_BUILD_EXEC_RUSTC_WRAPPER" ]; then
+        printf 'exec %s "$@"\n' "$(printf '%s' "$CAGENTS_BUILD_EXEC_RUSTC_WRAPPER" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")" >>"$shims/rustc-guard"
+    else
+        printf 'exec "$@"\n' >>"$shims/rustc-guard"
+    fi
+    chmod 755 "$shims/rustc-guard"
     CAGENTS_BUILD_EXEC_SHIMS=$shims
     PATH=$shims:$PATH
-    export CAGENTS_BUILD_EXEC_SHIMS PATH
+    RUSTC_WRAPPER=$shims/rustc-guard
+    export CAGENTS_BUILD_EXEC_SHIMS CAGENTS_BUILD_EXEC_RUSTC_WRAPPER PATH RUSTC_WRAPPER
     status=0
     supervised '' "$@" || status=$?
     rm -rf -- "$shims"
