@@ -120,6 +120,12 @@ turn, and reopen the saved chat; compare the completed and restored content.
 The fixture represents a reproducible payload path, not a captured user
 conversation or evidence about the provider's answer prose.
 
+For a chosen set of tool calls, write `fixture-tools.jsonl`: one call per
+line, as `{"name":"Bash","input":{"command":"cargo test","description":"Run
+the tests"},"result":"error[E0308]: mismatched types","is_error":true}`.
+Every turn emits each call and its result in order, before its answer, and
+records them in the synthetic history like the other behaviors.
+
 For image preview and viewer checks, copy a PNG to
 `"$fixture_root/home/fixture-image.png"` before spawning the agent. Native
 launches drop `CAGENTS_*` variables, so the fixture reads the image from its
