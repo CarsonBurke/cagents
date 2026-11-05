@@ -8,6 +8,9 @@ pub(super) struct State {
     recording: Option<SettingsField>,
     recording_error: Option<String>,
     reassign: Option<(SettingsField, String, usize)>,
+    /// The shortcut whose Record button gave up keyboard focus to a pending
+    /// Reassign, and gets it back once that offer goes away.
+    focus_return: Option<SettingsField>,
     filtering_key: bool,
     pressed_key_filter: Option<keyboard::Event>,
     query: Option<String>,
@@ -288,6 +291,7 @@ impl Cagents {
         match action {
             Action::Record(field) => {
                 self.palette.recording = Some(field);
+                self.palette.focus_return = None;
                 self.palette.filtering_key = false;
                 self.palette.query = None;
                 self.palette.recording_error = None;
@@ -296,6 +300,7 @@ impl Cagents {
             }
             Action::FilterKey => {
                 self.palette.filtering_key = true;
+                self.palette.focus_return = None;
                 self.palette.recording = None;
                 self.palette.query = None;
                 self.palette.reassign = None;
@@ -364,6 +369,7 @@ impl Cagents {
                         Task::batch([
                             self.save_settings_task(false),
                             self.synchronize_settings(&previous),
+                            self.return_recorder_focus(),
                         ])
                     }
                     Err(_) => {
@@ -377,7 +383,7 @@ impl Cagents {
                         } else {
                             refusal(field, &attempted).or_else(|| refusal(SettingsField::SHORTCUTS[owner], &attempted)).or_else(|| Some("Reassignment could not be saved. Check the other settings.".into()))
                         };
-                        Task::none()
+                        self.return_recorder_focus()
                     }
                 }
             }
@@ -404,6 +410,7 @@ impl Cagents {
             }
             Action::Close => {
                 self.palette.recording = None;
+                self.palette.focus_return = None;
                 self.palette.filtering_key = false;
                 self.palette.query = None;
                 self.palette.reassign = None;
@@ -536,13 +543,16 @@ impl Cagents {
                 self.palette.filtering_key = false;
                 self.palette.reassign = None;
                 self.palette.recording_error = None;
-                return Some(Task::none());
+                return Some(self.return_recorder_focus());
             }
             // A pending Reassign is reached with the keyboard: Tab and
             // Shift+Tab move focus to it rather than being recorded, which
             // would withdraw the offer the user is navigating to. It is the
             // recorder's only control, so either direction lands on it.
-            if self.palette.reassign.is_some() && is_tab_press(event).is_some() {
+            if let Some((field, _, _)) = &self.palette.reassign
+                && is_tab_press(event).is_some()
+            {
+                self.palette.focus_return = Some(*field);
                 return Some(
                     iced::widget::operation::focus(widget::Id::new(REASSIGN_BUTTON))
                         .map(cosmic::Action::App),
@@ -697,14 +707,34 @@ impl Cagents {
                 {
                     self.palette.reassign = Some((field, chord, owner));
                 }
-                Task::none()
+                if self.palette.reassign.is_some() {
+                    Task::none()
+                } else {
+                    self.return_recorder_focus()
+                }
             }
             _ => {
                 self.palette.recording = None;
                 self.palette.recording_error = None;
-                self.apply_setting_input(field, value)
+                Task::batch([
+                    self.apply_setting_input(field, value),
+                    self.return_recorder_focus(),
+                ])
             }
         }
+    }
+
+    /// Gives keyboard focus back to the Record button that handed it to a
+    /// Reassign offer which is no longer shown, so the user keeps their
+    /// place in the shortcut list.
+    fn return_recorder_focus(&mut self) -> Task<Message> {
+        self.palette
+            .focus_return
+            .take()
+            .map_or_else(Task::none, |field| {
+                iced::widget::operation::focus(settings_ui::record_shortcut_button(field))
+                    .map(cosmic::Action::App)
+            })
     }
 
     fn capture_first_palette_entry(&mut self) {
@@ -3255,8 +3285,7 @@ mod settings_recorder_tests {
     fn keyboard_reaches_and_activates_a_pending_reassign() {
         use iced::{
             Size,
-            advanced::{clipboard, widget::operation::Outcome},
-            futures::StreamExt,
+            advanced::clipboard,
             mouse,
             runtime::user_interface::{Cache, UserInterface},
         };
@@ -3287,10 +3316,6 @@ mod settings_recorder_tests {
             keyboard::key::Code::Enter,
             keyboard::Modifiers::empty(),
         );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
         let mut messages = Vec::new();
         for modifiers in [keyboard::Modifiers::empty(), keyboard::Modifiers::SHIFT] {
             let tab = press(
@@ -3317,18 +3342,7 @@ mod settings_recorder_tests {
                 Cache::default(),
                 &mut renderer,
             );
-            let mut stream = iced::runtime::task::into_stream(task).expect("a focus task");
-            while let Some(action) = runtime.block_on(stream.next()) {
-                if let iced::runtime::Action::Widget(operation) = action {
-                    let mut next = Some(operation);
-                    while let Some(mut operation) = next.take() {
-                        ui.operate(&renderer, operation.as_mut());
-                        if let Outcome::Chain(chained) = operation.finish() {
-                            next = Some(chained);
-                        }
-                    }
-                }
-            }
+            apply_widget_operations(task, &mut ui, &renderer);
             ui.update(
                 &[iced::Event::Keyboard(enter.clone())],
                 mouse::Cursor::Unavailable,
@@ -3344,9 +3358,14 @@ mod settings_recorder_tests {
         }
         assert!(app.palette_key_event(&enter).is_some());
         assert!(app.palette.reassign.is_some(), "Enter is not recorded");
+        assert_eq!(app.palette.focus_return, Some(field));
         for message in messages {
             drop(app.update(message));
         }
+        assert_eq!(
+            app.palette.focus_return, None,
+            "focus goes back to the row's Record button"
+        );
         assert!(app.palette.recording.is_none());
         assert!(
             app.core.keyboard_nav(),
@@ -3358,6 +3377,108 @@ mod settings_recorder_tests {
                 .keyboard_shortcuts
                 .toggle_projects
                 .contains(&chord)
+        );
+    }
+
+    /// Runs the widget operations of `task`, as the runtime would, on `ui`.
+    fn apply_widget_operations(
+        task: Task<Message>,
+        ui: &mut iced::runtime::user_interface::UserInterface<
+            '_,
+            Message,
+            cosmic::Theme,
+            cosmic::Renderer,
+        >,
+        renderer: &cosmic::Renderer,
+    ) {
+        use iced::{advanced::widget::operation::Outcome, futures::StreamExt};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut stream = iced::runtime::task::into_stream(task).expect("a focus task");
+        while let Some(action) = runtime.block_on(stream.next()) {
+            if let iced::runtime::Action::Widget(operation) = action {
+                let mut next = Some(operation);
+                while let Some(mut operation) = next.take() {
+                    ui.operate(renderer, operation.as_mut());
+                    if let Outcome::Chain(chained) = operation.finish() {
+                        next = Some(chained);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancelling_a_focused_reassign_returns_focus_to_its_record_button() {
+        use iced::{
+            Size,
+            advanced::clipboard,
+            mouse,
+            runtime::user_interface::{Cache, UserInterface},
+        };
+
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let field = SettingsField::ShortcutToggleProjects;
+        let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
+        drop(app.update(Message::Palette(Action::Record(field))));
+        drop(app.record_shortcut(field, chord));
+        let key = |key: keyboard::key::Named, code| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modified_key: keyboard::Key::Named(key),
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        drop(app.palette_key_event(&key(keyboard::key::Named::Tab, keyboard::key::Code::Tab)));
+        let task = app
+            .palette_key_event(&key(
+                keyboard::key::Named::Escape,
+                keyboard::key::Code::Escape,
+            ))
+            .expect("the recorder owns Escape");
+        assert!(app.palette.recording.is_none());
+
+        // A list of Record buttons stands in for the settings page: only
+        // the one for the cancelled row receives focus.
+        let list: Element<'_, Message> = widget::column::with_children(
+            [SettingsField::ShortcutCommandPalette, field]
+                .into_iter()
+                .map(|candidate| {
+                    widget::button::text("Record")
+                        .id(settings_ui::record_shortcut_button(candidate))
+                        .on_press(Message::Palette(Action::Record(candidate)))
+                        .into()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into();
+        let mut renderer = super::super::tests::headless_renderer();
+        let mut ui = UserInterface::build(
+            list,
+            Size::new(600.0, 300.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        apply_widget_operations(task, &mut ui, &renderer);
+        let mut messages = Vec::new();
+        ui.update(
+            &[iced::Event::Keyboard(key(
+                keyboard::key::Named::Enter,
+                keyboard::key::Code::Enter,
+            ))],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::Palette(Action::Record(candidate))] if *candidate == field),
+            "Enter activates the cancelled row's Record button"
         );
     }
 

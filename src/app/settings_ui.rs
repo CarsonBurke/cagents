@@ -1365,6 +1365,11 @@ fn keyboard_groups<'a>(
     groups
 }
 
+/// The Record button of a shortcut row.
+pub(super) fn record_shortcut_button(field: SettingsField) -> widget::Id {
+    widget::Id::new(format!("settings.shortcut.record.{field:?}"))
+}
+
 fn shortcut_input<'a>(
     label: &'static str,
     value: &'a str,
@@ -1407,6 +1412,7 @@ fn shortcut_input<'a>(
                     Icon::Keyboard,
                     format!("Record shortcut for {label}"),
                 )
+                .id(record_shortcut_button(field))
                 .compact()
                 .on_press(Message::Palette(palette_ui::Action::Record(field)))
                 .into(),
