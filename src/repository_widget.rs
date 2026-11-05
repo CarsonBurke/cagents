@@ -2077,6 +2077,10 @@ struct SourceLineAnchor {
 #[derive(Debug, Clone, Copy, Default)]
 struct FileViewportAnchors {
     editor: text_editor::ScrollPosition,
+    /// Whether the reader has moved the editor since it was last placed for
+    /// them, on opening or on following the comparison back to Edit. Until
+    /// they do, entering Diff keeps the comparison's own place.
+    editor_moved: bool,
     preview: f32,
     diff: [Option<DiffViewportAnchor>; 2],
 }
@@ -6519,6 +6523,8 @@ impl RepositoryRuntime {
                             vertical: editor.scroll_vertical,
                             horizontal: editor.scroll_horizontal,
                         };
+                        // A navigation names the place to read.
+                        self.viewports.editor_moved = true;
                     }
                     document
                         .content
@@ -8035,7 +8041,9 @@ impl RepositoryRuntime {
             return;
         }
         if let DocumentState::Editable(document) = &self.document {
-            self.viewports.editor = document.content.scroll_position();
+            let position = document.content.scroll_position();
+            self.viewports.editor_moved |= position != self.viewports.editor;
+            self.viewports.editor = position;
         }
     }
 
@@ -8110,12 +8118,17 @@ impl RepositoryRuntime {
                 vertical: source.fraction as f32 * self.editor_line_height(),
                 horizontal: source.horizontal,
             };
+            self.viewports.editor_moved = false;
         }
     }
 
     /// Entering Diff from the editor shows the line the reader was on.
+    ///
+    /// An editor nobody has moved since it was placed says nothing about
+    /// where to read: a freshly opened file keeps the first change, and a
+    /// return from Diff keeps the comparison where it was left.
     fn align_diff_to_editor(&mut self) {
-        if !self.editable_surface_visible() {
+        if !self.editable_surface_visible() || !self.viewports.editor_moved {
             return;
         }
         let position = self.viewports.editor;
@@ -17637,6 +17650,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_editor_nobody_moved_keeps_the_comparisons_own_place() {
+        let card = CardId::new();
+        let before = (0..200)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let after = before
+            .replace("line 20\n", "changed 20\n")
+            .replace("line 180\n", "changed 180\n");
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            // A file just opened in Edit: Diff starts at its first change.
+            let (mut runtime, _) = working_diff_runtime(card, &before, &after);
+            runtime.diff_mode = mode;
+            runtime.diff_viewport.height = 300.0;
+            runtime.source_surface = SourceSurface::Editor;
+            runtime.reset_diff_viewports();
+            let folded = runtime.diff_layout().unwrap().folded(mode).clone();
+            drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+            assert_eq!(
+                Some(runtime.diff_viewport.offset),
+                runtime.first_change_offset(),
+                "{mode:?}"
+            );
+            assert!(runtime.pending_diff_source.is_none());
+            assert_eq!(
+                runtime.diff_layout().unwrap().folded(mode),
+                &folded,
+                "{mode:?}: line 1 is not unfolded in place of the first change"
+            );
+
+            // Back to Edit from the top fold and straight back: the
+            // comparison stays where it was left, with nothing unfolded.
+            drop(runtime.update(RepositoryAction::DiffViewport {
+                card,
+                offset: 0.0,
+                height: 300.0,
+                horizontal: 0.0,
+                user_initiated: true,
+            }));
+            assert!(matches!(folded.row(0), DisplayRow::Fold { .. }));
+            drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: false }));
+            drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+            assert_eq!(runtime.diff_viewport.offset, 0.0, "{mode:?}");
+            assert_eq!(runtime.diff_layout().unwrap().folded(mode), &folded);
+        }
+    }
+
     #[tokio::test]
     async fn entering_diff_holds_the_editor_line_until_stale_rows_rebuild() {
         for mode in [DiffMode::Inline, DiffMode::Split] {
@@ -17697,6 +17757,7 @@ mod tests {
             vertical: 3.0,
             horizontal: 8.0,
         };
+        runtime.viewports.editor_moved = true;
         runtime.align_diff_to_editor();
         assert!(
             runtime.pending_diff_source.is_some(),
@@ -17727,6 +17788,7 @@ mod tests {
             vertical: 0.0,
             horizontal: 0.0,
         };
+        runtime.viewports.editor_moved = true;
         runtime.align_diff_to_editor();
         runtime.source_surface = SourceSurface::Diff;
         assert_eq!(diff_source_line(&runtime), Some(2));
