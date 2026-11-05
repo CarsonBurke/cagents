@@ -3736,6 +3736,323 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
     drop(lease);
 }
 
+/// A conversation with an open CLI view reopens after a daemon stop. An
+/// ordinary exit closes the view with proof and retires the actor ("healthy").
+/// One that ends between closing the provider and retiring its helper either
+/// still stopped the view ("console-closed") or was killed first and left it
+/// running ("console-alive"); the next daemon finishes that exit before any
+/// client connects, so the saved pane reopens instead of waiting on a closed
+/// owner.
+#[test]
+fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
+    let _helper_executable = retained_helper_executable();
+    const MODE: &str = "CAGENTS_PAIRED_INTERRUPTED_EXIT_TEST";
+    if std::env::var_os(MODE).is_none() {
+        for mode in ["healthy", "console-closed", "console-alive"] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let root = directory.path();
+            for path in [
+                "home/.claude",
+                "run",
+                "data",
+                "config",
+                "cache",
+                "bin",
+                "project",
+            ] {
+                fs::create_dir_all(root.join(path)).unwrap();
+            }
+            let test = thread::current().name().unwrap().to_owned();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env_clear()
+                .env(
+                    "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+                    retained_helper_executable(),
+                )
+                .env(MODE, mode)
+                .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+                .env("CAGENTS_HOLDER_ROOT", root)
+                .env("HOME", root.join("home"))
+                .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+                .env("XDG_RUNTIME_DIR", root.join("run"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_CACHE_HOME", root.join("cache"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", root.join("bin").display()),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "paired interrupted exit mode={mode} failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
+    let mode = std::env::var(MODE).unwrap();
+    let interrupted = mode != "healthy";
+    let console_survives = mode == "console-alive";
+    install_provider(&root.join("bin/claude"));
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let proof = |incarnation| HostSessionProof {
+        host_session_id: HostSessionId::new("paired-interrupted-exit"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new(incarnation),
+    };
+    let first = proof("first");
+    let lease = crate::daemon::HostLease::acquire(&paths, &first).unwrap();
+    let registry_path = root.join("registry.sqlite3");
+    let mut state = HostState::new(first.clone());
+    state.enable_holder_recovery();
+    state.install_model(super::super::model::Registry::at(&registry_path).unwrap());
+    let host = Arc::new(HostLock::new(state));
+    let notifications = super::super::notifications::Broker::start(
+        &host,
+        crate::notifications::Application::Cagents,
+    )
+    .unwrap();
+    host.lock().unwrap().notifications = Some(notifications.handle());
+    let launch = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        root.join("project"),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let id = launch.id;
+    start_execution(
+        &host,
+        0,
+        launch,
+        Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap()),
+    )
+    .unwrap();
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    let identity = handle.actor_identity().unwrap();
+    struct Cleanup(Vec<crate::daemon::holder_registry::Record>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for owner in &self.0 {
+                for process in [&owner.root, &owner.holder] {
+                    if process.is_current() {
+                        unsafe {
+                            libc::kill(process.pid, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut cleanup = Cleanup(vec![identity.record.clone()]);
+    wait_until(
+        || handle.attachment_snapshot().ready,
+        "actor never initialized",
+    );
+    handle
+        .command(chat::Command::Prompt {
+            text: "One explicit turn before the interrupted exit".into(),
+            attachments: Vec::new(),
+            mode: chat::PromptMode::Send,
+        })
+        .unwrap();
+    wait_until(
+        || root.join("provider-done").exists() && handle.confirmed_session_id().is_some(),
+        "fixture provider never confirmed its completed conversation",
+    );
+    let mut confirmed_source = host.lock().unwrap().chats[&id].session.clone();
+    confirmed_source.launch.session_id = handle.confirmed_session_id();
+    // Pair the console the way an execution console is published.
+    let recipe = crate::model::LaunchRecipe {
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: root.join("project"),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    host.lock()
+        .unwrap()
+        .chats
+        .get_mut(&id)
+        .unwrap()
+        .console_recipe = Some(recipe.clone());
+    let terminal =
+        crate::terminal_ipc::TerminalDescriptor::relaunchable(id, recipe.clone(), None).session;
+    let (descriptor, console) = super::super::state::spawn_terminal_view_owned(
+        &host,
+        0,
+        terminal,
+        Default::default(),
+        None,
+        true,
+    )
+    .unwrap();
+    let pair = console.holder_identity().unwrap().clone();
+    cleanup.0.push(pair.clone());
+    let mut saved = confirmed_source.clone();
+    saved.terminal = Some(descriptor.session);
+    handle
+        .update_native_source(saved.clone(), Some(recipe), Some(pair.clone()))
+        .unwrap();
+    {
+        let mut state = host.lock().unwrap();
+        let record = state.chats.get_mut(&id).unwrap();
+        record.session = saved.clone();
+        record.paired_terminal = Some(console.clone());
+    }
+    retained_actor::register_ownership(&host, &handle, &saved).unwrap();
+    // When interrupted, the second turn's outcomes cannot commit, so the exit
+    // closes the provider but cannot retire its helper.
+    let fault = rusqlite::Connection::open(&registry_path).unwrap();
+    if interrupted {
+        fault.execute_batch("CREATE TRIGGER reject_exit_commit BEFORE INSERT ON native_actor_cursors BEGIN SELECT RAISE(ABORT, 'fixture exit commit failure'); END;").unwrap();
+    }
+    fs::remove_file(root.join("provider-done")).unwrap();
+    handle
+        .command(chat::Command::Prompt {
+            text: "A second turn before the exit".into(),
+            attachments: Vec::new(),
+            mode: chat::PromptMode::Send,
+        })
+        .unwrap();
+    wait_until(
+        || root.join("provider-done").exists(),
+        "fixture provider never finished its second turn",
+    );
+    if console_survives {
+        // Killed right after closing the provider, before its CLI view or
+        // its final outcomes were dealt with.
+        host.lock().unwrap().graceful_shutdown();
+        handle.close().unwrap();
+        console.preserve_for_restart().unwrap();
+        assert!(
+            pair.holder.is_current(),
+            "the console must outlive this exit"
+        );
+    } else {
+        let mut error = None;
+        assert!(super::super::finish_shutdown_owners(
+            &host, &mut error, false
+        ));
+        if interrupted {
+            let error = error.expect("the unfinished retirement must be reported");
+            assert!(
+                error.to_string().contains("fixture exit commit failure"),
+                "{error}"
+            );
+        } else {
+            assert!(error.is_none(), "{error:?}");
+        }
+        assert!(
+            !pair.holder.is_current() && !pair.root.is_current(),
+            "ordinary exit must stop the paired console"
+        );
+        assert!(
+            crate::terminal::holder::cleanup::confirmed_owner(&pair, &first).unwrap(),
+            "ordinary exit must leave proof the paired console closed"
+        );
+    }
+    fault
+        .execute_batch("DROP TRIGGER IF EXISTS reject_exit_commit;")
+        .unwrap();
+    drop(fault);
+    assert!(
+        !identity.record.root.is_current(),
+        "the exit closes the provider"
+    );
+    if interrupted {
+        assert!(
+            identity.record.holder.is_current(),
+            "the interrupted exit must leave an unretired helper"
+        );
+    }
+    let old_host = Arc::downgrade(&host);
+    let old_proxy_alive = handle.resource_lifetime();
+    drop((handle, console, notifications, host, lease));
+    wait_until(
+        || old_host.strong_count() == 0 && !old_proxy_alive(),
+        "the exiting daemon did not detach from its helper",
+    );
+    let next = proof("successor");
+    let _next_lease = crate::daemon::HostLease::acquire(&paths, &next).unwrap();
+    let mut state = HostState::new(next.clone());
+    state.enable_holder_recovery();
+    state.install_model(super::super::model::Registry::at(&registry_path).unwrap());
+    let successor = Arc::new(HostLock::new(state));
+    let notifications = super::super::notifications::Broker::start(
+        &successor,
+        crate::notifications::Application::Cagents,
+    )
+    .unwrap();
+    successor.lock().unwrap().notifications = Some(notifications.handle());
+    // The reconciliation a daemon runs before its listener admits a client.
+    retained_actor::reconcile_previous_boot_history(&successor).unwrap();
+    super::super::state::restore_orphaned_holders(&successor).unwrap();
+    super::restore_orphaned_native(&successor, &[]).unwrap();
+    retained_actor::reconcile_retired_actors(&successor).unwrap();
+    {
+        let state = successor.lock().unwrap();
+        assert!(
+            state.chats.is_empty(),
+            "a closed helper must not be adopted as a live conversation"
+        );
+        assert!(
+            !state.terminals.contains_key(&id),
+            "the paired console must end with its actor"
+        );
+        assert!(state.chat_spawning.is_empty());
+    }
+    wait_until(
+        || !identity.record.holder.is_current() && !pair.holder.is_current(),
+        "the finished helper and its console must exit",
+    );
+    let registry = super::super::agent_execution::registry(&successor).unwrap();
+    let retired = registry
+        .lock()
+        .unwrap()
+        .native_actor_retirement(identity.instance)
+        .unwrap()
+        .expect("the next daemon must durably retire the exact actor");
+    assert_eq!(retired.owner(), &identity.record);
+    let confirmed = retired
+        .confirmed_session()
+        .expect("retirement names the conversation")
+        .to_owned();
+    assert_eq!(
+        confirmed_source.launch.session_id.as_deref(),
+        Some(confirmed.as_str())
+    );
+    let ServerResponse::ChatResumePrepared { session } = process_inner(
+        &successor,
+        17,
+        ClientRequest::ChatPrepareResume {
+            source: saved.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("the saved paired pane must reopen its conversation");
+    };
+    assert!(chat::is_retained_resume_successor(&saved, &session));
+    assert_eq!(
+        session.launch.session_id.as_deref(),
+        Some(confirmed.as_str())
+    );
+    assert!(successor.lock().unwrap().chats.is_empty());
+    assert_eq!(
+        fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "finishing the exit must never replay an explicit prompt"
+    );
+}
+
 #[test]
 fn unattached_claude_cleanup_refuses_unsupported_protocol_before_reservation() {
     let proof = HostSessionProof {

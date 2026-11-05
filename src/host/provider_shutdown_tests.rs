@@ -620,7 +620,7 @@ fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
 fn ordinary_shutdown_commits_final_outcomes_and_retires_completed_retained_actor() {
     ordinary_retained_shutdown(
         "host::provider_shutdown_tests::ordinary_shutdown_commits_final_outcomes_and_retires_completed_retained_actor",
-        false,
+        FinalCommit::Healthy,
     );
 }
 
@@ -628,11 +628,33 @@ fn ordinary_shutdown_commits_final_outcomes_and_retires_completed_retained_actor
 fn ordinary_shutdown_retains_uncommitted_actor_and_still_closes_healthy_owners() {
     ordinary_retained_shutdown(
         "host::provider_shutdown_tests::ordinary_shutdown_retains_uncommitted_actor_and_still_closes_healthy_owners",
-        true,
+        FinalCommit::RetriedInPlace,
     );
 }
 
-fn ordinary_retained_shutdown(test: &str, fail_commit: bool) {
+/// The daemon exits between closing the provider and retiring its helper, as
+/// when a final commit or attention wait outlasts it. The next daemon must
+/// finish that exit before any client connects, not adopt the closed helper
+/// as a live conversation that blocks its own resume.
+#[test]
+fn next_daemon_finishes_an_exit_interrupted_between_close_and_retirement() {
+    ordinary_retained_shutdown(
+        "host::provider_shutdown_tests::next_daemon_finishes_an_exit_interrupted_between_close_and_retirement",
+        FinalCommit::LeftToNextDaemon,
+    );
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FinalCommit {
+    Healthy,
+    /// The final Store commit fails once; the same daemon retries it.
+    RetriedInPlace,
+    /// The final Store commit fails and that daemon exits with it unfinished.
+    LeftToNextDaemon,
+}
+
+fn ordinary_retained_shutdown(test: &str, final_commit: FinalCommit) {
+    let fail_commit = final_commit != FinalCommit::Healthy;
     use crate::{agent::Provider, model::ProjectKind, workspace_model::ModelEdit};
 
     let Some(root) = private_runtime(test, true) else {
@@ -681,7 +703,7 @@ for line in sys.stdin:
         host_incarnation: HostIncarnation::new("ordinary-retained-shutdown"),
     };
     let paths = daemon::RuntimePaths::discover().unwrap();
-    let _lease = daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let lease = daemon::HostLease::acquire(&paths, &proof).unwrap();
     let registry_path = root.join("registry.sqlite3");
     let mut registry = model::Registry::at(&registry_path).unwrap();
     registry
@@ -716,7 +738,7 @@ for line in sys.stdin:
     // private Store fault. The external guardian still owns failure-family
     // settlement; this never treats a pidfd kill as a successful retirement.
     struct Cleanup {
-        host: SharedHost,
+        host: Option<SharedHost>,
         root: PathBuf,
     }
     impl Drop for Cleanup {
@@ -725,15 +747,17 @@ for line in sys.stdin:
             if let Ok(db) = rusqlite::Connection::open(self.root.join("registry.sqlite3")) {
                 let _ = db.execute_batch("DROP TRIGGER IF EXISTS fail_shutdown_commit;");
             }
-            let _ = finish_chat_shutdown(&self.host);
+            if let Some(host) = &self.host {
+                let _ = finish_chat_shutdown(host);
+            }
         }
     }
     let handle = host.lock().unwrap().chats[&id].handle.clone();
     let identity = handle.actor_identity().expect("real retained actor");
     let helper_pin = ProcessPin::capture(identity.record.holder.clone());
     let provider_pin = ProcessPin::capture(identity.record.root.clone());
-    let cleanup = Cleanup {
-        host: host.clone(),
+    let mut cleanup = Cleanup {
+        host: Some(host.clone()),
         root: root.clone(),
     };
     assert!(helper_pin.live() && provider_pin.live());
@@ -839,6 +863,94 @@ for line in sys.stdin:
         fault
             .execute_batch("DROP TRIGGER fail_shutdown_commit;")
             .unwrap();
+    }
+    if final_commit == FinalCommit::LeftToNextDaemon {
+        // The pane keeps the descriptor it last saw.
+        let saved = host.lock().unwrap().chats[&id].session.clone();
+        // That daemon exits now, with its provider closed and helper unretired.
+        let old_host = Arc::downgrade(&host);
+        let old_proxy_alive = handle.resource_lifetime();
+        cleanup.host = None;
+        drop((handle, healthy, notifications, registry, host, lease));
+        wait(
+            &mut || old_host.strong_count() == 0 && !old_proxy_alive(),
+            "the exiting daemon did not detach from its helper",
+        );
+        assert!(
+            helper_pin.live(),
+            "an unfinished exit must retain the helper"
+        );
+        let next = HostSessionProof {
+            host_session_id: HostSessionId::new("next-daemon"),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: HostIncarnation::new("next-daemon"),
+        };
+        let _next_lease = daemon::HostLease::acquire(&paths, &next).unwrap();
+        let mut state = HostState::new(next);
+        state.enable_holder_recovery();
+        state.install_model(model::Registry::at(&registry_path).unwrap());
+        let successor = Arc::new(state::HostLock::new(state));
+        let notifications =
+            notifications::Broker::start(&successor, crate::notifications::Application::Cagents)
+                .unwrap();
+        successor.lock().unwrap().notifications = Some(notifications.handle());
+        cleanup.host = Some(successor.clone());
+        // The reconciliation a daemon runs before its listener admits a client.
+        super::chat::retained_actor::reconcile_previous_boot_history(&successor).unwrap();
+        super::chat::restore_orphaned_native(&successor, &[]).unwrap();
+        super::chat::retained_actor::reconcile_retired_actors(&successor).unwrap();
+        assert!(
+            successor.lock().unwrap().chats.is_empty(),
+            "a closed helper must not be adopted as a live conversation"
+        );
+        let registry = agent_execution::registry(&successor).unwrap();
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .native_actor_committed_through(identity.instance, &identity.record)
+                .unwrap()
+                >= final_sequence,
+            "the next daemon must commit the final outcomes the exit left"
+        );
+        let retired = registry
+            .lock()
+            .unwrap()
+            .native_actor_retirement(identity.instance)
+            .unwrap()
+            .expect("the next daemon must durably retire the exact actor");
+        assert_eq!(retired.owner(), &identity.record);
+        let confirmed = retired
+            .confirmed_session()
+            .expect("retirement names the conversation")
+            .to_owned();
+        wait(
+            &mut || !helper_pin.live() && !identity.record.holder.is_current(),
+            "the finished helper did not exit",
+        );
+        helper_pin.assert_reaped();
+        // The pane reopens its saved conversation instead of waiting on an
+        // owner that will never answer.
+        let crate::terminal_ipc::ServerResponse::ChatResumePrepared { session } =
+            super::chat::process(
+                &successor,
+                0,
+                crate::terminal_ipc::ClientRequest::ChatPrepareResume {
+                    source: saved.clone(),
+                },
+            )
+            .unwrap()
+        else {
+            panic!("expected a prepared resume");
+        };
+        assert_ne!(session.id, saved.id, "a resume starts a successor");
+        assert_eq!(
+            session.launch.session_id.as_deref(),
+            Some(confirmed.as_str())
+        );
+        assert!(session.proof.is_none());
+        drop(cleanup);
+        return;
     }
     finish_chat_shutdown(&host).unwrap();
     assert!(healthy.is_completed());

@@ -696,8 +696,10 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
                     // Closing the provider leaves its retained helper alive
                     // until final outcomes are durably committed and ACKed.
                     // Preserve that ownership on failure, before retiring the
-                    // delegated session record below.
-                    chat::retained_actor::finish_close(host, &chat, &session)
+                    // delegated session record below. A paired CLI view closes
+                    // first, with the proof its resume requires.
+                    chat::retained_actor::close_paired_view(host, session.id)
+                        .and_then(|()| chat::retained_actor::finish_close(host, &chat, &session))
                 } else {
                     Ok(())
                 }

@@ -2532,6 +2532,15 @@ fn process_inner(
             } else {
                 retained_resume::ResumeRetirement::Unclassified
             };
+            // A helper whose daemon exited between closing its provider and
+            // retiring it finishes that exit here, then classifies as retired.
+            let retirement = if !retirement.is_classified()
+                && retained_actor::finish_interrupted_exit_of(host, &ended).map_err(unavailable)?
+            {
+                retained_resume::inspect_resume_retirement(host, &source).map_err(unavailable)?
+            } else {
+                retirement
+            };
             // A present owner must be restored, not replaced. Missing evidence
             // is never proof of a completed close; a runtime record left by a
             // proved retired or abandoned actor is not a present owner.
