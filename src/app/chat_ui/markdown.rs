@@ -1738,7 +1738,20 @@ fn linked(spans: impl Iterator<Item = Span>) -> Vec<Span> {
         joined.push(span);
     }
     let mut out = Vec::with_capacity(joined.len());
-    for span in joined {
+    for mut span in joined {
+        // Agents set positions in code (`src/lib.rs:12`) as often as in
+        // prose; a code span that is exactly one keeps its face and opens.
+        if let Span::Standard {
+            text,
+            link: link @ None,
+            code: true,
+            ..
+        } = &mut span
+        {
+            *link = destination(text);
+            out.push(span);
+            continue;
+        }
         let Span::Standard {
             text,
             strikethrough,
@@ -1818,7 +1831,16 @@ fn references(text: &str) -> impl Iterator<Item = (usize, usize, Uri)> + '_ {
 /// A file position needs a line and a path that reads as one - a directory
 /// separator or an extension that starts with a letter - so a time such as
 /// `12:30`, a ratio, or `issue:42` stays text.
+/// Domain suffixes that end a host name far more often than a file name.
+const HOST_SUFFIXES: [&str; 10] = [
+    "com", "net", "org", "io", "co", "internal", "local", "lan", "cloud", "svc",
+];
+
 fn destination(reference: &str) -> Option<Uri> {
+    // A code span holding a command (`cargo test src/a.rs:3`) is not a link.
+    if reference.is_empty() || reference.contains(char::is_whitespace) {
+        return None;
+    }
     let lower = reference.get(..8).unwrap_or(reference).to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
         let url = url::Url::parse(reference).ok()?;
@@ -1832,6 +1854,15 @@ fn destination(reference: &str) -> Option<Uri> {
     }
     let (path, position) = crate::document_link::file_position(reference);
     position?;
+    // `api.example.com:5432` and `ghcr.io/org/app:2` name a host's port or an
+    // image's tag, not a line of a file.
+    let first = path.split('/').next().unwrap_or(path);
+    if first
+        .rsplit_once('.')
+        .is_some_and(|(_, suffix)| HOST_SUFFIXES.contains(&suffix.to_ascii_lowercase().as_str()))
+    {
+        return None;
+    }
     let name = path.rsplit('/').next().unwrap_or(path);
     let extension = name.rsplit_once('.').is_some_and(|(stem, extension)| {
         !stem.is_empty() && extension.starts_with(|ch: char| ch.is_ascii_alphabetic())
@@ -2031,11 +2062,27 @@ mod tests {
             "See (https://example.com/a_(b)), src/main.rs:42:7. Then docs/guide.md:9, \
              lib.rs:3 and https://kept.example."
         );
-        // Code, an author's own link, and colons that are not positions stay
-        // as written.
+        // A code span that is exactly a position opens too, still as code.
+        let content = Content::parse("Open `src/code.rs:22` or `cargo test src/a.rs:3`.");
+        assert_eq!(
+            links(&content),
+            pairs(&[("src/code.rs:22", "src/code.rs:22")])
+        );
+        let Item::Paragraph(text) = &content.items()[0] else {
+            panic!("paragraph")
+        };
+        let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
+        assert!(
+            text.spans(style)
+                .iter()
+                .any(|span| { span.link.is_some() && span.font == Some(style.inline_code_font) })
+        );
+        // An author's own link, hosts, image tags, and colons that are not
+        // positions stay as written.
         let content = Content::parse(
-            "`src/code.rs:22` [the docs](https://display.example) at 12:30, issue:42, \
-             v1.2:3, ftp://host/x and https:// alone.",
+            "[the docs](https://display.example) at 12:30, issue:42, v1.2:3, \
+             ftp://host/x, https:// alone, api.example.com:5432, db.internal:6379, \
+             ghcr.io/org/app:2, docker.io/library/node:20 and std::fmt.",
         );
         assert_eq!(
             links(&content),
