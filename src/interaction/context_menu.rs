@@ -701,6 +701,118 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_selection_paints_only_its_row_over_a_resting_pointer() {
+        use cosmic::iced::keyboard::{self, key::Named};
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let window = Size::new(400.0, 300.0);
+        let viewport = Rectangle::with_size(window);
+        let anchor = mouse::Cursor::Available(Point::new(20.0, 20.0));
+        let mut element = surface(widget::menu::items(
+            &std::collections::HashMap::new(),
+            (0..3)
+                .map(|i| widget::menu::Item::Button(format!("Action {i}"), None, RowAction(i)))
+                .collect(),
+        ));
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(window, window),
+        );
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+            Layout::new(&node),
+            anchor,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        let mut popup = element
+            .as_widget_mut()
+            .overlay(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &viewport,
+                Vector::ZERO,
+            )
+            .expect("right click opens the real menu");
+        let mut measured = popup.as_overlay_mut().layout(&renderer, window);
+        popup.as_overlay_mut().update(
+            &Event::Window(window::Event::RedrawRequested(Instant::now())),
+            Layout::new(&measured),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+        );
+        measured = popup.as_overlay_mut().layout(&renderer, window);
+        for _ in 0..2 {
+            let key = keyboard::Key::Named(Named::ArrowDown);
+            popup.as_overlay_mut().update(
+                &Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                }),
+                Layout::new(&measured),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+            );
+            measured = popup.as_overlay_mut().layout(&renderer, window);
+        }
+        let rows: Vec<Rectangle> = Layout::new(&measured)
+            .children()
+            .next()
+            .expect("the open menu")
+            .children()
+            .map(|row| row.bounds())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        // The pointer rests on the last row, as it does after opening a menu
+        // and then switching to the keyboard.
+        let resting = mouse::Cursor::Available(rows[2].center());
+        let theme = Theme::default();
+        popup.as_overlay().draw(
+            &mut renderer,
+            &theme,
+            &renderer::Style::default(),
+            Layout::new(&measured),
+            resting,
+        );
+        let size = Size::new(window.width as u32, window.height as u32);
+        let pixels = renderer.screenshot(size, 1.0, Color::from_rgb(1.0, 0.0, 1.0));
+        // Sample each row's own background, left of its icon and label.
+        let fill = |row: &Rectangle| {
+            let (x, y) = ((row.x + 3.0) as u32, row.center_y() as u32);
+            let index = ((y * size.width + x) * 4) as usize;
+            [pixels[index], pixels[index + 1], pixels[index + 2]]
+        };
+        let fills: Vec<_> = rows.iter().map(fill).collect();
+        assert_ne!(
+            fills[1], fills[0],
+            "the keyboard-selected row must be visibly highlighted: {fills:?}"
+        );
+        assert_eq!(
+            fills[2], fills[0],
+            "a resting pointer must not highlight a second row: {fills:?}"
+        );
+        drop(popup);
+        assert!(messages.is_empty(), "navigation alone activates nothing");
+    }
+
+    #[test]
     fn generated_menu_actions_retain_their_captured_local_message_for_keyboard() {
         use cosmic::iced::keyboard::{self, key::Named};
         use std::rc::Rc;

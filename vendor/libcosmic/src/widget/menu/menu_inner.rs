@@ -968,13 +968,26 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
                                             },
                                         );
 
+                                        // Item buttons paint an opaque base over
+                                        // the path quad, so a keyboard selection
+                                        // draws its row in the same hovered state
+                                        // a pointer would give it.
+                                        let item_cursor = if ms.keyboard {
+                                            keyboard_item_cursor(
+                                                ms.index,
+                                                start_index + i,
+                                                clo.bounds(),
+                                            )
+                                        } else {
+                                            view_cursor
+                                        };
                                         mt.item.draw(
                                             &state.tree.children[active_root[0]].children[mt.index],
                                             r,
                                             &t,
                                             style,
                                             clo,
-                                            view_cursor,
+                                            item_cursor,
                                             &children_layout
                                                 .bounds()
                                                 .intersection(&viewport)
@@ -1482,6 +1495,21 @@ fn reveal_keyboard_item(state: &mut MenuState, index: usize, viewport: Size, off
         (viewport.height - bounds.y - bounds.height).min(0.0),
         (-bounds.y).max(0.0),
     );
+}
+
+/// The cursor an item draws with while a menu is under keyboard control: the
+/// selected row sees a pointer at its center, and the rest see none, so a
+/// resting mouse cannot show a second highlighted row.
+pub(crate) fn keyboard_item_cursor(
+    selected: Option<usize>,
+    index: usize,
+    bounds: Rectangle,
+) -> Cursor {
+    if selected == Some(index) {
+        Cursor::Available(bounds.center())
+    } else {
+        Cursor::Unavailable
+    }
 }
 
 /// `Some` owns the key; its value reuses the pointer path's submenu result.
