@@ -11,6 +11,7 @@ import subprocess
 import sys
 
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = "tests/fixtures/protocol-contract"
 SELECTION = {
