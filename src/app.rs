@@ -14508,7 +14508,9 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        self.settle_chat_close_confirm();
+        if let Some(settled) = self.settle_chat_close_confirm() {
+            return Task::batch([settled, self.update(message)]);
+        }
         // Pane callbacks retain their rendering origin while queued. Unwrap
         // once before all message-dependent policy and completion bookkeeping.
         let (message, pane_origin) = match message {

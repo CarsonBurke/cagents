@@ -167,6 +167,16 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
+        // Any pane waits behind a chat's question, so no second dialog opens
+        // underneath it and takes its keys.
+        if self.chat_close_asked(card) {
+            return Task::none();
+        }
+        if self.chat_close_dialog_visible() {
+            self.queued_card_closes
+                .push_back(QueuedCardClose { card, unasked });
+            return Task::none();
+        }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(
                 "This pane is moving to a channel. Wait for the move to finish before closing it.",
@@ -263,7 +273,7 @@ impl Cagents {
             }
             return self.start_terminal_close(allow_active);
         }
-        if !unasked && let Some(asked) = self.chat_close_question(card) {
+        if !unasked && let Some(asked) = self.ask_before_chat_close(card) {
             return asked;
         }
         self.request_card_removal(card)

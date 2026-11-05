@@ -693,11 +693,20 @@ fn losing_a_race_with_no_session_change_still_warns() {
 /// A window that attached to a chat another window is running.
 fn working_chat(peer: &mut Peer) -> uuid::Uuid {
     let (operation, _) = attached_with_update_pending(peer);
-    let CardRuntime::Chat(runtime) = peer.app.cards.get_mut(&peer.card).unwrap() else {
+    publish_activity(peer, |snapshot| snapshot.busy = true);
+    operation
+}
+
+/// What the provider reports reaches the handle whether or not the pane is on
+/// screen. The runtime's own copy is left alone, as it is for a hidden pane.
+fn publish_activity(peer: &Peer, change: impl FnOnce(&mut Snapshot)) {
+    let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get(&peer.card) else {
         panic!("expected a chat runtime");
     };
-    Arc::make_mut(&mut runtime.snapshot).busy = true;
-    operation
+    let handle = runtime.handle().unwrap();
+    let mut snapshot = (*handle.snapshot()).clone();
+    change(&mut snapshot);
+    handle.publish_snapshot_for_test(snapshot);
 }
 
 fn card_open(peer: &Peer) -> bool {
@@ -760,6 +769,106 @@ fn a_close_with_nothing_working_does_not_ask() {
     attached_with_update_pending(&mut idle);
     drop(idle.app.update(Message::CloseCard(idle.card)));
     assert!(!idle.app.chat_close_dialog_visible());
+}
+
+/// Delegated work outlives the turn that started it, and closing stops it too.
+#[test]
+fn closing_a_chat_with_a_running_background_agent_asks() {
+    let mut peer = peer();
+    attached_with_update_pending(&mut peer);
+    publish_activity(&peer, |snapshot| {
+        snapshot.subagents.push(chat::Subagent {
+            id: "agent".into(),
+            kind: "general".into(),
+            description: "Background work".into(),
+            status: chat::ToolStatus::Running,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        });
+    });
+
+    drop(peer.app.update(Message::CloseCard(peer.card)));
+
+    assert!(peer.app.chat_close_dialog_visible());
+}
+
+/// The copy on the runtime is only refreshed on screen, so a turn that ended
+/// while the pane was hidden still looks busy there.
+#[test]
+fn a_chat_that_finished_while_hidden_closes_without_asking() {
+    let mut peer = peer();
+    attached_with_update_pending(&mut peer);
+    let CardRuntime::Chat(runtime) = peer.app.cards.get_mut(&peer.card).unwrap() else {
+        panic!("expected a chat runtime");
+    };
+    Arc::make_mut(&mut runtime.snapshot).busy = true;
+
+    drop(peer.app.update(Message::CloseCard(peer.card)));
+
+    assert!(!peer.app.chat_close_dialog_visible());
+}
+
+/// Closing while the first message is on its way would drop the prompt.
+#[test]
+fn closing_during_this_windows_own_first_start_asks() {
+    let mut peer = peer();
+    let target = draft_runtime(&peer.app, peer.card).target;
+    peer.app
+        .chat_ui
+        .phases
+        .insert(peer.card, Phase::SavingDraft { target });
+
+    drop(peer.app.update(Message::CloseCard(peer.card)));
+
+    assert!(peer.app.chat_close_dialog_visible());
+    assert!(card_open(&peer));
+}
+
+/// Closes held behind a question go on once its conversation is gone, and a
+/// second close of any kind waits rather than opening a dialog under it.
+#[test]
+fn closes_waiting_on_a_question_go_on_when_it_ends_elsewhere() {
+    let mut peer = peer();
+    let operation = working_chat(&mut peer);
+    let kind = peer.app.card_state(peer.card).unwrap().kind.clone();
+    drop(project(&mut peer.app, peer.channel, peer.card, kind));
+    peer.app
+        .acknowledge_view_edit(Scope::Channel(peer.channel), Some(operation));
+    drop(peer.app.update(Message::CloseCard(peer.card)));
+
+    let waiting = CardId::new();
+    drop(peer.app.begin_card_close(waiting));
+    assert!(peer.app.terminal_close.is_none());
+    assert!(peer.app.pane_close_owned(waiting));
+
+    let replacement = draft_session(peer._directory.path());
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(replacement),
+    ));
+    drop(peer.app.update(Message::CancelChatClose));
+
+    assert!(peer.app.queued_card_closes.is_empty());
+    assert!(!peer.app.pane_close_owned(waiting));
+}
+
+/// A popup that closes under the question hands it the reader's keyboard state.
+#[test]
+fn answering_restores_the_keyboard_state_a_popup_handed_over() {
+    let mut peer = peer();
+    working_chat(&mut peer);
+    peer.app.core.set_keyboard_nav(false);
+    drop(peer.app.update(Message::CloseCard(peer.card)));
+
+    assert!(peer.app.adopt_chat_close_keyboard_nav(true));
+    drop(peer.app.update(Message::CancelChatClose));
+
+    assert!(peer.app.core.keyboard_nav());
 }
 
 /// A question about a conversation that has since been closed or replaced has

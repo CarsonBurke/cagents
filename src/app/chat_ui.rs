@@ -7702,17 +7702,18 @@ impl Cagents {
             .values()
             .find_map(|runtime| runtime.restart_blocker())
     }
-    /// Whether closing or a close-after-return already owns this card.
-    /// The conversation a close of `card` would stop while it is working, or
-    /// while this window cannot tell: it is still attaching, failed to attach
-    /// to a start made elsewhere, or still holds the draft that start came from.
-    pub(super) fn chat_working_session(&self, card: CardId) -> Option<TerminalId> {
+    /// The conversation a close of `card` would stop while it is working, and
+    /// whether that is known. This window may be unable to tell: it is still
+    /// attaching, failed to attach to a start made elsewhere, or still holds
+    /// the draft that start came from.
+    pub(super) fn chat_working_session(&self, card: CardId) -> Option<(TerminalId, bool)> {
         let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| &state.kind) else {
             return None;
         };
+        let pending = self.chat_start_pending(card);
         // A return already under way has given the conversation up; closing
         // only says not to keep its terminal.
-        if session.is_unstarted()
+        if (session.is_unstarted() && !pending)
             || self.chat_close_owned(card)
             || matches!(
                 self.chat_ui.phases.get(&card),
@@ -7721,17 +7722,43 @@ impl Cagents {
         {
             return None;
         }
-        let working = match self.cards.get(&card) {
-            Some(CardRuntime::Chat(runtime)) => {
-                runtime.is_draft() || runtime.snapshot.busy || self.chat_start_pending(card)
+        // A window sending its own first message knows what it just started.
+        if session.is_unstarted() {
+            return Some((session.id, true));
+        }
+        let certain = match self.cards.get(&card) {
+            // The handle's snapshot, not the runtime's copy: that one is only
+            // refreshed while the pane is on screen, and a tab can be closed
+            // without ever being shown.
+            Some(CardRuntime::Chat(runtime)) if runtime.connected() && !pending => {
+                match runtime.handle()?.snapshot().activity() {
+                    crate::agent::ActivityState::Working | crate::agent::ActivityState::Waiting => {
+                        true
+                    }
+                    crate::agent::ActivityState::Idle | crate::agent::ActivityState::Unknown => {
+                        return None;
+                    }
+                }
             }
-            Some(CardRuntime::Loading) => self.chat_start_pending(card),
-            Some(CardRuntime::Failed(_)) => self.chat_ui.peer_started.contains_key(&card),
-            _ => false,
+            // A pane that lost its connection or provider says so already, and
+            // closing is how the reader clears it.
+            Some(CardRuntime::Chat(runtime))
+                if runtime.disconnected
+                    || runtime
+                        .handle()
+                        .is_some_and(|handle| handle.snapshot().exited) =>
+            {
+                return None;
+            }
+            Some(CardRuntime::Chat(_)) => false,
+            Some(CardRuntime::Loading) if pending => false,
+            Some(CardRuntime::Failed(_)) if self.chat_ui.peer_started.contains_key(&card) => false,
+            _ => return None,
         };
-        working.then_some(session.id)
+        Some((session.id, certain))
     }
 
+    /// Whether closing or a close-after-return already owns this card.
     pub(super) fn chat_close_owned(&self, card: CardId) -> bool {
         matches!(
             self.chat_ui.phases.get(&card),

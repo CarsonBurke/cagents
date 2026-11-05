@@ -11,7 +11,10 @@ const CONFIRM: &str = "dialog.chat-close.confirm";
 pub(super) struct ChatCloseConfirm {
     card: CardId,
     session: TerminalId,
+    /// False when this window cannot tell, as while it is still attaching.
+    certain: bool,
     focus_confirm: bool,
+    restore_card: Option<CardId>,
     restore_keyboard_nav: bool,
 }
 
@@ -39,13 +42,15 @@ impl Cagents {
         self.ask_before_chat_close(card)
     }
 
-    fn ask_before_chat_close(&mut self, card: CardId) -> Option<Task<Message>> {
-        let session = self.chat_working_session(card)?;
+    pub(super) fn ask_before_chat_close(&mut self, card: CardId) -> Option<Task<Message>> {
+        let (session, certain) = self.chat_working_session(card)?;
         let restore_keyboard_nav = self.core.keyboard_nav();
         self.chat_close_confirm = Some(ChatCloseConfirm {
             card,
             session,
+            certain,
             focus_confirm: false,
+            restore_card: self.workspace.focused(),
             restore_keyboard_nav,
         });
         self.core.set_keyboard_nav(false);
@@ -73,12 +78,26 @@ impl Cagents {
             .is_some_and(|intent| self.chat_close_target_current(intent))
     }
 
-    /// Ends the question once its conversation has gone, so no modal state
-    /// outlives the dialog it belonged to.
-    pub(super) fn settle_chat_close_confirm(&mut self) {
-        if self.chat_close_confirm.is_some() && !self.chat_close_dialog_visible() {
-            drop(self.finish_chat_close_question());
+    /// A popup that opened or closed around the question recorded its own
+    /// keyboard state; the question restores the reader's.
+    pub(super) fn adopt_chat_close_keyboard_nav(&mut self, restore: bool) -> bool {
+        match self.chat_close_confirm.as_mut() {
+            Some(intent) => {
+                intent.restore_keyboard_nav = restore;
+                true
+            }
+            None => false,
         }
+    }
+
+    /// Ends the question once its conversation has gone, so no modal state
+    /// outlives the dialog it belonged to, and lets closes waiting on it go on.
+    pub(super) fn settle_chat_close_confirm(&mut self) -> Option<Task<Message>> {
+        if self.chat_close_confirm.is_none() || self.chat_close_dialog_visible() {
+            return None;
+        }
+        drop(self.finish_chat_close_question());
+        Some(self.next_queued_card_close())
     }
 
     fn finish_chat_close_question(&mut self) -> Option<ChatCloseConfirm> {
@@ -91,7 +110,12 @@ impl Cagents {
         let Some(intent) = self.finish_chat_close_question() else {
             return Task::none();
         };
-        iced::widget::operation::focus(self.card_keyboard_focus(intent.card))
+        let card = intent
+            .restore_card
+            .filter(|card| self.workspace.order().any(|id| id == *card))
+            .unwrap_or(intent.card);
+        let _ = self.workspace.focus(card);
+        iced::widget::operation::focus(self.card_keyboard_focus(card))
             .map(cosmic::Action::App)
             .chain(self.next_queued_card_close())
     }
@@ -118,14 +142,24 @@ impl Cagents {
     }
 
     pub(super) fn chat_close_dialog(&self) -> Element<'_, Message> {
+        let intent = self.chat_close_confirm.as_ref();
+        // Several closes can ask in turn, so each says which conversation it means.
+        let title = intent
+            .and_then(|intent| self.card_chrome.get(&intent.card))
+            .map_or_else(
+                || "Stop this conversation?".to_owned(),
+                |chrome| format!("Stop \u{201c}{}\u{201d}?", chrome.title),
+            );
+        let body = if intent.is_some_and(|intent| intent.certain) {
+            "It is still working. Closing it stops it and closes it in every window."
+        } else {
+            "It may still be working. Closing it stops anything it is doing and closes it in every window."
+        };
         dialog_ui::overlay(
             dialog_ui::surface(
                 widget::column::with_children(vec![
-                    crate::design::title("Stop this conversation?").into(),
-                    crate::design::body(
-                        "It is still working. Closing it stops it and closes it in every window.",
-                    )
-                    .into(),
+                    crate::design::title(title).into(),
+                    crate::design::body(body).into(),
                     dialog_ui::confirmation_actions(
                         crate::ui_controls::button::secondary("Keep working")
                             .id(widget::Id::new(CANCEL))
