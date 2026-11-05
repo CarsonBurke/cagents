@@ -481,8 +481,9 @@ impl Runtime {
         } else {
             preview.push(cached.preview.view());
             // The first line of a script (`python3 - <<'EOF'`) does not say
-            // what it does, so the provider's account of it is kept in view.
-            if let Some(description) = turn::script_description(&item.content) {
+            // what it does, so the provider's account of it is kept in view
+            // until the open step shows it above the command.
+            if !open && let Some(description) = turn::script_description(&item.content) {
                 preview.push(design::caption(description.to_owned()).into());
             }
         }
