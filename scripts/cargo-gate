@@ -47,7 +47,8 @@ Environment:
                          Percentage of time some task waited for a CPU over
                          the last 10 s (`some avg10` in /proc/pressure/cpu)
                          at or above which no further build starts beside a
-                         running one; default 60; 0 disables
+                         running one; default 60; 0 disables this and the
+                         settling time
   CAGENTS_BUILD_CPU_SETTLE_SECS
                          Seconds after a build starts before the pressure,
                          a 10 s average, can show it; no further build
@@ -178,13 +179,19 @@ slot_path() {
     if [ "$1" -eq 0 ]; then printf '%s' "$lock"; else printf '%s.%s' "$lock" "$1"; fi
 }
 
+# Seconds since boot: unlike the wall clock, never set back.
+uptime_seconds() {
+    read -r up _ </proc/uptime
+    printf '%s' "${up%%.*}"
+}
+
 # Whether the CPUs have room for one more build beside running ones: no build
 # started too recently for the pressure to show it (the newest start is in
 # `newest`), and the pressure is below the limit. A host that does not report
 # pressure has room.
 cpu_allows() {
     [ "$pressure_limit" -gt 0 ] || return 0
-    if [ -n "$newest" ] && [ $(($(date +%s) - newest)) -lt "$settle" ]; then
+    if [ -n "$newest" ] && [ $(($(uptime_seconds) - newest)) -lt "$settle" ]; then
         return 1
     fi
     some=$(sed -n 's/^some avg10=\([0-9]*\)[.[:space:]].*/\1/p' "$pressure_file" 2>/dev/null) || some=
@@ -217,7 +224,7 @@ fits() {
             if ! flock -n 7; then
                 running=$((running + 1))
                 claim= holder= claimed= since=
-                { read -r holder claimed since <"$path.cost"; } 2>/dev/null || :
+                { read -r holder claimed; read -r since; } <"$path.cost" 2>/dev/null || :
                 case $holder:$claimed in
                     *[!0-9:]*|:*|*:) ;;
                     *)
@@ -369,8 +376,9 @@ waiter_gone() {
 
 admitted() {
     # Prices this build for the builds that start after it, and dates its
-    # start, before the next waiter can look.
-    printf '%s %s %s\n' "$$" "$cost" "$(date +%s)" >"$(slot_path "$index").cost" 2>/dev/null || :
+    # start in seconds since boot, before the next waiter can look. The date
+    # is a line of its own, which gates that only price builds do not read.
+    printf '%s %s\n%s\n' "$$" "$cost" "$(uptime_seconds)" >"$(slot_path "$index").cost" 2>/dev/null || :
     exec 8>&-
     # Each build gets a share of the CPUs among the builds running once it
     # starts, replacing the repository's two-job default and capping a larger

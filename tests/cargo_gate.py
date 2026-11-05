@@ -928,6 +928,58 @@ class CpuPressureAdmission(TwoSlots):
             self.assertIn(name, result.stderr)
             del self.env[name]
 
+    def held_slot(self, index, sidecar):
+        """Holds slot `index` with a plain `flock` and prices it with `sidecar`,
+        a gate's cost file, whose holder is this test."""
+        path = self.root / ("slot.lock" if index == 0 else f"slot.lock.{index}")
+        holder = subprocess.Popen(
+            ["flock", path, "sh", "-c",
+             f"touch {path}.held; while [ ! -e {self.root}/release ]; do sleep 0.05; done"])
+        self.addCleanup(holder.wait, 10)
+        self.addCleanup((self.root / "release").touch)
+        while not Path(f"{path}.held").exists():
+            time.sleep(0.02)
+        Path(f"{path}.cost").write_text(sidecar.format(pid=os.getpid()))
+
+    @staticmethod
+    def uptime():
+        return int(float(Path("/proc/uptime").read_text().split()[0]))
+
+    def test_the_newest_of_several_running_builds_must_have_settled(self):
+        self.report("0.00")
+        self.env |= {"CAGENTS_BUILD_SLOTS": "3", "CAGENTS_BUILD_CPU_SETTLE_SECS": "60"}
+        self.held_slot(1, f"{{pid}} 1\n{self.uptime() - 600}\n")
+        self.held_slot(2, f"{{pid}} 1\n{self.uptime()}\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=2)
+
+    def test_settled_and_undated_running_builds_leave_room(self):
+        # A build priced by a gate that does not date its start is not waited for.
+        self.report("0.00")
+        self.env |= {"CAGENTS_BUILD_SLOTS": "3", "CAGENTS_BUILD_CPU_SETTLE_SECS": "60"}
+        self.held_slot(1, f"{{pid}} 1\n{self.uptime() - 600}\n")
+        self.held_slot(2, "{pid} 1\n")
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_dated_cost_still_reads_as_a_cost_to_gates_that_only_price(self):
+        self.report("0.00")
+        self.hold(1)
+        cost = next(self.root.glob("slot.lock*.cost")).read_text()
+        # The one-line read of gates that predate dated starts.
+        result = subprocess.run(
+            ["sh", "-c", 'read -r holder claimed; printf "%s:%s" "$holder" "$claimed"'],
+            input=cost, capture_output=True, text=True, check=True)
+        holder, claimed = result.stdout.split(":")
+        self.assertEqual(int(holder), self.holder.pid)
+        self.assertEqual(int(claimed), 2**20)
+
+    def test_an_unreadable_pressure_report_leaves_room(self):
+        self.pressure.write_text("some total=12\n")
+        self.hold(1)
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_default_slots_are_capped_at_four(self):
         del self.env["CAGENTS_BUILD_SLOTS"]
         result = self.build(1, timeout=10)
