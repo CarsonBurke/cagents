@@ -45,7 +45,8 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
           git rev-parse HEAD 'HEAD^{tree}'
-          sha256sum scripts/run-development tests/run-development-zig.py \
+          sha256sum scripts/run-development scripts/cargo-gate tests/run-development-zig.py \
+            scripts/cargo-gate-command.py tests/cargo_gate.py \
             scripts/check-format scripts/check-format-cache.py tests/check_format.py mise.toml
           for format_tool in git cargo rustc rustfmt rustup sh python3; do
             command -v "$format_tool"
@@ -69,6 +70,12 @@ jobs:
 
       - name: Check Zig discovery contracts
         run: python3 tests/run-development-zig.py -v
+
+      - name: Check held-command cancellation contracts
+        run: python3 tests/cargo_gate.py -v
+
+      - name: Check installer coordinator extraction contracts
+        run: python3 tests/installer_coordinator.py -v
 
       - name: Check validation checkout and process custody contracts
         run: |
@@ -118,6 +125,7 @@ jobs:
       - name: Check shell syntax
         run: |
           sh -n scripts/run-development
+          sh -n scripts/cargo-gate
           sh -n scripts/check-format
 
       - name: Check repository formatting

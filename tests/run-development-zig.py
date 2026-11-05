@@ -10,6 +10,7 @@ import unittest
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "scripts/run-development"
+GATE = SOURCE.with_name("cargo-gate")
 
 
 class ZigDiscovery(unittest.TestCase):
@@ -21,6 +22,8 @@ class ZigDiscovery(unittest.TestCase):
         (checkout / "scripts").mkdir(parents=True)
         self.runner = checkout / "scripts/run-development"
         shutil.copy2(SOURCE, self.runner)
+        shutil.copy2(GATE, checkout / "scripts/cargo-gate")
+        shutil.copy2(GATE.with_name("cargo-gate-command.py"), checkout / "scripts/cargo-gate-command.py")
         (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
 
         self.data = self.root / "data with spaces/mise"
@@ -63,7 +66,10 @@ exit 83
             PATH=f"{fake_bin}:{shim.parent}:/usr/bin:/bin",
             HOME=str(self.home), XDG_DATA_HOME=str(self.xdg),
             SHIM_CALLS=str(self.shim_calls), CARGO_CALLS=str(self.cargo_calls),
+            # The runner builds through the gate; keep it off the host's locks.
+            CAGENTS_BUILD_LOCK=str(self.root / "cargo.lock"),
         )
+        self.env.pop("CAGENTS_BUILD_SLOT_HELD", None)
         self.env.pop("MISE_DATA_DIR", None)
         self.env.pop("CAGENTS_ZIG", None)
 

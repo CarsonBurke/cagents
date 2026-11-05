@@ -27,6 +27,24 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    // The browser bundles HarfBuzz while system FreeType loads system HarfBuzz.
+    // Exporting either bundled font API lets the dynamic loader mix their state.
+    // Localize only these definitions in the final Linux browser UI; imported
+    // system functions and unrelated runtime exports retain their usual binding.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && std::env::var_os("CARGO_FEATURE_INTEGRATED_BROWSER").is_some()
+    {
+        let output = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
+        let map = output.join("linux-ui-font-symbols.map");
+        std::fs::write(&map, "{ local: hb_*; FT_*; };\n")
+            .expect("write Linux browser UI font symbol map");
+        // Forward the complete path as one linker argument, including commas.
+        // The compiler driver splits -Wl arguments at commas in filesystem paths.
+        println!("cargo:rustc-link-arg-bin=cagents-ui=-Xlinker");
+        println!("cargo:rustc-link-arg-bin=cagents-ui=--version-script");
+        println!("cargo:rustc-link-arg-bin=cagents-ui=-Xlinker");
+        println!("cargo:rustc-link-arg-bin=cagents-ui={}", map.display());
+    }
     println!("cargo:rerun-if-env-changed=CAGENTS_CHECKOUT_ROOT");
     println!("cargo:rerun-if-env-changed=CAGENTS_BUILD_METADATA");
     let base = std::env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION");
@@ -77,14 +95,26 @@ fn git_metadata(base: &str) -> Option<String> {
     } else {
         manifest.join(head)
     };
-    // Rebuild when the checkout moves: the HEAD file itself, and the ref it
-    // points at when it is symbolic. A packed ref changes through the HEAD
-    // file's own directory less predictably, so the index is watched as well;
-    // a commit always rewrites it.
+    // Rebuild when the checkout moves: the HEAD file itself, the ref it points
+    // at when it is symbolic, and the index, which every commit rewrites. That
+    // covers a commit on a packed branch, whose new loose ref leaves
+    // packed-refs alone; a ref move that keeps the index, such as `update-ref`,
+    // leaves a stale short SHA until the next rebuild.
     println!("cargo:rerun-if-changed={}", head.display());
     if let Some(reference) = git(&manifest, &["symbolic-ref", "-q", "HEAD"]) {
-        if let Some(path) = git(&manifest, &["rev-parse", "--git-path", &reference]) {
-            println!("cargo:rerun-if-changed={path}");
+        // Cargo treats a watched path that does not exist as always changed,
+        // so watching a packed branch's loose file would rebuild this crate
+        // on every invocation. Watch the file the ref actually lives in.
+        let path = git(&manifest, &["rev-parse", "--git-path", &reference])
+            .map(|path| manifest.join(path))
+            .filter(|path| path.exists())
+            .or_else(|| {
+                git(&manifest, &["rev-parse", "--git-path", "packed-refs"])
+                    .map(|path| manifest.join(path))
+                    .filter(|path| path.exists())
+            });
+        if let Some(path) = path {
+            println!("cargo:rerun-if-changed={}", path.display());
         }
     }
     if let Some(index) = git(&manifest, &["rev-parse", "--git-path", "index"]) {
