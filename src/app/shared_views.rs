@@ -85,6 +85,9 @@ pub(super) struct State {
     default_requests: HashSet<CardId>,
     pub blocked: HashSet<Scope>,
     pub adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
+    /// Chat cards whose shared view moved them to another conversation since
+    /// this window last saved, which storage must be told explicitly.
+    pub chat_adoptions: HashMap<CardId, crate::session::ChatIdentityAdoption>,
     pub restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     restoration_requests: HashMap<CardId, TerminalId>,
 }
@@ -235,6 +238,11 @@ impl Cagents {
             return self.reconcile_workspace_model();
         };
         let mut retry = None;
+        // Another client may have published the very change refused here,
+        // as when two windows report the same conversation from the daemon.
+        // Nothing the reader asked for was lost then.
+        let mut satisfied = false;
+        let mut differing = Vec::new();
         if let Change::Update { before, pane } = &change
             && before.id == pane.id
             && self
@@ -259,6 +267,21 @@ impl Cagents {
                     .iter()
                     .find(|current| current.id == pane.id)
                     .unwrap();
+                satisfied = Pane {
+                    title: current.title.clone(),
+                    user_title: current.user_title.clone(),
+                    width_fraction: current.width_fraction,
+                    ..pane.clone()
+                } == *current;
+                if pane.kind != current.kind {
+                    differing.push("kind");
+                }
+                if pane.scope != current.scope {
+                    differing.push("scope");
+                }
+                if pane.pending_terminal_start != current.pending_terminal_start {
+                    differing.push("pending start");
+                }
                 let mut presentation = current.clone();
                 let later = &self.shared_views.pending[index + 1..];
                 let superseded = |field: fn(&Pane, &Pane) -> bool| {
@@ -293,7 +316,11 @@ impl Cagents {
                 }
             }
         }
-        tracing::warn!(?scope, %operation, %error, "refused source-sensitive pane intent; host applied no fields");
+        if satisfied {
+            tracing::debug!(?scope, %operation, "a refused pane update was already in the shared view");
+        } else {
+            tracing::warn!(?scope, %operation, %error, ?differing, "refused source-sensitive pane intent; host applied no fields");
+        }
         self.shared_views.pending.remove(index);
         let source_basis = self.shared_views.source_bases.remove(&operation);
         if let Some((operation, scope, revision, change)) = retry {
@@ -312,9 +339,11 @@ impl Cagents {
                 change,
             });
         }
-        self.notices.record(TransientNotice::warning(
-            "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
-        ));
+        if !satisfied {
+            self.notices.record(TransientNotice::warning(
+                "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
+            ));
+        }
         self.reconcile_workspace_model()
     }
 
@@ -1964,6 +1993,11 @@ impl Cagents {
                             (CardKind::Chat(a), CardKind::Chat(b)) => a.id == b.id,
                             (a, b) => a == b,
                         };
+                        if let (CardKind::Chat(saved), CardKind::Chat(canonical)) =
+                            (&card.kind, &pane.kind)
+                        {
+                            self.adopt_shared_chat_identity(pane.id, saved, canonical);
+                        }
                         if !same_session {
                             // A held title belongs to the replaced session.
                             self.reported_title_save.cards.remove(&pane.id);
@@ -1980,7 +2014,14 @@ impl Cagents {
                                 && matches!(self.cards.get(&pane.id),
                                     Some(CardRuntime::Chat(runtime)) if runtime.session.is_unstarted())
                             {
-                                self.stash_unsent_chat(pane.id);
+                                if matches!(&pane.kind, CardKind::Chat(canonical) if !canonical.is_unstarted())
+                                    && self.chat_draft_follows_peer_start(pane.id)
+                                {
+                                    // It follows that conversation, whose first
+                                    // message the text may only repeat.
+                                    self.chat_ui.started_elsewhere.insert(pane.id);
+                                }
+                                self.carry_unsent_chat(pane.id);
                             }
                             self.cards.remove(&pane.id);
                             self.lifecycle.remove(pane.id);
@@ -2015,6 +2056,14 @@ impl Cagents {
                     }
                 }
                 _ => {
+                    // A closed card the view reopens may hold another
+                    // conversation than the one it last saved.
+                    if let (Some(CardKind::Chat(saved)), CardKind::Chat(canonical)) = (
+                        self.card_state(pane.id).map(|card| card.kind.clone()),
+                        &pane.kind,
+                    ) {
+                        self.adopt_shared_chat_identity(pane.id, &saved, canonical);
+                    }
                     let card = CardState {
                         id: pane.id,
                         generation: self.durable.generation,
@@ -2094,6 +2143,37 @@ impl Cagents {
             self.persist();
         }
         Task::batch(tasks)
+    }
+
+    /// Records that chat card `card`, which this window holds as `saved`,
+    /// now shows the shared view's `canonical` conversation.
+    ///
+    /// Storage refuses a snapshot that re-points a chat card at another
+    /// conversation unless the change is recorded explicitly. Another client
+    /// recorded it in its own store; this window, which only follows the
+    /// canonical view, records it in its own before the next save.
+    pub(super) fn adopt_shared_chat_identity(
+        &mut self,
+        card: CardId,
+        saved: &crate::chat::Session,
+        canonical: &crate::chat::Session,
+    ) {
+        use std::collections::hash_map::Entry;
+        match self.shared_views.chat_adoptions.entry(card) {
+            Entry::Occupied(entry) if entry.get().expected == canonical.id => {
+                // Back to the conversation storage already holds.
+                entry.remove();
+            }
+            Entry::Occupied(mut entry) => entry.get_mut().canonical = canonical.clone(),
+            Entry::Vacant(entry) if saved.id != canonical.id => {
+                entry.insert(crate::session::ChatIdentityAdoption {
+                    card,
+                    expected: saved.id,
+                    canonical: canonical.clone(),
+                });
+            }
+            Entry::Vacant(_) => {}
+        }
     }
 
     fn attach_shared_pane(&mut self, pane: &Pane) -> Task<Message> {
@@ -3141,6 +3221,7 @@ mod tests {
             "foreign-watch-first",
             "uncaptured",
             "later-title",
+            "already-published",
         ] {
             let (mut app, source, _, before) = channel_move_fixture();
             let (tx, rx) = async_channel::unbounded();
@@ -3189,6 +3270,13 @@ mod tests {
             };
             browser.current_url = "https://authoritative.example".parse().unwrap();
             current.scope = Some("/authoritative-source".into());
+            if control == "already-published" {
+                // Another client published the same session first, as two
+                // windows attached to one conversation both do.
+                current.kind = desired.kind.clone();
+                current.scope = desired.scope.clone();
+                current.pending_terminal_start = desired.pending_terminal_start;
+            }
             let expected = current.clone();
             if control == "missing" {
                 model.views[0].panes.clear();
@@ -3222,10 +3310,12 @@ mod tests {
                     .iter()
                     .any(|(id, _, _)| *id == operation)
             );
-            assert!(
+            assert_eq!(
                 app.notices
                     .recent()
-                    .any(|entry| entry.notice.message.contains("session update was refused"))
+                    .any(|entry| entry.notice.message.contains("session update was refused")),
+                control != "already-published",
+                "{control}: a refusal warns only when the session intent was lost"
             );
             if matches!(
                 control,
@@ -6954,6 +7044,220 @@ mod tests {
                 Some(TEXT),
                 "{case}: autosave"
             );
+        }
+    }
+
+    /// Two windows show one unstarted draft and the other window starts it
+    /// (#2176). This window follows it: it attaches to the started
+    /// conversation, keeps the reader's own unsent text, drops a copy of the
+    /// message the other window sent, and saves without a refused write.
+    /// Covers the started conversation arriving under the draft's own
+    /// identity after an unstarted one, and directly, and a draft that can
+    /// only follow once its file chooser closes, on its next Send, with the
+    /// file it had attached.
+    #[test]
+    fn draft_started_in_another_window_attaches_and_saves() {
+        use crate::app::workspace_model_sync::ModelUpdate;
+        const SENT: &str = "Message from window A";
+        const NOTES: &str = "Unsent notes typed in window B\n  keep their spacing ";
+        const FILE: &str = "/repo/notes.txt";
+        for (text, through_unstarted, held) in [
+            (NOTES, true, false),
+            (NOTES, false, false),
+            (SENT, true, false),
+            (SENT, false, false),
+            (NOTES, true, true),
+        ] {
+            let case = format!("text={text:?} through_unstarted={through_unstarted} held={held}");
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, a, b, _) = fixture();
+            app.active_workspace = Some(PathBuf::from("/repo"));
+            Arc::make_mut(&mut app.durable).active_channel = Some(a);
+            drop(app.new_native_chat(crate::agent::Provider::Claude, Some("/repo".into())));
+            let card = app.workspace.focused().unwrap();
+            let target = match app.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) => runtime.target,
+                _ => panic!("{case}: a new chat opens a draft runtime"),
+            };
+            drop(app.update(Message::ChatUi(chat_ui::Action::Composer(
+                target,
+                cosmic::widget::text_editor::Action::Edit(
+                    cosmic::widget::text_editor::Edit::Paste(Arc::new(text.into())),
+                ),
+            ))));
+            let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+            app.shared_views.pending.clear();
+            let mut model = app.workspace_model.clone();
+            model.views = vec![View::empty(a), View::empty(b)];
+            model.channels = [a, b]
+                .into_iter()
+                .map(|id| crate::workspace_model::ModelChannel {
+                    id,
+                    repository: PathBuf::from("/repo"),
+                    title: "view".into(),
+                    title_source: Default::default(),
+                    ordinal: 1,
+                })
+                .collect();
+            model.views[0].panes.push(pane.clone());
+            let apply = |app: &mut Cagents, model: &mut crate::workspace_model::WorkspaceModel| {
+                model.sequence += 1;
+                for view in &mut model.views {
+                    view.revision += 1;
+                }
+                drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                    scope: Scope::Channel(a),
+                    operation: None,
+                    model: model.clone(),
+                }));
+            };
+            apply(&mut app, &mut model);
+            // This window's own store holds the draft it shows.
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("window-b.sqlite3"),
+                crate::model::BootId::new("peer-started-draft"),
+            )
+            .unwrap();
+            writer.snapshot(app.persistent_workspace());
+            writer.flush(Duration::from_secs(5)).unwrap();
+            let store = writer.operation_store();
+            app.session = Some(writer);
+
+            // The other window's Send saves the draft under a fresh identity,
+            // and its provider then starts that conversation.
+            let CardKind::Chat(draft) = &pane.kind else {
+                unreachable!()
+            };
+            let mut candidate = draft.clone();
+            candidate.id = TerminalId::new();
+            let mut started = candidate.clone();
+            started.launch.session_id = Some("fixture-started-conversation".into());
+            assert!(
+                candidate.is_unstarted() && !started.is_unstarted(),
+                "{case}"
+            );
+            if through_unstarted {
+                pane.kind = CardKind::Chat(candidate.clone());
+                model.views[0].panes = vec![pane.clone()];
+                apply(&mut app, &mut model);
+                assert!(
+                    matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime))
+                        if runtime.session == candidate && runtime.unsent_text() == text),
+                    "{case}: the draft follows the candidate with its text"
+                );
+            }
+            if held {
+                chat_ui::attach_file_for_test(&mut app, card, FILE);
+                chat_ui::set_attachment_chooser_for_test(&mut app, card, true);
+            }
+            pane.kind = CardKind::Chat(started.clone());
+            model.views[0].panes = vec![pane.clone()];
+            apply(&mut app, &mut model);
+            if held {
+                // The open chooser holds the draft back, and says so.
+                let (_, error) = chat_ui::composer_state_for_test(&app, card);
+                assert!(
+                    error.is_some_and(|error| error.contains("started in another window")),
+                    "{case}: the draft says why it stays"
+                );
+                assert!(!app.chat_start_pending(card), "{case}: held");
+                chat_ui::set_attachment_chooser_for_test(&mut app, card, false);
+                let target = match app.cards.get(&card) {
+                    Some(CardRuntime::Chat(runtime)) => runtime.target,
+                    _ => panic!("{case}: the draft is still shown"),
+                };
+                drop(app.update(Message::ChatUi(chat_ui::Action::Submit(
+                    target,
+                    crate::chat::PromptMode::Send,
+                ))));
+                assert!(
+                    app.notices
+                        .entries
+                        .iter()
+                        .any(|entry| entry.notice.message.contains("started in another window")),
+                    "{case}: Send says where the draft went"
+                );
+            }
+
+            assert!(
+                matches!(app.card_state(card).map(|state| &state.kind),
+                    Some(CardKind::Chat(session)) if session == &started),
+                "{case}: the card holds the started conversation"
+            );
+            assert_eq!(
+                chat_ui::pending_switch_target(&app, card).card,
+                card,
+                "{case}: the card attaches to the started conversation"
+            );
+            assert_eq!(
+                app.persistent_workspace()
+                    .chat_drafts
+                    .get(&card)
+                    .map(String::as_str),
+                Some(text),
+                "{case}: the unsent text is kept while it attaches"
+            );
+            let writer = app.session.as_ref().unwrap();
+            writer
+                .flush(Duration::from_secs(5))
+                .unwrap_or_else(|error| {
+                    panic!("{case}: this window's store refused the pane: {error}")
+                });
+            assert_eq!(writer.last_error(), None, "{case}");
+            assert!(
+                matches!(store.load_card(card, None).unwrap().map(|card| card.kind),
+                    Some(CardKind::Chat(session)) if session == started),
+                "{case}: storage holds the started conversation"
+            );
+
+            // The attachment shows the transcript, which begins with the
+            // message the other window sent.
+            let snapshot = crate::chat::Snapshot {
+                session_id: started.launch.session_id.clone(),
+                items: vec![Arc::new(crate::chat::Item {
+                    started_at: None,
+                    id: "first".into(),
+                    role: crate::chat::Role::User,
+                    content: crate::chat::ItemContent::Text {
+                        text: SENT.into(),
+                        thinking: false,
+                        phase: Default::default(),
+                    },
+                    at: None,
+                })],
+                ..crate::chat::Snapshot::default()
+            };
+            let first = crate::chat::Snapshot {
+                session_id: snapshot.session_id.clone(),
+                ..crate::chat::Snapshot::default()
+            };
+            drop(app.update(chat_ui::ready_message_for_pending_switch(&app, card, first)));
+            assert!(!app.chat_start_pending(card), "{case}: attached");
+            assert!(
+                matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.unsent_text() == text),
+                "{case}: the text waits for the transcript"
+            );
+            chat_ui::show_chat_snapshot_for_test(&mut app, card, snapshot);
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+                panic!("{case}: the card shows the conversation");
+            };
+            let expected = if text == SENT { "" } else { text };
+            assert_eq!(runtime.unsent_text(), expected, "{case}: composer");
+            let files = if held {
+                vec![PathBuf::from(FILE)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                chat_ui::composer_state_for_test(&app, card).0,
+                files,
+                "{case}: attached files come along"
+            );
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(5))
+                .unwrap_or_else(|error| panic!("{case}: refused after attaching: {error}"));
         }
     }
 }

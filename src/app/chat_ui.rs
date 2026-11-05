@@ -763,6 +763,14 @@ pub(super) struct State {
     /// Cards refused because the account list does not name their account,
     /// whose home is still on the device and can be restored.
     restorable_accounts: HashMap<CardId, RestorableAccount>,
+    /// Drafts another client started, whose cards are attaching to that
+    /// conversation. Their carried-over unsent text may repeat its first
+    /// message, which is checked once the transcript shows it.
+    pub(super) started_elsewhere: HashSet<CardId>,
+    /// Files other than images attached to a draft whose conversation was
+    /// replaced, carried to the composer that opens in its place. Unlike
+    /// images, they are not part of the saved draft.
+    carried_files: HashMap<CardId, Vec<Attachment>>,
     /// The model last chosen for each provider, and its effort, which a new
     /// conversation of that provider starts on.
     last_models: HashMap<Provider, (String, Option<String>)>,
@@ -790,6 +798,8 @@ impl Default for State {
             capacity_offers: HashSet::new(),
             removed_accounts: HashSet::new(),
             restorable_accounts: HashMap::new(),
+            started_elsewhere: HashSet::new(),
+            carried_files: HashMap::new(),
             last_models: HashMap::new(),
         }
     }
@@ -2257,6 +2267,10 @@ pub(super) struct Runtime {
     pub(super) tool_groups_expanded: bool,
     composer: text_editor::Content<cosmic::Renderer>,
     revision: u64,
+    /// The composer revision at which unsent text carried over from a draft
+    /// another client started may still repeat that client's first message.
+    /// Cleared once the transcript settles it, or the reader edits the text.
+    first_message_echo: Option<u64>,
     attachments: Vec<Attachment>,
     thumbnails: thumbnails::Cache,
     /// Clipboard reads and image writes still destined for this draft.
@@ -3113,6 +3127,51 @@ impl Runtime {
         }
     }
 
+    /// Checks carried-over unsent text against the first message of the
+    /// conversation another client started from this draft, once the
+    /// transcript shows it.
+    fn await_first_message_echo(&mut self) {
+        self.first_message_echo = Some(self.revision);
+        self.settle_first_message_echo();
+    }
+
+    /// Drops the composer text if it is exactly the conversation's first
+    /// message, which the client that started it already sent, so it is not
+    /// offered again. Any other text is the reader's own and stays.
+    fn settle_first_message_echo(&mut self) {
+        let Some(revision) = self.first_message_echo else {
+            return;
+        };
+        if revision != self.revision || !self.attachments.is_empty() {
+            // Edited since, or more than the text: no longer a copy.
+            self.first_message_echo = None;
+            return;
+        }
+        if self.snapshot.history_loading || !self.visible.load(Ordering::Relaxed) {
+            return;
+        }
+        let first = self
+            .snapshot
+            .items
+            .iter()
+            .find_map(|item| match &item.content {
+                chat::ItemContent::Text { text, .. } if item.role == chat::Role::User => Some(text),
+                _ => None,
+            });
+        let Some(first) = first else {
+            if self.snapshot.has_earlier {
+                // The first message is not in view, so nothing can be shown
+                // to repeat it.
+                self.first_message_echo = None;
+            }
+            return;
+        };
+        self.first_message_echo = None;
+        if !self.snapshot.has_earlier && self.composer.text().trim() == first.trim() {
+            self.replace_draft(text_editor::Content::new());
+        }
+    }
+
     /// Puts a whole new draft in the composer. Whatever the completion list
     /// was doing belonged to the old one.
     fn replace_draft(&mut self, composer: text_editor::Content<cosmic::Renderer>) {
@@ -3194,6 +3253,7 @@ impl Runtime {
             attachment_order: Vec::new(),
             image_pastes_saving: 0,
             submit_after_paste: None,
+            first_message_echo: None,
             attachment_chooser_pending: None,
             expanded: HashSet::new(),
             child_expanded: HashMap::new(),
@@ -4088,6 +4148,11 @@ impl Runtime {
     fn refresh(&mut self) {
         self.prepare_local_prompt();
         self.refresh_session();
+        self.refresh_snapshot();
+        self.settle_first_message_echo();
+    }
+
+    fn refresh_snapshot(&mut self) {
         if !self.visible.load(Ordering::Relaxed) {
             if let Some((snapshot, clock)) = self
                 .handle()
@@ -6361,8 +6426,13 @@ impl Cagents {
         // A conversation another window started is not a launch option; it
         // is attached, or recovered, as the conversation it is. An operation
         // already under way on the card keeps the launch it began with.
-        if !session.is_unstarted() || self.chat_start_pending(card) {
+        if self.chat_start_pending(card) {
             return Task::none();
+        }
+        if !session.is_unstarted() {
+            return self
+                .follow_peer_started_chat(card, session)
+                .unwrap_or_else(Task::none);
         }
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return Task::none();
@@ -6402,6 +6472,58 @@ impl Cagents {
         }
         let target = runtime.target;
         self.load_draft_skills(target)
+    }
+
+    /// Attaches draft `card` to `session`, the conversation another client
+    /// started from it under the same identity, which its shared view now
+    /// holds. The unsent text comes along unless it repeats that
+    /// conversation's first message.
+    ///
+    /// `None` when the card is not an idle draft of that conversation. When
+    /// the draft cannot leave yet, the reason is shown on it and it follows
+    /// once it can: when its file chooser answers, or on its next Send.
+    fn follow_peer_started_chat(
+        &mut self,
+        card: CardId,
+        session: &chat::Session,
+    ) -> Option<Task<Message>> {
+        if session.is_unstarted()
+            || self.chat_start_pending(card)
+            || !matches!(self.card_state(card).map(|state| &state.kind), Some(CardKind::Chat(current)) if current == session)
+        {
+            return None;
+        }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+            return None;
+        };
+        if !runtime.is_draft() || runtime.session.id != session.id {
+            return None;
+        }
+        // Whatever is composed comes along; only work still under way
+        // holds the draft back.
+        let blocker = if runtime.attachment_chooser_pending.is_some() {
+            Some("Finish or cancel the file chooser to open it here.")
+        } else if runtime.pastes_pending != 0 {
+            Some("It opens here once the image attachment finishes.")
+        } else if runtime.pending.is_some() {
+            Some("It opens here once the pending chat command finishes.")
+        } else if runtime.queued.is_some() {
+            Some("It opens here once the first message is on its way.")
+        } else {
+            None
+        };
+        if let Some(blocker) = blocker {
+            runtime.error = Some(format!(
+                "This conversation was started in another window. {blocker}"
+            ));
+            return Some(Task::none());
+        }
+        self.carry_unsent_chat(card);
+        self.chat_ui.started_elsewhere.insert(card);
+        self.cards.insert(card, CardRuntime::Loading);
+        self.lifecycle
+            .register(card, Exposure::Offscreen, Residency::Cold, Instant::now());
+        Some(self.open_chat(card, session.clone(), chat::Intent::Restore))
     }
 
     /// Catches draft `card` up, once it can choose again, with launch options
@@ -7058,19 +7180,7 @@ impl Cagents {
             self.settings.editor_syntax_theme,
         );
         runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
-        if let Some(draft) = self.chat_ui.drafts.remove(&card)
-            && !draft.is_empty()
-        {
-            runtime.replace_draft(text_editor::Content::with_text(&draft));
-        }
-        if let Some(images) = self.chat_ui.draft_attachments.remove(&card) {
-            runtime.replace_attachments(
-                images
-                    .into_iter()
-                    .filter(|a| a.reference.is_some())
-                    .collect(),
-            );
-        }
+        self.restore_unsent_chat(card, &mut runtime);
         // Nothing runs, so there is nothing for the lifecycle to hydrate or
         // hibernate: the card is whole as it stands.
         self.lifecycle.remove(card);
@@ -7281,6 +7391,47 @@ impl Cagents {
         }
     }
 
+    /// Puts what was composed in `card` before its runtime last left, or
+    /// before its conversation was replaced, in `runtime`'s composer.
+    pub(super) fn restore_unsent_chat(&mut self, card: CardId, runtime: &mut Runtime) {
+        if let Some(draft) = self.chat_ui.drafts.remove(&card)
+            && !draft.is_empty()
+        {
+            runtime.replace_draft(text_editor::Content::with_text(&draft));
+        }
+        let mut attachments = self
+            .chat_ui
+            .draft_attachments
+            .remove(&card)
+            .unwrap_or_default();
+        attachments.retain(|attachment| attachment.reference.is_some());
+        attachments.extend(self.chat_ui.carried_files.remove(&card).unwrap_or_default());
+        if !attachments.is_empty() {
+            runtime.replace_attachments(attachments);
+        }
+    }
+
+    /// Keeps what the reader is composing in `card`'s draft, whose
+    /// conversation another client replaced, for the composer that opens in
+    /// its place: the saved draft, and the attached files it leaves out.
+    pub(super) fn carry_unsent_chat(&mut self, card: CardId) {
+        self.stash_unsent_chat(card);
+        let files = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime
+                .unsent_attachments()
+                .iter()
+                .filter(|attachment| attachment.reference.is_none())
+                .cloned()
+                .collect::<Vec<_>>(),
+            _ => return,
+        };
+        if files.is_empty() {
+            self.chat_ui.carried_files.remove(&card);
+        } else {
+            self.chat_ui.carried_files.insert(card, files);
+        }
+    }
+
     /// A first save that will not start its provider may still have
     /// committed B. Queue the B -> A replacement behind it, so storage
     /// converges on the conversation the composer still shows, including
@@ -7310,6 +7461,7 @@ impl Cagents {
             return;
         }
         let snapshot = self.persistent_workspace();
+        self.record_shared_chat_identities();
         if let Some(writer) = self.session.as_ref() {
             writer.replace_chat_identity(card, pending.candidate.id, current, snapshot);
         }
@@ -7344,6 +7496,8 @@ impl Cagents {
         self.chat_ui.fresh_offers.remove(&card);
         self.chat_ui.removed_accounts.remove(&card);
         self.chat_ui.restorable_accounts.remove(&card);
+        self.chat_ui.started_elsewhere.remove(&card);
+        self.chat_ui.carried_files.remove(&card);
     }
     pub(super) fn chat_capacity_guidance(&self, card: CardId) -> Option<&'static str> {
         (self.chat_ui.capacity_offers.contains(&card)
@@ -7357,6 +7511,13 @@ impl Cagents {
 
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.phases.contains_key(&card)
+    }
+    /// Whether `card` shows an idle draft, which follows its shared view to
+    /// the conversation another client started from it. A start of its own
+    /// already under way keeps the launch it began with.
+    pub(super) fn chat_draft_follows_peer_start(&self, card: CardId) -> bool {
+        matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.is_draft())
+            && !self.chat_start_pending(card)
     }
     /// A shared echo may arrive before a starting chat has a runtime. Only
     /// the exact attempted descriptor reserves that attachment; a canonical
@@ -8223,26 +8384,77 @@ impl Cagents {
     ///
     /// The conversation starts under a new identity, so it never meets
     /// anything an earlier start of this card may have left in the daemon.
+    ///
+    /// A Send that cannot start the draft says why on the draft, or follows
+    /// the conversation the card holds now; it never does nothing.
     fn start_chat_draft(&mut self, target: Target) -> Task<Message> {
-        if self.chat_start_pending(target.card)
-            || self
-                .card_state(target.card)
-                .is_none_or(|state| !state.existence.is_open())
+        if self
+            .card_state(target.card)
+            .is_none_or(|state| !state.existence.is_open())
             || self.refuse_for_deleting_card(target.card)
-            || self.pane_transfer_pending(target.card)
         {
             return Task::none();
+        }
+        let refusal = if self.chat_start_pending(target.card) {
+            Some("This conversation is still starting. Send this again once it opens.")
+        } else if self.pane_transfer_pending(target.card) {
+            Some("This pane is moving to another view. Send this again once it arrives.")
+        } else {
+            None
+        };
+        let Some(runtime) = self.chat_card_runtime_mut(target) else {
+            return Task::none();
+        };
+        let refusal = refusal.or_else(|| {
+            if runtime.attachment_chooser_pending.is_some() {
+                Some("Finish or cancel the file chooser before sending.")
+            } else if runtime.queued.is_some() {
+                Some("The first message is still on its way.")
+            } else {
+                None
+            }
+        });
+        if let Some(refusal) = refusal {
+            runtime.error = Some(refusal.into());
+            return Task::none();
+        }
+        let source = runtime.session.clone();
+        let current = match self.card_state(target.card).map(|state| &state.kind) {
+            Some(CardKind::Chat(current)) => current.clone(),
+            _ => return Task::none(),
+        };
+        if current != source {
+            // The card holds another conversation than its composer: one
+            // another client started from this draft, or launch options it
+            // chose meanwhile. The draft catches up first.
+            if let Some(follow) = self.follow_peer_started_chat(target.card, &current) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(_))) {
+                    self.status = Some(TransientNotice::success(
+                        "This conversation was started in another window. Opening it here.",
+                    ));
+                }
+                return follow;
+            }
+            let adopted = self.adopt_shared_draft_session(target.card, &current);
+            let caught_up = matches!(self.cards.get(&target.card),
+                Some(CardRuntime::Chat(runtime)) if runtime.target == target && runtime.session == current);
+            if caught_up {
+                return Task::batch([adopted, self.start_chat_draft(target)]);
+            }
+            if let Some(runtime) = self.chat_card_runtime_mut(target) {
+                runtime.error = Some(
+                    "This draft changed in another window and could not be updated here. Nothing was sent; your text is kept."
+                        .into(),
+                );
+            }
+            return adopted;
         }
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) else {
             return Task::none();
         };
-        if runtime.target != target || !runtime.choosing() || !runtime.session.is_unstarted() {
-            return Task::none();
-        }
-        let source = runtime.session.clone();
-        if !self.card_state(target.card).is_some_and(
-            |state| matches!(&state.kind, CardKind::Chat(current) if current == &source),
-        ) {
+        if !runtime.is_draft() || !source.is_unstarted() {
+            // Only an unstarted draft starts here; a Send reaches anything
+            // else through the conversation's own prompt.
             return Task::none();
         }
         let Some(writer) = self.session.as_ref() else {
@@ -8294,6 +8506,7 @@ impl Cagents {
         // The composer and public source are still A. The snapshot projection
         // contains the exact candidate B and the still-editable text/images.
         let snapshot = self.persistent_workspace();
+        self.record_shared_chat_identities();
         let writer = self.session.as_ref().expect("writer was checked above");
         // Exact replacement equality is idempotent when B already landed;
         // otherwise the original A identity must still match. This explicit
@@ -9770,20 +9983,9 @@ impl Cagents {
                             );
                             // Whatever was typed before this card last left the
                             // chat surface comes back with it.
-                            if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
-                                && !draft.is_empty()
-                            {
-                                runtime.replace_draft(text_editor::Content::with_text(&draft));
-                            }
-                            if let Some(images) =
-                                self.chat_ui.draft_attachments.remove(&target.card)
-                            {
-                                runtime.replace_attachments(
-                                    images
-                                        .into_iter()
-                                        .filter(|a| a.reference.is_some())
-                                        .collect(),
-                                );
+                            self.restore_unsent_chat(target.card, &mut runtime);
+                            if self.chat_ui.started_elsewhere.remove(&target.card) {
+                                runtime.await_first_message_echo();
                             }
                             runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
                             runtime.show(visible);
@@ -12634,6 +12836,41 @@ pub(super) fn pending_switch_target(app: &Cagents, card: CardId) -> Target {
         .attempt(card)
         .expect("switch staged an attempt")
         .target
+}
+
+/// Puts draft `card` in the middle of choosing files to attach, or out of it.
+#[cfg(test)]
+pub(super) fn set_attachment_chooser_for_test(app: &mut Cagents, card: CardId, open: bool) {
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+        panic!("a chat runtime");
+    };
+    runtime.attachment_chooser_pending = open.then(uuid::Uuid::new_v4);
+}
+
+/// Attaches the file at `path`, which is not an image, to `card`'s composer.
+#[cfg(test)]
+pub(super) fn attach_file_for_test(app: &mut Cagents, card: CardId, path: &str) {
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+        panic!("a chat runtime");
+    };
+    let mut attachments = runtime.attachments.clone();
+    attachments.push(Attachment::file(path));
+    runtime.replace_attachments(attachments);
+}
+
+/// The files attached in `card`'s composer, and the problem it shows.
+#[cfg(test)]
+pub(super) fn composer_state_for_test(
+    app: &Cagents,
+    card: CardId,
+) -> (Vec<std::path::PathBuf>, Option<String>) {
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("a chat runtime");
+    };
+    (
+        runtime.attachments.iter().map(|a| a.path.clone()).collect(),
+        runtime.error.clone(),
+    )
 }
 
 #[cfg(test)]
@@ -28502,6 +28739,25 @@ mod tests {
             drop(f.app.update(Message::WorkspaceModelObserved(
                 super::super::workspace_model_sync::ModelUpdate::Read(f.model.clone()),
             )));
+            if mutation == "unstarted" {
+                // A draft is never upgrade recovery, but the started
+                // conversation its view now holds under the draft's identity
+                // is one another window started from it. The draft follows it
+                // through an ordinary restore and keeps its unsent text.
+                let attempt = f
+                    .app
+                    .chat_ui
+                    .attempt(f.card)
+                    .expect("the draft follows the started conversation");
+                assert_eq!(attempt.upgrade_admission, None, "{mutation}");
+                assert_eq!(attempt.session, f.canonical, "{mutation}");
+                assert_eq!(
+                    f.app.persistent_workspace().chat_drafts.get(&f.card),
+                    Some(&f.draft),
+                    "{mutation}"
+                );
+                continue;
+            }
             assert!(
                 !f.app.chat_start_pending(f.card),
                 "{mutation} cannot dispatch a strict or ordinary provider attachment"

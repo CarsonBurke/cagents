@@ -311,6 +311,15 @@ pub enum SessionError {
     Worker(std::io::Error),
 }
 
+/// A chat card whose shared view holds conversation `canonical` where this
+/// window last saved conversation `expected`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatIdentityAdoption {
+    pub card: CardId,
+    pub expected: TerminalId,
+    pub canonical: crate::chat::Session,
+}
+
 /// An explicit change of the identity a card's payload is bound to, which
 /// ordinary snapshots are not allowed to make.
 #[derive(Debug, Clone)]
@@ -326,24 +335,30 @@ enum Replacement {
     Terminal(TerminalSession),
     /// A new conversation started in a chat card in place of its own.
     Chat(crate::chat::Session),
+    /// The conversation the card's shared view now holds, which another
+    /// client put in place of the one this window last saved.
+    SharedChat(crate::chat::Session),
 }
 
 impl Replacement {
     fn id(&self) -> TerminalId {
         match self {
             Self::Terminal(session) => session.id,
-            Self::Chat(session) => session.id,
+            Self::Chat(session) | Self::SharedChat(session) => session.id,
         }
     }
 
+    /// Whether both rebind the same kind of payload, so one can continue the
+    /// other's chain. Who authorized each step does not matter: a chain is
+    /// applied under the authority of its newest step.
     fn same_kind(&self, other: &Self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(other)
+        self.kind() == other.kind()
     }
 
     fn kind(&self) -> ReplacedIdentity {
         match self {
             Self::Terminal(_) => ReplacedIdentity::Terminal,
-            Self::Chat(_) => ReplacedIdentity::Chat,
+            Self::Chat(_) | Self::SharedChat(_) => ReplacedIdentity::Chat,
         }
     }
 }
@@ -354,7 +369,9 @@ impl IdentityReplacement {
     fn replaces(&self, kind: &CardKind) -> bool {
         let held = match (&self.replacement, kind) {
             (Replacement::Terminal(_), CardKind::Terminal(session)) => session.id,
-            (Replacement::Chat(_), CardKind::Chat(session)) => session.id,
+            (Replacement::Chat(_) | Replacement::SharedChat(_), CardKind::Chat(session)) => {
+                session.id
+            }
             _ => return false,
         };
         held == self.expected_terminal_id && held != self.replacement.id()
@@ -367,6 +384,9 @@ impl IdentityReplacement {
             }
             Replacement::Chat(session) => {
                 store.replace_chat_identity(self.card_id, self.expected_terminal_id, session)
+            }
+            Replacement::SharedChat(session) => {
+                store.adopt_chat_identity(self.card_id, self.expected_terminal_id, session)
             }
         }
     }
@@ -762,6 +782,23 @@ impl SessionRuntime {
         );
     }
 
+    /// Records the conversations chat cards' shared views now hold in place
+    /// of the ones this window last saved for them, which other clients
+    /// started or replaced. Snapshots refuse such a change on their own.
+    ///
+    /// The caller queues the write that shows them right after, which keeps
+    /// it behind them in either queue mode.
+    pub fn adopt_chat_identities(&self, adoptions: impl IntoIterator<Item = ChatIdentityAdoption>) {
+        self.replace_identities(
+            adoptions.into_iter().map(|adoption| IdentityReplacement {
+                card_id: adoption.card,
+                expected_terminal_id: adoption.expected,
+                replacement: Replacement::SharedChat(adoption.canonical),
+            }),
+            None,
+        );
+    }
+
     /// Commit an exact account transition once, in order with queued snapshots.
     /// The caller keeps its candidate inactive until this receipt succeeds;
     /// failures are returned without retaining an automatic retry.
@@ -883,21 +920,33 @@ impl SessionRuntime {
         replacement: IdentityReplacement,
         state: Option<Arc<WorkspaceState>>,
     ) {
+        self.replace_identities([replacement], state);
+    }
+
+    /// Queues `replacements` in order, then `state` as the newest snapshot
+    /// when given.
+    fn replace_identities(
+        &self,
+        replacements: impl IntoIterator<Item = IdentityReplacement>,
+        state: Option<Arc<WorkspaceState>>,
+    ) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
-            if queue.ordered_identities {
-                if let Some(previous) = queue.latest.take() {
+            for replacement in replacements {
+                if queue.ordered_identities {
+                    if let Some(previous) = queue.latest.take() {
+                        queue
+                            .conversions
+                            .push_back(ConversionCheckpoint::Snapshot(previous));
+                    }
                     queue
                         .conversions
-                        .push_back(ConversionCheckpoint::Snapshot(previous));
+                        .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
+                } else {
+                    merge_identity_replacement(&mut queue.identity_replacements, replacement);
                 }
-                queue
-                    .conversions
-                    .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-            } else {
-                merge_identity_replacement(&mut queue.identity_replacements, replacement);
             }
             if let Some(state) = state {
                 queue.latest = Some(state);
@@ -1508,6 +1557,16 @@ trait SessionStore {
         expected_id: TerminalId,
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError>;
+    fn adopt_chat_identity(
+        &self,
+        _card_id: CardId,
+        _expected_id: TerminalId,
+        _canonical: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::InvalidState(
+            "This store does not support shared chat identities".into(),
+        ))
+    }
     fn save_workspace(
         &self,
         state: &WorkspaceState,
@@ -1612,6 +1671,15 @@ impl SessionStore for StateStore {
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
         Self::replace_chat_identity(self, card_id, expected_id, replacement)
+    }
+
+    fn adopt_chat_identity(
+        &self,
+        card_id: CardId,
+        expected_id: TerminalId,
+        canonical: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        Self::adopt_chat_identity(self, card_id, expected_id, canonical)
     }
 
     fn save_workspace(
@@ -1723,6 +1791,14 @@ impl SessionStore for Arc<StateStore> {
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
         StateStore::replace_chat_identity(self, card_id, expected_id, replacement)
+    }
+    fn adopt_chat_identity(
+        &self,
+        card_id: CardId,
+        expected_id: TerminalId,
+        canonical: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        StateStore::adopt_chat_identity(self, card_id, expected_id, canonical)
     }
     fn save_workspace(
         &self,
@@ -4933,6 +5009,14 @@ mod tests {
             ) -> Result<(), StoreError> {
                 self.store
                     .replace_chat_identity(card, expected, replacement)
+            }
+            fn adopt_chat_identity(
+                &self,
+                card: CardId,
+                expected: TerminalId,
+                canonical: &crate::chat::Session,
+            ) -> Result<(), StoreError> {
+                self.store.adopt_chat_identity(card, expected, canonical)
             }
             fn save_workspace(
                 &self,
