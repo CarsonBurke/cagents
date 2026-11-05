@@ -776,6 +776,9 @@ impl Cagents {
             self.resume_error("This conversation is open outside this window. Return to its original window before resuming.");
             return Task::none();
         }
+        if let Some(task) = self.defer_retiring_conversation(&entry, false) {
+            return task;
+        }
         let session = &entry.session;
         if session.native_continuity.retains_provider() {
             let generation = self.resume_ui.generation;
@@ -803,6 +806,10 @@ impl Cagents {
         entry: SavedConversation,
         prepared: bool,
     ) -> Task<Message> {
+        if let Some(task) = self.defer_retiring_conversation(&entry, prepared) {
+            return task;
+        }
+        let user_title = self.chrome_ui.user_titles.get(&entry.card).cloned();
         let mut session = entry.session;
         if !session.launch.recipe.working_directory.is_dir()
             && !session.launch.needs_read_only_history()
@@ -821,20 +828,110 @@ impl Cagents {
         }
         let replace = self.resume_ui.replace;
         self.close_resume();
+        // Read before forgetting the closed card, which records where it was.
+        let home = self.closed_card_home(entry.card);
         self.recently_closed
             .retain(|(card, _)| card.id != entry.card);
-        let scope = self.select_worktree(session.launch.recipe.working_directory.clone(), false);
+        let scope = self.enter_resumed_conversation_home(home, &session);
         // The draft `/resume` was asked from gives its place to the
         // conversation, where both belong to the same strip.
         let replace = replace.filter(|card| {
             self.chat_is_unused(*card) && self.workspace.order().any(|id| id == *card)
         });
-        let insert = self.insert_chat_card(session, replace, None);
-        if let Some(card) = self.workspace.focused() {
-            self.apply_reported_title(card, entry.title);
+        let insert = self.insert_resumed_chat_card(session, replace, user_title);
+        // Manual names were installed before insertion. Otherwise publish
+        // the saved automatic title instead of the provider's generic name.
+        if let Some(card) = self.durable.focused
+            && self.apply_reported_title(card, entry.title)
+        {
+            self.persist();
         }
         let discard = replace.map_or_else(Task::none, |card| self.close_card_unasked(card));
         Task::batch([scope, insert, discard])
+    }
+
+    fn defer_retiring_conversation(
+        &mut self,
+        entry: &SavedConversation,
+        prepared: bool,
+    ) -> Option<Task<Message>> {
+        let home @ channel_ui::ClosedCardHome::Pending(_) = self.closed_card_home(entry.card)?
+        else {
+            return None;
+        };
+        let task = self.defer_channel_reopen(
+            home,
+            channel_ui::Reopen::Conversation {
+                entry: entry.clone(),
+                prepared,
+                generation: self.resume_ui.generation,
+                replace: self.resume_ui.replace,
+            },
+        )?;
+        self.resume_ui.loading = true;
+        Some(task)
+    }
+
+    pub(super) fn finish_deferred_conversation(
+        &mut self,
+        entry: SavedConversation,
+        prepared: bool,
+        generation: u64,
+        replace: Option<CardId>,
+        same_home: bool,
+    ) -> Task<Message> {
+        if generation != self.resume_ui.generation {
+            return Task::none();
+        }
+        self.resume_ui.loading = false;
+        if !same_home {
+            self.resume_error(
+                "The channel changed while reopening. Select the conversation again.",
+            );
+            return Task::none();
+        }
+        self.resume_ui.replace = replace;
+        if prepared && self.existing_conversation_card(&entry.session).is_none() {
+            self.insert_resumed_conversation(entry, true)
+        } else {
+            self.resume_saved_conversation(entry)
+        }
+    }
+
+    pub(super) fn fail_deferred_conversation(&mut self, generation: u64, error: &str) -> bool {
+        if generation == self.resume_ui.generation {
+            self.resume_ui.loading = false;
+            self.resume_error(error);
+            return true;
+        }
+        false
+    }
+
+    /// Enters the place a resumed conversation belongs: the channel it was
+    /// closed in, brought back if it retired with its last card; else the
+    /// channel `/resume` was asked from, when the conversation runs in that
+    /// channel's directory; else the conversation's own worktree.
+    fn enter_resumed_conversation_home(
+        &mut self,
+        home: Option<channel_ui::ClosedCardHome>,
+        session: &chat::Session,
+    ) -> Task<Message> {
+        let directory = &session.launch.recipe.working_directory;
+        if let Some(home) = home
+            && let Some(scope) = self.enter_closed_card_home(home)
+        {
+            return scope;
+        }
+        if home.is_none()
+            && let Some(channel) = self.durable.active_channel
+            && !self.channel_ui.is_deleting(channel)
+            && self.channel_directory(channel).as_ref() == Some(directory)
+        {
+            return self
+                .enter_closed_card_home(channel_ui::ClosedCardHome::Channel(channel))
+                .unwrap_or_else(Task::none);
+        }
+        self.select_worktree(directory.clone(), false)
     }
 
     /// Closes the picker and stops indexing. Focus is left to whatever the
@@ -1119,6 +1216,83 @@ mod tests {
         assert_eq!(card.kind, CardKind::Chat(prepared));
         assert_eq!(card.title, "Review peripheral Rust modules");
         assert!(!app.resume_ui.loading);
+    }
+
+    #[test]
+    fn prepared_resume_transfers_a_manual_title_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        let mut entry = saved(directory.path());
+        entry.title = "Parser recovery".into();
+        app.chrome_ui
+            .user_titles
+            .insert(entry.card, entry.title.clone());
+        entry.session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "saved-owner".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "saved-incarnation".into(),
+        });
+        entry.session.native_continuity =
+            chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        let mut prepared = entry.session.clone();
+        prepared.reset_owned_codex_listener();
+        prepared.id = TerminalId::new();
+        prepared.proof = None;
+        prepared.terminal = None;
+        drop(app.resume_saved_conversation(entry.clone()));
+        assert!(app.resume_ui.loading);
+        let generation = app.resume_ui.generation;
+        let before_settings = app.settings_save_generation;
+        drop(app.update_resume(Action::Prepared(generation, entry, Ok(prepared.clone()))));
+
+        let card = app
+            .card_state(app.workspace.focused().unwrap())
+            .unwrap()
+            .clone();
+        assert_eq!(card.kind, CardKind::Chat(prepared));
+        assert_eq!(card.title, "Parser recovery");
+        assert_eq!(app.chrome_ui.user_titles[&card.id], "Parser recovery");
+        assert!(app.settings_save_generation > before_settings);
+        assert!(!app.apply_reported_title(card.id, "Original provider prompt".into()));
+        assert_eq!(app.card_state(card.id).unwrap().title, "Parser recovery");
+        assert_eq!(
+            app.capture_settings_save().unwrap().view.user_titles[&card.id],
+            "Parser recovery"
+        );
+
+        // The saved list uses the resumed card's title, and later provider
+        // indexing must not replace the manual name on that new identity.
+        let current = app.card_state(card.id).unwrap();
+        let CardKind::Chat(session) = &current.kind else {
+            panic!("a resumed chat");
+        };
+        let saved = SavedConversation {
+            card: card.id,
+            title: current.title.clone(),
+            session: session.clone(),
+            open: false,
+            updated_at_unix_ms: 2,
+        };
+        app.resume_ui.open = true;
+        list(&mut app, generation, vec![saved]);
+        drop(app.update_resume(Action::Indexed(
+            generation,
+            Progress::Found {
+                conversations: Vec::new(),
+                titles: vec![(card.id, "Original provider prompt".into())],
+                read: 1,
+            },
+        )));
+        let row = app
+            .resume_ui
+            .rows
+            .iter()
+            .find(|row| row.card == card.id)
+            .unwrap();
+        assert_eq!(row.title, "Parser recovery");
+        assert!(matches!(&row.source, Source::Saved(saved) if saved.title == "Parser recovery"));
     }
 
     #[test]
