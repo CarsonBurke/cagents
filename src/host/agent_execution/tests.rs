@@ -1,3 +1,4 @@
+mod automation_removal;
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
 #[cfg(target_os = "linux")]
@@ -36,7 +37,9 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         return None;
     }
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path();
+    // Ordinary fixture paths must agree with canonical project keys even when
+    // the caller's temporary directory has a symlinked parent.
+    let root = directory.path().canonicalize().unwrap();
     for path in [
         "bin",
         "home/.claude",
@@ -78,7 +81,7 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
                 "absent"
             },
         )
-        .env("CAGENTS_EXECUTION_FIXTURE", root)
+        .env("CAGENTS_EXECUTION_FIXTURE", &root)
         .env("HOME", root.join("home"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CONFIG_HOME", root.join("config"))
@@ -459,6 +462,7 @@ fn blocking_owning_close_preserves_a_replacement_installed_during_provider_join(
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
     let spec = ProcessSpec {
+        stdout_noise: None,
         execution: None,
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -1664,6 +1668,7 @@ fn retained_old_alias_preflights_current_agent_before_real_holder_release() {
         std::fs::File::open(directory).unwrap(),
     ))));
     let process = ProcessSpec {
+        stdout_noise: None,
         execution: Some(context.clone()),
         messages: None,
         transport: TransportSpec::OwnedUnixWebSocket { socket },

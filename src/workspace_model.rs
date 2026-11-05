@@ -86,6 +86,26 @@ pub struct NavigationOrder {
     pub items: Vec<NavigationItem>,
 }
 
+/// Complete a saved mixed order using the same placement as the sidebar:
+/// newly discovered channels precede saved destinations; new worktrees follow.
+/// Existing destinations retain their relative order before an explicit move.
+pub fn merge_navigation_fallback(items: &mut Vec<NavigationItem>, fallback: &[NavigationItem]) {
+    let mut known = std::collections::HashSet::new();
+    items.retain(|item| known.insert(item.clone()));
+    let mut channels = Vec::new();
+    let mut worktrees = Vec::new();
+    for item in fallback {
+        if known.insert(item.clone()) {
+            match item {
+                NavigationItem::Channel(_) => channels.push(item.clone()),
+                NavigationItem::Worktree(_) => worktrees.push(item.clone()),
+            }
+        }
+    }
+    items.splice(0..0, channels);
+    items.extend(worktrees);
+}
+
 pub fn reorder_navigation(
     items: &mut Vec<NavigationItem>,
     source: &NavigationItem,
@@ -253,11 +273,7 @@ impl WorkspaceModel {
                         self.navigation_orders.len() - 1
                     });
                 let items = &mut self.navigation_orders[index].items;
-                for item in fallback {
-                    if !items.contains(item) {
-                        items.push(item.clone());
-                    }
-                }
+                merge_navigation_fallback(items, fallback);
                 reorder_navigation(items, source, before.as_ref());
             }
             ModelEdit::RetitleChannel { id, title } => {
@@ -537,6 +553,38 @@ pub fn repository_display_name(repository: &Path) -> String {
 mod tests {
     use super::*;
     use crate::model::ChannelTitleSource;
+
+    #[test]
+    fn navigation_folding_keeps_missing_channels_above_the_saved_mixed_order() {
+        let repository = PathBuf::from("/repo/.git");
+        let worktree = NavigationItem::Worktree("/repo".into());
+        let old = NavigationItem::Channel(ChannelId::new());
+        let first = NavigationItem::Channel(ChannelId::new());
+        let newest = NavigationItem::Channel(ChannelId::new());
+        let added_worktree = NavigationItem::Worktree("/repo/.worktrees/new".into());
+        let mut model = WorkspaceModel::default();
+        model.navigation_orders.push(NavigationOrder {
+            repository: repository.clone(),
+            items: vec![worktree.clone(), old.clone()],
+        });
+        let visible = vec![
+            newest.clone(),
+            first.clone(),
+            worktree.clone(),
+            old.clone(),
+            added_worktree,
+        ];
+        model.fold(
+            1,
+            &ModelEdit::ReorderNavigation {
+                repository,
+                source: worktree,
+                before: Some(old),
+                fallback: visible.clone(),
+            },
+        );
+        assert_eq!(model.navigation_orders[0].items, visible);
+    }
 
     #[test]
     fn conversation_title_proof_roundtrips_without_changing_existing_edit_prefix() {

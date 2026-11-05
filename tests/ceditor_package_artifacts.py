@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Real shell/archive checks with inert Cargo products; no compilation or launch."""
+"""Real shell/archive checks with inert products; no compilation or product startup."""
 import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -41,8 +42,9 @@ class CeditorPackageArtifacts(unittest.TestCase):
         self.tools = self.directory / "tools"
         self.tools.mkdir()
         self.calls = self.directory / "calls.jsonl"
+        self.prebuilt_bytes = {}
         for name in PRODUCTS:
-            self.executable(self.target / "release" / name, f"stale:{name}\n")
+            self.prebuilt_product(name)
             self.executable(self.target / NATIVE / "release" / name, f"stale-native:{name}\n")
         self.tool("cargo", r'''
 import tomllib
@@ -105,6 +107,34 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
     output.write(json.dumps([Path(sys.argv[0]).name, sys.argv[1:]]) + '\\n')
 """ + body)
 
+    def prebuilt_product(self, name, *, output=None, status=0):
+        if output is None:
+            output = f"{name} 0.1.3\n"
+        path = self.target / "release" / name
+        version_call = shlex.quote(json.dumps(["version", [name]]))
+        self.executable(path, "#!/bin/sh\n"
+                        '[ "$#" -eq 1 ] && [ "$1" = --version ] || exit 91\n'
+                        f"printf '%s\\n' {version_call} >> \"$MOCK_CALLS\"\n"
+                        f"printf '%s' {shlex.quote(output)}\nexit {status}\n")
+        self.prebuilt_bytes[name] = path.read_bytes()
+
+    def version_probes(self):
+        return [args[0] for tool, args in map(json.loads, self.calls.read_text().splitlines())
+                if tool == "version"]
+
+    def forbid_packaging_after_version_failure(self):
+        for name in ("mktemp", "install"):
+            self.tool(name, "raise SystemExit('version rejection must precede packaging')\n")
+
+    def assert_prebuilt_failure_has_no_output(self, result, product, message):
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(message, result.stderr)
+        self.assertIn(product, result.stderr)
+        self.assertEqual(self.builds(), [])
+        tools = [tool for tool, _ in map(json.loads, self.calls.read_text().splitlines())]
+        self.assertTrue({"mktemp", "install", "strip"}.isdisjoint(tools), tools)
+        self.assertFalse(self.dist.exists())
+
     def package(self, **overrides):
         return subprocess.run(
             ["/bin/sh", str(self.checkout / "scripts/package-ceditor-linux.sh")],
@@ -138,8 +168,9 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                 member = package.getmember(private + product)
                 self.assertTrue(member.isfile())
                 self.assertEqual(member.mode, 0o755)
-                expected = f"fresh:{product}:{NATIVE}\n" if fresh else f"stale:{product}\n"
-                self.assertEqual(package.extractfile(member).read(), expected.encode())
+                expected = (f"fresh:{product}:{NATIVE}\n".encode()
+                            if fresh else self.prebuilt_bytes[product])
+                self.assertEqual(package.extractfile(member).read(), expected)
             self.assertEqual(package.extractfile(private + ".ceditor-companions").read(),
                              b"ceditor companions v1\n")
             self.assertEqual(package.getmember(prefix + "lib/ceditor/current").linkname,
@@ -155,6 +186,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                 result = self.package()
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assert_archive(fresh=True)
+                self.assertEqual(self.version_probes(), [])
                 common = ["build", "--manifest-path", str(self.checkout / "Cargo.toml"),
                           "--locked", "--release", "--target-dir", str(self.target),
                           "--target", NATIVE]
@@ -195,7 +227,48 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         result = self.package(CAGENTS_SKIP_BUILD="1", PATH=str(self.tools))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.builds(), [])
+        self.assertEqual(self.version_probes(), ["ceditor", "cagents", "cagentsd"])
         self.assert_archive(fresh=False)
+
+    def test_matching_prebuilt_versions_with_optional_newline_package_exact_bytes(self):
+        for final_newline in (True, False):
+            with self.subTest(final_newline=final_newline):
+                self.reset_outputs()
+                for product in PRODUCTS:
+                    self.prebuilt_product(product, output=f"{product} 0.1.3" + ("\n" if final_newline else ""))
+                result = self.package(CAGENTS_SKIP_BUILD="1")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.builds(), [])
+                self.assertEqual(self.version_probes(), ["ceditor", "cagents", "cagentsd"])
+                self.assert_archive(fresh=False)
+
+    def test_each_prebuilt_companion_rejects_mismatched_and_malformed_versions_before_outputs(self):
+        self.forbid_packaging_after_version_failure()
+        for product in PRODUCTS:
+            for output in (f"other-product 0.1.3\n", f"{product} 0.1.2\n",
+                           f"{product} 0.1.3+local.1234567\n", "",
+                           f" {product} 0.1.3\n", f"{product} 0.1.3 \n",
+                           f"{product} 0.1.3\nextra output\n", f"{product} 0.1.3\n\n"):
+                with self.subTest(product=product, output=output):
+                    self.reset_outputs()
+                    for companion in PRODUCTS:
+                        self.prebuilt_product(companion)
+                    self.prebuilt_product(product, output=output)
+                    result = self.package(CAGENTS_SKIP_BUILD="1")
+                    self.assert_prebuilt_failure_has_no_output(
+                        result, product, "does not report requested version 0.1.3")
+
+    def test_each_prebuilt_companion_requires_success_even_with_matching_output(self):
+        self.forbid_packaging_after_version_failure()
+        for product in PRODUCTS:
+            with self.subTest(product=product):
+                self.reset_outputs()
+                for companion in PRODUCTS:
+                    self.prebuilt_product(companion)
+                self.prebuilt_product(product, status=17)
+                result = self.package(CAGENTS_SKIP_BUILD="1")
+                self.assert_prebuilt_failure_has_no_output(
+                    result, product, "could not verify prebuilt")
 
     def test_existing_native_target_override_guards_remain(self):
         for override in ({"CARGO_BUILD_TARGET": NATIVE},
