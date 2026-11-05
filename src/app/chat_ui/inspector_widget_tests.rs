@@ -297,8 +297,9 @@ mod inspector_widget {
                     .map(|paragraph| {
                         format!(
                             "Reading checkpoint {turn:03}/{paragraph:02}: {}\n\n",
+                            // Exceed prose::paragraph's 2048-byte Flow threshold.
                             "The copper bridge crosses the river beside the old station. "
-                                .repeat(12)
+                                .repeat(48)
                         )
                     })
                     .collect::<String>(),
