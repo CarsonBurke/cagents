@@ -23637,6 +23637,130 @@ mod tests {
         close_chat(&mut app, card);
     }
 
+    /// A saved terminal, as a pane restored from an earlier daemon has one.
+    fn saved_terminal_pane(app: &mut Cagents) -> CardId {
+        let mut state = crate::app::tests::terminal_card_state();
+        let card = state.id;
+        let CardKind::Terminal(session) = &mut state.kind else {
+            unreachable!();
+        };
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("earlier-host"),
+            boot_id: crate::model::BootId::new("earlier-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("earlier-incarnation"),
+        };
+        Arc::make_mut(&mut app.durable).cards.push(state);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        card
+    }
+
+    /// Answers the close `card` is waiting on: its terminal is proven gone.
+    fn settle_proven_gone(app: &mut Cagents, card: CardId) {
+        let intent = app
+            .terminal_close
+            .clone()
+            .expect("this pane's close is running");
+        assert_eq!(intent.card, card);
+        let _ = app.update(Message::TerminalCloseFinished {
+            card,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: crate::app::terminal_close::CloseOutcome::NotHosted,
+        });
+        let _ = app.update(Message::CommitClose(card));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+    }
+
+    /// "Close other panes" with a retained chat first: the chat holds the
+    /// workspace's only removal, and its close can fail with nothing left to
+    /// tell the panes behind it.
+    #[test]
+    fn a_failed_retained_chat_close_does_not_strand_the_panes_behind_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = failed_chat(&mut app);
+        let first = saved_terminal_pane(&mut app);
+        let second = saved_terminal_pane(&mut app);
+        app.chrome_ui.closing_group = vec![card, first, second];
+        drop(app.close_pane_group());
+        assert_eq!(app.workspace.pending_close().unwrap().unmounting, card);
+        let _ = app.update(Message::CommitClose(card));
+        let target = app.chat_ui.phases[&card].target();
+        let saved = app.chat_return_session(card).unwrap();
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            target,
+            saved,
+            Err("cleanup remains unconfirmed".into()),
+        )));
+
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(
+            app.workspace.pending_close(),
+            None,
+            "a chat that stays gives up its removal"
+        );
+        settle_proven_gone(&mut app, first);
+        settle_proven_gone(&mut app, second);
+        assert!(!app.terminal_close_in_progress(second));
+
+        app.notices.entries.clear();
+        app.status = None;
+        close_chat(&mut app, card);
+    }
+
+    /// The workspace removes one pane at a time, so a second pane that isn't a
+    /// terminal waits for its turn rather than being refused.
+    #[test]
+    fn panes_closed_together_each_get_their_turn() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let first = failed_chat(&mut app);
+        let second = failed_chat(&mut app);
+        app.chrome_ui.closing_group = vec![first, second];
+        drop(app.close_pane_group());
+        let _ = app.update(Message::DismissStatus);
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+        assert!(app.terminal_close_in_progress(second));
+
+        let _ = app.update(Message::CommitClose(first));
+        let target = app.chat_ui.phases[&first].target();
+        let saved = app.chat_return_session(first).unwrap();
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            target,
+            saved,
+            Ok(()),
+        )));
+        assert!(!app.card_state(first).unwrap().existence.is_open());
+
+        let target = app.chat_ui.phases[&second].target();
+        let saved = app.chat_return_session(second).unwrap();
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            target,
+            saved,
+            Ok(()),
+        )));
+        assert!(!app.card_state(second).unwrap().existence.is_open());
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+    }
+
+    /// Commit can find the pane has become something it mustn't remove. The
+    /// removal it was holding has to go back, or no other pane can ever close.
+    #[test]
+    fn a_chat_close_turned_away_at_commit_gives_up_its_removal() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = failed_chat(&mut app);
+        let other = saved_terminal_pane(&mut app);
+        app.chrome_ui.closing_group = vec![card];
+        drop(app.close_pane_group());
+        assert!(app.workspace.pending_close().is_some());
+        app.mark_pane_moving(card);
+        let _ = app.update(Message::CommitClose(card));
+        assert_eq!(app.workspace.pending_close(), None);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+
+        let _ = app.update(Message::CloseCard(other));
+        settle_proven_gone(&mut app, other);
+    }
+
     #[test]
     fn repeated_removal_request_reuses_its_reservation() {
         let mut app = crate::app::tests::context_inspector_test_app(false);

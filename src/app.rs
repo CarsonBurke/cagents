@@ -5350,6 +5350,10 @@ pub struct Cagents {
     terminal_close: Option<terminal_close::CloseIntent>,
     queued_card_closes: VecDeque<terminal_close::QueuedCardClose>,
     close_queue_turn: Option<CardId>,
+    close_queue_advancing: bool,
+    /// The pending removal whose commit has been delivered, so anything still
+    /// holding it is one of the closes the commit started.
+    close_commit_delivered: Option<CardId>,
     terminal_close_attempts: HashSet<TerminalId>,
     terminal_close_generation: u64,
     closed_terminal_cards: HashSet<CardId>,
@@ -13124,7 +13128,7 @@ impl Cagents {
         let Some(card) = cards.pop_front() else {
             return match intent {
                 DirtyCloseIntent::PaneGroup => self.close_pane_group(),
-                DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
+                DirtyCloseIntent::Card(card) => self.update(Message::CloseCard(card)),
                 DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
             };
         };
@@ -13143,6 +13147,69 @@ impl Cagents {
         });
         iced::widget::operation::focus(dirty_close_control_id(card, focused))
             .map(cosmic::Action::App)
+    }
+
+    fn commit_requested_close(&mut self, id: CardId) -> Task<Message> {
+        if self
+            .card_state(id)
+            .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
+            || self.chat_has_parked_runtime(id)
+        {
+            return self.begin_chat_close(id);
+        }
+        if self
+            .card_state(id)
+            .is_none_or(|card| !card.existence.is_open())
+        {
+            return Task::none();
+        }
+        if self.pending_terminal_spawn(id) {
+            return self.begin_card_close(id);
+        }
+        if terminal_continuity(self.card_state(id))
+            .and_then(TerminalContinuity::live_proof)
+            .is_some()
+            && !self.closed_terminal_cards.contains(&id)
+        {
+            return self.begin_card_close(id);
+        }
+        match self.commit_card_removal(id, None) {
+            Some(task) => task,
+            None => {
+                // Refused after all: the pane stays, and nothing else
+                // will advance the closes queued behind it.
+                self.closed_terminal_cards.remove(&id);
+                self.proven_gone_cards.remove(&id);
+                self.next_queued_card_close()
+            }
+        }
+    }
+
+    fn report_notice(&mut self, notice: TransientNotice) {
+        if crate::daemon_health::replaces_notice(&notice.message)
+            || notice
+                .details
+                .as_deref()
+                .is_some_and(crate::daemon_health::replaces_notice)
+        {
+            // The banner speaks for this outcome now, so an earlier report
+            // under the same key would only be giving an outdated reason.
+            if let Some(key) = notice.key {
+                self.notices.resolve(key);
+            }
+        } else {
+            let details = notice.details.as_deref();
+            match notice.severity {
+                NoticeSeverity::Error => {
+                    tracing::error!(message = %notice.message, details, "application notice")
+                }
+                NoticeSeverity::Warning => {
+                    tracing::warn!(message = %notice.message, details, "application notice")
+                }
+                NoticeSeverity::Success => {}
+            }
+            self.notices.record(notice);
+        }
     }
 
     fn close_pane_group(&mut self) -> Task<Message> {
@@ -13185,7 +13252,9 @@ impl Cagents {
         }
         match close.intent {
             DirtyCloseIntent::PaneGroup => self.close_pane_group(),
-            DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
+            // Called rather than sent: a queued pane could start meanwhile and
+            // leave this close, the one the reader just asked for, turned away.
+            DirtyCloseIntent::Card(card) => self.update(Message::CloseCard(card)),
             DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
         }
     }
@@ -14346,6 +14415,8 @@ impl Application for Cagents {
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
             close_queue_turn: None,
+            close_queue_advancing: false,
+            close_commit_delivered: None,
             terminal_close_attempts: HashSet::new(),
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
@@ -16600,38 +16671,13 @@ impl Application for Cagents {
             Message::CancelRepositoryClose => self.cancel_dirty_close(),
             Message::CommitClose(id) => {
                 if self
-                    .card_state(id)
-                    .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
-                    || self.chat_has_parked_runtime(id)
+                    .workspace
+                    .pending_close()
+                    .is_some_and(|pending| pending.unmounting == id)
                 {
-                    return self.begin_chat_close(id);
+                    self.close_commit_delivered = Some(id);
                 }
-                if self
-                    .card_state(id)
-                    .is_none_or(|card| !card.existence.is_open())
-                {
-                    return Task::none();
-                }
-                if self.pending_terminal_spawn(id) {
-                    return self.begin_card_close(id);
-                }
-                if terminal_continuity(self.card_state(id))
-                    .and_then(TerminalContinuity::live_proof)
-                    .is_some()
-                    && !self.closed_terminal_cards.contains(&id)
-                {
-                    return self.begin_card_close(id);
-                }
-                match self.commit_card_removal(id, None) {
-                    Some(task) => task,
-                    None => {
-                        // Refused after all: the pane stays, and nothing else
-                        // will advance the closes queued behind it.
-                        self.closed_terminal_cards.remove(&id);
-                        self.proven_gone_cards.remove(&id);
-                        self.next_queued_card_close()
-                    }
-                }
+                self.commit_requested_close(id)
             }
             Message::Viewport { generation, event } => {
                 // Native callbacks already queued by an unmounted worktree
@@ -18100,7 +18146,7 @@ impl Application for Cagents {
         let task = Task::batch([
             task,
             self.flush_settings_on_blur(),
-            self.resume_stalled_close_queue(),
+            self.settle_close_queue(),
         ]);
         if projection == Projection::Full {
             self.sync_worktree_protections();
@@ -18109,30 +18155,7 @@ impl Application for Cagents {
         // The transport wording the health banner replaces may sit in either
         // part of a notice: a reworded one keeps the raw reason as detail.
         if let Some(notice) = self.status.take() {
-            if crate::daemon_health::replaces_notice(&notice.message)
-                || notice
-                    .details
-                    .as_deref()
-                    .is_some_and(crate::daemon_health::replaces_notice)
-            {
-                // The banner speaks for this outcome now, so an earlier report
-                // under the same key would only be giving an outdated reason.
-                if let Some(key) = notice.key {
-                    self.notices.resolve(key);
-                }
-            } else {
-                let details = notice.details.as_deref();
-                match notice.severity {
-                    NoticeSeverity::Error => {
-                        tracing::error!(message = %notice.message, details, "application notice")
-                    }
-                    NoticeSeverity::Warning => {
-                        tracing::warn!(message = %notice.message, details, "application notice")
-                    }
-                    NoticeSeverity::Success => {}
-                }
-                self.notices.record(notice);
-            }
+            self.report_notice(notice);
         }
         self.resolve_notices_for_closed_cards();
         self.sync_notice_countdown();
@@ -23141,17 +23164,14 @@ mod tests {
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
 
         let _ = app.update(Message::CloseCard(card));
-        let close = app.update(Message::DiscardAndCloseRepository(card));
+        drop(app.update(Message::DiscardAndCloseRepository(card)));
 
         assert!(app.dirty_repository_close.is_none());
         assert!(matches!(
             app.cards.get(&card),
             Some(CardRuntime::Repository(runtime)) if !runtime.blocks_navigation()
         ));
-        assert!(matches!(
-            task_app_message(close),
-            Message::CloseCard(candidate) if candidate == card
-        ));
+        assert!(app.pane_close_owned(card));
     }
 
     #[test]
@@ -29757,6 +29777,8 @@ mod tests {
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
             close_queue_turn: None,
+            close_queue_advancing: false,
+            close_commit_delivered: None,
             terminal_close_attempts: HashSet::new(),
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),

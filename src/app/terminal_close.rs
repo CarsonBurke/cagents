@@ -80,22 +80,78 @@ fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> boo
 }
 
 impl Cagents {
-    /// Carries the queue on when the pane whose turn it was stopped being closed
-    /// without settling, as when a retained chat's close fails. The panes behind
-    /// it would otherwise stay disabled on "Checking…" until the next launch.
-    pub(super) fn resume_stalled_close_queue(&mut self) -> Task<Message> {
-        match self.close_queue_turn {
-            Some(card) if !self.pane_close_owned(card) => self.next_queued_card_close(),
-            _ => Task::none(),
+    /// Runs after every update, because not every way a close ends reports back:
+    /// a retained chat's close can fail, or a pane can be refused at commit, with
+    /// nothing left to tell the queue. Without this the workspace's only removal
+    /// stays taken and the panes behind it stay disabled on "Checking…" until
+    /// the next launch.
+    pub(super) fn settle_close_queue(&mut self) -> Task<Message> {
+        if let Some(card) = self
+            .workspace
+            .pending_close()
+            .map(|pending| pending.unmounting)
+            && self.close_commit_delivered == Some(card)
+            && !self.removal_owner_running(card)
+        {
+            let _ = self.workspace.cancel_close(card);
+            self.close_commit_delivered = None;
+            self.closed_terminal_cards.remove(&card);
+            self.proven_gone_cards.remove(&card);
+        }
+        if self.queued_card_closes.is_empty() {
+            Task::none()
+        } else {
+            self.next_queued_card_close()
+        }
+    }
+
+    /// Whether something is still working towards removing `card` once its
+    /// reservation has reached the commit.
+    fn removal_owner_running(&self, card: CardId) -> bool {
+        self.terminal_close
+            .as_ref()
+            .is_some_and(|intent| intent.card == card)
+            || self.terminal_close_pending(card)
+            || self.chat_close_owned(card)
+    }
+
+    /// Whether the queue has to wait. The workspace removes one pane at a time,
+    /// and the dialog blocks workspace messages, so a pane started under either
+    /// would be turned away or dropped unasked.
+    fn close_in_flight(&self) -> bool {
+        self.workspace.pending_close().is_some()
+            || self.terminal_close.is_some()
+            || self.dirty_repository_close.is_some()
+            || !self.chrome_ui.closing_group.is_empty()
+            || self.close_queue_turn.is_some_and(|card| {
+                self.pane_close_owned(card)
+                    && !self
+                        .queued_card_closes
+                        .iter()
+                        .any(|queued| queued.card == card)
+            })
+    }
+
+    fn queue_card_close(&mut self, card: CardId, unasked: bool) {
+        if let Some(queued) = self
+            .queued_card_closes
+            .iter_mut()
+            .find(|queued| queued.card == card)
+        {
+            queued.unasked |= unasked;
+        } else {
+            self.queued_card_closes
+                .push_back(QueuedCardClose { card, unasked });
         }
     }
 
     pub(super) fn next_queued_card_close(&mut self) -> Task<Message> {
-        // The dialog blocks workspace messages, so the panes behind it would be
-        // dropped unasked. Dismissing it carries on with them.
-        if self.terminal_close_dialog_visible() {
+        // Starting a pane runs a whole update, which comes back here. This loop
+        // already moves on from whatever that update settles.
+        if self.close_queue_advancing || self.close_in_flight() {
             return Task::none();
         }
+        self.close_queue_advancing = true;
         self.close_queue_turn = None;
         let mut tasks = Vec::new();
         let mut kept = 0;
@@ -134,6 +190,7 @@ impl Cagents {
                 kept += 1;
             }
         }
+        self.close_queue_advancing = false;
         // Each turned-away pane's own reason, if it has one, is already a notice.
         if kept > 0 {
             let notice = TransientNotice::warning(if kept == 1 {
@@ -142,7 +199,7 @@ impl Cagents {
                 "Some panes were kept. Close them again."
             });
             if let Some(earlier) = self.status.replace(notice) {
-                self.notices.record(earlier);
+                self.report_notice(earlier);
             }
         }
         Task::batch(tasks)
@@ -264,6 +321,16 @@ impl Cagents {
             self.status = Some(TransientNotice::warning(reason));
             return Task::none();
         }
+        // Wait for the removal under way, rather than have it refuse this pane
+        // at the end of its own close.
+        if self
+            .workspace
+            .pending_close()
+            .is_some_and(|pending| pending.unmounting != card)
+        {
+            self.queue_card_close(card, unasked);
+            return Task::none();
+        }
         if let Some(session) = ended_terminal(self.card_state(card)).cloned() {
             if !self.terminal_close_attempts.insert(session.id) {
                 return Task::none();
@@ -300,16 +367,7 @@ impl Cagents {
             // A silent close is still in flight. Preserve subsequent close
             // clicks until that card is settled, instead of dropping them.
             if !intent.active && intent.detail.is_none() && intent.card != card {
-                if let Some(queued) = self
-                    .queued_card_closes
-                    .iter_mut()
-                    .find(|queued| queued.card == card)
-                {
-                    queued.unasked |= unasked;
-                } else {
-                    self.queued_card_closes
-                        .push_back(QueuedCardClose { card, unasked });
-                }
+                self.queue_card_close(card, unasked);
             }
             return Task::none();
         }
@@ -424,7 +482,11 @@ impl Cagents {
             _ => self.workspace.request_close(card),
         };
         match reservation {
-            Ok(handoff) => self.card_removal(handoff),
+            Ok(handoff) => {
+                // A fresh commit is on its way to this reservation.
+                self.close_commit_delivered = None;
+                self.card_removal(handoff)
+            }
             Err(error) => {
                 self.closed_terminal_cards.remove(&card);
                 self.proven_gone_cards.remove(&card);
@@ -432,13 +494,9 @@ impl Cagents {
                 self.status = Some(TransientNotice::error(
                     "This pane couldn't be removed right now, so it was kept. Close it again.",
                 ));
-                // Nothing will settle this close, so unless another removal is
-                // on its way, nothing else would advance the queue.
-                if self.workspace.pending_close().is_some() {
-                    Task::none()
-                } else {
-                    self.next_queued_card_close()
-                }
+                // Nothing will settle this close, so nothing else would advance
+                // the queue. It waits by itself for a removal still on its way.
+                self.next_queued_card_close()
             }
         }
     }
@@ -1189,6 +1247,35 @@ mod tests {
         assert!(app.queued_card_closes.is_empty());
         assert!(app.terminal_close_pending(behind));
         assert_eq!(app.close_queue_turn, Some(behind));
+    }
+
+    /// Discarding an edit is the close the reader asked for. A pane already
+    /// queued can't take its place while a message is on its way.
+    #[test]
+    fn a_discarded_edit_closes_ahead_of_the_panes_already_queued() {
+        let (mut app, first) = retry_close_fixture();
+        let behind = queued_terminal(&mut app, first);
+        app.cards.insert(
+            first,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(first))),
+        );
+        app.queued_card_closes.push_back(QueuedCardClose {
+            card: behind,
+            unasked: true,
+        });
+        drop(app.update(Message::CloseCard(first)));
+        assert!(app.dirty_repository_close.is_some());
+        drop(app.update(Message::DiscardAndCloseRepository(first)));
+        assert!(app.dirty_repository_close.is_none());
+        assert_eq!(
+            app.terminal_close.as_ref().map(|intent| intent.card),
+            Some(first),
+            "the discarded pane's close starts at once"
+        );
+        assert_eq!(
+            app.queued_card_closes.front().map(|queued| queued.card),
+            Some(behind)
+        );
     }
 
     #[test]
