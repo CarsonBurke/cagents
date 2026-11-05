@@ -439,7 +439,9 @@ Only settings that change what Cargo, rustc or the tests do reach the host:
 `CARGO_INCREMENTAL` and other `CAGENTS_` settings, except `CAGENTS_BUILD_*` and names that look like
 credentials (containing `TOKEN`, `KEY`, `SECRET`, `PASS`, `AUTH`,
 `CREDENTIAL` or `COOKIE`). They travel on the connection's standard input,
-not its command line. This user's Cargo `[profile]` settings are applied
+not its command line, along with this shell's open-file limit, which the
+command gets up to the host's hard limit; an ssh session's usual 1024 fails
+descriptor-heavy suites that pass here. This user's Cargo `[profile]` settings are applied
 there; its build settings, such as `jobs` and `build-dir`, describe this host
 and are not. Each slot's commands get a private `TMPDIR`,
 `$XDG_RUNTIME_DIR/cof/<repository>-<N>` (mode 0700) on the host, short enough
