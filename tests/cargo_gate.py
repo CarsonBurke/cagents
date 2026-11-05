@@ -541,15 +541,11 @@ class MemoryAdmission(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_a_running_builds_expected_peak_is_reserved(self):
-        # The holder has claimed almost none of its expected peak, which is
-        # all the free memory, so a newcomer must wait.
-        available = int(Path("/proc/meminfo").read_text().split("MemAvailable:")[1].split()[0])
-        free_gib = available // 2**20
-        if free_gib < 4:
-            self.skipTest("too little free memory to place two builds")
-        self.hold(free_gib)
+        # The holder has claimed almost none of an expected peak larger than
+        # any host's memory, so even a small newcomer must wait.
+        self.hold(10**6)
         with self.assertRaises(subprocess.TimeoutExpired):
-            self.build(2, timeout=2)
+            self.build(1, timeout=2)
 
     def test_a_lone_build_gets_half_the_cpus(self):
         result = self.build(1, timeout=10)
