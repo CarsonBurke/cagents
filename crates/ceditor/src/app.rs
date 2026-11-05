@@ -4374,10 +4374,15 @@ impl Application for Editor {
                 }
                 Message::SyntaxTheme(theme) => {
                     self.settings.editor_syntax_theme = theme;
-                    for tab in &mut self.tabs {
-                        tab.runtime.set_syntax_theme(theme);
-                    }
-                    self.save_settings()
+                    let recoloured = self
+                        .tabs
+                        .iter_mut()
+                        .map(|tab| {
+                            tab.runtime.set_syntax_theme(theme);
+                            repository_task(tab.runtime.refresh_diff_presentation(tab.id))
+                        })
+                        .collect::<Vec<_>>();
+                    Task::batch([self.save_settings(), Task::batch(recoloured)])
                 }
                 Message::LanguageServerAssistance(enabled) => {
                     self.set_language_server_assistance(enabled)

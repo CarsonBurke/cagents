@@ -13840,19 +13840,21 @@ impl Cagents {
         );
         if previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
         {
-            for runtime in self.cards.values_mut() {
-                match runtime {
-                    CardRuntime::Repository(runtime) => {
-                        runtime.set_wrap_lines(wrap_lines);
+            for (&card, runtime) in self.cards.iter_mut() {
+                let runtime = match runtime {
+                    CardRuntime::Repository(runtime) => runtime,
+                    CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                    CardRuntime::Chat(runtime) => {
                         runtime.set_syntax_theme(syntax_theme);
+                        continue;
                     }
-                    CardRuntime::PullRequests(pane) => {
-                        pane.runtime.set_wrap_lines(wrap_lines);
-                        pane.runtime.set_syntax_theme(syntax_theme);
-                    }
-                    CardRuntime::Chat(runtime) => runtime.set_syntax_theme(syntax_theme),
-                    _ => {}
-                }
+                    _ => continue,
+                };
+                runtime.set_wrap_lines(wrap_lines);
+                runtime.set_syntax_theme(syntax_theme);
+                // A comparison recoloured in the new palette is requested
+                // again rather than left empty until the next refresh.
+                tasks.push(repository_task(runtime.refresh_diff_presentation(card)));
             }
         }
         if previous.diff_hide_unchanged != self.settings.diff_hide_unchanged {

@@ -2648,7 +2648,7 @@ impl RepositoryRuntime {
     }
 
     /// Installs the syntax palette and drops every comparison coloured with
-    /// the old one.
+    /// the old one; [`Self::refresh_diff_presentation`] requests them again.
     ///
     /// The Edit surface re-derives its highlighter in `view` and repaints at
     /// once; a [`DiffModel`] carries baked spans and would keep showing the
@@ -2658,9 +2658,18 @@ impl RepositoryRuntime {
             return;
         }
         self.syntax_theme = theme;
+        self.discard_rendered_diffs();
+    }
+
+    /// Drops every comparison built with a previous presentation, keeping
+    /// the reader's logical row for the rebuilt one.
+    fn discard_rendered_diffs(&mut self) {
+        let anchor = self.current_diff_viewport();
         self.diffs.clear();
+        self.stale_diff = None;
         self.working_diff.applied = None;
         self.working_diff.additions.clear();
+        self.pending_diff_anchor = Some(anchor);
     }
 
     pub fn set_diff_hide_unchanged(&mut self, enabled: bool) -> Task<RepositoryAction> {
@@ -5680,15 +5689,10 @@ impl RepositoryRuntime {
             return;
         }
         let family_changed = self.editor_font.family != font.family;
-        let anchor = self.current_diff_viewport();
         self.editor_font = font;
         self.editor_font_size = size;
         if family_changed {
-            self.diffs.clear();
-            self.stale_diff = None;
-            self.working_diff.applied = None;
-            self.working_diff.additions.clear();
-            self.pending_diff_anchor = Some(anchor);
+            self.discard_rendered_diffs();
         } else {
             self.update_diff_typography();
         }
@@ -17725,6 +17729,43 @@ mod tests {
         }));
         assert_eq!(reading(&runtime), read);
         assert!((runtime.diff_viewport.offset - 10.5 * 25.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_syntax_theme_change_requests_the_comparison_again_on_the_same_row() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        load_fresh_diff(&mut runtime, card, two_change_model());
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: 10.5 * DIFF_ROW_HEIGHT,
+            height: 40.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
+        let reading = |runtime: &RepositoryRuntime| match runtime.current_diff_viewport().row {
+            Some(diff_layout::Anchor::Row { row, fraction }) => (row, (fraction * 1e3).round()),
+            other => panic!("a code row is being read: {other:?}"),
+        };
+        let read = reading(&runtime);
+
+        runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::Mocha);
+        assert!(runtime.diff_model().is_none());
+        drop(runtime.refresh_diff_presentation(card));
+        let Some(DiffState::Loading { request, .. }) =
+            runtime.diff_state(&DiffBasis::IndexToWorktree)
+        else {
+            panic!("the recoloured comparison is requested again");
+        };
+        let request = *request;
+        drop(runtime.update(RepositoryAction::DiffLoaded {
+            identity,
+            basis: DiffBasis::IndexToWorktree,
+            request,
+            content: staged_text_diff(two_change_model()),
+        }));
+        assert_eq!(reading(&runtime), read);
+        assert!((runtime.diff_viewport.offset - 10.5 * DIFF_ROW_HEIGHT).abs() < 0.01);
     }
 
     #[test]
