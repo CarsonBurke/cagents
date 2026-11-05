@@ -2400,6 +2400,19 @@ fn submission(
     }
 }
 
+/// Whether `current` only appends to `previous`. The client's wire lineage
+/// proves it for provider items; a long message presented as one is a new
+/// item on each publication, so its source's append-only revision proves it.
+fn known_append(
+    handle: Option<&Arc<ClientHandle>>,
+    prose: &logical_prose::State,
+    previous: &Arc<chat::Item>,
+    current: &Arc<chat::Item>,
+) -> bool {
+    handle.is_some_and(|handle| handle.known_append(previous, current))
+        || prose.proves(previous, current)
+}
+
 impl Runtime {
     /// The word the caret is naming something with and the rows offered for
     /// it, or `None` while there is nothing to offer.
@@ -3779,9 +3792,7 @@ impl Runtime {
                             (ItemContent::Text { text: old, thinking: a, phase: x },
                              ItemContent::Text { text: next, thinking: b, phase: y })
                             if old.len() == next.len() && a == b && x == y)
-                        && handle
-                            .as_ref()
-                            .is_some_and(|handle| handle.known_append(previous, item))
+                        && known_append(handle.as_ref(), &self.logical_prose, previous, item)
                 });
                 let metadata_reused = metadata_proven
                     && self.preparation.retarget_metadata(
@@ -3814,9 +3825,7 @@ impl Runtime {
                         previous.role == item.role
                             && ChangeToken::of(&previous.content).shape
                                 == ChangeToken::of(&item.content).shape
-                            && handle
-                                .as_ref()
-                                .is_some_and(|handle| handle.known_append(previous, item))
+                            && known_append(handle.as_ref(), &self.logical_prose, previous, item)
                     });
                 // Bytes alone do not bound rich-block parsing or thousands
                 // of tiny fences. Every changed prose publication goes to the
@@ -3826,11 +3835,7 @@ impl Runtime {
                         item,
                         growing && (!reader_only || coordinated),
                         theme,
-                        |old, new| {
-                            handle
-                                .as_ref()
-                                .is_some_and(|handle| handle.known_append(old, new))
-                        },
+                        |old, new| known_append(handle.as_ref(), &self.logical_prose, old, new),
                     );
                     if replaced && !exact && !proven_from_cache {
                         let replacement = CachedItem::preparing_replacement(
@@ -3876,9 +3881,7 @@ impl Runtime {
                 .and_then(|cached| cached.item.as_ref())
                 .filter(|previous| !Arc::ptr_eq(previous, item))
                 .is_some_and(|previous| {
-                    handle
-                        .as_ref()
-                        .is_some_and(|handle| handle.known_append(previous, item))
+                    known_append(handle.as_ref(), &self.logical_prose, previous, item)
                 });
             if let Some(cached) = cache.get_mut(&item.id) {
                 cached.reader_memory = self.scroll_memory.clone();
@@ -27050,6 +27053,54 @@ mod tests {
         app.chat_runtime_mut(target).unwrap().show(false);
         app.chat_runtime_mut(target).unwrap().refresh();
         assert!(chat_runtime(&app, card).logical_prose.raw().is_none());
+    }
+    #[test]
+    fn a_long_answer_keeps_its_prepared_text_while_parts_are_appended() {
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (_card, target, handle) = history_fixture(&mut app);
+        let part = chat::TRANSCRIPT_PART_BYTES;
+        let message = "- list item that streams in\n".repeat(4 * part / 28);
+        let source = |bytes: usize, revision: u64| chat::TextCopySource {
+            cache: uuid::Uuid::from_u128(766),
+            scope: chat::TextCopyScope::Conversation,
+            token: 7,
+            revision,
+            bytes: bytes as u64,
+        };
+        let publish = |end: usize, revision: u64| {
+            let body = &message[..end];
+            let mut snapshot = (*handle.snapshot()).clone();
+            let items = logical_prose::parts("answer", body, 0..usize::MAX);
+            snapshot.text_copy_sources.conversation =
+                vec![Some(source(body.len(), revision)); items.len()];
+            snapshot.items = items;
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+        };
+        publish(part / 2, 1);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        preparation::drain_fixture(runtime);
+        assert!(!runtime.cache["answer"].placeholder);
+        // Each append crosses into another part, so every publication joins
+        // into a new item; the prepared text stays shown until the next is ready.
+        for end in [part + part / 2, 2 * part + part / 2, message.len()] {
+            publish(end, 1);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.refresh();
+            assert!(
+                !runtime.cache["answer"].placeholder,
+                "an append to {end} bytes blanked the answer"
+            );
+            preparation::drain_fixture(runtime);
+            assert!(!runtime.cache["answer"].placeholder);
+        }
+        // A rewrite is not an append and waits for its own preparation.
+        publish(message.len() - 1, 2);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        assert!(runtime.cache["answer"].placeholder);
     }
     struct LiveSharedRecovery {
         app: Cagents,

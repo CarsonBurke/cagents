@@ -9,14 +9,25 @@
 //! source reads that Copy uses, and shown once it is whole; until then the
 //! parts that are present are joined as they are.
 use super::*;
+use std::sync::Weak;
 
-/// Complete messages kept for windows that show only part of them, in total.
-/// Copy's own limit bounds any single one, so the larger of two at a window's
-/// edges can still be read while the other stays resident.
+/// Complete messages kept for windows that show only part of them, across the
+/// application. Copy's own limit bounds any single one, so the larger of two
+/// at a window's edges can still be read while the other stays resident.
 const HYDRATED_BYTES: usize = 2 * chat::TEXT_COPY_LIMIT_BYTES;
 /// Reads that fail are retried after a growing delay, then left alone until
-/// their source changes.
+/// the message is rewritten or its pane is shown again.
 const ATTEMPTS: u32 = 3;
+
+fn hydrated_budget() -> Arc<tokio::sync::Semaphore> {
+    application_capacity!(HYDRATED_BYTES)
+}
+
+/// Complete reads for presentation run one at a time across the application,
+/// so they never take the slots Copy needs.
+fn read_slots() -> Arc<tokio::sync::Semaphore> {
+    application_capacity!(1)
+}
 
 /// The identity a complete read is valid for. An append keeps it, so a read
 /// made before an append still supplies the prefix.
@@ -36,6 +47,23 @@ impl Key {
     }
 }
 
+/// A complete message, charged to the application's budget while held.
+struct Hydrated {
+    text: Arc<str>,
+    _budget: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// The bytes of one message that a presented text item holds. Within one
+/// [`Key`] the source only grows by appending, so an item holding a longer
+/// range from the same start extends one holding a shorter range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Span {
+    item: String,
+    key: Key,
+    start: usize,
+    end: usize,
+}
+
 struct Merged {
     parts: Vec<usize>,
     hydrated: usize,
@@ -44,10 +72,12 @@ struct Merged {
 
 #[derive(Default)]
 pub(super) struct State {
-    hydrated: HashMap<Key, Arc<str>>,
+    hydrated: HashMap<Key, Hydrated>,
     failures: HashMap<Key, u32>,
     request: Option<(chat::TextCopySource, u32)>,
     merged: HashMap<String, Merged>,
+    /// Spans of presented items that are still alive, by item address.
+    spans: HashMap<usize, (Weak<chat::Item>, Span)>,
     /// The last publication projected, the state it was projected under, and
     /// the result: an unchanged publication keeps its exact presented Arc.
     last: Option<(Arc<Snapshot>, u64, Arc<Snapshot>)>,
@@ -71,6 +101,21 @@ fn text(item: &chat::Item) -> Option<(&str, bool, chat::Phase)> {
         } => Some((text, *thinking, *phase)),
         _ => None,
     }
+}
+
+/// The message a presented text item belongs to and where its bytes start:
+/// a later part names both in its ID, anything else is its own message.
+fn place(item: &chat::Item) -> Option<(&str, usize, usize)> {
+    let (body, ..) = text(item)?;
+    Some(match chat::TranscriptPart::parse(&item.id) {
+        Some(part)
+            if part.layout == "text"
+                && part.fields == [(part.fields[0].0, part.fields[0].0 + body.len()), (0, 0)] =>
+        {
+            (part.item, part.index, part.fields[0].0)
+        }
+        _ => (item.id.as_str(), 0, 0),
+    })
 }
 
 /// The part that `next` claims to be must continue `previous` exactly: same
@@ -99,30 +144,33 @@ fn continues(
         && previous.role == next.role
 }
 
+/// `sources` is `None` when the publication's sources do not align with its
+/// items; then only the IDs vouch for a run.
 fn run_at<'a>(
     items: &'a [Arc<chat::Item>],
     index: usize,
-    source: Option<&chat::TextCopySource>,
+    sources: Option<&'a [Option<chat::TextCopySource>]>,
 ) -> Option<Run<'a>> {
+    let source_at = |index: usize| sources.and_then(|sources| sources.get(index)?.as_ref());
     let first = &items[index];
+    let (item, mut position, start) = place(first)?;
     let (body, ..) = text(first)?;
-    let (item, mut position, start) = match chat::TranscriptPart::parse(&first.id) {
-        Some(part)
-            if part.layout == "text"
-                && part.fields == [(part.fields[0].0, part.fields[0].0 + body.len()), (0, 0)] =>
-        {
-            (part.item, part.index, part.fields[0].0)
-        }
-        _ => (first.id.as_str(), 0, 0),
-    };
+    let source = source_at(index);
+    let key = source.and_then(Key::of);
     let mut end = start + body.len();
     let mut next = index + 1;
+    // Every real part of a message carries that message's source.
     while let Some(candidate) = items.get(next)
         && continues(&items[next - 1], candidate, item, position + 1, end)
+        && (sources.is_none() || source_at(next).and_then(Key::of) == key)
     {
         end += text(candidate).map_or(0, |(body, ..)| body.len());
         position += 1;
         next += 1;
+    }
+    // A source that does not reach the bytes the parts claim is not theirs.
+    if source.is_some_and(|source| (source.bytes as usize) < end) {
+        return None;
     }
     // A lone first part shows its own whole message unless its source says
     // the message continues past the window.
@@ -142,6 +190,34 @@ fn run_at<'a>(
 }
 
 impl State {
+    fn record(&mut self, item: &Arc<chat::Item>, span: Span) {
+        self.spans
+            .entry(Arc::as_ptr(item) as usize)
+            .or_insert_with(|| (Arc::downgrade(item), span));
+    }
+
+    fn span(&self, item: &Arc<chat::Item>) -> Option<&Span> {
+        let (weak, span) = self.spans.get(&(Arc::as_ptr(item) as usize))?;
+        // A live item at this address is the one recorded there.
+        (std::ptr::eq(weak.as_ptr(), Arc::as_ptr(item)) && weak.strong_count() > 0).then_some(span)
+    }
+
+    /// Whether `current` presents the same bytes of the same message as
+    /// `previous` and possibly more after them. A joined message is a new
+    /// item on every publication, so the client's wire lineage cannot vouch
+    /// for it; the source's own append-only revision does.
+    pub(super) fn proves(&self, previous: &Arc<chat::Item>, current: &Arc<chat::Item>) -> bool {
+        match (self.span(previous), self.span(current)) {
+            (Some(old), Some(new)) => {
+                old.item == new.item
+                    && old.key == new.key
+                    && old.start == new.start
+                    && old.end <= new.end
+            }
+            _ => false,
+        }
+    }
+
     /// Presents `raw` with each message's parts joined. Returns `raw` itself
     /// when no message in it is cut.
     pub(super) fn project(&mut self, raw: Arc<Snapshot>) -> Arc<Snapshot> {
@@ -153,41 +229,78 @@ impl State {
         }
         let sources = &raw.text_copy_sources.conversation;
         let aligned = sources.len() == raw.items.len();
-        let source_at = |index: usize| aligned.then(|| sources[index].as_ref()).flatten();
+        let aligned_sources = aligned.then_some(sources.as_slice());
         let mut items = Vec::with_capacity(raw.items.len());
         let mut projected_sources = Vec::with_capacity(sources.len());
         let mut merged = HashMap::new();
         let mut wanted = Vec::new();
         let mut needed = HashSet::new();
+        let mut spans = Vec::new();
         let mut changed = false;
         let mut index = 0;
         while index < raw.items.len() {
-            let source = source_at(index);
-            let Some(run) = run_at(&raw.items, index, source) else {
-                items.push(raw.items[index].clone());
-                if aligned {
-                    projected_sources.push(sources[index].clone());
+            let source = aligned_sources.and_then(|sources| sources[index].as_ref());
+            let key = source.and_then(Key::of);
+            let run = run_at(&raw.items, index, aligned_sources);
+            let hydrated = run.as_ref().and_then(|run| {
+                let complete =
+                    source.is_none_or(|source| run.start == 0 && source.bytes as usize <= run.end);
+                // A complete read supplies everything up to its own length;
+                // parts the window holds beyond it are a later append.
+                let hydrated = (!complete)
+                    .then(|| key.as_ref().and_then(|key| self.hydrated.get(key)))
+                    .flatten()
+                    .filter(|hydrated| hydrated.text.len() >= run.start)
+                    .map(|hydrated| hydrated.text.clone());
+                if !complete && let (Some(source), Some(key)) = (source, &key) {
+                    // A read already made covers what this window shows; the
+                    // window pages before it needs anything appended since.
+                    if hydrated.is_none() {
+                        wanted.push(source.clone());
+                    }
+                    needed.insert(key.clone());
                 }
-                index += 1;
+                Some(hydrated)
+            });
+            let mut unjoined = index + 1;
+            // Joining never makes a message larger than preparation accepts,
+            // and never presents one message twice: such a run's parts all
+            // stay separate.
+            let run = run.zip(hydrated).filter(|(run, hydrated)| {
+                let joined = hydrated
+                    .as_ref()
+                    .map_or(run.end - run.start, |text| text.len().max(run.end));
+                let joins = joined <= preparation::SOURCE_BYTES && !merged.contains_key(run.item);
+                if !joins {
+                    unjoined = run.parts.end;
+                }
+                joins
+            });
+            let Some((run, hydrated)) = run else {
+                for (offset, item) in raw.items[index..unjoined].iter().enumerate() {
+                    let key = aligned_sources
+                        .and_then(|sources| sources[index + offset].as_ref())
+                        .and_then(Key::of);
+                    if let (Some(key), Some((message, _, start))) = (key, place(item)) {
+                        let end = start + text(item).map_or(0, |(body, ..)| body.len());
+                        spans.push((
+                            item.clone(),
+                            Span {
+                                item: message.to_owned(),
+                                key,
+                                start,
+                                end,
+                            },
+                        ));
+                    }
+                    items.push(item.clone());
+                    if aligned {
+                        projected_sources.push(sources[index + offset].clone());
+                    }
+                }
+                index = unjoined;
                 continue;
             };
-            let key = source.and_then(Key::of);
-            let complete =
-                source.is_none_or(|source| run.start == 0 && source.bytes as usize <= run.end);
-            // A complete read supplies everything up to its own length; parts
-            // the window holds beyond it are a later append.
-            let hydrated = (!complete)
-                .then(|| key.as_ref().and_then(|key| self.hydrated.get(key)))
-                .flatten()
-                .filter(|text| text.len() >= run.start)
-                .cloned();
-            if !complete && let (Some(source), Some(key)) = (source, key) {
-                let covered = hydrated.as_ref().map_or(0, |text| text.len().max(run.end));
-                if covered < source.bytes as usize {
-                    wanted.push(source.clone());
-                }
-                needed.insert(key);
-            }
             let parts = &raw.items[run.parts.clone()];
             let pointers: Vec<usize> = parts
                 .iter()
@@ -222,6 +335,19 @@ impl State {
                     Arc::new(item)
                 }
             };
+            if let Some(key) = &key {
+                let start = if hydrated.is_some() { 0 } else { run.start };
+                let end = start + text(&item).map_or(0, |(body, ..)| body.len());
+                spans.push((
+                    item.clone(),
+                    Span {
+                        item: run.item.to_owned(),
+                        key: key.clone(),
+                        start,
+                        end,
+                    },
+                ));
+            }
             merged.insert(
                 run.item.to_owned(),
                 Merged {
@@ -238,11 +364,14 @@ impl State {
             index = run.parts.end;
         }
         self.merged = merged;
+        self.spans.retain(|_, (item, _)| item.strong_count() > 0);
+        for (item, span) in spans {
+            self.record(&item, span);
+        }
         // Keep complete reads only for messages this window still cuts.
         self.hydrated.retain(|key, _| needed.contains(key));
         self.failures.retain(|key, _| needed.contains(key));
-        let budget =
-            HYDRATED_BYTES.saturating_sub(self.hydrated.values().map(|text| text.len()).sum());
+        let budget = hydrated_budget().available_permits();
         let next = wanted.into_iter().find(|source| {
             source.bytes as usize <= chat::TEXT_COPY_LIMIT_BYTES
                 && source.bytes as usize <= budget
@@ -269,9 +398,13 @@ impl State {
         let projected = if changed {
             let mut snapshot = (*raw).clone();
             snapshot.items = items;
-            if aligned {
-                snapshot.text_copy_sources.conversation = projected_sources;
-            }
+            // Copy finds a message's source by position. Without aligned
+            // sources none can be trusted, so Copy uses what is shown.
+            snapshot.text_copy_sources.conversation = if aligned {
+                projected_sources
+            } else {
+                Vec::new()
+            };
             Arc::new(snapshot)
         } else {
             raw.clone()
@@ -304,12 +437,24 @@ impl State {
             return false;
         };
         self.request = None;
-        match result {
-            Ok(text) if text.len() == source.bytes as usize => {
+        let budget = match &result {
+            Ok(text) if text.len() == source.bytes as usize => u32::try_from(text.len())
+                .ok()
+                .and_then(|bytes| hydrated_budget().try_acquire_many_owned(bytes).ok()),
+            _ => None,
+        };
+        match (result, budget) {
+            (Ok(text), Some(budget)) => {
                 self.failures.remove(&key);
-                self.hydrated.insert(key, text.into());
+                self.hydrated.insert(
+                    key,
+                    Hydrated {
+                        text: text.into(),
+                        _budget: budget,
+                    },
+                );
             }
-            Ok(_) | Err(_) => {
+            _ => {
                 *self.failures.entry(key).or_default() += 1;
             }
         }
@@ -336,6 +481,8 @@ pub(super) struct Read {
     handle: Arc<ClientHandle>,
     source: chat::TextCopySource,
     attempt: u32,
+    /// Not part of the read's identity.
+    slots: Arc<tokio::sync::Semaphore>,
 }
 impl PartialEq for Read {
     fn eq(&self, other: &Self) -> bool {
@@ -368,6 +515,7 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Option<Subscription<Message>> 
             handle,
             source: source.clone(),
             attempt,
+            slots: read_slots(),
         },
         read,
     ))
@@ -381,10 +529,16 @@ fn read(read: &Read) -> std::pin::Pin<Box<dyn iced::futures::Stream<Item = Messa
         }
         let handle = read.handle.clone();
         let source = read.source.clone();
-        let result = tokio::task::spawn_blocking(move || handle.copy_text(source))
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result);
+        // The slot stays taken until the blocking read returns, even when a
+        // hidden pane drops this subscription first.
+        let slot = read.slots.clone().acquire_owned().await;
+        let result = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            handle.copy_text(source)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
         Message::ChatUi(Action::LogicalProseRead(read.target, read.source, result))
     }))
 }
@@ -641,6 +795,147 @@ mod tests {
             .collect();
         assert_eq!(ids, ["answer", forged.as_str(), "opaque:native-part:1"]);
         assert_eq!(body(&projected.items[0]), message);
+    }
+
+    #[test]
+    fn a_growing_message_proves_each_joined_publication_appends_to_the_last() {
+        let message = message();
+        let mut state = State::default();
+        // Streaming starts with one part, shown as it is.
+        let head = &message[..PART / 4];
+        let first = snapshot(
+            parts("answer", head, 0..usize::MAX),
+            Some(source(head.len())),
+        );
+        let first = state.project(first);
+        assert_eq!(first.items.len(), 1);
+        let mut previous = first.items[0].clone();
+        let mut grown_to = head.len();
+        for end in [PART + PART / 3, 2 * PART + 7, message.len()] {
+            let mut end = end.min(message.len());
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            let body = &message[..end];
+            let projected = state.project(snapshot(
+                parts("answer", body, 0..usize::MAX),
+                Some(source(body.len())),
+            ));
+            let current = projected.items[0].clone();
+            assert!(!Arc::ptr_eq(&previous, &current), "a joined item is new");
+            assert!(
+                state.proves(&previous, &current),
+                "{grown_to} -> {end} bytes appends"
+            );
+            assert!(!state.proves(&current, &previous), "shrinking is no append");
+            previous = current;
+            grown_to = end;
+        }
+    }
+
+    #[test]
+    fn a_rewrite_or_a_window_from_another_start_is_not_an_append() {
+        let message = message();
+        let mut state = State::default();
+        let whole = state.project(snapshot(
+            parts("answer", &message, 0..usize::MAX),
+            Some(source(message.len())),
+        ));
+        let whole = whole.items[0].clone();
+        let mut rewritten = source(message.len());
+        rewritten.revision += 1;
+        let replaced = state.project(snapshot(
+            parts("answer", &message, 0..usize::MAX),
+            Some(rewritten),
+        ));
+        assert!(!state.proves(&whole, &replaced.items[0]));
+        // A window paged past the first part presents bytes from elsewhere.
+        let later = state.project(snapshot(
+            parts("answer", &message, 1..usize::MAX),
+            Some(source(message.len())),
+        ));
+        assert!(!state.proves(&whole, &later.items[0]));
+        // Items this state never presented prove nothing.
+        assert!(!state.proves(&text_item("a", "x"), &text_item("a", "xy")));
+    }
+
+    #[test]
+    fn parts_whose_sources_disagree_or_fall_short_are_not_joined() {
+        let message = message();
+        let cut = parts("answer", &message, 0..usize::MAX);
+        let mut other = source(message.len());
+        other.token += 1;
+        let mut sources: Vec<_> = cut.iter().map(|_| Some(source(message.len()))).collect();
+        *sources.last_mut().unwrap() = Some(other);
+        let mut raw = Snapshot::default();
+        raw.items = cut.clone();
+        raw.text_copy_sources.conversation = sources;
+        let projected = State::default().project(Arc::new(raw));
+        assert_eq!(
+            projected.items.len(),
+            2,
+            "the last part is another message's"
+        );
+        assert!(Arc::ptr_eq(&projected.items[1], cut.last().unwrap()));
+        // A lone later part whose source ends before its own bytes is forged.
+        let tail = parts("answer", &message, 2..3);
+        let raw = snapshot(tail.clone(), Some(source(PART)));
+        let mut state = State::default();
+        let projected = state.project(raw.clone());
+        assert!(Arc::ptr_eq(&projected, &raw));
+        assert!(state.request().is_none());
+    }
+
+    #[test]
+    fn joining_without_aligned_sources_leaves_copy_to_what_is_shown() {
+        let message = message();
+        let mut raw = Snapshot::default();
+        raw.items = parts("answer", &message, 0..usize::MAX);
+        raw.text_copy_sources.conversation = vec![Some(source(message.len()))];
+        let projected = State::default().project(Arc::new(raw));
+        assert_eq!(body(&projected.items[0]), message);
+        assert!(projected.text_copy_sources.conversation.is_empty());
+    }
+
+    #[test]
+    fn a_message_larger_than_preparation_accepts_keeps_its_parts() {
+        let message = "word ".repeat(preparation::SOURCE_BYTES / 5 + PART);
+        let cut = parts("answer", &message, 0..usize::MAX);
+        let raw = snapshot(cut.clone(), Some(source(message.len())));
+        let projected = State::default().project(raw.clone());
+        assert!(Arc::ptr_eq(&projected, &raw));
+    }
+
+    #[test]
+    fn complete_reads_share_one_slot_and_one_budget_across_panes() {
+        assert!(Arc::ptr_eq(&read_slots(), &read_slots()));
+        assert_eq!(read_slots().available_permits(), 1);
+        let budget = hydrated_budget();
+        let before = budget.available_permits();
+        let message = message();
+        let mut state = State::default();
+        state.project(snapshot(
+            parts("answer", &message, 1..usize::MAX),
+            Some(source(message.len())),
+        ));
+        assert!(state.complete(&source(message.len()), Ok(message.clone())));
+        assert_eq!(budget.available_permits(), before - message.len());
+        state.release();
+        assert_eq!(budget.available_permits(), before);
+        // A read the budget cannot hold counts as a failed attempt.
+        let held = budget
+            .clone()
+            .try_acquire_many_owned(before as u32)
+            .unwrap();
+        state.project(snapshot(
+            parts("answer", &message, 1..usize::MAX),
+            Some(source(message.len())),
+        ));
+        assert!(
+            state.request().is_none(),
+            "no read starts without room for its text"
+        );
+        drop(held);
     }
 
     #[test]
