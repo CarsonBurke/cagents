@@ -55,13 +55,18 @@ fn inspector_paint_reports_an_accepted_handoff_failure_without_navigating() {
     let target = chat_runtime(&app, card).target;
     drop(app.update(Message::WindowResized(960.0, 900.0)));
     assert!(app.context_inspector_is_overlay());
+    let notices = app.notices.entries.len();
     drop(app.update(Message::ChatUi(Action::SessionLinkOpened(Err(
         "The session's window did not finish opening.".into(),
     )))));
+    // The full app reducer drains the status write channel into notice history.
+    assert_eq!(app.notices.entries.len(), notices + 1);
+    let notice = &app.notices.entries.back().unwrap().notice;
     assert_eq!(
-        app.status.as_ref().unwrap().message,
+        notice.message,
         "The session's window did not finish opening."
     );
+    assert_eq!(notice.severity, NoticeSeverity::Warning);
     assert_eq!(app.workspace.focused(), Some(card));
     assert_eq!(chat_runtime(&app, card).target, target);
     assert!(app.context_inspector_is_overlay());
