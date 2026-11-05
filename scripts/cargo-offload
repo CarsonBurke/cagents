@@ -215,8 +215,10 @@ def say(*words):
 
 def temporary_directory(slot):
     """A short private directory for the slot's temporary files, or one in
-    the slot when another user holds the short one's name."""
-    private = f"/var/tmp/cagents-offload-{os.getuid()}"
+    the slot when another user holds the short one's name. Tests bind Unix
+    sockets several levels under it, within 108 bytes, so the HOST fixtures
+    want a base of at most 28 bytes (docs/development.md)."""
+    private = f"/var/tmp/cof-{os.getuid()}"
     try:
         os.mkdir(private, 0o700)
     except FileExistsError:
@@ -357,6 +359,16 @@ elif command == "run":
     environment["TMPDIR"] = temporary = temporary_directory(base)
     shutil.rmtree(temporary, ignore_errors=True)
     os.makedirs(temporary, mode=0o700)
+    # Tests that look for an enclosing checkout fail under a stray one; say
+    # so rather than move the tests somewhere they would pass.
+    ancestor = temporary
+    while ancestor != os.path.dirname(ancestor):
+        ancestor = os.path.dirname(ancestor)
+        if os.path.lexists(os.path.join(ancestor, ".git")):
+            print(f"cargo-gate: {os.path.join(ancestor, '.git')} on {os.uname().nodename} "
+                  "puts this build's temporary files inside a Git checkout",
+                  file=sys.stderr, flush=True)
+            break
     # build.rs asks Git for the version stamp only when it is not given; the
     # slot is not a repository, and whatever encloses it is not this one.
     environment["GIT_CEILING_DIRECTORIES"] = os.path.dirname(base)

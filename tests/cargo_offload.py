@@ -301,7 +301,7 @@ class StandInHost(unittest.TestCase):
 
     def test_temporary_files_go_in_the_slot_and_do_not_outlive_the_next_command(self):
         # Short enough for the Unix sockets tests bind under it, and on disk.
-        tmp = Path(f"/var/tmp/cagents-offload-{os.getuid()}/crate-0")
+        tmp = Path(f"/var/tmp/cof-{os.getuid()}/crate-0")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         (self.crate / "build.rs").write_text(textwrap.dedent(f"""
             fn main() {{
