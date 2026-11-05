@@ -175,7 +175,17 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
         )
         .map_err(|error| error.message)?;
     } else if !retire {
-        return Err("The agent never established a reusable provider".into());
+        // A conclusive pre-provider failure has nothing to reuse. Retire only
+        // its exact empty dispatch, so normal scheduler release can clear the
+        // reusable slot without replaying the failed run. Pending or uncertain
+        // startup still refuses above and the write transaction repeats every
+        // ownership/run predicate before publishing the ordinary retirement.
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .close_unstarted_automation_agent(&agent, expected)?;
+        announce(host, &registry);
+        return Ok(Reconciliation::Closed);
     }
     registry
         .lock()
