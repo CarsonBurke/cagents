@@ -1318,7 +1318,7 @@ impl RemoteActor {
             verify_peer(&control, &self.0.identity.record)?;
             Ok::<_, String>(received)
         })()
-        .map_err(|error| format!("{error} during the retained actor `pinned_directory` request"))?;
+        .map_err(|error| interrupted_request("pinned_directory", error))?;
         match response {
             Err(error) => Err(error),
             Ok(identity) => {
@@ -3152,12 +3152,11 @@ fn exchange<T: DeserializeOwned>(
         deadline_io::send_until(&control, invocation, deadline)?;
         deadline_io::receive_until(&control, deadline)
     })()
-    .map_err(|error| {
-        format!(
-            "{error} during the retained actor `{}` request",
-            invocation.method
-        )
-    })
+    .map_err(|error| interrupted_request(&invocation.method, error))
+}
+/// Name the request a transport failure interrupted.
+fn interrupted_request(method: &str, error: String) -> String {
+    format!("{error} during the `{method}` request")
 }
 fn verify_peer(control: &UnixStream, record: &Record) -> Result<(), String> {
     let credentials = peer(control)?;

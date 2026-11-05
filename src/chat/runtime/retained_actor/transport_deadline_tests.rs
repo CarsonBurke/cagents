@@ -48,6 +48,7 @@ fn retained_call_and_adoption_bound_the_connect_phase_without_disturbing_owner()
         .unwrap_err();
     // The diagnostic names the interrupted request rather than calling every
     // call an inspection.
+    assert!(error.contains("deadline expired"), "{error}");
     assert!(error.contains("`state` request"), "{error}");
     assert!(!error.contains("inspection"), "{error}");
     assert!(start.elapsed() < Duration::from_secs(2));

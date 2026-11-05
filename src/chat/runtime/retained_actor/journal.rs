@@ -746,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn commits_skip_fsync_and_keep_a_reclaimable_rollback_journal() {
+    fn journal_commits_without_fsync_in_rollback_mode() {
         let root = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(root.path()).unwrap();
         // 0 is OFF: the helper's request loop never waits for the disk.
@@ -760,8 +760,9 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(mode, "delete");
-        // A committed write is visible to another reader without fsync, and
-        // leaves no sidecar that would change the file after its disposition.
+        // A committed transaction leaves no sidecar file behind. Reclamation
+        // after a drained disposition is covered by
+        // checked_retirement_fences_mutation_and_allows_delayed_reader_store_drop.
         let source = super::super::transport::fixture_source();
         journal.remember_published_source(&source).unwrap();
         assert_eq!(durable_sources(root.path()), vec![source]);
