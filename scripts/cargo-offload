@@ -19,6 +19,7 @@ import base64
 import json
 import os
 import queue
+import resource
 from pathlib import Path
 import shlex
 import signal
@@ -199,7 +200,7 @@ def profile_config(path):
 # command ends with what it started when its standard input closes: the
 # connection to this host dropped or the gate here was cancelled.
 REMOTE_AGENT = r'''
-import fcntl, hashlib, json, os, shutil, signal, stat, subprocess, sys, threading, time
+import fcntl, hashlib, json, os, resource, shutil, signal, stat, subprocess, sys, threading, time
 command, base = sys.argv[1], os.path.expanduser(sys.argv[2])
 
 def until_closed(then):
@@ -425,10 +426,26 @@ elif command == "prune":
             os.rmdir(directory)
 
 elif command == "run":
-    # The environment comes first on standard input, never on the command
+    # The environment and limits come first on standard input, never on the command
     # line, which every user of the host can read.
     directory, arguments = sys.argv[3], sys.argv[4:]
-    environment = json.loads(sys.stdin.buffer.readline())
+    request = json.loads(sys.stdin.buffer.readline())
+    environment = request["environment"]
+    # The command opens as many files as it could where it was asked for: a
+    # host whose sessions keep the conventional 1024 would otherwise fail a
+    # suite that passes there, and one with more would hide a leak.
+    wanted = request.get("open_files")
+    if wanted is not None:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if wanted < 0:
+            wanted = hard
+        elif hard != resource.RLIM_INFINITY:
+            wanted = min(wanted, hard)
+        if wanted != soft:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+            except (OSError, ValueError):
+                pass  # Beyond what the kernel allows; the host's own limit stands.
     running = open(os.path.join(base, "running"), "a")
     fcntl.flock(running, fcntl.LOCK_EX)
     os.chdir(os.path.join(base, "src", directory))
@@ -719,7 +736,9 @@ class Offload:
             stdout=subprocess.PIPE if subcommand == "build" else None,
         )
         try:
-            command.stdin.write((json.dumps(environment) + "\n").encode())
+            request = {"environment": environment,
+                       "open_files": resource.getrlimit(resource.RLIMIT_NOFILE)[0]}
+            command.stdin.write((json.dumps(request) + "\n").encode())
             command.stdin.flush()
         except (BrokenPipeError, ValueError):
             pass  # The connection failed or was cancelled; its status says which.

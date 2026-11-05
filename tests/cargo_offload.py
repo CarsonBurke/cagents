@@ -12,6 +12,7 @@ import ast
 import fcntl
 import json
 import os
+import resource
 from pathlib import Path
 import shutil
 import signal
@@ -610,7 +611,7 @@ class RemoteRun(unittest.TestCase):
                 ["python3", "-c", offload.REMOTE_AGENT, "run", base, ".",
                  "sh", "-c", f"sleep 120 & echo $! >{marker}; wait"],
                 stdin=subprocess.PIPE, start_new_session=True)
-            agent.stdin.write(b"{}\n")
+            agent.stdin.write(b'{"environment": {}}\n')
             agent.stdin.flush()
             deadline = time.monotonic() + 10
             while not marker.exists() or not marker.read_text().strip():
@@ -634,9 +635,32 @@ class RemoteRun(unittest.TestCase):
                  "sh", "-c", 'test "$PROBE" = x && exit 7'],
                 stdin=subprocess.PIPE)
             self.addCleanup(agent.stdin.close)
-            agent.stdin.write(b'{"PROBE": "x"}\n')
+            agent.stdin.write(b'{"environment": {"PROBE": "x"}}\n')
             agent.stdin.flush()
             self.assertEqual(agent.wait(timeout=15), 7)
+
+    def test_the_command_gets_the_open_file_limit_it_was_asked_for(self):
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        above = hard + 1 if hard != resource.RLIM_INFINITY else None
+        for wanted, expected in ((64, 64), (above, hard), (-1, hard)):
+            if wanted is None:
+                continue
+            with self.subTest(wanted=wanted), tempfile.TemporaryDirectory() as base:
+                Path(base, "src").mkdir()
+                # The connection stays open, as it does while the gate waits.
+                agent = subprocess.Popen(
+                    ["python3", "-c", offload.REMOTE_AGENT, "run", base, ".",
+                     "sh", "-c", "ulimit -Sn"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                self.addCleanup(agent.stdout.close)
+                self.addCleanup(agent.stdin.close)
+                agent.stdin.write(json.dumps({"environment": {}, "open_files": wanted}).encode()
+                                  + b"\n")
+                agent.stdin.flush()
+                self.assertEqual(agent.wait(timeout=15), 0)
+                reported = agent.stdout.read().decode().strip()
+                self.assertEqual(reported, "unlimited" if expected == resource.RLIM_INFINITY
+                                 else str(expected))
 
 
 class Prune(unittest.TestCase):
