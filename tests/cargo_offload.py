@@ -1002,6 +1002,50 @@ class StandInHost(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.root / "local-build").exists())
 
+    def test_tests_running_there_keep_their_slot_from_the_next_build(self):
+        # A plain `cargo test` runs its tests on the build host, from the
+        # slot's target directory. Another build must not rewrite the test
+        # executable, or anything else there, until the tests have ended.
+        def worktree(path, text):
+            (path / "src").mkdir(parents=True, exist_ok=True)
+            (path / "tests").mkdir(exist_ok=True)
+            for name in ("Cargo.toml", ".gitignore", "src/main.rs"):
+                (path / name).write_text((self.crate / name).read_text())
+            (path / "tests/slow.rs").write_text(textwrap.dedent("""
+                #[test]
+                fn slow() {
+                    let exe = std::env::current_exe().unwrap();
+                    let before = std::fs::read(&exe).unwrap();
+                    std::fs::write(exe.with_file_name("started"), "").unwrap();
+                    std::thread::sleep(std::time::Duration::from_secs(6));
+                    assert!(std::fs::read(&exe).unwrap() == before, "rewritten under the test");
+                    eprintln!("%s");
+                }
+            """) % text)
+            if not (path / ".git").exists():
+                subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+        worktree(self.crate, "first")
+        other = self.root / "elsewhere" / "crate"
+        worktree(other, "second")
+        env = self.remote_env() | {"CAGENTS_BUILD_REMOTE_SLOTS": "1"}
+        testing = subprocess.Popen([str(self.gate), "test", "--test", "slow"], cwd=self.crate,
+                                   env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True)
+        self.addCleanup(testing.kill)
+        deadline = time.monotonic() + 120
+        # Beside the test executable, wherever the host's Cargo puts it.
+        while not any(self.root.rglob("started")):
+            self.assertIsNone(testing.poll(), "the tests ended before they were seen running")
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.1)
+        building = subprocess.run([str(self.gate), "test", "--no-run", "--test", "slow"],
+                                  cwd=other, env=env, capture_output=True, text=True,
+                                  timeout=120)
+        out, err = testing.communicate(timeout=60)
+        self.assertEqual(testing.returncode, 0, err)
+        self.assertEqual(building.returncode, 0, building.stderr)
+        self.assertIn("waiting for", building.stderr)
+
     def test_a_worktree_returns_to_the_slot_it_used_last(self):
         env = self.remote_env()
         slots = self.host_home / ".cache/cagents-offload/crate"
