@@ -522,7 +522,7 @@ pub(crate) fn holds_terminal(terminal: TerminalId, kind: Kind) -> io::Result<boo
 #[cfg(feature = "ui")]
 fn holds_terminal_in(directory: &Path, terminal: TerminalId) -> io::Result<bool> {
     match read(&socket(directory, terminal).with_extension("json")) {
-        Ok(record) => Ok(record.holder.is_current()),
+        Ok(record) => Ok(record.holder.is_current() || record.root.is_current()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
@@ -833,6 +833,7 @@ mod tests {
         // Discovery prunes a dead holder's record. This caller has no such authority.
         let mut dead = record();
         dead.holder.start += 1;
+        dead.root.start += 1;
         dead.create(&directory).unwrap();
         assert!(!holds_terminal_in(&directory, dead.terminal).unwrap());
         assert!(dead.path(&directory).exists());
@@ -869,9 +870,16 @@ mod tests {
             let mut gone = record.clone();
             gone.terminal = TerminalId::new();
             gone.holder.start += 1;
+            gone.root.start += 1;
             gone.create(&directory).unwrap();
             assert!(!holds_terminal_in(&directory, gone.terminal).unwrap());
         }
+
+        // Its terminal's root process outlived the holder.
+        let mut orphaned = record();
+        orphaned.holder.start += 1;
+        orphaned.create(&directory).unwrap();
+        assert!(holds_terminal_in(&directory, orphaned.terminal).unwrap());
     }
 
     fn endpoint_with_byte_length(root: &Path, length: usize) -> PathBuf {

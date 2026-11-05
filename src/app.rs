@@ -10295,14 +10295,17 @@ impl Cagents {
                                 crate::ui_controls::button::primary(retry_label)
                                     .id(card_control_id(id, "retry"))
                                     .name(format!("{retry_label} {}", labels.type_label))
-                                    .on_press(
-                                        if cfg!(not(feature = "integrated-browser"))
-                                            && browser_session.is_some()
-                                        {
-                                            Message::OpenBrowserInSystem(id)
-                                        } else {
-                                            Message::RetryCard(id)
-                                        },
+                                    // Retry does nothing once Close owns the pane.
+                                    .on_press_maybe(
+                                        (!self.terminal_close_in_progress(id)).then_some(
+                                            if cfg!(not(feature = "integrated-browser"))
+                                                && browser_session.is_some()
+                                            {
+                                                Message::OpenBrowserInSystem(id)
+                                            } else {
+                                                Message::RetryCard(id)
+                                            },
+                                        ),
                                     )
                                     .into(),
                             ] };
@@ -16612,8 +16615,15 @@ impl Application for Cagents {
                 {
                     return self.begin_card_close(id);
                 }
-                self.commit_card_removal(id, None)
-                    .unwrap_or_else(Task::none)
+                match self.commit_card_removal(id, None) {
+                    Some(task) => task,
+                    None => {
+                        // Refused after all: the pane stays, and nothing else
+                        // will advance the closes queued behind it.
+                        self.closed_terminal_cards.remove(&id);
+                        self.next_queued_card_close()
+                    }
+                }
             }
             Message::Viewport { generation, event } => {
                 // Native callbacks already queued by an unmounted worktree

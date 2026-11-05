@@ -404,7 +404,10 @@ fn prove_not_hosted_at(
     let cannot_confirm = || {
         "Cagents can't confirm this terminal has stopped, so the pane was kept. Try Close again in a moment. If this keeps happening, leave the pane in place.".to_owned()
     };
-    if holder(session.id).map_err(|_| cannot_confirm())? {
+    if holder(session.id).map_err(|error| {
+        tracing::warn!(%error, terminal = %session.id, "could not read the holder record for Close");
+        cannot_confirm()
+    })? {
         return Err(UNADOPTED.into());
     }
     // Check even when the saved boot is over. No process outlives its boot, but
