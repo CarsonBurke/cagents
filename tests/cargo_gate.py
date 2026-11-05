@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shutil
 import signal
@@ -195,6 +196,323 @@ class CargoGateApplicability(unittest.TestCase):
                     self.assertFalse((root / "calls.json").exists())
 
 
+class InstalledGateDeferral(unittest.TestCase):
+    """A checkout whose gate has fallen behind the installed one runs that."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-deferral-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.gate = self.root / "checkout" / "cargo-gate"
+        self.gate.parent.mkdir()
+        shutil.copy2(ROOT / "scripts/cargo-gate", self.gate)
+        shutil.copy2(ROOT / "scripts/cargo-gate-command.py", self.gate.parent)
+        self.version = int(re.search(r"^gate_version=(\d+)$", self.gate.read_text(), re.M)[1])
+        self.installed = self.root / "cagents-cargo-gate"
+        self.env = os.environ | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
+                                 "CAGENTS_BUILD_REMOTE": "local",
+                                 "CAGENTS_BUILD_INSTALLED_GATE": str(self.installed)}
+        self.env.pop("CAGENTS_BUILD_SLOT_HELD", None)
+
+    def install(self, version):
+        self.installed.write_text(f"#!/bin/sh\ngate_version={version}\necho installed \"$@\"\n")
+        self.installed.chmod(0o755)
+
+    def run_gate(self, env=None):
+        return subprocess.run([str(self.gate), "exec", "echo", "checkout"], env=env or self.env,
+                              cwd=self.root, capture_output=True, text=True, timeout=30)
+
+    def test_a_newer_installed_gate_runs_instead(self):
+        self.install(self.version + 1)
+        self.assertEqual(self.run_gate().stdout, "installed exec echo checkout\n")
+
+    def test_an_installed_gate_no_newer_than_this_one_does_not(self):
+        for version in (self.version, self.version - 1):
+            with self.subTest(version=version):
+                self.install(version)
+                self.assertEqual(self.run_gate().stdout, "checkout\n")
+
+    def test_an_empty_setting_runs_this_gate_always(self):
+        self.install(self.version + 1)
+        self.assertEqual(self.run_gate(self.env | {"CAGENTS_BUILD_INSTALLED_GATE": ""}).stdout,
+                         "checkout\n")
+
+
+class InstalledGateSync(unittest.TestCase):
+    """A gate change merged into main is installed by the next gate run."""
+
+    files = ("cargo-gate", "cargo-gate-command.py", "cargo-gate-sync.py", "cargo-offload",
+             "seed-build-dir", "build-disk-guard", "install-cargo-gate")
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-sync-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.checkout = self.root / "checkout"
+        (self.checkout / "scripts").mkdir(parents=True)
+        for name in self.files:
+            shutil.copy2(ROOT / "scripts" / name, self.checkout / "scripts" / name)
+        self.clock = int(time.time()) - 1000
+        self.git_env = os.environ | {
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+        self.git("init", "-q", "-b", "main")
+        self.first = self.commit("gate")
+        self.destination = self.root / "installed"
+        self.destination.mkdir()
+        self.installed = self.destination / "cagents-cargo-gate"
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith("CAGENTS_BUILD_")} | {
+            "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
+            "CAGENTS_BUILD_REMOTE": "local",
+            "CAGENTS_BUILD_INSTALLED_GATE": str(self.installed)}
+        self.install()
+        self.assertEqual(self.recorded(), self.first)
+
+    def install(self):
+        result = subprocess.run([str(self.checkout / "scripts/install-cargo-gate"),
+                                 str(self.destination)], env=self.env, capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def git(self, *arguments, env=None):
+        return subprocess.run(["git", *arguments], cwd=self.checkout, env=env or self.git_env,
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self, message, at=None):
+        """Commits everything, by default at a time before any installation."""
+        if at is None:
+            self.clock += 1
+            at = self.clock
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", message,
+                 env=self.git_env | {"GIT_COMMITTER_DATE": f"@{at} +0000",
+                                     "GIT_AUTHOR_DATE": f"@{at} +0000"})
+        return self.git("rev-parse", "HEAD")
+
+    def later(self):
+        return int(time.time()) + 100
+
+    def main_moves_to(self, commit):
+        self.git("update-ref", "refs/remotes/origin/main", commit)
+
+    def record(self):
+        return json.loads((self.destination / "cagents-cargo-gate.installation").read_text())
+
+    def recorded(self):
+        return self.record()["commit"]
+
+    def target(self):
+        return os.readlink(self.installed)
+
+    def run_installed(self, cwd=None):
+        return subprocess.run([str(self.installed), "exec", "sh", "-c", "printf ran"],
+                              cwd=cwd or self.checkout, env=self.env, capture_output=True,
+                              text=True, timeout=120)
+
+    def change_gate(self, line):
+        """Adds LINE to the gate, run before anything else it does."""
+        gate = self.checkout / "scripts/cargo-gate"
+        shebang, rest = gate.read_text().split("\n", 1)
+        gate.write_text(f"{shebang}\n{line}\n{rest}")
+
+    def test_main_changing_the_gate_installs_it_and_runs_it(self):
+        self.change_gate("printf 'main gate\\n' >&2")
+        merged = self.commit("change the gate", at=self.later())
+        self.main_moves_to(merged)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("installed origin/main's gate", result.stderr)
+        # Main's gate ran this command, not the one it replaced.
+        self.assertIn("main gate", result.stderr)
+        self.assertEqual(self.recorded(), merged)
+        # Once installed, the next run has nothing to do.
+        again = self.run_installed()
+        self.assertEqual((again.returncode, again.stdout, again.stderr), (0, "ran", "main gate\n"))
+
+    def test_main_changing_nothing_of_the_gate_installs_nothing(self):
+        (self.checkout / "README").write_text("unrelated\n")
+        merged = self.commit("unrelated", at=self.later())
+        self.main_moves_to(merged)
+        before = self.target()
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "ran", ""))
+        self.assertEqual(self.target(), before)
+        self.assertEqual(self.recorded(), self.first)
+        self.assertEqual((self.destination / "cagents-cargo-gate.checked").read_text(),
+                         merged + "\n")
+
+    def test_an_installation_newer_than_mains_change_stays_until_main_changes_the_gate(self):
+        # Installed from a branch under test after main last changed the gate.
+        self.change_gate("# branch change")
+        self.commit("branch")
+        self.install()
+        branch = self.target()
+        self.git("checkout", "-q", "-b", "later", self.first)
+        (self.checkout / "README").write_text("unrelated\n")
+        self.main_moves_to(self.commit("unrelated", at=self.later()))
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "ran", ""))
+        self.assertEqual(self.target(), branch)
+        # Main changes the gate after the branch was installed.
+        self.change_gate("# another change")
+        merged = self.commit("another change", at=self.later() + 1)
+        self.main_moves_to(merged)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertNotEqual(self.target(), branch)
+        self.assertEqual(self.recorded(), merged)
+
+    def test_a_branch_main_merged_as_other_commits_is_current(self):
+        self.change_gate("# branch change")
+        self.commit("branch")
+        self.install()
+        installed = self.target()
+        # Main squashes the branch: other commits, later, with the same files.
+        squashed = self.git("commit-tree", "-p", self.first, "-m", "squash", "HEAD^{tree}",
+                            env=self.git_env | {"GIT_COMMITTER_DATE": f"@{self.later()} +0000"})
+        self.main_moves_to(squashed)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "ran", ""))
+        self.assertEqual(self.target(), installed)
+
+    def test_an_installation_from_before_records_is_replaced_by_mains_newer_gate(self):
+        (self.destination / "cagents-cargo-gate.installation").unlink()
+        os.utime(self.installed, (self.clock, self.clock))
+        self.change_gate("# merged change")
+        merged = self.commit("change the gate", at=self.later())
+        self.main_moves_to(merged)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("installed origin/main's gate", result.stderr)
+        self.assertEqual(self.recorded(), merged)
+
+    def test_a_gate_main_cannot_install_is_reported_and_not_retried(self):
+        installer = self.checkout / "scripts/install-cargo-gate"
+        installer.write_text("#!/bin/sh\necho broken installer >&2\nexit 1\n")
+        broken = self.commit("break the installer", at=self.later())
+        self.main_moves_to(broken)
+        before = self.target()
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("could not install origin/main's gate", result.stderr)
+        self.assertIn("broken installer", result.stderr)
+        self.assertEqual(self.target(), before)
+        again = self.run_installed()
+        self.assertEqual((again.returncode, again.stdout), (0, "ran"), again.stderr)
+        self.assertIn("could not be installed", again.stderr)
+        self.assertNotIn("broken installer", again.stderr)
+
+    def test_an_installer_that_records_nothing_is_not_run_again(self):
+        installer = self.checkout / "scripts/install-cargo-gate"
+        installer.write_text(installer.read_text().replace(
+            'mv -f -- "$destination/cagents-cargo-gate.installation.new" '
+            '"$destination/cagents-cargo-gate.installation"', ':'))
+        self.change_gate("# merged change")
+        merged = self.commit("an installer that records nothing", at=self.later())
+        self.main_moves_to(merged)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("did not record what it installed", result.stderr)
+        again = self.run_installed()
+        self.assertEqual((again.returncode, again.stdout), (0, "ran"), again.stderr)
+        self.assertIn("could not be installed", again.stderr)
+
+    def test_a_gate_finding_another_installing_goes_on_and_installs_later(self):
+        self.change_gate("# merged change")
+        merged = self.commit("change the gate", at=self.later())
+        self.main_moves_to(merged)
+        before = self.target()
+        with open(self.destination / "cagents-cargo-gate.install.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "ran", ""))
+        self.assertEqual(self.target(), before)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertEqual(self.recorded(), merged)
+
+    def test_a_merged_branch_counts_from_when_main_merged_it(self):
+        # Installed from a branch main never takes.
+        self.git("checkout", "-q", "-b", "unmerged")
+        self.change_gate("# unmerged change")
+        self.commit("unmerged")
+        self.install()
+        # A branch written before that installation, merged into main after.
+        self.git("checkout", "-q", "-b", "written-earlier", self.first)
+        self.change_gate("# merged change")
+        self.commit("written earlier")
+        self.git("checkout", "-q", "-b", "trunk", self.first)
+        self.git("merge", "-q", "--no-ff", "-m", "merge", "written-earlier",
+                 env=self.git_env | {"GIT_COMMITTER_DATE": f"@{self.later()} +0000"})
+        merged = self.git("rev-parse", "HEAD")
+        self.main_moves_to(merged)
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("installed origin/main's gate", result.stderr)
+        self.assertEqual(self.recorded(), merged)
+
+    def test_a_newer_gate_installed_from_changed_files_stays(self):
+        gate = self.checkout / "scripts/cargo-gate"
+        text = gate.read_text()
+        version = int(re.search(r"^gate_version=(\d+)$", text, re.M).group(1))
+        gate.write_text(text.replace(f"gate_version={version}\n", f"gate_version={version + 1}\n"))
+        self.install()
+        # Files that are not their commit's record no commit.
+        self.assertIsNone(self.recorded())
+        installed = self.target()
+        gate.write_text(text + "# merged change\n")
+        self.main_moves_to(self.commit("change the gate", at=self.later()))
+        result = self.run_installed()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "ran", ""))
+        self.assertEqual(self.target(), installed)
+        again = self.run_installed()
+        self.assertEqual((again.returncode, again.stdout, again.stderr), (0, "ran", ""))
+
+    def test_another_clone_of_the_same_repository_installs_mains(self):
+        self.git("remote", "add", "origin", "https://github.com/example/gate.git")
+        self.install()
+        clone = self.root / "clone"
+        subprocess.run(["git", "clone", "-q", str(self.checkout), str(clone)], env=self.git_env,
+                       check=True, capture_output=True)
+        def in_clone(*arguments, env=None):
+            subprocess.run(["git", *arguments], cwd=clone, env=env or self.git_env, check=True,
+                           capture_output=True)
+        # Another way to the same repository, which ignores case.
+        in_clone("remote", "set-url", "origin", "ssh://git@github.com:22/Example/gate")
+        with open(clone / "scripts/cargo-gate", "a") as gate:
+            gate.write("# merged change\n")
+        in_clone("commit", "-qam", "change the gate",
+                 env=self.git_env | {"GIT_COMMITTER_DATE": f"@{self.later()} +0000"})
+        in_clone("update-ref", "refs/remotes/origin/main", "HEAD")
+        result = self.run_installed(cwd=clone)
+        self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
+        self.assertIn("installed origin/main's gate", result.stderr)
+        self.assertEqual(self.record()["origin"], "ssh://git@github.com:22/Example/gate")
+
+    def test_a_checkout_of_another_repository_changes_nothing(self):
+        other = self.root / "other"
+        (other / "scripts").mkdir(parents=True)
+        for name in self.files:
+            shutil.copy2(self.checkout / "scripts" / name, other / "scripts" / name)
+        with open(other / "scripts/cargo-gate", "a") as gate:
+            gate.write("# a fork's change\n")
+        self.git("remote", "add", "origin", "https://github.com/example/gate.git")
+        self.install()
+        for arguments in (["init", "-q", "-b", "main"], ["add", "-A"],
+                          ["remote", "add", "origin", "https://github.com/fork/gate.git"],
+                          ["commit", "-q", "-m", "x"],
+                          ["update-ref", "refs/remotes/origin/main", "HEAD"]):
+            subprocess.run(["git", *arguments], cwd=other, env=self.git_env, check=True,
+                           capture_output=True)
+        before = self.target()
+        result = self.run_installed(cwd=other)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "ran", ""))
+        self.assertEqual(self.target(), before)
+        self.assertEqual(self.recorded(), self.first)
+
+
 class HeldCommand(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -226,6 +544,9 @@ class HeldCommand(unittest.TestCase):
             "CAGENTS_BUILD_LOCK": str(self.lock),
             "CAGENTS_BUILD_SLOTS": "1",
             "CARGO_BUILD_JOBS": "1",
+            # This copy of the gate, not a newer installed one, building here.
+            "CAGENTS_BUILD_INSTALLED_GATE": "",
+            "CAGENTS_BUILD_REMOTE": "local",
         }
         self.env.pop("CAGENTS_BUILD_SLOT_HELD", None)
         self.children = []
@@ -790,6 +1111,7 @@ class PreflightCancellation(unittest.TestCase):
             "CAGENTS_BUILD_LOCK": str(self.lock), "CAGENTS_BUILD_SLOTS": "1",
             "CARGO_BUILD_JOBS": "1", "FIXTURE_ROOT": str(self.root),
             "TMPDIR": str(self.root / "tmp"), "LC_ALL": "C",
+            "CAGENTS_BUILD_REMOTE": "local", "CAGENTS_BUILD_INSTALLED_GATE": "",
         }
         self.children = []
         self.descendants = []
@@ -963,7 +1285,8 @@ class TwoSlots(unittest.TestCase):
             key: value for key, value in os.environ.items()
             if not key.startswith("CAGENTS_BUILD_") and key != "CARGO_BUILD_JOBS"
         } | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_SLOTS": "2",
-              "CAGENTS_BUILD_CPU_PRESSURE": "0"}
+              "CAGENTS_BUILD_CPU_PRESSURE": "0", "CAGENTS_BUILD_REMOTE": "local",
+              "CAGENTS_BUILD_INSTALLED_GATE": ""}
 
     def hold(self, cost):
         holder = subprocess.Popen(
@@ -1456,6 +1779,7 @@ class CpuPressureAdmission(TwoSlots):
             "CAGENTS_BUILD_CPU_SETTLE_SECS": "60",
             "CAGENTS_BUILD_CPU_PRESSURE_FILE": str(self.pressure),
             "CAGENTS_BUILD_COST_GIB": "7", "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1",
+            "CAGENTS_BUILD_REMOTE": "local", "CAGENTS_BUILD_INSTALLED_GATE": "",
         }
         now = self.uptime()
         dates = {"future":now + 10**6, "fresh":now, "old":now - 600}

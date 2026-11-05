@@ -16,6 +16,7 @@ import resource
 from pathlib import Path
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -38,8 +39,8 @@ def load_offload():
 offload = load_offload()
 
 
-class Routing(unittest.TestCase):
-    def test_builds_checks_lints_tests_and_docs_run_remotely(self):
+class Parsing(unittest.TestCase):
+    def test_commands_that_compile_run_remotely(self):
         for arguments, subcommand in (
             (["build", "--locked", "--profile", "dev-runtime", "--bin", "cagents"], "build"),
             (["b", "--release"], "build"),
@@ -48,37 +49,85 @@ class Routing(unittest.TestCase):
             (["test", "--locked", "--all-targets", "--", "--test-threads=1"], "test"),
             (["t", "-p", "cagents", "--", "/a/test/filter"], "test"),
             (["doc", "--no-deps"], "doc"),
+            (["run", "--bin", "cagents"], "run"),
+            (["bench"], "bench"),
+            (["+nightly", "build"], "build"),
+            (["fix", "--allow-dirty"], "fix"),
+            (["test", "--no-run", "--message-format=json"], "test"),
         ):
             with self.subTest(arguments=arguments):
-                self.assertEqual(offload.route(arguments), subcommand)
+                self.assertEqual(offload.parse(arguments).subcommand, subcommand)
 
-    def test_programs_benchmarks_and_other_subcommands_run_here(self):
-        for arguments in (["run", "--bin", "cagents"], ["bench"], ["metadata"], ["fmt"],
-                          ["+nightly", "build"], ["tree"], []):
+    def test_commands_that_compile_nothing_run_here(self):
+        for arguments in (["metadata"], ["fmt"], ["tree"], ["clean"], ["+nightly", "fmt"],
+                          ["--version"], []):
             with self.subTest(arguments=arguments):
-                self.assertIsNone(offload.route(arguments))
+                self.assertIsNone(offload.parse(arguments))
 
-    def test_paths_and_configuration_on_this_host_keep_a_command_here(self):
-        for arguments in (
-            ["build", "--manifest-path", "x/Cargo.toml"],
-            ["check", "--target-dir=/var/tmp/t"],
-            ["build", "--config", "build.jobs=2"],
-            ["check", "-Zunstable-options"],
-            ["test", "--features", "/etc/x"],
-            ["build", "--artifact-dir", "out"],
-        ):
+    def test_commands_that_may_compile_elsewhere_are_refused(self):
+        for arguments in (["install", "ripgrep"], ["nextest", "run"], ["--locked", "build"],
+                          ["doc", "--open", "--message-format=json"]):
             with self.subTest(arguments=arguments):
-                self.assertIsNone(offload.route(arguments))
+                with self.assertRaises(offload.Refusal) as refusal:
+                    offload.parse(arguments)
+                self.assertIn("CAGENTS_BUILD_REMOTE=local", str(refusal.exception))
 
-    def test_results_used_on_this_host_keep_a_command_here(self):
-        for arguments in (["test", "--no-run"], ["doc", "--open"], ["doc", "--target", "x"],
-                          ["clippy", "--fix", "--allow-dirty"], ["check", "--fix"],
-                          ["build", "--timings"], ["test", "--timings=html"],
-                          ["build", "--message-format=json"], ["build", "--message-format", "json"]):
-            with self.subTest(arguments=arguments):
-                self.assertIsNone(offload.route(arguments))
-        # Only `build` parses messages itself.
-        self.assertEqual(offload.route(["check", "--message-format=short"]), "check")
+    def test_run_passes_its_bare_and_trailing_arguments_to_the_program(self):
+        plan = offload.parse(["run", "--bin", "x", "-p", "y", "first", "--flag", "--", "z"])
+        self.assertEqual(plan.program, ["first", "--flag", "--", "z"])
+        self.assertEqual(plan.arguments(lambda _o, v: v, []),
+                         ["run", "--bin", "x", "-p", "y", "--message-format=json-render-diagnostics"])
+        self.assertEqual(offload.parse(["run", "--", "a", "b"]).program, ["a", "b"])
+
+    def test_paths_are_translated_and_test_arguments_kept(self):
+        plan = offload.parse(["test", "--manifest-path=a/Cargo.toml", "--target-dir", "t",
+                              "--config", "build.jobs=2", "--config", "c.toml", "--", "/x"])
+        seen = []
+
+        def translate(option, value):
+            seen.append((option, value))
+            return "R/" + value
+        self.assertEqual(plan.arguments(translate, []),
+                         ["test", "--manifest-path=R/a/Cargo.toml", "--target-dir", "R/t",
+                          "--config", "R/build.jobs=2", "--config", "R/c.toml", "--", "/x"])
+        self.assertIn(("--config", "build.jobs=2"), seen)
+
+    def test_messages_this_side_reads_keep_the_callers_diagnostics(self):
+        def words(*arguments):
+            return offload.parse(list(arguments)).arguments(lambda _o, v: v, [])
+        self.assertEqual(words("build"), ["build", "--message-format=json-render-diagnostics"])
+        self.assertEqual(words("build", "--message-format", "short"),
+                         ["build", "--message-format=json-render-diagnostics,json-diagnostic-short"])
+        self.assertEqual(words("test", "--no-run", "--message-format=json"),
+                         ["test", "--no-run", "--message-format=json"])
+        self.assertEqual(words("check", "--message-format=short"),
+                         ["check", "--message-format=short"])
+        self.assertEqual(words("doc", "--open"), ["doc", "--message-format=json-render-diagnostics"])
+        self.assertEqual(words("test", "--", "--nocapture"), ["test", "--", "--nocapture"])
+
+
+class Rewrite(unittest.TestCase):
+    def test_the_build_hosts_paths_become_this_hosts(self):
+        mappings = [("/h/slot-0/src/target", "/c/target"), ("/h/slot-0/src", "/c")]
+        message = {"executable": "/h/slot-0/src/target/debug/x", "src_path": "/h/slot-0/src/src/main.rs",
+                   "filenames": ["/h/slot-0/src-other/y"], "fresh": True, "n": 1}
+        self.assertEqual(offload.rewrite(message, mappings), {
+            "executable": "/c/target/debug/x", "src_path": "/c/src/main.rs",
+            "filenames": ["/h/slot-0/src-other/y"], "fresh": True, "n": 1})
+
+    def test_search_paths_from_build_scripts_name_this_hosts_directories(self):
+        mappings = [("/h/slot-0/src/target", "/c/target")]
+        self.assertEqual(offload.rewrite({"linked_paths": ["native=/h/slot-0/src/target/x", "/usr/lib"]},
+                                         mappings),
+                         {"linked_paths": ["native=/c/target/x", "/usr/lib"]})
+        self.assertEqual(offload.rewrite("a=b", mappings), "a=b")
+
+    def test_path_package_ids_name_this_hosts_checkout(self):
+        mappings = [("/h/slot-0/src", "/c")]
+        self.assertEqual(offload.rewrite("path+file:///h/slot-0/src/crates/x#x@0.1.0", mappings),
+                         "path+file:///c/crates/x#x@0.1.0")
+        self.assertEqual(offload.rewrite("registry+https://github.com/x#y@1", mappings),
+                         "registry+https://github.com/x#y@1")
 
 
 class Artifacts(unittest.TestCase):
@@ -95,19 +144,28 @@ class Artifacts(unittest.TestCase):
             self.message(f"{self.target}/dev-runtime/cagents-ui", ["bin"]),
             self.message(f"{self.target}/debug/examples/demo", ["example"]),
             self.message(f"{self.target}/debug/deps/probe-0123", ["test"]),
+            self.message(f"{self.target}/debug/deps/cagents-4567", ["lib"]),
             self.message(f"{self.target}/dev-runtime/cagents", ["bin"], reason="build-finished"),
             "warning: not a message",
             "{not json",
         ]
-        self.assertEqual(offload.artifacts(messages, self.target), [
+        self.assertEqual(offload.artifacts(messages, [self.target]), {self.target: [
             "dev-runtime/cagents-ui", "debug/examples/demo", "debug/deps/probe-0123",
-        ])
+            "debug/deps/cagents-4567",
+        ]})
+
+    def test_test_harnesses_in_a_separate_build_directory_are_listed_by_it(self):
+        build = "/var/tmp/cargo-build/home/u/.cache/cagents-offload/r/slot-1/src/target"
+        messages = [self.message(f"{self.target}/debug/probe", ["bin"]),
+                    self.message(f"{build}/debug/build/probe/0123/out/probe-0123", ["test"])]
+        self.assertEqual(offload.artifacts(messages, [self.target, build, self.target]), {
+            self.target: ["debug/probe"], build: ["debug/build/probe/0123/out/probe-0123"]})
 
     def test_executables_outside_the_target_are_not_copied(self):
         messages = [self.message("/usr/bin/true", ["bin"]),
                     self.message(f"{self.target}/../../escape", ["bin"]),
                     self.message(f"{self.target}-other/debug/x", ["bin"])]
-        self.assertEqual(offload.artifacts(messages, self.target), [])
+        self.assertEqual(offload.artifacts(messages, [self.target]), {})
 
 
 class RemoteCommand(unittest.TestCase):
@@ -134,6 +192,91 @@ class RemoteCommand(unittest.TestCase):
                     result = subprocess.run([shell, "-c", " ".join(probe)],
                                             capture_output=True, text=True, check=True)
                     self.assertEqual(result.stdout.strip(), repr(arguments))
+
+
+def agent_function(name):
+    tree = ast.parse(offload.REMOTE_AGENT)
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == name)
+    scope = {"os": os}
+    exec(compile(ast.Module([function], []), "agent", "exec"), scope)
+    return scope[name]
+
+
+class Resident(unittest.TestCase):
+    def test_a_process_tree_holds_its_descendants_memory(self):
+        child = subprocess.Popen(["python3", "-c", "b = bytearray(64 << 20); import time; time.sleep(30)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        time.sleep(1)
+        held = agent_function("resident")([os.getpid(), 999999999])
+        self.assertGreater(held[os.getpid()], 64 << 20)
+        self.assertEqual(held[999999999], 0)
+
+
+# Sockets bind under these tests' directories, whose paths must stay short
+# however long TMPDIR is.
+SOCKET_ROOT = "/tmp"
+
+
+class SharedConnection(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cof-", dir=SOCKET_ROOT)
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.log = self.root / "ssh.log"
+        tools = self.root / "tools"
+        tools.mkdir()
+        (tools / "ssh").write_text(f'#!/bin/sh\necho "$@" >> {self.log}\n')
+        (tools / "ssh").chmod(0o755)
+        self.runtime = self.root / "runtime"
+        self.runtime.mkdir(mode=0o700)
+        self.environment = {"XDG_RUNTIME_DIR": str(self.runtime),
+                            "PATH": f"{tools}:{os.environ['PATH']}"}
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = self.environment["PATH"]
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+
+    def build(self, environment=None):
+        return offload.Offload("host", offload.parse(["check"]), environment or self.environment)
+
+    def test_one_builds_steps_share_a_private_connection_that_ends_with_it(self):
+        build = self.build()
+        build.share_connection()
+        command = " ".join(build.remote("exists", "x"))
+        path = command.split("ControlPath=")[1].split()[0]
+        self.assertTrue(path.startswith(f"{self.runtime}/cof-ssh-{os.getpid()}-"))
+        self.assertLessEqual(len(path) + 17, 107)
+        self.assertIn("ControlMaster=auto", command)
+        other = self.build()
+        other.share_connection()
+        self.assertNotEqual(other.control, build.control)
+        other.close_connection()
+        directory = build.control
+        build.close_connection()
+        self.assertFalse(os.path.exists(directory))
+        self.assertIn(f"ControlPath={path} -o ControlPersist=60 -O exit host", self.log.read_text())
+
+    def test_a_runtime_directory_too_long_for_a_socket_is_passed_over(self):
+        deep = self.runtime / ("d" * 90)
+        deep.mkdir()
+        build = self.build(self.environment | {"XDG_RUNTIME_DIR": str(deep)})
+        build.share_connection()
+        self.addCleanup(build.close_connection)
+        self.assertIsNotNone(build.control)
+        self.assertFalse(build.control.startswith(str(deep)))
+        self.assertLessEqual(len(build.control), offload.CONTROL_PATH_LIMIT)
+        self.assertEqual(list(deep.iterdir()), [])
+
+    def test_without_a_short_enough_directory_each_step_connects_alone(self):
+        limit = offload.CONTROL_PATH_LIMIT
+        offload.CONTROL_PATH_LIMIT = 1
+        self.addCleanup(setattr, offload, "CONTROL_PATH_LIMIT", limit)
+        build = self.build()
+        build.share_connection()
+        self.assertIsNone(build.control)
+        self.assertNotIn("ControlPath", " ".join(build.remote("exists", "x")))
+        self.assertEqual(list(self.runtime.iterdir()), [])
 
 
 class EnclosingCheckout(unittest.TestCase):
@@ -226,12 +369,70 @@ class Settings(unittest.TestCase):
             "CARGO_PROFILE_DEV_DEBUG": "0", "CAGENTS_LIVE_TESTS": "0",
         })
 
-    def test_a_setting_naming_a_file_here_keeps_the_build_here(self):
-        self.assertEqual(offload.local_path_setting({
+    def test_settings_naming_files_here_are_found_and_script_settings_are_not(self):
+        self.assertEqual(offload.path_settings({
             "CAGENTS_TEST_RETAINED_ACTOR_HELPER": "/t/cagentsd", "CAGENTS_LIVE_TESTS": "0",
-            "CAGENTS_BUILD_LOCK": "/var/tmp/l", "TMPDIR": "/tmp/x"}),
-            "CAGENTS_TEST_RETAINED_ACTOR_HELPER")
-        self.assertIsNone(offload.local_path_setting({"CAGENTS_BUILD_LOCK": "/l", "TMPDIR": "/t"}))
+            "CAGENTS_BUILD_LOCK": "/var/tmp/l", "TMPDIR": "/tmp/x", "CAGENTS_ZIG": "/z/zig",
+            "CAGENTS_FIXTURE": "~/f", "CAGENTS_API_KEY_FILE": "/k"}),
+            ["CAGENTS_FIXTURE", "CAGENTS_TEST_RETAINED_ACTOR_HELPER"])
+
+
+class Sweep(unittest.TestCase):
+    def test_only_unused_directories_of_ended_builds_are_removed(self):
+        ended = subprocess.Popen(["true"])
+        ended.wait()
+        with tempfile.TemporaryDirectory(prefix="cof-", dir=SOCKET_ROOT) as root:
+            names = {
+                # An older gate's names, judged by age.
+                "old": "cof-ssh-old", "fresh": "cof-ssh-fresh",
+                # A build that ended a while ago, and one still waiting for
+                # the host, however long, which never connected.
+                "ended": f"cof-ssh-{ended.pid}-abc", "waiting": f"cof-ssh-{os.getpid()}-abc",
+                # One that looks ended but used its directory just now, as a
+                # build in another PID namespace does while it waits.
+                "renewed": f"cof-ssh-{ended.pid}-ghi",
+                # A connection that outlives its ended build for a while.
+                "listening": f"cof-ssh-{ended.pid}-def",
+            }
+            paths = {key: Path(root, name) for key, name in names.items()}
+            for path in paths.values():
+                path.mkdir()
+            Path(root, "unrelated").mkdir()
+            listener = socket.socket(socket.AF_UNIX)
+            self.addCleanup(listener.close)
+            listener.bind(str(paths["listening"] / "m"))
+            listener.listen()
+            ancient = time.time() - 3600
+            for key in ("old", "ended", "waiting", "listening"):
+                os.utime(paths[key], (ancient, ancient))
+            offload.sweep_connections(root)
+            self.assertEqual(sorted(path.name for path in Path(root).iterdir()),
+                             sorted([names["fresh"], names["waiting"], names["renewed"],
+                                     names["listening"], "unrelated"]))
+
+
+class ThisHost(unittest.TestCase):
+    def test_where_builds_go_is_a_status_failure_cannot_give(self):
+        script = str(ROOT / "scripts/cargo-offload")
+        here = subprocess.run([script, "--host"], capture_output=True, text=True,
+                              env=os.environ | {"CAGENTS_BUILD_REMOTE": "local"})
+        self.assertEqual(here.returncode, offload.FALL_BACK)
+        self.assertNotIn(here.returncode, (0, 1))
+
+    @unittest.skipIf(offload.is_this_host("fw16"), "this is the default build host")
+    def test_an_empty_build_host_setting_is_the_default_host(self):
+        script = str(ROOT / "scripts/cargo-offload")
+        default = subprocess.run([script, "--host"], capture_output=True, text=True,
+                                 env=os.environ | {"CAGENTS_BUILD_REMOTE": ""})
+        self.assertEqual((default.returncode, default.stdout), (0, "fw16\n"))
+
+
+    def test_this_hosts_names_and_addresses_build_here(self):
+        self.assertTrue(offload.is_this_host(socket.gethostname()))
+        self.assertTrue(offload.is_this_host("localhost"))
+        self.assertTrue(offload.is_this_host("127.0.0.1"))
+        self.assertFalse(offload.is_this_host("192.0.2.1"))
+
 
     def test_profiles_are_kept_and_this_hosts_build_settings_are_not(self):
         with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
@@ -259,8 +460,16 @@ class Settings(unittest.TestCase):
 
 STAND_IN_SSH = """#!/bin/sh
 # Runs the remote command here, as ssh would on the build host.
+for argument do
+    if [ "$argument" = -G ]; then
+        # Where the host is: an address that is not this machine's.
+        printf 'hostname 192.0.2.1\\n'
+        exit 0
+    fi
+done
 while [ "$#" -gt 0 ]; do
     case $1 in
+        -O) exit 0 ;;
         -o) shift 2 ;;
         -*) shift ;;
         *) break ;;
@@ -273,17 +482,21 @@ if [ "$1" = marked ]; then
     # A host with a stray Git marker above its temporary directory.
     shift
     cd "$HOME"
-    exec env -i HOME="$HOME" PATH="$PATH" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
+    exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
         CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/stray/cof" sh -c "mkdir -p '$HOME/stray/.git'; $*"
 fi
 shift
 cd "$HOME"
-# Like sshd, start from a clean environment and a session's own open-file
-# limit: nothing of this one reaches the build host except what the command
-# carries.
+# Like sshd, start from a clean environment, the host's own search path and a
+# session's own open-file limit: nothing of this one reaches the build host
+# except what the command carries.
 ulimit -Sn 256
-exec env -i HOME="$HOME" PATH="$PATH" CARGO_HOME="$CARGO_HOME" \
-    RUSTUP_HOME="$RUSTUP_HOME" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
+# Its Cargo keeps intermediates outside the slot, as a build-dir setting in
+# its configuration would, and inside the stand-in's home, which the test
+# removes.
+exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" \
+    RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_BUILD_DIR="$HOME/build{workspace-root}/target" \
+    CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
 """
 
 
@@ -322,12 +535,20 @@ class StandInHost(unittest.TestCase):
             if not key.startswith(("CAGENTS_BUILD_", "CARGO_BUILD_"))
         } | {
             "PATH": f"{tools}:{os.environ['PATH']}",
+            # A build host's `cargo` is rustup's, as fw16's is, rather than
+            # whatever wraps it first on this host's PATH: mise's shim, for
+            # one, raises the open-file limit the build is meant to keep.
+            "STAND_IN_HOST_PATH": os.pathsep.join([
+                os.path.join(os.environ.get("CARGO_HOME", str(home / ".cargo")), "bin"),
+                os.environ["PATH"]]),
             "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
             "CAGENTS_BUILD_REMOTE": "stand-in",
             "CAGENTS_BUILD_REMOTE_SLOTS": "2",
             "CAGENTS_BUILD_SEED": "0",
             "CAGENTS_BUILD_FREE_FLOOR_GIB": "0",
             "CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB": "1",
+            "CAGENTS_BUILD_REMOTE_RETRY_SECONDS": "1",
+            "CAGENTS_BUILD_INSTALLED_GATE": "",
             "CARGO_HOME": os.environ.get("CARGO_HOME", str(home / ".cargo")),
             "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(home / ".rustup")),
             "CARGO_BUILD_BUILD_DIR": str(self.root / "local-build"),
@@ -354,6 +575,270 @@ class StandInHost(unittest.TestCase):
         self.assertEqual(subprocess.run([executable], capture_output=True, text=True).stdout, "probe\n")
         # Nothing was built here.
         self.assertFalse((self.root / "local-build").exists())
+
+    def test_a_worktree_builds_its_own_sources_in_a_slot_another_built_newer_ones_in(self):
+        # Two worktrees of one repository share the slot. The second's copy
+        # of a patched path dependency is older than the first's build there,
+        # as a checkout made before the other's edit is: Cargo, judging path
+        # dependencies by modification time, must still see it changed.
+        def worktree(path, value, mtime=None):
+            (path / "vendor/dep/src").mkdir(parents=True, exist_ok=True)
+            (path / "src").mkdir(exist_ok=True)
+            (path / "Cargo.toml").write_text(textwrap.dedent("""
+                [package]
+                name = "probe"
+                version = "0.1.0"
+                edition = "2021"
+                [dependencies]
+                dep = { path = "vendor/dep" }
+                [workspace]
+            """))
+            (path / "vendor/dep/Cargo.toml").write_text(
+                '[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2021"\n')
+            library = path / "vendor/dep/src/lib.rs"
+            library.write_text(f"pub fn value() -> u32 {{ {value} }}\n")
+            if mtime is not None:
+                os.utime(library, (mtime, mtime))
+            (path / "src/main.rs").write_text('fn main() { println!("{}", dep::value()); }\n')
+            (path / ".gitignore").write_text("/target\n")
+            if not (path / ".git").exists():
+                subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+
+        worktree(self.crate, 11)
+        other = self.root / "elsewhere" / "crate"
+        other.mkdir(parents=True)
+        worktree(other, 22, mtime=time.time() - 3600)
+        env = self.remote_env() | {"CAGENTS_BUILD_REMOTE_SLOTS": "1"}
+        for path, expected in ((self.crate, "11\n"), (other, "22\n"), (self.crate, "11\n")):
+            result = subprocess.run([str(self.gate), "run", "--quiet"], cwd=path, env=env,
+                                    capture_output=True, text=True, timeout=120)
+            self.assertEqual((result.returncode, result.stdout), (0, expected), result.stderr)
+        # An unchanged worktree's next build there compiles nothing.
+        result = subprocess.run([str(self.gate), "build"], cwd=self.crate, env=env,
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Compiling", result.stderr)
+
+    def test_a_slot_synced_by_modification_time_rebuilds_its_sources_once(self):
+        env = self.remote_env() | {"CAGENTS_BUILD_REMOTE_SLOTS": "1"}
+        main = self.crate / "src/main.rs"
+        original = main.read_text()
+        main.write_text('fn main() { println!("other"); }\n')
+        self.assertEqual(self.gate_run("build", env=env).returncode, 0)
+        # A slot copied the old way: its copy now matches this checkout, with
+        # this checkout's older time, but its build is of the other sources.
+        # A gate from before copied this checkout's file with its own older
+        # time into the slot and built nothing new; its lease wrote the
+        # owner.
+        slot = self.host_home / ".cache/cagents-offload/crate/slot-0"
+        self.assertTrue((slot / "synced-by-content").is_file())
+        (slot / "owner").write_text("older-gate\n")
+        old = time.time() - 3600
+        for copy in (main, slot / "src/src/main.rs"):
+            copy.write_text(original)
+            os.utime(copy, (old, old))
+        result = self.gate_run("run", "--quiet", env=env)
+        self.assertEqual((result.returncode, result.stdout), (0, "probe\n"), result.stderr)
+        result = self.gate_run("build", env=env)
+        self.assertNotIn("Compiling", result.stderr)
+
+    def test_the_program_inherits_none_of_the_builds_processes(self):
+        (self.crate / "src/main.rs").write_text(
+            'fn main() { let id = std::process::id(); print!("[{}]", std::fs::read_to_string('
+            'format!("/proc/{id}/task/{id}/children")).unwrap().trim()); }\n')
+        result = self.gate_run("run", "--quiet", env=self.remote_env())
+        self.assertEqual((result.returncode, result.stdout), (0, "[]"), result.stderr)
+
+    def test_a_programs_own_status_is_never_taken_for_building_here(self):
+        # 75 is EX_TEMPFAIL, and also how cargo-offload says this host builds.
+        (self.crate / "src/main.rs").write_text("fn main() { std::process::exit(75); }\n")
+        result = self.gate_run("run", "--quiet", env=self.remote_env())
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertFalse((self.root / "local-build").exists())
+        self.assertEqual(list(Path(self.env["XDG_RUNTIME_DIR"]).glob("cof-ssh-*")), [])
+
+    def test_the_build_goes_where_the_gate_found_it_should(self):
+        # cargo-offload would decide afresh that this host builds, as a slow
+        # name lookup can, and exit 75 having built nothing.
+        tools = self.root / "tools"
+        (tools / "cargo-offload").rename(tools / "cargo-offload.real")
+        (tools / "cargo-offload").write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            [ "$1" != --host ] || {{ echo stand-in; exit 0; }}
+            CAGENTS_BUILD_REMOTE=local exec '{tools / "cargo-offload.real"}' "$@"
+        """))
+        (tools / "cargo-offload").chmod(0o755)
+        (self.crate / "src/main.rs").write_text(
+            'fn main() { println!("{:?}", std::env::var("CAGENTS_BUILD_OFFLOAD_HOST").ok()); }\n')
+        result = self.gate_run("run", "--quiet", env=self.remote_env())
+        self.assertEqual((result.returncode, result.stdout), (0, "None\n"), result.stderr)
+        self.assertTrue((self.host_home / ".cache/cagents-offload/crate/slot-0/src/target").is_dir())
+        self.assertFalse((self.root / "local-build").exists())
+
+    def test_a_gate_without_its_offload_helper_does_not_build_here(self):
+        (self.root / "tools/cargo-offload").unlink()
+        result = self.gate_run("build", env=self.remote_env())
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("cargo-offload is missing", result.stderr)
+        self.assertIn("CAGENTS_BUILD_REMOTE=local", result.stderr)
+        self.assertFalse((self.root / "local-build").exists())
+
+    def test_run_builds_there_and_runs_the_program_here(self):
+        (self.crate / "src/main.rs").write_text(textwrap.dedent("""
+            fn main() {
+                let arguments: Vec<String> = std::env::args().skip(1).collect();
+                println!("{} {} {}", arguments.join(","), env!("CARGO_PKG_NAME"),
+                         std::env::var("CARGO_MANIFEST_DIR").unwrap());
+                println!("{}", std::fs::read_to_string("/proc/self/exe").is_ok());
+                std::process::exit(3);
+            }
+        """))
+        result = self.gate_run("run", "--bin", "probe", "--", "a", "b c", env=self.remote_env())
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], f"a,b c probe {self.crate.resolve()}")
+        self.assertTrue((self.crate / "target/debug/probe").is_file())
+        self.assertFalse((self.root / "local-build").exists())
+
+    def test_test_executables_and_their_messages_come_back_with_this_hosts_paths(self):
+        (self.crate / "src/main.rs").write_text(
+            'fn main() {}\n#[test]\nfn passes() { assert_eq!(1 + 1, 2); }\n')
+        result = self.gate_run("test", "--no-run", "--message-format=json", env=self.remote_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        messages = [json.loads(line) for line in result.stdout.splitlines()]
+        executables = [message["executable"] for message in messages
+                       if message.get("reason") == "compiler-artifact" and message.get("executable")]
+        self.assertEqual(len(executables), 1, executables)
+        # The harness is where Cargo here would have put it: in this host's
+        # build directory, wherever the build host's Cargo keeps its own.
+        self.assertTrue(executables[0].startswith(str(self.root / "local-build") + "/"),
+                        executables[0])
+        self.assertNotIn(str(self.host_home), result.stdout)
+        self.assertTrue((self.host_home / "build").is_dir())
+        run = subprocess.run([executables[0]], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stdout)
+        self.assertIn("test passes ... ok", run.stdout)
+
+    def test_timing_reports_come_back(self):
+        result = self.gate_run("build", "--timings", env=self.remote_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.crate / "target/cargo-timings/cargo-timing.html").is_file())
+
+    def test_path_options_in_the_checkout_are_translated(self):
+        result = self.gate_run("build", "--manifest-path", "./Cargo.toml", "--target-dir",
+                               "target/alternate", env=self.remote_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.crate / "target/alternate/debug/probe").is_file())
+        result = self.gate_run("check", f"--target-dir={self.root}/elsewhere", env=self.remote_env())
+        self.assertEqual(result.returncode, 78, result.stderr)
+        self.assertIn("is outside this checkout", result.stderr)
+        self.assertFalse((self.root / "elsewhere").exists())
+
+    def test_a_file_a_setting_names_in_the_target_reaches_the_tests(self):
+        (self.crate / "src/main.rs").write_text(textwrap.dedent("""
+            fn main() {}
+            #[test]
+            fn helper() {
+                let helper = std::env::var("CAGENTS_PROBE_HELPER").unwrap();
+                let output = std::process::Command::new(&helper).output().unwrap();
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "helper\\n", "{helper}");
+            }
+        """))
+        helper = self.crate / "target/debug/helper"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("#!/bin/sh\necho helper\n")
+        helper.chmod(0o755)
+        env = self.remote_env() | {"CAGENTS_PROBE_HELPER": str(helper)}
+        result = self.gate_run("test", env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("test helper ... ok", result.stdout)
+        result = self.gate_run("test", env=env | {"CAGENTS_PROBE_HELPER": "/bin/true"})
+        self.assertEqual(result.returncode, 78, result.stderr)
+        self.assertIn("CAGENTS_PROBE_HELPER names /bin/true, outside this checkout", result.stderr)
+
+    def test_fixes_made_there_are_applied_here(self):
+        main = self.crate / "src/main.rs"
+        main.write_text('fn main() {\n    let mut value = 1;\n    println!("{value}");\n}\n')
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(git + ["add", "-A"], cwd=self.crate, check=True)
+        subprocess.run(git + ["commit", "-qm", "probe"], cwd=self.crate, check=True)
+        main.write_text(main.read_text() + "// uncommitted\n")
+        result = self.gate_run("fix", "--bin", "probe", env=self.remote_env())
+        self.assertEqual(result.returncode, 78, result.stderr)
+        self.assertIn("uncommitted changes", result.stderr)
+        subprocess.run(["git", "checkout", "--", "src/main.rs"], cwd=self.crate, check=True)
+        result = self.gate_run("fix", "--bin", "probe", env=self.remote_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("    let value = 1;", main.read_text())
+        self.assertIn("applied fixes to 1 file", result.stderr)
+        self.assertFalse((self.root / "local-build").exists())
+
+    def test_commands_that_compile_nothing_run_here_and_others_are_refused(self):
+        result = self.gate_run("metadata", "--format-version", "1", "--no-deps", env=self.remote_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["packages"][0]["name"], "probe")
+        self.assertFalse((self.host_home / ".cache").exists())
+        result = self.gate_run("install", "--path", ".", env=self.remote_env())
+        self.assertEqual(result.returncode, 78, result.stderr)
+        self.assertIn("`cargo install` may compile", result.stderr)
+
+    def test_cargo_in_an_exec_command_builds_there(self):
+        result = self.gate_run(
+            "exec", "sh", "-ec",
+            "cargo build --bin probe; cargo metadata --format-version 1 >/dev/null; "
+            "cargo --help | grep -q 'Rust.s package manager'; command -v cargo",
+            env=self.remote_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.strip().endswith("/cargo"))
+        self.assertNotIn(os.path.dirname(shutil.which("cargo")), result.stdout)
+        self.assertTrue((self.crate / "target/debug/probe").is_file())
+        self.assertTrue((self.host_home / ".cache/cagents-offload/crate/slot-0/src/target/debug/probe")
+                        .is_file())
+        self.assertFalse((self.root / "local-build").exists())
+        # Its shim is gone afterwards.
+        self.assertFalse(Path(result.stdout.strip()).exists())
+
+    def test_cargo_in_an_exec_command_reaches_cargo_through_a_wrapper(self):
+        # Like mise's shim, the wrapper runs the next `cargo` on PATH after its
+        # own directory, which inside the command is the gate's shim.
+        wrappers = self.root / "wrappers"
+        wrappers.mkdir()
+        (wrappers / "cargo").write_text(textwrap.dedent("""\
+            #!/bin/sh
+            here=$(dirname "$0")
+            IFS=:
+            for entry in $PATH; do
+                [ "$entry" != "$here" ] && [ -x "$entry/cargo" ] && exec "$entry/cargo" "$@"
+            done
+            exit 127
+        """))
+        (wrappers / "cargo").chmod(0o755)
+        env = self.remote_env()
+        # Rustup's Cargo follows the wrapper, ahead of any wrapper of this
+        # host's own, which would look for the next `cargo` the same way.
+        env["PATH"] = os.pathsep.join(
+            [str(wrappers), os.path.join(env["CARGO_HOME"], "bin"), env["PATH"]])
+        result = self.gate_run("exec", "sh", "-ec", "cargo build --bin probe",
+                               env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.crate / "target/debug/probe").is_file())
+        self.assertFalse((self.root / "local-build").exists())
+
+    def test_documentation_opens_here(self):
+        (self.crate / "src/lib.rs").write_text("//! Probe documentation.\n")
+        opened = self.root / "opened"
+        browser = self.root / "browser"
+        browser.write_text(f"#!/bin/sh\nprintf '%s' \"$1\" >{opened}\n")
+        browser.chmod(0o755)
+        result = self.gate_run("doc", "--no-deps", "--open",
+                               env=self.remote_env() | {"BROWSER": str(browser)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        deadline = time.monotonic() + 10
+        while not opened.exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.1)
+        page = Path(opened.read_text())
+        self.assertTrue(page.is_file(), page)
+        self.assertTrue(str(page).startswith(str(self.crate.resolve())), page)
 
     def test_documentation_comes_back(self):
         (self.crate / "src/lib.rs").write_text("//! Probe documentation.\n")
@@ -409,12 +894,15 @@ class StandInHost(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((slot_tmp / "left-behind").exists())
 
-    def test_the_build_gets_this_shells_open_file_limit(self):
+    def test_the_build_may_open_as_many_files_as_the_host_allows(self):
+        # However low the caller's soft limit, and the stand-in session's
+        # 256, the build gets the hard limit.
         (self.crate / "build.rs").write_text(textwrap.dedent("""
             fn main() {
                 let limits = std::fs::read_to_string("/proc/self/limits").unwrap();
                 let line = limits.lines().find(|l| l.starts_with("Max open files")).unwrap();
-                assert_eq!(line.split_whitespace().nth(3), Some("512"), "{line}");
+                let fields: Vec<_> = line.split_whitespace().collect();
+                assert_eq!(fields[3], fields[4], "{line}");
                 println!("cargo:rerun-if-changed=build.rs");
             }
         """))
@@ -432,31 +920,47 @@ class StandInHost(unittest.TestCase):
         self.assertEqual(result.returncode, 101)
         self.assertIn("missing", result.stderr)
 
-    def test_an_unreachable_host_builds_here_after_saying_so(self):
-        env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "unreachable"}
+    def test_an_unreachable_host_is_waited_for_within_the_admission_budget(self):
+        env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "unreachable",
+                                   "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "3"}
         result = self.gate_run("check", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("cargo-gate: building here: unreachable is unreachable\n", result.stderr)
-        self.assertTrue((self.root / "local-build").exists())
-        # The next build does not try again at once.
-        result = self.gate_run("check", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertRegex(result.stderr, r"building here: unreachable is unreachable \(tried \d+s ago\)")
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertEqual(result.stderr.count("unreachable is unreachable; waiting for it"), 1,
+                         result.stderr)
+        self.assertIn("set CAGENTS_BUILD_REMOTE=local to build here instead", result.stderr)
+        self.assertIn("build admission timed out: unreachable is unreachable", result.stderr)
+        self.assertFalse((self.root / "local-build").exists())
 
-    def test_a_host_that_does_not_answer_builds_here_and_is_tried_again(self):
+    def test_a_host_that_comes_back_takes_the_build(self):
+        # Unreachable for the first two tries.
+        tries = self.root / "tries"
+        ssh = self.root / "tools/ssh"
+        ssh.write_text(ssh.read_text().replace(
+            '[ "$1" != unreachable ] || exit 255',
+            '[ "$1" != unreachable ] || exit 255\n'
+            f'[ "$1" != flaky ] || {{ echo >>{tries}; [ $(wc -l <{tries}) -gt 2 ] || exit 255; }}'))
+        result = self.gate_run("build", env=self.remote_env() | {"CAGENTS_BUILD_REMOTE": "flaky"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("flaky is unreachable; waiting for it", result.stderr)
+        self.assertTrue((self.crate / "target/debug/probe").is_file())
+        self.assertFalse((self.root / "local-build").exists())
+
+    def test_a_host_that_does_not_answer_is_waited_for(self):
         env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "silent",
-                                   "CAGENTS_BUILD_REMOTE_ANSWER_SECONDS": "1"}
+                                   "CAGENTS_BUILD_REMOTE_ANSWER_SECONDS": "1",
+                                   "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "4"}
         result = self.gate_run("check", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("building here: silent did not answer within 1s\n", result.stderr)
-        self.assertFalse((self.root / "runtime/cagents-offload/silent.unreachable").exists())
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertIn("silent did not answer within 1s; waiting for it", result.stderr)
+        self.assertFalse((self.root / "local-build").exists())
 
-    def test_a_lease_that_fails_on_the_host_does_not_mark_it_unreachable(self):
+    def test_a_lease_that_fails_on_the_host_fails_the_command(self):
         env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "broken"}
         result = self.gate_run("check", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("building here: broken could not lease a build slot (status 1)\n", result.stderr)
-        self.assertFalse((self.root / "runtime/cagents-offload/broken.unreachable").exists())
+        self.assertEqual(result.returncode, 69, result.stderr)
+        self.assertIn("broken could not lease a build slot (status 1); set CAGENTS_BUILD_REMOTE=local",
+                      result.stderr)
+        self.assertFalse((self.root / "local-build").exists())
 
     def test_tests_stop_under_a_stray_git_marker_and_other_commands_do_not(self):
         env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "marked"}
@@ -474,24 +978,73 @@ class StandInHost(unittest.TestCase):
         self.assertIn(f"cargo-gate: {self.host_home}/stray/.git on marked puts the tests inside a Git checkout;",
                       result.stderr)
         self.assertNotIn("waiting", result.stderr)
-        self.assertNotIn("building here", result.stderr)
         self.assertFalse((self.root / "local-build").exists())
         result = self.gate_run("check", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("building here", result.stderr)
 
     def test_local_builds_here_silently(self):
         env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "local"}
         result = self.gate_run("check", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("building here", result.stderr)
         self.assertTrue((self.root / "local-build").exists())
 
-    def test_a_host_below_its_disk_floor_builds_here(self):
-        env = self.remote_env() | {"CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB": str(10**7)}
+    def test_a_host_below_its_disk_floor_is_waited_for(self):
+        env = self.remote_env() | {"CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB": str(10**7),
+                                   "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "3"}
+        result = self.gate_run("check", env=env)
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertRegex(result.stderr, r"stand-in has \d+ GiB free, below its 10000000 GiB floor; waiting")
+        self.assertFalse((self.root / "local-build").exists())
+
+    def test_the_build_host_itself_builds_here(self):
+        env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": socket.gethostname()}
         result = self.gate_run("check", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertRegex(result.stderr, r"building here: stand-in has \d+ GiB free, below its 10000000 GiB floor")
+        self.assertTrue((self.root / "local-build").exists())
+
+    def test_tests_running_there_keep_their_slot_from_the_next_build(self):
+        # A plain `cargo test` runs its tests on the build host, from the
+        # slot's target directory. Another build must not rewrite the test
+        # executable, or anything else there, until the tests have ended.
+        def worktree(path, text):
+            (path / "src").mkdir(parents=True, exist_ok=True)
+            (path / "tests").mkdir(exist_ok=True)
+            for name in ("Cargo.toml", ".gitignore", "src/main.rs"):
+                (path / name).write_text((self.crate / name).read_text())
+            (path / "tests/slow.rs").write_text(textwrap.dedent("""
+                #[test]
+                fn slow() {
+                    let exe = std::env::current_exe().unwrap();
+                    let before = std::fs::read(&exe).unwrap();
+                    std::fs::write(exe.with_file_name("started"), "").unwrap();
+                    std::thread::sleep(std::time::Duration::from_secs(6));
+                    assert!(std::fs::read(&exe).unwrap() == before, "rewritten under the test");
+                    eprintln!("%s");
+                }
+            """) % text)
+            if not (path / ".git").exists():
+                subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+        worktree(self.crate, "first")
+        other = self.root / "elsewhere" / "crate"
+        worktree(other, "second")
+        env = self.remote_env() | {"CAGENTS_BUILD_REMOTE_SLOTS": "1"}
+        testing = subprocess.Popen([str(self.gate), "test", "--test", "slow"], cwd=self.crate,
+                                   env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True)
+        self.addCleanup(testing.kill)
+        deadline = time.monotonic() + 120
+        # Beside the test executable, wherever the host's Cargo puts it.
+        while not any(self.root.rglob("started")):
+            self.assertIsNone(testing.poll(), "the tests ended before they were seen running")
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.1)
+        building = subprocess.run([str(self.gate), "test", "--no-run", "--test", "slow"],
+                                  cwd=other, env=env, capture_output=True, text=True,
+                                  timeout=120)
+        out, err = testing.communicate(timeout=60)
+        self.assertEqual(testing.returncode, 0, err)
+        self.assertEqual(building.returncode, 0, building.stderr)
+        self.assertIn("waiting for", building.stderr)
 
     def test_a_worktree_returns_to_the_slot_it_used_last(self):
         env = self.remote_env()
@@ -519,8 +1072,54 @@ class StandInHost(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 30)
         self.assertIn("waiting for one of 2 build slots on stand-in", result.stderr)
         self.assertIn("cargo-gate: build admission timed out", result.stderr)
-        self.assertNotIn("building here", result.stderr)
         self.assertFalse((self.root / "local-build").exists())
+
+    def test_the_build_host_admits_a_build_by_the_memory_it_is_expected_to_need(self):
+        # Another build holds a slot there, priced as the largest; this one
+        # is expected to need more memory than the host has beside it.
+        other = self.host_home / ".cache/cagents-offload/crate/slot-1"
+        other.mkdir(parents=True)
+        lock = open(other / "lock", "a")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        env = self.remote_env() | {"CAGENTS_BUILD_COST_GIB": "100000",
+                                   "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "3"}
+        result = self.gate_run("check", env=env)
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertIn("waiting for memory on stand-in", result.stderr)
+        self.assertNotIn("waiting for one of", result.stderr)
+        # Alone there, the same build starts: nothing else is expected to
+        # take the memory it sees.
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        result = self.gate_run("check", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting", result.stderr)
+
+    def test_remote_commands_leave_no_core_dumps_unless_asked(self):
+        (self.crate / "src/main.rs").write_text(textwrap.dedent("""
+            fn main() {}
+            #[test]
+            fn limit() {
+                let limits = std::fs::read_to_string("/proc/self/limits").unwrap();
+                let line = limits.lines().find(|line| line.starts_with("Max core file size")).unwrap();
+                println!("core={}", line.split_whitespace().nth(4).unwrap());
+            }
+        """))
+        soft, hard = resource.getrlimit(resource.RLIMIT_CORE)
+        if hard == 0:
+            self.skipTest("core dumps are disabled outright here")
+
+        def allow_cores():
+            resource.setrlimit(resource.RLIMIT_CORE, (hard, hard))
+
+        for env, expected in ((self.remote_env(), "core=0"),
+                              (self.remote_env() | {"CAGENTS_BUILD_REMOTE_CORE_DUMPS": "1"},
+                               "core=" + ("unlimited" if hard == resource.RLIM_INFINITY else str(hard)))):
+            result = subprocess.run([str(self.gate), "test", "--", "--nocapture"], cwd=self.crate,
+                                    env=env, capture_output=True, text=True, timeout=120,
+                                    preexec_fn=allow_cores)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(expected, result.stdout)
 
     def test_the_admission_budget_does_not_time_the_build(self):
         (self.crate / "build.rs").write_text(
@@ -658,17 +1257,14 @@ class RemoteRun(unittest.TestCase):
             agent.stdin.flush()
             self.assertEqual(agent.wait(timeout=15), 7)
 
-    def test_the_command_gets_the_open_file_limit_it_was_asked_for(self):
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        above = hard + 1 if hard != resource.RLIM_INFINITY else None
-        for wanted, expected in ((64, 64), (above, hard), (-1, hard)):
-            if wanted is None:
-                continue
-            with self.subTest(wanted=wanted), tempfile.TemporaryDirectory() as base:
+    def test_the_command_may_open_as_many_files_as_the_host_allows(self):
+        hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        # An older gate's request still names a limit, which no longer
+        # lowers it.
+        for request in ({"environment": {}}, {"environment": {}, "open_files": 64}):
+            with self.subTest(request=request), tempfile.TemporaryDirectory() as base:
                 Path(base, "src").mkdir()
-                # The connection stays open, as it does while the gate waits.
-                # The agent starts below every requested limit, as an ssh
-                # session's 1024 does, so each request must change it.
+                # The agent starts low, as an ssh session's 1024 does.
                 agent = subprocess.Popen(
                     ["python3", "-c", offload.REMOTE_AGENT, "run", base, ".",
                      "sh", "-c", "ulimit -Sn"],
@@ -676,13 +1272,13 @@ class RemoteRun(unittest.TestCase):
                     preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (32, hard)))
                 self.addCleanup(agent.stdout.close)
                 self.addCleanup(agent.stdin.close)
-                agent.stdin.write(json.dumps({"environment": {}, "open_files": wanted}).encode()
-                                  + b"\n")
+                # The connection stays open, as it does while the gate waits.
+                agent.stdin.write(json.dumps(request).encode() + b"\n")
                 agent.stdin.flush()
                 self.assertEqual(agent.wait(timeout=15), 0)
                 reported = agent.stdout.read().decode().strip()
-                self.assertEqual(reported, "unlimited" if expected == resource.RLIM_INFINITY
-                                 else str(expected))
+                self.assertEqual(reported, "unlimited" if hard == resource.RLIM_INFINITY
+                                 else str(hard))
 
 
 class Prune(unittest.TestCase):
