@@ -434,7 +434,9 @@ esac
             "/usr/bin/ln -snf versions/independent \"$FIXTURE_PREFIX/current\"; exit 8"
         } else if matches!(failure, "outer-signal" | "outer-signal-invalid-target") {
             r#"target=$(cat "$FIXTURE_OUTER_PID_FILE") || exit 97
-if [ "$FIXTURE_REJECT_SIGNAL" = true ]; then target=not-a-pid; fi
+# Above any pid_max, so delivery fails with ESRCH. A non-numeric target is not
+# portable: bash 5.3 in POSIX mode reports it but exits 0.
+if [ "$FIXTURE_REJECT_SIGNAL" = true ]; then target=2147483647; fi
 # Successful delivery makes the outer installer cancel this tool's group.
 # Keep that TERM from interrupting the builtin send-and-record section.
 trap '' TERM
@@ -681,7 +683,7 @@ exec sh "$@""#,
             );
             assert_eq!(
                 fs::read_to_string(home.path().join("signal-rejected")).unwrap(),
-                "not-a-pid\n"
+                "2147483647\n"
             );
         } else {
             assert_eq!(

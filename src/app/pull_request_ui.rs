@@ -3,12 +3,11 @@ use crate::github::{
     PullRequest, PullRequestComment, PullRequestConversation, PullRequestInspection,
     PullRequestReviewThread,
 };
-use crate::repository::HeadState;
 use cosmic::widget::markdown;
 
 type ActionTask = iced::Task<Action>;
 
-/// Includes local HEAD and remote authority, not just the branch's display name.
+/// Stable inspector identity, with a separate local HEAD revision for refresh fencing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub worktree: PathBuf,
@@ -27,7 +26,7 @@ pub enum Section {
 #[derive(Debug, Clone)]
 pub enum Action {
     Refresh,
-    Resolved(Target, u64, Result<Option<Arc<PullRequest>>, String>),
+    Resolved(Target, u64, Result<Resolution, String>),
     Loaded(
         Target,
         u64,
@@ -40,6 +39,12 @@ pub enum Action {
     OpenMarkdownLink(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct Resolution {
+    target: Target,
+    pull_request: Option<Arc<PullRequest>>,
+}
+
 impl Action {
     pub(super) fn allowed_while_modal(&self) -> bool {
         matches!(self, Self::Resolved(..) | Self::Loaded(..))
@@ -48,6 +53,10 @@ impl Action {
 
 #[derive(Debug, Default)]
 pub struct State {
+    // The source-control snapshot and the inspector's observed ref are distinct:
+    // a ref-only refresh must not relabel old files/history as a fresh snapshot.
+    source_target: Option<Target>,
+    source_key: Option<ActiveWorktreeKey>,
     target: Option<Target>,
     unavailable: Option<String>,
     generation: u64,
@@ -68,6 +77,14 @@ pub struct State {
     discussion_collapsed: bool,
 }
 
+impl Target {
+    fn same_identity(&self, other: &Self) -> bool {
+        self.worktree == other.worktree
+            && self.branch == other.branch
+            && self.repository == other.repository
+    }
+}
+
 impl State {
     /// Call after selection, repository refresh, or HEAD changes, including while
     /// another inspector tab is visible. Old completions cannot restore old data.
@@ -77,12 +94,28 @@ impl State {
         unavailable: Option<String>,
     ) -> ActionTask {
         self.unavailable = unavailable;
-        if self.target == target {
+        let unchanged_source = self.source_target == target;
+        self.source_target = target.clone();
+        if self.target == target || (unchanged_source && target.is_some()) {
             return ActionTask::none();
         }
+        let same_identity = self
+            .target
+            .as_ref()
+            .zip(target.as_ref())
+            .is_some_and(|(old, new)| old.same_identity(new));
         self.cancellation.cancel();
         self.generation = self.generation.wrapping_add(1);
         self.target = target;
+        if same_identity {
+            self.loading = false;
+            if self.target.as_ref().is_some_and(|target| {
+                !crate::github::polling::ready(&target.repository.host, false)
+            }) {
+                return ActionTask::none();
+            }
+            return self.refresh();
+        }
         self.inspection = None;
         self.pull_request = None;
         self.preview = None;
@@ -97,9 +130,28 @@ impl State {
     }
 
     fn refresh(&mut self) -> ActionTask {
+        self.refresh_with(
+            RepositoryService::system("git"),
+            GitHubService::system("gh"),
+        )
+    }
+
+    fn refresh_with<
+        E: crate::repository::ProcessExecutor + 'static,
+        G: crate::repository::ProcessExecutor + 'static,
+    >(
+        &mut self,
+        git: RepositoryService<E>,
+        github: GitHubService<G>,
+    ) -> ActionTask {
         let Some(target) = self.target.clone() else {
             return ActionTask::none();
         };
+        if !crate::github::polling::ready(&target.repository.host, true) {
+            self.error = crate::github::polling::rate_limit(&target.repository.host)
+                .map(|limit| limit.to_string());
+            return ActionTask::none();
+        }
         self.cancellation.cancel();
         self.cancellation = CancellationToken::new();
         let cancellation = self.cancellation.clone();
@@ -114,25 +166,7 @@ impl State {
             async move {
                 let work = target.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    verify_local_head(&work, &cancellation)?;
-                    let Some(head_repository) = crate::github::worktree_head_repository(
-                        &work.worktree,
-                        &work.branch,
-                        &cancellation,
-                    ) else {
-                        return Ok(None);
-                    };
-                    let result = GitHubService::system("gh")
-                        .resolve_branch(
-                            &work.repository,
-                            &head_repository,
-                            &work.branch,
-                            work.head_oid.as_deref(),
-                            &cancellation,
-                        )
-                        .map_err(|error| error.to_string())?;
-                    verify_local_head(&work, &cancellation)?;
-                    Ok(result.map(Arc::new))
+                    resolve_current_pull_request(&git, &github, &work, &cancellation)
                 })
                 .await
                 .map_err(|error| format!("Pull request loader failed: {error}"))
@@ -159,9 +193,24 @@ impl State {
                 if !self.accepts(&target, generation) {
                     return ActionTask::none();
                 }
-                let pull_request = match result {
-                    Ok(Some(pr)) => pr,
-                    Ok(None) => {
+                let resolution = match result {
+                    Ok(resolution) if resolution.target.same_identity(&target) => resolution,
+                    Ok(_) => {
+                        self.loading = false;
+                        self.error = Some("The worktree identity changed during refresh.".into());
+                        return ActionTask::none();
+                    }
+                    Err(error) => {
+                        self.loading = false;
+                        self.error = Some(error);
+                        return ActionTask::none();
+                    }
+                };
+                let target = resolution.target;
+                self.target = Some(target.clone());
+                let pull_request = match resolution.pull_request {
+                    Some(pr) => pr,
+                    None => {
                         self.preview = None;
                         self.pull_request = None;
                         self.inspection = None;
@@ -169,11 +218,6 @@ impl State {
                         self.description.clear();
                         self.loading = false;
                         self.loaded = true;
-                        return ActionTask::none();
-                    }
-                    Err(error) => {
-                        self.loading = false;
-                        self.error = Some(error);
                         return ActionTask::none();
                     }
                 };
@@ -199,7 +243,6 @@ impl State {
                     async move {
                         let work = target.clone();
                         let result = tokio::task::spawn_blocking(move || {
-                            verify_local_head(&work, &cancellation)?;
                             let inspection = GitHubService::system("gh")
                                 .inspect_pull_request(
                                     &work.repository,
@@ -207,7 +250,6 @@ impl State {
                                     &cancellation,
                                 )
                                 .map_err(|error| error.to_string())?;
-                            verify_local_head(&work, &cancellation)?;
                             Ok(Some(Arc::new(inspection)))
                         })
                         .await
@@ -226,6 +268,11 @@ impl State {
                 self.loaded = true;
                 match result {
                     Ok(inspection) => {
+                        if inspection.as_ref().is_none_or(|inspection| {
+                            inspection.checks.is_ok() && inspection.conversation.is_ok()
+                        }) {
+                            crate::github::polling::succeeded(&target.repository.host);
+                        }
                         self.comment_markdown.clear();
                         if let Some(inspection) = &inspection
                             && let Ok(conversation) = &inspection.conversation
@@ -287,24 +334,77 @@ impl Drop for State {
     }
 }
 
-fn verify_local_head(target: &Target, cancellation: &CancellationToken) -> Result<(), String> {
-    let status = RepositoryService::system("git")
-        .status_with_untracked(&target.worktree, false, cancellation)
+fn verify_local_head_with<E: crate::repository::ProcessExecutor>(
+    git: &RepositoryService<E>,
+    target: &Target,
+    cancellation: &CancellationToken,
+) -> Result<Target, String> {
+    // Resolve only the ref: scanning tracked files cannot establish a stronger
+    // revision fence and becomes very expensive with active agent worktrees.
+    let head = git
+        .resolve_head(&target.worktree, cancellation)
         .map_err(|error| error.to_string())?;
-    let matches = match status.head {
-        HeadState::Branch { name, oid } => {
-            name == target.branch && target.head_oid.as_deref() == Some(oid.as_str())
-        }
-        HeadState::Unborn { branch } => {
-            branch.as_deref() == Some(target.branch.as_str()) && target.head_oid.is_none()
-        }
-        _ => false,
-    };
-    if matches {
-        Ok(())
+    let branch = git
+        .symbolic_head(&target.worktree, cancellation)
+        .map_err(|error| error.to_string())?;
+    if branch
+        .as_ref()
+        .and_then(|reference| reference.as_str().strip_prefix("refs/heads/"))
+        == Some(target.branch.as_str())
+    {
+        let mut current = target.clone();
+        current.head_oid = head.map(|oid| oid.as_str().to_owned());
+        Ok(current)
     } else {
-        Err("The worktree branch or HEAD changed. Refresh the repository before inspecting its pull request.".into())
+        Err(
+            "The worktree branch changed. Refresh the repository before inspecting its pull request."
+                .into(),
+        )
     }
+}
+
+fn resolve_current_pull_request<
+    E: crate::repository::ProcessExecutor,
+    G: crate::repository::ProcessExecutor,
+>(
+    git: &RepositoryService<E>,
+    github: &GitHubService<G>,
+    target: &Target,
+    cancellation: &CancellationToken,
+) -> Result<Resolution, String> {
+    let current = verify_local_head_with(git, target, cancellation)?;
+    let branch = crate::repository::ValidatedBranchName::parse(&current.branch)
+        .map_err(|error| error.to_string())?;
+    // Same remote selection as worktree_head_repository, using this refresh's
+    // reader so the complete path has exactly one HEAD read and no status scan.
+    let head_repository = git
+        .branch_remote(&current.worktree, &branch, cancellation)
+        .ok()
+        .flatten()
+        .and_then(|remote| {
+            remote
+                .push_url
+                .as_deref()
+                .or(remote.fetch_url.as_deref())
+                .and_then(crate::github::remote_repository_key)
+        });
+    let pull_request = match head_repository {
+        Some(head_repository) => github
+            .resolve_branch(
+                &current.repository,
+                &head_repository,
+                &current.branch,
+                current.head_oid.as_deref(),
+                cancellation,
+            )
+            .map_err(|error| error.to_string())?
+            .map(Arc::new),
+        None => None,
+    };
+    Ok(Resolution {
+        target: current,
+        pull_request,
+    })
 }
 
 fn link<'a>(label: &'a str, url: &Url) -> Element<'a, Action> {
@@ -1051,6 +1151,11 @@ pub fn view(state: &State) -> Element<'_, Action> {
 
 impl Cagents {
     pub(super) fn handle_pull_request_ui(&mut self, action: Action) -> Task<Message> {
+        if matches!(&action, Action::Resolved(..) | Action::Loaded(..))
+            && !self.pull_request_binding_is_current()
+        {
+            return Task::none();
+        }
         let url = match &action {
             Action::OpenUrl(url) => Some(Ok(url.clone())),
             Action::OpenMarkdownLink(uri) => Some(Url::parse(uri)),
@@ -1134,6 +1239,7 @@ impl Cagents {
 
     pub(super) fn sync_pull_request_inspector(&mut self) -> Task<Message> {
         if !self.context_inspector_open || self.context_tab != ContextTab::PullRequest {
+            self.pull_request_inspector.source_key = None;
             return self
                 .pull_request_inspector
                 .synchronize(None, None)
@@ -1145,6 +1251,11 @@ impl Cagents {
             .source_control
             .as_ref()
             .filter(|source| self.sidebar_state.active_worktree() == Some(&source.key));
+        let source_key = source.map(|source| &source.key);
+        if self.pull_request_inspector.source_key.as_ref() != source_key {
+            drop(self.pull_request_inspector.synchronize(None, None));
+            self.pull_request_inspector.source_key = source_key.cloned();
+        }
         let candidate = source
             .filter(|source| source.data_state == SidebarDataState::Ready)
             .and_then(|source| {
@@ -1191,7 +1302,7 @@ impl Cagents {
         };
         if self
             .pull_request_inspector
-            .target
+            .source_target
             .as_ref()
             .is_some_and(|target| {
                 target.worktree == *worktree
@@ -1225,22 +1336,70 @@ impl Cagents {
                     .find(|row| row.path == *worktree && row.branch.as_deref() == Some(branch))
                     .and_then(|row| row.pull_request().cloned())
             });
+        let previous_generation = self.pull_request_inspector.generation;
         let task = self.pull_request_inspector.synchronize(Some(target), None);
-        self.pull_request_inspector.preview = preview;
+        if self.pull_request_inspector.generation != previous_generation {
+            self.pull_request_inspector.preview = preview;
+        }
         task.map(Message::PullRequestUi).map(cosmic::Action::App)
     }
 
     /// The application supplies the visible/focused 30-second cadence.
     pub(super) fn maybe_refresh_pull_request(&mut self) -> Task<Message> {
+        self.maybe_refresh_pull_request_with(
+            RepositoryService::system("git"),
+            GitHubService::system("gh"),
+        )
+    }
+
+    fn pull_request_binding_is_current(&self) -> bool {
+        let state = &self.pull_request_inspector;
+        self.context_inspector_open
+            && self.context_tab == ContextTab::PullRequest
+            && state.source_key.as_ref() == self.sidebar_state.active_worktree()
+            && self
+                .sidebar_model
+                .source_control
+                .as_ref()
+                .is_some_and(|source| {
+                    state.source_key.as_ref() == Some(&source.key)
+                        && source.data_state == SidebarDataState::Ready
+                        && state.source_target.as_ref().is_some_and(|target| {
+                            target.worktree == source.key.canonical_path
+                                && source.branch.as_ref().map(|branch| branch.as_str())
+                                    == Some(target.branch.as_str())
+                                && source.head_oid.as_deref() == target.head_oid.as_deref()
+                                && self
+                                    .github_availability
+                                    .get(&source.key.project_id)
+                                    .and_then(GitHubAvailability::repository_key)
+                                    == Some(&target.repository)
+                        })
+                })
+    }
+
+    fn maybe_refresh_pull_request_with<
+        E: crate::repository::ProcessExecutor + 'static,
+        G: crate::repository::ProcessExecutor + 'static,
+    >(
+        &mut self,
+        git: RepositoryService<E>,
+        github: GitHubService<G>,
+    ) -> Task<Message> {
         if !self.context_inspector_open
             || self.context_tab != ContextTab::PullRequest
+            || !self.pull_request_binding_is_current()
             || self.pull_request_inspector.loading
-            || self.pull_request_inspector.target.is_none()
+            || self
+                .pull_request_inspector
+                .target
+                .as_ref()
+                .is_none_or(|target| !crate::github::polling::ready(&target.repository.host, false))
         {
             return Task::none();
         }
         self.pull_request_inspector
-            .refresh()
+            .refresh_with(git, github)
             .map(Message::PullRequestUi)
             .map(cosmic::Action::App)
     }
@@ -1256,6 +1415,283 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository::{CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput};
+
+    struct RefreshFixture {
+        head: std::sync::Mutex<String>,
+        calls: std::sync::Mutex<Vec<CommandSpec>>,
+        caller: std::thread::ThreadId,
+        host: &'static str,
+    }
+
+    impl ProcessExecutor for RefreshFixture {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            _: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            assert_ne!(std::thread::current().id(), self.caller);
+            self.calls.lock().unwrap().push(command.clone());
+            let has = |value: &str| command.arguments.iter().any(|argument| argument == value);
+            let stdout = if has("rev-parse") {
+                format!("{}\n", self.head.lock().unwrap()).into_bytes()
+            } else if has("symbolic-ref") {
+                b"refs/heads/feature\n".to_vec()
+            } else if has("config") {
+                format!("remote.origin.url\nhttps://{}/owner/repo.git\0", self.host).into_bytes()
+            } else {
+                assert!(has("pr") && has("list"), "unexpected fixture request");
+                serde_json::to_vec(&vec![self.pull_request()]).unwrap()
+            };
+            Ok(ProcessOutput {
+                success: true,
+                exit_code: Some(0),
+                signal: None,
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    impl RefreshFixture {
+        fn pull_request(&self) -> PullRequest {
+            let mut value =
+                serde_json::to_value(crate::pull_request_review::tests::pull_request(7)).unwrap();
+            value["url"] = format!("https://{}/owner/repo/pull/7", self.host).into();
+            value["body"] = "Fresh remote description".into();
+            value["headRepository"] = serde_json::json!({"name":"repo"});
+            value["headRepositoryOwner"] = serde_json::json!({"login":"owner"});
+            serde_json::from_value(value).unwrap()
+        }
+    }
+
+    fn refresh_app(host: &'static str) -> Cagents {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let worktree = PathBuf::from("/repo/feature");
+        let project = ProjectId::new();
+        app.context_inspector_open = true;
+        app.context_tab = ContextTab::PullRequest;
+        app.github_availability.insert(
+            project,
+            GitHubAvailability::Ready {
+                repository_key: GitHubRepoKey::new(host, None, "owner", "repo").unwrap(),
+                pull_requests: Vec::new(),
+                refreshed_at: 1,
+            },
+        );
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            crate::repository::RepositoryId::new(),
+            "repo".into(),
+            "/repo".into(),
+            vec![SidebarWorktree::new(
+                crate::model::WorktreeId::new(),
+                worktree.clone(),
+                Some("feature".into()),
+                false,
+                false,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+        ));
+        app.sidebar_state
+            .sync_active_worktree(&app.sidebar_model, &SidebarFocus::Repository { worktree });
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let mut source = SourceControlModel::loading(key);
+        source.data_state = SidebarDataState::Ready;
+        source.branch = Some(crate::repository::ValidatedBranchName::parse("feature").unwrap());
+        source.head_oid = Some("a".repeat(40).into_boxed_str());
+        app.sidebar_model.source_control = Some(source);
+        drop(app.sync_pull_request_inspector());
+        app.pull_request_inspector.loading = false;
+        app.pull_request_inspector.loaded = true;
+        app.pull_request_inspector.filter = "keep this filter".into();
+        app.pull_request_inspector.description_open = true;
+        app.pull_request_inspector.checks_collapsed = true;
+        app.pull_request_inspector.description = markdown::parse("Loaded description").collect();
+        app
+    }
+
+    #[test]
+    fn automatic_refresh_observes_external_head_without_rebinding_or_rescanning() {
+        use cosmic::iced::futures::StreamExt;
+        let host = "automatic-inspector-refresh.invalid";
+        let mut app = refresh_app(host);
+        let requested = app.pull_request_inspector.target.clone().unwrap();
+        let source = app.sidebar_model.source_control.clone();
+        let key = app.sidebar_state.active_worktree().cloned();
+        let fixture = Arc::new(RefreshFixture {
+            head: std::sync::Mutex::new("b".repeat(40)),
+            calls: Default::default(),
+            caller: std::thread::current().id(),
+            host,
+        });
+        let old = Arc::new(PullRequestInspection {
+            pull_request: fixture.pull_request(),
+            checks: Ok(Vec::new()),
+            conversation: Ok(Default::default()),
+        });
+        app.pull_request_inspector.pull_request = Some(Arc::new(old.pull_request.clone()));
+        app.pull_request_inspector.inspection = Some(old.clone());
+        let task = app.maybe_refresh_pull_request_with(
+            RepositoryService::new("git", fixture.clone()),
+            GitHubService::new("gh", fixture.clone()),
+        );
+        let generation = app.pull_request_inspector.generation;
+        assert!(app.pull_request_inspector.loading);
+        assert!(Arc::ptr_eq(
+            app.pull_request_inspector.inspection.as_ref().unwrap(),
+            &old
+        ));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut outputs = 0;
+                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                            Message::PullRequestUi(action),
+                        )) = action
+                        {
+                            assert!(matches!(&action, Action::Resolved(_, _, Ok(_))));
+                            outputs += 1;
+                            drop(app.handle_pull_request_ui(action));
+                        }
+                    }
+                }
+                assert_eq!(outputs, 1);
+            });
+        let observed = app.pull_request_inspector.target.clone().unwrap();
+        assert_eq!(observed.head_oid.as_deref(), Some("b".repeat(40).as_str()));
+        // A local commit need not be pushed: the unique, proven source branch
+        // still owns the same PR at its previous hosted tip.
+        let resolved = app.pull_request_inspector.pull_request.as_ref().unwrap();
+        assert_eq!(resolved.number, 7);
+        assert_eq!(resolved.head_ref_oid, "a".repeat(40));
+        assert_eq!(app.sidebar_state.active_worktree(), key.as_ref());
+        assert_eq!(
+            app.sidebar_model.source_control, source,
+            "ref read is not a full file/history snapshot"
+        );
+        assert_eq!(
+            app.pull_request_inspector.source_target.as_ref(),
+            Some(&requested)
+        );
+        drop(app.sync_pull_request_inspector());
+        assert_eq!(app.pull_request_inspector.target.as_ref(), Some(&observed));
+        assert_eq!(app.pull_request_inspector.generation, generation);
+        assert!(app.pull_request_inspector.loaded && app.pull_request_inspector.loading);
+        assert_eq!(app.pull_request_inspector.filter, "keep this filter");
+        assert!(
+            app.pull_request_inspector.description_open
+                && app.pull_request_inspector.checks_collapsed
+        );
+        assert!(Arc::ptr_eq(
+            app.pull_request_inspector.inspection.as_ref().unwrap(),
+            &old
+        ));
+        drop(app.handle_pull_request_ui(Action::Loaded(
+            requested.clone(),
+            generation,
+            Err("old HEAD".into()),
+        )));
+        drop(app.handle_pull_request_ui(Action::Loaded(
+            observed.clone(),
+            generation.wrapping_sub(1),
+            Err("old generation".into()),
+        )));
+        assert!(app.pull_request_inspector.error.is_none());
+        let fresh = Arc::new(PullRequestInspection {
+            pull_request: fixture.pull_request(),
+            checks: Ok(Vec::new()),
+            conversation: Ok(Default::default()),
+        });
+        drop(app.handle_pull_request_ui(Action::Loaded(
+            observed.clone(),
+            generation,
+            Ok(Some(fresh.clone())),
+        )));
+        assert!(Arc::ptr_eq(
+            app.pull_request_inspector.inspection.as_ref().unwrap(),
+            &fresh
+        ));
+        assert!(!app.pull_request_inspector.loading);
+        // A later full snapshot catching up to the ref-only result starts no duplicate work.
+        app.sidebar_model.source_control.as_mut().unwrap().head_oid =
+            observed.head_oid.clone().map(String::into_boxed_str);
+        drop(app.sync_pull_request_inspector());
+        assert_eq!(app.pull_request_inspector.generation, generation);
+        assert_eq!(app.pull_request_inspector.target.as_ref(), Some(&observed));
+        assert_eq!(
+            app.pull_request_inspector.source_target.as_ref(),
+            Some(&observed)
+        );
+        let calls = fixture.calls.lock().unwrap();
+        for (name, count) in [
+            ("rev-parse", 1),
+            ("symbolic-ref", 1),
+            ("config", 1),
+            ("status", 0),
+            ("list", 1),
+        ] {
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|command| command.arguments.iter().any(|arg| arg == name))
+                    .count(),
+                count,
+                "{name}"
+            );
+        }
+        assert_eq!(calls.len(), 4);
+        crate::github::polling::succeeded(host);
+    }
+
+    #[test]
+    fn an_old_refresh_cannot_restore_a_replaced_worktree_binding_at_the_same_path() {
+        let mut app = refresh_app("replaced-inspector-binding.invalid");
+        let old = app.pull_request_inspector.target.clone().unwrap();
+        let generation = app.pull_request_inspector.generation;
+        let next_id = crate::model::WorktreeId::new();
+        app.sidebar_model.projects[0].worktrees[0].id = next_id;
+        app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &SidebarFocus::Repository {
+                worktree: old.worktree.clone(),
+            },
+        );
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .key
+            .worktree_id = next_id;
+        drop(app.handle_pull_request_ui(Action::Resolved(
+            old.clone(),
+            generation,
+            Ok(Resolution {
+                target: old.clone(),
+                pull_request: None,
+            }),
+        )));
+        assert!(
+            app.pull_request_inspector.loaded,
+            "mismatched active key cannot admit the response"
+        );
+        drop(app.sync_pull_request_inspector());
+        assert_ne!(app.pull_request_inspector.generation, generation);
+        assert!(!app.pull_request_inspector.loaded);
+        drop(app.handle_pull_request_ui(Action::Loaded(
+            old,
+            generation,
+            Err("old attachment".into()),
+        )));
+        assert!(app.pull_request_inspector.error.is_none());
+    }
 
     fn target() -> Target {
         Target {
@@ -1299,6 +1735,178 @@ mod tests {
     }
 
     #[test]
+    fn a_local_commit_preserves_content_and_filter_while_refreshing() {
+        let mut state = State::default();
+        state.target = Some(target());
+        state.loaded = true;
+        state.filter = "keep this filter".into();
+        state.description = markdown::parse("loaded description").collect();
+        let pr = crate::pull_request_review::tests::pull_request(7);
+        let inspection = Arc::new(PullRequestInspection {
+            pull_request: pr.clone(),
+            checks: Ok(Vec::new()),
+            conversation: Ok(Default::default()),
+        });
+        state.pull_request = Some(Arc::new(pr));
+        state.inspection = Some(Arc::clone(&inspection));
+        let mut next = target();
+        next.head_oid = Some("bbb".into());
+        drop(state.synchronize(Some(next), None));
+        assert!(state.loaded);
+        assert!(state.loading);
+        assert_eq!(state.filter, "keep this filter");
+        assert!(!state.description.is_empty());
+        assert!(state.pull_request.is_some());
+        assert!(Arc::ptr_eq(state.inspection.as_ref().unwrap(), &inspection));
+    }
+
+    #[test]
+    fn local_head_changes_observe_automatic_host_backoff_without_blank_content() {
+        let host = "inspector-commit-backoff.invalid";
+        let mut original = target();
+        original.repository = GitHubRepoKey::new(host, None, "owner", "repo").unwrap();
+        let mut state = State::default();
+        state.target = Some(original.clone());
+        state.loaded = true;
+        state.filter = "keep".into();
+        state.description = markdown::parse("Loaded content").collect();
+        crate::github::polling::failed(
+            host,
+            &crate::github::GitHubError::Inspection("offline".into()),
+        );
+        original.head_oid = Some("b".repeat(40));
+        drop(state.synchronize(Some(original), None));
+        assert!(!state.loading);
+        assert!(state.loaded);
+        assert_eq!(state.filter, "keep");
+        assert!(!state.description.is_empty());
+        crate::github::polling::succeeded(host);
+    }
+
+    #[test]
+    fn a_server_limited_inspector_explains_its_wait_without_discarding_content() {
+        let host = "inspector-server-limit.invalid";
+        let mut selected = target();
+        selected.repository = GitHubRepoKey::new(host, None, "owner", "repo").unwrap();
+        crate::github::polling::failed(
+            host,
+            &crate::github::GitHubError::RateLimited {
+                limit: crate::github::polling::RateLimit {
+                    retry_at: crate::github::polling::now() + 120,
+                },
+            },
+        );
+        let mut state = State::default();
+        drop(state.synchronize(Some(selected), None));
+        assert!(!state.loading);
+        assert!(state.error.as_deref().unwrap().contains("Retrying at"));
+        state.loaded = true;
+        state.filter = "keep".into();
+        state.description = markdown::parse("Loaded content").collect();
+        let before = state.generation;
+        drop(state.update(Action::Refresh));
+        assert_eq!(state.generation, before);
+        assert!(!state.loading);
+        assert!(state.loaded);
+        assert_eq!(state.filter, "keep");
+        assert!(!state.description.is_empty());
+        assert!(state.error.as_deref().unwrap().contains("Retrying at"));
+    }
+
+    #[test]
+    fn inspector_head_verification_reads_one_oid_and_checks_symbolic_branch_without_status() {
+        use crate::repository::{CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput};
+        struct CountingGit {
+            calls: std::sync::Mutex<Vec<CommandSpec>>,
+            branch: Option<&'static str>,
+            unborn: bool,
+        }
+        impl ProcessExecutor for CountingGit {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                self.calls.lock().unwrap().push(command.clone());
+                let symbolic = command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "symbolic-ref");
+                let (success, stdout) = if symbolic {
+                    (
+                        self.branch.is_some(),
+                        self.branch.unwrap_or_default().to_owned(),
+                    )
+                } else {
+                    (
+                        !self.unborn,
+                        if self.unborn {
+                            String::new()
+                        } else {
+                            "a".repeat(40)
+                        },
+                    )
+                };
+                Ok(ProcessOutput {
+                    success,
+                    exit_code: Some(if success { 0 } else { 1 }),
+                    signal: None,
+                    stdout: format!("{stdout}\n").into_bytes(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+        for (branch, unborn, expected) in [
+            (Some("refs/heads/feature"), false, true),
+            (Some("refs/heads/other"), false, false),
+            (None, false, false),
+            (Some("refs/heads/feature"), true, true),
+            (Some("refs/heads/other"), true, false),
+        ] {
+            let executor = Arc::new(CountingGit {
+                calls: Default::default(),
+                branch,
+                unborn,
+            });
+            let git = RepositoryService::new("git", executor.clone());
+            let mut target = target();
+            target.head_oid = (!unborn).then(|| "a".repeat(40));
+            assert_eq!(
+                verify_local_head_with(&git, &target, &CancellationToken::new()).is_ok(),
+                expected
+            );
+            let calls = executor.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|command| command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "rev-parse"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|command| command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "symbolic-ref"))
+                    .count(),
+                1
+            );
+            assert!(calls.iter().all(|command| {
+                !command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "status")
+            }));
+        }
+    }
+
+    #[test]
     fn the_discussion_header_counts_only_what_the_filters_leave_visible() {
         let conversation = PullRequestConversation {
             threads: vec![
@@ -1311,6 +1919,7 @@ mod tests {
                 state: crate::github::RemoteValue("APPROVED".into()),
             }],
             truncated: false,
+            threads_truncated: false,
         };
         assert_eq!(discussion_count(&conversation, "", false), 4);
         // Hiding resolved threads drops the settled one and nothing else.
@@ -1339,7 +1948,14 @@ mod tests {
         state.target = Some(target.clone());
         state.generation = 2;
         state.loading = true;
-        let _ = state.update(Action::Resolved(target.clone(), 1, Ok(None)));
+        let _ = state.update(Action::Resolved(
+            target.clone(),
+            1,
+            Ok(Resolution {
+                target: target.clone(),
+                pull_request: None,
+            }),
+        ));
         assert!(state.loading);
         assert!(!state.loaded);
         let _ = state.update(Action::Loaded(target.clone(), 1, Err("old request".into())));
@@ -1376,7 +1992,14 @@ mod tests {
         state.target = Some(target.clone());
         state.generation = 1;
         state.loading = true;
-        let _ = state.update(Action::Resolved(target, 1, Ok(None)));
+        let _ = state.update(Action::Resolved(
+            target.clone(),
+            1,
+            Ok(Resolution {
+                target,
+                pull_request: None,
+            }),
+        ));
         assert!(state.loaded);
         assert!(!state.loading);
         assert!(state.inspection.is_none());

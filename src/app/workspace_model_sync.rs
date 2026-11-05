@@ -56,6 +56,19 @@ pub enum ModelUpdate {
         model: WorkspaceModel,
     },
     NavigationFailed(String),
+    /// The registry's answer to this window's request to retire an emptied
+    /// channel: the model after it decided, either way. A channel still in it
+    /// was kept.
+    RetirementAnswered {
+        channel: ChannelId,
+        model: WorkspaceModel,
+    },
+    /// A definitive refusal of the edit itself, rather than an unknown
+    /// transport outcome that the publisher will retry.
+    RetirementFailed {
+        channel: ChannelId,
+        error: String,
+    },
     /// Optional naming yielded after temporary admission pressure. The next
     /// real wake may retry this exact current candidate; this is not a timer.
     TitleDeferred(ModelEdit),
@@ -246,6 +259,12 @@ fn publish(
                             error: error.to_string(),
                         });
                     }
+                    if let ModelEdit::RetireEmptyChannel { home, .. } = &request {
+                        let _ = updates.send_blocking(ModelUpdate::RetirementFailed {
+                            channel: home.channel,
+                            error: error.to_string(),
+                        });
+                    }
                     if let ModelEdit::ReopenProject { repository, .. } = request {
                         let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
                             repository,
@@ -373,12 +392,12 @@ fn send(
             model: model.clone(),
         });
     }
-    if reordered
-        || matches!(
-            &request,
-            ModelEdit::SuggestConversationTitle { .. } | ModelEdit::RetireEmptyChannel { .. }
-        )
-    {
+    if let ModelEdit::RetireEmptyChannel { home, .. } = &request {
+        let _ = updates.send_blocking(ModelUpdate::RetirementAnswered {
+            channel: home.channel,
+            model: model.clone(),
+        });
+    } else if reordered || matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
         let _ = updates.send_blocking(ModelUpdate::Read(model.clone()));
     }
     if let Some(repository) = reopened {
@@ -532,6 +551,28 @@ impl Cagents {
         &mut self,
         update: ModelUpdate,
     ) -> (Task<Message>, bool) {
+        if let ModelUpdate::RetirementAnswered { channel, model } = update {
+            // The registry never echoes this window's own retirement, so the
+            // answer's model is the evidence of it: a channel absent there
+            // retired, even when metadata folded since keeps an older channel
+            // list. It retires here while the retirement still reads as this
+            // window's own, which keeps its cards reopenable.
+            let retired =
+                model.channel(channel).is_none() && model.identity == self.workspace_model.identity;
+            let (mut task, applied) =
+                self.apply_workspace_model_update_effect(ModelUpdate::Read(model));
+            if retired {
+                self.workspace_model
+                    .channels
+                    .retain(|shared| shared.id != channel);
+                task = Task::batch([task, self.retire_peer_channel(channel)]);
+            }
+            self.channel_work.retiring.remove(&channel);
+            return (
+                Task::batch([task, self.finish_channel_reopen(channel)]),
+                applied || retired,
+            );
+        }
         if let ModelUpdate::Read(model) = &update
             && model.identity == self.workspace_model.identity
             && model.sequence < self.shared_views.snapshot_sequence
@@ -543,6 +584,14 @@ impl Cagents {
 
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::RetirementFailed { channel, error } => {
+                self.channel_work.retiring.remove(&channel);
+                self.fail_channel_reopen(
+                    channel,
+                    &format!("Could not reopen the channel: {error}. Try reopening again."),
+                );
+                Task::none()
+            }
             ModelUpdate::TitleDeferred(edit) => {
                 self.defer_channel_title_suggestion(&edit);
                 Task::none()
@@ -609,6 +658,9 @@ impl Cagents {
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
+            ModelUpdate::RetirementAnswered { .. } => {
+                unreachable!("a retirement answer is applied as the snapshot it carries")
+            }
             ModelUpdate::Read(model) => {
                 if !self.install_workspace_model_snapshot(model) {
                     return Task::none();
@@ -668,6 +720,17 @@ impl Cagents {
                 }
 
                 if sequence <= self.workspace_model.sequence {
+                    if let ModelEdit::DeleteChannel { id } = edit {
+                        // A snapshot can overtake this explicit instruction.
+                        // It must still revoke automatic revival, even when
+                        // absence already removed the local channel.
+                        self.forget_channel_revival(id);
+                        self.workspace_model
+                            .channels
+                            .retain(|channel| channel.id != id);
+                        let retired = self.retire_peer_channel(id);
+                        return Task::batch([retired, self.finish_channel_reopen(id)]);
+                    }
                     return Task::none();
                 }
                 // An explicit delete is an instruction rather than an absence,
@@ -696,6 +759,9 @@ impl Cagents {
                     self.close_shared_project(&repository)
                 });
                 let retired = deleted.map_or_else(Task::none, |id| {
+                    // An explicit deletion is final even if an automatic
+                    // retirement of this identity was already in flight.
+                    self.forget_channel_revival(id);
                     // The registry has authoritatively removed this identity,
                     // even if its creation acknowledgment never reached us.
                     // A failed session close must not make it publishable again.
@@ -706,7 +772,8 @@ impl Cagents {
                     {
                         channel.shared = true;
                     }
-                    self.retire_peer_channel(id)
+                    let retired = self.retire_peer_channel(id);
+                    Task::batch([retired, self.finish_channel_reopen(id)])
                 });
                 Task::batch([removed, retired, self.reconcile_workspace_model()])
             }
@@ -968,6 +1035,7 @@ impl Cagents {
             tasks.push(self.sync_chrome());
         }
         self.refresh_channel_title_suggestions();
+        self.restore_channel_names();
         Task::batch(tasks)
     }
 
@@ -1547,11 +1615,19 @@ impl Cagents {
             repository: repository.clone(),
             name,
         });
+        // A new channel's title is empty; a revived one keeps the name it had.
+        let (title, title_source) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .map(|channel| (channel.title.clone(), channel.title_source))
+            .unwrap_or_default();
         self.publish_model_edit(ModelEdit::CreateChannel {
             id,
             repository,
-            title: String::new(),
-            title_source: Default::default(),
+            title,
+            title_source,
         });
     }
 

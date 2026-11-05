@@ -7,7 +7,10 @@ turn busy, acknowledges queued-message removal, and settles on interrupt.
 Later turns complete immediately. Busy messages deliberately stay queued;
 this fixture checks composer interactions, not provider delivery.
 
-Use a new directory beneath the repository's ignored `.worktrees/` for every
+From a shell without a desktop session, such as plain SSH,
+[`scripts/native-evidence`](development.md#native-evidence) sets up this environment;
+you still open the project and start the conversation.
+By hand, use a new directory beneath the repository's ignored `.worktrees/` for every
 run. Keep its HOME, XDG data/config/cache, daemon runtime, and project isolated
 from the development application you normally use. For example, from the
 checkout being validated:
