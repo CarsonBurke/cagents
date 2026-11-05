@@ -333,18 +333,26 @@ scripts/cargo-gate check --locked --no-default-features --features ui --bin cage
 scripts/cargo-gate test --locked --no-default-features --features host --all-targets
 ```
 
-The gate admits a few builds at once: one per 8 GiB of RAM after an 8 GiB
-reserve, at most one per 8 CPUs. A build starts beside others only while
-8 GiB is actually available; one `cagents` build peaked at 6.5 GiB with 12
-jobs. With several slots each build gets an equal
-share of the CPUs as `CARGO_BUILD_JOBS`, which also caps a larger value; `-j`
-still wins. For `test`, `bench` and `run` only the build holds a slot, and the
-tests or program run after it is released, so do not wrap the gate in another
-lock. Rustdoc compiles doctests while they run, so `cargo test --doc` keeps
-its slot throughout; a plain `cargo test` compiles its doctests after the
-slot is released. The development runner builds its matched set through the
-gate itself, and skips the gate when the set is
-[already current](#up-to-date-launches).
+The gate admits several builds at once, up to one per 4 GiB of RAM after an 8
+GiB reserve and at most one per 4 CPUs. Builds spend most of their time in a
+few crates that compile or link on one CPU, so each busies about 1.4 CPUs on
+average, and memory decides how many fit. Each build has an expected peak: 3
+GiB for anything in the CLI lane, 4 GiB for other checks, 7 GiB for a host
+build or test build, 9 GiB for a UI one and 8 GiB for an `exec` script such as
+the development runner; a slot held by a plain `flock` counts as 9 GiB.
+`CAGENTS_BUILD_COST_GIB` overrides it. A build starts beside others only when
+the memory available, less what the running builds are expected to take beyond
+what they already hold, covers its own; a lone build always starts. Each build
+gets a share of the CPUs among the builds running once it starts, between 4 and
+8 (the jobs the costs were measured with) and at most half the CPUs, as
+`CARGO_BUILD_JOBS`, which also caps a larger value; `-j` still wins. For
+`test`, `bench` and `run` only the build holds a slot, and the tests or program
+run after it is released, so do not wrap the gate in another lock. Rustdoc
+compiles doctests while they run, so `cargo test --doc` keeps its slot
+throughout; a plain `cargo test` compiles its doctests after the slot is
+released. The development runner builds its matched set through the gate
+itself, and skips the gate when the set is [already
+current](#up-to-date-launches).
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock /var/tmp/cagents-cargo.lock` takes exactly one
