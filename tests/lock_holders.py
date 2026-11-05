@@ -116,7 +116,7 @@ class LockHolders(unittest.TestCase):
         self.assertIn("Everyone queued waits until every holder releases it", notes)
         self.assertIn("commands and directories above", notes)
         self.assertIn("ask the owner", notes)
-        self.assertNotIn("took this lock", report)
+        self.assertNotIn("took this lock", notes)
         self.assertNotRegex(notes, "(?i)kill|probably|leftover|WARNING")
         os.kill(daemon, 0)
         self.assertTrue(self.holds())
@@ -151,9 +151,29 @@ class LockHolders(unittest.TestCase):
             "that long ago",
         )
         notes = self.notes(report)
-        self.assertIn("idle during the sample. The holder took this lock itself.", notes)
-        self.assertNotIn("inherited", notes)
+        self.assertIn(f"idle during the sample. {holder.pid} took this lock; any process that inherited",
+                      notes)
+        self.assertNotIn("could have inherited", notes)
         self.assertNotRegex(notes, "(?i)kill|leftover")
+
+    def test_several_takers_of_a_shared_lock_are_all_named(self):
+        takers = []
+        for _ in range(2):
+            taker = self.start(
+                sys.executable, "-c",
+                "import fcntl, os, sys, time\n"
+                "lock = open(sys.argv[1], 'a')\n"
+                "fcntl.flock(lock, fcntl.LOCK_SH)\n"
+                "open(sys.argv[1] + '.' + str(os.getpid()), 'w').close()\n"
+                "time.sleep(60)\n",
+                str(self.lock),
+            )
+            takers.append(taker)
+            self.wait_for(Path(f"{self.lock}.{taker.pid}").exists, "a shared holder")
+        notes = self.notes(self.report())
+        first, second = sorted(taker.pid for taker in takers)
+        self.assertIn(f"{first} and {second} took this lock; any process that inherited it", notes)
+        self.assertNotIn("another holder", notes)
 
     def test_a_taker_does_not_speak_for_a_holder_that_inherited_from_it(self):
         pid_file = self.root / "child"
@@ -172,8 +192,7 @@ class LockHolders(unittest.TestCase):
         self.assertRegex(report, rf"holder {taker.pid} .*at most that long ago")
         self.assertNotRegex(report, rf"holder {child} .*at most that long ago")
         notes = self.notes(report)
-        self.assertIn(f"{taker.pid} took this lock; another holder could have inherited it", notes)
-        self.assertNotIn("The holder took this lock itself", notes)
+        self.assertIn(f"{taker.pid} took this lock; any process that inherited it", notes)
 
     def test_a_busy_unrecognized_holder_is_said_to_be_busy(self):
         self.python_holder("while True: pass")
@@ -199,7 +218,7 @@ class LockHolders(unittest.TestCase):
         self.wait_for(lambda: self.report().count("  holder ") == 1, "the parent letting go")
         report = self.report()
         self.assertIn(f"holder {child} ", report)
-        self.assertNotIn("took this lock", report)
+        self.assertNotIn("took this lock", self.notes(report))
         self.assertIn("could have inherited the lock from another process", report)
 
     def test_a_shell_holding_the_lock_of_a_flock_that_exited_is_only_undetermined(self):
@@ -209,8 +228,8 @@ class LockHolders(unittest.TestCase):
         self.wait_for(self.holds, "holder")
         report = self.report()
         self.assertIn(f"holder {shell.pid} ", report)
-        self.assertNotIn("took this lock", report)
         notes = self.notes(report)
+        self.assertNotIn("took this lock", notes)
         self.assertIn("this can't tell which", notes)
         self.assertNotRegex(notes, "(?i)kill|leftover")
 

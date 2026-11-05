@@ -202,18 +202,17 @@ def main(arguments):
         for pid in sorted(held):
             print(f"  holder {describe(pid, before, after, parents, pid in took_it)}")
         if hidden:
-            print(f"  holder {hidden}, recorded by /proc/locks; its descriptors aren't readable here")
+            print(f"  holder {hidden}, recorded by /proc/locks for this inode; its descriptors aren't readable here")
         family = set().union(*(subtree(pid, parents) for pid in held)) if held else set()
         idle = not any(after.get(p, 0) > before.get(p, 0) for p in family)
         if held and not any(looks_legitimate(p) for p in family):
             # A taker that has gone proves nothing: `exec 9>LOCK; flock 9` leaves a
             # healthy shell holding the lock of a process that has exited.
-            if held == took_it and len(held) == 1:
-                origin = "The holder took this lock itself."
-            elif took_it:
+            if took_it:
+                # Not that nothing else holds it: a holder may not be readable here.
                 origin = (
-                    f"{' and '.join(map(str, sorted(took_it)))} took this lock; another holder "
-                    "could have inherited it, and would keep it after they exit."
+                    f"{' and '.join(map(str, sorted(took_it)))} took this lock; any process that "
+                    "inherited it would keep it after that."
                 )
             else:
                 origin = (
