@@ -335,17 +335,27 @@ scripts/cargo-gate test --locked --no-default-features --features host --all-tar
 ```
 
 The gate admits several builds at once, up to one per 4 GiB of RAM after an 8
-GiB reserve and at most one per 4 CPUs. Builds spend most of their time in a
-few crates that compile or link on one CPU, so each busies about 1.4 CPUs on
-average, and memory decides how many fit. Each build has an expected peak: 3
-GiB for anything in the CLI lane, 4 GiB for other checks, 7 GiB for a host
-build or test build, 9 GiB for a UI one and 8 GiB for an `exec` script such as
-the development runner; a slot held by a plain `flock` counts as 9 GiB.
-`CAGENTS_BUILD_COST_GIB` overrides it. A build starts beside others only when
-the memory available, less what the running builds are expected to take beyond
-what they already hold, covers its own; a lone build always starts. Each build
-gets a share of the CPUs among the builds running once it starts, between 4 and
-8 (the jobs the costs were measured with) and at most half the CPUs, as
+GiB reserve, at most one per 4 CPUs and at most 4 (`CAGENTS_BUILD_SLOTS`
+overrides the count). Builds spend most of their time in a few crates that
+compile or link on one CPU, so each busies about 1.4 CPUs on average, and
+memory and CPU pressure decide how many run. On a host whose CPUs are already
+saturated, by other builds or other work, a further build slows every running
+one rather than finishing sooner, so a build starts beside others only while
+the kernel's CPU pressure (`some avg10` in `/proc/pressure/cpu`, the share of
+the last 10 seconds in which some task waited for a CPU) is below 60%
+(`CAGENTS_BUILD_CPU_PRESSURE`; `0` disables this check and the next), and not
+within 10 seconds of the newest build starting
+(`CAGENTS_BUILD_CPU_SETTLE_SECS`), before that 10 second average can show it. A
+host that does not report pressure is treated as having room. Each build has an
+expected peak: 3 GiB for anything in the CLI lane, 4 GiB for other checks, 7
+GiB for a host build or test build, 9 GiB for a UI one and 8 GiB for an `exec`
+script such as the development runner; a slot held by a plain `flock` counts as
+9 GiB. `CAGENTS_BUILD_COST_GIB` overrides it. A build starts beside others only
+when the memory available, less what the running builds are expected to take
+beyond what they already hold, covers its own. A lone build always starts,
+whatever the memory or pressure, so no build waits forever. Each build gets a
+share of the CPUs among the builds running once it starts, between 4 and 8 (the
+jobs the costs were measured with) and at most half the CPUs, as
 `CARGO_BUILD_JOBS`, which also caps a larger value; `-j` still wins. For
 `test`, `bench` and `run` only the build holds a slot, and the tests or program
 run after it is released, so do not wrap the gate in another lock. Rustdoc
