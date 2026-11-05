@@ -213,6 +213,10 @@ class LedgerContractTests(unittest.TestCase):
         self.base()
         self.refuses("--base-ref", "f" * 40, contains="Cannot read trusted comparison base")
 
+    def test_present_guard_without_its_current_snapshot_is_refused(self):
+        (self.root / CHECK.FIXTURES / "127.json").unlink()
+        self.refuses(contains="Missing protocol 127 snapshot")
+
     def test_first_adoption_still_compares_selected_base_source(self):
         (self.root / CHECK.FIXTURES / "127.json").unlink()
         base = self.base()
@@ -288,6 +292,11 @@ class WorkflowApplicabilityTests(unittest.TestCase):
             else:
                 path.write_text("# Private applicability stub\n")
 
+    def install_ledger(self):
+        directory = self.root / CHECK.FIXTURES
+        directory.mkdir(parents=True)
+        (directory / "127.json").write_bytes((ROOT / CHECK.FIXTURES / "127.json").read_bytes())
+
     def run_step(self, base=None, cwd=None):
         environment = dict(os.environ)
         environment["PROTOCOL_CONTRACT_BASE_SHA"] = "" if base is None else base
@@ -299,6 +308,7 @@ class WorkflowApplicabilityTests(unittest.TestCase):
         self.assertIn("Not applicable: selected IPC source contract", result.stdout)
 
     def test_every_partial_group_is_refused_before_fetch_or_execution(self):
+        self.install_ledger()
         for mask in range(1, 7):
             with self.subTest(mask=mask):
                 for path in self.paths:
@@ -311,6 +321,7 @@ class WorkflowApplicabilityTests(unittest.TestCase):
 
     def test_complete_group_requires_a_trusted_base_then_runs_tests_and_checker(self):
         self.install(range(3))
+        self.install_ledger()
         result = self.run_step()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("trusted event comparison base", result.stderr)
@@ -325,6 +336,7 @@ class WorkflowApplicabilityTests(unittest.TestCase):
 
     def test_missing_base_object_with_no_fetch_source_fails(self):
         self.install(range(3))
+        self.install_ledger()
         subprocess.run(["git", "init", "-q", "--initial-branch=main"], cwd=self.root, check=True)
         result = self.run_step("f" * 40)
         self.assertNotEqual(result.returncode, 0)
@@ -332,6 +344,7 @@ class WorkflowApplicabilityTests(unittest.TestCase):
 
     def test_shallow_checkout_fetches_the_exact_event_base_from_private_origin(self):
         self.install(range(3))
+        self.install_ledger()
         subprocess.run(["git", "init", "-q", "--initial-branch=main"], cwd=self.root, check=True)
         subprocess.run(["git", "add", "."], cwd=self.root, check=True)
         commit = ["git", "-c", "user.name=Contract fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Private shallow fixture"]
@@ -352,9 +365,32 @@ class WorkflowApplicabilityTests(unittest.TestCase):
 
     def test_symlinked_contract_source_is_refused(self):
         self.install(range(3))
+        self.install_ledger()
         path = self.root / self.paths[1]
         path.rename(path.with_suffix(".real"))
         path.symlink_to(path.with_suffix(".real"))
+        result = self.run_step()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("never a symlink", result.stderr)
+
+    def test_orphan_ledger_with_all_sources_absent_is_refused(self):
+        self.install_ledger()
+        result = self.run_step()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("Incomplete protocol contract", result.stderr)
+        self.assertNotIn("Not applicable", result.stdout)
+
+    def test_sources_without_the_snapshot_directory_are_refused(self):
+        self.install(range(3))
+        result = self.run_step()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("snapshot directory must all exist", result.stderr)
+
+    def test_symlinked_ledger_directory_is_refused_even_with_sources_absent(self):
+        self.install_ledger()
+        directory = self.root / CHECK.FIXTURES
+        directory.rename(directory.with_name("real-ledger"))
+        directory.symlink_to(directory.with_name("real-ledger"), target_is_directory=True)
         result = self.run_step()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("never a symlink", result.stderr)

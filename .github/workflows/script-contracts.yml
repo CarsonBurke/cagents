@@ -140,7 +140,7 @@ jobs:
           import subprocess
           import sys
 
-          def present(path):
+          def present(path, directory=False):
               current = Path()
               for index, part in enumerate(path.parts):
                   current /= part
@@ -148,7 +148,7 @@ jobs:
                       mode = current.lstat().st_mode
                   except FileNotFoundError:
                       return False
-                  expected = stat.S_ISREG if index == len(path.parts) - 1 else stat.S_ISDIR
+                  expected = stat.S_ISDIR if directory or index < len(path.parts) - 1 else stat.S_ISREG
                   if not expected(mode):
                       print(f"Invalid contract path: {current} must be a regular file or real directory, never a symlink", file=sys.stderr)
                       raise SystemExit(2)
@@ -160,11 +160,12 @@ jobs:
               "tests/protocol_contract.py",
           )]
           exists = [present(path) for path in paths]
-          if not any(exists):
+          ledger_present = present(Path("tests/fixtures/protocol-contract"), directory=True)
+          if not any(exists) and not ledger_present:
               print("Not applicable: selected IPC source contract (guard and fixtures absent at this head)", flush=True)
               raise SystemExit(0)
-          if not all(exists):
-              print("Incomplete protocol contract: checker, source lexer and tests must all exist", file=sys.stderr)
+          if not all(exists) or not ledger_present:
+              print("Incomplete protocol contract: checker, source lexer, tests and snapshot directory must all exist", file=sys.stderr)
               raise SystemExit(2)
           base = os.environ.get("PROTOCOL_CONTRACT_BASE_SHA", "")
           if not re.fullmatch(r"[0-9a-f]{40}", base) or base == "0" * 40:
