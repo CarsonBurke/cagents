@@ -2653,7 +2653,9 @@ impl State {
                 }
                 if let Some(result) = run.run.as_ref().map(|run| &run.result) {
                     content = content.push(crate::design::body(result.text.as_str()));
-                    if let Some(diagnostic) = &result.diagnostic {
+                    if let Some(diagnostic) = &result.diagnostic
+                        && run.firing.diagnostic.as_ref() != Some(diagnostic)
+                    {
                         content = content.push(crate::design::body(diagnostic));
                     }
                     if result.truncated {
