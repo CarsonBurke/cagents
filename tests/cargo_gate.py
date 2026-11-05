@@ -486,5 +486,80 @@ with pathlib.Path({str(self.root / 'cargo-calls')!r}).open('a') as calls:
                 calls.unlink()
 
 
+
+class MemoryAdmission(unittest.TestCase):
+    """Two slots, one held by a gated build that records its expected cost."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-memory-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.gate = self.root / "cargo-gate"
+        shutil.copy2(ROOT / "scripts/cargo-gate", self.gate)
+        shutil.copy2(ROOT / "scripts/cargo-gate-command.py", self.root / "cargo-gate-command.py")
+        self.env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("CAGENTS_BUILD_") and key != "CARGO_BUILD_JOBS"
+        } | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_SLOTS": "2"}
+
+    def hold(self, cost):
+        holder = subprocess.Popen(
+            [str(self.gate), "exec", "sh", "-c", f"touch {self.root}/held; "
+             f"while [ ! -e {self.root}/release ]; do sleep 0.05; done"],
+            env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(holder.wait, 10)
+        self.addCleanup((self.root / "release").touch)
+        deadline = time.monotonic() + 10
+        while not (self.root / "held").exists():
+            self.assertLess(time.monotonic(), deadline, "holder never admitted")
+            time.sleep(0.02)
+        return holder
+
+    def build(self, cost, timeout):
+        return subprocess.run(
+            [str(self.gate), "exec", "sh", "-c", 'printf "%s" "$CARGO_BUILD_JOBS"'],
+            env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+    def test_a_build_that_fits_starts_beside_a_running_one(self):
+        self.hold(1)
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting", result.stderr)
+        cpus = os.cpu_count()
+        self.assertEqual(int(result.stdout), max(4, cpus // 2))
+
+    def test_a_build_that_does_not_fit_waits_for_the_running_one(self):
+        self.hold(1)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(10**6, timeout=2)
+        (self.root / "release").touch()
+        result = self.build(10**6, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_running_builds_expected_peak_is_reserved(self):
+        # The holder has claimed almost none of its expected peak, which is
+        # all the free memory, so a newcomer must wait.
+        available = int(Path("/proc/meminfo").read_text().split("MemAvailable:")[1].split()[0])
+        free_gib = available // 2**20
+        if free_gib < 4:
+            self.skipTest("too little free memory to place two builds")
+        self.hold(free_gib)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(2, timeout=2)
+
+    def test_a_lone_build_gets_half_the_cpus(self):
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(int(result.stdout), max(4, os.cpu_count() // 2))
+
+    def test_an_invalid_cost_is_refused(self):
+        result = self.build("08", timeout=10)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("CAGENTS_BUILD_COST_GIB", result.stderr)
+
 if __name__ == "__main__":
     unittest.main()
