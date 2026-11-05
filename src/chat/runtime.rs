@@ -4873,12 +4873,12 @@ mod tests {
             "The agent printed 8 lines in a row that are not part of the conversation, so it was stopped. Last output: garbage",
             "",
         );
-        assert!(invalid.summary.contains("status 0"));
         assert!(
             invalid
                 .summary
-                .contains("8 lines in a row that are not part of the conversation"),
-            "a status must not erase the bounded framing diagnosis"
+                .starts_with("The agent printed 8 lines in a row that are not part of the conversation"),
+            "a clean status adds nothing to the bounded framing diagnosis: {}",
+            invalid.summary
         );
     }
 

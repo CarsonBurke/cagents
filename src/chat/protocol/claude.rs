@@ -2899,9 +2899,14 @@ impl Adapter for Claude {
                         });
                     }
                 } else if string(response, "subtype") != "success" {
-                    // A reply to a request this adapter sent is a known frame,
-                    // so an unrecognized outcome is a protocol error.
-                    return Err("Unsupported Claude control response subtype".into());
+                    // Without a recognized handshake reply the session cannot
+                    // start. Any later command fails alone, so a newer CLI's
+                    // reply cannot end a working conversation.
+                    if string(&request, "subtype") == "initialize" {
+                        return Err("Unsupported Claude control response subtype".into());
+                    }
+                    self.warn_unknown("control response", string(response, "subtype"));
+                    acknowledged = Err("Claude returned an unrecognized control response; the requested change is unconfirmed".into());
                 } else {
                     match string(&request, "subtype") {
                         "initialize" => {
