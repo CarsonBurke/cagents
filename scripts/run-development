@@ -294,7 +294,7 @@ build_products() {
 # each executable. The set counts as current only if all of that still
 # matches and no file the build read changed since the build started. When anything is unsure, the build runs through the gate,
 # where Cargo makes the real decision; this never builds outside the gate.
-build_identity() {
+build_identity_inputs() {
     printf 'lane %s\n' "$ui_feature"
     rustc -vV || return 1
     git -C "$root" rev-parse HEAD 2>/dev/null || printf '%s\n' 'no commit'
@@ -312,6 +312,15 @@ build_identity() {
         { name = $0; sub(/=.*/, "", name) }
         name in seen { print "env " $0 }
     ' | LC_ALL=C sort
+}
+# Build variables may contain registry tokens or arbitrary credentials watched
+# by a build script. Keep the payload in memory and persist only its digest.
+# Capture the producer separately so a failed toolchain probe cannot be hidden
+# by the final command's status in a POSIX shell pipeline.
+build_identity() {
+    identity=$(build_identity_inputs) || return 1
+    fingerprint=$(printf '%s\n' "$identity" | sha256sum) || return 1
+    printf 'identity-sha256 %s\n' "${fingerprint%% *}"
 }
 # What the dev-runtime build scripts asked Cargo to watch: env-changed for
 # variable names, or changed for paths. Outputs of earlier builds count too,
@@ -391,21 +400,24 @@ build_and_record() {
     mkdir -p -- "$products"
     started=$(mktemp "$products/.run-development-started.XXXXXX")
     built=$started.built
-    rm -f -- "$record"
-    trap 'rm -f -- "$started" "$started.new" "$built"' EXIT
+    replacement=
+    trap 'rm -f -- "$started" "$replacement" "$built"' EXIT
     trap 'exit 130' INT
     trap 'exit 129' HUP
     trap 'exit 143' TERM
+    # mktemp creates mode 0600 even when the caller's umask permits sharing.
+    replacement=$(mktemp "$products/.run-development-record.XXXXXX")
+    rm -f -- "$record"
     build_products flock -- "$products/.run-development.lock" || {
         status=$?
-        rm -f -- "$started" "$built"
+        rm -f -- "$started" "$replacement" "$built"
         return "$status"
     }
-    if build_identity >"$started.new" && cat -- "$built" >>"$started.new"; then
-        touch -r "$started" "$started.new"
-        mv -f -- "$started.new" "$record"
+    if build_identity >"$replacement" && cat -- "$built" >>"$replacement"; then
+        touch -r "$started" "$replacement"
+        mv -f -- "$replacement" "$record"
     fi
-    rm -f -- "$started" "$started.new" "$built"
+    rm -f -- "$started" "$replacement" "$built"
     trap - EXIT HUP INT TERM
 }
 
