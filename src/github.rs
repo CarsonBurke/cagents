@@ -26,9 +26,9 @@ use crate::repository::{
 pub mod avatar;
 pub mod checkout;
 pub mod polling;
+pub mod review_actions;
 mod review_batches;
 mod review_refresh;
-pub mod review_actions;
 pub mod review_requests;
 pub use review_batches::VIEWED_BATCH_SIZE;
 pub use review_refresh::ReviewRefresh;
@@ -2053,7 +2053,8 @@ impl<E: ProcessExecutor> GitHubService<E> {
         {
             // The answer is complete, but its headers can still exhaust the
             // host's quota, exactly as for a successful request.
-            let headers = &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
+            let headers =
+                &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
             match polling::RateLimit::classify(&String::from_utf8_lossy(headers), polling::now()) {
                 Some(limit) => {
                     polling::failed(&repository.host, &GitHubError::RateLimited { limit })

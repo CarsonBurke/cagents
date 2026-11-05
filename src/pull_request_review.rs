@@ -1085,11 +1085,11 @@ impl State {
                             });
                         self.force_conversation = false;
                         self.loaded_snapshot = Some(loaded.clone());
+                        if let Some(target) = &self.target {
+                            crate::github::polling::succeeded(&target.repository.host);
+                        }
                         self.adopt(&loaded);
                         if unchanged_conversation {
-                            if let Some(target) = &self.target {
-                                crate::github::polling::succeeded(&target.repository.host);
-                            }
                             return ActionTask::none();
                         }
                         return self.load_discussion();
