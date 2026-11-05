@@ -5,7 +5,9 @@
 //! executed, which keeps argument handling shell-free and makes every operation
 //! straightforward to test with a fake executor.
 
+mod ignored_worktree_files;
 mod managed_worktrees;
+pub use ignored_worktree_files::default_disposable_ignored_directories;
 #[cfg(test)]
 pub(crate) use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
 mod worktree_setup_intent;
