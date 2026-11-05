@@ -7,14 +7,20 @@
 //! joined back into the message they came from. When the window holds only
 //! some of them, the complete message is read through the same cache-only
 //! source reads that Copy uses, and shown once it is whole; until then the
-//! parts that are present are joined as they are.
+//! parts that are present are joined as they are. A message larger than a
+//! whole window is never read whole: like the rest of the transcript, it is
+//! paged, and only the parts the window holds are joined.
 use super::*;
 use std::sync::Weak;
 
+/// The largest message read whole. Every message presented costs the view
+/// work for each of its blocks on every frame; the store's window bounds that
+/// work, so a message read whole may add at most another window's worth.
+const READ_BYTES: usize = chat::TRANSCRIPT_WINDOW_BYTES;
 /// Complete messages kept for windows that show only part of them, across the
-/// application. Copy's own limit bounds any single one, so the larger of two
-/// at a window's edges can still be read while the other stays resident.
-const HYDRATED_BYTES: usize = 2 * chat::TEXT_COPY_LIMIT_BYTES;
+/// application: the larger of two at a window's edges can still be read while
+/// the other stays resident.
+const HYDRATED_BYTES: usize = 2 * READ_BYTES;
 /// Reads that fail are retried after a growing delay, then left alone until
 /// the message is rewritten or its pane is shown again.
 const ATTEMPTS: u32 = 3;
@@ -261,14 +267,16 @@ impl State {
             let hydrated = run.as_ref().and_then(|run| {
                 let complete =
                     source.is_none_or(|source| run.start == 0 && source.bytes as usize <= run.end);
+                let readable =
+                    !complete && source.is_some_and(|source| source.bytes as usize <= READ_BYTES);
                 // A complete read supplies everything up to its own length;
                 // parts the window holds beyond it are a later append.
-                let stored = (!complete)
+                let stored = readable
                     .then(|| key.as_ref().and_then(|key| self.hydrated.get(key)))
                     .flatten()
                     .map(|hydrated| hydrated.text.clone());
                 let hydrated = stored.clone().filter(|text| text.len() >= run.start);
-                if !complete && let (Some(source), Some(key)) = (source, &key) {
+                if readable && let (Some(source), Some(key)) = (source, &key) {
                     // While a message streams, the window slides forward past
                     // what the last read covers. Read it again once the window
                     // has moved half its length, so a fresh read arrives
@@ -397,8 +405,7 @@ impl State {
         self.failures.retain(|key, _| needed.contains(key));
         let budget = hydrated_budget().available_permits();
         let next = wanted.into_iter().find(|source| {
-            source.bytes as usize <= chat::TEXT_COPY_LIMIT_BYTES
-                && source.bytes as usize <= budget
+            source.bytes as usize <= budget
                 && Key::of(source).is_some_and(|key| {
                     self.failures
                         .get(&key)
@@ -963,6 +970,23 @@ mod tests {
         let raw = snapshot(cut.clone(), Some(source(message.len())));
         let projected = State::default().project(raw.clone());
         assert!(Arc::ptr_eq(&projected, &raw));
+    }
+
+    #[test]
+    fn a_message_larger_than_a_window_is_paged_not_read_whole() {
+        let message = "word ".repeat((READ_BYTES + PART) / 5);
+        let count = message.len().div_ceil(PART);
+        let tail = parts("answer", &message, count - 4..count);
+        let raw = snapshot(tail, Some(source(message.len())));
+        let mut state = State::default();
+        let projected = state.project(raw);
+        assert_eq!(projected.items.len(), 1);
+        assert_eq!(
+            body(&projected.items[0]),
+            &message[(count - 4) * PART..],
+            "the parts the window holds are joined"
+        );
+        assert!(state.request().is_none());
     }
 
     #[test]

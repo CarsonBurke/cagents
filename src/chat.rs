@@ -1435,6 +1435,10 @@ pub struct TextCopySource {
 /// so one enormous message or tool output stays pageable.
 pub const TRANSCRIPT_PART_BYTES: usize = 128 * 1024;
 
+/// A transcript window presents items of at most this many bytes in all; the
+/// reader pages to see more.
+pub const TRANSCRIPT_WINDOW_BYTES: usize = 3 * 1024 * 1024;
+
 /// Where a presented part after the first sits in its transcript item. The
 /// first part keeps the item's own ID; each later part's ID names the item,
 /// the part's position, the item's layout and the byte range it shows of each

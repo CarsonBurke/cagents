@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 const PART_BYTES: usize = crate::chat::TRANSCRIPT_PART_BYTES;
-const WINDOW_BYTES: usize = 3 * 1024 * 1024;
+const WINDOW_BYTES: usize = crate::chat::TRANSCRIPT_WINDOW_BYTES;
 const WINDOW_ITEMS: usize = 128;
 // Leave room between provider items for overlapping history pages to supply
 // missing records without renumbering the whole conversation on every page.
