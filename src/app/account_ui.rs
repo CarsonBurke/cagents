@@ -174,6 +174,32 @@ impl OmpRecord {
 }
 
 impl State {
+    /// The managed home at `path`, of an account the daemon just refused
+    /// because its account list does not name it, when that home may still
+    /// be on its device: one a lost or reset account list stranded, which
+    /// the daemon can restore under its original key.
+    ///
+    /// The refusal is the daemon's answer from the list as it stands; the
+    /// copy here can lag a list that was reset under it, so it is not asked
+    /// again. A local home is looked for on disk, so a home that is really
+    /// gone is never offered. A remote device's files are not visible from
+    /// here; its list says whether the home was removed, and the device
+    /// itself answers when it is asked to restore it.
+    pub(super) fn restorable_home(&self, path: &Path) -> Option<(Provider, uuid::Uuid)> {
+        let homes = self.homes.as_ref()?;
+        let (provider, key) = homes.managed_identity(path)?;
+        if crate::device::is_remote() {
+            return (!self.registry.contains_managed_home(homes, provider, key))
+                .then_some((provider, key));
+        }
+        homes.is_kept(provider, key).then_some((provider, key))
+    }
+
+    #[cfg(test)]
+    pub(super) fn use_homes(&mut self, homes: Homes) {
+        self.homes = Some(homes);
+    }
+
     pub(super) fn probe_owner(&self, id: &AccountId) -> Option<u64> {
         self.account(id).map(|state| state.owner)
     }
@@ -335,7 +361,7 @@ impl State {
             .collect()
     }
 
-    fn set_registry(&mut self, registry: Registry) {
+    pub(super) fn set_registry(&mut self, registry: Registry) {
         if registry.revision() < self.registry.revision() {
             return;
         }

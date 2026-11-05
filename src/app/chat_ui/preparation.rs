@@ -3095,17 +3095,17 @@ mod tests {
             "let value_123 = 123;\n",
             crate::settings::EditorSyntaxTheme::Mocha,
         );
-        let dark = output.blocks[&key].spans(true).clone();
-        let light = output.blocks[&key].spans(false).clone();
-        assert_eq!(format!("{dark:?}"), format!("{:?}", expected.spans(true)));
-        assert_eq!(format!("{light:?}"), format!("{:?}", expected.spans(false)));
+        let dark = output.blocks[&key].highlight(true).clone();
+        let light = output.blocks[&key].highlight(false).clone();
+        assert_eq!(&dark, expected.highlight(true));
+        assert_eq!(&light, expected.highlight(false));
         let mut cached = CachedItem::preparing(&source, crate::settings::EditorSyntaxTheme::Mocha);
         output.install(&mut cached, false, false);
         assert!(
-            Arc::ptr_eq(&dark, cached.blocks[&key].spans(true)),
+            dark.ptr_eq(cached.blocks[&key].highlight(true)),
             "installation moves the worker's spans without re-highlighting"
         );
-        assert!(Arc::ptr_eq(&light, cached.blocks[&key].spans(false)));
+        assert!(light.ptr_eq(cached.blocks[&key].highlight(false)));
         assert!(!cached.placeholder);
     }
     #[test]
@@ -3123,7 +3123,7 @@ mod tests {
         let output = execute(shared, permit()).unwrap();
         assert_eq!(output.syntax_work.0, 200);
         let key = fence_key("rust", "let value_123 = 123;\n");
-        let spans = output.blocks[&key].spans(true).clone();
+        let highlight = output.blocks[&key].highlight(true).clone();
         drop(
             state
                 .accept(target, "message", run, ready(Ok(output)))
@@ -3140,7 +3140,7 @@ mod tests {
                 (0, 0),
                 "a tiny tail append does not highlight completed history again"
             );
-            assert!(Arc::ptr_eq(&spans, output.blocks[&key].spans(true)));
+            assert!(highlight.ptr_eq(output.blocks[&key].highlight(true)));
             drop(
                 state
                     .accept(target, "message", run, ready(Ok(output)))

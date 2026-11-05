@@ -81,7 +81,10 @@ Environment:
                          4 and 8
 
 Slot 0 is the plain lock file, so a command still run under
-`flock /var/tmp/cagents-cargo.lock` occupies exactly one slot.
+`flock --close /var/tmp/cagents-cargo.lock` occupies exactly one slot. Without
+--close, a daemon the command leaves behind keeps the slot until it exits. With
+it, gated commands under that flock run in its slot, and killing the flock frees
+the slot even if its command keeps running.
 EOF
 }
 
@@ -334,7 +337,10 @@ acquire() {
         check_admission
         if [ -z "$waiter" ]; then
             exec 6>>"$lock"
-            flock 6 &
+            # Neither the queue nor the caller's streams: if this gate is killed,
+            # the request must not keep everyone queued behind a slot another
+            # gated build could skip, or a caller reading its output waiting.
+            flock 6 8>&- </dev/null >/dev/null 2>&1 &
             waiter=$!
         fi
         # The shared descriptor locks only once the queued request is granted:
@@ -572,9 +578,44 @@ inherits_slot() {
     return 1
 }
 
-# Already inside a slot: a gated command running Cargo again, or a caller
-# that took the lock itself.
-if inside_gate || inherits_slot; then
+# Whether `path` is one of this gate's slots, given the resolved first slot.
+is_slot() {
+    case $1 in
+        "$held") return 0 ;;
+        "$held".*)
+            number=${1#"$held".}
+            case $number in ''|*[!0-9]*|0*|??????????*) return 1 ;; esac
+            [ "$number" -lt "$slots" ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+# Whether a `flock` command started this one, as under
+# `flock --close /var/tmp/cagents-cargo.lock scripts/run-development`, and holds
+# a slot it did not pass down. Among ancestors, only a running `flock` counts: it
+# holds the slot for exactly as long as its command runs. Any other ancestor
+# holding a slot may be a leftover, and everything it starts would skip admission.
+# (A process that itself inherited the slot is inherits_slot's case.)
+started_by_flock() {
+    held=$(readlink -f "$lock")
+    ancestor=$PPID
+    while [ "$ancestor" -gt 1 ]; do
+        { read -r name </proc/"$ancestor"/comm; } 2>/dev/null || return 1
+        if [ "$name" = flock ]; then
+            for descriptor in /proc/"$ancestor"/fd/*; do
+                path=$(readlink "$descriptor" 2>/dev/null) || continue
+                is_slot "$path" || continue
+                if grep -q '^lock:.*FLOCK' /proc/"$ancestor"/fdinfo/"${descriptor##*/}" 2>/dev/null; then
+                    return 0
+                fi
+            done
+        fi
+        ancestor=$(sed -n 's/^PPid:[[:space:]]*//p' /proc/"$ancestor"/status 2>/dev/null) || return 1
+        [ -n "$ancestor" ] || return 1
+    done
+    return 1
+}
+if inside_gate || inherits_slot || started_by_flock; then
     [ "$mode" = exec ] || set -- cargo "$@"
     exec "$@"
 fi

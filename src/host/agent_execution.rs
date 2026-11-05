@@ -102,7 +102,21 @@ pub(super) fn selected_account(spec: &Spec) -> Result<Account, String> {
             .accounts(homes.as_ref())
             .into_iter()
             .find(|account| account.provider == spec.provider && account.id() == *id)
-            .ok_or_else(|| "The selected provider account was removed".into()),
+            .ok_or_else(|| {
+                // A home a lost account list no longer names is not removed:
+                // the daemon restores it if its provider confirms the login.
+                let kept = id
+                    .as_str()
+                    .split_once('/')
+                    .and_then(|(_, key)| uuid::Uuid::parse_str(key).ok())
+                    .zip(homes.as_ref())
+                    .is_some_and(|(key, homes)| homes.is_unregistered(&accounts, spec.provider, key));
+                if kept {
+                    "The selected provider account isn't in the account list, but its files are still on this device. cagents restores it if its provider still reports a sign-in to it, so try again shortly; otherwise choose another account.".into()
+                } else {
+                    "The selected provider account was removed".into()
+                }
+            }),
         None => {
             let preferred = accounts.project_default_account(
                 &spec.target.repository,
