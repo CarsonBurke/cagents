@@ -778,6 +778,55 @@ impl DiffModel {
         }
     }
 
+    /// The new-side source line at logical `row`, or the nearest one after
+    /// it, then before it: a deleted row has none of its own.
+    pub fn new_line_at_row(&self, mode: DiffMode, row: usize) -> Option<u32> {
+        fn nearest(
+            lines: impl DoubleEndedIterator<Item = Option<u32>> + Clone,
+            row: usize,
+        ) -> Option<u32> {
+            lines
+                .clone()
+                .skip(row)
+                .flatten()
+                .next()
+                .or_else(|| lines.take(row).flatten().last())
+        }
+        match mode {
+            DiffMode::Inline => nearest(self.inline_rows.iter().map(|row| row.new_line), row),
+            DiffMode::Split => nearest(self.split_rows.iter().map(|row| row.new_line), row),
+        }
+    }
+
+    /// The logical row that shows new-side source `line`: the first row at
+    /// or after it, moved up over the deleted rows directly above so a
+    /// change to the line stays in view. Past the end it is the last row,
+    /// and the top when the new side has no lines. `None` without rows.
+    pub fn row_at_new_line(&self, mode: DiffMode, line: u32) -> Option<usize> {
+        fn row(lines: &[Option<u32>], line: u32) -> Option<usize> {
+            if lines.is_empty() {
+                return None;
+            }
+            let Some(at) = lines
+                .iter()
+                .position(|new| new.is_some_and(|new| new >= line))
+            else {
+                return Some(if lines.iter().any(Option::is_some) {
+                    lines.len() - 1
+                } else {
+                    0
+                });
+            };
+            let deleted = lines[..at].iter().rev().take_while(|new| new.is_none());
+            Some(at - deleted.count())
+        }
+        let lines: Vec<Option<u32>> = match mode {
+            DiffMode::Inline => self.inline_rows.iter().map(|row| row.new_line).collect(),
+            DiffMode::Split => self.split_rows.iter().map(|row| row.new_line).collect(),
+        };
+        row(&lines, line)
+    }
+
     /// The syntax theme this model's spans were coloured with, so a cached
     /// model can be rebuilt when the user changes the setting.
     #[must_use]
@@ -1748,6 +1797,33 @@ mod tests {
                     assert_eq!(actual[palette], expected, "{path}, {theme:?}, dark={dark}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn source_lines_map_to_rows_across_deleted_rows_in_both_layouts() {
+        let model = build_diff("one\ndeleted\ntwo\n", "one\ntwo\n");
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            let second = model.row_at_new_line(mode, 2).unwrap();
+            assert_eq!(model.new_line_at_row(mode, second), Some(2));
+            // The deleted row directly above line 2 stays in view.
+            assert_eq!(second, 1, "{mode:?}");
+            assert_eq!(model.row_at_new_line(mode, 1), Some(0));
+            assert_eq!(model.new_line_at_row(mode, 1), Some(2), "{mode:?}");
+            assert_eq!(model.new_line_at_row(mode, usize::MAX), Some(2));
+            assert_eq!(
+                model.row_at_new_line(mode, 99),
+                Some(model.row_count(mode) - 1)
+            );
+        }
+        assert_eq!(
+            build_diff("", "").row_at_new_line(DiffMode::Inline, 1),
+            None
+        );
+        // An emptied file has no new-side lines: it opens at the top.
+        let emptied = build_diff("one\ntwo\n", "");
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            assert_eq!(emptied.row_at_new_line(mode, 1), Some(0), "{mode:?}");
         }
     }
 

@@ -205,6 +205,15 @@ impl FoldReveals {
         }
     }
 
+    /// Reveals `rows` more of fold `fold` from its top, or from its bottom.
+    fn reveal(&mut self, fold: usize, from_top: bool, rows: usize) {
+        if self.0.len() <= fold {
+            self.0.resize(fold + 1, [0; 2]);
+        }
+        let revealed = &mut self.0[fold][usize::from(!from_top)];
+        *revealed = revealed.saturating_add(rows);
+    }
+
     fn get(&self, fold: usize) -> [usize; 2] {
         self.0.get(fold).copied().unwrap_or_default()
     }
@@ -472,6 +481,23 @@ impl DiffLayout {
             return false;
         }
         self.reveals.expand(fold, expansion);
+        self.rebuild(model)
+    }
+
+    /// Shows model `row` where a fold hides it, opening the fold from its
+    /// nearer end through [`FOLD_STEP`] rows past the row. The rest of the
+    /// run stays folded, so the changes beyond it remain in view.
+    pub fn reveal_row(&mut self, model: &DiffModel, mode: DiffMode, row: usize) -> bool {
+        let folded = &self.folded[layout_index(mode)];
+        let DisplayRow::Fold { fold, rows } = folded.row(folded.display(row)) else {
+            return false;
+        };
+        let (above, below) = (row - rows.start, rows.end - row);
+        if above <= below {
+            self.reveals.reveal(fold, true, above + 1 + FOLD_STEP);
+        } else {
+            self.reveals.reveal(fold, false, below + FOLD_STEP);
+        }
         self.rebuild(model)
     }
 
