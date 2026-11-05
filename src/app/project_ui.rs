@@ -2661,16 +2661,20 @@ mod tests {
     }
 
     fn removal_editor(app: &mut Cagents, target: &Target, dirty: bool) -> (CardId, LspDocumentId) {
+        removal_editor_at(app, target, dirty, "main.rs")
+    }
+
+    fn removal_editor_at(
+        app: &mut Cagents,
+        target: &Target,
+        dirty: bool,
+        file: &str,
+    ) -> (CardId, LspDocumentId) {
         let card = CardId::new();
         let mut runtime = if dirty {
             repository_widget::RepositoryRuntime::dirty_fixture(card)
         } else {
-            repository_widget::RepositoryRuntime::open_fixture(
-                card,
-                "main.rs",
-                "replacement buffer\n",
-            )
-            .0
+            repository_widget::RepositoryRuntime::open_fixture(card, file, "replacement buffer\n").0
         };
         let selected = runtime.selected_path().unwrap().to_owned();
         let view = RepositoryView {
@@ -2731,7 +2735,8 @@ mod tests {
                 )),
             );
             let capture = app.capture_worktree_removal(&target);
-            let (successor, new_doc) = removal_editor(&mut app, &target, false);
+            // Another file: one file's language tools have one owning pane.
+            let (successor, new_doc) = removal_editor_at(&mut app, &target, false, "lib.rs");
             let before = app.card_state(successor).unwrap().clone();
             let scope = app.durable.card_scopes[&successor].clone();
             let action = Action::Deleted {
