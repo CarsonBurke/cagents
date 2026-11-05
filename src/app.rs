@@ -29187,13 +29187,16 @@ mod tests {
                         .collect(),
                 })),
             );
-            let first = app.source_control_mutations[&key.canonical_path];
-            assert_eq!(first.kind, MutationKind::Stage);
+            let first = {
+                let mutation = &app.source_control_mutations[&key.canonical_path];
+                (mutation.id, mutation.kind)
+            };
+            assert_eq!(first.1, MutationKind::Stage);
             let report = mutation_report("Stage", Ok(outcome));
             assert!(report.is_some());
             drop(app.update(Message::SourceControlMutated {
                 key: key.clone(),
-                operation: first.id,
+                operation: first.0,
                 report,
                 committed: false,
             }));
@@ -29209,9 +29212,12 @@ mod tests {
                     old_path: None,
                 }],
             })));
-            let second = app.source_control_mutations[&key.canonical_path];
-            assert_eq!(second.kind, MutationKind::Stage);
-            assert_ne!(second.id, first.id);
+            let second = {
+                let mutation = &app.source_control_mutations[&key.canonical_path];
+                (mutation.id, mutation.kind)
+            };
+            assert_eq!(second.1, MutationKind::Stage);
+            assert_ne!(second.0, first.0);
             let report = mutation_report(
                 "Stage",
                 Ok(MutationOutcome::Applied {
@@ -29221,7 +29227,7 @@ mod tests {
             assert!(report.is_none());
             drop(app.update(Message::SourceControlMutated {
                 key: key.clone(),
-                operation: second.id,
+                operation: second.0,
                 report,
                 committed: false,
             }));
