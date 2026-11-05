@@ -152,6 +152,7 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
 /// exclusion (final Detach, handoff commit, failed startup, unpinned pane) must
 /// wake it. Only terminal data and read traffic is exempt: a request missing
 /// here costs one maintenance pass, while the reverse would strand a worker.
+/// Startup reservations can also drop off the request path, so they wake too.
 fn may_release_retention(request: &ClientRequest) -> bool {
     !matches!(
         request,

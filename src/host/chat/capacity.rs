@@ -204,7 +204,6 @@ impl Drop for Reservation {
         if state.chat_spawning.get(&self.source.id) == Some(&self.source) {
             state.chat_spawning.remove(&self.source.id);
             state.inventory_generation += 1;
-            // An off-request startup can be the last retention exclusion.
             crate::daemon::wake();
         }
     }
