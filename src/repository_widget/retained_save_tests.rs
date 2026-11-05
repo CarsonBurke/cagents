@@ -105,6 +105,13 @@ pub(super) struct TaskTrace {
     details: Vec<String>,
 }
 
+impl TaskTrace {
+    /// Whether an actual file-worker completion reached the runtime.
+    pub(super) fn answered(&self) -> bool {
+        !self.reads.is_empty()
+    }
+}
+
 fn load_state(runtime: &RepositoryRuntime) -> String {
     let document = match &runtime.document {
         DocumentState::None => "None".to_owned(),
