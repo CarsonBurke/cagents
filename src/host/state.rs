@@ -605,12 +605,16 @@ impl HostState {
         activation
     }
 
-    pub(super) fn notification_sessions_unchanged(
+    pub(super) fn notification_sessions_claimed(
         &self,
         presence: &crate::notifications::Presence,
     ) -> bool {
         self.notification_watchers.values().any(|current| {
-            current.destination() == presence.destination() && current.sessions == presence.sessions
+            current.destination() == presence.destination()
+                && presence
+                    .sessions
+                    .iter()
+                    .all(|session| current.sessions.contains(session))
         })
     }
 

@@ -75,6 +75,9 @@ use crate::{
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+// A live close may outlast a slow commit or shared request at the daemon's fence
+// before its own teardown. Timing out earlier would call that wait unresponsive.
+const TERMINAL_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
 // Close is acknowledged only after interruption and process teardown. Allow
 // those grace periods plus time to schedule the worker and deliver its reply.
 const CHAT_CLOSE_TIMEOUT: Duration = crate::chat::INTERRUPT_TIMEOUT
@@ -1130,8 +1133,16 @@ impl ControlClient {
 
     pub fn close_terminal(&mut self, terminal_id: TerminalId) -> Result<(), ControlError> {
         self.attach_and_synchronize(terminal_id)?;
-        let action =
-            self.expect_accepted(ClientRequest::ShutdownTerminal { terminal_id }, terminal_id);
+        let action = self
+            .request_attached_with_deadline(
+                ClientRequest::ShutdownTerminal { terminal_id },
+                terminal_id,
+                Instant::now() + TERMINAL_CLOSE_TIMEOUT,
+            )
+            .and_then(|response| match response {
+                ServerResponse::Accepted => Ok(()),
+                response => Err(unexpected_response("request acceptance", &response)),
+            });
         match action {
             // Accepted confirms retirement, which already removed this
             // subscription. Detaching that retired ID would hide success.
@@ -1170,12 +1181,13 @@ impl ControlClient {
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         self.attach_and_synchronize(terminal_id)?;
         let action = self
-            .request_attached(
+            .request_attached_with_deadline(
                 ClientRequest::CloseTerminalChecked {
                     terminal_id,
                     allow_active,
                 },
                 terminal_id,
+                Instant::now() + TERMINAL_CLOSE_TIMEOUT,
             )
             .and_then(|response| match response {
                 ServerResponse::TerminalCloseChecked {
@@ -1630,7 +1642,25 @@ impl ControlClient {
         request: ClientRequest,
         deadline: Instant,
     ) -> Result<ServerResponse, ControlError> {
-        let result = self.request_inner(request, None, Some(deadline));
+        self.request_until(request, None, deadline)
+    }
+
+    fn request_attached_with_deadline(
+        &mut self,
+        request: ClientRequest,
+        terminal_id: TerminalId,
+        deadline: Instant,
+    ) -> Result<ServerResponse, ControlError> {
+        self.request_until(request, Some(terminal_id), deadline)
+    }
+
+    fn request_until(
+        &mut self,
+        request: ClientRequest,
+        streaming_terminal: Option<TerminalId>,
+        deadline: Instant,
+    ) -> Result<ServerResponse, ControlError> {
+        let result = self.request_inner(request, streaming_terminal, Some(deadline));
         let read_restored = self.restore_read_timeout();
         let write_restored = self
             .stream
@@ -6691,6 +6721,9 @@ mod tests {
             if peer_case == "disconnect" {
                 return;
             }
+            if peer_case == "late-closed" {
+                thread::sleep(IO_TIMEOUT + Duration::from_millis(500));
+            }
             let message = match peer_case.as_str() {
                 "remote-error" => ServerMessage::Error(ProtocolError::new(
                     ProtocolErrorCode::TerminalUnavailable,
@@ -6729,7 +6762,7 @@ mod tests {
             }
             write_frame(&mut server_stream, &envelope).unwrap();
             let mut next = 4;
-            if peer_case != "closed" {
+            if !matches!(peer_case.as_str(), "closed" | "late-closed") {
                 assert_eq!(
                     request(&mut server_stream, &pinned, next),
                     ClientRequest::Detach { terminal_id: id },
@@ -6790,6 +6823,16 @@ mod tests {
         for checked in [false, true] {
             assert_eq!(
                 public_terminal_close_exchange(checked, "closed").unwrap(),
+                terminal::ipc::TerminalCloseResult::Closed
+            );
+        }
+    }
+
+    #[test]
+    fn live_terminal_closes_outlast_the_ordinary_reply_timeout() {
+        for checked in [false, true] {
+            assert_eq!(
+                public_terminal_close_exchange(checked, "late-closed").unwrap(),
                 terminal::ipc::TerminalCloseResult::Closed
             );
         }
@@ -7128,7 +7171,9 @@ mod tests {
                 return;
             }
             if ending == "timeout" {
-                wait.recv_timeout(Duration::from_secs(2)).unwrap();
+                // A close's own deadline restores IO_TIMEOUT before this Detach.
+                wait.recv_timeout(IO_TIMEOUT + Duration::from_secs(3))
+                    .unwrap();
                 return;
             }
             if ending == "malformed" {

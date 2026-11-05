@@ -634,6 +634,7 @@ struct TerminalCloseRetirement {
     proof: Arc<HostSessionProof>,
     generation: Result<Option<String>, String>,
     ticket: uuid::Uuid,
+    deadline: Instant,
     _interrupted: ExplicitCloseGuard,
     previous: Option<super::state::Retirement>,
 }
@@ -669,7 +670,8 @@ impl Drop for ExplicitCloseGuard {
     }
 }
 
-/// Close outlasts a slow commit or shared request here, then asks for a retry.
+/// One close outlasts a slow commit or shared request, then asks for a retry.
+/// The client allows TERMINAL_CLOSE_TIMEOUT, which also covers its teardown.
 const CLOSE_FENCE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Take the writer only while it is free and read the saved pin under it. A
@@ -679,9 +681,9 @@ fn close_fence<'gate>(
     host: &SharedHost,
     gate: &'gate RwLock<()>,
     terminal: crate::model::TerminalId,
+    deadline: Instant,
 ) -> Result<(RwLockWriteGuard<'gate, ()>, Result<Option<String>, String>), ProtocolError> {
     let registry = super::agent_execution::registry(host);
-    let deadline = Instant::now() + CLOSE_FENCE_BUDGET;
     loop {
         let admission = match gate.try_write() {
             Ok(admission) => Some(admission),
@@ -726,7 +728,8 @@ fn reserve_terminal_close(
     generation: Result<Option<String>, String>,
 ) -> Result<TerminalCloseRetirement, ProtocolError> {
     let gate = control_gate(host);
-    let (_admission, current) = close_fence(host, &gate, terminal)?;
+    let deadline = Instant::now() + CLOSE_FENCE_BUDGET;
+    let (_admission, current) = close_fence(host, &gate, terminal, deadline)?;
     ensure_terminal_close_open(host)?;
     let unavailable =
         |message| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true);
@@ -797,6 +800,7 @@ fn reserve_terminal_close(
             proof: state.proof_handle(),
             generation,
             ticket: entry.ticket,
+            deadline,
             _interrupted: ExplicitCloseGuard {
                 host: Arc::downgrade(host),
                 terminal,
@@ -844,7 +848,7 @@ fn finish_terminal_close(
         return Err(error(message));
     }
     let gate = control_gate(host);
-    let (mut admission, current) = close_fence(host, &gate, close.terminal)?;
+    let (mut admission, current) = close_fence(host, &gate, close.terminal, close.deadline)?;
     ensure_terminal_close_open(host)?;
     // None is a known unpinned local window, not an unavailable Registry.
     // The writer also drains publications that passed their initial check
@@ -894,7 +898,7 @@ fn finish_terminal_close(
             }
             return Err(error(message));
         }
-        let (fenced, current) = close_fence(host, &gate, close.terminal)?;
+        let (fenced, current) = close_fence(host, &gate, close.terminal, close.deadline)?;
         admission = fenced;
         ensure_terminal_close_open(host)?;
         let current = current.map_err(|cause| {
@@ -1273,12 +1277,12 @@ pub(super) fn process_request(
                 ));
             }
             if presence.application == crate::notifications::Application::Cagents {
-                let (registry, unchanged) = {
+                let (registry, claimed) = {
                     let state = host.lock().unwrap_or_else(|p| p.into_inner());
                     state.ensure_retention_available(&presence.sessions)?;
                     (
                         state.execution_registry.clone(),
-                        state.notification_sessions_unchanged(&presence),
+                        state.notification_sessions_claimed(&presence),
                     )
                 };
                 // The shared control reader spans selection and publication;
@@ -1290,7 +1294,7 @@ pub(super) fn process_request(
                     let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
                     // Windows republish on any workspace change. Only a new
                     // claim, or a pin that a close removed, needs this fsync.
-                    let mut pinned = unchanged;
+                    let mut pinned = claimed;
                     for terminal in &presence.sessions {
                         pinned = pinned
                             && registry
@@ -3036,6 +3040,42 @@ pub(in crate::host) mod tests {
     }
 
     #[test]
+    fn a_close_refused_after_removing_its_pin_can_retry() {
+        let (host, _directory, session, handle) = retention_client_host("close-refused");
+        let id = session.id;
+        process_request(
+            &host,
+            1,
+            ClientRequest::NotificationPresence {
+                presence: terminal_presence(id),
+            },
+        )
+        .unwrap();
+        let pin = retention_pin_generation(&host, id);
+        handle.shutdown().unwrap();
+        let gate = control_gate(&host);
+        let slow_request = gate.read().unwrap();
+        let refusal = close_fence(&host, &gate, id, Instant::now()).unwrap_err();
+        assert_eq!(refusal.code, ProtocolErrorCode::TerminalUnavailable);
+        assert!(refusal.retryable);
+        drop(slow_request);
+
+        let source = host.lock().unwrap().terminals[&id].session.clone();
+        let close = reserve_terminal_close(&host, id, &handle, &source, None, pin.clone()).unwrap();
+        super::super::agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .forget_retention_pin(id, pin.as_ref().unwrap().as_ref().unwrap())
+            .unwrap();
+        drop(close);
+        assert!(host.lock().unwrap().terminals.contains_key(&id));
+
+        finish_test_terminal_close(&host, id, &handle, Ok(None)).unwrap();
+        assert!(!host.lock().unwrap().terminals.contains_key(&id));
+    }
+
+    #[test]
     fn republishing_an_unchanged_window_commits_only_to_restore_its_claim() {
         let (host, _directory, session, _handle) = retention_client_host("republish");
         let id = session.id;
@@ -3053,6 +3093,15 @@ pub(in crate::host) mod tests {
         };
         let claimed = retention_pin_generation(&host, id);
         assert!(claimed.as_ref().unwrap().is_some());
+        publish(terminal_presence(id));
+        assert_eq!(retention_pin_generation(&host, id), claimed);
+
+        // Dropping another card from the window claims nothing new either.
+        let other = TerminalId::new();
+        let mut both = terminal_presence(id);
+        both.sessions.push(other);
+        publish(both);
+        let claimed = retention_pin_generation(&host, id);
         publish(terminal_presence(id));
         assert_eq!(retention_pin_generation(&host, id), claimed);
 
