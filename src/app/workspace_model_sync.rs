@@ -3406,6 +3406,96 @@ mod tests {
         }
     }
 
+    /// A managed terminal can fail to attach before a snapshot fences it, as
+    /// when the daemon is replaced while the app runs. Neither its body nor
+    /// any Retry route may reattach or relaunch its stale session.
+    #[test]
+    fn fenced_terminal_whose_attachment_failed_cannot_be_retried() {
+        use crate::agent_execution::{
+            Agent, HostedSession, Origin, Placement, Spec, Surface, Target,
+        };
+        use crate::workspace_model::views::{Pane, Scope, View};
+        let (mut app, project, repository) = app_with_project();
+        let channel = ChannelId::new();
+        let sibling = app.durable.cards[0].id;
+        let CardKind::Terminal(mut registered) = super::super::tests::terminal_card_state().kind
+        else {
+            unreachable!()
+        };
+        registered.launch.working_directory = "/repo".into();
+        let live = |boot: &str| TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("managed-host"),
+            boot_id: crate::model::BootId::new(boot),
+            host_incarnation: crate::model::HostIncarnation::new("managed-incarnation"),
+        };
+        registered.continuity = live("previous-boot");
+        let mut current = registered.clone();
+        current.continuity = live("current-boot");
+        let agent = Agent {
+            id: crate::model::AgentId::new(),
+            name: None,
+            origin: Origin::User,
+            spec: Spec {
+                provider: crate::agent::Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: repository.clone(),
+                    directory: "/repo".into(),
+                    placement: Some(Placement::Channel(channel)),
+                },
+                surface: Surface::Terminal,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: Placement::Channel(channel),
+            session: Some(HostedSession::Terminal(registered.clone())),
+            console: Some(registered.clone()),
+            created_ms: 0,
+            closed: false,
+        };
+        let managed = CardId::from_uuid(agent.id.as_uuid());
+        let mut kept = super::super::tests::terminal_card_state();
+        kept.id = managed;
+        kept.kind = CardKind::Terminal(registered);
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(kept);
+        let mut local_channel = local(channel, project, "Channel", 0);
+        local_channel.cards = vec![sibling, managed];
+        local_channel.focused = Some(managed);
+        durable.channels.push(local_channel);
+        durable.active_channel = Some(channel);
+        let mut model = registry(vec![shared(channel, &repository, "Channel", 0)]);
+        model.views.push(View {
+            scope: Scope::Channel(channel),
+            revision: 3,
+            panes: vec![Pane {
+                id: managed,
+                title: "Canonical title".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 0.8,
+                kind: CardKind::Terminal(current),
+                scope: Some("/repo".into()),
+            }],
+            retired: vec![],
+        });
+        model.agents.push(agent);
+        let _published = intercept_publishes(&mut app);
+        drop(app.apply_workspace_model_update(ModelUpdate::Connected(model)));
+        assert!(app.shared_views.quarantined.contains(&managed));
+
+        app.cards
+            .insert(managed, CardRuntime::Failed("connection lost".into()));
+        drop(app.update(Message::RetryCard(managed)));
+        assert!(
+            matches!(app.cards.get(&managed), Some(CardRuntime::Failed(_))),
+            "Retry must leave a fenced pane as it is"
+        );
+        assert!(!app.terminal_start_in_flight(managed));
+        assert!(!app.terminal_retry_pending(managed));
+    }
+
     #[test]
     fn attention_unpublished_managed_adoption_requires_complete_source_proof() {
         let (mut app, mut agent, _, _) = managed_display_fixture();

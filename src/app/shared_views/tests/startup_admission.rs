@@ -625,6 +625,10 @@ fn local_only_cached_chat_still_restores_and_preserves_its_draft() {
 }
 
 fn visible_text(app: &Cagents, card: CardId) -> String {
+    element_text(app.chat_view(card))
+}
+
+fn element_text(mut element: cosmic::Element<'_, Message>) -> String {
     use cosmic::iced::advanced::{
         Layout, layout,
         widget::{Operation, Tree},
@@ -640,7 +644,6 @@ fn visible_text(app: &Cagents, card: CardId) -> String {
         }
     }
     let renderer = crate::app::tests::headless_renderer();
-    let mut element = app.chat_view(card);
     let mut tree = Tree::new(element.as_widget());
     let node = element.as_widget_mut().layout(
         &mut tree,
@@ -763,15 +766,20 @@ fn retired_cached_draft_stays_readable_and_cannot_start_provider() {
     );
 }
 
-#[test]
-fn fenced_managed_chat_keeps_its_text_and_closes_without_stopping_a_session() {
-    if isolated("fenced_managed_chat_keeps_its_text_and_closes_without_stopping_a_session") {
-        return;
-    }
+/// A cached chat in the shown channel whose managed agent reports a later
+/// boot than the pane's saved proof, admitted so the pane is fenced.
+fn fenced_managed_chat(
+    text: &str,
+) -> (
+    ScriptedDaemon,
+    Cagents,
+    ChannelId,
+    Pane,
+    crate::workspace_model::WorkspaceModel,
+) {
     use crate::agent_execution::{Agent, HostedSession, Origin, Placement, Spec, Target};
     let daemon = ScriptedDaemon::start();
     let (mut app, active, hidden, pane, identity) = cached_chat();
-    let text = "Unsent text beside a stale session";
     Arc::make_mut(&mut app.durable).active_channel = Some(hidden);
     app.workspace = Cagents::rebuild_workspace(&app.durable);
     app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(pane.id, text.into())]));
@@ -810,6 +818,16 @@ fn fenced_managed_chat_keeps_its_text_and_closes_without_stopping_a_session() {
     model.agents = vec![agent];
     admit(&mut app, active, hidden, model.clone());
     assert!(app.shared_views.quarantined.contains(&pane.id));
+    (daemon, app, hidden, pane, model)
+}
+
+#[test]
+fn fenced_managed_chat_keeps_its_text_and_closes_without_stopping_a_session() {
+    if isolated("fenced_managed_chat_keeps_its_text_and_closes_without_stopping_a_session") {
+        return;
+    }
+    let text = "Unsent text beside a stale session";
+    let (daemon, mut app, hidden, pane, mut model) = fenced_managed_chat(text);
     assert!(app.chat_awaiting_admission(pane.id));
     let visible = visible_text(&app, pane.id);
     assert!(
@@ -848,6 +866,39 @@ fn fenced_managed_chat_keeps_its_text_and_closes_without_stopping_a_session() {
     assert!(
         daemon.requests().is_empty(),
         "a fenced pane must not reconnect or close its stale session"
+    );
+}
+
+#[test]
+fn fenced_pane_whose_attachment_failed_offers_no_retry() {
+    if isolated("fenced_pane_whose_attachment_failed_offers_no_retry") {
+        return;
+    }
+    // The pane failed to attach before a snapshot fenced it, as when the
+    // daemon is replaced while the app runs.
+    let (daemon, mut app, _, pane, _) = fenced_managed_chat("");
+    app.cards
+        .insert(pane.id, CardRuntime::Failed("connection lost".into()));
+    // The pane body, not the chat view: a failed runtime is drawn there.
+    let visible = element_text(app.card_view(pane.id, true, false));
+    assert!(
+        visible.contains("Agent connection unavailable")
+            && visible.contains(crate::app::shared_views::FENCED_PANE_EXPLANATION)
+            && !visible.contains("Retry")
+            && !visible.contains("connection lost"),
+        "{visible}"
+    );
+    // Retry also arrives from the inspector, outside the pane's own view.
+    let task = app.update(Message::RetryCard(pane.id));
+    settle(&mut app, task);
+    assert!(matches!(
+        app.cards.get(&pane.id),
+        Some(CardRuntime::Failed(_))
+    ));
+    assert!(app.card_state(pane.id).unwrap().existence.is_open());
+    assert!(
+        daemon.requests().is_empty(),
+        "a fenced pane must not reattach or relaunch its stale session"
     );
 }
 
