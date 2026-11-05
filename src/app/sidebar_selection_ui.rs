@@ -699,7 +699,7 @@ impl Cagents {
                         .collect::<Vec<_>>(),
                     "these worktrees",
                 ),
-                "Git will remove these worktree directories, including uncommitted and untracked files. \
+                "Git will remove these worktree directories, including uncommitted, untracked and ignored files such as .env. \
                  Unsaved editor changes are discarded. Their branches are retained. \
                  Terminals and chats running in them, including detached ones, are closed first.",
             ),

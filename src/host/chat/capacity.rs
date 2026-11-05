@@ -1193,7 +1193,10 @@ exit 0
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let snapshot = client.snapshot();
-            if (!read_only || snapshot.read_only_reason.is_some())
+            // A reader's single initial frame applies its history, read-only
+            // reason and exit one event at a time, so a view can attach between
+            // them. Release requires the settled reader, so wait for its exit.
+            if (!read_only || (snapshot.read_only_reason.is_some() && snapshot.exited))
                 && snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body")))
             {
                 return;
