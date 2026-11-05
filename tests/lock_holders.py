@@ -90,7 +90,7 @@ class LockHolders(unittest.TestCase):
         report = self.report()
         self.assertIn(f"holder {holder.pid} flock", report)
         self.assertIn("idle", report)
-        self.assertNotIn("WARNING", report)
+        self.assertNotIn("isn't a recognized", report)
         self.assertIn("note: nothing holding this used CPU", report)
 
     def test_a_leftover_that_inherited_the_lock_is_named_and_left_running(self):
@@ -104,9 +104,23 @@ class LockHolders(unittest.TestCase):
         self.assertTrue(self.holds(), "the fixture must reproduce the inherited lock")
         report = self.report()
         self.assertIn(f"holder {daemon} sleep", report)
-        self.assertIn("WARNING", report)
+        self.assertIn("isn't a recognized build or session", report)
+        self.assertIn("idle during the sample", report)
+        self.assertIn("inherited the lock", report)
+        # It can't tell this from a script between its own steps, so never concludes.
+        self.assertIn("this can't tell which", report)
+        self.assertIn("Ask its owner", report)
+        self.assertNotIn("probably", report)
+        self.assertNotIn("WARNING", report)
         os.kill(daemon, 0)
         self.assertTrue(self.holds())
+
+    def test_a_holders_figure_is_labeled_as_its_process_age(self):
+        self.start("flock", str(self.lock), "sleep", "60")
+        self.wait_for(self.holds, "holder")
+        report = self.report()
+        self.assertRegex(report, r"process age \d+:\d\d:\d\d")
+        self.assertNotIn(", up ", report)
 
     def test_a_wrapper_script_running_a_build_raises_no_warning(self):
         # Named cargo, so it counts as a build though the script closes the lock for it.
@@ -119,7 +133,7 @@ class LockHolders(unittest.TestCase):
         self.start(str(wrapper_with_child))
         self.wait_for(self.holds, "holder")
         self.wait_for(lambda: "outer.sh" in self.report(), "the report")
-        self.assertNotIn("WARNING", self.report())
+        self.assertNotIn("isn't a recognized", self.report())
 
     def test_a_holder_with_a_busy_child_gets_no_idle_note(self):
         self.start("flock", "--close", str(self.lock), "sh", "-c", "while :; do :; done")
@@ -151,7 +165,7 @@ class LockHolders(unittest.TestCase):
                 program.chmod(0o755)
                 self.start(str(program))
                 self.wait_for(self.holds, "holder")
-                self.assertNotIn("WARNING", self.report())
+                self.assertNotIn("isn't a recognized", self.report())
                 self.end_processes()
                 self.pids.clear()
                 self.processes.clear()

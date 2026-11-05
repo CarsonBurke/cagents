@@ -5,8 +5,9 @@ import os
 import sys
 import time
 
-# A live holder has one of these among it and its descendants. Wrapper scripts and
-# whatever they start vary too much to list. Names only say what a process looks like.
+# A recognized holder has one of these among it and its descendants. Wrapper scripts
+# and whatever they start vary too much to list, so another holder is not thereby a
+# leftover. Names only say what a process looks like.
 LEGITIMATE = {"cargo", "cargo-gate", "flock", "kwin_wayland", "native-evidence", "niri", "rustc"}
 # Run as `sh PATH`, or longer than a kernel process name.
 SCRIPTS = {
@@ -126,7 +127,7 @@ def subtree(pid, parents):
     return members
 
 
-def uptime(pid):
+def age(pid):
     fields = stat_fields(pid)
     if not fields:
         return "?"
@@ -149,7 +150,7 @@ def describe(pid, before, after, parents):
         directory = "?"
     return (
         f"{pid} {fields[0]}, {activity} with {len(members) - 1} descendants, "
-        f"up {uptime(pid)}, in {directory}\n      {command[:200]}"
+        f"process age {age(pid)}, in {directory}\n      {command[:200]}"
     )
 
 
@@ -169,8 +170,11 @@ def main(arguments):
     if arguments[:1] in (["-h"], ["--help"]):
         print(__doc__)
         print("Usage: scripts/lock-holders [LOCK...]  (default: /var/tmp/cagents-*.lock*)")
+        print("A holder's process age includes any time it queued: the kernel doesn't record")
+        print("when a lock was taken.")
         return 0
     locks = arguments or default_locks()
+    # The kernel doesn't record when a lock was taken, so only a process's age can be shown.
     holders, waiters = scan({os.path.realpath(lock) for lock in locks})
     recorded = hidden_lockers()
     before, _ = cpu_ticks()
@@ -194,19 +198,18 @@ def main(arguments):
         if hidden:
             print(f"  holder {hidden}, recorded by /proc/locks; its descriptors aren't readable here")
         family = set().union(*(subtree(pid, parents) for pid in held)) if held else set()
+        idle = not any(after.get(p, 0) > before.get(p, 0) for p in family)
         if held and not any(looks_legitimate(p) for p in family):
             print(
-                "  WARNING: nothing holding this is running a build or session, so a leftover "
-                "process probably inherited it. Everyone queued waits until that process exits."
+                f"  note: this isn't a recognized build or session, and it was "
+                f"{'idle' if idle else 'busy'} during the sample. It could be between steps of "
+                "its own, or could have inherited the lock from a process that exited; this "
+                "can't tell which. Everyone queued waits until it releases the lock. Ask its "
+                "owner before acting on it."
             )
         # The head of a gate's queue is idle by design while it waits for a slot.
-        elif held and not lock.endswith(".queue") and not any(
-            after.get(p, 0) > before.get(p, 0) for p in family
-        ):
-            print(
-                "  note: nothing holding this used CPU during the sample. If that lasts, "
-                "check whether these are a leftover."
-            )
+        elif held and idle and not lock.endswith(".queue"):
+            print("  note: nothing holding this used CPU during the sample.")
         if waiting:
             print(f"  {len(waiting)} waiting: {' '.join(map(str, sorted(waiting)))}")
     return 0
