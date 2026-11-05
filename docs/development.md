@@ -333,18 +333,26 @@ scripts/cargo-gate check --locked --no-default-features --features ui --bin cage
 scripts/cargo-gate test --locked --no-default-features --features host --all-targets
 ```
 
-The gate admits a few builds at once: one per 8 GiB of RAM after an 8 GiB
-reserve, at most one per 8 CPUs. A build starts beside others only while
-8 GiB is actually available; one `cagents` build peaked at 6.5 GiB with 12
-jobs. With several slots each build gets an equal
-share of the CPUs as `CARGO_BUILD_JOBS`, which also caps a larger value; `-j`
-still wins. For `test`, `bench` and `run` only the build holds a slot, and the
-tests or program run after it is released, so do not wrap the gate in another
-lock. Rustdoc compiles doctests while they run, so `cargo test --doc` keeps
-its slot throughout; a plain `cargo test` compiles its doctests after the
-slot is released. The development runner builds its matched set through the
-gate itself, and skips the gate when the set is
-[already current](#up-to-date-launches).
+The gate admits several builds at once, up to one per 4 GiB of RAM after an 8
+GiB reserve and at most one per 4 CPUs. Builds spend most of their time in a
+few crates that compile or link on one CPU, so each busies about 1.4 CPUs on
+average, and memory decides how many fit. Each build has an expected peak: 3
+GiB for anything in the CLI lane, 4 GiB for other checks, 7 GiB for a host
+build or test build, 9 GiB for a UI one and 8 GiB for an `exec` script such as
+the development runner; a slot held by a plain `flock` counts as 9 GiB.
+`CAGENTS_BUILD_COST_GIB` overrides it. A build starts beside others only when
+the memory available, less what the running builds are expected to take beyond
+what they already hold, covers its own; a lone build always starts. Each build
+gets a share of the CPUs among the builds running once it starts, between 4 and
+8 (the jobs the costs were measured with) and at most half the CPUs, as
+`CARGO_BUILD_JOBS`, which also caps a larger value; `-j` still wins. For
+`test`, `bench` and `run` only the build holds a slot, and the tests or program
+run after it is released, so do not wrap the gate in another lock. Rustdoc
+compiles doctests while they run, so `cargo test --doc` keeps its slot
+throughout; a plain `cargo test` compiles its doctests after the slot is
+released. The development runner builds its matched set through the gate
+itself, and skips the gate when the set is [already
+current](#up-to-date-launches).
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock /var/tmp/cagents-cargo.lock` takes exactly one
@@ -382,7 +390,54 @@ and `-j` takes precedence for a single invocation; with several build slots,
 `scripts/cargo-gate` sets or caps `CARGO_BUILD_JOBS` to a share of the CPUs.
 Run the isolated feature lanes one after another, each through the gate.
 
-Worktrees can share Cargo's target and build directories. Cargo makes path
+Give each worktree its own build directory, which the user-wide
+`build-dir = "/var/tmp/cargo-build{workspace-root}/target"` setting already
+does; do not point several worktrees at one with `CARGO_BUILD_BUILD_DIR`.
+Cargo names a workspace crate's artifacts by its path relative to the
+workspace, so worktrees on different commits overwrite each other's `cagents`
+and vendored crates, and each build after another worktree's recompiles them:
+1–3 minutes of a build slot every time. A new worktree does not need to start
+cold. Before its first gated build, `scripts/cargo-gate` runs
+`scripts/seed-build-dir`, which copies the main checkout's compiled
+dependencies into the new build directory with btrfs reflinks. The copy takes
+under a minute and shares file data with the main checkout's until either side
+rewrites a file, so it costs only file system metadata. Cargo then rebuilds
+what differs: this checkout's own and vendored crates, which depend on the
+checkout path, and the crates that depend on them. Incremental caches are not
+copied. Seeding does nothing on a file system without reflinks, when the main
+checkout has no build, for a directory that has been built in, or with
+`CAGENTS_BUILD_SEED=0`; run `scripts/seed-build-dir` by hand to seed a
+directory a plain `cargo` would create. Seeded directories carry Cargo's
+`CACHEDIR.TAG`, so `prune-cargo-build-dirs` reclaims them after their worktree
+is removed.
+
+The gate's helpers run from the gate's own directory. Install a changed gate
+for every checkout with `scripts/install-cargo-gate`, never by copying
+`scripts/cargo-gate` alone: it stages the gate with its helpers, checks that
+the staged gate runs a command, renames them into `/var/tmp`, and checks the
+result.
+
+Build directories share one disk. When the file system holding them has less
+than twice a floor free (5% of its size, at most 64 GiB), `scripts/cargo-gate`
+runs `scripts/build-disk-guard`, which reclaims removed worktrees' build
+directories at once with `prune-cargo-build-dirs`, at most every ten minutes
+across the host; idle live worktrees' are left to the pruner's own schedule.
+Below the floor it refuses the build and says why. Remove worktrees you no
+longer need; their build directories follow. Set `CAGENTS_BUILD_FREE_FLOOR_GIB`
+to change the floor, or `0` to disable the guard.
+
+The build script that stamps `--version` reruns only when the stamp could
+change, because each rerun recompiles `cagents`. It watches this checkout's
+`HEAD` and `HEAD` reflog. While the checkout is clean it also watches the
+compiled sources (`src`, `crates`, `vendor`, `assets`, `packaging`,
+`fixtures`, `tests/fixtures`, the manifest, lockfile, toolchain, Cargo
+configuration and build script), and while it is dirty, the index, which
+restoring or stashing rewrites. It reads `git status` without refreshing the
+index, and it does not watch the shared `packed-refs`, which pruning or
+deleting any branch rewrites. An edit outside those sources, or undoing an edit
+by hand, updates the `.dirty` suffix at the next rerun.
+
+Worktrees that do share a build directory stay correct. Cargo makes path
 packages relocatable and compares source timestamps, so an older checkout can
 otherwise reuse another checkout's code and version stamp. The local Cargo
 configuration supplies `CAGENTS_CHECKOUT_ROOT`; our workspace crates track it
