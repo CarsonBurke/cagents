@@ -843,9 +843,13 @@ class MemoryAdmission(TwoSlots):
         except subprocess.TimeoutExpired:
             waiter.kill()
             status = waiter.wait()
-            self.assertNotIn("unbound", waiter.stderr.read())
+            stderr = waiter.stderr.read()
+            self.assertNotIn("unbound", stderr)
         else:
-            self.assertEqual(status, 0, waiter.stderr.read())
+            stderr = waiter.stderr.read()
+            self.assertEqual(status, 0, stderr)
+        # Its missing cost file is expected, not an error to report.
+        self.assertNotIn("No such file", stderr)
         waiter.stderr.close()
 
     def test_an_invalid_cost_is_refused(self):
@@ -952,6 +956,13 @@ class CpuPressureAdmission(TwoSlots):
         self.held_slot(2, f"{{pid}} 1\n{self.uptime()}\n")
         with self.assertRaises(subprocess.TimeoutExpired):
             self.build(1, timeout=2)
+
+    def test_a_start_from_before_a_reboot_has_settled(self):
+        self.report("0.00")
+        self.env |= {"CAGENTS_BUILD_SLOTS": "3", "CAGENTS_BUILD_CPU_SETTLE_SECS": "60"}
+        self.held_slot(1, f"{{pid}} 1\n{self.uptime() + 10**6}\n")
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_settled_and_undated_running_builds_leave_room(self):
         # A build priced by a gate that does not date its start is not waited for.

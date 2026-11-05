@@ -191,8 +191,10 @@ uptime_seconds() {
 # pressure has room.
 cpu_allows() {
     [ "$pressure_limit" -gt 0 ] || return 0
-    if [ -n "$newest" ] && [ $(($(uptime_seconds) - newest)) -lt "$settle" ]; then
-        return 1
+    # A start after now is from before a reboot, whose holder's PID was reused.
+    if [ -n "$newest" ]; then
+        age=$(($(uptime_seconds) - newest))
+        [ "$age" -lt 0 ] || [ "$age" -ge "$settle" ] || return 1
     fi
     some=$(sed -n 's/^some avg10=\([0-9]*\)[.[:space:]].*/\1/p' "$pressure_file" 2>/dev/null) || some=
     [ -n "$some" ] || return 0
@@ -224,7 +226,7 @@ fits() {
             if ! flock -n 7; then
                 running=$((running + 1))
                 claim= holder= claimed= since=
-                { read -r holder claimed; read -r since; } <"$path.cost" 2>/dev/null || :
+                { read -r holder claimed; read -r since; } 2>/dev/null <"$path.cost" || :
                 case $holder:$claimed in
                     *[!0-9:]*|:*|*:) ;;
                     *)
