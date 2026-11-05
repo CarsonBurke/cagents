@@ -2731,6 +2731,9 @@ impl State {
                 .into(),
             widget::row::with_children(vec![
                 crate::ui_controls::field::select(
+                    "Pull request filter",
+                    "pull-requests.filter",
+                    "browser-filters",
                     &BrowserFilter::ALL,
                     Some(self.browser_filter as usize),
                     Action::BrowserFilterIndex,
