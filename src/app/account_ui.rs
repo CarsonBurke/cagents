@@ -6458,9 +6458,19 @@ mod app_tests {
             assert_eq!(app.account_ui.logins.len(), 1);
             assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Waiting);
             assert!(!app.account_ui.asking_host);
+            // Updates hand the pending notice to the notices list; the stale
+            // reply adds nothing after it.
             assert_eq!(
-                app.status.as_ref().unwrap().message,
-                "replacement is current"
+                app.notices
+                    .recent()
+                    .next()
+                    .map(|entry| entry.notice.message.as_str()),
+                Some("replacement is current")
+            );
+            assert!(
+                !app.notices
+                    .recent()
+                    .any(|entry| entry.notice.message.contains("old close failed"))
             );
         }
     }
@@ -6514,8 +6524,17 @@ mod app_tests {
                 assert_eq!(app.card_state(card), Some(&current), "{changed}");
                 assert!(!app.account_ui.asking_host, "{changed}");
                 assert_eq!(
-                    app.status.as_ref().unwrap().message,
-                    "current state",
+                    app.notices
+                        .recent()
+                        .next()
+                        .map(|entry| entry.notice.message.as_str()),
+                    Some("current state"),
+                    "{changed}"
+                );
+                assert!(
+                    !app.notices
+                        .recent()
+                        .any(|entry| entry.notice.message.contains("stale failure")),
                     "{changed}"
                 );
             }
@@ -6532,11 +6551,9 @@ mod app_tests {
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert!(!app.account_ui.asking_host);
         assert!(
-            app.status
-                .as_ref()
-                .unwrap()
-                .message
-                .contains("original unavailable")
+            app.notices
+                .recent()
+                .any(|entry| entry.notice.message.contains("original unavailable"))
         );
         // An original close acknowledged after returning to its strip must
         // retain the visible card; normal strip close still owns its surface.
@@ -9328,7 +9345,14 @@ mod app_tests {
         let id = app.account_ui.add_managed_fixture(Provider::Claude, 912);
         let recipe = recipe_on(&app, &id);
         let now = now_ms();
-        app.account_ui.account_mut(&id).unwrap().present = true;
+        {
+            // An earlier probe read this account's usage.
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = true;
+            let mut probed = UsageSnapshot::state(UsageStatus::Ok, "", now - 60_000);
+            probed.detail = None;
+            state.snapshot = Some(probed);
+        }
         // The CLI remains installed, but this account's home was moved aside.
         let _ = app.locate_accounts();
         let restored = app
@@ -9436,7 +9460,7 @@ mod app_tests {
         let _ = app.account_reported(
             Provider::Claude,
             &recipe,
-            vec![(claude_report(0.4), now_ms())],
+            vec![(claude_report(0.4), now_ms() + 1_000)],
         );
         assert_eq!(app.account_ui.account(&id).unwrap().failure, None);
     }
