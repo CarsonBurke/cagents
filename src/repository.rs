@@ -8009,11 +8009,26 @@ mod tests {
                     "initial",
                 ],
             );
+            // Git 2.56 refuses `remote add` for a name nested under an existing
+            // remote, but clones configured earlier, or by hand, still carry
+            // both; configure them directly as such a clone would.
             for name in ["team", "team/nested"] {
                 let unavailable = root.join(format!("missing-{}.git", name.replace('/', "-")));
                 git(
                     root,
-                    &["remote", "add", name, unavailable.to_str().unwrap()],
+                    &[
+                        "config",
+                        &format!("remote.{name}.url"),
+                        unavailable.to_str().unwrap(),
+                    ],
+                );
+                git(
+                    root,
+                    &[
+                        "config",
+                        &format!("remote.{name}.fetch"),
+                        &format!("+refs/heads/*:refs/remotes/{name}/*"),
+                    ],
                 );
             }
             // No fetch or symbolic remote HEAD: the configured remote names
@@ -13465,8 +13480,11 @@ mod worktree_journal_tests {
             fixture.git(&["config", "branch.topic.remote"]),
             "team/nested"
         );
+        // The created local `topic` now takes precedence over the shorthand,
+        // so name the remote explicitly: its slash must not split it as
+        // remote `team`, branch `nested/topic`.
         let mut input = fixture.input("from-cached-topic");
-        input.base = "topic".into();
+        input.base = "team/nested/topic".into();
         fixture.resolve(input);
         assert!(
             matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/team/nested/topic")
