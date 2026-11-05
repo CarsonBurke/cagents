@@ -2639,7 +2639,9 @@ impl Actor {
                 // A parsing budget can leave complete lines queued even after
                 // the pipe closes. Keep fair poll passes until those drain. Input
                 // the provider stopped reading no longer holds the actor open.
-                if stdout_eof && (self.pending.is_empty() || stdin_closed.is_some()) && !frames_ready
+                if stdout_eof
+                    && (self.pending.is_empty() || stdin_closed.is_some())
+                    && !frames_ready
                 {
                     if !self.output.is_empty() {
                         return Err(with_ignored_output(
