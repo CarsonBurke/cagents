@@ -384,7 +384,8 @@ pub enum ModelEdit {
         /// The panes the user reviewed when confirming. The registry refuses
         /// the deletion if the channel's canonical view has gained any other
         /// pane since, because deleting retires every current placement.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// `None` for a deletion with nothing to review, such as one the CLI
+        /// issues.
         reviewed: Option<Vec<crate::model::CardId>>,
     },
     /// Daemon-only invalidation after a committed execution descriptor change.
