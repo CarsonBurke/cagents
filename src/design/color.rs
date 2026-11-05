@@ -158,6 +158,13 @@ pub fn accent_wash(theme: &Theme) -> Color {
     mix(base(theme), theme.cosmic().accent.base.into(), 0.14)
 }
 
+/// The ground selected text sits on. Text keeps its own color over it, so it
+/// is a tint rather than the accent itself: a link, drawn in the accent,
+/// would otherwise vanish into its own selection.
+pub fn selection_wash(theme: &Theme) -> Color {
+    mix(base(theme), theme.cosmic().accent.base.into(), 0.4)
+}
+
 pub fn accent_color(theme: &Theme) -> Color {
     theme.cosmic().accent.base.into()
 }
@@ -293,6 +300,30 @@ pub fn budget_tone(used: f32) -> fn(&Theme) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A selected link is drawn in the accent over the selection, so the two
+    /// must stay apart in both themes.
+    #[test]
+    fn a_selected_link_stays_legible() {
+        let luminance = |color: Color| {
+            let channel = |c: f32| {
+                if c <= 0.039_28 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+        };
+        let contrast = |a: Color, b: Color| {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        };
+        for theme in [Theme::dark(), Theme::light()] {
+            let ratio = contrast(accent_color(&theme), selection_wash(&theme));
+            assert!(ratio >= 2.0, "{ratio}");
+        }
+    }
 
     #[test]
     fn rules_sit_a_fifth_closer_to_their_surface_and_stay_opaque() {
