@@ -996,6 +996,13 @@ const RAIL_BREAKPOINT: f32 = 560.0;
 /// Card width below which two category columns no longer fit their labels,
 /// so the picker collapses to a single dropdown under the search field.
 const RAIL_WIDTH: f32 = 42.0 * design::GRID_UNIT;
+/// How narrow a shortcut's action name may become beside its keys before the
+/// keys move beneath it: room for a short name, such as "Close pane", or about
+/// half of a long one on each of two lines.
+const SHORTCUT_LABEL_MIN_WIDTH: f32 = 120.0;
+/// Holds a Terminal checkbox or a "Scoped" caption, so every row keeps the
+/// policy column aligned.
+const SHORTCUT_POLICY_WIDTH: f32 = 96.0;
 
 /// The settings pane's body. Its layout follows the card's width, which the
 /// user sets per card, not the window's.
@@ -1361,6 +1368,11 @@ fn keyboard_groups<'a>(
     groups
 }
 
+/// The Record button of a shortcut row.
+pub(super) fn record_shortcut_button(field: SettingsField) -> widget::Id {
+    widget::Id::new(format!("settings.shortcut.record.{field:?}"))
+}
+
 fn shortcut_input<'a>(
     label: &'static str,
     value: &'a str,
@@ -1378,13 +1390,14 @@ fn shortcut_input<'a>(
     let chords = settings::parse_chords(value);
     let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
     let source = if value == default { "Default" } else { "User" };
-    let aliases: Vec<Element<'a, Message>> = chords
+    let mut controls: Vec<Element<'a, Message>> = chords
         .iter()
         .enumerate()
         .map(|(index, chord)| {
             let mut remaining = chords.clone();
             remaining.remove(index);
             crate::ui_controls::button::quiet(format!("{chord} ×"))
+                .name(format!("Remove {chord} shortcut for {label}"))
                 .on_press(Message::SettingsDraftChanged {
                     field,
                     value: settings::format_chords(&remaining),
@@ -1392,21 +1405,64 @@ fn shortcut_input<'a>(
                 .into()
         })
         .collect();
-    let mut controls = Vec::with_capacity(2);
+    // Record, Reset, Source and the Terminal policy end the row as one unit:
+    // they never part across lines, each keeps its column in every row, and
+    // they stay on the keys' line when those move beneath the action's name.
+    let scope = workspace_widget::shortcut_descriptor(action).scope;
+    let policy: Element<'a, Message> = if scope.applies_to(workspace_widget::FocusedPane::Terminal)
+        || scope == workspace_widget::ShortcutScope::OutsideTerminal
+    {
+        crate::interaction::tooltip(
+            crate::ui_controls::field::checkbox(
+                draft
+                    .terminal_passthrough_actions
+                    .iter()
+                    .any(|id| id == action.id()),
+            )
+            .label("Terminal")
+            .on_toggle(move |enabled| Message::ShortcutTerminalPassthrough {
+                action: action.id().to_owned(),
+                enabled,
+            }),
+            "Send these keys to the terminal instead of running this workspace action",
+        )
+        .into()
+    } else {
+        crate::interaction::tooltip(
+            design::caption("Scoped"),
+            "Applies in its own pane; terminals keep these keys",
+        )
+        .into()
+    };
     controls.push(
-        crate::ui_controls::icon_button(Icon::Keyboard, format!("Record shortcut for {label}"))
-            .compact()
-            .on_press(Message::Palette(palette_ui::Action::Record(field)))
+        widget::row::with_children(vec![
+            widget::row::with_children(vec![
+                crate::ui_controls::icon_button(
+                    Icon::Keyboard,
+                    format!("Record shortcut for {label}"),
+                )
+                .id(record_shortcut_button(field))
+                .compact()
+                .on_press(Message::Palette(palette_ui::Action::Record(field)))
+                .into(),
+                crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label} shortcut"))
+                    .compact()
+                    .on_press_maybe((value != default).then(|| Message::SettingsDraftChanged {
+                        field,
+                        value: default,
+                    }))
+                    .into(),
+            ])
+            .spacing(2)
             .into(),
-    );
-    controls.push(
-        crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label} shortcut"))
-            .compact()
-            .on_press_maybe((value != default).then(|| Message::SettingsDraftChanged {
-                field,
-                value: default,
-            }))
-            .into(),
+            design::caption(source).width(64).into(),
+            widget::container(policy)
+                .width(SHORTCUT_POLICY_WIDTH)
+                .into(),
+        ])
+        .spacing(space::S)
+        .align_y(Alignment::Center)
+        .into(),
     );
     let required = if settings::shortcut_required(index) {
         " · required"
@@ -1445,77 +1501,14 @@ fn shortcut_input<'a>(
             }
         }
     }
-    let row = widget::row::with_children(vec![
-        // Reserve the source and Terminal policy columns first, then share
-        // the remaining width between the label and bounded key controls.
-        widget::row::with_children(vec![
-            design::body(format!("{label}{required}"))
-                .width(Length::FillPortion(3))
-                .into(),
-            widget::row::with_children(vec![
-                // Reserve the actions before allocating the remaining key
-                // area to scrollable aliases. The label keeps its own share.
-                crate::interaction::horizontal_wheel(
-                    iced::widget::scrollable(
-                        widget::row::with_children(aliases)
-                            .spacing(2)
-                            .align_y(Alignment::Center),
-                    )
-                    .direction(iced::widget::scrollable::Direction::Horizontal(
-                        design::scrollbar(),
-                    ))
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-                ),
-                widget::row::with_children(controls)
-                    .spacing(2)
-                    .align_y(Alignment::Center)
-                    .height(design::DENSE_ROW_HEIGHT)
-                    .into(),
-            ])
-            .spacing(2)
-            .align_y(Alignment::Center)
-            .width(Length::FillPortion(4))
-            .into(),
-        ])
-        .spacing(space::S)
-        .align_y(Alignment::Center)
-        .width(Length::Fill)
-        .into(),
-        design::caption(source).width(64).into(),
-        {
-            let scope = workspace_widget::shortcut_descriptor(action).scope;
-            if scope.applies_to(workspace_widget::FocusedPane::Terminal)
-                || scope == workspace_widget::ShortcutScope::OutsideTerminal
-            {
-                crate::interaction::tooltip(
-                    crate::ui_controls::field::checkbox(
-                        draft
-                            .terminal_passthrough_actions
-                            .iter()
-                            .any(|id| id == action.id()),
-                    )
-                    .label("Terminal")
-                    .on_toggle(move |enabled| {
-                        Message::ShortcutTerminalPassthrough {
-                            action: action.id().to_owned(),
-                            enabled,
-                        }
-                    }),
-                    "Send these keys to the terminal instead of running this workspace action",
-                )
-                .into()
-            } else {
-                crate::interaction::tooltip(
-                    design::caption("Scoped"),
-                    "Applies in its own pane; terminals keep these keys",
-                )
-                .into()
-            }
-        },
-    ])
-    .spacing(space::S)
-    .align_y(Alignment::Center);
+    // The keys and their buttons end the action's line while its name keeps
+    // readable room, and otherwise move beneath the name and wrap there, in
+    // order.
+    let row =
+        crate::ui_controls::labeled_controls(design::body(format!("{label}{required}")), controls)
+            .min_label(SHORTCUT_LABEL_MIN_WIDTH)
+            .spacing(2.0)
+            .label_gap(space::S);
     let mut children = vec![row.into()];
     if chords.iter().any(|chord| {
         settings::parse_shortcut(chord).is_ok_and(|binding| {
@@ -1669,7 +1662,7 @@ mod keyboard_table_tests {
     }
 
     #[test]
-    fn default_shortcut_rows_keep_chips_and_controls_on_one_line() {
+    fn default_shortcut_rows_keep_every_control_visible_and_in_order() {
         use iced::{
             Rectangle, Size,
             advanced::{
@@ -1679,11 +1672,13 @@ mod keyboard_table_tests {
         };
         #[derive(Default)]
         struct Controls {
+            label: &'static str,
             buttons: Vec<Rectangle>,
-            aliases: Option<Rectangle>,
-            advisory: Option<Rectangle>,
             source: Option<Rectangle>,
+            label_bounds: Option<Rectangle>,
+            advisory: Option<Rectangle>,
             terminal: Option<Rectangle>,
+            scoped: Option<Rectangle>,
         }
         impl Operation for Controls {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -1697,21 +1692,13 @@ mod keyboard_table_tests {
             ) {
                 self.buttons.push(bounds);
             }
-            fn scrollable(
-                &mut self,
-                _: Option<&widget::Id>,
-                bounds: Rectangle,
-                _: Rectangle,
-                _: iced::Vector,
-                _: &mut dyn iced::advanced::widget::operation::Scrollable,
-            ) {
-                assert!(self.aliases.replace(bounds).is_none());
-            }
             fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
                 match text {
-                    "Reserved while editing text" => self.advisory = Some(bounds),
                     "Default" | "User" => self.source = Some(bounds),
+                    "Reserved while editing text" => self.advisory = Some(bounds),
                     "Terminal" => self.terminal = Some(bounds),
+                    "Scoped" => self.scoped = Some(bounds),
+                    _ if text.starts_with(self.label) => self.label_bounds = Some(bounds),
                     _ => {}
                 }
             }
@@ -1719,104 +1706,147 @@ mod keyboard_table_tests {
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let draft = SettingsDraft::from_settings(&AppSettings::default());
         let invalid = HashMap::new();
-        for field in SettingsField::SHORTCUTS {
-            let action = field.shortcut_action().unwrap();
-            let value = draft
-                .keyboard_shortcuts
-                .shortcut_values()
-                .into_iter()
-                .find(|(candidate, _)| *candidate == action)
-                .unwrap()
-                .1;
-            let row = shortcut_input(
-                field.label(),
-                value,
-                field,
-                &draft.keyboard_shortcuts,
-                &invalid,
-            );
-            let mut element = settings_group("Keyboard", "", vec![row])
-                .compact()
-                .view("Keyboard", "")
-                .unwrap();
-            let mut tree = Tree::new(element.as_widget());
-            let layout = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::new(560.0, 0.0), Size::new(560.0, 1000.0)),
-            );
-            let mut controls = Controls::default();
-            element.as_widget_mut().operate(
-                &mut tree,
-                Layout::new(&layout),
-                &renderer,
-                &mut controls,
-            );
-            // Every chip plus Record and even the disabled Reset exposes its
-            // actual native button bounds. A checkbox may also be focusable.
-            assert!(
-                controls.buttons.len() >= settings::parse_chords(value).len() + 2,
-                "{field:?}: {:?}",
-                controls.buttons
-            );
-            let aliases = controls.aliases.expect("bounded alias strip");
-            assert!(aliases.width > 0.0 && aliases.height > 0.0);
-            assert!(aliases.x >= 0.0 && aliases.x + aliases.width <= 560.1);
-            let alias_count = settings::parse_chords(value).len();
-            let center = controls.buttons[0].center_y();
-            for (index, bounds) in controls.buttons.iter().enumerate() {
+        for width in [360.0, 560.0] {
+            for field in SettingsField::SHORTCUTS {
+                let action = field.shortcut_action().unwrap();
+                let value = draft
+                    .keyboard_shortcuts
+                    .shortcut_values()
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .unwrap()
+                    .1;
+                let row = shortcut_input(
+                    field.label(),
+                    value,
+                    field,
+                    &draft.keyboard_shortcuts,
+                    &invalid,
+                );
+                let mut element = settings_group("Keyboard", "", vec![row])
+                    .compact()
+                    .view("Keyboard", "")
+                    .unwrap();
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::new(width, 0.0), Size::new(width, 1000.0)),
+                );
+                let mut controls = Controls {
+                    label: field.label(),
+                    ..Controls::default()
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut controls,
+                );
+                // Each chip, Record and even the disabled Reset expose their
+                // native button bounds; the Terminal checkbox may follow.
+                let keys = settings::parse_chords(value).len() + 2;
                 assert!(
-                    bounds.width > 0.0 && bounds.height > 0.0,
-                    "{field:?} has an empty control: {:?}",
+                    controls.buttons.len() == keys
+                        || (controls.terminal.is_some() && controls.buttons.len() == keys + 1),
+                    "{field:?} at{width}: {:?}",
                     controls.buttons
                 );
-                assert!(
-                    (bounds.center_y() - center).abs() < 0.1,
-                    "{field:?} controls wrapped: {:?}",
-                    controls.buttons
-                );
-                // Alias content is allowed beyond its scroll viewport;
-                // pinned actions and policy controls must remain visible.
-                if index >= alias_count {
-                    assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= 560.1);
-                }
-            }
-            for group in [
-                &controls.buttons[..alias_count],
-                &controls.buttons[alias_count..],
-            ] {
-                for adjacent in group.windows(2) {
+                let buttons = &controls.buttons[..keys];
+                for bounds in &controls.buttons {
                     assert!(
-                        adjacent[0].x + adjacent[0].width <= adjacent[1].x + 0.1,
-                        "{field:?} controls overlap or reorder: {:?}",
-                        controls.buttons
+                        bounds.width > 0.0 && bounds.height > 0.0,
+                        "{field:?} at{width}: empty native control {bounds:?}"
+                    );
+                    assert!(
+                        bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.1,
+                        "{field:?} at{width}: clipped native control {bounds:?}"
                     );
                 }
-            }
-            assert!(aliases.x + aliases.width <= controls.buttons[alias_count].x + 0.1);
-            if matches!(
-                field,
-                SettingsField::ShortcutMovePaneLeft
-                    | SettingsField::ShortcutMovePaneRight
-                    | SettingsField::ShortcutReopenPane
-            ) {
-                let caption = controls
-                    .advisory
-                    .expect("the editing advisory must remain visible");
+                // Chips may wrap in a narrow pane, but in reading order: each
+                // follows the previous one on its line or starts a lower line.
+                for pair in buttons.windows(2) {
+                    let same_line = (pair[0].center_y() - pair[1].center_y()).abs() < 4.1;
+                    assert!(
+                        if same_line {
+                            pair[0].x + pair[0].width <= pair[1].x + 0.1
+                        } else {
+                            pair[1].y >= pair[0].y + pair[0].height - 0.1
+                        },
+                        "{field:?} at{width}: controls out of order {buttons:?}"
+                    );
+                }
+                // Record and Reset stay together after the last chip.
+                let [.., record, reset] = buttons[..] else {
+                    unreachable!("every row has Record and Reset");
+                };
                 assert!(
-                    caption.height > 0.0
-                        && caption.y + caption.height <= layout.size().height + 0.1
+                    (record.center_y() - reset.center_y()).abs() < 0.1,
+                    "{field:?} at{width}: Record and Reset separated {buttons:?}"
                 );
+                let label = controls
+                    .label_bounds
+                    .expect("the action label remains visible");
+                // The name sits before the controls on their line, or above
+                // them once they move beneath it; it never overlaps one.
                 assert!(
-                    controls
-                        .buttons
-                        .iter()
-                        .all(|button| button.y + button.height <= caption.y + 0.1)
+                    label.width > 0.0
+                        && controls.buttons.iter().all(|bounds| {
+                            label.x + label.width <= bounds.x + 0.1
+                                || label.y + label.height <= bounds.y + 0.1
+                        }),
+                    "{field:?} at{width}: label {label:?} meets {:?}",
+                    controls.buttons
                 );
+                // Source and the Terminal policy follow Reset on its line.
+                let source = controls.source.expect("Source remains visible");
+                let policy = controls
+                    .terminal
+                    .or(controls.scoped)
+                    .expect("every row states its Terminal policy");
+                for bounds in [source, policy] {
+                    assert!(bounds.width > 0.0 && bounds.height > 0.0);
+                    assert!(
+                        bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.1,
+                        "{field:?} at{width}: clipped {bounds:?}"
+                    );
+                    assert!(
+                        (bounds.center_y() - reset.center_y()).abs() < 4.1,
+                        "{field:?} at{width}: {bounds:?} left Reset {reset:?}"
+                    );
+                }
+                assert!(
+                    reset.x + reset.width <= source.x + 0.1
+                        && source.x + source.width <= policy.x + 0.1,
+                    "{field:?} at{width}: Reset {reset:?}, Source {source:?}, policy {policy:?}"
+                );
+                if let Some(caption) = controls.advisory {
+                    assert!(
+                        caption.height > 0.0
+                            && caption.y + caption.height <= node.size().height + 0.1
+                            && buttons
+                                .iter()
+                                .all(|button| button.y + button.height <= caption.y + 0.1),
+                        "{field:?} at{width}: the editing advisory must stay below the row"
+                    );
+                }
+                if width == 560.0 {
+                    if matches!(
+                        field,
+                        SettingsField::ShortcutMovePaneLeft
+                            | SettingsField::ShortcutMovePaneRight
+                            | SettingsField::ShortcutReopenPane
+                    ) {
+                        assert!(
+                            controls.advisory.is_some(),
+                            "{field:?}: the editing advisory must remain visible"
+                        );
+                    }
+                }
             }
         }
-        // A configured alias list may exceed the available key area. It
-        // must not take the already reserved source and Terminal policy away.
+        // A configured alias list may exceed a line. Its chips wrap, and the
+        // source and Terminal policy stay visible after Record and Reset.
         let aliases = (b'a'..=b'z')
             .map(|key| format!("Ctrl+Alt+Shift+{}", char::from(key)))
             .collect::<Vec<_>>();
@@ -1844,7 +1874,10 @@ mod keyboard_table_tests {
             &renderer,
             &layout::Limits::new(Size::new(560.0, 0.0), Size::new(560.0, 1000.0)),
         );
-        let mut controls = Controls::default();
+        let mut controls = Controls {
+            label: field.label(),
+            ..Controls::default()
+        };
         element
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut controls);
@@ -1854,7 +1887,7 @@ mod keyboard_table_tests {
         let terminal = controls
             .terminal
             .expect("configured row keeps its actual Terminal checkbox");
-        for bounds in [source, terminal] {
+        for bounds in controls.buttons.iter().chain([&source, &terminal]) {
             assert!(bounds.width > 0.0 && bounds.height > 0.0, "{bounds:?}");
             assert!(
                 bounds.x >= 0.0 && bounds.x + bounds.width <= 560.1,
@@ -1869,22 +1902,18 @@ mod keyboard_table_tests {
     }
 
     #[test]
-    fn long_alias_row_keeps_record_reset_and_scrolled_removal_reachable() {
+    fn long_alias_row_keeps_record_reset_and_every_removal_reachable() {
         use iced::{
-            Event, Point, Rectangle, Size, Vector,
+            Event, Rectangle, Size,
             advanced::{
                 clipboard, mouse,
-                widget::{
-                    Operation,
-                    operation::{Focusable, Scrollable},
-                },
+                widget::{Operation, operation::Focusable},
             },
             runtime::{UserInterface, user_interface::Cache},
         };
         #[derive(Default)]
         struct Geometry {
             buttons: Vec<Rectangle>,
-            strip: Option<(Rectangle, Vector)>,
             label: Option<Rectangle>,
         }
         impl Operation for Geometry {
@@ -1898,16 +1927,6 @@ mod keyboard_table_tests {
                 _: &mut dyn Focusable,
             ) {
                 self.buttons.push(bounds);
-            }
-            fn scrollable(
-                &mut self,
-                _: Option<&widget::Id>,
-                bounds: Rectangle,
-                _: Rectangle,
-                translation: Vector,
-                _: &mut dyn Scrollable,
-            ) {
-                assert!(self.strip.replace((bounds, translation)).is_none());
             }
             fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
                 if text.starts_with(SettingsField::ShortcutRenamePane.label()) {
@@ -1936,100 +1955,63 @@ mod keyboard_table_tests {
             .view("Keyboard", "")
             .unwrap();
         let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        let mut ui = UserInterface::build(
-            element,
-            Size::new(560.0, 300.0),
-            Cache::new(),
-            &mut renderer,
-        );
+        let viewport = Size::new(560.0, 2_000.0);
+        let mut ui = UserInterface::build(element, viewport, Cache::new(), &mut renderer);
         let mut geometry = Geometry::default();
         ui.operate(&renderer, &mut geometry);
-        let (strip, initial_translation) = geometry.strip.expect("bounded alias viewport");
         let label = geometry.label.expect("actual visible action label");
         assert!(label.width > 0.0 && label.height > 0.0);
-        assert!(label.x >= 0.0 && label.x + label.width <= strip.x + 0.1);
-        assert!(label.y >= 0.0 && label.y + label.height <= 300.1);
-        assert!(strip.width > 0.0 && strip.height > 0.0);
-        assert_eq!(initial_translation, Vector::ZERO);
+        // Every chip, then Record and Reset, is visible inside the pane.
+        for bounds in &geometry.buttons {
+            assert!(bounds.width > 0.0 && bounds.height > 0.0, "{bounds:?}");
+            assert!(
+                bounds.x >= 0.0 && bounds.x + bounds.width <= viewport.width + 0.1,
+                "{bounds:?}"
+            );
+            assert!(
+                label.y + label.height <= bounds.y + 0.1,
+                "a long alias list moves beneath the name: {label:?} {bounds:?}"
+            );
+        }
         let record = geometry.buttons[aliases.len()];
         let reset = geometry.buttons[aliases.len() + 1];
-        for bounds in [record, reset] {
-            assert!(bounds.width > 0.0 && bounds.height > 0.0);
-            assert!(bounds.x >= strip.x + strip.width - 0.1);
-            assert!(bounds.x + bounds.width <= 560.1);
-        }
         assert!(record.x + record.width <= reset.x + 0.1);
-        for (point, recording) in [(record.center(), true), (reset.center(), false)] {
+        let click = |ui: &mut UserInterface<'_, Message, cosmic::Theme, cosmic::Renderer>,
+                     renderer: &mut cosmic::Renderer,
+                     bounds: Rectangle| {
             let mut messages = Vec::new();
             let _ = ui.update(
                 &[
                     Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
                     Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
                 ],
-                mouse::Cursor::Available(point),
-                &mut renderer,
+                mouse::Cursor::Available(bounds.center()),
+                renderer,
                 &mut clipboard::Null,
                 &mut messages,
             );
-            if recording {
-                assert_eq!(messages.len(), 1);
-                assert!(matches!(
-                    &messages[0],
-                    Message::Palette(palette_ui::Action::Record(actual)) if *actual == field
-                ));
-            } else {
-                assert_eq!(messages.len(), 1);
-                assert!(matches!(
-                    &messages[0],
-                    Message::SettingsDraftChanged { field: actual, value }
-                        if *actual == field && value == &default
-                ));
-            }
-        }
-        // A real vertical wheel is translated into the horizontal alias
-        // strip, so the last chip can be removed without moving the actions.
-        let mut messages = Vec::new();
-        let _ = ui.update(
-            &[Event::Mouse(mouse::Event::WheelScrolled {
-                delta: mouse::ScrollDelta::Pixels {
-                    x: 0.0,
-                    y: -100_000.0,
-                },
-            })],
-            mouse::Cursor::Available(strip.center()),
-            &mut renderer,
-            &mut clipboard::Null,
-            &mut messages,
-        );
-        assert!(messages.is_empty());
-        let mut scrolled = Geometry::default();
-        ui.operate(&renderer, &mut scrolled);
-        let (after_strip, translation) = scrolled.strip.unwrap();
-        assert_eq!(after_strip, strip);
-        assert!(translation.x > 0.0);
-        assert_eq!(scrolled.buttons[aliases.len()], record);
-        assert_eq!(scrolled.buttons[aliases.len() + 1], reset);
-        let last = scrolled.buttons[aliases.len() - 1];
-        let point: Point = last.center() - translation;
-        assert!(
-            strip.contains(point),
-            "the last alias must be actually visible"
-        );
-        let _ = ui.update(
-            &[
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-            ],
-            mouse::Cursor::Available(point),
-            &mut renderer,
-            &mut clipboard::Null,
-            &mut messages,
-        );
-        assert_eq!(messages.len(), 1);
+            messages
+        };
+        let messages = click(&mut ui, &mut renderer, record);
         assert!(matches!(
-            &messages[0],
-            Message::SettingsDraftChanged { field: actual, value }
-                if *actual == field && settings::parse_chords(value).as_slice() == &aliases[..aliases.len() - 1]
+            messages.as_slice(),
+            [Message::Palette(palette_ui::Action::Record(actual))] if *actual == field
+        ));
+        let messages = click(&mut ui, &mut renderer, reset);
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::SettingsDraftChanged { field: actual, value }]
+                if *actual == field && *value == default
+        ));
+        // The last chip wraps onto a later line rather than scrolling out of
+        // view, so it is removed with a plain click.
+        let last = geometry.buttons[aliases.len() - 1];
+        let messages = click(&mut ui, &mut renderer, last);
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::SettingsDraftChanged { field: actual, value }]
+                if *actual == field
+                    && settings::parse_chords(value).as_slice() == &aliases[..aliases.len() - 1]
         ));
     }
 

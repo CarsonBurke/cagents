@@ -3433,7 +3433,7 @@ mod tests {
         // manager-side variable expansion or replacement by manager state.
         command
             .env("CAGENTS_SCOPE_TEST", "caller-value")
-            .args(["-c", "cat /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
+            .args(["-c", "sed -n 's/^0:://p' /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
             .arg(&output)
             .arg("$HOME");
         command
@@ -3453,18 +3453,27 @@ mod tests {
         let holder_cgroup = std::fs::read_to_string(format!("/proc/{holder_pid}/cgroup"));
         // SAFETY: this PID belongs to the fixture's own background sleep.
         unsafe { libc::kill(holder_pid, libc::SIGTERM) };
-        let holder_cgroup = holder_cgroup.unwrap();
-        let caller = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        // Hybrid hosts also list v1 controllers (`1:net_cls:/`); membership
+        // is the unified hierarchy's `0::` entry, as in process_scope.
+        let unified = |cgroup: &str| {
+            cgroup
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))
+                .unwrap()
+                .to_owned()
+        };
+        let holder_cgroup = unified(&holder_cgroup.unwrap());
+        let caller = unified(&std::fs::read_to_string("/proc/self/cgroup").unwrap());
         let mut lines = evidence.lines();
         let scope = lines.next().unwrap();
-        assert_ne!(scope, caller.trim());
+        assert_ne!(scope, caller);
         assert!(
             scope.contains("cagentsd-") && scope.ends_with(".scope"),
             "{scope}"
         );
         assert_eq!(lines.next(), Some("$HOME"));
         assert_eq!(lines.next(), Some("caller-value"));
-        assert_eq!(holder_cgroup.trim(), scope);
+        assert_eq!(holder_cgroup, scope);
     }
 
     #[test]

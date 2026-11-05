@@ -44,6 +44,10 @@ impl Drop for EvidenceDirectory {
 }
 
 fn private_runtime(test: &str) -> Option<PathBuf> {
+    private_runtime_within(test, Duration::from_secs(30))
+}
+
+fn private_runtime_within(test: &str, limit: Duration) -> Option<PathBuf> {
     if let Some(root) = std::env::var_os(ROOT) {
         let expected = match std::env::var(SCOPE).as_deref() {
             Ok("present") => true,
@@ -104,7 +108,7 @@ fn private_runtime(test: &str) -> Option<PathBuf> {
         .stdout(Stdio::from(File::create(&stdout).unwrap()))
         .stderr(Stdio::from(File::create(&stderr).unwrap()));
     let mut child = TestChild(command.spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + limit;
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             break Some(status);
@@ -120,7 +124,7 @@ fn private_runtime(test: &str) -> Option<PathBuf> {
     let stderr = fs::read_to_string(stderr).unwrap();
     assert!(
         status.is_some_and(|status| status.success()),
-        "isolated retained-child fixture failed or exceeded 30s; retained {}:\n{stdout}\n{stderr}",
+        "isolated retained-child fixture failed or exceeded {limit:?}; retained {}:\n{stdout}\n{stderr}",
         root.display()
     );
     assert!(
@@ -462,6 +466,94 @@ fn retained_original_child_refuses_empty_control_until_exact_reap() {
     original.finish();
     assert!(!child_reaper::has_outstanding_ownership());
     assert_empty(&host);
+    accepted_empty_stop(&host);
+}
+
+// Runs the actual consumers beside live retained custody. Each consumer's guard
+// must move it to a fresh process; without one it would run here and be refused.
+#[test]
+fn retained_custody_does_not_reach_upgrade_consumers() {
+    // Each consumer runs its own fixture process, so this outlives ordinary fixtures.
+    let Some(root) = private_runtime_within(
+        "host::state::retained_child_shutdown_tests::retained_custody_does_not_reach_upgrade_consumers",
+        Duration::from_secs(300),
+    ) else {
+        return;
+    };
+    let host = host();
+    let capability = preflight(&host);
+    let reservation = child_reaper::reserve().unwrap();
+    let mut original = Original::spawn(&root);
+    original.retain(reservation);
+    original.assert_live();
+    refuse_all(&host, &capability);
+
+    use super::tests as consumers;
+    // Every test using the fresh-process guard. Add new ones here too.
+    let fixtures: [(&str, fn()); 12] = [
+        (
+            "host::client::tests::slow_chat_close_allows_list_but_fences_upgrade_and_shutdown",
+            crate::host::client::tests::slow_chat_close_allows_list_but_fences_upgrade_and_shutdown,
+        ),
+        (
+            "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence",
+            crate::host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence,
+        ),
+        (
+            "host::state::tests::upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_restore",
+            consumers::upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_restore,
+        ),
+        (
+            "host::state::tests::idle_and_ended_claude_conversations_do_not_block_an_upgrade",
+            consumers::idle_and_ended_claude_conversations_do_not_block_an_upgrade,
+        ),
+        (
+            "host::state::tests::native_upgrade_retains_hidden_lineage_and_restarts_final_claude_conversation_once",
+            consumers::native_upgrade_retains_hidden_lineage_and_restarts_final_claude_conversation_once,
+        ),
+        (
+            "host::state::tests::restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint",
+            consumers::restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint,
+        ),
+        (
+            "host::state::tests::a_carried_terminal_keeps_its_process_across_an_upgrade",
+            consumers::a_carried_terminal_keeps_its_process_across_an_upgrade,
+        ),
+        (
+            "host::state::tests::a_carried_terminal_survives_a_failed_recovery_after_adoption",
+            consumers::a_carried_terminal_survives_a_failed_recovery_after_adoption,
+        ),
+        (
+            "host::state::tests::upgrade_commit_failure_preserves_live_control_authority",
+            consumers::upgrade_commit_failure_preserves_live_control_authority,
+        ),
+        (
+            "host::state::tests::upgrade_rejects_stale_inventory_and_pending_reservations_without_shutdown",
+            consumers::upgrade_rejects_stale_inventory_and_pending_reservations_without_shutdown,
+        ),
+        (
+            "host::state::tests::committed_upgrade_fences_control_and_retains_checkpoint_until_close",
+            consumers::committed_upgrade_fences_control_and_retains_checkpoint_until_close,
+        ),
+        (
+            "host::state::tests::a_handoff_no_window_can_still_save_stops_refusing_the_upgrade",
+            consumers::a_handoff_no_window_can_still_save_stops_refusing_the_upgrade,
+        ),
+    ];
+    for (name, consumer) in fixtures {
+        // The guard selects its child by the current test thread's name.
+        thread::Builder::new()
+            .name(name.into())
+            .spawn(consumer)
+            .unwrap()
+            .join()
+            .unwrap_or_else(|_| panic!("{name} reached retained custody or failed"));
+    }
+
+    original.assert_live();
+    refuse_all(&host, &capability);
+    original.finish();
+    assert!(!child_reaper::has_outstanding_ownership());
     accepted_empty_stop(&host);
 }
 

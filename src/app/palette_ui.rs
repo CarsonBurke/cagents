@@ -8,6 +8,9 @@ pub(super) struct State {
     recording: Option<SettingsField>,
     recording_error: Option<String>,
     reassign: Option<(SettingsField, String, usize)>,
+    /// The shortcut whose Record button gave up keyboard focus to a pending
+    /// Reassign, and gets it back once that offer goes away.
+    focus_return: Option<SettingsField>,
     filtering_key: bool,
     pressed_key_filter: Option<keyboard::Event>,
     query: Option<String>,
@@ -137,6 +140,7 @@ impl EntryIdentity {
 
 const ROW_HEIGHT: f32 = 40.0;
 const ROW_SPACING: f32 = space::XXS;
+const REASSIGN_BUTTON: &str = "palette.recording.reassign";
 
 fn palette_query(query: &str) -> (Option<char>, &str) {
     let query = query.trim();
@@ -287,6 +291,7 @@ impl Cagents {
         match action {
             Action::Record(field) => {
                 self.palette.recording = Some(field);
+                self.palette.focus_return = None;
                 self.palette.filtering_key = false;
                 self.palette.query = None;
                 self.palette.recording_error = None;
@@ -295,6 +300,7 @@ impl Cagents {
             }
             Action::FilterKey => {
                 self.palette.filtering_key = true;
+                self.palette.focus_return = None;
                 self.palette.recording = None;
                 self.palette.query = None;
                 self.palette.reassign = None;
@@ -363,6 +369,7 @@ impl Cagents {
                         Task::batch([
                             self.save_settings_task(false),
                             self.synchronize_settings(&previous),
+                            self.return_recorder_focus(),
                         ])
                     }
                     Err(_) => {
@@ -376,7 +383,7 @@ impl Cagents {
                         } else {
                             refusal(field, &attempted).or_else(|| refusal(SettingsField::SHORTCUTS[owner], &attempted)).or_else(|| Some("Reassignment could not be saved. Check the other settings.".into()))
                         };
-                        Task::none()
+                        self.return_recorder_focus()
                     }
                 }
             }
@@ -403,6 +410,7 @@ impl Cagents {
             }
             Action::Close => {
                 self.palette.recording = None;
+                self.palette.focus_return = None;
                 self.palette.filtering_key = false;
                 self.palette.query = None;
                 self.palette.reassign = None;
@@ -517,8 +525,14 @@ impl Cagents {
         restore.chain(command)
     }
 
+    /// Whether the next key press is a shortcut being recorded or a key to
+    /// filter the palette by, rather than anything the shell acts on.
+    pub(super) fn palette_records_keys(&self) -> bool {
+        self.palette.recording.is_some() || self.palette.filtering_key
+    }
+
     pub(super) fn palette_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
-        if self.palette.recording.is_some() || self.palette.filtering_key {
+        if self.palette_records_keys() {
             // Recording is globally visible, but a real dialog owns its
             // key before the recording or settings draft can change.
             if self.modal_is_open() {
@@ -529,7 +543,20 @@ impl Cagents {
                 self.palette.filtering_key = false;
                 self.palette.reassign = None;
                 self.palette.recording_error = None;
-                return Some(Task::none());
+                return Some(self.return_recorder_focus());
+            }
+            // A pending Reassign is reached with the keyboard: Tab and
+            // Shift+Tab move focus to it rather than being recorded, which
+            // would withdraw the offer the user is navigating to. It is the
+            // recorder's only control, so either direction lands on it.
+            if let Some((field, _, _)) = &self.palette.reassign
+                && is_tab_press(event).is_some()
+            {
+                self.palette.focus_return = Some(*field);
+                return Some(
+                    iced::widget::operation::focus(widget::Id::new(REASSIGN_BUTTON))
+                        .map(cosmic::Action::App),
+                );
             }
             if let keyboard::Event::KeyPressed {
                 key,
@@ -680,14 +707,34 @@ impl Cagents {
                 {
                     self.palette.reassign = Some((field, chord, owner));
                 }
-                Task::none()
+                if self.palette.reassign.is_some() {
+                    Task::none()
+                } else {
+                    self.return_recorder_focus()
+                }
             }
             _ => {
                 self.palette.recording = None;
                 self.palette.recording_error = None;
-                self.apply_setting_input(field, value)
+                Task::batch([
+                    self.apply_setting_input(field, value),
+                    self.return_recorder_focus(),
+                ])
             }
         }
+    }
+
+    /// Gives keyboard focus back to the Record button that handed it to a
+    /// Reassign offer which is no longer shown, so the user keeps their
+    /// place in the shortcut list.
+    fn return_recorder_focus(&mut self) -> Task<Message> {
+        self.palette
+            .focus_return
+            .take()
+            .map_or_else(Task::none, |field| {
+                iced::widget::operation::focus(settings_ui::record_shortcut_button(field))
+                    .map(cosmic::Action::App)
+            })
     }
 
     fn capture_first_palette_entry(&mut self) {
@@ -1016,6 +1063,7 @@ impl Cagents {
                         "Reassign from {}",
                         SettingsField::SHORTCUTS[*owner].label()
                     ))
+                    .id(widget::Id::new(REASSIGN_BUTTON))
                     .on_press(Message::Palette(Action::Reassign))
                     .into(),
                 );
@@ -1107,6 +1155,77 @@ impl Cagents {
         )
     }
 
+    /// Reopens this exact closed pane, including after its channel's retirement
+    /// settles. A later close must never change the intent being replayed.
+    pub(super) fn reopen_closed_pane(&mut self, id: CardId) -> Task<Message> {
+        let Some(index) = self
+            .recently_closed
+            .iter()
+            .position(|(card, _)| card.id == id)
+        else {
+            return Task::none();
+        };
+        let scope = self.active_workspace_destination();
+        let (card, saved_scope) = self.recently_closed[index].clone();
+        if let CardKind::Chat(session) = &card.kind
+            && session.launch.session_id.is_some()
+        {
+            let task = self.resume_saved_conversation(crate::persistence::SavedConversation {
+                card: card.id,
+                title: card.title.clone(),
+                session: session.clone(),
+                open: false,
+                updated_at_unix_ms: crate::chat::now_ms().unwrap_or(0) as i64,
+            });
+            return task;
+        }
+        if let Some(home @ channel_ui::ClosedCardHome::Pending(_)) = self.closed_card_home(card.id)
+        {
+            return self
+                .defer_channel_reopen(home, channel_ui::Reopen::Pane(card.id))
+                .unwrap_or_else(Task::none);
+        }
+        if card.kind.is_utility() {
+            self.recently_closed.remove(index);
+            return self.open_utility_card(card.kind);
+        }
+        // Close retires the old card's filing. The matching saved
+        // destination identifies the workspace being reopened in;
+        // channel membership is restored separately on insertion, into
+        // the channel entered here.
+        let mut previous = (None, None);
+        let (owner, scope, revived) = match saved_scope {
+            Some(WorkspaceDestination::Worktree(_) | WorkspaceDestination::Folder(_)) => {
+                (self.active_workspace.clone(), Task::none(), None)
+            }
+            Some(WorkspaceDestination::Channel(id)) => {
+                previous = (self.durable.active_channel, self.active_workspace.clone());
+                let home = self.closed_channel_home(id);
+                let revived = match home {
+                    Some(channel_ui::ClosedCardHome::Retired(retired)) => Some(retired),
+                    _ => None,
+                };
+                match home.and_then(|home| self.enter_closed_card_home(home)) {
+                    Some(entered) => (None, entered, revived),
+                    // Closed in the strip on screen, which takes it back.
+                    None if saved_scope == scope => (None, Task::none(), None),
+                    // Its channel could not be brought back, and the
+                    // pane belongs nowhere else.
+                    None => return Task::none(),
+                }
+            }
+            None => (None, Task::none(), None),
+        };
+        self.recently_closed.remove(index);
+        let reopened = self.duplicate_pane_in_scope(card, owner);
+        // A pane that cannot be cloned, or that opens outside the
+        // window, leaves a revived channel with nothing in it.
+        let abandoned = revived.map_or_else(Task::none, |retired| {
+            self.abandon_empty_revival(retired, previous)
+        });
+        Task::batch([scope, reopened, abandoned])
+    }
+
     pub(super) fn run_workspace_command(
         &mut self,
         command: Command,
@@ -1189,42 +1308,16 @@ impl Cagents {
             }
             Command::ReopenPane => {
                 let scope = self.active_workspace_destination();
-                let Some(index) = self
-                    .recently_closed
-                    .iter()
-                    .rposition(|(_, saved_scope)| *saved_scope == scope)
-                else {
+                // The latest pane closed here, or in a channel that retired
+                // when it closed, which reopening brings back.
+                let Some(index) = self.recently_closed.iter().rposition(|(_, saved_scope)| {
+                    *saved_scope == scope
+                        || matches!(saved_scope, Some(WorkspaceDestination::Channel(id))
+                            if self.closed_channel_reopens_from(*id, scope))
+                }) else {
                     return Task::none();
                 };
-                let (card, saved_scope) = self.recently_closed[index].clone();
-                if let CardKind::Chat(session) = &card.kind
-                    && session.launch.session_id.is_some()
-                {
-                    let task =
-                        self.resume_saved_conversation(crate::persistence::SavedConversation {
-                            card: card.id,
-                            title: card.title.clone(),
-                            session: session.clone(),
-                            open: false,
-                            updated_at_unix_ms: crate::chat::now_ms().unwrap_or(0) as i64,
-                        });
-                    return task;
-                }
-                self.recently_closed.remove(index);
-                if card.kind.is_utility() {
-                    self.open_utility_card(card.kind)
-                } else {
-                    // Close retires the old card's filing. The matching saved
-                    // destination identifies the workspace being reopened in;
-                    // channel membership is restored separately on insertion.
-                    let owner = match saved_scope {
-                        Some(
-                            WorkspaceDestination::Worktree(_) | WorkspaceDestination::Folder(_),
-                        ) => self.active_workspace.clone(),
-                        Some(WorkspaceDestination::Channel(_)) | None => None,
-                    };
-                    self.duplicate_pane_in_scope(card, owner)
-                }
+                self.reopen_closed_pane(self.recently_closed[index].0.id)
             }
             Command::FocusPane1
             | Command::FocusPane2
@@ -2960,6 +3053,81 @@ mod settings_recorder_tests {
     }
 
     #[test]
+    fn settings_capture_yields_to_a_current_form_dialog_and_resumes_after_escape() {
+        for filtering in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            app.context_inspector_open = false;
+            let field = SettingsField::ShortcutToggleProjects;
+            drop(app.update_palette(if filtering {
+                Action::FilterKey
+            } else {
+                Action::Record(field)
+            }));
+            let settings = app.settings.clone();
+            let draft = app
+                .settings_draft
+                .keyboard_shortcuts
+                .toggle_projects
+                .clone();
+            app.device_ui.open = true;
+            let event = keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::F8),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::F8),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F8),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+                text: None,
+                repeat: false,
+            };
+            drop(app.update(Message::KeyEvent {
+                event: event.clone(),
+                captured: false,
+            }));
+            assert!(app.device_ui.open);
+            assert_eq!(app.palette.filtering_key, filtering);
+            assert_eq!(app.palette.recording, (!filtering).then_some(field));
+            assert!(app.palette.recording_error.is_none());
+            assert_eq!(app.settings, settings);
+            assert_eq!(app.settings_draft.keyboard_shortcuts.toggle_projects, draft);
+            assert!(app.settings_search.is_empty());
+            drop(app.update(Message::KeyEvent {
+                event: keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                },
+                captured: false,
+            }));
+            assert!(!app.device_ui.open, "the visible form owns Escape");
+            assert!(app.palette.is_open(), "covered capture was not cancelled");
+            drop(app.update(Message::KeyEvent {
+                event,
+                captured: false,
+            }));
+            assert!(
+                !app.palette.is_open(),
+                "exposed capture accepts the fresh chord"
+            );
+            if filtering {
+                assert_eq!(app.settings_search, "Ctrl+Alt+F8");
+                assert_eq!(app.settings, settings);
+            } else {
+                assert!(
+                    app.settings
+                        .keyboard_shortcuts
+                        .toggle_projects
+                        .contains(&"Ctrl+Alt+F8".into())
+                );
+                assert!(app.settings_invalid.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn settings_recorder_and_key_filter_share_dispatch_character_normalization() {
         let event = |value: &str, physical, modifiers| keyboard::Event::KeyPressed {
             key: keyboard::Key::Character(value.into()),
@@ -3111,6 +3279,207 @@ mod settings_recorder_tests {
         );
         assert!(app.settings_pending.is_empty());
         assert!(app.settings_invalid.is_empty());
+    }
+
+    #[test]
+    fn keyboard_reaches_and_activates_a_pending_reassign() {
+        use iced::{
+            Size,
+            advanced::clipboard,
+            mouse,
+            runtime::user_interface::{Cache, UserInterface},
+        };
+
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.core.set_keyboard_nav(true);
+        let field = SettingsField::ShortcutToggleProjects;
+        let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
+        drop(app.update(Message::Palette(Action::Record(field))));
+        assert!(
+            !app.core.keyboard_nav(),
+            "the shell's own Tab traversal would move focus out of the recorder"
+        );
+        drop(app.record_shortcut(field, chord.clone()));
+        assert!(app.palette.reassign.is_some());
+
+        let press = |key: keyboard::key::Named, code, modifiers| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modified_key: keyboard::Key::Named(key),
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        };
+        let enter = press(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            keyboard::Modifiers::empty(),
+        );
+        let mut messages = Vec::new();
+        for modifiers in [keyboard::Modifiers::empty(), keyboard::Modifiers::SHIFT] {
+            let tab = press(
+                keyboard::key::Named::Tab,
+                keyboard::key::Code::Tab,
+                modifiers,
+            );
+            let task = app.palette_key_event(&tab).expect("the recorder owns Tab");
+            assert!(
+                app.palette.reassign.is_some(),
+                "Tab moves toward Reassign instead of being recorded"
+            );
+            assert_eq!(app.palette.recording, Some(field));
+
+            // Nothing is focused until the Tab's own task runs on the
+            // recorder; Enter then reaches Reassign only if that task put
+            // focus there.
+            messages.clear();
+            let surface = app.palette_surface().expect("recording surface");
+            let mut renderer = super::super::tests::headless_renderer();
+            let mut ui = UserInterface::build(
+                surface,
+                Size::new(600.0, 300.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            apply_widget_operations(task, &mut ui, &renderer);
+            ui.update(
+                &[iced::Event::Keyboard(enter.clone())],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert!(
+                matches!(messages.as_slice(), [Message::Palette(Action::Reassign)]),
+                "Tab with {modifiers:?} then Enter requests the reassignment: {}",
+                messages.len()
+            );
+        }
+        assert!(app.palette_key_event(&enter).is_some());
+        assert!(app.palette.reassign.is_some(), "Enter is not recorded");
+        assert_eq!(app.palette.focus_return, Some(field));
+        for message in messages {
+            drop(app.update(message));
+        }
+        assert_eq!(
+            app.palette.focus_return, None,
+            "focus goes back to the row's Record button"
+        );
+        assert!(app.palette.recording.is_none());
+        assert!(
+            app.core.keyboard_nav(),
+            "traversal returns once recording ends"
+        );
+        assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
+        assert!(
+            app.settings
+                .keyboard_shortcuts
+                .toggle_projects
+                .contains(&chord)
+        );
+    }
+
+    /// Runs the widget operations of `task`, as the runtime would, on `ui`.
+    fn apply_widget_operations(
+        task: Task<Message>,
+        ui: &mut iced::runtime::user_interface::UserInterface<
+            '_,
+            Message,
+            cosmic::Theme,
+            cosmic::Renderer,
+        >,
+        renderer: &cosmic::Renderer,
+    ) {
+        use iced::{advanced::widget::operation::Outcome, futures::StreamExt};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut stream = iced::runtime::task::into_stream(task).expect("a focus task");
+        while let Some(action) = runtime.block_on(stream.next()) {
+            if let iced::runtime::Action::Widget(operation) = action {
+                let mut next = Some(operation);
+                while let Some(mut operation) = next.take() {
+                    ui.operate(renderer, operation.as_mut());
+                    if let Outcome::Chain(chained) = operation.finish() {
+                        next = Some(chained);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancelling_a_focused_reassign_returns_focus_to_its_record_button() {
+        use iced::{
+            Size,
+            advanced::clipboard,
+            mouse,
+            runtime::user_interface::{Cache, UserInterface},
+        };
+
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let field = SettingsField::ShortcutToggleProjects;
+        let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
+        drop(app.update(Message::Palette(Action::Record(field))));
+        drop(app.record_shortcut(field, chord));
+        let key = |key: keyboard::key::Named, code| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modified_key: keyboard::Key::Named(key),
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        drop(app.palette_key_event(&key(keyboard::key::Named::Tab, keyboard::key::Code::Tab)));
+        let task = app
+            .palette_key_event(&key(
+                keyboard::key::Named::Escape,
+                keyboard::key::Code::Escape,
+            ))
+            .expect("the recorder owns Escape");
+        assert!(app.palette.recording.is_none());
+
+        // A list of Record buttons stands in for the settings page: only
+        // the one for the cancelled row receives focus.
+        let list: Element<'_, Message> = widget::column::with_children(
+            [SettingsField::ShortcutCommandPalette, field]
+                .into_iter()
+                .map(|candidate| {
+                    widget::button::text("Record")
+                        .id(settings_ui::record_shortcut_button(candidate))
+                        .on_press(Message::Palette(Action::Record(candidate)))
+                        .into()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into();
+        let mut renderer = super::super::tests::headless_renderer();
+        let mut ui = UserInterface::build(
+            list,
+            Size::new(600.0, 300.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        apply_widget_operations(task, &mut ui, &renderer);
+        let mut messages = Vec::new();
+        ui.update(
+            &[iced::Event::Keyboard(key(
+                keyboard::key::Named::Enter,
+                keyboard::key::Code::Enter,
+            ))],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::Palette(Action::Record(candidate))] if *candidate == field),
+            "Enter activates the cancelled row's Record button"
+        );
     }
 
     #[test]

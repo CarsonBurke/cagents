@@ -363,7 +363,7 @@ fn local(role: &str) {
 fn proxies() -> Vec<PathBuf> {
     let runtime = root()
         .join("runtime")
-        .join(crate::instance::RUNTIME_SUBDIRECTORY);
+        .join(crate::instance::runtime_subdirectory());
     let mut paths: Vec<_> = match fs::read_dir(runtime) {
         Ok(entries) => entries
             .map(|entry| entry.unwrap().path())
