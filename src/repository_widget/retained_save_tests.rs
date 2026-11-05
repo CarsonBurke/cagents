@@ -106,9 +106,10 @@ pub(super) struct TaskTrace {
 }
 
 impl TaskTrace {
-    /// Whether an actual file-worker completion reached the runtime.
+    /// Whether an actual file-worker completion for the selected document
+    /// reached the runtime.
     pub(super) fn answered(&self) -> bool {
-        !self.reads.is_empty()
+        self.reads.iter().any(|read| read.accepted)
     }
 }
 
