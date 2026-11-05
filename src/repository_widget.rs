@@ -12239,32 +12239,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
             || layout.bounds(),
             |size| iced::Rectangle::new(layout.position() + offset, size),
         );
-        for roots in [true, false] {
-            let nodes = if roots {
-                accessible.root_mut()
-            } else {
-                accessible.children_mut()
-            };
-            for accessible_node in nodes {
-                let node = accessible_node.node_mut();
-                if let Some(bounds) = node.bounds() {
-                    let x0 = bounds.x0.max(f64::from(clip.x));
-                    let y0 = bounds.y0.max(f64::from(clip.y));
-                    let x1 = bounds.x1.min(f64::from(clip.x + clip.width));
-                    let y1 = bounds.y1.min(f64::from(clip.y + clip.height));
-                    if x1 <= x0 || y1 <= y0 {
-                        node.set_hidden();
-                    } else {
-                        node.set_bounds(Rect::new(
-                            x0 - f64::from(offset.x),
-                            y0 - f64::from(offset.y),
-                            x1 - f64::from(offset.x),
-                            y1 - f64::from(offset.y),
-                        ));
-                    }
-                }
-            }
-        }
+        crate::ui_controls::accessible_bounds::place(&mut accessible, offset, Some(clip));
         accessible
     }
 }
@@ -20308,7 +20283,7 @@ mod tests {
         use crate::workspace_widget::forwarding_test::{Traverse, leaf, renderer};
         use cosmic::iced::{Point, Size, Vector};
 
-        let renderer = renderer();
+        let mut renderer = renderer();
         // The canvas cancels horizontal scrolling while a row applies it to
         // its text. Neither real translation may consume the enclosing
         // scrollable's virtual offset before a descendant opens an overlay
@@ -20374,7 +20349,16 @@ mod tests {
                 &layout.bounds(),
                 &renderer,
             );
-            for kind in ["operate", "overlay", "update", "mouse_interaction"] {
+            canvas.as_widget().draw(
+                &tree,
+                &mut renderer,
+                &cosmic::Theme::default(),
+                &renderer::Style::default(),
+                layout,
+                iced::mouse::Cursor::Unavailable,
+                &layout.bounds(),
+            );
+            for kind in ["operate", "overlay", "update", "mouse_interaction", "draw"] {
                 assert_eq!(visits.offsets(kind), vec![offset], "{kind}");
             }
         }

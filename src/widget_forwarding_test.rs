@@ -60,10 +60,14 @@ impl<Message> Widget<Message, Theme, Renderer> for Leaf {
         _renderer: &mut Renderer,
         _theme: &Theme,
         _style: &renderer::Style,
-        _layout: Layout<'_>,
+        layout: Layout<'_>,
         _cursor: mouse::Cursor,
         _viewport: &Rectangle,
     ) {
+        self.visits
+            .0
+            .borrow_mut()
+            .push(("draw", layout.virtual_offset()));
     }
     fn update(
         &mut self,

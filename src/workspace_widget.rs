@@ -2210,7 +2210,9 @@ mod tests {
             "scroll",
             "file drop",
             "scroll and file drop",
+            "file drop at 2x",
         ] {
+            let scale = if wrapper.ends_with("2x") { 2.0 } else { 1.0 };
             let (content, visits) = leaf::<()>(
                 Size::new(100.0, 60.0),
                 vec![
@@ -2242,8 +2244,8 @@ mod tests {
             let mut surface: Element<'_, ()> =
                 WorkspaceSurface::new(content, &shortcuts, FocusedPane::Other, 100.0, |_| ())
                     .into();
-            if matches!(wrapper, "file drop" | "scroll and file drop") {
-                surface = crate::file_drop::surface(surface, 1.0);
+            if wrapper.contains("file drop") {
+                surface = crate::file_drop::surface(surface, scale);
             }
             let mut tree = Tree::new(&surface);
             let node = surface
@@ -2299,13 +2301,20 @@ mod tests {
                     )
                 })
                 .collect();
+            // The scale wrapper converts logical targets to physical ones;
+            // the sibling registered before it is not scaled.
+            let scaled = |id, x: f64, y: f64, width: f64, height: f64| {
+                let scale = f64::from(scale);
+                (id, x * scale, y * scale, width * scale, height * scale)
+            };
             assert_eq!(
                 actual,
                 vec![
-                    (2, 30.0, 30.0, 70.0, 40.0),
-                    (1, 20.0, 30.0, 70.0, 40.0),
+                    scaled(2, 30.0, 30.0, 70.0, 40.0),
+                    scaled(1, 20.0, 30.0, 70.0, 40.0),
                     (99, 0.0, 0.0, 10.0, 10.0)
-                ]
+                ],
+                "{wrapper}"
             );
             assert_eq!(visits.offsets("drag"), vec![offset]);
         }

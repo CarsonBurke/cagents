@@ -359,23 +359,30 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         tree: &Tree,
         cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
+        use crate::ui_controls::accessible_bounds::place;
+
         let mut children = layout.children();
         let (Some(content), Some(toggle)) = (children.next(), children.next()) else {
             return iced_accessibility::A11yTree::default();
         };
-        let content = content.with_virtual_offset(layout.virtual_offset());
-        let toggle = toggle.with_virtual_offset(layout.virtual_offset());
-        let content = self
+        // Descendants report layout coordinates, so the cut is applied in
+        // them and the scroll offset once afterwards: text past the fold is
+        // hidden as it is from sight, rather than lying over what follows.
+        let state = tree.state.downcast_ref::<State>();
+        let offset = layout.virtual_offset();
+        let mut content = self
             .content
             .as_widget()
             .a11y_nodes(content, &tree.children[0], cursor);
-        if !tree.state.downcast_ref::<State>().tall {
+        place(&mut content, offset, Some(Self::shown(state, layout)));
+        if !state.tall {
             return content;
         }
-        let toggle = self
+        let mut toggle = self
             .toggle
             .as_widget()
             .a11y_nodes(toggle, &tree.children[1], cursor);
+        place(&mut toggle, offset, None);
         iced_accessibility::A11yTree::join([content, toggle].into_iter())
     }
 
@@ -471,9 +478,15 @@ mod tests {
                     &layout::Limits::new(Size::ZERO, Size::new(100.0, 500.0)),
                 )
                 .move_to(Point::new(30.0, 40.0));
+            // The control is cut where the fold cuts what is painted.
+            let shown = if folded && height > 60.0 {
+                80.0
+            } else {
+                height
+            };
             let mut expected = vec![(
                 "Content".to_owned(),
-                Rect::new(23.0, 75.0, 123.0, f64::from(75.0 + height)),
+                Rect::new(23.0, 75.0, 123.0, f64::from(75.0 + shown)),
                 vec![(
                     "Content",
                     offset,
@@ -496,6 +509,74 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// Plain text ignores the virtual offset and controls apply it, yet both
+    /// must land where they are painted; and what the fold cuts away must not
+    /// lie over what follows it.
+    #[test]
+    fn fold_places_every_accessible_node_where_it_is_painted_and_hides_the_cut() {
+        use crate::workspace_widget::forwarding_test::{Press, native_button};
+        use iced_accessibility::accesskit::{Rect, Role};
+
+        let renderer = renderer();
+        let offset = Vector::new(7.0, -35.0);
+        let content: Element<'_, Press> = cosmic::widget::column::with_children(vec![
+            cosmic::widget::text("Opening")
+                .width(100.0)
+                .height(40.0)
+                .into(),
+            native_button("Kept", Size::new(100.0, 40.0)),
+            native_button("Cut", Size::new(100.0, 130.0)),
+        ])
+        .into();
+        let mut widget = fold(
+            content,
+            cosmic::widget::text("Show more").width(100.0).height(20.0),
+            true,
+            80.0,
+            10.0,
+            |_| Color::BLACK,
+        );
+        let mut tree = Tree::new(&widget);
+        let node = widget
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(100.0, 500.0)),
+            )
+            .move_to(Point::new(30.0, 40.0));
+        let accessible = widget.as_widget().a11y_nodes(
+            Layout::new(&node).with_virtual_offset(offset),
+            &tree,
+            mouse::Cursor::Unavailable,
+        );
+        let named = |role: Role, name: &str| {
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .map(|node| node.node())
+                .find(|node| node.role() == role && node.label() == Some(name))
+                .unwrap_or_else(|| panic!("{name} is advertised"))
+        };
+        // Content starts at y 40, which the offset paints at 75.
+        assert_eq!(
+            named(Role::Paragraph, "Opening").bounds(),
+            Some(Rect::new(23.0, 75.0, 123.0, 115.0))
+        );
+        // The fold shows 80 px: the second control ends there, the third
+        // starts there.
+        let kept = named(Role::Button, "Kept");
+        assert_eq!(kept.bounds(), Some(Rect::new(23.0, 115.0, 123.0, 155.0)));
+        assert!(!kept.is_hidden());
+        assert!(named(Role::Button, "Cut").is_hidden());
+        // The toggle sits past the cut and its spacing: 40 + 80 + 10.
+        assert_eq!(
+            named(Role::Paragraph, "Show more").bounds(),
+            Some(Rect::new(23.0, 165.0, 123.0, 185.0))
+        );
     }
 
     #[test]
