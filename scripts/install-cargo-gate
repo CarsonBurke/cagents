@@ -80,9 +80,25 @@ current=$(version "$destination/cagents-cargo-gate")
 [ "${staged:-0}" -ge "${current:-0}" ] ||
     fail "the installed gate is version $current, newer than this checkout's ${staged:-0}; install from a checkout that has it"
 
+# The commit installed from, by which gates later install main's newer gate
+# themselves. Files that differ from their commit match none: then nothing
+# is recorded, and the next gate run in a checkout of main installs main's.
+revision=${CAGENTS_BUILD_INSTALL_REVISION:-}
+if [ -z "$revision" ] && revision=$(git -C "$source" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null) &&
+    ! git -C "$source" diff --quiet HEAD -- $(printf '%s\n' "$files" | sed 's/^[^:]*://') install-cargo-gate 2>/dev/null; then
+    printf '%s: scripts differ from %s, so the next gate run in a checkout of main replaces this installation with main'\''s\n' \
+        "$program" "$(printf '%s' "$revision" | cut -c1-12)" >&2
+    revision=
+fi
+rm -f -- "$destination/cagents-cargo-gate.source"
+
 printf '%s\n' "$files" | while IFS=: read -r installed file; do
     mv -f -- "$stage/$installed" "$destination/$installed"
 done
 smoke "$destination/cagents-cargo-gate"
+if [ -n "$revision" ]; then
+    printf '%s\n' "$revision" >"$stage/source"
+    mv -f -- "$stage/source" "$destination/cagents-cargo-gate.source"
+fi
 printf '%s: installed %s/cagents-cargo-gate from %s\n' \
-    "$program" "$destination" "$(git -C "$source" rev-parse --short HEAD 2>/dev/null || printf 'this checkout')"
+    "$program" "$destination" "${revision:+$(printf '%s' "$revision" | cut -c1-12)}${revision:-this checkout}"

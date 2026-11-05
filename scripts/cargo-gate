@@ -16,6 +16,66 @@ set -eu
 # builds.
 gate_version=2
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
+
+# A gate change merged into main is live without anyone installing it: the
+# installer records the commit it installed from, and when this checkout's
+# origin/main has gone past it and changed the gate or a helper, main's are
+# installed. An installation main has not reached, such as a branch's under
+# test, stays until main has it.
+gate_files='scripts/cargo-gate scripts/cargo-gate-command.py scripts/cargo-offload scripts/seed-build-dir scripts/build-disk-guard scripts/install-cargo-gate'
+sync_installed() {
+    [ "$(basename -- "$installed")" = cagents-cargo-gate ] || return 1
+    main=$(git rev-parse -q --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null) || return 1
+    record=$installed.source
+    recorded=$(cat -- "$record" 2>/dev/null) || recorded=
+    [ "$recorded" != "$main" ] || return 1
+    # Not this repository's main, or one without the gate.
+    git cat-file -e "$main:scripts/install-cargo-gate" 2>/dev/null || return 1
+    if [ -n "$recorded" ]; then
+        git merge-base --is-ancestor "$recorded" "$main" 2>/dev/null || return 1
+        if git diff --quiet "$recorded" "$main" -- $gate_files 2>/dev/null; then
+            printf '%s\n' "$main" >"$record.$$" && mv -f -- "$record.$$" "$record" || rm -f -- "$record.$$"
+            return 1
+        fi
+    fi
+    failed=$(cat -- "$installed.sync-failed" 2>/dev/null) || failed=
+    if [ "$failed" = "$main" ]; then
+        printf 'cargo-gate: %s is not origin/main'\''s gate, which could not be installed; run scripts/install-cargo-gate from main\n' \
+            "$installed" >&2
+        return 1
+    fi
+    (
+        # One gate installs; the others go on with what is there.
+        exec 8>>"$installed.sync.lock"
+        flock -n 8 || exit 1
+        [ "$(cat -- "$record" 2>/dev/null)" != "$main" ] || exit 0
+        stage=$(mktemp -d "${TMPDIR:-/tmp}/cagents-gate-sync.XXXXXX") || exit 2
+        trap 'rm -rf -- "$stage"' EXIT
+        if output=$(git archive "$main" $gate_files 2>&1 | tar -x -C "$stage" 2>&1 &&
+            CAGENTS_BUILD_INSTALL_REVISION=$main \
+                "$stage/scripts/install-cargo-gate" "$(dirname -- "$installed")" 2>&1) &&
+            # An installer from before this records nothing, and would be run
+            # again by every gate.
+            [ "$(cat -- "$record" 2>/dev/null)" = "$main" ] ||
+            { output="${output:+$output
+}main's installer did not record what it installed"; false; }; then
+            rm -f -- "$installed.sync-failed"
+            printf 'cargo-gate: installed origin/main'\''s gate (%s) as %s\n' \
+                "$(printf '%s' "$main" | cut -c1-12)" "$installed" >&2
+        else
+            printf '%s\n' "$main" >"$installed.sync-failed"
+            printf 'cargo-gate: could not install origin/main'\''s gate as %s; run scripts/install-cargo-gate from main:\n%s\n' \
+                "$installed" "$output" >&2
+            exit 2
+        fi
+    )
+}
+if [ -n "$installed" ] && [ "${CAGENTS_BUILD_INSTALL_SYNC-1}" != 0 ] && sync_installed &&
+    [ "$(readlink -f -- "$installed")" = "$(readlink -f -- "$0")" ]; then
+    # Once is enough, should the new installation not record its commit.
+    CAGENTS_BUILD_INSTALL_SYNC=0 exec "$installed" "$@"
+fi
+
 if [ -n "$installed" ] && [ -x "$installed" ] &&
     [ "$(readlink -f -- "$installed")" != "$(readlink -f -- "$0")" ]; then
     theirs=$(sed -n 's/^gate_version=\([0-9][0-9]*\)$/\1/p' "$installed" 2>/dev/null | head -n 1)
@@ -58,7 +118,8 @@ for `flock /var/tmp/cagents-cargo.lock COMMAND`, whose gated commands run in
 that slot without waiting.
 
 A checkout's gate defers to the installed one, /var/tmp/cagents-cargo-gate,
-when that is newer.
+when that is newer. Run inside a checkout whose origin/main has changed the
+gate since the installed one's commit, the gate first installs main's.
 
 A checkout whose Cargo build directory has never been built is first seeded
 from the main checkout's with scripts/seed-build-dir. When the file system
@@ -76,6 +137,8 @@ Environment:
                          The installed gate a checkout's older gate defers
                          to (default /var/tmp/cagents-cargo-gate); empty
                          runs this checkout's gate always
+  CAGENTS_BUILD_INSTALL_SYNC=0
+                         Do not install origin/main's newer gate
   CAGENTS_BUILD_SEED=0   Do not seed a new build directory
   CAGENTS_BUILD_FREE_FLOOR_GIB
                          Free space below which builds are refused; default
@@ -670,7 +733,7 @@ cargo=${CAGENTS_BUILD_CARGO:-cargo}
 offload=$(dirname "$0")/cargo-offload
 if [ -x "$offload" ]; then
     where=0
-    "$offload" --host >/dev/null || where=$?
+    build_host=$("$offload" --host) || where=$?
 elif [ "${CAGENTS_BUILD_REMOTE-}" = local ]; then
     where=75
 else
@@ -693,12 +756,10 @@ if [ "$where" -eq 0 ]; then
         # with the program's.
         status=0
         # The build host admits the build by the memory it is expected to
-        # need, as this host would, and gives it the caller's open-file
-        # limit, measured here: an interpreter wrapper such as mise's raises
-        # its own before cargo-offload could read it.
+        # need, as this host would.
         supervised '' env CAGENTS_BUILD_ADMISSION_DEADLINE="$deadline" \
             CAGENTS_BUILD_EXPECTED_KIB="$(expected_cost "$@")" \
-            CAGENTS_BUILD_OPEN_FILES="$(ulimit -Sn)" "$offload" "$@" || status=$?
+            CAGENTS_BUILD_OFFLOAD_HOST="$build_host" "$offload" "$@" || status=$?
         exit "$status"
     fi
     # Each Cargo command in COMMAND goes through this gate, with its own
@@ -706,7 +767,7 @@ if [ "$where" -eq 0 ]; then
     # The shim reaches this gate by its own path, naming Cargo so that
     # `cargo --help` is Cargo's; the gate takes the shim off PATH again, so
     # it reaches this host's Cargo.
-    self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+    self=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)/$(basename "$0")
     shims=$(mktemp -d "${TMPDIR:-/tmp}/cagents-cargo-shim.XXXXXX")
     quoted=$(printf '%s' "$self" | sed "s/'/'\\\\''/g")
     printf "#!/bin/sh\nexec '%s' cargo \"\$@\"\n" "$quoted" >"$shims/cargo"
