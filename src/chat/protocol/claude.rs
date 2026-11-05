@@ -2850,6 +2850,24 @@ impl Adapter for Claude {
                 if frame["parent_tool_use_id"].is_null() {
                     self.observe_title(&mut step);
                 }
+                // The turn's outcome takes its reason from the errors reported
+                // before it, so this result's own failure must precede it.
+                if failed_result(&frame) {
+                    let errors = provider_error_text(&frame["errors"]);
+                    let message = if !errors.is_empty() {
+                        errors
+                    } else if !string(&frame, "result").is_empty() {
+                        string(&frame, "result").into()
+                    } else if string(&frame, "subtype").is_empty() {
+                        "Claude ended the turn without reporting success".into()
+                    } else {
+                        format!("Claude result: {}", string(&frame, "subtype"))
+                    };
+                    step.events.push(Event::Error {
+                        message,
+                        fatal: false,
+                    });
+                }
                 let can_suggest = frame["parent_tool_use_id"].is_null()
                     && frame["is_error"] != true
                     && frame["subtype"] == "success"
@@ -2955,22 +2973,6 @@ impl Adapter for Claude {
                     }
                 }
                 step.events.push(Event::Usage(self.usage.clone()));
-                if failed_result(&frame) {
-                    let errors = provider_error_text(&frame["errors"]);
-                    let message = if !errors.is_empty() {
-                        errors
-                    } else if !string(&frame, "result").is_empty() {
-                        string(&frame, "result").into()
-                    } else if string(&frame, "subtype").is_empty() {
-                        "Claude ended the turn without reporting success".into()
-                    } else {
-                        format!("Claude result: {}", string(&frame, "subtype"))
-                    };
-                    step.events.push(Event::Error {
-                        message,
-                        fatal: false,
-                    });
-                }
             }
             "system" => self.system(&frame, &mut step)?,
             "auth_status" => {
@@ -6920,6 +6922,28 @@ mod tests {
         assert!(
             matches!(parent.events.as_slice(), [Event::Error { .. }]),
             "ordinary parent API errors keep their existing event representation"
+        );
+    }
+
+    #[test]
+    fn failed_result_outcome_states_its_own_error_not_an_earlier_one() {
+        let frames = vec![
+            json!({"type":"stream_event","uuid":"transient","event":{"type":"error","error":{"type":"overloaded_error","message":"earlier transient overload"}}}),
+            json!({"type":"result","uuid":"failed-turn","subtype":"error_during_execution","is_error":true,"errors":["Prompt is too long"]}),
+        ];
+        let (_, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(Claude {
+                busy: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        assert!(
+            matches!(&state.outcome, Some(crate::agent::ActivityOutcome::Failed { reason })
+                if reason.contains("Prompt is too long") && !reason.contains("earlier transient")),
+            "{:?}",
+            state.outcome
         );
     }
 
