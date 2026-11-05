@@ -6163,7 +6163,8 @@ impl Cagents {
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             runtime.unqueue();
         }
-        self.stash_unsent_chat_draft(card);
+        self.stash_unsent_chat(card);
+        self.cards.remove(&card);
         self.lifecycle.remove(card);
         self.shared_views.attached.insert(card);
         self.chat_ui.peer_started.insert(card, session.id);
@@ -6187,7 +6188,7 @@ impl Cagents {
         }
         self.chat_ui.peer_started.remove(&card);
         self.chat_ui.phases.remove(&card);
-        self.stash_unsent_chat_draft(card);
+        self.stash_unsent_chat(card);
         self.cards.remove(&card);
         self.lifecycle.remove(card);
         self.resolve_notice(NoticeKey::ChatAttach(card));
@@ -6201,27 +6202,6 @@ impl Cagents {
 
     pub(in crate::app) fn chat_is_draft(&self, card: CardId) -> bool {
         matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.is_draft())
-    }
-
-    /// Moves what a person has written in `card`'s draft out of its runtime,
-    /// and drops the runtime, for the next runtime the card gets to take up.
-    pub(in crate::app) fn stash_unsent_chat_draft(&mut self, card: CardId) {
-        if !matches!(self.cards.get(&card), Some(CardRuntime::Chat(_))) {
-            return;
-        }
-        let Some(CardRuntime::Chat(runtime)) = self.cards.remove(&card) else {
-            return;
-        };
-        self.chat_ui.drafts.insert(card, runtime.unsent_text());
-        let images = runtime
-            .unsent_attachments()
-            .iter()
-            .filter(|image| image.reference.is_some())
-            .cloned()
-            .collect::<Vec<_>>();
-        if !images.is_empty() {
-            self.chat_ui.draft_attachments.insert(card, images);
-        }
     }
 
     /// Catches draft `card` up, once it can choose again, with what another

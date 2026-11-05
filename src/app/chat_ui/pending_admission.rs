@@ -336,7 +336,8 @@ impl Cagents {
         }
         let task = match &pane.kind {
             CardKind::Chat(session) if session.is_unstarted() => {
-                self.stash_unsent_chat_draft(pane.id);
+                self.stash_unsent_chat(pane.id);
+                self.cards.remove(&pane.id);
                 self.open_chat(pane.id, session.clone(), chat::Intent::Restore)
             }
             CardKind::Chat(session) => {
