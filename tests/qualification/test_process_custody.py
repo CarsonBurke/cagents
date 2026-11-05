@@ -155,6 +155,35 @@ class OwnedFamily:
         self.close()
 
 
+def observe_real_polls(before_wait, after_wait=None):
+    """Observe requested waits; every readiness result comes from kernel poll."""
+    real_poll = select.poll
+    observations = []
+
+    class ObservedPoll:
+        def __init__(self):
+            self.original = real_poll()
+            self.descriptors = []
+
+        def register(self, descriptor, events):
+            self.descriptors.append(descriptor)
+            return self.original.register(descriptor, events)
+
+        def poll(self, timeout=None):
+            waiting = timeout is not None and timeout > 0
+            descriptors = tuple(self.descriptors)
+            if waiting:
+                before_wait(descriptors, timeout)
+            events = self.original.poll(timeout)
+            if waiting:
+                observations.append((descriptors, timeout, list(events)))
+                if after_wait is not None:
+                    after_wait(descriptors, timeout, events)
+            return events
+
+    return ObservedPoll, observations
+
+
 class ProcessCustodyExitTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -210,9 +239,13 @@ class ProcessCustodyExitTests(unittest.TestCase):
                             raise OSError(number, "Injected live owned-node metadata failure")
                         return current(candidate, executable=executable)
 
-                    with mock.patch.object(owner, "current", side_effect=missing):
+                    with mock.patch.object(owner, "current", side_effect=missing), \
+                            mock.patch.object(owner, "exited", wraps=owner.exited) as exit_checks:
                         with self.assertRaises((OSError, RuntimeError)):
                             owner.exact_matches(family.executable)
+                    grace = [call for call in exit_checks.call_args_list
+                             if call.args[0] is node and call.kwargs.get("wait_until") is not None]
+                    self.assertEqual(len(grace), 0 if number == errno.EACCES else 1)
                     self.assertFalse(owner.exited(node))
                     self.assertFalse(node["settled"])
                     self.assertNotIn("exit_code", node)
@@ -224,8 +257,11 @@ class ProcessCustodyExitTests(unittest.TestCase):
             ticks = node["start_ticks"]
             try:
                 node["start_ticks"] = ticks + 1
-                with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
-                    owner.exact_matches(family.executable)
+                with mock.patch.object(owner, "exited", wraps=owner.exited) as exit_checks:
+                    with self.assertRaisesRegex(RuntimeError, "incarnation changed"):
+                        owner.exact_matches(family.executable)
+                self.assertFalse(any(call.kwargs.get("wait_until") is not None
+                                     for call in exit_checks.call_args_list))
             finally:
                 node["start_ticks"] = ticks
             self.assertFalse(owner.exited(node))
@@ -250,6 +286,7 @@ class ProcessCustodyExitTests(unittest.TestCase):
             self.assertFalse(owner.exited(node))
             self.assertFalse(node["settled"])
             self.assertIs(owner.nodes[node["pid"]], node)
+            self.assertNotIn("exit_code", node)
 
     def test_expected_executable_file_failure_is_not_a_node_disappearance(self):
         with OwnedFamily(self, self.module) as family:
@@ -260,12 +297,121 @@ class ProcessCustodyExitTests(unittest.TestCase):
                     raise FileNotFoundError(errno.ENOENT, "Injected expected executable-file disappearance")
                 return real_stat(path, *args, **kwargs)
 
-            with mock.patch.object(self.module.os, "stat", side_effect=expected_file_missing):
+            with mock.patch.object(self.module.os, "stat", side_effect=expected_file_missing), \
+                    mock.patch.object(family.owner, "exited", wraps=family.owner.exited) as exit_checks:
                 with self.assertRaisesRegex(FileNotFoundError, "expected executable-file"):
                     family.owner.exact_matches(family.executable)
+            self.assertFalse(any(call.kwargs.get("wait_until") is not None
+                                 for call in exit_checks.call_args_list))
             self.assertFalse(family.owner.exited(family.node))
             self.assertFalse(family.node["settled"])
             self.assertNotIn("exit_code", family.node)
+
+    def test_owned_metadata_disappearance_waits_only_on_original_pidfds(self):
+        for number in (errno.ENOENT, errno.ESRCH):
+            with self.subTest(metadata_errno=number), OwnedFamily(self, self.module) as family:
+                owner, node = family.owner, family.node
+                descriptor = node["pidfd"]
+                current = owner.current
+                missing = []
+                released = []
+
+                def metadata_missing(candidate, executable=False):
+                    if candidate is node:
+                        self.assertFalse(owner.exited(node))
+                        missing.append(node["pid"])
+                        raise OSError(number, "Injected pre-exit metadata disappearance")
+                    return current(candidate, executable=executable)
+
+                def release_at_bounded_poll(descriptors, timeout):
+                    self.assertEqual(descriptors, (descriptor,))
+                    self.assertGreater(timeout, 0)
+                    self.assertLessEqual(timeout, 100)
+                    self.assertEqual(missing, [node["pid"]])
+                    self.assertFalse(released, "Only one bounded wait releases this real child")
+                    self.assertFalse(owner.exited(node), "Real child is still pipe-held")
+                    family.worker.stdin.write(b"exit\n")
+                    family.worker.stdin.flush()
+                    released.append(descriptor)
+
+                poll_proxy, observations = observe_real_polls(release_at_bounded_poll)
+                with mock.patch.object(owner, "current", side_effect=metadata_missing), \
+                        mock.patch.object(self.module.select, "poll", poll_proxy):
+                    matches = owner.exact_matches(family.executable)
+                self.assertEqual(released, [descriptor])
+                self.assertEqual(len(observations), 1)
+                self.assertTrue(any(flags & select.POLLIN for _, flags in observations[0][2]))
+                self.assertEqual([item[0]["pid"] for item in matches], [family.worker.pid])
+                self.assertIs(owner.nodes[node["pid"]], node)
+                self.assertEqual(node["pidfd"], descriptor)
+                self.assertFalse(node["settled"])
+                self.assertNotIn("exit_code", node)
+                self.assertFalse(owner.reap(node), "Actual parent still owns the zombie status")
+                self.assertEqual(family.line(), b"dead\n")
+                family.command(b"reap\n", b"reaped 23\n")
+                self.assertTrue(owner.reap(node))
+                self.assertIsNone(node["exit_code"])
+                self.assertIn("status unavailable", node["exit_status_source"])
+                self.assertEqual(node["pidfd"], descriptor)
+
+        with self.subTest(shared_budget=True), OwnedFamily(self, self.module) as family:
+            owner, node = family.owner, family.node
+            worker_node = owner.nodes[family.worker.pid]
+            descriptor, worker_descriptor = node["pidfd"], worker_node["pidfd"]
+            self.assertEqual(set(owner.nodes), {node["pid"], family.worker.pid})
+            # Keep the same real records/fds, but inspect the departing child
+            # before its genuinely live parent in this single matching pass.
+            owner.nodes[family.worker.pid] = owner.nodes.pop(family.worker.pid)
+            current = owner.current
+            clock = [1000.0]
+            released = []
+
+            def metadata_missing(candidate, executable=False):
+                if candidate is node or candidate is worker_node:
+                    self.assertFalse(owner.exited(candidate))
+                    raise OSError(errno.ENOENT, "Injected original-node metadata disappearance")
+                return current(candidate, executable=executable)
+
+            def before_wait(descriptors, timeout):
+                self.assertGreater(timeout, 0)
+                self.assertLessEqual(timeout, 100)
+                if descriptors == (descriptor,):
+                    self.assertFalse(released)
+                    family.worker.stdin.write(b"exit\n")
+                    family.worker.stdin.flush()
+                    released.append(descriptor)
+                else:
+                    self.assertEqual(descriptors, (worker_descriptor,))
+                    self.assertEqual(released, [descriptor])
+                    self.assertLessEqual(timeout, 11, "The second node cannot receive a new 100 ms budget")
+
+            def after_wait(descriptors, _timeout, events):
+                if descriptors == (descriptor,):
+                    self.assertTrue(any(flags & select.POLLIN for _, flags in events))
+                    # Control only budget arithmetic; readiness and process
+                    # exit remain real. No handshake runs under this clock.
+                    clock[0] += 0.09
+                else:
+                    self.assertFalse(events, "The real worker remains alive")
+
+            poll_proxy, observations = observe_real_polls(before_wait, after_wait)
+            with mock.patch.object(owner, "current", side_effect=metadata_missing), \
+                    mock.patch.object(self.module.select, "poll", poll_proxy), \
+                    mock.patch.object(self.module.time, "monotonic", side_effect=lambda: clock[0]):
+                with self.assertRaisesRegex(RuntimeError, "metadata vanished without original pidfd exit"):
+                    owner.exact_matches(family.executable)
+            self.assertEqual([item[0] for item in observations], [(descriptor,), (worker_descriptor,)])
+            self.assertIs(owner.nodes[node["pid"]], node)
+            self.assertIs(owner.nodes[family.worker.pid], worker_node)
+            self.assertEqual((node["pidfd"], worker_node["pidfd"]), (descriptor, worker_descriptor))
+            self.assertFalse(node["settled"] or worker_node["settled"])
+            self.assertNotIn("exit_code", node)
+            self.assertNotIn("exit_code", worker_node)
+            self.assertEqual(family.line(), b"dead\n")
+            family.command(b"reap\n", b"reaped 23\n")
+            self.assertTrue(owner.reap(node))
+            self.assertIsNone(node["exit_code"])
+            self.assertFalse(owner.exited(worker_node))
 
 
 if __name__ == "__main__":
