@@ -2670,6 +2670,13 @@ mod tests {
         dirty: bool,
         file: &str,
     ) -> (CardId, LspDocumentId) {
+        let card = removal_pane(app, target, dirty, file);
+        let doc = app.lsp_document(card).unwrap();
+        assert_eq!(app.lsp.status(doc), LspStatus::Starting);
+        (card, doc)
+    }
+
+    fn removal_pane(app: &mut Cagents, target: &Target, dirty: bool, file: &str) -> CardId {
         let card = CardId::new();
         let mut runtime = if dirty {
             repository_widget::RepositoryRuntime::dirty_fixture(card)
@@ -2706,14 +2713,35 @@ mod tests {
             1,
             &"buffer\n".into(),
         ));
-        let doc = app.lsp_document(card).unwrap();
-        assert_eq!(app.lsp.status(doc), LspStatus::Starting);
-        (card, doc)
+        card
+    }
+
+    /// A pane refused language tools for another pane's file can still take
+    /// them once that owner's worktree is gone.
+    #[test]
+    fn a_pane_refused_language_tools_recovers_after_the_owner_is_removed() {
+        removal_callback_test(|| {
+            let (mut app, _root, target) = removal_lsp_app();
+            let (owner, _) = removal_editor(&mut app, &target, false);
+            let capture = app.capture_worktree_removal(&target);
+            let refused = removal_pane(&mut app, &target, false, "main.rs");
+            assert_eq!(app.lsp_document(refused), None);
+            drop(app.update(Message::ProjectUi(Action::Deleted {
+                target,
+                capture,
+                result: Ok(()),
+            })));
+            assert_eq!(app.lsp_document(owner), None);
+            drop(app.update(Message::ContextInspector(
+                InspectorAction::RestartLanguageServer(refused),
+            )));
+            assert!(app.lsp_document(refused).is_some());
+        });
     }
 
     #[test]
-    fn worktree_removal_callback_retires_only_original_documents_and_preserves_same_path_successor()
-    {
+    fn worktree_removal_callback_retires_only_original_documents_and_preserves_same_worktree_successor()
+     {
         removal_callback_test(|| {
             let (mut app, _root, target) = removal_lsp_app();
             let (original, old_doc) = removal_editor(&mut app, &target, false);

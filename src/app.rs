@@ -15680,7 +15680,10 @@ impl Application for Cagents {
                 }
                 if saved
                     && let Some(key) = self.sidebar_state.active_worktree().cloned()
-                    && self.repository_card_for(&key.canonical_path) == Some(card)
+                    && self.card_state(card).is_some_and(|state| {
+                        matches!(&state.kind, CardKind::Repository(view)
+                            if view.worktree == key.canonical_path)
+                    })
                 {
                     tasks.push(self.reload_source_control(&key));
                 }
