@@ -13046,6 +13046,94 @@ mod tests {
     }
 
     #[test]
+    fn working_diff_worker_matches_the_native_source_and_leaves_the_editor_alone() {
+        use cosmic::iced::futures::StreamExt;
+
+        for cancelled in [false, true] {
+            let card = CardId::new();
+            let baseline = "xlet café = \"😀\";\nsecond\r\n\rthird\rfourth";
+            let saved = "let café = \"😀\";\r\nsecond\n\rthird\rfourth\n";
+            let after = "xlet café = \"😀\";\r\nsecond\n\rthird\rfourth\n";
+            let (mut runtime, _) = working_diff_runtime(card, baseline, saved);
+            runtime.set_lsp_document(None);
+            runtime.source_surface = SourceSurface::Editor;
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+            }));
+            runtime.working_diff.applied = None;
+            drop(runtime.working_diff_task(card));
+            let ticket = runtime.working_diff.timer.unwrap();
+            runtime.working_diff.deadline = Some(Instant::now());
+            let editor_state = |runtime: &RepositoryRuntime| {
+                let DocumentState::Editable(document) = &runtime.document else {
+                    panic!("native buffer")
+                };
+                (
+                    document.saved_text.clone(),
+                    document.saved_history_revision,
+                    document.dirty,
+                    document.revision,
+                    document.history.revision(),
+                    document.content.cursor(),
+                )
+            };
+            let original_state = editor_state(&runtime);
+            assert!(runtime.is_dirty());
+
+            let task = runtime.start_working_diff(card, ticket);
+            assert_eq!(editor_state(&runtime), original_state);
+            if cancelled {
+                runtime
+                    .working_diff
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .cancellation
+                    .cancel();
+            }
+
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let completion = executor.block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(action) = action {
+                        return action;
+                    }
+                }
+                panic!("the diff worker must return its completion")
+            });
+            let RepositoryAction::WorkingDiffLoaded { result, .. } = &completion else {
+                panic!("working diff completion")
+            };
+            if cancelled {
+                assert!(matches!(result, Ok(None)));
+            } else {
+                let model = result.as_ref().unwrap().as_ref().unwrap();
+                let expected = crate::diff_view::build_diff(baseline, after);
+                for marker in ["[LF]", "[CRLF]", "[no newline]"] {
+                    assert!(
+                        expected
+                            .inline_rows
+                            .iter()
+                            .any(|row| row.text.ends_with(marker))
+                    );
+                }
+                assert_eq!(model.line_counts, expected.line_counts);
+                assert_eq!(model.inline_rows, expected.inline_rows);
+                assert_eq!(model.split_rows, expected.split_rows);
+            }
+            drop(runtime.update(completion));
+            if !cancelled {
+                assert!(runtime.working_annotations_current());
+            }
+            assert_eq!(editor_state(&runtime), original_state);
+        }
+    }
+
+    #[test]
     fn working_diff_coalesces_edits_and_rejects_cancelled_revision_results() {
         let card = CardId::new();
         let (mut runtime, identity) = working_diff_runtime(card, "old\n", "first\n");
