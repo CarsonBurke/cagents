@@ -87,7 +87,7 @@ impl Cagents {
             return Task::none();
         }
         let mut tasks = Vec::new();
-        let (mut explained, mut unexplained) = (0, 0);
+        let mut kept = 0;
         while let Some(QueuedCardClose { card, unasked }) = self.queued_card_closes.pop_front() {
             if !self
                 .card_state(card)
@@ -95,6 +95,8 @@ impl Cagents {
             {
                 continue;
             }
+            // Each nested update logs and clears the status, so one set before
+            // the queue moved is held back for the caller to report.
             let earlier_notice = self.status.take();
             // Acquire the next close's ownership before returning a task.
             // A delayed CardId-only message would leave Retry free to
@@ -104,7 +106,6 @@ impl Cagents {
             } else {
                 Message::CloseCard(card)
             }));
-            let turned_away = self.status.is_some();
             if self.status.is_none() {
                 self.status = earlier_notice;
             }
@@ -114,22 +115,20 @@ impl Cagents {
             if self.pane_close_owned(card) {
                 break;
             }
-            if !self
+            if self
                 .card_state(card)
                 .is_some_and(|state| state.existence.is_open())
             {
-                continue;
-            }
-            if turned_away {
-                explained += 1;
-            } else {
-                unexplained += 1;
+                kept += 1;
             }
         }
-        if unexplained > 0 || explained > 1 {
-            self.status = Some(TransientNotice::warning(
-                "Some panes were kept. Close them again.",
-            ));
+        // Each turned-away pane's own reason, if it has one, is already a notice.
+        if kept > 0 {
+            self.status = Some(TransientNotice::warning(if kept == 1 {
+                "A pane was kept. Close it again."
+            } else {
+                "Some panes were kept. Close them again."
+            }));
         }
         Task::batch(tasks)
     }
@@ -1139,6 +1138,11 @@ mod tests {
         assert!(!app.pane_close_owned(moving));
         assert!(app.pane_close_owned(next), "the next pane got its turn");
         assert!(app.queued_card_closes.is_empty());
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|notice| notice.message.starts_with("A pane was kept"))
+        );
     }
 
     #[test]
@@ -1166,7 +1170,7 @@ mod tests {
             app.status
                 .as_ref()
                 .is_some_and(|notice| notice.message.starts_with("Some panes")),
-            "only the last pane's reason would remain"
+            "the rest would go without a word about them"
         );
     }
 
