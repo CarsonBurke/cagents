@@ -1692,8 +1692,23 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                 .intersection(viewport)
                 .is_some_and(|bounds| cursor.is_over(bounds));
         if !inside {
-            state.tip_suppressed = false;
             state.inspect_control = true;
+        }
+        // A press keeps the tooltip hidden until the pointer leaves the
+        // control or the window, or the window loses focus. A menu the press
+        // opened makes the cursor unavailable to this layer without the
+        // pointer moving, so an unavailable cursor alone is not a leave.
+        let left = matches!(
+            event,
+            Event::Mouse(mouse::Event::CursorLeft) | Event::Window(window::Event::Unfocused)
+        ) || cursor.position().is_some_and(|position| {
+            !layout
+                .bounds()
+                .intersection(viewport)
+                .is_some_and(|bounds| bounds.contains(position))
+        });
+        if left {
+            state.tip_suppressed = false;
         }
         if matches!(self.kind, Kind::Tooltip) && inside && state.inspect_control {
             // The Widget API has no enabled query. COSMIC buttons expose this
@@ -2025,6 +2040,45 @@ mod tests {
                 &bounds,
             );
             assert!(!tree.state.downcast_ref::<State>().tip_open);
+            assert!(tree.state.downcast_ref::<State>().tip_suppressed);
+        }
+        // A context menu the press opened covers the control: the runtime
+        // hands this layer an unavailable cursor while the pointer stays put.
+        // Closing the menu returns the same position, which is not a re-entry.
+        for (event, cursor) in [
+            (
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: node.bounds().center(),
+                }),
+                mouse::Cursor::Unavailable,
+            ),
+            (
+                Event::Window(window::Event::RedrawRequested(
+                    Instant::now() + TOOLTIP_DELAY,
+                )),
+                mouse::Cursor::Unavailable,
+            ),
+            (
+                Event::Window(window::Event::RedrawRequested(
+                    Instant::now() + TOOLTIP_DELAY * 2,
+                )),
+                pointer,
+            ),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            assert!(
+                !tree.state.downcast_ref::<State>().tip_open,
+                "a menu over the pressed control must not re-arm its tooltip"
+            );
             assert!(tree.state.downcast_ref::<State>().tip_suppressed);
         }
         element.as_widget_mut().update(
