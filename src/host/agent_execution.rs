@@ -467,7 +467,7 @@ fn dispatch(
             .map_err(before)?;
         if ended {
             return Err(before(
-                "This agent stopped when the daemon stopped; reopen its conversation to resume it. The prompt was not sent".into(),
+                "This agent's process has stopped; reopen its conversation to resume it. The prompt was not sent".into(),
             ));
         }
         let state = host.lock().unwrap_or_else(|p| p.into_inner());

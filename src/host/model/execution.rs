@@ -1552,7 +1552,7 @@ impl Registry {
                         run.result.diagnostic = Some("The provider was retired before its launch could be bound; no prompt was submitted".into());
                     } else if end == ProcessEnd::Stopped {
                         changed = true;
-                        run.result.diagnostic = Some("The daemon stopped before this prompt finished, so its effects may be incomplete. It was not resent; inspect the conversation before sending more work.".into());
+                        run.result.diagnostic = Some("The agent's process stopped before this prompt finished, so its effects may be incomplete. It was not resent; inspect the conversation before sending more work.".into());
                     }
                     run.finished_ms = Some(now_ms);
                     run.revision = run
@@ -3083,10 +3083,9 @@ mod tests {
             assert!(view.retired.is_empty());
             assert!(registry.model().unwrap().channel(channel).is_some());
             assert!(
-                run.result
-                    .diagnostic
-                    .as_deref()
-                    .is_some_and(|text| text.contains("daemon stopped")),
+                run.result.diagnostic.as_deref().is_some_and(
+                    |text| text.contains("process stopped before this prompt finished")
+                ),
                 "{run:?}"
             );
 

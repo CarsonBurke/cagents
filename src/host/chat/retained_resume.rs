@@ -182,6 +182,12 @@ fn same_account_home(source: &Session, captured: &LaunchAccountScope) -> Result<
     Ok(())
 }
 
+const SURVIVOR: &str = "A process from this conversation's earlier Claude session is still running, so nothing was started in its place. Retry once it has exited";
+
+/// Also the answer for a pane whose conversation had an open CLI view, since
+/// that view's terminal could still hold the conversation.
+const UNMATCHED: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place";
+
 /// An actor that ended without retirement grants disk resume only when no
 /// writer of it can survive: its exact helper and provider are gone in this
 /// boot with nothing left in their process group or session, it was never
@@ -208,12 +214,10 @@ fn abandoned(
         || issued.terminal.is_some()
         || source.terminal.is_some()
     {
-        return Err(
-            "The saved Claude actor ended without retirement and its ownership does not match this pane exactly".into(),
-        );
+        return Err(UNMATCHED.into());
     }
     if !Handle::inspect_abandoned_actor(ownership.owner(), proof)? {
-        return Err("The saved Claude actor ended without retirement and part of it may still be running; no replacement was prepared".into());
+        return Err(SURVIVOR.into());
     }
     let captured = ownership.scope().map_err(|_| {
         "The ended Claude actor has no captured physical account identity".to_owned()
@@ -520,7 +524,7 @@ pub(super) fn unnamed_conversation(
                     }
                     crate::chat::runtime::RetirementInspection::ExitedUnproved => {
                         if !Handle::inspect_abandoned_actor(ownership.owner(), &proof)? {
-                            return Err("The saved Claude actor ended without retirement and part of it may still be running; no replacement was prepared".into());
+                            return Err(SURVIVOR.into());
                         }
                         recorded?
                     }
@@ -546,7 +550,7 @@ pub(super) fn unnamed_conversation(
     // An actor is registered before it starts, so a same-boot pane without
     // one has no ended actor to vouch for; a live record decides instead.
     if !found && !previous_boot {
-        return Err("The unnamed Claude pane has no registered actor whose end is proved".into());
+        return Err("cagents has no record of this conversation's earlier Claude process, so it cannot prove that process ended. Nothing was started in its place".into());
     }
     Ok(learned)
 }
