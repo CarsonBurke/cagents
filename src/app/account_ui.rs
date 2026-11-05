@@ -2554,11 +2554,20 @@ impl Cagents {
                 self.account_ui.table.linking = false;
                 match result {
                     Ok(registry) => {
+                        // A repeated link returns the registration the reader
+                        // already sees. A restored archive was hidden, so it
+                        // reads as added.
+                        let recovered = self.account_ui.registry.find(key).is_some()
+                            && !self.account_ui.registry.is_archived(key);
                         self.account_ui.set_registry(registry);
                         self.account_ui.table.link = None;
                         self.status = Some(
-                            TransientNotice::success("Existing account home added.")
-                                .with_key(NoticeKey::AccountLink),
+                            TransientNotice::success(if recovered {
+                                "That account home is already listed."
+                            } else {
+                                "Existing account home added."
+                            })
+                            .with_key(NoticeKey::AccountLink),
                         );
                         let id = self
                             .account_ui
@@ -3350,7 +3359,7 @@ impl Cagents {
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
                 let (key, result) = match result {
-                    Ok((registry, key)) => (key, Ok(registry)),
+                    Ok((registry, linked)) => (linked, Ok(registry)),
                     Err(error) => (key, Err(error)),
                 };
                 Message::AccountUi(Action::LinkReady { key, result })
@@ -3368,17 +3377,8 @@ impl Cagents {
                     .map(Homes::lifecycle_lock)
                     .transpose()
                     .map_err(|error| error.to_string())?;
-                let chosen = if let Some(relative) = raw_path.strip_prefix("~/") {
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .ok_or("HOME is unavailable")?
-                        .join(relative)
-                } else {
-                    PathBuf::from(raw_path)
-                };
-                if !chosen.is_absolute() {
-                    return Err("Enter an absolute path or one starting with ~/".into());
-                }
+                let chosen =
+                    account::expand_linked_home(raw_path, std::env::var_os("HOME").as_deref())?;
                 let path = std::fs::canonicalize(&chosen)
                     .map_err(|error| format!("{}: {error}", chosen.display()))?;
                 crate::secure_file::validate_owned_directory(&path)
@@ -3409,7 +3409,7 @@ impl Cagents {
             .map_err(|error| error.to_string())
             .and_then(|result| result);
             let (key, result) = match result {
-                Ok((registry, key)) => (key, Ok(registry)),
+                Ok((registry, linked)) => (linked, Ok(registry)),
                 Err(error) => (key, Err(error)),
             };
             Message::AccountUi(Action::LinkReady { key, result })
@@ -7919,6 +7919,54 @@ mod app_tests {
         assert!(state.present);
         assert_eq!(state.identity.as_ref(), Some(&identity));
         assert_eq!(app.account_ui.display_name(state), "new@example.com");
+    }
+
+    /// Repeating a link to a listed home closes the form without claiming to
+    /// have added another account.
+    #[test]
+    fn a_recovered_link_says_the_home_is_already_listed() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let link = |registry: &mut Registry, key| {
+            registry.link(Provider::Codex, key, home.clone(), None, None, 1)
+        };
+        let notice = |before: Registry, after: Registry, key| {
+            let mut app = context_inspector_test_app(false);
+            app.account_ui.set_registry(before);
+            let _ = app.update(Message::AccountUi(Action::LinkStart(Provider::Codex)));
+            let _ = app.update(Message::AccountUi(Action::LinkReady {
+                key,
+                result: Ok(after),
+            }));
+            assert!(app.account_ui.table.link.is_none());
+            app.notices
+                .recent()
+                .map(|entry| entry.notice.message.clone())
+                .collect::<Vec<_>>()
+        };
+        let empty = Registry::default();
+        let mut listed = empty.clone();
+        let key = link(&mut listed, uuid::Uuid::new_v4()).unwrap();
+        assert_eq!(
+            notice(empty, listed.clone(), key),
+            ["Existing account home added."]
+        );
+        let mut repeated = listed.clone();
+        assert_eq!(link(&mut repeated, uuid::Uuid::new_v4()), Ok(key));
+        assert_eq!(
+            notice(listed.clone(), repeated, key),
+            ["That account home is already listed."]
+        );
+        // An archived home is hidden, so restoring it reads as added.
+        let mut archived = listed;
+        assert!(archived.archive_duplicate(key, &Account::system(Provider::Codex)));
+        let mut restored = archived.clone();
+        assert_eq!(link(&mut restored, uuid::Uuid::new_v4()), Ok(key));
+        assert_eq!(
+            notice(archived, restored, key),
+            ["Existing account home added."]
+        );
     }
 
     /// A failed link says why, and stops saying it once the reader gives up

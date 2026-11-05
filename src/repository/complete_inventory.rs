@@ -2,6 +2,19 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 
+fn census_error(failure: ProcessFailure) -> RepositoryError {
+    if failure.kind == crate::process::ProcessFailureKind::Exit {
+        // Preparation presents RepositoryError directly. Retain the bounded
+        // causal diagnostic rather than only the helper's numeric exit code.
+        RepositoryError::InvalidOutput {
+            field: "worktree_safety",
+            reason: failure.reported_detail(),
+        }
+    } else {
+        failure.into()
+    }
+}
+
 pub(super) fn require_complete_inventory(output: &ProcessOutput) -> Result<(), RepositoryError> {
     if output.stderr.iter().any(|byte| !byte.is_ascii_whitespace()) {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -50,7 +63,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let command = self
             .status_command(worktree)
             .arg("--ignore-submodules=none");
-        let output = self.run_checked(&command, cancellation)?;
+        let output = self
+            .run_checked(&command, cancellation)
+            .map_err(census_error)?;
         require_complete_inventory(&output)?;
         let mut status = invalid_output(parse_status(&output.stdout), output)?;
         if !status.dirty.is_dirty() {
@@ -63,6 +78,37 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     reason,
                 }
             })?;
+            let helper_error = |error: std::io::Error| RepositoryError::InvalidOutput {
+                field: "worktree_safety",
+                reason: format!("Git census helpers could not be retained: {error}"),
+            };
+            let helpers = tempfile::tempdir().map_err(helper_error)?;
+            fs::write(
+                helpers.path().join("submodule-status"),
+                include_bytes!("pr_checkout/submodule_status.sh"),
+            )
+            .map_err(helper_error)?;
+            fs::write(
+                helpers.path().join("check-submodule-paths"),
+                include_bytes!("pr_checkout/submodule_paths.sh"),
+            )
+            .map_err(helper_error)?;
+            let root_guard = CommandSpec::new("/bin/sh")
+                .arg(helpers.path().join("submodule-status"))
+                .arg("guard")
+                .cwd(worktree)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_COMMON_DIR")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_PAGER", "cat")
+                .env("CAGENTS_PR_GIT", &executable)
+                .env("CAGENTS_PR_SUBMODULE_HELPERS", helpers.path());
+            let output = self
+                .run_checked(&root_guard, cancellation)
+                .map_err(census_error)?;
+            require_complete_inventory(&output)?;
             let command = self
                 .git_read(
                     worktree,
@@ -71,11 +117,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         "foreach",
                         "--quiet",
                         "--recursive",
-                        include_str!("pr_checkout/submodule_status.sh"),
+                        "/bin/sh \"$CAGENTS_PR_SUBMODULE_HELPERS/submodule-status\"",
                     ],
                 )
-                .env("CAGENTS_PR_GIT", executable);
-            let output = self.run_checked(&command, cancellation)?;
+                .env("CAGENTS_PR_GIT", executable)
+                .env("CAGENTS_PR_SUBMODULE_HELPERS", helpers.path());
+            let output = self
+                .run_checked(&command, cancellation)
+                .map_err(census_error)?;
             require_complete_inventory(&output)?;
             if !output.stdout.is_empty() {
                 // Child paths are relative to different repositories. Only a
