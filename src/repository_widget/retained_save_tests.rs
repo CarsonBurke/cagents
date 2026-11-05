@@ -88,14 +88,137 @@ impl Checkout {
     }
 }
 
-async fn finish(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
-    if let Some(mut stream) = iced::runtime::task::into_stream(task) {
-        while let Some(action) = stream.next().await {
-            if let iced::runtime::Action::Output(action) = action {
-                drop(runtime.update(action));
+#[derive(Debug)]
+pub(super) struct LoadCompletion {
+    action: &'static str,
+    accepted: bool,
+    stale: bool,
+    loading: bool,
+    reading: bool,
+    attested: bool,
+    followup_units: usize,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct TaskTrace {
+    reads: Vec<LoadCompletion>,
+    details: Vec<String>,
+}
+
+fn load_state(runtime: &RepositoryRuntime) -> String {
+    let document = match &runtime.document {
+        DocumentState::None => "None".to_owned(),
+        DocumentState::Loading { predecessor } => {
+            format!("Loading(predecessor={})", predecessor.is_some())
+        }
+        DocumentState::Editable(_) => "Editable".to_owned(),
+        DocumentState::Image { .. } => "Image".to_owned(),
+        DocumentState::Pdf { .. } => "Pdf".to_owned(),
+        DocumentState::ReadOnly { path, reason } => format!("ReadOnly({path:?}, {reason:?})"),
+        DocumentState::Failed { path, message } => format!("Failed({path:?}, {message:?})"),
+    };
+    format!(
+        "document={document}; reading={}; reload_pending={}; attested={}; watch={:?}",
+        runtime.document_reading,
+        runtime.document_reload_pending,
+        runtime.original_read_attested,
+        runtime
+            .document_watch
+            .as_ref()
+            .map(|watch| (watch.id(), watch.revision(), watch.error()))
+    )
+}
+
+pub(super) async fn finish(
+    runtime: &mut RepositoryRuntime,
+    task: Task<RepositoryAction>,
+) -> TaskTrace {
+    let mut trace = TaskTrace::default();
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut tasks = vec![task];
+        let mut actions = 0;
+        while let Some(task) = tasks.pop() {
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                // initial_load batches listing and reading. Preserve the whole
+                // original stream before driving any queued replacement read.
+                while let Some(action) = stream.next().await {
+                    actions += 1;
+                    assert!(
+                        actions <= 256,
+                        "repository task action limit; trace={:?}; {}",
+                        trace.details,
+                        load_state(runtime)
+                    );
+                    if let iced::runtime::Action::Output(action) = action {
+                        let read = match &action {
+                            RepositoryAction::FileLoadedAt { identity, result }
+                            | RepositoryAction::DocumentReloaded { identity, result } => {
+                                let kind = if matches!(&action, RepositoryAction::FileLoadedAt { .. }) {
+                                    "FileLoadedAt"
+                                } else {
+                                    "DocumentReloaded"
+                                };
+                                let accepted = runtime.accepts_selected(identity);
+                                let revision = runtime.document_watch.as_ref().map(DocumentWatch::revision);
+                                let read_revision = result.as_ref().ok().and_then(|read| read.watch_revision);
+                                let stale = read_revision.zip(revision).is_some_and(|(read, now)| read != now);
+                                // These fixtures read their own synthetic files.
+                                // Preserve typed outer/inner errors before update.
+                                trace.details.push(format!(
+                                    "{kind}; path={:?}; identity={identity:?}; accepted={accepted}; result={result:?}; before={}",
+                                    identity.worktree.join(&identity.path),
+                                    load_state(runtime)
+                                ));
+                                Some((kind, accepted, stale))
+                            }
+                            _ => None,
+                        };
+                        let followup = runtime.update(action);
+                        let mut reread = false;
+                        if let Some((kind, accepted, stale)) = read {
+                            let completion = LoadCompletion {
+                                action: kind,
+                                accepted,
+                                stale,
+                                loading: matches!(runtime.document, DocumentState::Loading { .. }),
+                                reading: runtime.document_reading,
+                                attested: runtime.original_read_attested,
+                                followup_units: followup.units(),
+                            };
+                            reread = accepted && completion.loading && completion.reading;
+                            trace.details.push(format!(
+                                "{kind}; after={}; followup_units={}",
+                                load_state(runtime),
+                                completion.followup_units
+                            ));
+                            trace.reads.push(completion);
+                        }
+                        if reread {
+                            assert!(
+                                followup.units() > 0,
+                                "accepted read is loading without a reread; trace={:?}",
+                                trace.details
+                            );
+                            tasks.push(followup);
+                        } else {
+                            // Save, directory refresh, focus/scroll and other
+                            // terminal followups keep their original explicit
+                            // drivers. In particular, never list Root `/` here.
+                            drop(followup);
+                        }
+                    }
+                }
             }
         }
-    }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "repository tasks did not settle within 10s; trace={:?}; {}",
+        trace.details,
+        load_state(runtime)
+    );
+    trace
 }
 
 async fn loaded(path: &Path) -> (RepositoryRuntime, CardId, crate::operation_recovery::Shared) {
@@ -110,12 +233,102 @@ async fn loaded(path: &Path) -> (RepositoryRuntime, CardId, crate::operation_rec
         card,
         path: "file.txt".into(),
     });
-    finish(&mut runtime, task).await;
-    assert_eq!(runtime.editor_text().as_deref(), Some("baseline"));
+    let trace = finish(&mut runtime, task).await;
+    assert_eq!(
+        runtime.editor_text().as_deref(),
+        Some("baseline"),
+        "file-open path={path:?}; trace={:?}",
+        trace.details
+    );
     assert!(runtime.original_read_attested);
     let custody = crate::operation_recovery::Shared::default();
     assert!(runtime.configure_save_recovery(custody.clone(), vec![path.to_owned()]));
     (runtime, card, custody)
+}
+
+#[tokio::test]
+async fn initial_load_completes_after_a_stale_first_read() {
+    if isolated_test(
+        "repository_widget::retained_save_tests::initial_load_completes_after_a_stale_first_read",
+    ) {
+        return;
+    }
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let checkout = Checkout::new();
+    let path = checkout.path().join("file.txt");
+    std::fs::write(&path, "baseline").unwrap();
+    let card = CardId::new();
+    let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+        project: ProjectId::new(),
+        repository: checkout.path().to_owned(),
+        worktree: checkout.path().to_owned(),
+        selected_file: None,
+    });
+    let initial = runtime.update(RepositoryAction::OpenFile {
+        card,
+        path: "file.txt".into(),
+    });
+    let watch = runtime.document_watch.as_ref().unwrap().clone();
+    let forced_stale = Arc::new(AtomicBool::new(false));
+    let forced = forced_stale.clone();
+    // Preserve the actual worker/read result. Force only its captured watch
+    // revision, independently of native callback timing on the test host.
+    let initial = initial.map(move |mut action| {
+        if let RepositoryAction::FileLoadedAt { result, .. } = &mut action {
+            assert!(!forced.swap(true, Ordering::SeqCst));
+            let read = result.as_mut().expect("the actual initial read succeeded");
+            assert!(matches!(
+                read.clone().into_parts().1,
+                Ok(LoadedFile {
+                    content: FileContent::Editable { text, .. },
+                    ..
+                }) if text == "baseline"
+            ));
+            read.watch_revision = Some(watch.revision().wrapping_sub(1));
+        }
+        action
+    });
+    let trace = finish(&mut runtime, initial).await;
+    assert!(forced_stale.load(Ordering::SeqCst));
+    assert_eq!(
+        runtime.editor_text().as_deref(),
+        Some("baseline"),
+        "forced stale initial completion; path={path:?}; loading={}; reading={}; \
+         reload_pending={}; attested={}",
+        matches!(runtime.document, DocumentState::Loading { .. }),
+        runtime.document_reading,
+        runtime.document_reload_pending,
+        runtime.original_read_attested
+    );
+    assert!(runtime.original_read_attested);
+    assert!(!runtime.document_reading);
+    let first = trace.reads.first().expect("actual initial completion");
+    assert!(
+        first.action == "FileLoadedAt"
+            && first.accepted
+            && first.stale
+            && first.loading
+            && first.reading
+            && !first.attested
+            && first.followup_units > 0,
+        "stale first completion must queue its actual reread; trace={:?}",
+        trace.details
+    );
+    assert!(
+        trace
+            .reads
+            .iter()
+            .any(|read| read.action == "DocumentReloaded"
+                && read.accepted
+                && !read.loading
+                && !read.reading
+                && read.attested),
+        "actual replacement worker must complete; trace={:?}",
+        trace.details
+    );
 }
 
 fn insert(runtime: &mut RepositoryRuntime, card: CardId, character: char) {
@@ -395,8 +608,13 @@ async fn root_scope_owned_file_round_trip(path: &Path) {
         card,
         path: relative,
     });
-    finish(&mut runtime, load).await;
-    assert_eq!(runtime.editor_text().as_deref(), Some("baseline"));
+    let trace = finish(&mut runtime, load).await;
+    assert_eq!(
+        runtime.editor_text().as_deref(),
+        Some("baseline"),
+        "file-open path={path:?}; trace={:?}",
+        trace.details
+    );
     assert_eq!(runtime.source_surface, SourceSurface::Editor);
     assert!(!runtime.mutation_refresh_pending);
     assert!(!runtime.saves_elsewhere());
@@ -625,8 +843,13 @@ async fn root_scope_can_publish_to_a_write_search_only_parent() {
         card,
         path: path.strip_prefix(&source).unwrap().to_owned(),
     });
-    finish(&mut runtime, load).await;
-    assert_eq!(runtime.editor_text().as_deref(), Some("baseline"));
+    let trace = finish(&mut runtime, load).await;
+    assert_eq!(
+        runtime.editor_text().as_deref(),
+        Some("baseline"),
+        "file-open path={path:?}; trace={:?}",
+        trace.details
+    );
     assert_eq!(runtime.source_surface, SourceSurface::Editor);
     assert!(!runtime.mutation_refresh_pending);
     assert!(!runtime.saves_elsewhere());
