@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise held-command lifetime with private locks and owned processes only."""
 
+import contextlib
 import ctypes
 import errno
 import fcntl
@@ -462,6 +463,204 @@ while True:
                 ready.unlink()
                 calls.unlink()
 
+    def leftover_daemon_fixture(self):
+        # A Cargo that leaves a daemon behind, in the build phase or the test run,
+        # as a fixture cagentsd did when its `cargo test` was killed.
+        binary = self.root / "bin"
+        binary.mkdir()
+        cargo = binary / "cargo"
+        cargo.write_text(f"""#!/bin/sh
+root={str(self.root)!r}
+case " $* " in
+    *" --no-run "*) [ -e "$root/in-build" ] || exit 0 ;;
+esac
+setsid sleep 60 &
+printf '%s %s' "$!" "$$" > "$root/ready.new"
+mv "$root/ready.new" "$root/ready"
+exec sleep 60
+""")
+        cargo.chmod(0o755)
+        self.env["PATH"] = f"{binary}:{self.env['PATH']}"
+
+    def kill_gate_and_check_the_daemon(self, child):
+        self.wait_for((self.root / "ready").exists, "the leftover daemon")
+        daemon, stub = map(int, (self.root / "ready").read_text().split())
+        for pid in (daemon, stub):
+            with contextlib.suppress(ProcessLookupError):
+                self.descendants.append((pid, os.pidfd_open(pid)))
+        child.kill()
+        child.wait(timeout=5)
+        os.kill(daemon, 0)
+        open_files = [os.readlink(entry) for entry in Path(f"/proc/{daemon}/fd").iterdir()]
+        self.assertNotIn(str(self.lock), open_files)
+        self.wait_for(self.slot_is_free, "the slot of a killed gate")
+        os.kill(daemon, 0)
+
+    def test_a_daemon_from_a_killed_test_run_does_not_keep_the_slot(self):
+        self.leftover_daemon_fixture()
+        child = subprocess.Popen(
+            [str(self.gate), "test", "--locked"], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        self.children.append(child)
+        self.kill_gate_and_check_the_daemon(child)
+
+    def test_a_daemon_from_a_killed_build_does_not_keep_the_slot(self):
+        self.leftover_daemon_fixture()
+        (self.root / "in-build").touch()
+        child = subprocess.Popen(
+            [str(self.gate), "test", "--locked"], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        self.children.append(child)
+        self.kill_gate_and_check_the_daemon(child)
+
+    def test_under_flock_close_a_gated_command_uses_the_callers_slot(self):
+        result = subprocess.run(
+            ["flock", "--close", str(self.lock), str(self.gate), "exec", "true"],
+            env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting", result.stderr)
+
+    def under_flock(self, slot, *inner, env=None):
+        """A gated `exec true` under `flock --close slot`, through `inner`, without waiting long."""
+        return subprocess.run(
+            ["flock", "--close", str(slot), *inner, str(self.gate), "exec", "true"],
+            env=env or self.env, capture_output=True, text=True, timeout=10,
+        )
+
+    def hold_slot_elsewhere(self, slot=None):
+        holder = subprocess.Popen(["flock", "--close", str(slot or self.lock), "sleep", "60"],
+                                  start_new_session=True)
+        self.children.append(holder)
+        self.addCleanup(self.end_group, holder.pid)
+        self.wait_for(lambda: self.is_locked(slot or self.lock), "the other holder")
+
+    def is_locked(self, path):
+        with Path(path).open("a") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+        return False
+
+    def assert_gate_queues(self, *command, env=None):
+        child = subprocess.Popen(
+            [*command, str(self.gate), "exec", "true"], env=env or self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        self.children.append(child)
+        self.addCleanup(self.end_group, child.pid)
+        time.sleep(1)
+        self.assertIsNone(child.poll(), "the gate must queue")
+
+    def test_a_flock_further_up_still_counts_as_the_callers_slot(self):
+        script = f'"{self.gate}" exec true; :'
+        result = subprocess.run(
+            ["flock", "--close", str(self.lock), "sh", "-c", f"sh -c '{script}'; :"],
+            env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting", result.stderr)
+
+    def test_flock_on_a_numbered_slot_counts_only_if_that_slot_exists(self):
+        second = Path(f"{self.lock}.1")
+        result = self.under_flock(second, env=self.env | {"CAGENTS_BUILD_SLOTS": "2"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Run in that slot, not admitted to a free one: an admitted command gets the marker.
+        result = subprocess.run(
+            ["flock", "--close", f"{self.lock}.10", str(self.gate), "exec",
+             "sh", "-c", 'test -z "${CAGENTS_BUILD_SLOT_HELD+x}"'],
+            env=self.env | {"CAGENTS_BUILD_SLOTS": "12"}, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.hold_slot_elsewhere()
+        self.assert_gate_queues("flock", "--close", str(second))
+
+    def test_flock_on_the_queue_or_cost_file_is_not_a_slot(self):
+        self.hold_slot_elsewhere()
+        for name in (".queue", ".cost", ".1.queue", ".00"):
+            self.assert_gate_queues("flock", "--close", f"{self.lock}{name}")
+
+    def test_flock_through_a_symlink_counts_as_the_callers_slot(self):
+        link = self.root / "link.lock"
+        link.symlink_to(self.lock)
+        result = self.under_flock(self.lock, env=self.env | {"CAGENTS_BUILD_LOCK": str(link)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting", result.stderr)
+
+    def test_a_flock_with_a_slot_open_but_not_locked_is_not_holding_it(self):
+        # flock --close closes only the lock it took, so this one keeps the slot open.
+        other = self.root / "other.lock"
+        self.hold_slot_elsewhere()
+        with self.lock.open("a") as opened:
+            child = subprocess.Popen(
+                ["flock", "--close", str(other), str(self.gate), "exec", "true"],
+                env=self.env, pass_fds=(opened.fileno(),),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+            )
+        self.children.append(child)
+        self.addCleanup(self.end_group, child.pid)
+        time.sleep(1)
+        self.assertIsNone(child.poll(), "an open descriptor is not a held slot")
+
+    def test_a_leftover_that_is_not_flock_does_not_admit_what_it_starts(self):
+        # A held slot on an ancestor that isn't flock, and that closes it for its children.
+        script = f'exec 7>>"{self.lock}"; flock 7; "{self.gate}" exec true 7>&-; :'
+        self.assert_gate_queues_script(script)
+
+    def assert_gate_queues_script(self, script):
+        ready = self.root / "started"
+        child = subprocess.Popen(
+            ["sh", "-c", f': > "{ready}"; {script}'], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        self.children.append(child)
+        self.addCleanup(self.end_group, child.pid)
+        self.wait_for(ready.exists, "the holder")
+        time.sleep(1)
+        self.assertIsNone(child.poll(), "only a running flock's slot counts")
+
+    def test_a_killed_gate_leaves_nobody_holding_the_queue(self):
+        self.hold_slot_elsewhere()
+        gate = subprocess.Popen(
+            [str(self.gate), "exec", "true"], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        self.children.append(gate)
+        self.addCleanup(self.end_group, gate.pid)
+        queue = Path(f"{self.lock}.queue")
+        self.wait_for(lambda: self.is_locked(queue), "the gate at the head of the queue")
+        children = Path(f"/proc/{gate.pid}/task/{gate.pid}/children")
+        def requesting():
+            return any(
+                Path(f"/proc/{pid}/comm").read_text().strip() == "flock"
+                for pid in children.read_text().split()
+                if Path(f"/proc/{pid}/comm").exists()
+            )
+        self.wait_for(requesting, "the gate's request for the slot")
+        gate.kill()
+        gate.wait(timeout=5)
+        self.wait_for(lambda: not self.is_locked(queue), "the queue to free")
+        # Its request is still waiting for the slot, without the caller's streams.
+        # Read to EOF without blocking: anything the gate wrote first also reads ready.
+        for stream in (gate.stdout, gate.stderr):
+            deadline = time.monotonic() + 5
+            while select.select([stream], [], [], max(0, deadline - time.monotonic()))[0]:
+                if not os.read(stream.fileno(), 4096):
+                    break
+            else:
+                self.fail("a stream stayed open")
+
+    def end_group(self, group):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(group, signal.SIGKILL)
+
+    def test_an_unrelated_holder_is_still_waited_for(self):
+        self.hold_slot_elsewhere()
+        self.assert_gate_queues()
+
     def test_successful_split_preserves_cargo_and_program_arguments(self):
         binary = self.root / "bin"
         binary.mkdir()
@@ -857,6 +1056,269 @@ class MemoryAdmission(TwoSlots):
         self.assertEqual(result.returncode, 2)
         self.assertIn("CAGENTS_BUILD_COST_GIB", result.stderr)
 
+
+ADMISSION_FLOCK = r'''#!/usr/bin/python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+root = Path(os.environ["FIXTURE_ROOT"])
+arguments = sys.argv[1:]
+if arguments in (["6"], ["8"]):
+    info = os.fstat(int(arguments[0]))
+    for kind, name in (("queue", "slot.lock.queue"), ("base", "slot.lock")):
+        path = root / name
+        if path.exists() and (info.st_dev, info.st_ino) == (path.stat().st_dev, path.stat().st_ino):
+            suffix = os.environ.get("FIXTURE_ORDER_ID", "")
+            receipt = root / (kind + ("-" + suffix if suffix else "") + ".waiting")
+            receipt.with_suffix(".tmp").write_text(json.dumps({"pid":os.getpid()}))
+            receipt.with_suffix(".tmp").replace(receipt)
+if arguments == ["-n", "6"] and os.environ.get("FIXTURE_GRANT_DELAY"):
+    info = os.fstat(6)
+    base = root / "slot.lock"
+    if base.exists() and info.st_ino == base.stat().st_ino:
+        status = subprocess.call(["/usr/bin/flock", *arguments], close_fds=False)
+        if status == 0:
+            time.sleep(float(os.environ["FIXTURE_GRANT_DELAY"]))
+        raise SystemExit(status)
+os.execv("/usr/bin/flock", ["flock", *arguments])
+'''
+
+
+class AdmissionTimeout(unittest.TestCase):
+    """Reuse private preflight tools; all flock operations remain real."""
+
+    setUpClass = classmethod(PreflightCancellation.setUpClass.__func__)
+    tearDownClass = classmethod(PreflightCancellation.tearDownClass.__func__)
+    setting = "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS"
+
+    def setUp(self):
+        self.fixture = PreflightCancellation("test_failed_or_empty_metadata_still_skips_helpers_and_builds")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        # Adapt the existing inert tool with short delays and fast cooperative
+        # cleanup. Ordinary preflight contracts keep their original fixture.
+        tool = PREFLIGHT_TOOL.replace(
+            '    (root / (phase + ".signalled")).write_text(str(number))\n',
+            '    (root / (phase + ".signalled")).write_text(str(number))\n'
+            '    if config.get("fast_cancel"):\n        raise SystemExit(128 + number)\n',
+        ).replace(
+            'record(event)\n',
+            'event["order_id"] = os.environ.get("FIXTURE_ORDER_ID", "")\nrecord(event)\n'
+            'delay = config.get("delays", {}).get(phase, 0)\n'
+            'if delay:\n'
+            '    receipt = root / (phase + ".delaying")\n'
+            '    receipt.with_suffix(".tmp").write_text(json.dumps(event))\n'
+            '    receipt.with_suffix(".tmp").replace(receipt)\n'
+            '    time.sleep(delay)\n',
+        )
+        self.assertIn('if config.get("fast_cancel")', tool)
+        self.assertIn('phase + ".delaying"', tool)
+        for name in ("bin/cargo", "build-disk-guard", "seed-build-dir"):
+            (self.fixture.root / name).write_text(tool)
+        flock = self.fixture.root / "bin/flock"
+        flock.write_text(ADMISSION_FLOCK)
+        flock.chmod(0o700)
+        self.fixture.env[self.setting] = "1"
+
+    def reset(self, **config):
+        self.fixture.clear()
+        for pattern in ("*.waiting", "*.delaying"):
+            for path in self.fixture.root.glob(pattern):
+                path.unlink()
+        self.fixture.configure(fast_cancel=True, **config)
+
+    def pin(self, receipt):
+        self.fixture.wait_for(receipt.exists, receipt.name)
+        pid = json.loads(receipt.read_text())["pid"]
+        pidfd = os.pidfd_open(pid)
+        self.fixture.descendants.append((pid, pidfd))
+        return pid, pidfd
+
+    def retire(self, owned):
+        pid, pidfd = owned
+        self.fixture.wait_for(lambda: bool(select.select([pidfd], [], [], 0)[0]), "owned waiter exit")
+        try:
+            caller_reaped = os.waitpid(pid, os.WNOHANG)[0] == pid
+        except ChildProcessError:
+            caller_reaped = False
+        return caller_reaped
+
+    def finish_blocked(self, process, holder, *, seconds=2):
+        # Baseline gates have no timeout; release only our outside holder to
+        # let those owned waits finish, retaining the causal failure result.
+        completed_while_held = True
+        try:
+            stdout, stderr = process.communicate("", timeout=seconds)
+        except subprocess.TimeoutExpired:
+            completed_while_held = False
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            stdout, stderr = process.communicate(timeout=5)
+        return completed_while_held, stdout, stderr
+
+    def assert_timeout(self, process, stderr):
+        self.assertEqual(process.returncode, 124, stderr)
+        self.assertIn("admission", stderr.lower())
+        self.assertIn("tim", stderr.lower())
+        self.assertNotIn("compiler", [event["phase"] for event in self.fixture.calls()])
+        self.assertTrue(self.fixture.slot_is_free())
+
+    def test_expiry_in_each_preflight_hook_reaps_without_compiling(self):
+        for phase in ("metadata", "guard", "seed"):
+            with self.subTest(phase=phase):
+                self.reset(delays={phase:2})
+                process = self.fixture.start()
+                owned = self.pin(self.fixture.root / (phase + ".delaying"))
+                _stdout, stderr = process.communicate("", timeout=5)
+                caller_reaped = self.retire(owned)
+                self.assert_timeout(process, stderr)
+                self.assertFalse(caller_reaped)
+                self.fixture.assert_preflight_unslotted(self.fixture.calls())
+
+    def test_one_budget_covers_cumulative_hooks_and_seed_is_not_fail_soft_on_expiry(self):
+        # Two seconds, so a loaded host still reaches the seed hook within the budget.
+        self.reset(delays={"metadata":0.7, "guard":0.7, "seed":1.2})
+        process = self.fixture.start(environment=self.fixture.env | {self.setting:"2"})
+        _stdout, stderr = process.communicate("", timeout=8)
+        self.assert_timeout(process, stderr)
+        self.assertEqual([event["phase"] for event in self.fixture.calls()], ["metadata", "guard", "seed"])
+
+    def test_queue_base_and_no_fit_expiry_withdraws_owned_waiter_and_preserves_holder(self):
+        for kind in ("queue", "base", "memory", "cpu-pressure", "cpu-settle"):
+            with self.subTest(kind=kind):
+                self.reset()
+                root = self.fixture.root
+                path = root / ("slot.lock.queue" if kind == "queue" else "slot.lock")
+                cost = root / "slot.lock.cost"
+                if kind != "queue":
+                    cost.write_text("outside-holder-sentinel\n")
+                environment = self.fixture.env.copy()
+                if kind == "memory":
+                    environment |= {"CAGENTS_BUILD_SLOTS":"2", "CAGENTS_BUILD_COST_GIB":"1000000",
+                                    "CAGENTS_BUILD_CPU_PRESSURE":"0"}
+                if kind.startswith("cpu-"):
+                    pressure = root / "cpu-pressure"
+                    pressure.write_text("some avg10=" + ("99.00" if kind == "cpu-pressure" else "0.00")
+                                        + " avg60=0.00 avg300=0.00 total=0\n")
+                    since = Path("/proc/uptime").read_text().split()[0].split(".")[0]
+                    cost.write_text(f"{os.getpid()} 0\n{since}\n")
+                    environment |= {"CAGENTS_BUILD_SLOTS":"2", "CAGENTS_BUILD_COST_GIB":"1",
+                                    "CAGENTS_BUILD_CPU_PRESSURE_FILE":str(pressure),
+                                    "CAGENTS_BUILD_CPU_PRESSURE":"60",
+                                    "CAGENTS_BUILD_CPU_SETTLE_SECS":"0" if kind == "cpu-pressure" else "3600"}
+                expected_cost = cost.read_text() if kind != "queue" else None
+                with path.open("a") as holder:
+                    fcntl.flock(holder, fcntl.LOCK_EX)
+                    process = self.fixture.start(environment=environment)
+                    owned = self.pin(root / ("queue.waiting" if kind == "queue" else "base.waiting"))
+                    completed, _stdout, stderr = self.finish_blocked(process, holder)
+                    caller_reaped = self.retire(owned)
+                    self.assertTrue(completed, "gate required its outside holder to release")
+                    self.assertEqual(process.returncode, 124, stderr)
+                    self.assertIn("admission", stderr.lower())
+                    self.assertFalse(caller_reaped)
+                    if kind != "queue":
+                        self.assertEqual(cost.read_text(), expected_cost)
+                    if kind == "cpu-pressure":
+                        self.assertIn("CPUs busy (99% pressure, limit 60%)", stderr)
+                    self.assertNotIn("compiler", [event["phase"] for event in self.fixture.calls()])
+                self.assertTrue(self.fixture.slot_is_free())
+                with (root / "slot.lock.queue").open("a") as queue:
+                    fcntl.flock(queue, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertFalse((root / "slot.lock.1.cost").exists())
+
+    def test_each_direct_signal_cancels_queued_wait_without_timeout_or_orphan(self):
+        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+            with self.subTest(signal=number):
+                self.reset()
+                with (self.fixture.root / "slot.lock.queue").open("a") as holder:
+                    fcntl.flock(holder, fcntl.LOCK_EX)
+                    process = self.fixture.start(environment=self.fixture.env | {self.setting:"5"})
+                    owned = self.pin(self.fixture.root / "queue.waiting")
+                    process.send_signal(number)
+                    completed, _stdout, stderr = self.finish_blocked(process, holder, seconds=1)
+                    caller_reaped = self.retire(owned)
+                    self.assertTrue(completed, "cancellation left a waiter behind its outside holder")
+                    self.assertEqual(process.returncode, 128 + number, stderr)
+                    self.assertFalse(caller_reaped)
+                    self.assertNotIn("timed out", stderr.lower())
+                    self.assertNotIn("compiler", [event["phase"] for event in self.fixture.calls()])
+
+    def test_private_kernel_queue_preserves_arrival_order(self):
+        self.reset()
+        root = self.fixture.root
+        processes = []
+        with (root / "slot.lock.queue").open("a") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            for identifier in ("first", "second"):
+                process = self.fixture.start(environment=self.fixture.env | {
+                    self.setting:"5", "FIXTURE_ORDER_ID":identifier})
+                processes.append(process)
+                pid, _pidfd = self.pin(root / ("queue-" + identifier + ".waiting"))
+                # Recorder readiness precedes exec. Confirm the first real
+                # flock is kernel-blocked before submitting the next one.
+                self.fixture.wait_for(lambda: "lock" in Path(f"/proc/{pid}/wchan").read_text(), "kernel FIFO waiter")
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            for process in processes:
+                _stdout, stderr = process.communicate("", timeout=5)
+                self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual([event["order_id"] for event in self.fixture.calls() if event["phase"] == "compiler"],
+                         ["first", "second"])
+
+    def test_invalid_timeout_is_refused_before_hooks(self):
+        for value in ("", "0", "00", "-1", "+1", "1.0", "1s", " 1", "1 ", "١", "１", "1\n"):
+            with self.subTest(value=value):
+                self.reset()
+                process = self.fixture.start(environment=self.fixture.env | {self.setting:value})
+                _stdout, stderr = process.communicate("", timeout=5)
+                self.assertEqual(process.returncode, 2, stderr)
+                self.assertIn(self.setting, stderr)
+                self.assertEqual(self.fixture.calls(), [])
+
+    def test_ordinary_guard_exit124_is_not_relabelled_as_timeout(self):
+        self.reset(guard_exit=124)
+        process = self.fixture.start(environment=self.fixture.env | {self.setting:"5"})
+        _stdout, stderr = process.communicate("", timeout=5)
+        self.assertEqual(process.returncode, 124, stderr)
+        self.assertNotIn("timed out", stderr.lower())
+        self.assertEqual([event["phase"] for event in self.fixture.calls()], ["metadata", "guard"])
+
+    def test_leading_zero_budget_does_not_limit_an_admitted_build(self):
+        self.reset(delays={"compiler":1.25}, compiler_exit=17)
+        process = self.fixture.start(environment=self.fixture.env | {self.setting:"0001"})
+        _stdout, stderr = process.communicate("", timeout=5)
+        self.assertEqual(process.returncode, 17, stderr)
+        self.assertNotIn("timed out", stderr.lower())
+        compiler = next(event for event in self.fixture.calls() if event["phase"] == "compiler")
+        self.assertTrue(compiler["held"])
+        self.assertTrue(compiler["marker"])
+        self.assertTrue(self.fixture.slot_is_free())
+
+    def test_grant_after_deadline_does_not_create_a_claim_or_start_compiler(self):
+        self.reset()
+        process = self.fixture.start(environment=self.fixture.env | {"FIXTURE_GRANT_DELAY":"1.15"})
+        _stdout, stderr = process.communicate("", timeout=5)
+        self.assert_timeout(process, stderr)
+        self.assertFalse(any(self.fixture.root.glob("slot.lock*.cost")))
+
+    def test_unset_budget_waits_until_private_holder_releases(self):
+        self.reset()
+        environment = self.fixture.env.copy()
+        environment.pop(self.setting)
+        with (self.fixture.root / "slot.lock.queue").open("a") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            process = self.fixture.start(environment=environment)
+            self.pin(self.fixture.root / "queue.waiting")
+            time.sleep(0.35)
+            self.assertIsNone(process.poll())
+            self.assertNotIn("compiler", [event["phase"] for event in self.fixture.calls()])
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            _stdout, stderr = process.communicate("", timeout=5)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertNotIn("timed out", stderr.lower())
+
 class CpuPressureAdmission(TwoSlots):
     """Two slots and memory to spare; the CPU pressure comes from a fixture."""
 
@@ -964,6 +1426,91 @@ class CpuPressureAdmission(TwoSlots):
         result = self.build(1, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def assert_start_selection(self, starts, *, waits, disabled=False, readable=True):
+        # Redirect only meminfo through the actual sed executable. The tested
+        # 7 GiB cost always fits this synthetic 64 GiB; no RAM is allocated.
+        binary = self.root / "start-tools"
+        binary.mkdir(exist_ok=True)
+        memory = self.root / "start-meminfo"
+        memory.write_text("MemTotal:       67108864 kB\nMemAvailable:   67108864 kB\n")
+        sed = binary / "sed"
+        sed.write_text(
+            "#!/usr/bin/python3\nimport os,sys\n"
+            "arguments = [os.environ['FIXTURE_MEMINFO'] if argument == '/proc/meminfo' "
+            "else argument for argument in sys.argv[1:]]\n"
+            "os.execv('/usr/bin/sed', ['sed', *arguments])\n"
+        )
+        sed.chmod(0o700)
+        temporary = self.root / "start-tmp"
+        temporary.mkdir(exist_ok=True)
+        command = self.root / "start-command"
+        command.unlink(missing_ok=True)
+        self.report("0.00")
+        if not readable:
+            self.pressure.write_text("some total=12\n")
+        environment = {
+            "PATH": str(binary) + ":/usr/bin:/bin", "TMPDIR": str(temporary), "LC_ALL": "C",
+            "FIXTURE_MEMINFO": str(memory), "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
+            "CAGENTS_BUILD_SLOTS": "3", "CARGO_BUILD_JOBS": "1",
+            "CAGENTS_BUILD_CPU_PRESSURE": "0" if disabled else "60",
+            "CAGENTS_BUILD_CPU_SETTLE_SECS": "60",
+            "CAGENTS_BUILD_CPU_PRESSURE_FILE": str(self.pressure),
+            "CAGENTS_BUILD_COST_GIB": "7", "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1",
+        }
+        now = self.uptime()
+        dates = {"future":now + 10**6, "fresh":now, "old":now - 600}
+        holders, costs = [], {}
+        try:
+            for index, start in enumerate(starts, 1):
+                path = self.root / f"slot.lock.{index}"
+                holder = path.open("a")
+                holders.append(holder)
+                fcntl.flock(holder, fcntl.LOCK_EX)
+                cost = Path(str(path) + ".cost")
+                cost.write_text(f"{os.getpid()} 1\n{dates[start]}\n")
+                costs[cost] = cost.read_bytes()
+            process = subprocess.Popen(
+                [str(self.gate), "exec", "/bin/sh", "-c", 'printf admitted > "$1"',
+                 "fixture", str(command)], cwd=self.root, env=environment,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True,
+            )
+            try:
+                _stdout, stderr = process.communicate(timeout=5)
+            finally:
+                if process.poll() is None:
+                    process.send_signal(signal.SIGTERM)
+                process.communicate(timeout=5)
+            for cost, expected in costs.items():
+                self.assertEqual(cost.read_bytes(), expected)
+                with Path(str(cost).removesuffix(".cost")).open("a") as probe:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for name in ("slot.lock", "slot.lock.queue"):
+                with (self.root / name).open("a") as probe:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertFalse((self.root / "slot.lock.cost").exists())
+            self.assertEqual((process.returncode, command.exists()), (124, False) if waits else (0, True), stderr)
+            if waits:
+                self.assertIn("admission", stderr.lower())
+        finally:
+            for holder in holders:
+                holder.close()
+
+    def test_a_future_start_cannot_mask_a_fresh_holder_in_either_scan_order(self):
+        for starts in (("future", "fresh"), ("fresh", "future")):
+            with self.subTest(starts=starts):
+                self.assert_start_selection(starts, waits=True)
+
+    def test_start_selection_preserves_admission_and_pressure_read_error_controls(self):
+        for starts, waits, disabled, readable in (
+            (("future",), False, False, True), (("old",), False, False, True),
+            (("fresh",), True, False, True), (("future", "fresh"), False, True, True),
+            (("old",), False, False, False), (("future", "fresh"), True, False, False),
+        ):
+            with self.subTest(starts=starts, disabled=disabled, readable=readable):
+                self.assert_start_selection(starts, waits=waits, disabled=disabled, readable=readable)
+
     def test_settled_and_undated_running_builds_leave_room(self):
         # A build priced by a gate that does not date its start is not waited for.
         self.report("0.00")
@@ -1001,6 +1548,7 @@ class CpuPressureAdmission(TwoSlots):
         memory_gib = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
         if os.cpu_count() >= 20 and memory_gib >= 28:
             self.assertEqual(len(slots), 4)
+
 
 
 if __name__ == "__main__":

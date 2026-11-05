@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 pub(crate) mod accessibility_probe;
+pub(crate) mod accessible_bounds;
 pub mod button;
 mod display;
 mod editable;
@@ -11,6 +12,7 @@ pub use find_options::{FindOption, find_options};
 mod gauge;
 mod icon;
 mod icon_button;
+mod labeled_controls;
 mod owned;
 mod placeholder;
 mod popover;
@@ -28,6 +30,7 @@ pub use icon::{Icon, ceditor_icon, ceditor_window_icon, passive_icon, provider_i
 pub use icon_button::{
     IconButton, control_style, icon_button, segmented_controls, toolbar_actions,
 };
+pub use labeled_controls::labeled_controls;
 pub use owned::owned;
 pub use placeholder::{Placeholder, placeholder};
 pub use popover::{popover, popover_item};
