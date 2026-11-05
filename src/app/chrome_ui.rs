@@ -1497,6 +1497,28 @@ mod tests {
                 &[Event::Keyboard(event.clone())],
                 false,
             );
+            for message in messages.iter().cloned() {
+                drop(app.update(message));
+            }
+            // Include the real subscription after widget messages. Copy path
+            // checks menu isolation without Rename's modal shielding it.
+            drop(app.update(Message::KeyEvent {
+                event,
+                captured: statuses == [Status::Captured],
+            }));
+            assert_eq!(
+                app.terminal_find[&card].selected,
+                if menu_steps > 0 || !native_focus {
+                    0
+                } else if backwards {
+                    2
+                } else {
+                    1
+                },
+                "only the field with native focus may step, exactly once; \
+                 widget messages: {messages:?}, clipboard writes: {:?}, statuses: {statuses:?}",
+                frames.clipboard.0,
+            );
             if find_menu {
                 assert_eq!(statuses, [Status::Captured]);
                 assert!(messages.is_empty(), "the text menu owns Enter");
@@ -1521,26 +1543,6 @@ mod tests {
             } else {
                 assert!(messages.is_empty(), "remembered focus cannot claim Enter");
             }
-            for message in messages {
-                drop(app.update(message));
-            }
-            // Include the real subscription after widget messages. Copy path
-            // checks menu isolation without Rename's modal shielding it.
-            drop(app.update(Message::KeyEvent {
-                event,
-                captured: statuses == [Status::Captured],
-            }));
-            assert_eq!(
-                app.terminal_find[&card].selected,
-                if menu_steps > 0 || !native_focus {
-                    0
-                } else if backwards {
-                    2
-                } else {
-                    1
-                },
-                "only the field with native focus may step, exactly once"
-            );
         }
     }
 
