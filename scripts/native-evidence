@@ -425,14 +425,22 @@ run_session() {
     settle_session_processes 9>&-
     # A document portal can leave a FUSE mount in the runtime directory.
     if [ -d "$runtime" ]; then
-        awk -v runtime="$runtime" 'index($5, runtime "/") == 1 && $(NF - 2) ~ /^fuse/ { print $5 }' \
-            /proc/self/mountinfo | while IFS= read -r mount; do
-            timeout -k 5 10 fusermount3 -u -z "$mount" 2>/dev/null ||
-                timeout -k 5 10 fusermount -u -z "$mount" 2>/dev/null || :
-        done 9>&-
+        {
+            awk -v runtime="$runtime" 'index($5, runtime "/") == 1 && $(NF - 2) ~ /^fuse/ { print $5 }' \
+                /proc/self/mountinfo | while IFS= read -r mount; do
+                timeout -k 5 10 fusermount3 -u -z "$mount" 2>/dev/null ||
+                    timeout -k 5 10 fusermount -u -z "$mount" 2>/dev/null || :
+            done
+        } 9>&-
     fi
-    if ! timeout -k 5 30 rm -rf -- "$runtime" "$harness_root" "$compositor_home" "$logs/ui-$side.log" \
-        2>"$logs/clear-$side.log" 9>&-; then
+    local clear_status=0
+    timeout -k 5 30 rm -rf -- "$runtime" "$harness_root" "$compositor_home" "$logs/ui-$side.log" \
+        2>"$logs/clear-$side.log" 9>&- || clear_status=$?
+    if [ "$clear_status" -eq 124 ] || [ "$clear_status" -eq 137 ]; then
+        printf 'could not clear the last session: it was still going after 30 seconds, so a mount in %s may be stuck\n' \
+            "$runtime" >"$state/failed"
+        return 1
+    elif [ "$clear_status" -ne 0 ]; then
         printf 'could not clear the last session; see %s\n' "$logs/clear-$side.log" >"$state/failed"
         return 1
     fi
@@ -577,7 +585,7 @@ run_app() {
     session_path=$state/session-bin:
     # The runner still calls scripts/cargo-gate, which must not join the shared queue.
     local status=0
-    fixture_env env CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 \
+    fixture_env env CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         scripts/run-development --browserless --debug --log-file "$logs/ui-$side.log" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then
