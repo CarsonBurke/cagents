@@ -13,10 +13,11 @@ def require(value, message):
 
 def process_state(pid):
     directory = pathlib.Path('/proc') / str(pid)
+    # In this order: a released process reports root as its owner, then has no stat to read.
+    info = directory.stat()
     text = (directory / 'stat').read_text()
     values = text.rpartition(') ')[2].split()
     require(len(values) > 19, 'Invalid owned-process stat')
-    info = directory.stat()
     return {'pid': pid, 'state': values[0], 'ppid': int(values[1]),
             'start_ticks': int(values[19]), 'uid': info.st_uid}
 
@@ -24,11 +25,11 @@ def child_ids(pid):
     result = set()
     tasks = pathlib.Path('/proc') / str(pid) / 'task'
     try: threads = list(tasks.iterdir())
-    except FileNotFoundError: return result
+    except (FileNotFoundError, ProcessLookupError): return result
     require(len(threads) <= MAX_THREADS, 'Owned process exceeds thread bound')
     for thread in threads:
         try: result.update(int(v) for v in (thread / 'children').read_text().split())
-        except FileNotFoundError: continue
+        except (FileNotFoundError, ProcessLookupError): continue
     require(len(result) <= MAX_CHILDREN, 'Owned process exceeds child bound')
     return result
 
@@ -67,8 +68,13 @@ class Custody:
         require(value['start_ticks'] == node['start_ticks'] and value['uid'] == self.uid,
                 'Owned process incarnation changed')
         if executable and value['state'] not in ('Z', 'X'):
-            value['executable'] = os.readlink(f"/proc/{node['pid']}/exe")
-            info = os.stat(f"/proc/{node['pid']}/exe")
+            try:
+                value['executable'] = os.readlink(f"/proc/{node['pid']}/exe")
+                info = os.stat(f"/proc/{node['pid']}/exe")
+            except PermissionError as error:
+                # A released process denies this read too. A live one means it.
+                if not self.exited(node): raise
+                raise ProcessLookupError(errno.ESRCH, 'Owned process was released') from error
             value['executable_identity'] = [info.st_dev, info.st_ino]
         return value
 

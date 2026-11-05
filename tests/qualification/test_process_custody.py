@@ -328,7 +328,7 @@ class ProcessCustodyExitTests(unittest.TestCase):
 
     def test_a_process_whose_main_thread_exited_is_settled_without_a_report(self):
         program = ("import ctypes, threading, time\n"
-                   "threading.Thread(target=time.sleep, args=(600,)).start()\n"
+                   "threading.Thread(target=time.sleep, args=(30,)).start()\n"
                    "ctypes.CDLL(None).pthread_exit(None)\n")
         with tempfile.TemporaryDirectory() as directory:
             owner = self.module.Custody(lambda: False)
@@ -347,6 +347,25 @@ class ProcessCustodyExitTests(unittest.TestCase):
             self.assertEqual(node["exit_code"], -signal.SIGTERM)
             owner.close_pidfds()
 
+    def test_a_process_whose_main_thread_exited_still_gets_sigkill(self):
+        program = ("import ctypes, signal, threading, time\n"
+                   "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                   "threading.Thread(target=time.sleep, args=(30,)).start()\n"
+                   "ctypes.CDLL(None).pthread_exit(None)\n")
+        with tempfile.TemporaryDirectory() as directory:
+            owner = self.module.Custody(lambda: False)
+            child = owner.launch([sys.executable, "-I", "-c", program], directory, "fixture-owned-parent")
+            node = owner.nodes[child.pid]
+            deadline = time.monotonic() + HANDSHAKE_SECONDS
+            while owner.current(node)["state"] != "Z":
+                self.assertLess(time.monotonic(), deadline, "The main thread did not exit")
+                time.sleep(0.01)
+            reports = []
+            owner.settle_all(lambda: None, lambda stage, error: reports.append(error))
+            self.assertEqual(reports, [])
+            self.assertEqual(node["exit_code"], -signal.SIGKILL)
+            owner.close_pidfds()
+
     def test_another_metadata_failure_is_fatal_and_settlement_reports_it(self):
         with OwnedFamily(self, self.module) as family:
             owner, node = family.owner, family.node
@@ -361,7 +380,8 @@ class ProcessCustodyExitTests(unittest.TestCase):
             denials = [denied]
 
             def denied_once(candidate, executable=False):
-                if candidate is node and executable and denials:
+                # The worker: settlement signals it first, and its child may exit with it.
+                if candidate is owner.nodes[family.worker.pid] and executable and denials:
                     raise denials.pop()
                 return real(candidate, executable=executable)
 
@@ -377,6 +397,8 @@ class ProcessCustodyExitTests(unittest.TestCase):
             changes = (
                 ({"pinned_executable": "/changed", "pinned_executable_identity": [0, 0]},
                  owner.expected_daemon, "no retargeting"),
+                ({"pinned_executable": family.executable, "pinned_executable_identity": [0, 0]},
+                 owner.expected_daemon, "no retargeting"),
                 ({}, family.executable, "held-lock corroboration"),
             )
             for node_change, expected_daemon, message in changes:
@@ -387,14 +409,52 @@ class ProcessCustodyExitTests(unittest.TestCase):
                         owner.signal_owned(node, signal.SIGTERM)
                     send.assert_not_called()
 
+    def test_a_process_released_during_a_read_is_not_a_custody_failure(self):
+        real_stat, real_read = Path.stat, Path.read_text
+        with OwnedFamily(self, self.module) as family:
+            owner, node = family.owner, family.node
+            released = []
+
+            # The kernel's order: root owns a released process, and its stat is gone.
+            def stat(path, *args, **kwargs):
+                if path.name != str(node["pid"]):
+                    return real_stat(path, *args, **kwargs)
+                released.append(path)
+                return mock.Mock(st_uid=0)
+
+            def read_text(path, *args, **kwargs):
+                if released and path.name == "stat":
+                    raise FileNotFoundError(errno.ENOENT, "Injected released process")
+                return real_read(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "stat", stat), mock.patch.object(Path, "read_text", read_text), \
+                    self.assertRaises(FileNotFoundError):
+                owner.current(node)
+            self.assertEqual(self.module.process_state(node["pid"])["uid"], os.getuid())
+
+            denied = PermissionError(errno.EACCES, "Injected denied executable")
+            with mock.patch.object(self.module.os, "readlink", side_effect=denied):
+                with self.assertRaises(PermissionError):
+                    owner.current(node, executable=True)
+                with mock.patch.object(owner, "exited", return_value=True), \
+                        self.assertRaises(ProcessLookupError):
+                    owner.current(node, executable=True)
+
+            tasks = ProcessLookupError(errno.ESRCH, "Injected released process")
+            with mock.patch.object(Path, "iterdir", side_effect=tasks):
+                self.assertEqual(self.module.child_ids(node["pid"]), set())
+            with mock.patch.object(Path, "read_text", side_effect=tasks):
+                self.assertEqual(self.module.child_ids(node["pid"]), set())
+
     def test_a_new_child_that_lost_its_metadata_is_waited_for(self):
         vanished = FileNotFoundError(errno.ENOENT, "Injected exiting executable")
         with tempfile.TemporaryDirectory() as directory:
             owner = self.module.Custody(lambda: False)
-            with mock.patch.object(owner, "pin", side_effect=vanished):
-                child = owner.launch(["sh", "-c", "sleep 0.3; exit 7"], directory, "fixture-owned-parent")
-            self.assertEqual(owner.nodes[child.pid]["exit_code"], 7)
-            self.assertTrue(owner.nodes[child.pid]["settled"])
+            for error in (vanished, ProcessLookupError(errno.ESRCH, "Injected released process")):
+                with self.subTest(error=error), mock.patch.object(owner, "pin", side_effect=error):
+                    child = owner.launch(["sh", "-c", "sleep 0.3; exit 7"], directory, "fixture-owned-parent")
+                self.assertEqual(owner.nodes[child.pid]["exit_code"], 7)
+                self.assertTrue(owner.nodes[child.pid]["settled"])
 
             with mock.patch.object(owner, "pin", side_effect=vanished), \
                     mock.patch.object(self.module, "NEW_CHILD_EXIT_SECONDS", 0.1), \
