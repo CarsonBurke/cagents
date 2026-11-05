@@ -2065,7 +2065,6 @@ fn check_parent_depth(db: &Connection, origin: &Origin) -> Result<(), String> {
     Ok(())
 }
 
-/// Why a confirmed-stopped process ends its agent's execution.
 /// The open agent bound to this exact process, or launching it.
 fn process_agent(tx: &Transaction<'_>, source: &HostedSession) -> Result<Option<Agent>, String> {
     tx.query_row(
@@ -2096,6 +2095,7 @@ fn process_ended(tx: &Connection, agent: AgentId) -> Result<bool, String> {
     .map_err(|e| e.to_string())
 }
 
+/// Why a confirmed-stopped process ends its agent's execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProcessEnd {
     /// The user or caller closed the agent: its pane and record retire too.

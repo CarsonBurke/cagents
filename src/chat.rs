@@ -1567,17 +1567,35 @@ pub struct TextCopySources {
 impl Command {
     /// Whether the command gives the provider work: a turn, a reply to its
     /// question, or a queued or provider command it runs.
+    ///
+    /// Exhaustive on purpose, so that a new command has to be classified.
     pub fn gives_work(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::ResumeAfterLogin { .. }
-                | Self::Prompt { .. }
-                | Self::Answer { .. }
-                | Self::Compact
-                | Self::Slash { .. }
-                | Self::StartQueued { .. }
-                | Self::Branch { .. }
-        )
+            | Self::Prompt { .. }
+            | Self::Answer { .. }
+            | Self::Compact
+            | Self::Slash { .. }
+            | Self::StartQueued { .. }
+            | Self::Branch { .. } => true,
+            Self::Interrupt
+            | Self::StopSubagent { .. }
+            | Self::SetModel { .. }
+            | Self::SetFastMode { .. }
+            | Self::SetPermissionMode { .. }
+            | Self::RefreshPermissions
+            | Self::UpdatePermissionSettings { .. }
+            | Self::DismissPermissionDenial { .. }
+            | Self::Refresh
+            | Self::LoadEarlier
+            | Self::RemoveQueued { .. }
+            | Self::SetInterruptMode { .. }
+            | Self::ListBranches
+            | Self::LoadLater
+            | Self::LoadFileChanges { .. }
+            | Self::LoadFileChangePatches { .. }
+            | Self::ReadTextCopy { .. } => false,
+        }
     }
 }
 

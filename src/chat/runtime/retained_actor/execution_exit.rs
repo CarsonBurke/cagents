@@ -60,8 +60,14 @@ fn abandoned_in(proc: &std::path::Path, holder: &Process, root: &Process) -> Res
         };
         let stat = match std::fs::read(entry.path().join("stat")) {
             Ok(stat) => stat,
-            // A process that exited during the scan holds no group.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            // A process that exited during the scan holds no group: its
+            // entry is gone, or was reaped between opening and reading it.
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue;
+            }
             Err(error) => {
                 return Err(format!(
                     "Cannot read process {pid} for exact absence: {error}"
