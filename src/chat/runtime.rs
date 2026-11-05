@@ -3910,6 +3910,7 @@ fn apply_projected_event(
             state.detail = reason;
             state.busy = false;
             state.waiting = false;
+            state.turn_error = None;
             state.error = None;
             state.read_only_reason = None;
             state.plan.clear();

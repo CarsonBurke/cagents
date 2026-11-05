@@ -219,14 +219,14 @@ impl Startup {
 
 /// Bounds how long a published receipt may wait for its holder to retire
 /// discovery. A holder that died in that window leaves the record behind.
+const RETIREMENT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Why releasing through a live holder failed. Only a transport failure can
 /// be the holder retiring on its own, so only that one waits for a receipt.
 enum ReleaseError {
     Authority(String),
     Transport(String),
 }
-
-const RETIREMENT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn consume(
     terminal: TerminalId,
