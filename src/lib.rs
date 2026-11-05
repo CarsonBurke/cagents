@@ -52,6 +52,23 @@ pub fn refuse_filtered_test_run(mut arguments: impl Iterator<Item = String>) {
     }
 }
 
+// A fixture re-runs this binary for one `--exact` test, and may check that child's
+// output and limits, so only the outer run reports or changes anything at startup.
+// `scripts/test-lib` also passes `--exact`, so its runs keep the limit they inherit.
+// The binary also re-executes as a holder or actor, whose own `.init_array` hook may
+// run after these in link order, and whose limit is the one under test.
+#[cfg(all(test, target_os = "linux"))]
+fn is_fixture_child() -> bool {
+    std::env::args()
+        .skip(1)
+        .enumerate()
+        .any(|(index, argument)| {
+            argument == "--exact"
+                || (index == 0
+                    && (argument.starts_with("--cagents-") || argument.starts_with("--internal-")))
+        })
+}
+
 // Sandboxes such as Codex's can leave an empty .git in writable roots, which then
 // fails unrelated fixtures with "enclosing Git checkout" refusals. Name the cause on
 // stderr before any test runs, so it is not read as many separate defects.
@@ -60,6 +77,9 @@ pub fn refuse_filtered_test_run(mut arguments: impl Iterator<Item = String>) {
 #[unsafe(link_section = ".init_array")]
 static REPORT_ENCLOSING_GIT: extern "C" fn() = {
     extern "C" fn report() {
+        if is_fixture_child() {
+            return;
+        }
         let mut found = std::collections::BTreeSet::new();
         for root in [std::env::temp_dir(), "/tmp".into(), "/var/tmp".into()] {
             found.extend(
@@ -86,6 +106,9 @@ static REPORT_ENCLOSING_GIT: extern "C" fn() = {
 #[unsafe(link_section = ".init_array")]
 static RAISE_TEST_DESCRIPTOR_LIMIT: extern "C" fn() = {
     extern "C" fn raise() {
+        if is_fixture_child() {
+            return;
+        }
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
