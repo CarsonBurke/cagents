@@ -5,6 +5,8 @@ from types import SimpleNamespace
 MAX_CHILDREN = 4096
 MAX_THREADS = 512
 METADATA_EXIT_GRACE_MS = 100
+# How long a new child that has lost its metadata may take to give its wait status.
+NEW_CHILD_EXIT_SECONDS = 5
 
 def require(value, message):
     if not value: raise RuntimeError(message)
@@ -120,7 +122,7 @@ class Custody:
         except ChildProcessError:
             # ECHILD alone never proves completed reaping.
             try: current = process_state(pid)
-            except FileNotFoundError: current = None
+            except (FileNotFoundError, ProcessLookupError): current = None
             if current is None or current['start_ticks'] != node['start_ticks']:
                 node.update(settled=True, exit_code=None,
                             exit_status_source='original pidfd exit AND original-process disappearance; parent reaped, status unavailable')
@@ -140,7 +142,7 @@ class Custody:
                 node = self.nodes[parent]
                 if self.reap(node): continue
                 try: self.current(node)
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
                     require(self.exited(node), 'Owned parent vanished without pidfd exit')
                     continue
             for pid in child_ids(parent):
@@ -160,7 +162,9 @@ class Custody:
         self.direct[child.pid] = child
         try: self.pin(child.pid, self.pid, direct=True, role=role)
         except (FileNotFoundError, ProcessLookupError):
-            code = child.poll()
+            # A process loses its executable well before it can be waited for.
+            try: code = child.wait(timeout=NEW_CHILD_EXIT_SECONDS)
+            except subprocess.TimeoutExpired: code = None
             require(code is not None, 'New child vanished before custody without original wait status')
             self.nodes[child.pid] = {'pid': child.pid, 'role': role, 'settled': True,
                 'exit_code': code, 'exit_status_source': 'direct Popen reaped before live pin',
@@ -170,14 +174,20 @@ class Custody:
 
     def signal_owned(self, node, signum):
         if self.reap(node): return
-        current = self.current(node, executable=True)
-        require(current['state'] not in ('Z', 'X'), 'Do not signal an exited child')
-        if node.get('pinned_executable'):
-            require(current.get('executable') == node['pinned_executable'] and
-                    current.get('executable_identity') == node['pinned_executable_identity'],
-                    'Pinned UI/daemon executable incarnation changed; no retargeting')
-        if current.get('executable') == self.expected_daemon:
-            require(self.daemon is node, 'Matched daemon lacks private held-lock corroboration')
+        try: current = self.current(node, executable=True)
+        except OSError as error:
+            if error.errno not in (errno.ENOENT, errno.ESRCH): raise
+            current = {}
+        # A process that is exiting has no executable to check, and may yet be
+        # running: a main thread can exit before the others. The original pidfd
+        # can only reach this process.
+        if 'executable' in current:
+            if node.get('pinned_executable'):
+                require(current['executable'] == node['pinned_executable'] and
+                        current['executable_identity'] == node['pinned_executable_identity'],
+                        'Pinned UI/daemon executable incarnation changed; no retargeting')
+            if current['executable'] == self.expected_daemon:
+                require(self.daemon is node, 'Matched daemon lacks private held-lock corroboration')
         try: signal.pidfd_send_signal(node['pidfd'], signum, None, 0)
         except ProcessLookupError:
             require(self.exited(node), 'Owned signal lost its process without pidfd exit')
