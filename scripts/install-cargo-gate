@@ -96,6 +96,8 @@ version() {
 }
 staged=$(version "$stage/cagents-cargo-gate")
 current=$(version "$destination/cagents-cargo-gate")
+# Exit 3 tells a gate installing main's that this is no failure; nothing
+# else here exits 3.
 if [ "${staged:-0}" -lt "${current:-0}" ]; then
     printf '%s: %s\n' "$program" "the installed gate is version $current, newer than this checkout's ${staged:-0}; install from a checkout that has it" >&2
     exit 3
@@ -143,15 +145,16 @@ printf '%s\n' "$files" | while IFS=: read -r installed file; do
     mv -f -- "$destination/.$installed.new" "$destination/$installed"
 done
 committed=true
+# The replaced installation's time is when it was replaced.
+case $retired in
+    "$(readlink -f -- "$versions")"/v.*/cagents-cargo-gate) touch -c -- "${retired%/*}" ;;
+esac
 mv -f -- "$destination/cagents-cargo-gate.installation.new" "$destination/cagents-cargo-gate.installation"
 # Gates judge main afresh against this installation.
 rm -f -- "$destination/cagents-cargo-gate.checked" "$destination/cagents-cargo-gate.install-failed"
 smoke "$destination/cagents-cargo-gate"
 # Earlier installations a running build may still be using stay a week after
-# they were replaced.
-case $retired in
-    "$(readlink -f -- "$versions")"/v.*/cagents-cargo-gate) touch -c -- "${retired%/*}" ;;
-esac
+# they were replaced (see above).
 find "$versions" -mindepth 1 -maxdepth 1 -type d -name 'v.*' ! -name "${stage##*/}" -mtime +7 \
     -exec rm -rf -- {} + 2>/dev/null || true
 printf '%s: installed %s/cagents-cargo-gate from %s\n' "$program" "$destination" \

@@ -21,10 +21,12 @@ from act on it, so a fork's main never replaces it.
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
 INSTALLER = "scripts/install-cargo-gate"
 # What the gate needs beside it, should a record not say.
@@ -39,15 +41,31 @@ def git(*arguments):
 
 
 def same_repository(first, second):
-    """Whether two origin URLs name one repository, however they reach it."""
+    """Whether two origin URLs name one repository, however they reach it:
+    by HTTPS or SSH, in either SSH form, with or without a port, user or
+    `.git`. Hosts such as GitHub ignore case, so this does too."""
     def plain(url):
-        url = url.strip().rstrip("/").removesuffix(".git")
-        for scheme in ("https://", "http://", "ssh://", "git://"):
-            url = url.removeprefix(scheme)
-        url = url.split("@", 1)[-1]  # user@ in SSH and HTTPS forms
-        host, _, path = url.replace(":", "/", 1).partition("/")
-        return host.lower(), path
+        url = url.strip()
+        if "://" in url:
+            parts = urllib.parse.urlsplit(url)
+            host, path = parts.hostname or "", parts.path
+        else:  # scp-like: [user@]host:path
+            host, _, path = url.rpartition("@")[2].partition(":")
+        return host.lower(), path.strip("/").removesuffix(".git").lower()
     return plain(first) == plain(second)
+
+
+def gate_version(text):
+    match = re.search(r"^gate_version=([0-9]+)$", text or "", re.M)
+    return int(match.group(1)) if match else 0
+
+
+def read_text(path):
+    try:
+        with open(path) as file:
+            return file.read()
+    except OSError:
+        return None
 
 
 def read_json(path):
@@ -113,6 +131,9 @@ class Installation:
         if blobs is not None and isinstance(files, dict) and \
                 dict(zip(paths, blobs.split())) == files:
             return "current"
+        if gate_version(git("show", f"{main}:scripts/cargo-gate")) < \
+                gate_version(read_text(self.installed)):
+            return "keep"  # Installed from a newer gate than main's.
         commit = record.get("commit")
         if commit and git("merge-base", "--is-ancestor", commit, main) is not None:
             return "install"  # Main has what was installed and has changed it since.

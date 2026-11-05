@@ -479,7 +479,8 @@ class InstalledGateSync(unittest.TestCase):
         def in_clone(*arguments, env=None):
             subprocess.run(["git", *arguments], cwd=clone, env=env or self.git_env, check=True,
                            capture_output=True)
-        in_clone("remote", "set-url", "origin", "git@github.com:example/gate")
+        # Another way to the same repository, which ignores case.
+        in_clone("remote", "set-url", "origin", "ssh://git@github.com:22/Example/gate")
         with open(clone / "scripts/cargo-gate", "a") as gate:
             gate.write("# merged change\n")
         in_clone("commit", "-qam", "change the gate",
@@ -488,7 +489,7 @@ class InstalledGateSync(unittest.TestCase):
         result = self.run_installed(cwd=clone)
         self.assertEqual((result.returncode, result.stdout), (0, "ran"), result.stderr)
         self.assertIn("installed origin/main's gate", result.stderr)
-        self.assertEqual(self.record()["origin"], "git@github.com:example/gate")
+        self.assertEqual(self.record()["origin"], "ssh://git@github.com:22/Example/gate")
 
     def test_a_checkout_of_another_repository_changes_nothing(self):
         other = self.root / "other"
