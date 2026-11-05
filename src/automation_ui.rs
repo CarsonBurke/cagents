@@ -973,9 +973,10 @@ impl State {
             | Action::Effort(..)
             | Action::Reuse(..)
             | Action::Precheck(..) => self.draft.is_some(),
-            Action::Provider(index) => self.draft.as_ref().is_some_and(|draft| {
-                *index < PROVIDERS.len() && *index != draft.provider
-            }),
+            Action::Provider(index) => self
+                .draft
+                .as_ref()
+                .is_some_and(|draft| *index < PROVIDERS.len() && *index != draft.provider),
             Action::Target(index) => self
                 .draft
                 .as_ref()
@@ -7401,7 +7402,8 @@ mod tests {
         let Some(Effect::Request {
             sequence,
             request: Request::Audit { id, .. },
-        }) = state.update(Action::ToggleDetail(DetailSection::Changes)) else {
+        }) = state.update(Action::ToggleDetail(DetailSection::Changes))
+        else {
             panic!("investigating recorded changes reads the same subject");
         };
         assert_eq!(id, owner.id);
@@ -7435,10 +7437,12 @@ mod tests {
         });
         assert_eq!(state.selected.as_ref().unwrap().id, other.id);
         assert!(state.error.is_none());
-        assert!(!Outline::of(&state, 360.0, 700.0)
-            .texts
-            .iter()
-            .any(|(text, _)| text == refusal));
+        assert!(
+            !Outline::of(&state, 360.0, 700.0)
+                .texts
+                .iter()
+                .any(|(text, _)| text == refusal)
+        );
     }
 
     #[test]
@@ -7488,7 +7492,8 @@ mod tests {
                 let Some(Effect::Request {
                     sequence,
                     request: Request::History { .. },
-                }) = followup else {
+                }) = followup
+                else {
                     panic!("finish the history retry");
                 };
                 state.update(Action::Received {
@@ -7513,7 +7518,8 @@ mod tests {
         let Some(Effect::Request {
             sequence,
             request: Request::Cancel { firing, .. },
-        }) = state.update(Action::CancelRun) else {
+        }) = state.update(Action::CancelRun)
+        else {
             panic!("the user cancels the displayed run");
         };
         assert_eq!(firing, detail.firing.id);
@@ -7525,7 +7531,8 @@ mod tests {
         let Some(Effect::Request {
             sequence,
             request: Request::ShowFiring { id },
-        }) = state.update(Action::Tick) else {
+        }) = state.update(Action::Tick)
+        else {
             panic!("periodic refresh reads the run");
         };
         assert_eq!(id, detail.firing.id);
@@ -7535,9 +7542,13 @@ mod tests {
         });
         assert_eq!(state.error.as_deref(), Some(refusal));
         Outline::of(&state, 900.0, 700.0).text(refusal);
-        assert!(matches!(state.update(Action::CancelRun), Some(Effect::Request {
-            request: Request::Cancel { .. }, ..
-        })));
+        assert!(matches!(
+            state.update(Action::CancelRun),
+            Some(Effect::Request {
+                request: Request::Cancel { .. },
+                ..
+            })
+        ));
         assert!(state.error.is_none());
     }
 
