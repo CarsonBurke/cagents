@@ -548,6 +548,8 @@ class HeldCommand(unittest.TestCase):
             # This copy of the gate, not a newer installed one, building here.
             "CAGENTS_BUILD_INSTALLED_GATE": "",
             "CAGENTS_BUILD_REMOTE": "local",
+            # A gate these tests kill leaves its command directory behind.
+            "TMPDIR": str(self.root),
         }
         self.env.pop("CAGENTS_BUILD_SLOT_HELD", None)
         self.children = []

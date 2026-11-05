@@ -615,6 +615,19 @@ printf '%s\\n' '{{{metadata}}}'
                 self.assertEqual((self.destination / "debug/deps/libzstd-1.rlib").read_bytes(), b"rlib")
                 self.assertFalse(wrong.exists())
 
+    def test_cargo_failing_to_describe_the_workspace_leaves_seeding_undone(self):
+        tools = self.root / "tools"
+        tools.mkdir()
+        (tools / "cargo").write_text("#!/bin/sh\nexit 37\n")
+        (tools / "cargo").chmod(0o755)
+        result = subprocess.run(
+            [str(SEED), "--from", str(self.source)], cwd=self.root,
+            env={**self.env, "PATH": f"{tools}:{os.environ['PATH']}"},
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.destination.exists())
+
     def test_a_build_holding_either_cargo_lock_delays_the_copy(self):
         if not reflinks(self.root):
             self.skipTest("this file system cannot reflink")

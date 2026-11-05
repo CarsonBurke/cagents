@@ -115,7 +115,7 @@ done
 build_dir_of() {
     metadata=$(cd "$1" && cargo metadata --format-version 1 --no-deps 2>/dev/null) || metadata=
     build_dir=$(printf '%s\n' "$metadata" | sed -n 's/.*"build_directory":"\([^"]*\)".*/\1/p')
-    # Cargo before 1.91 reports no build directory: it builds in the target.
+    # A Cargo that reports no build directory builds in the target.
     [ -n "$build_dir" ] || build_dir=$(printf '%s\n' "$metadata" |
         sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
     printf '%s\n' "$build_dir"
