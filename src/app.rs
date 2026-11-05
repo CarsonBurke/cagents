@@ -5853,12 +5853,7 @@ impl Cagents {
         visible: bool,
         explicit_retry: bool,
     ) -> Task<Message> {
-        if self.shared_views.defaults.contains_key(&card)
-            || self.durable.pending_terminal_creations.contains(&card)
-            || (self.shared_views.attached.contains(&card)
-                && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
-                && !explicit_retry)
-        {
+        if self.terminal_start_held(card, explicit_retry) {
             return Task::none();
         }
         // A restored recipe is presentation until its exact attachment has
