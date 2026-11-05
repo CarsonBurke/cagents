@@ -1226,6 +1226,91 @@ class CpuPressureAdmission(TwoSlots):
         result = self.build(1, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def assert_start_selection(self, starts, *, waits, disabled=False, readable=True):
+        # Redirect only meminfo through the actual sed executable. The tested
+        # 7 GiB cost always fits this synthetic 64 GiB; no RAM is allocated.
+        binary = self.root / "start-tools"
+        binary.mkdir(exist_ok=True)
+        memory = self.root / "start-meminfo"
+        memory.write_text("MemTotal:       67108864 kB\nMemAvailable:   67108864 kB\n")
+        sed = binary / "sed"
+        sed.write_text(
+            "#!/usr/bin/python3\nimport os,sys\n"
+            "arguments = [os.environ['FIXTURE_MEMINFO'] if argument == '/proc/meminfo' "
+            "else argument for argument in sys.argv[1:]]\n"
+            "os.execv('/usr/bin/sed', ['sed', *arguments])\n"
+        )
+        sed.chmod(0o700)
+        temporary = self.root / "start-tmp"
+        temporary.mkdir(exist_ok=True)
+        command = self.root / "start-command"
+        command.unlink(missing_ok=True)
+        self.report("0.00")
+        if not readable:
+            self.pressure.write_text("some total=12\n")
+        environment = {
+            "PATH": str(binary) + ":/usr/bin:/bin", "TMPDIR": str(temporary), "LC_ALL": "C",
+            "FIXTURE_MEMINFO": str(memory), "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
+            "CAGENTS_BUILD_SLOTS": "3", "CARGO_BUILD_JOBS": "1",
+            "CAGENTS_BUILD_CPU_PRESSURE": "0" if disabled else "60",
+            "CAGENTS_BUILD_CPU_SETTLE_SECS": "60",
+            "CAGENTS_BUILD_CPU_PRESSURE_FILE": str(self.pressure),
+            "CAGENTS_BUILD_COST_GIB": "7", "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1",
+        }
+        now = self.uptime()
+        dates = {"future":now + 10**6, "fresh":now, "old":now - 600}
+        holders, costs = [], {}
+        try:
+            for index, start in enumerate(starts, 1):
+                path = self.root / f"slot.lock.{index}"
+                holder = path.open("a")
+                holders.append(holder)
+                fcntl.flock(holder, fcntl.LOCK_EX)
+                cost = Path(str(path) + ".cost")
+                cost.write_text(f"{os.getpid()} 1\n{dates[start]}\n")
+                costs[cost] = cost.read_bytes()
+            process = subprocess.Popen(
+                [str(self.gate), "exec", "/bin/sh", "-c", 'printf admitted > "$1"',
+                 "fixture", str(command)], cwd=self.root, env=environment,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True,
+            )
+            try:
+                _stdout, stderr = process.communicate(timeout=5)
+            finally:
+                if process.poll() is None:
+                    process.send_signal(signal.SIGTERM)
+                process.communicate(timeout=5)
+            for cost, expected in costs.items():
+                self.assertEqual(cost.read_bytes(), expected)
+                with Path(str(cost).removesuffix(".cost")).open("a") as probe:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for name in ("slot.lock", "slot.lock.queue"):
+                with (self.root / name).open("a") as probe:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertFalse((self.root / "slot.lock.cost").exists())
+            self.assertEqual((process.returncode, command.exists()), (124, False) if waits else (0, True), stderr)
+            if waits:
+                self.assertIn("admission", stderr.lower())
+        finally:
+            for holder in holders:
+                holder.close()
+
+    def test_a_future_start_cannot_mask_a_fresh_holder_in_either_scan_order(self):
+        for starts in (("future", "fresh"), ("fresh", "future")):
+            with self.subTest(starts=starts):
+                self.assert_start_selection(starts, waits=True)
+
+    def test_start_selection_preserves_admission_and_pressure_read_error_controls(self):
+        for starts, waits, disabled, readable in (
+            (("future",), False, False, True), (("old",), False, False, True),
+            (("fresh",), True, False, True), (("future", "fresh"), False, True, True),
+            (("old",), False, False, False), (("future", "fresh"), True, False, False),
+        ):
+            with self.subTest(starts=starts, disabled=disabled, readable=readable):
+                self.assert_start_selection(starts, waits=waits, disabled=disabled, readable=readable)
+
     def test_settled_and_undated_running_builds_leave_room(self):
         # A build priced by a gate that does not date its start is not waited for.
         self.report("0.00")

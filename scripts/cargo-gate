@@ -238,7 +238,13 @@ fits() {
                             claim="$holder:$claimed"
                             case $since in
                                 ''|*[!0-9]*) ;;
-                                *) [ -n "$newest" ] && [ "$since" -le "$newest" ] || newest=$since ;;
+                                *)
+                                    # Discard pre-reboot dates before choosing
+                                    # the newest, so they cannot hide a fresh start.
+                                    if [ "$since" -le "$(uptime_seconds)" ]; then
+                                        [ -n "$newest" ] && [ "$since" -le "$newest" ] || newest=$since
+                                    fi
+                                    ;;
                             esac
                         fi
                         ;;
