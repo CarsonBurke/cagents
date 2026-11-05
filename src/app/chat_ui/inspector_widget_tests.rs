@@ -434,6 +434,10 @@ mod inspector_widget {
             };
             frames.frame(&mut app, &mut move_reader);
             let before = frames.settle(&mut app, target, None);
+            let initial_width = before
+                .transcript_viewport
+                .expect("the initial reader has a measured viewport")
+                .width;
             assert!(before.travel > 1500.0, "fixture has a real long transcript");
             assert!(
                 before.composer_mounted,
@@ -490,8 +494,18 @@ mod inspector_widget {
                     drop(app.update(Message::ToggleContextInspector));
                     drop(app.update(Message::WindowResized(1280.0, 800.0)));
                     assert_eq!(app.context_inspector_mount(), Some(InspectorLayout::Docked));
+                    drop(app.update(Message::Frame(Instant::now() + DIALOG_TRANSITION_DURATION)));
+                    assert!(app.context_inspector_transition.is_none());
+                    assert_eq!(app.context_inspector_progress(), 1.0);
                 }
                 let after = frames.settle(&mut app, target, glyph.as_ref());
+                if stage == "redocked wide Inspector" {
+                    assert_eq!(
+                        after.transcript_viewport.unwrap().width,
+                        initial_width,
+                        "settled redock must restore the original reader width"
+                    );
+                }
                 assert!(
                     after.composer_mounted,
                     "{stage}: the actual draft editor is mounted"
