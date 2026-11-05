@@ -681,7 +681,10 @@ fn actual_app_inactive_terminal_native_admission_obeys_save_and_prepared_selecti
             CardKind::Terminal(session),
             CardRuntime::Terminal(peer.handle().clone().into()),
         );
-        let _save = if blocked == "saving" {
+        let _save = (blocked == "saving").then(|| {
+            let fixture = super::tests::CloseSaveFixture::install(&mut app, selected);
+            super::tests::CloseSaveFixture::edit(&mut app, selected, "unsaved\n");
+            assert!(app.prepare_editor_save(selected));
             let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&selected) else {
                 unreachable!()
             };
@@ -690,10 +693,8 @@ fn actual_app_inactive_terminal_native_admission_obeys_save_and_prepared_selecti
                 runtime.is_saving(),
                 "actual save admission must precede native input"
             );
-            Some(task)
-        } else {
-            None
-        };
+            (fixture, task)
+        });
         app.update_prepared = blocked == "prepared";
         prepare(&mut app);
         assert_eq!(app.focused_repository_is_saving(), blocked == "saving");
@@ -783,16 +784,17 @@ fn actual_app_inactive_browser_native_admission_obeys_save_and_prepared_selectio
                 load_state: None,
             }),
         );
-        let _save = if blocked == "saving" {
+        let _save = (blocked == "saving").then(|| {
+            let fixture = super::tests::CloseSaveFixture::install(&mut app, selected);
+            super::tests::CloseSaveFixture::edit(&mut app, selected, "unsaved\n");
+            assert!(app.prepare_editor_save(selected));
             let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&selected) else {
                 unreachable!()
             };
             let task = runtime.request_save(selected, false);
             assert!(runtime.is_saving());
-            Some(task)
-        } else {
-            None
-        };
+            (fixture, task)
+        });
         app.update_prepared = blocked == "prepared";
         prepare(&mut app);
         let (_cache, messages) = native_sibling_batch(&app, sibling);
@@ -844,6 +846,9 @@ fn prepared_update_refuses_routed_sibling_reconciliation_before_any_workspace_mu
     let sibling = add_inactive_native_card(&mut app, CardKind::Settings, CardRuntime::Settings);
     prepare(&mut app);
     app.workspace.take_widget_focus_request();
+    // Settle the ambient attention acknowledgement for the focused pane so
+    // the refusal's own task is what the assertion below observes.
+    drop(app.sync_visible_attention());
     app.update_prepared = true;
     let before = app.workspace.order().collect::<Vec<_>>();
     let durable_focus = app.durable.focused;
@@ -868,8 +873,9 @@ fn prepared_update_refuses_routed_sibling_reconciliation_before_any_workspace_mu
     assert_eq!(app.durable.focused, durable_focus);
     assert_eq!(app.workspace.order().collect::<Vec<_>>(), before);
     assert!(app.workspace.take_widget_focus_request().is_none());
-    assert!(
-        iced::runtime::task::into_stream(task).is_none(),
+    assert_eq!(
+        task.units(),
+        0,
         "no viewport/native focus effect may escape prepared refusal"
     );
     assert!(

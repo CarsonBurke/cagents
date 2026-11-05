@@ -5860,13 +5860,15 @@ mod tests {
                 assert!(messages.is_empty(), "switching disables draft controls");
             } else {
                 // Clicking outside COSMIC's native editor first emits its
-                // ordinary ClearSelection. The following release must admit
-                // exactly one chooser, without editing/submitting the draft.
+                // ordinary ClearSelection and the history observation that
+                // follows it. The release must admit exactly one chooser,
+                // without editing/submitting the draft.
                 assert!(
                     matches!(messages.as_slice(), [
                         Message::ChatUi(Action::Composer(editor, text_editor::Action::ClearSelection)),
+                        Message::ChatUi(Action::ComposerHistory(observed, command)),
                         Message::ChatUi(Action::Attach(found)),
-                    ] if *editor == target && *found == target),
+                    ] if *editor == target && *observed == target && !command.changes_text() && *found == target),
                     "attachment control emitted unexpected messages: {messages:?}; bounds={rect:?}; cursor={cursor:?}; viewport={viewport:?}; captured={captured:?}"
                 );
             }
@@ -12529,10 +12531,11 @@ mod tests {
             &renderer,
             &layout::Limits::new(iced::Size::ZERO, viewport.size()),
         );
-        // The first presented frame reports both transcripts' geometry.
-        // Establish and validate that lifecycle publication before testing
-        // which composer owns keyboard actions, without allowing unrelated
-        // chat messages through the keyboard assertions below.
+        // The first presented frame shares both transcripts' geometry with
+        // their runtimes directly; only navigation becomes a model message.
+        // Establish that lifecycle before testing which composer owns
+        // keyboard actions, without allowing unrelated chat messages through
+        // the keyboard assertions below.
         let mut presented = Vec::new();
         element.as_widget_mut().update(
             &mut tree,
@@ -12546,15 +12549,16 @@ mod tests {
             &mut Shell::new(&mut presented),
             &viewport,
         );
-        let reported: Vec<_> = presented
-            .iter()
-            .map(|message| match message {
-                Message::ChatUi(Action::Scrolled(target, None, _, false)) => *target,
-                _ => panic!("unexpected initial frame message: {message:?}"),
-            })
-            .collect();
-        assert_eq!(reported.len(), 2);
-        assert!(reported.contains(&first.target) && reported.contains(&second.target));
+        assert!(
+            presented.is_empty(),
+            "unexpected initial frame messages: {presented:?}"
+        );
+        for runtime in [&first, &second] {
+            assert!(
+                runtime.observed_scroll.borrow().contains_key(&None),
+                "the first frame observes each transcript's geometry"
+            );
+        }
         for (target, expected) in [
             (sidebar, None),
             (

@@ -22927,13 +22927,13 @@ mod tests {
     }
 
     /// Own both the checkout and its private outside parent for every lazy Save.
-    struct CloseSaveFixture {
+    pub(super) struct CloseSaveFixture {
         _directory: tempfile::TempDir,
         path: PathBuf,
     }
 
     impl CloseSaveFixture {
-        fn install(app: &mut Cagents, card: CardId) -> Self {
+        pub(super) fn install(app: &mut Cagents, card: CardId) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let checkout = directory.path().join("checkout");
             std::fs::create_dir(&checkout).unwrap();
@@ -22969,7 +22969,7 @@ mod tests {
             }
         }
 
-        fn edit(app: &mut Cagents, card: CardId, text: &str) {
+        pub(super) fn edit(app: &mut Cagents, card: CardId, text: &str) {
             let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
                 panic!("repository remains installed");
             };
