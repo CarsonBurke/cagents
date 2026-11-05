@@ -266,14 +266,24 @@ fn sweep_with_procfs(root: &Path, proc_root: &Path) -> io::Result<Usage> {
 /// Sweeps until the dropped lease's cache is reclaimed. A concurrent test's
 /// fork duplicates every descriptor, close-on-exec or not, until its child
 /// execs, and that copy keeps the dropped lease locked. Each attempt first
-/// blocks until the last copy closes; a fork can also copy that probe, so a
-/// lost race retries rather than failing.
+/// waits until the last copy closes; a fork can also copy that probe, so a
+/// lost race retries rather than failing. A lease that stays held fails
+/// after a hang guard instead of blocking the test forever.
 #[cfg(all(test, feature = "host"))]
 pub(crate) fn sweep_reclaiming(root: &Path, proc_root: &Path, directory: &Path) -> Usage {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut swept = Usage::default();
     for _ in 0..100 {
         let probe = private_file(&directory.join(LEASE)).unwrap();
-        lock(&probe, libc::LOCK_EX).unwrap();
+        while let Err(error) = lock(&probe, libc::LOCK_EX | libc::LOCK_NB) {
+            assert_eq!(error.raw_os_error(), Some(libc::EWOULDBLOCK), "{error}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} stayed leased",
+                directory.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         drop(probe);
         let attempt = sweep_with_procfs(root, proc_root).unwrap();
         swept.count += attempt.count;
