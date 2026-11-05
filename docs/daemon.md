@@ -469,13 +469,9 @@ Manual sidebar order is stored by the selected device daemon and shared across w
 
 ### Merged worktree notices
 
-Settings → General → **Merged worktrees** is disabled by default. When enabled, sidebar PR refreshes look for one clean, inactive GitHub worktree at a time whose exact branch and current commit were merged, and show a notice naming any ignored files it holds, such as `.env`. The worktree, its catalog entry and its branch are kept: an inventory cannot exclude files another program writes later, so only an explicitly confirmed **Delete worktree** removes it. The daemon refuses automatic-removal requests from older clients. See [Merged worktree notices and ignored files](configuration.md#merged-worktree-notices-and-ignored-files).
-
-Cleanup waits for every hosted process and accepted/background operation to retire. Offline GitHub, unknown ownership, pending saves, and older windows or independent editors without directory protection all postpone removal. Inactive file-list browser tabs can be retired with the removed worktree. An independent ceditor window conservatively protects its original startup folders until that editor process exits, including folders whose startup tabs have since closed.
+Settings → General → **Merged worktrees** is disabled by default. When enabled, sidebar PR refreshes look for GitHub worktrees whose exact branch and current commit were merged, one at a time, and show a notice naming what deleting each would discard, such as uncommitted changes or an ignored `.env`. The worktree, its catalog entry and its branch are always kept: an inventory cannot exclude files another program writes later, so only an explicitly confirmed **Delete worktree** removes it. The daemon refuses automatic-removal requests from older clients. See [Merged worktree notices and ignored files](configuration.md#merged-worktree-notices-and-ignored-files).
 
 Directory protection covers both the pathname and a held directory identity. Moving an open checkout with `git worktree move` preserves its protection, and replacing its old pathname does not bypass the original path lease.
-
-Independent editor detection covers the installed `ceditor` and `ceditor-development` executable names. If Linux hides an executable path, the census checks only its main-thread process name: an editor name postpones cleanup, while an unrelated hardened process does not. Custom-renamed editor binaries are outside this identity contract.
 
 Use matched CLI, UI, daemon, and ceditor builds when enabling this option (wire protocol 66).
 

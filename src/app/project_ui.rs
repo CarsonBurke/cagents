@@ -230,13 +230,15 @@ pub enum Action {
     /// Runs a failed deletion again. The user confirmed it once already.
     RetryDelete(WorktreeId),
     AwaitSessions(Target, WorktreeRemovalCapture),
-    /// An eligible merged worktree was kept. `ignored` names the user files
-    /// that only an explicitly confirmed deletion would discard.
+    /// A merged worktree was inventoried for its notice; it is always kept.
+    /// `ignored` names the user files that only an explicitly confirmed
+    /// deletion would discard, or is `None` when the inventory was incomplete.
     MergedWorktreeKept {
         target: Target,
         generation: u64,
         request: crate::worktree_cleanup::RemovalRequest,
-        ignored: Vec<String>,
+        ignored: Option<Vec<String>>,
+        uncommitted: bool,
     },
     Deleted {
         target: Target,
@@ -385,46 +387,36 @@ impl Cagents {
         self.project_ui
             .automatic_attempts
             .retain(|id, attempt| attempt.project != project_id || current_ids.contains(id));
-        let candidate = records.iter().filter_map(|(record, _)| {
-            let source = self.sidebar_model.project(project_id)?.worktrees.iter()
-                .find(|row| row.id == record.id && row.path == record.path)?
-                .head_repository.as_ref()?;
-            let pr = matching_attached_pr(record, source, pull_requests)?;
-            if pr.state.0 != "MERGED"
-                || record.head_oid.as_deref() != Some(pr.head_ref_oid.as_str())
-                || record.lock.locked
-                || self
-                    .active_workspace
-                    .as_ref()
-                    .is_some_and(|active| active.starts_with(&record.path))
-                || self
-                    .durable
-                    .cards
+        let candidate = records
+            .iter()
+            .filter_map(|(record, status)| {
+                let source = self
+                    .sidebar_model
+                    .project(project_id)?
+                    .worktrees
                     .iter()
-                    .any(|card| {
-                        card.existence.is_open()
-                            && card_belongs_to(card, &record.path)
-                            && match &card.kind {
-                                CardKind::Repository(view) => view.selected_file.is_some()
-                                    || self.durable.repository_navigation.get(&card.id)
-                                        .is_some_and(|navigation| navigation.selected_file.is_some())
-                                    || matches!(self.cards.get(&card.id), Some(CardRuntime::Repository(runtime)) if runtime.selected_path().is_some() || runtime.blocks_navigation()),
-                                _ => true,
-                            }
-                    })
-            {
-                return None;
-            }
-            let target = self.project_target(project_id, Some(record.id))?;
-            if self.worktree_deletion_blocker(&target).is_some() {
-                return None;
-            }
-            let branch = record
-                .branch
-                .as_deref()?
-                .strip_prefix("refs/heads/")?
-                .to_owned();
-            let request = crate::worktree_cleanup::RemovalRequest {
+                    .find(|row| row.id == record.id && row.path == record.path)?
+                    .head_repository
+                    .as_ref()?;
+                let pr = matching_attached_pr(record, source, pull_requests)?;
+                // Nothing is removed, so open chats, terminals and editors in the
+                // worktree need no protection from this notice.
+                if pr.state.0 != "MERGED"
+                    || record.head_oid.as_deref() != Some(pr.head_ref_oid.as_str())
+                    || record.lock.locked
+                {
+                    return None;
+                }
+                let target = self.project_target(project_id, Some(record.id))?;
+                if self.worktree_deletion_blocker(&target).is_some() {
+                    return None;
+                }
+                let branch = record
+                    .branch
+                    .as_deref()?
+                    .strip_prefix("refs/heads/")?
+                    .to_owned();
+                let request = crate::worktree_cleanup::RemovalRequest {
                     repository: self.sidebar_model.project(project_id)?.repository.clone(),
                     path: record.path.clone(),
                     branch,
@@ -435,18 +427,34 @@ impl Cagents {
                         number: pr.number,
                     },
                 };
-            if self.project_ui.automatic_attempts.get(&record.id).is_some_and(|attempt| {
-                attempt.project == project_id && attempt.request == request
-                    && (attempt.retained || attempt.at.elapsed() < Duration::from_secs(30))
-            }) {
-                return None;
-            }
-            Some((target, request))
-        })
-        // A refused candidate must not monopolize every later refresh. Prefer
-        // unseen candidates, then those whose last attempt is oldest.
-        .min_by_key(|(target, _)| target.worktree.and_then(|id| self.project_ui.automatic_attempts.get(&id).map(|attempt| attempt.at)));
-        let Some((target, request)) = candidate else {
+                if self
+                    .project_ui
+                    .automatic_attempts
+                    .get(&record.id)
+                    .is_some_and(|attempt| {
+                        attempt.project == project_id
+                            && attempt.request == request
+                            && (attempt.retained || attempt.at.elapsed() < Duration::from_secs(30))
+                    })
+                {
+                    return None;
+                }
+                let uncommitted = status
+                    .as_ref()
+                    .is_some_and(|status| status.dirty.is_dirty());
+                Some((target, request, uncommitted))
+            })
+            // A refused candidate must not monopolize every later refresh. Prefer
+            // unseen candidates, then those whose last attempt is oldest.
+            .min_by_key(|(target, _, _)| {
+                target.worktree.and_then(|id| {
+                    self.project_ui
+                        .automatic_attempts
+                        .get(&id)
+                        .map(|attempt| attempt.at)
+                })
+            });
+        let Some((target, request, uncommitted)) = candidate else {
             return Task::none();
         };
         let Some(generation) = self.project_ui.next_automatic_attempt.checked_add(1) else {
@@ -472,17 +480,17 @@ impl Cagents {
                     .notable_ignored_files(&path, &crate::process::CancellationToken::new())
             })
             .await;
-            // The notice is still useful without the inventory; deletion keeps
-            // its own confirmation either way.
+            // The notice is still useful without the inventory, but must say
+            // the check did not finish; deletion keeps its own confirmation.
             let ignored = match inventory {
-                Ok(Ok(files)) => files.iter().map(ToString::to_string).collect(),
+                Ok(Ok(files)) => Some(files.iter().map(ToString::to_string).collect()),
                 Ok(Err(error)) => {
                     tracing::warn!(%error, "could not list ignored files in merged worktree");
-                    Vec::new()
+                    None
                 }
                 Err(error) => {
                     tracing::warn!(%error, "ignored-file inventory task failed");
-                    Vec::new()
+                    None
                 }
             };
             Message::ProjectUi(Action::MergedWorktreeKept {
@@ -490,6 +498,7 @@ impl Cagents {
                 generation,
                 request,
                 ignored,
+                uncommitted,
             })
         })
     }
@@ -1474,6 +1483,7 @@ impl Cagents {
                 generation,
                 request,
                 ignored,
+                uncommitted,
             } => {
                 let Some(id) = target.worktree else {
                     return Task::none();
@@ -1516,7 +1526,11 @@ impl Cagents {
                 // Automatic cleanup has no user confirmation to reuse. Keep
                 // this out of Deletion.failure: its RetryDelete action is an
                 // already-confirmed destructive operation.
-                self.status = Some(merged_worktree_kept_notice(&target.label, &ignored));
+                self.status = Some(merged_worktree_notice(
+                    &target.label,
+                    ignored.as_deref(),
+                    uncommitted,
+                ));
                 return Task::none();
             }
             Action::Deleted {
@@ -2018,29 +2032,53 @@ impl Cagents {
     }
 }
 
-/// Names a few ignored files inline; when more remain, the notice details
-/// list all of them.
-fn merged_worktree_kept_notice(label: &str, ignored: &[String]) -> TransientNotice {
+/// Says what deleting a merged worktree would discard. A few ignored files are
+/// named inline; when more remain, the details list a bounded number of them.
+fn merged_worktree_notice(
+    label: &str,
+    ignored: Option<&[String]>,
+    uncommitted: bool,
+) -> TransientNotice {
     const INLINE: usize = 3;
-    if ignored.is_empty() {
+    const DETAILED: usize = 50;
+    let Some(files) = ignored else {
+        let changes = if uncommitted {
+            ", and it has uncommitted changes"
+        } else {
+            ""
+        };
         return TransientNotice::warning(format!(
-            "{label} is merged. Its worktree was kept; choose Delete worktree when you no longer need it."
+            "{label} is merged. Its ignored files could not be checked{changes}; review the worktree before deleting it."
+        ));
+    };
+    if files.is_empty() && !uncommitted {
+        return TransientNotice::warning(format!(
+            "{label} is merged. You can delete its worktree from its menu in Projects when you no longer need it."
         ));
     }
-    let names = ignored[..ignored.len().min(INLINE)].join(", ");
-    let message = |names: &str| {
-        format!(
-            "{label} is merged. Its worktree was kept because it holds ignored files: {names}. Deleting it would discard them."
-        )
-    };
-    if ignored.len() <= INLINE {
-        return TransientNotice::warning(message(&names));
+    let mut held = Vec::new();
+    if uncommitted {
+        held.push("uncommitted changes".to_owned());
     }
-    TransientNotice::warning(message(&format!(
-        "{names} and {} more",
-        ignored.len() - INLINE
-    )))
-    .with_details(ignored.join("\n"))
+    if !files.is_empty() {
+        let mut names = files[..files.len().min(INLINE)].join(", ");
+        if files.len() > INLINE {
+            names.push_str(&format!(" and {} more", files.len() - INLINE));
+        }
+        held.push(format!("ignored files ({names})"));
+    }
+    let notice = TransientNotice::warning(format!(
+        "{label} is merged. Its worktree still has {}, which deleting it would discard.",
+        held.join(" and ")
+    ));
+    if files.len() <= INLINE {
+        return notice;
+    }
+    let mut details = files[..files.len().min(DETAILED)].join("\n");
+    if files.len() > DETAILED {
+        details.push_str(&format!("\n… and {} more", files.len() - DETAILED));
+    }
+    notice.with_details(details)
 }
 
 fn launch_task(executable: PathBuf, path: PathBuf, editor: bool) -> Task<Message> {
@@ -2721,21 +2759,37 @@ mod tests {
     }
 
     #[test]
-    fn merged_worktree_kept_notice_lists_overflowing_ignored_files_in_details() {
-        let quiet = merged_worktree_kept_notice("feature", &[]);
-        assert!(quiet.message.contains("choose Delete worktree"));
-        assert_eq!(quiet.details, None);
-
-        let files: Vec<String> = [".env", "a.db", "b.db", "c.db", "d.db"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let notice = merged_worktree_kept_notice("feature", &files);
-        assert!(notice.message.contains(".env, a.db, b.db and 2 more"));
-        assert_eq!(
-            notice.details.as_deref(),
-            Some(".env\na.db\nb.db\nc.db\nd.db")
+    fn merged_worktree_notice_names_what_deletion_would_discard() {
+        let clean = merged_worktree_notice("feature", Some(&[]), false);
+        assert!(
+            clean
+                .message
+                .contains("delete its worktree from its menu in Projects")
         );
+        assert!(!clean.message.contains("kept"));
+        assert_eq!(clean.details, None);
+
+        let dirty = merged_worktree_notice("feature", Some(&[]), true);
+        assert!(
+            dirty
+                .message
+                .contains("still has uncommitted changes, which deleting it")
+        );
+
+        let unknown = merged_worktree_notice("feature", None, true);
+        assert!(unknown.message.contains("could not be checked"));
+        assert!(unknown.message.contains("uncommitted changes"));
+        assert!(!unknown.message.contains("delete its worktree from"));
+
+        let files: Vec<String> = (0..60).map(|index| format!("file-{index}.db")).collect();
+        let many = merged_worktree_notice("feature", Some(&files), true);
+        assert!(many.message.contains(
+            "uncommitted changes and ignored files (file-0.db, file-1.db, file-2.db and 57 more)"
+        ));
+        let details = many.details.unwrap();
+        assert_eq!(details.lines().count(), 51);
+        assert!(details.starts_with("file-0.db\n"));
+        assert!(details.ends_with("file-49.db\n… and 10 more"));
     }
 
     #[test]
@@ -2778,7 +2832,8 @@ mod tests {
                 target: target.clone(),
                 generation: 1,
                 request,
-                ignored: vec![".env".into()],
+                ignored: Some(vec![".env".into()]),
+                uncommitted: false,
             })));
             assert!(app.project_ui.automatic_attempts[&target.worktree.unwrap()].retained);
             assert!(app.project_ui.deletions.is_empty());
@@ -3019,8 +3074,12 @@ mod tests {
                 existence: Existence::Open,
             }]);
         // Exercise the real eligibility path and its synchronous pending
-        // state, without polling the future or contacting gh/the daemon.
+        // state, without polling the future or contacting gh/the daemon. The
+        // worktree being the active workspace must not suppress a notice that
+        // removes nothing.
+        app.active_workspace = Some(linked.path.clone());
         drop(app.cleanup_merged_worktree_task(project, &[(record.clone(), None)], &[pr.clone()]));
+        assert!(app.project_ui.automatic_attempts.contains_key(&linked.id));
         assert!(app.project_ui.deletions.is_empty());
         assert_eq!(row(&app, linked.id).unwrap().deletion, None);
         assert!(!app.project_ui.is_deleting(linked.id));
@@ -3044,7 +3103,8 @@ mod tests {
             target: target.clone(),
             generation,
             request: request.clone(),
-            ignored: Vec::new(),
+            ignored: Some(Vec::new()),
+            uncommitted: false,
         }));
         assert!(!app.project_ui.automatic_attempts[&linked.id].retained);
         assert_eq!(
@@ -3061,14 +3121,15 @@ mod tests {
             target: target.clone(),
             generation,
             request: request.clone(),
-            ignored: vec![".env".into(), "data.db".into()],
+            ignored: Some(vec![".env".into(), "data.db".into()]),
+            uncommitted: false,
         }));
         assert_eq!(row(&app, linked.id).unwrap().path, linked.path);
         assert_eq!(row(&app, linked.id).unwrap().deletion, None);
         assert!(app.project_ui.deletions.is_empty());
         let notice = app.status.as_ref().unwrap();
         assert!(notice.message.contains("is merged"));
-        assert!(notice.message.contains(".env, data.db"));
+        assert!(notice.message.contains("ignored files (.env, data.db)"));
         assert_eq!(notice.details, None);
         let session = app.session.as_ref().unwrap();
         session.flush(Duration::from_secs(5)).unwrap();
@@ -3135,7 +3196,8 @@ mod tests {
             target: other_target,
             generation: other_generation,
             request: other_request,
-            ignored: vec![".env".into(), "data.db".into()],
+            ignored: Some(vec![".env".into(), "data.db".into()]),
+            uncommitted: false,
         }));
         assert!(app.project_ui.deletions.is_empty());
 
@@ -3181,7 +3243,8 @@ mod tests {
                 target: target.clone(),
                 generation,
                 request: request.clone(),
-                ignored: Vec::new(),
+                ignored: Some(Vec::new()),
+                uncommitted: false,
             }));
             assert!(app.project_ui.deletions.is_empty());
             assert_eq!(app.project_ui.automatic_attempts[&linked.id].at, pending_at);
@@ -3196,7 +3259,8 @@ mod tests {
             target: target.clone(),
             generation: fresh_generation,
             request: fresh_request,
-            ignored: vec![".env".into(), "data.db".into()],
+            ignored: Some(vec![".env".into(), "data.db".into()]),
+            uncommitted: false,
         }));
         assert!(app.project_ui.deletions.is_empty());
 
@@ -3221,7 +3285,8 @@ mod tests {
             target,
             generation: queued.generation,
             request: queued.request,
-            ignored: Vec::new(),
+            ignored: Some(Vec::new()),
+            uncommitted: false,
         }));
         assert_eq!(app.project_ui.deletions[&linked.id].started_at, manual_at);
         assert!(app.project_ui.deletions[&linked.id].failure.is_none());

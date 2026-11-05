@@ -413,7 +413,7 @@ fn settings_category_controls<'a>(
             );
             let cleanup = setting_field(
                 "Merged worktrees",
-                "Show a notice when a GitHub worktree's pull request is merged, naming ignored files such as .env that deleting it would discard. Worktrees are never deleted automatically.",
+                "Show a notice when a GitHub worktree's pull request is merged, naming uncommitted changes and ignored files such as .env that deleting it would discard. Worktrees are never deleted automatically.",
                 crate::settings_widgets::toggle(
                     "Notify about merged worktrees",
                     draft.auto_delete_merged_worktrees,

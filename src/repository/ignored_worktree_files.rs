@@ -15,6 +15,14 @@ pub fn default_disposable_ignored_directories() -> Vec<String> {
         ".pytest_cache",
         ".mypy_cache",
         ".ruff_cache",
+        ".tox",
+        ".gradle",
+        ".next",
+        ".nuxt",
+        ".svelte-kit",
+        ".turbo",
+        ".parcel-cache",
+        "coverage",
     ]
     .into_iter()
     .map(str::to_owned)
