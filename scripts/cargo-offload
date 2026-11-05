@@ -231,6 +231,16 @@ def temporary_directory(slot):
     name = os.path.basename(os.path.dirname(slot)) + "-" + os.path.basename(slot).removeprefix("slot-")
     return os.path.join(private, name)
 
+
+def enclosing_checkout(path):
+    """A Git marker above `path`, under which tests that check Git ancestry
+    fail, or None."""
+    while path != os.path.dirname(path):
+        path = os.path.dirname(path)
+        if os.path.lexists(os.path.join(path, ".git")):
+            return os.path.join(path, ".git")
+    return None
+
 if command == "lease":
     slots, key, floor = int(sys.argv[3]), sys.argv[4], int(sys.argv[5]) * 2**30
     profiles = sys.argv[6]
@@ -307,7 +317,7 @@ if command == "lease":
         with open(config + ".new", "w") as file:
             file.write(profiles)
         os.replace(config + ".new", config)
-    say("slot", index, os.path.realpath(slot))
+    say("slot", index, os.path.realpath(slot), enclosing_checkout(temporary_directory(slot)) or "")
     while True:
         time.sleep(3600)
 
@@ -359,16 +369,7 @@ elif command == "run":
     environment["TMPDIR"] = temporary = temporary_directory(base)
     shutil.rmtree(temporary, ignore_errors=True)
     os.makedirs(temporary, mode=0o700)
-    # Tests that look for an enclosing checkout fail under a stray one; say
-    # so rather than move the tests somewhere they would pass.
-    ancestor = temporary
-    while ancestor != os.path.dirname(ancestor):
-        ancestor = os.path.dirname(ancestor)
-        if os.path.lexists(os.path.join(ancestor, ".git")):
-            print(f"cargo-gate: {os.path.join(ancestor, '.git')} on {os.uname().nodename} "
-                  "puts this build's temporary files inside a Git checkout",
-                  file=sys.stderr, flush=True)
-            break
+
     # build.rs asks Git for the version stamp only when it is not given; the
     # slot is not a repository, and whatever encloses it is not this one.
     environment["GIT_CEILING_DIRECTORIES"] = os.path.dirname(base)
@@ -577,6 +578,16 @@ class Offload:
                 pass
             return self.fall_back(f"{self.host} is unreachable")
         slot = words[2]
+        marker = words[3] if len(words) > 3 else None
+        if marker and subcommand == "test":
+            # Tests that check Git ancestry would fail there for a reason
+            # that is not theirs; the slot is released before building here.
+            lease.stdin.close()
+            try:
+                lease.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                lease.kill()
+            return self.fall_back(f"{marker} on {self.host} would put the tests inside a Git checkout")
         try:
             return self.build(subcommand, slot, top, workspace, cwd, metadata)
         finally:

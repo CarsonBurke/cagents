@@ -8,6 +8,7 @@ in a temporary directory. Cargo builds only a tiny private crate.
 
 import importlib.machinery
 import importlib.util
+import ast
 import fcntl
 import json
 import os
@@ -133,6 +134,25 @@ class RemoteCommand(unittest.TestCase):
                     self.assertEqual(result.stdout.strip(), repr(arguments))
 
 
+class EnclosingCheckout(unittest.TestCase):
+    def test_a_git_marker_in_any_ancestor_is_found(self):
+        tree = ast.parse(offload.REMOTE_AGENT)
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.FunctionDef) and node.name == "enclosing_checkout")
+        scope = {"os": os}
+        exec(compile(ast.Module([function], []), "agent", "exec"), scope)
+        with tempfile.TemporaryDirectory() as root:
+            deep = Path(root, "a", "b", "c")
+            deep.mkdir(parents=True)
+            self.assertIsNone(scope["enclosing_checkout"](str(deep)))
+            Path(root, "a", ".git").mkdir()
+            self.assertEqual(scope["enclosing_checkout"](str(deep)), str(Path(root, "a", ".git")))
+            # The directory itself is not its own ancestor.
+            Path(root, "a", ".git").rmdir()
+            Path(deep, ".git").write_text("gitdir: x")
+            self.assertIsNone(scope["enclosing_checkout"](str(deep)))
+
+
 class Settings(unittest.TestCase):
     def test_only_build_affecting_settings_without_local_paths_are_forwarded(self):
         environment = {
@@ -191,6 +211,14 @@ done
 [ "$1" != unreachable ] || exit 255
 [ "$1" != silent ] || exec sleep 600
 [ "$1" != broken ] || exit 1
+if [ "$1" = marked ] && case $2 in rsync) false ;; esac; then
+    # A host with a stray Git marker above its temporary directory.
+    shift
+    cd "$HOME"
+    env -i HOME="$HOME" PATH="$PATH" CARGO_HOME="$CARGO_HOME" \
+        RUSTUP_HOME="$RUSTUP_HOME" sh -c "$*" | sed -u 's|^slot [0-9]* [^ ]*|& /stray/.git|'
+    exit
+fi
 shift
 cd "$HOME"
 # Like sshd, start from a clean environment: nothing of this one reaches the
@@ -351,6 +379,17 @@ class StandInHost(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("building here: broken could not lease a build slot (status 1)\n", result.stderr)
         self.assertFalse((self.root / "runtime/cagents-offload/broken.unreachable").exists())
+
+    def test_tests_build_here_under_a_stray_git_marker_and_other_commands_do_not(self):
+        env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "marked"}
+        result = self.gate_run("test", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("building here: /stray/.git on marked would put the tests inside a Git checkout\n",
+                      result.stderr)
+        self.assertTrue((self.root / "local-build").exists())
+        result = self.gate_run("check", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("building here", result.stderr)
 
     def test_local_builds_here_silently(self):
         env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "local"}
