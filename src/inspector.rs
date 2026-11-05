@@ -2396,6 +2396,39 @@ mod tests {
             _viewport: &Rectangle,
         ) {
         }
+        fn update(
+            &mut self,
+            _tree: &mut Tree,
+            event: &Event,
+            _layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            _renderer: &Renderer,
+            _clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, &'static str>,
+            _viewport: &Rectangle,
+        ) {
+            if matches!(
+                event,
+                Event::Window(cosmic::iced::window::Event::RedrawRequested(_))
+            ) {
+                assert_eq!(cursor, mouse::Cursor::Unavailable);
+                shell.publish("background rendering completion");
+                shell.invalidate_layout();
+                shell.invalidate_widgets();
+                shell.request_redraw();
+                // A focused obscured editor can request IME during redraw.
+                // Its rendering must progress without taking modal input.
+                let input_method: cosmic::iced::InputMethod = cosmic::iced::InputMethod::Enabled {
+                    cursor: Rectangle::with_size(Size::UNIT),
+                    purpose: cosmic::iced::input_method::Purpose::Normal,
+                    preedit: None,
+                };
+                shell.request_input_method(&input_method);
+                shell.capture_event();
+            } else {
+                shell.publish("background took input");
+            }
+        }
         fn overlay<'a>(
             &'a mut self,
             _tree: &'a mut Tree,
@@ -2487,6 +2520,82 @@ mod tests {
             messages.is_empty(),
             "the obscured background must not answer input aimed at the modal"
         );
+    }
+
+    #[test]
+    fn modal_overlay_keeps_background_rendering_live_without_input_or_ime() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut element: Element<'_, &'static str> = ModalOverlay::new(
+            Element::new(Talkative),
+            widget::container(cosmic::iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .into();
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let redraw = Event::Window(cosmic::iced::window::Event::RedrawRequested(
+            cosmic::iced::time::Instant::now(),
+        ));
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            &redraw,
+            Layout::new(&node),
+            mouse::Cursor::Available(cosmic::iced::Point::new(8.0, 8.0)),
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &viewport,
+        );
+        assert!(shell.is_layout_invalid());
+        assert!(shell.are_widgets_invalid());
+        assert_eq!(
+            shell.redraw_request(),
+            cosmic::iced::window::RedrawRequest::NextFrame
+        );
+        assert!(!shell.is_event_captured());
+        assert_eq!(shell.input_method(), &cosmic::iced::InputMethod::Disabled);
+        drop(shell);
+        assert_eq!(messages, ["background rendering completion"]);
+
+        for event in [
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Event::Keyboard(cosmic::iced::keyboard::Event::ModifiersChanged(
+                cosmic::iced::keyboard::Modifiers::CTRL,
+            )),
+            Event::Window(cosmic::iced::window::Event::Resized(viewport.size())),
+            Event::Window(cosmic::iced::window::Event::Focused),
+        ] {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(cosmic::iced::Point::new(8.0, 8.0)),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            assert!(messages.is_empty(), "background received {event:?}");
+        }
     }
 
     fn source_context() -> RepositoryInspectorContext {

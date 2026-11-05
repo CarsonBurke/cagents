@@ -1,5 +1,8 @@
 // These regressions cross the real app reducers with resident ClientHandle
-// publications. All returned tasks are dropped: no daemon or provider runs.
+// publications. Reducer-only tests below drop returned tasks; the full-widget
+// regressions complete shaping tasks. No daemon or provider runs.
+
+include!("inspector_widget_tests.rs");
 
 fn inspector_paint_app() -> Cagents {
     let mut app = crate::app::tests::context_inspector_test_app(false);

@@ -286,6 +286,33 @@ impl Memory {
             .map(|context| context.rows.len())
             .sum()
     }
+
+    /// Observe geometry produced by the real transcript layout, including
+    /// while the modal Inspector intentionally withholds widget operations.
+    #[cfg(test)]
+    pub(super) fn inspector_fixture_geometry(
+        &self,
+        subagent: Option<&str>,
+    ) -> Option<(Scroll, Size, Vec<(String, Rectangle)>)> {
+        let anchor = self.0.borrow();
+        let context = anchor
+            .contexts
+            .iter()
+            .find(|context| context.subagent.as_deref() == subagent)?;
+        Some((
+            Scroll::new(
+                context.top?,
+                context.geometry?.content.height,
+                context.geometry?.viewport.height,
+            ),
+            context.geometry?.viewport,
+            context
+                .rows
+                .iter()
+                .map(|row| (row.id.clone(), row.bounds))
+                .collect(),
+        ))
+    }
 }
 
 pub(super) fn transcript_observed<'a>(
