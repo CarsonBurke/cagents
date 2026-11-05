@@ -422,7 +422,8 @@ bounds the wait for a slot on the host as it does one here; the build there
 has no timeout.
 
 The command runs here instead, after one line saying why, when the host is
-unreachable (it is not tried again for a minute), has less than
+unreachable (it is not tried again for a minute), does not answer within
+`CAGENTS_BUILD_REMOTE_ANSWER_SECONDS` (default 30), has less than
 `CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB` free (default 40; it first discards the
 leased slot's own build output), or the command's inputs or results are on
 this host: `run`, `bench`, `test --no-run`, `doc --open`, `doc --target`,
@@ -440,8 +441,9 @@ credentials (containing `TOKEN`, `KEY`, `SECRET`, `PASS`, `AUTH`,
 `CREDENTIAL` or `COOKIE`). They travel on the connection's standard input,
 not its command line. This user's Cargo `[profile]` settings are applied
 there; its build settings, such as `jobs` and `build-dir`, describe this host
-and are not. Each slot's commands get a private `TMPDIR` in the slot, emptied before the
-next command there. Cargo's registry and Git caches and the toolchain on the
+and are not. Each slot's commands get a private `TMPDIR` on the host's disk,
+`/var/tmp/cagents-offload-<uid>/<repository>-<N>`, short enough for the Unix
+sockets tests bind under it and emptied before the next command there. Cargo's registry and Git caches and the toolchain on the
 host are shared with anything else built there; Cargo locks its caches itself.
 
 ### Compilation jobs and shared build directories

@@ -189,6 +189,8 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 [ "$1" != unreachable ] || exit 255
+[ "$1" != silent ] || exec sleep 600
+[ "$1" != broken ] || exit 1
 shift
 cd "$HOME"
 # Like sshd, start from a clean environment: nothing of this one reaches the
@@ -298,14 +300,16 @@ class StandInHost(unittest.TestCase):
         self.assertTrue((slot / "target").is_dir())
 
     def test_temporary_files_go_in_the_slot_and_do_not_outlive_the_next_command(self):
-        tmp = self.host_home / ".cache/cagents-offload/crate/slot-0/tmp"
-        (self.crate / "build.rs").write_text(textwrap.dedent("""
-            fn main() {
+        # Short enough for the Unix sockets tests bind under it, and on disk.
+        tmp = Path(f"/var/tmp/cagents-offload-{os.getuid()}/crate-0")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (self.crate / "build.rs").write_text(textwrap.dedent(f"""
+            fn main() {{
                 let dir = std::env::temp_dir();
-                assert!(dir.ends_with("slot-0/tmp"), "{}", dir.display());
+                assert_eq!(dir, std::path::Path::new({json.dumps(str(tmp))}));
                 std::fs::write(dir.join("left-behind"), "").unwrap();
                 println!("cargo:rerun-if-changed=build.rs");
-            }
+            }}
         """))
         env = self.remote_env()
         result = self.gate_run("check", env=env)
@@ -332,6 +336,21 @@ class StandInHost(unittest.TestCase):
         result = self.gate_run("check", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stderr, r"building here: unreachable is unreachable \(tried \d+s ago\)")
+
+    def test_a_host_that_does_not_answer_builds_here_and_is_tried_again(self):
+        env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "silent",
+                                   "CAGENTS_BUILD_REMOTE_ANSWER_SECONDS": "1"}
+        result = self.gate_run("check", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("building here: silent did not answer within 1s\n", result.stderr)
+        self.assertFalse((self.root / "runtime/cagents-offload/silent.unreachable").exists())
+
+    def test_a_lease_that_fails_on_the_host_does_not_mark_it_unreachable(self):
+        env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "broken"}
+        result = self.gate_run("check", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("building here: broken could not lease a build slot (status 1)\n", result.stderr)
+        self.assertFalse((self.root / "runtime/cagents-offload/broken.unreachable").exists())
 
     def test_local_builds_here_silently(self):
         env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "local"}
@@ -432,6 +451,23 @@ class RemoteRun(unittest.TestCase):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     lease.wait(timeout=1)
             self.assertEqual(lease.wait(timeout=10), 0)
+
+    def test_pruning_waits_for_the_slots_command_to_end(self):
+        with tempfile.TemporaryDirectory() as base:
+            Path(base, "src").mkdir()
+            stale = Path(base, "src", "stale.rs")
+            stale.write_text("")
+            with open(Path(base, "running"), "a") as running:
+                fcntl.flock(running, fcntl.LOCK_EX)
+                prune = subprocess.Popen(["python3", "-c", offload.REMOTE_AGENT, "prune", base],
+                                         stdin=subprocess.PIPE)
+                self.addCleanup(prune.kill)
+                prune.stdin.close()
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    prune.wait(timeout=1)
+                self.assertTrue(stale.exists())
+            self.assertEqual(prune.wait(timeout=10), 0)
+            self.assertFalse(stale.exists())
 
     def test_closing_the_connection_ends_the_command_and_its_children(self):
         with tempfile.TemporaryDirectory() as base:

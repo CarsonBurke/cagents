@@ -197,7 +197,7 @@ def profile_config(path):
 # command ends with what it started when its standard input closes: the
 # connection to this host dropped or the gate here was cancelled.
 REMOTE_AGENT = r'''
-import fcntl, json, os, shutil, signal, subprocess, sys, threading, time
+import fcntl, json, os, shutil, signal, stat, subprocess, sys, threading, time
 command, base = sys.argv[1], os.path.expanduser(sys.argv[2])
 
 def until_closed(then):
@@ -212,6 +212,22 @@ def until_closed(then):
 
 def say(*words):
     print(*words, flush=True)
+
+def temporary_directory(slot):
+    """A short private directory for the slot's temporary files, or one in
+    the slot when another user holds the short one's name."""
+    private = f"/var/tmp/cagents-offload-{os.getuid()}"
+    try:
+        os.mkdir(private, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return os.path.join(slot, "tmp")
+    status = os.lstat(private)
+    if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid() or status.st_mode & 0o077:
+        return os.path.join(slot, "tmp")
+    name = os.path.basename(os.path.dirname(slot)) + "-" + os.path.basename(slot).removeprefix("slot-")
+    return os.path.join(private, name)
 
 if command == "lease":
     slots, key, floor = int(sys.argv[3]), sys.argv[4], int(sys.argv[5]) * 2**30
@@ -298,6 +314,10 @@ elif command == "prune":
     # input, keeping Cargo's target directory.
     source = os.path.join(base, "src")
     keep = set(filter(None, sys.stdin.buffer.read().split(b"\0")))
+    # A cancelled build's lease is released only after this ends, as after a
+    # command, so the next build's copy cannot lose files to this walk.
+    running = open(os.path.join(base, "running"), "a")
+    fcntl.flock(running, fcntl.LOCK_EX)
     keep_dirs = {b"."}
     for path in keep:
         parts = path.split(b"/")
@@ -329,13 +349,14 @@ elif command == "run":
     fcntl.flock(running, fcntl.LOCK_EX)
     os.chdir(os.path.join(base, "src", directory))
     environment = dict(os.environ, **environment)
-    # Temporary files go in the slot, on its disk, rather than in the host's
-    # /tmp, which may be memory and which others use. The slot runs one
-    # command at a time, so whatever the last one left there is stale.
-    temporary = os.path.join(base, "tmp")
+    # Temporary files go on disk in a directory of this slot's own, rather
+    # than in the host's /tmp, which may be memory and which others use. The
+    # path stays short: tests bind Unix sockets under it, whose paths are
+    # limited to 108 bytes. The slot runs one command at a time, so whatever
+    # the last one left there is stale.
+    environment["TMPDIR"] = temporary = temporary_directory(base)
     shutil.rmtree(temporary, ignore_errors=True)
     os.makedirs(temporary, mode=0o700)
-    environment["TMPDIR"] = temporary
     # build.rs asks Git for the version stamp only when it is not given; the
     # slot is not a repository, and whatever encloses it is not this one.
     environment["GIT_CEILING_DIRECTORIES"] = os.path.dirname(base)
@@ -401,6 +422,7 @@ class Offload:
         self.slots = positive(environment, "CAGENTS_BUILD_REMOTE_SLOTS", 3)
         self.jobs = positive(environment, "CAGENTS_BUILD_REMOTE_JOBS", 6)
         self.floor = positive(environment, "CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB", 40)
+        self.answer = positive(environment, "CAGENTS_BUILD_REMOTE_ANSWER_SECONDS", 30)
         # Each step connects on its own: a connection takes about 0.2 s, and
         # a shared master would be one more process whose end, as when a
         # cancelled gate drains its descendants, cuts every build using it.
@@ -429,13 +451,15 @@ class Offload:
     def cancel(self, number, _frame):
         """Ends what this build started. The remote command ends through its
         connection, so this waits for it to end there; the lease outlives it
-        and ends after it."""
+        and ends after it. A second signal stops waiting for a connection
+        that may be dead; the host still ends the command when it notices."""
+        again = bool(self.cancelled)
         if not self.cancelled:
             self.cancelled = number
         for child in self.children:
             if child.poll() is not None or (child is self.lease and self.command is not None):
                 continue
-            if child is self.command:
+            if child is self.command and not again:
                 try:
                     child.stdin.close()
                 except (OSError, ValueError):
@@ -493,32 +517,47 @@ class Offload:
         # The gate's admission budget covers the wait for a slot on the build
         # host, as it does one here, but not the build.
         deadline = admission_deadline(self.environment)
-        def within(limit):
-            if deadline is None:
-                return limit
-            left = max(0.0, (deadline - time.monotonic_ns()) / 1e9)
-            return left if limit is None else min(limit, left)
         lines = Lines(lease.stdout)
+        def next_line(limit):
+            left = None if deadline is None else max(0.0, (deadline - time.monotonic_ns()) / 1e9)
+            if left is not None and (limit is None or left <= limit):
+                try:
+                    return lines.next(left)
+                except TimeoutError:
+                    raise AdmissionExpired from None
+            return lines.next(limit)
         try:
-            line = lines.next(within(30))
+            line = next_line(self.answer)
             if line == "wait":
                 say(f"waiting for one of {self.slots} build slots on {self.host}")
                 while line == "wait":
-                    line = lines.next(within(None))
+                    line = next_line(None)
+        except AdmissionExpired:
+            lease.kill()
+            say("build admission timed out")
+            return 124
         except TimeoutError:
-            line = None
-            if deadline is not None and time.monotonic_ns() >= deadline:
-                lease.kill()
-                say("build admission timed out")
-                return 124
+            # Connected or not, a host this slow is not one to wait for now;
+            # it is not marked unreachable for other builds.
+            lease.kill()
+            return self.fall_back(f"{self.host} did not answer within {self.answer}s")
         if self.cancelled:
             return 128 + self.cancelled
         words = (line or "").split()
         if not words or words[0] != "slot":
-            lease.kill()
             if words[:1] == ["refuse"]:
+                lease.kill()
                 return self.fall_back(
                     f"{self.host} has {words[1]} GiB free, below its {words[2]} GiB floor")
+            try:
+                status = lease.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                lease.kill()
+                status = lease.wait()
+            if status != 255:
+                return self.fall_back(f"{self.host} could not lease a build slot (status {status})")
+            # ssh's own failure: no connection. Other builds skip the host
+            # for a while instead of each waiting for the connection timeout.
             try:
                 self.unreachable.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 self.unreachable.touch()
@@ -639,6 +678,10 @@ def positive(environment, name, default):
         say(f"{name} must be a positive integer")
         sys.exit(2)
     return int(value)
+
+
+class AdmissionExpired(Exception):
+    """The gate's admission budget ran out before a slot was leased."""
 
 
 class Lines:
