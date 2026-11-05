@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 pub(crate) mod accessibility_probe;
+pub(crate) mod accessible_bounds;
 pub mod button;
 mod display;
 mod editable;
