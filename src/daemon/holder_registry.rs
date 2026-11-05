@@ -506,24 +506,27 @@ pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
     Ok(records)
 }
 
-/// Whether a running process holds a record for this terminal, for a caller
+/// The running process that holds a record for this terminal, for a caller
 /// that holds no authority over the registry. Unlike discovery this creates and
 /// removes nothing. Holders don't carry the terminal's environment markers, so
 /// this record is the only evidence of one. Any live record counts: a holder of
 /// another version, application or kind can't be adopted, but it is still alive.
 /// A record that can't be read is an error, not an absence.
 #[cfg(feature = "ui")]
-pub(crate) fn holds_terminal(terminal: TerminalId, kind: Kind) -> io::Result<bool> {
+pub(crate) fn holding_process(terminal: TerminalId, kind: Kind) -> io::Result<Option<i32>> {
     let directory = directory(kind).map_err(io::Error::other)?;
     crate::secure_file::reject_symlink_components(&directory)?;
-    holds_terminal_in(&directory, terminal)
+    holding_process_in(&directory, terminal)
 }
 
 #[cfg(feature = "ui")]
-fn holds_terminal_in(directory: &Path, terminal: TerminalId) -> io::Result<bool> {
+fn holding_process_in(directory: &Path, terminal: TerminalId) -> io::Result<Option<i32>> {
     match read(&socket(directory, terminal).with_extension("json")) {
-        Ok(record) => Ok(record.holder.is_current() || record.root.is_current()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Ok(record) => Ok([record.holder, record.root]
+            .into_iter()
+            .find(Process::is_current)
+            .map(|process| process.pid)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -821,21 +824,29 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("holders");
         let unknown = TerminalId::new();
-        assert!(!holds_terminal_in(&directory, unknown).unwrap());
+        assert!(holding_process_in(&directory, unknown).unwrap().is_none());
         assert!(!directory.exists(), "a read must not create the registry");
 
         crate::secure_file::prepare_private_directory(&directory).unwrap();
         let live = record();
         live.create(&directory).unwrap();
-        assert!(holds_terminal_in(&directory, live.terminal).unwrap());
-        assert!(!holds_terminal_in(&directory, unknown).unwrap());
+        assert!(
+            holding_process_in(&directory, live.terminal)
+                .unwrap()
+                .is_some()
+        );
+        assert!(holding_process_in(&directory, unknown).unwrap().is_none());
 
         // Discovery prunes a dead holder's record. This caller has no such authority.
         let mut dead = record();
         dead.holder.start += 1;
         dead.root.start += 1;
         dead.create(&directory).unwrap();
-        assert!(!holds_terminal_in(&directory, dead.terminal).unwrap());
+        assert!(
+            holding_process_in(&directory, dead.terminal)
+                .unwrap()
+                .is_none()
+        );
         assert!(dead.path(&directory).exists());
 
         let unreadable = TerminalId::new();
@@ -844,7 +855,7 @@ mod tests {
             "not a record",
         )
         .unwrap();
-        assert!(holds_terminal_in(&directory, unreadable).is_err());
+        assert!(holding_process_in(&directory, unreadable).is_err());
     }
 
     /// Adoption can turn these down; none of them makes the holder less alive.
@@ -864,7 +875,11 @@ mod tests {
             let mut record = record();
             change(&mut record);
             record.create(&directory).unwrap();
-            assert!(holds_terminal_in(&directory, record.terminal).unwrap());
+            assert!(
+                holding_process_in(&directory, record.terminal)
+                    .unwrap()
+                    .is_some()
+            );
 
             // The same record with its holder gone is no longer evidence of one.
             let mut gone = record.clone();
@@ -872,14 +887,21 @@ mod tests {
             gone.holder.start += 1;
             gone.root.start += 1;
             gone.create(&directory).unwrap();
-            assert!(!holds_terminal_in(&directory, gone.terminal).unwrap());
+            assert!(
+                holding_process_in(&directory, gone.terminal)
+                    .unwrap()
+                    .is_none()
+            );
         }
 
         // Its terminal's root process outlived the holder.
         let mut orphaned = record();
         orphaned.holder.start += 1;
         orphaned.create(&directory).unwrap();
-        assert!(holds_terminal_in(&directory, orphaned.terminal).unwrap());
+        assert_eq!(
+            holding_process_in(&directory, orphaned.terminal).unwrap(),
+            Some(orphaned.root.pid)
+        );
     }
 
     fn endpoint_with_byte_length(root: &Path, length: usize) -> PathBuf {

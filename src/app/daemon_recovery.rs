@@ -61,7 +61,14 @@ pub(super) fn reconcile(
     }
     let socket = ensure_daemon_ready().map_err(|error| error.to_string())?;
     let id = session.id;
-    reconcile_at(session, explicit_retry, &socket, Path::new("/proc")).inspect_err(|error| {
+    reconcile_with(
+        session,
+        explicit_retry,
+        &socket,
+        Path::new("/proc"),
+        registered_holder,
+    )
+    .inspect_err(|error| {
         tracing::warn!(terminal = %id, explicit_retry, %error, "terminal recovery refused");
     })
 }
@@ -72,14 +79,21 @@ pub(super) fn inspect_saved_at(
     session: TerminalSession,
     socket: &Path,
 ) -> Result<RecoveredTerminal, String> {
-    reconcile_at(session, false, socket, Path::new("/proc"))
+    reconcile_with(
+        session,
+        false,
+        socket,
+        Path::new("/proc"),
+        registered_holder,
+    )
 }
 
-fn reconcile_at(
+fn reconcile_with(
     session: TerminalSession,
     explicit_retry: bool,
     socket: &Path,
     proc_root: &Path,
+    holder: impl Fn(crate::model::TerminalId) -> Result<Option<i32>, String>,
 ) -> Result<RecoveredTerminal, String> {
     let expected = session
         .continuity
@@ -249,6 +263,17 @@ fn reconcile_at(
     {
         return Err("the saved agent conversation is already hosted by another terminal; preserving the live session".into());
     }
+    // A holder doesn't carry the terminal's markers, so the scan below can't see
+    // one, and nothing the daemon lists accounts for it.
+    for terminal in [session.id, replacement_id] {
+        if let Some(pid) = holder(terminal)
+            .map_err(|error| format!("cannot check for a process behind this terminal: {error}"))?
+        {
+            return Err(format!(
+                "Process {pid} may still be running this terminal, but the daemon isn't showing it. Starting the terminal again would run a second copy, so nothing was started."
+            ));
+        }
+    }
     ensure_no_surviving_process(&session, owner, proc_root)?;
     // Recheck the lease after process inspection. If discovery raced replacement,
     // do not authorize a launch against either incarnation.
@@ -310,7 +335,6 @@ pub(super) fn prove_not_hosted(session: &TerminalSession) -> Result<(), String> 
 const UNREACHABLE: &str = "Cagents can't reach its daemon, so this terminal may still be running. The pane was kept. Close it again once the daemon is back.";
 const STILL_HOSTED: &str = "The daemon still has this terminal, so the pane was kept. Use Retry or Reconnect on the pane to use it.";
 const CONTINUED: &str = "A running terminal continues this one, so the pane was kept. Use Retry or Reconnect on the pane if it offers them, or stop that terminal and close the pane again.";
-const UNADOPTED: &str = "This terminal may still be running: a process behind it is alive but the daemon isn't showing it. The pane was kept. Use Retry or Reconnect on the pane if it offers them. Otherwise leave the pane in place.";
 /// Retry holds the lease through attachment, so waiting longer than this would
 /// leave the pane looking unresponsive to a click on Close.
 const LEASE_WAIT: Duration = if cfg!(test) {
@@ -320,21 +344,28 @@ const LEASE_WAIT: Duration = if cfg!(test) {
 };
 
 /// A holder that this daemon didn't adopt is alive, and unlisted, by design.
-fn registered_holder(terminal: crate::model::TerminalId) -> Result<bool, String> {
-    use crate::daemon::holder_registry::{Kind, holds_terminal};
+fn registered_holder(terminal: crate::model::TerminalId) -> Result<Option<i32>, String> {
+    use crate::daemon::holder_registry::{Kind, holding_process};
     for kind in [Kind::Terminal, Kind::Native] {
-        if holds_terminal(terminal, kind).map_err(|error| error.to_string())? {
-            return Ok(true);
+        if let Some(pid) = holding_process(terminal, kind).map_err(|error| error.to_string())? {
+            return Ok(Some(pid));
         }
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// Retry refuses too, so it isn't a way out of this one.
+fn unadopted_refusal(pid: i32) -> String {
+    format!(
+        "This terminal may still be running in process {pid}, which the daemon isn't showing, so the pane was kept. Retry can't reach that process. If you no longer need what it was running, stop it, then close the pane again. Otherwise leave the pane in place."
+    )
 }
 
 fn prove_not_hosted_at(
     session: &TerminalSession,
     socket: &Path,
     proc_root: &Path,
-    holder: impl FnOnce(crate::model::TerminalId) -> Result<bool, String>,
+    holder: impl FnOnce(crate::model::TerminalId) -> Result<Option<i32>, String>,
 ) -> Result<(), String> {
     session
         .continuity
@@ -404,11 +435,11 @@ fn prove_not_hosted_at(
     let cannot_confirm = || {
         "Cagents can't confirm this terminal has stopped, so the pane was kept. Try Close again in a moment. If this keeps happening, leave the pane in place.".to_owned()
     };
-    if holder(session.id).map_err(|error| {
+    if let Some(pid) = holder(session.id).map_err(|error| {
         tracing::warn!(%error, terminal = %session.id, "could not read the holder record for Close");
         cannot_confirm()
     })? {
-        return Err(UNADOPTED.into());
+        return Err(unadopted_refusal(pid));
     }
     // Check even when the saved boot is over. No process outlives its boot, but
     // a replacement started on this one carries the saved terminal's lineage
@@ -1034,6 +1065,39 @@ mod tests {
         assert_eq!(recovered.expected_host, Some(replacement_proof));
     }
 
+    /// Close points away from Retry here because Retry would start a second
+    /// copy beside the process it can't see.
+    #[test]
+    fn retry_starts_nothing_beside_a_live_holder() {
+        // The last is a replacement whose spawn reply was lost, with a holder of
+        // its own.
+        let cases: [fn(bool) -> Result<Option<i32>, String>; 3] = [
+            |original| Ok(original.then_some(4242)),
+            |original| {
+                if original {
+                    Err("the record can't be read".to_owned())
+                } else {
+                    Ok(None)
+                }
+            },
+            |original| Ok((!original).then_some(4242)),
+        ];
+        for holder in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let original = session(directory.path(), &proof("old"));
+            let id = original.id;
+            let replacement_proof = proof("replacement");
+            let _lease = lease(directory.path(), &replacement_proof);
+            let server = discovery(&socket, replacement_proof, Vec::new(), 1);
+            let result = reconcile_with(original, true, &socket, directory.path(), |terminal| {
+                holder(terminal == id)
+            });
+            server.join().unwrap();
+            assert!(result.is_err());
+        }
+    }
+
     #[test]
     fn explicit_retry_does_not_override_missing_daemon_ownership() {
         let directory = tempfile::tempdir().unwrap();
@@ -1340,8 +1404,17 @@ mod tests {
         })
     }
 
-    fn no_holder(_: crate::model::TerminalId) -> Result<bool, String> {
-        Ok(false)
+    fn no_holder(_: crate::model::TerminalId) -> Result<Option<i32>, String> {
+        Ok(None)
+    }
+
+    fn reconcile_at(
+        session: TerminalSession,
+        explicit_retry: bool,
+        socket: &Path,
+        proc_root: &Path,
+    ) -> Result<RecoveredTerminal, String> {
+        reconcile_with(session, explicit_retry, socket, proc_root, no_holder)
     }
 
     fn other_boot(incarnation: &str) -> HostSessionProof {
@@ -1573,11 +1646,11 @@ mod tests {
         let server = inventory(&socket, current, served);
         let refusal = prove_not_hosted_at(&saved, &socket, directory.path(), |terminal| {
             assert_eq!(terminal, id);
-            Ok(true)
+            Ok(Some(4242))
         })
         .unwrap_err();
         server.join().unwrap();
-        assert_eq!(refusal, UNADOPTED);
+        assert_eq!(refusal, unadopted_refusal(4242));
 
         // Unreadable holder evidence is unknown, not absent.
         let socket = directory.path().join("unreadable.sock");
