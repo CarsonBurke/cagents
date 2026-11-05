@@ -868,32 +868,36 @@ fn assert_upgrade_environment(host: &SharedHost, agent: AgentId) {
             "selected {name} must still be compared"
         );
     }
-    let (busy, _) = record.handle.update_activity();
     use crate::update::impact::{Disposition, Policy};
-    for (policy, expected) in [
-        (
-            Policy::WhenIdle,
-            if busy {
-                Disposition::WaitsForIdle
-            } else {
-                Disposition::Resumes
-            },
-        ),
-        (
-            Policy::Interrupt,
-            if busy {
-                Disposition::Interrupted
-            } else {
-                Disposition::Resumes
-            },
-        ),
-    ] {
-        let impact = state.upgrade_impact(policy).unwrap();
-        let impact = impact
-            .sessions
-            .iter()
-            .find(|impact| impact.id == session)
-            .unwrap();
+    // The provider can finish draining between two reads of its activity, so
+    // judge the impact only against activity that held across it.
+    let handle = record.handle.clone();
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    let (busy, impacts) = loop {
+        let (busy, _) = handle.update_activity();
+        let impacts = [Policy::WhenIdle, Policy::Interrupt].map(|policy| {
+            let impact = state.upgrade_impact(policy).unwrap();
+            let impact = impact
+                .sessions
+                .into_iter()
+                .find(|impact| impact.id == session)
+                .unwrap();
+            (policy, impact)
+        });
+        if handle.update_activity().0 == busy {
+            break (busy, impacts);
+        }
+        assert!(
+            Instant::now() < hang_guard,
+            "provider activity never settled"
+        );
+    };
+    for (policy, impact) in impacts {
+        let expected = match (policy, busy) {
+            (_, false) => Disposition::Resumes,
+            (Policy::WhenIdle, true) => Disposition::WaitsForIdle,
+            (Policy::Interrupt, true) => Disposition::Interrupted,
+        };
         assert_eq!(impact.disposition, expected, "{}", impact.reason);
     }
 }
