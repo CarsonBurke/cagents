@@ -1556,6 +1556,10 @@ impl Drop for Inner {
             .get_mut()
             .unwrap_or_else(|p| p.into_inner())
             .take()
+            // The worker's own final notification can release the last
+            // handle, for example when the host retires its record. That
+            // thread is already finishing, and joining itself panics.
+            && worker.thread().id() != thread::current().id()
         {
             let _ = worker.join();
         }
@@ -2079,6 +2083,9 @@ impl Actor {
         self.step(initial)?;
         let mut stdout_eof = false;
         let mut stderr_eof = false;
+        // A provider that exits closes its stdin before its exit is observable.
+        // Keep the write error only as a fallback: the exit explains the failure.
+        let mut stdin_closed: Option<String> = None;
         let mut closing = None;
         let mut partial_started = None;
         let mut interrupt_sent = false;
@@ -2199,8 +2206,9 @@ impl Actor {
                 }
             }
             // A parsing budget can leave complete lines queued even after
-            // the pipe closes. Keep fair poll passes until those drain.
-            if stdout_eof && self.pending.is_empty() && !frames_ready {
+            // the pipe closes. Keep fair poll passes until those drain. Input
+            // the provider stopped reading no longer holds the actor open.
+            if stdout_eof && (self.pending.is_empty() || stdin_closed.is_some()) && !frames_ready {
                 if !self.output.is_empty() {
                     return Err(with_ignored_output(
                         "Provider ended with an incomplete JSON line",
@@ -2221,7 +2229,8 @@ impl Actor {
                                 &last_ignored,
                             ));
                         }
-                        return Ok(());
+                        // A clean exit still lost any input it never read.
+                        return stdin_closed.map_or(Ok(()), Err);
                     }
                     return Err(with_ignored_output(
                         &format!("Provider exited with {status}"),
@@ -2249,7 +2258,9 @@ impl Actor {
                 .write_started
                 .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
             {
-                return Err("Provider stdin stalled for 30 seconds".into());
+                return Err(
+                    stdin_closed.unwrap_or_else(|| "Provider stdin stalled for 30 seconds".into())
+                );
             }
             if self.dirty
                 && self.visible.load(Ordering::Acquire)
@@ -2280,7 +2291,7 @@ impl Actor {
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: if self.pending.is_empty() {
+                    fd: if self.pending.is_empty() || stdin_closed.is_some() {
                         -1
                     } else {
                         stdin.as_raw_fd()
@@ -2333,6 +2344,12 @@ impl Actor {
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        // The provider closed its input, ordinarily by exiting.
+                        // Drain its output to EOF so its exit status, and any
+                        // final frames, explain the failure instead of EPIPE.
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                            stdin_closed = Some(format!("Provider stdin: {e}"));
+                        }
                         Err(e) => return Err(format!("Provider stdin: {e}")),
                     }
                 }
@@ -8161,6 +8178,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn provider_exit_during_a_write_reports_its_exit_status_not_the_broken_pipe() {
+        let directory = tempfile::tempdir().unwrap();
+        let release = directory.path().join("release");
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            // Close stdin before announcing it, so the next host write
+            // always meets EPIPE; exit only after that write is queued.
+            arguments: vec![
+                "-c".into(),
+                format!(
+                    "read -r init; exec 0<&-; printf '%s\\n' '{{\"text\":\"closed\"}}'; \
+                     until [ -e '{}' ]; do sleep 0.01; done; exit 75",
+                    release.display()
+                ),
+            ],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| !snapshot.items.is_empty());
+        handle.command(Command::Refresh).unwrap();
+        std::fs::write(&release, b"").unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        let failure = handle.failure();
+        handle.close().unwrap();
+        assert!(
+            failure
+                .as_deref()
+                .is_some_and(|error| error.contains("Provider exited with exit status: 75")),
+            "{failure:?} {:?}",
+            snapshot.error
+        );
     }
 
     #[test]
