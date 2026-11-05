@@ -702,11 +702,7 @@ impl OutputAdmission {
 pub(super) fn run(target: Target, request: Request) -> Result<Task<Message>, u64> {
     // One shaping job, no waiting worker queue. Deferred live entries become
     // eligible when that job completes; redraw alone cannot create a busy loop.
-    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    let slots = SLOTS
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone();
-    run_with_slots(target, request, slots)
+    run_with_slots(target, request, application_capacity!(1))
 }
 fn run_with_slots(
     target: Target,
