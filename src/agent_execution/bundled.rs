@@ -538,16 +538,19 @@ mod tests {
     #[test]
     fn managed_skills_resolve_relative_system_paths() {
         let directory = crate::test_fixture::tempdir().unwrap();
-        let root = directory.path().join("account");
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let ascents = cwd.ancestors().skip(1).count();
+        // A shallow account would let the relative input's '..' components
+        // clamp at '/', hiding an incorrect resolution against the account.
+        let root = (0..ascents).fold(directory.path().join("account"), |root, _| {
+            root.join("nested")
+        });
         let system = directory.path().join("system");
-        fs::create_dir(&root).unwrap();
+        fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(system.join("skills")).unwrap();
         // Keep the production call relative to the unchanged process cwd while
         // placing every fixture file outside the account home.
-        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
-        let relative_system = cwd
-            .ancestors()
-            .skip(1)
+        let relative_system = (0..ascents)
             .map(|_| "..")
             .collect::<std::path::PathBuf>()
             .join(system.strip_prefix("/").unwrap());
@@ -555,6 +558,14 @@ mod tests {
         assert_eq!(
             relative_system.canonicalize().unwrap(),
             system.canonicalize().unwrap()
+        );
+        assert_eq!(
+            root.join(&relative_system)
+                .canonicalize()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound,
+            "resolving relative to the account must not reach the system fixture"
         );
         share_managed_skills(&root, &relative_system).unwrap();
         assert!(fs::read_link(root.join("skills")).unwrap().is_absolute());
