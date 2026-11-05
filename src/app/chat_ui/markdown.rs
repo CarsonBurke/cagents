@@ -1825,16 +1825,49 @@ fn references(text: &str) -> impl Iterator<Item = (usize, usize, Uri)> + '_ {
         })
 }
 
-/// What a bare reference opens: a web address, or a file at a line.
-///
-/// A file position needs a line and a path that reads as one - a directory
-/// separator or an extension that starts with a letter - so a time such as
-/// `12:30`, a ratio, or `issue:42` stays text.
 /// Domain suffixes that end a host name far more often than a file name.
-const HOST_SUFFIXES: [&str; 10] = [
-    "com", "net", "org", "io", "co", "internal", "local", "lan", "cloud", "svc",
+const HOST_SUFFIXES: [&str; 17] = [
+    "com",
+    "net",
+    "org",
+    "io",
+    "co",
+    "dev",
+    "app",
+    "ai",
+    "edu",
+    "gov",
+    "test",
+    "localhost",
+    "internal",
+    "local",
+    "lan",
+    "cloud",
+    "svc",
 ];
 
+/// File names that are conventionally written without an extension.
+const EXTENSIONLESS_FILES: [&str; 12] = [
+    "Makefile",
+    "GNUmakefile",
+    "makefile",
+    "Dockerfile",
+    "Containerfile",
+    "Justfile",
+    "justfile",
+    "Rakefile",
+    "Gemfile",
+    "Procfile",
+    "Vagrantfile",
+    "Jenkinsfile",
+];
+
+/// What a bare reference opens: a web address, or a file at a line.
+///
+/// A file position needs a line and a file name that reads as one: an
+/// extension that starts with a letter, a dotfile, or a conventional
+/// extensionless name such as `Makefile`. So a time such as `12:30`,
+/// `issue:42`, and an image tag such as `bitnami/redis:7` stay text.
 fn destination(reference: &str) -> Option<Uri> {
     // A code span holding a command (`cargo test src/a.rs:3`) is not a link.
     if reference.is_empty() || reference.contains(char::is_whitespace) {
@@ -1863,11 +1896,11 @@ fn destination(reference: &str) -> Option<Uri> {
         return None;
     }
     let name = path.rsplit('/').next().unwrap_or(path);
-    let extension = name.rsplit_once('.').is_some_and(|(stem, extension)| {
-        !stem.is_empty() && extension.starts_with(|ch: char| ch.is_ascii_alphabetic())
-    });
-    (!path.is_empty() && !path.contains(':') && (path.contains('/') || extension))
-        .then(|| Arc::from(reference))
+    let file = EXTENSIONLESS_FILES.contains(&name)
+        || name.rsplit_once('.').is_some_and(|(_, extension)| {
+            extension.starts_with(|ch: char| ch.is_ascii_alphabetic())
+        });
+    (file && !path.contains(':')).then(|| Arc::from(reference))
 }
 
 #[cfg(test)]
@@ -2036,7 +2069,7 @@ mod tests {
     #[test]
     fn bare_addresses_and_file_positions_are_links() {
         let answer = "See (https://example.com/a_(b)), src/main.rs:42:7. Then \
-            docs/guide.md:9, *lib.rs:3* and <https://kept.example>.";
+            docs/guide.md:9, *lib.rs:3*, docker/Dockerfile:4, .env:2 and <https://kept.example>.";
         let content = Content::parse(answer);
         let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
             list.iter()
@@ -2050,6 +2083,8 @@ mod tests {
                 ("src/main.rs:42:7", "src/main.rs:42:7"),
                 ("docs/guide.md:9", "docs/guide.md:9"),
                 ("lib.rs:3", "lib.rs:3"),
+                ("docker/Dockerfile:4", "docker/Dockerfile:4"),
+                (".env:2", ".env:2"),
                 ("https://kept.example", "https://kept.example"),
             ])
         );
@@ -2059,7 +2094,7 @@ mod tests {
         assert_eq!(
             text.plain().as_ref(),
             "See (https://example.com/a_(b)), src/main.rs:42:7. Then docs/guide.md:9, \
-             lib.rs:3 and https://kept.example."
+             lib.rs:3, docker/Dockerfile:4, .env:2 and https://kept.example."
         );
         // A code span that is exactly a position opens too, still as code.
         let content = Content::parse("Open `src/code.rs:22` or `cargo test src/a.rs:3`.");
@@ -2081,7 +2116,8 @@ mod tests {
         let content = Content::parse(
             "[the docs](https://display.example) at 12:30, issue:42, v1.2:3, \
              ftp://host/x, https:// alone, api.example.com:5432, db.internal:6379, \
-             ghcr.io/org/app:2, docker.io/library/node:20 and std::fmt.",
+             ghcr.io/org/app:2, docker.io/library/node:20, bitnami/redis:7, \
+             app.localhost:3000, api.example.dev:8443, src/bin:3 and std::fmt.",
         );
         assert_eq!(
             links(&content),
