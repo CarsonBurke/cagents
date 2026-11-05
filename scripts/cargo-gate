@@ -168,14 +168,17 @@ if [ -n "${CAGENTS_BUILD_EXEC_SHIMS-}" ]; then
     done
     export PATH
     # The guard against compiling here, below, is for Cargo that bypassed
-    # the shim; this gate's own Cargo gets the wrapper the caller had.
-    if [ "${RUSTC_WRAPPER-}" = "$here/cargo-gate-rustc-guard" ]; then
+    # the shim; this gate's own Cargo gets the wrapper the caller had, from
+    # whichever gate's exec set it.
+    case ${RUSTC_WRAPPER-} in
+    */cargo-gate-rustc-guard)
         if [ -n "${CAGENTS_BUILD_EXEC_RUSTC_WRAPPER-}" ]; then
             RUSTC_WRAPPER=$CAGENTS_BUILD_EXEC_RUSTC_WRAPPER
         else
             unset RUSTC_WRAPPER
         fi
-    fi
+        ;;
+    esac
 fi
 named=false
 case $1 in

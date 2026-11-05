@@ -757,9 +757,11 @@ if command == "lease":
         existing = slot_indices(base)
         # The same build, running: once it ends, this one has nothing left
         # to compile in its slot.
+        def claimed(index):
+            return read_claim(os.path.join(base, f"slot-{index}"))
         same = [index for index in existing
-                if build and read_claim(os.path.join(base, f"slot-{index}")).get("build") == build
-                and owner(index) == key and leased(os.path.join(base, f"slot-{index}"))]
+                if build and claimed(index).get("build") == build
+                and claimed(index).get("key") == key and leased(os.path.join(base, f"slot-{index}"))]
         if same:
             return same, "same"
         indices = existing[:]
@@ -783,7 +785,9 @@ if command == "lease":
             # builds that went on meanwhile.
             queue = join_queue()
             order, why = candidates()
-        for index in order:
+        # A slot is taken only from the head of the queue: one that waited
+        # for the same build, once it ends, gets back in line first.
+        for index in order if why != "same" else ():
             slot = os.path.join(base, f"slot-{index}")
             if not os.path.isdir(slot):
                 os.makedirs(os.path.join(slot, "src"), exist_ok=True)
@@ -814,7 +818,7 @@ if command == "lease":
     # What this build is, at once, so that builds deciding meanwhile price it
     # and do not take it for a build it is not.
     with open(os.path.join(slot, "claim.new"), "w") as file:
-        json.dump({"cost": cost, "pid": None, "build": build}, file)
+        json.dump({"cost": cost, "pid": None, "build": build, "key": key}, file)
     os.replace(os.path.join(slot, "claim.new"), os.path.join(slot, "claim"))
     # At the head of the queue, unless it waited for the same build: the
     # build starts once the memory it is expected to need is free beside the
@@ -957,8 +961,9 @@ elif command == "run":
     # Builds admitted later price this one by what its processes hold.
     cost, _ = claim(base)
     with open(os.path.join(base, "claim.new"), "w") as file:
-        json.dump({"cost": cost, "pid": os.getpid(), "build": read_claim(base).get("build", "")},
-                  file)
+        claimed = read_claim(base)
+        json.dump({"cost": cost, "pid": os.getpid(), "build": claimed.get("build", ""),
+                   "key": claimed.get("key", "")}, file)
     os.replace(os.path.join(base, "claim.new"), os.path.join(base, "claim"))
     os.chdir(os.path.join(base, "src", directory))
     environment = dict(os.environ, **environment)
@@ -1303,18 +1308,21 @@ class Offload:
                     return 128 + self.cancelled, None
                 time.sleep(0.1)
 
-    def build_identity(self):
-        """The Cargo command this is, for a command that only builds there,
-        without what only its tests take; empty for one that also runs tests
-        there, which a request for the same build should not wait out."""
+    def build_identity(self, directory):
+        """The Cargo command this is, run from `directory` of the checkout, for
+        a command that only builds there, without what only its tests take or
+        what only changes how Cargo reports; empty for one that also runs
+        tests there, which a request for the same build should not wait out."""
         if self.plan.subcommand in ("test", "bench") and not self.plan.no_run:
             return ""
         options = [option for option in self.plan.options
                    if option[0] is not None or self.plan.subcommand not in ("test", "bench")]
-        identity = json.dumps([self.plan.toolchain, self.plan.name, options,
+        identity = json.dumps([self.plan.toolchain, self.plan.subcommand, directory, options,
                                sorted((name, value) for name, value
                                       in forwarded_environment(self.environment).items()
-                                      if not name.startswith("CAGENTS_"))])
+                                      if not name.startswith(("CAGENTS_", "CARGO_TERM_"))
+                                      and name not in ("RUST_BACKTRACE", "RUST_LIB_BACKTRACE",
+                                                       "RUST_LOG"))])
         return hashlib.sha256(identity.encode()).hexdigest()[:24]
 
     def try_lease(self, base, top, deadline):
@@ -1324,7 +1332,7 @@ class Offload:
         lease = self.lease = self.spawn(
             self.remote("lease", base, self.slots, f"{os.uname().nodename}:{top}", self.floor,
                         profile_config(os.path.expanduser("~/.cargo/config.toml")), self.cost,
-                        self.build_identity()),
+                        self.build_identity(os.path.relpath(os.path.realpath(os.getcwd()), top))),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
         lines = Lines(lease.stdout)

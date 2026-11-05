@@ -442,11 +442,12 @@ holds another 50 GiB of build output above its floor, beyond the 50 GiB each
 slot made in the last 12 hours is taken to be filling to; how many build at
 once is then down to memory and CPU, below. Unless `CAGENTS_BUILD_REMOTE_JOBS`
 is set, each build gets the host's CPUs divided among the builds leased when
-it starts, as `CARGO_BUILD_JOBS`, between 4 and 8 and at most half the CPUs,
-as builds here get. A request from the same worktree for the same build as
-one building now, a command that runs nothing there, waits for that slot
-rather than build it again in another, outside the queue meanwhile: once it
-ends, little is left to compile. A
+it starts, as `CARGO_BUILD_JOBS`: at least 4, and at most 8 or half the CPUs
+where that is more than 4, as builds here get. A request from the same worktree
+and directory for the same build as one building now, a command that runs
+nothing there, waits for that slot rather than build it again in another,
+outside the queue meanwhile, and then gets back in line: once it ends, little
+is left to compile. A
 build copies the
 checkout's tracked and untracked, not ignored, files into a free slot and
 removes the slot's other files. It prefers the slot this worktree used last,

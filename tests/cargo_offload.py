@@ -107,9 +107,9 @@ class Parsing(unittest.TestCase):
 
 
 class BuildIdentity(unittest.TestCase):
-    def identity(self, *arguments, environment=None):
+    def identity(self, *arguments, environment=None, directory="."):
         return offload.Offload("host", offload.parse(list(arguments)),
-                               environment or {}).build_identity()
+                               environment or {}).build_identity(directory)
 
     def test_a_build_is_the_same_whatever_tests_it_would_pick(self):
         self.assertEqual(self.identity("test", "--no-run", "--lib", "app::"),
@@ -118,6 +118,16 @@ class BuildIdentity(unittest.TestCase):
                             self.identity("test", "--no-run", "--lib", "--features", "ui"))
         self.assertNotEqual(self.identity("check"),
                             self.identity("check", environment={"RUSTFLAGS": "-Dwarnings"}))
+
+    def test_a_build_is_the_same_however_it_is_named_or_reported(self):
+        self.assertEqual(self.identity("b"), self.identity("build"))
+        self.assertEqual(self.identity("check"),
+                         self.identity("check", environment={"CARGO_TERM_COLOR": "always",
+                                                             "RUST_BACKTRACE": "1"}))
+
+    def test_a_build_from_another_directory_of_the_checkout_is_another_build(self):
+        self.assertNotEqual(self.identity("check", directory="crates/a"),
+                            self.identity("check", directory="crates/b"))
 
     def test_a_command_that_runs_tests_there_is_no_build_to_wait_for(self):
         self.assertEqual(self.identity("test", "--lib"), "")
@@ -1314,7 +1324,7 @@ class RemoteRun(unittest.TestCase):
 
     def test_the_same_build_waits_for_its_slot_rather_than_build_again_elsewhere(self):
         with tempfile.TemporaryDirectory() as base:
-            lock = self.hold(base, 0, {"cost": 1, "pid": None, "build": "same"})
+            lock = self.hold(base, 0, {"cost": 1, "pid": None, "build": "same", "key": "key"})
             lease, lines = self.lease(base, build="same")
             self.assertEqual(lines.next(10), "wait same")
             with self.assertRaises(TimeoutError):
@@ -1325,6 +1335,28 @@ class RemoteRun(unittest.TestCase):
             self.assertEqual(json.loads(others.next(10).removeprefix("slot "))["index"], 1)
             fcntl.flock(lock, fcntl.LOCK_UN)
             self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
+
+    def test_a_build_that_waited_for_the_same_one_gets_back_in_line(self):
+        with tempfile.TemporaryDirectory() as base:
+            lock = self.hold(base, 0, {"cost": 1, "pid": None, "build": "same", "key": "key"})
+            waiter, waits = self.lease(base, slots=1, build="same")
+            self.assertEqual(waits.next(10), "wait same")
+            # In line meanwhile, so first to the slot once it frees.
+            other, others = self.lease(base, slots=1, build="other")
+            self.assertEqual(others.next(10), "wait")
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            self.assertEqual(json.loads(others.next(10).removeprefix("slot "))["index"], 0)
+            self.assertEqual(waits.next(10), "wait")
+            with self.assertRaises(TimeoutError):
+                waits.next(1.5)
+            other.stdin.close()
+            self.assertEqual(json.loads(waits.next(10).removeprefix("slot "))["index"], 0)
+
+    def test_the_same_build_from_another_checkout_is_not_waited_for(self):
+        with tempfile.TemporaryDirectory() as base:
+            self.hold(base, 0, {"cost": 1, "pid": None, "build": "same", "key": "elsewhere"})
+            lease, lines = self.lease(base, build="same")
+            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
 
     def run_agent(self, base, command):
         Path(base, "src").mkdir(exist_ok=True)
