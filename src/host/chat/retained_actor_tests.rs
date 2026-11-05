@@ -4537,9 +4537,96 @@ fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
     expected.id = again.id;
     assert_eq!(again, expected, "only the allocation changes");
     let registry = super::super::agent_execution::registry(&successor).unwrap();
-    let registry = registry.lock().unwrap();
-    let lineage = registry.session_lineage(session.id).unwrap();
-    assert!(lineage.is_some());
-    assert_eq!(registry.session_lineage(again.id).unwrap(), lineage);
+    {
+        let registry = registry.lock().unwrap();
+        let lineage = registry.session_lineage(session.id).unwrap();
+        assert!(lineage.is_some());
+        assert_eq!(registry.session_lineage(again.id).unwrap(), lineage);
+    }
     assert!(successor.lock().unwrap().chats.is_empty());
+
+    // One no lineage records resumes as a conversation of its own.
+    let mut unrecorded = session.clone();
+    unrecorded.id = TerminalId::new();
+    let ServerResponse::ChatResumePrepared { session: own } = process_inner(
+        &successor,
+        19,
+        ClientRequest::ChatPrepareResume {
+            source: unrecorded.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("an unrecorded successor resumes on its own");
+    };
+    assert_ne!(own.id, unrecorded.id);
+    let mut expected = unrecorded.clone();
+    expected.id = own.id;
+    assert_eq!(own, expected);
+    assert_eq!(
+        registry.lock().unwrap().session_lineage(own.id).unwrap(),
+        None
+    );
+
+    // While any process runs a conversation, no successor of it is
+    // prepared, whether or not it holds work: that would be a second writer.
+    let fresh = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        root.join("project"),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let running = fresh.id;
+    start_execution(
+        &successor,
+        20,
+        fresh,
+        Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap()),
+    )
+    .unwrap();
+    let live = successor.lock().unwrap().chats[&running].handle.clone();
+    let _live_cleanup = Cleanup(live.actor_identity().unwrap().record.clone());
+    wait_until(
+        || live.attachment_snapshot().ready,
+        "the second conversation never initialized",
+    );
+    live.command(chat::Command::Prompt {
+        text: "A turn that names the running conversation".into(),
+        attachments: Vec::new(),
+        mode: chat::PromptMode::Send,
+    })
+    .unwrap();
+    wait_until(
+        || live.confirmed_session_id().is_some(),
+        "the second conversation never named itself",
+    );
+    let mut second = unrecorded.clone();
+    second.launch.session_id = live.confirmed_session_id();
+    // Also one its lineage records.
+    let mut recorded = session.clone();
+    recorded.launch.session_id = second.launch.session_id.clone();
+    for (client, source) in [(21, second), (22, recorded)] {
+        let refused = process_inner(
+            &successor,
+            client,
+            ClientRequest::ChatPrepareResume { source },
+        )
+        .err()
+        .expect("a running conversation is never prepared again");
+        assert!(
+            refused
+                .message
+                .contains("may still be writing to this Claude conversation"),
+            "{}",
+            refused.message
+        );
+    }
+    assert_eq!(successor.lock().unwrap().chats.len(), 1);
+    // The client that started it closes it.
+    process(
+        &successor,
+        20,
+        ClientRequest::ChatClose { chat_id: running },
+    )
+    .unwrap();
 }

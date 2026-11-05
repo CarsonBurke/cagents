@@ -349,42 +349,52 @@ pub(super) fn inspect_resume_retirement(
     }
 }
 
-/// Whether a prepared resume successor was never started, so a second resume
-/// of it replaces no process and keeps its lineage. Preparation recorded it in
-/// a lineage. Only a start issues an ownership proof, and every Claude start
-/// registers its retained actor before it runs; neither exists for this
-/// allocation, and nothing in this daemon runs, starts or admits it or its
-/// conversation.
-pub(super) fn never_started(host: &SharedHost, source: &Session) -> Result<bool, String> {
+/// A resume successor the daemon prepared but that has no ownership proof yet.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Unstarted {
+    /// Preparation recorded it in a lineage and it never started, so a second
+    /// resume of it replaces no process and keeps that lineage, with the agent
+    /// it was prepared to take over. Only a start issues an ownership proof,
+    /// and every Claude start registers its retained actor before it runs;
+    /// neither exists for this allocation.
+    InLineage,
+    /// No lineage records it here, so it resumes as a conversation of its own.
+    Unrecorded,
+}
+
+const OPEN_ELSEWHERE: &str = "Another pane may still be writing to this Claude conversation, so nothing was started. Close that pane, then resume this conversation again";
+
+/// Whether `source` is a resume successor that never started, and how it
+/// resumes. Nothing in this daemon may run, start or admit its conversation,
+/// and every other registered owner of that conversation must be proved
+/// ended, since a second process on it would be a second writer.
+pub(super) fn unstarted(host: &SharedHost, source: &Session) -> Result<Option<Unstarted>, String> {
     if source.launch.provider != Provider::Claude
         || source.native_continuity != crate::chat::NativeContinuity::ReconnectOnly
         || source.proof.is_some()
         || source.terminal.is_some()
         || source.launch.session_id.is_none()
     {
-        return Ok(false);
+        return Ok(None);
     }
-    let proof = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .proof()
-        .clone();
-    {
+    let proof = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.chats.contains_key(&source.id) || state.chat_handoffs.contains_key(&source.id) {
-            return Ok(false);
+            return Err("This conversation is already open, so nothing was started".into());
         }
-    }
+        // An idle process on the conversation can still write to it.
+        if state.chats.values().any(|record| {
+            let mut launch = record.session.launch.clone();
+            launch.session_id = record.handle.confirmed_session_id();
+            super::same_conversation(&launch, &source.launch)
+                || super::same_conversation(&record.session.launch, &source.launch)
+        }) {
+            return Err(OPEN_ELSEWHERE.into());
+        }
+        state.proof().clone()
+    };
     current_admission(host, source, &proof)?;
     let registry = super::super::agent_execution::registry(host)?;
-    if registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .session_lineage(source.id)?
-        .is_none()
-    {
-        return Ok(false);
-    }
     let mut after = None;
     loop {
         let page = registry
@@ -392,15 +402,48 @@ pub(super) fn never_started(host: &SharedHost, source: &Session) -> Result<bool,
             .unwrap_or_else(|p| p.into_inner())
             .native_actor_ownerships(after, 128)?;
         if page.is_empty() {
-            return Ok(true);
+            break;
         }
         for ownership in page {
             after = Some(ownership.actor());
             if ownership.source().id == source.id {
-                return Ok(false);
+                return Err(
+                    "This conversation already started in its pane; reopen that pane to continue it. Nothing was started"
+                        .into(),
+                );
+            }
+            // A kernel boot change ended every process of an earlier boot.
+            if !super::same_conversation(&ownership.source().launch, &source.launch)
+                || ownership.owner().boot != proof.boot_id
+            {
+                continue;
+            }
+            let retirement = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .native_actor_retirement(ownership.actor())?;
+            let ended = match retirement {
+                Some(retirement) => !ownership.is_pending() && !retirement.is_pending(),
+                None => {
+                    !ownership.is_pending()
+                        && Handle::inspect_abandoned_actor(ownership.owner(), &proof)?
+                }
+            };
+            if !ended {
+                return Err(OPEN_ELSEWHERE.into());
             }
         }
     }
+    let recorded = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .session_lineage(source.id)?
+        .is_some();
+    Ok(Some(if recorded {
+        Unstarted::InLineage
+    } else {
+        Unstarted::Unrecorded
+    }))
 }
 
 const UNRECORDED: &str = "The saved Claude actor ended without a retirement that records which conversation it confirmed, so nothing was resumed or started in its place. Its conversation, if it began one, can be found and reopened with Resume";

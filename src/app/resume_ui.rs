@@ -143,7 +143,14 @@ pub enum Action {
     Resume(CardId),
     More,
     Submit,
-    Prepared(u64, SavedConversation, Result<chat::Session, String>),
+    /// The service's answer to preparing a resume. `Ok(None)` means it could
+    /// not be reached to prepare an unstarted successor, which then resumes as
+    /// a conversation of its own, as it would without one.
+    Prepared(
+        u64,
+        SavedConversation,
+        Result<Option<chat::Session>, String>,
+    ),
 }
 
 /// What indexing has found so far, in the order it is found.
@@ -612,7 +619,7 @@ impl Cagents {
                 }
                 self.resume_ui.loading = false;
                 match result {
-                    Ok(session) => {
+                    Ok(Some(session)) => {
                         if !prepared_resume_matches(&entry.session, &session) {
                             self.resume_error("The service did not prepare this exact saved conversation. Its original identity was retained.");
                             return Task::none();
@@ -623,12 +630,7 @@ impl Cagents {
                         }
                         self.insert_resumed_conversation(entry, true)
                     }
-                    // A daemon that cannot vouch for an unstarted successor
-                    // (an older one, or one that cannot prove it never ran)
-                    // still lets it resume, as its own conversation.
-                    Err(_) if !entry.session.native_continuity.retains_provider() => {
-                        self.insert_resumed_conversation(entry, false)
-                    }
+                    Ok(None) => self.insert_resumed_conversation(entry, false),
                     Err(error) => {
                         self.resume_error(&error);
                         Task::none()
@@ -789,14 +791,23 @@ impl Cagents {
         if session.native_continuity.retains_provider() || unstarted_successor(session) {
             let generation = self.resume_ui.generation;
             self.resume_ui.loading = true;
+            let unstarted = unstarted_successor(session);
             return cosmic::task::future(async move {
                 let source = entry.session.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let socket = crate::terminal::ipc::daemon_socket_path()
                         .map_err(|error| error.to_string())?;
-                    crate::control::ControlClient::connect(&socket)
-                        .map_err(|error| error.to_string())?
+                    let mut client = match crate::control::ControlClient::connect(&socket) {
+                        Ok(client) => client,
+                        // Nothing runs to vouch for it, or to refuse it.
+                        Err(crate::control::ControlError::Connect(_)) if unstarted => {
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    client
                         .prepare_chat_resume(source)
+                        .map(Some)
                         .map_err(|error| error.to_string())
                 })
                 .await
@@ -1123,8 +1134,6 @@ impl Cagents {
     }
 }
 
-/// Shape validation of the authenticated preparation reply. It grants no
-/// provider ownership; Start/Attach still runs normal HOST admission.
 /// A resume successor the daemon prepared but that never started. Resuming it
 /// again through the daemon keeps the lineage, and the agent, it was prepared
 /// to take over.
@@ -1136,6 +1145,8 @@ fn unstarted_successor(session: &chat::Session) -> bool {
         && session.launch.session_id.is_some()
 }
 
+/// Shape validation of the authenticated preparation reply. It grants no
+/// provider ownership; Start/Attach still runs normal HOST admission.
 fn prepared_resume_matches(source: &chat::Session, prepared: &chat::Session) -> bool {
     // An ended retained Claude actor resumes as a reconnect-only successor,
     // on the conversation the daemon proved it confirmed.
@@ -1234,7 +1245,11 @@ mod tests {
         // successor, never another retained actor.
         prepared.native_continuity = chat::NativeContinuity::ReconnectOnly;
         let generation = app.resume_ui.generation;
-        drop(app.update_resume(Action::Prepared(generation, entry, Ok(prepared.clone()))));
+        drop(app.update_resume(Action::Prepared(
+            generation,
+            entry,
+            Ok(Some(prepared.clone())),
+        )));
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
         assert_eq!(card.kind, CardKind::Chat(prepared));
         assert_eq!(card.title, "Review peripheral Rust modules");
@@ -1268,7 +1283,11 @@ mod tests {
         assert!(app.resume_ui.loading);
         let generation = app.resume_ui.generation;
         let before_settings = app.settings_save_generation;
-        drop(app.update_resume(Action::Prepared(generation, entry, Ok(prepared.clone()))));
+        drop(app.update_resume(Action::Prepared(
+            generation,
+            entry,
+            Ok(Some(prepared.clone())),
+        )));
 
         let card = app
             .card_state(app.workspace.focused().unwrap())
@@ -1319,7 +1338,7 @@ mod tests {
     }
 
     #[test]
-    fn unstarted_successor_resumes_through_the_daemon_and_falls_back_to_its_own_card() {
+    fn unstarted_successor_resumes_through_the_daemon_which_may_refuse_it() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         // A prepared successor the card closed before it ever started.
@@ -1336,20 +1355,30 @@ mod tests {
         drop(app.update_resume(Action::Prepared(
             generation,
             entry.clone(),
-            Ok(prepared.clone()),
+            Ok(Some(prepared.clone())),
         )));
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
         assert_eq!(card.kind, CardKind::Chat(prepared));
 
-        // A daemon that cannot vouch for it still resumes it, on its own.
+        // A refusal, such as another pane still writing to the conversation,
+        // is shown and starts nothing.
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
         drop(app.resume_saved_conversation(entry.clone()));
         let generation = app.resume_ui.generation;
         drop(app.update_resume(Action::Prepared(
             generation,
-            entry,
-            Err("Unknown request".into()),
+            entry.clone(),
+            Err("Another pane may still be writing to this Claude conversation".into()),
         )));
+        assert!(app.durable.cards.is_empty());
+        assert!(app.resume_ui.error.is_some());
+
+        // With no daemon to vouch for it or refuse it, it resumes on its own.
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.resume_saved_conversation(entry.clone()));
+        let generation = app.resume_ui.generation;
+        drop(app.update_resume(Action::Prepared(generation, entry, Ok(None))));
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
         let CardKind::Chat(session) = &card.kind else {
             panic!("the conversation resumes as a chat");
@@ -1519,7 +1548,7 @@ mod tests {
         let _ = app.update_resume(Action::Prepared(
             7,
             entry.clone(),
-            Ok(entry.session.clone()),
+            Ok(Some(entry.session.clone())),
         ));
         assert!(app.durable.cards.is_empty());
         let _ = app.resume_saved_conversation(entry);
@@ -1538,7 +1567,7 @@ mod tests {
         let _ = app.update_resume(Action::Prepared(
             generation,
             entry.clone(),
-            Ok(entry.session),
+            Ok(Some(entry.session)),
         ));
         assert_eq!(app.durable.cards.len(), 1);
         assert_eq!(app.workspace.focused(), card);

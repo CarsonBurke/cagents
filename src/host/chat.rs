@@ -2553,9 +2553,21 @@ fn process_inner(
             let previous_boot = source.proof.as_ref().is_some_and(|previous| {
                 previous.is_complete() && previous.boot_id != proof.boot_id
             });
+            let unstarted = if previous_boot || unconfirmed {
+                None
+            } else {
+                retained_resume::unstarted(host, &source).map_err(unavailable)?
+            };
+            // A successor no lineage records here resumes on its own, as any
+            // conversation reopened without an owner to take over.
+            if unstarted == Some(retained_resume::Unstarted::Unrecorded) {
+                let mut session = source;
+                session.id = TerminalId::new();
+                return Ok(ServerResponse::ChatResumePrepared { session });
+            }
             let closed = if previous_boot
                 || unconfirmed
-                || retained_resume::never_started(host, &source).map_err(unavailable)?
+                || unstarted == Some(retained_resume::Unstarted::InLineage)
             {
                 true
             } else if source.launch.provider == Provider::Claude {
