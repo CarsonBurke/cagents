@@ -26,6 +26,19 @@ done
 # daemon restart. Mirror that contract rather than emitting an ephemeral stream.
 umask 077
 config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+task_scene=
+task_scene_file=$config/fixture-agent-task-receipt.json
+if [ -e "$task_scene_file" ] || [ -L "$task_scene_file" ]; then
+    if [ ! -f "$task_scene_file" ] || [ -L "$task_scene_file" ] ||
+        ! task_scene=$(jq -ers 'select(length == 1) | .[0]
+            | select(type == "object" and keys == ["situation", "status"])
+            | select(.situation == "text" or .situation == "task-only")
+            | select(.status == "completed" or .status == "failed")
+            | .situation + "-" + .status' "$task_scene_file" 2>/dev/null); then
+        printf '%s\n' 'Invalid fixture-agent-task-receipt.json' >&2
+        exit 2
+    fi
+fi
 project=$(pwd -P | jq -Rr 'gsub("[^a-zA-Z0-9]"; "-")')
 history=$config/projects/$project/$session.jsonl
 mkdir -p "$(dirname "$history")"
@@ -51,6 +64,28 @@ emit_record() {
     persist_record "$1"
     printf '%s\n' "$1"
 }
+
+# A fixed live receipt precedes its launch acknowledgement, without a timer.
+# The main result ends the turn; only the receipt/ACK can settle its Agent.
+task_receipt_turn() {
+    agent_tool=fixture-agent-tool-$turn
+    agent_task=fixture-agent-task-$turn
+    agent_status=${task_scene##*-}
+    emit_record "$(jq -cn --arg turn "$turn" --arg tool "$agent_tool" '{type:"assistant",uuid:("fixture-agent-launch-"+$turn),message:{id:("fixture-agent-launch-"+$turn),role:"assistant",content:[{type:"tool_use",id:$tool,name:"Agent",input:{description:"Check receipt settlement",run_in_background:true}}]}}')"
+    emit_record "$(jq -cn --arg turn "$turn" --arg tool "$agent_tool" --arg task "$agent_task" '{type:"system",subtype:"task_started",uuid:("fixture-agent-start-"+$turn),task_id:$task,tool_use_id:$tool,task_type:"local_agent",description:"Check receipt settlement"}')"
+    case $task_scene in
+        text-*)
+            emit_record "$(jq -cn --arg turn "$turn" --arg tool "$agent_tool" --arg task "$agent_task" --arg status "$agent_status" '{type:"user",uuid:("fixture-agent-notice-"+$turn),origin:{kind:"task-notification"},message:{role:"user",content:("<task-notification>\n<task-id>"+$task+"</task-id>\n<tool-use-id>"+$tool+"</tool-use-id>\n<status>"+$status+"</status>\n<summary>Offline Agent task "+$status+"</summary>\n<result>Offline report.</result>\n</task-notification>")}}')"
+            ;;
+        task-only-*)
+            emit_record "$(jq -cn --arg turn "$turn" --arg task "$agent_task" --arg status "$agent_status" '{type:"system",subtype:"task_notification",uuid:("fixture-agent-notice-"+$turn),task_id:$task,status:$status,summary:("Offline Agent task "+$status)}')"
+            ;;
+    esac
+    emit_record "$(jq -cn --arg turn "$turn" --arg tool "$agent_tool" --arg task "$agent_task" '{type:"user",uuid:("fixture-agent-ack-"+$turn),tool_use_result:{status:"async_launched",agentId:$task},message:{role:"user",content:[{type:"tool_result",tool_use_id:$tool,content:"Launched"}]}}')"
+    emit_record "$(jq -cn --arg turn "$turn" '{type:"assistant",uuid:("fixture-agent-answer-"+$turn),message:{id:("fixture-agent-answer-"+$turn),role:"assistant",content:[{type:"text",text:"The offline task receipt has arrived."}]}}')"
+    emit_record "$(jq -cn --arg session "$session" --arg turn "$turn" '{type:"result",uuid:("fixture-agent-result-"+$turn),subtype:"success",is_error:false,session_id:$session}')"
+}
+
 verbosity_turn() {
     input=$(jq -cn '{path:"src/app.rs",prompt:("Internal skill and protocol framing.\n" * 80)}')
     first=$(printf '%s' "$input" | jq -Rs '.[0:30]')
@@ -71,6 +106,22 @@ verbosity_turn() {
     emit_record "$(jq -cn --arg turn "$turn" '{type:"user",uuid:("verbosity-denied-result-"+$turn),message:{role:"user",content:[{type:"tool_result",tool_use_id:("denied-"+$turn),is_error:true,content:"Attempted read\nPermission denied"}]}}')"
     emit_record "$(jq -cn --arg turn "$turn" '{type:"assistant",uuid:("verbosity-shell-"+$turn),message:{id:("verbosity-shell-"+$turn),role:"assistant",content:[{type:"tool_use",id:("shell-"+$turn),name:"Bash",input:{command:"cat <<EOF\nheredoc payload stays in detail\nEOF"}}]}}')"
     emit_record "$(jq -cn --arg turn "$turn" '{type:"user",uuid:("verbosity-shell-result-"+$turn),message:{role:"user",content:[{type:"tool_result",tool_use_id:("shell-"+$turn),content:"Shell fixture complete"}]}}')"
+}
+
+# Optional scripted tool calls: each line of fixture-tools.jsonl is
+# {"name":..., "input":{...}, "result":"...", "is_error":bool}, emitted as a
+# tool call and its result on every turn, so a rendering check can choose the
+# exact calls and outputs it needs.
+tools_file=$config/fixture-tools.jsonl
+tools_turn() {
+    call=0
+    while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        call=$((call + 1))
+        id="tool-$turn-$call"
+        emit_record "$(printf '%s' "$spec" | jq -c --arg id "$id" '{type:"assistant",uuid:("fixture-"+$id),message:{id:("fixture-"+$id),role:"assistant",content:[{type:"tool_use",id:$id,name:.name,input:.input}]}}')"
+        emit_record "$(printf '%s' "$spec" | jq -c --arg id "$id" '{type:"user",uuid:("fixture-"+$id+"-result"),message:{role:"user",content:[{type:"tool_result",tool_use_id:$id,is_error:(.is_error // false),content:(.result // "")}]}}')"
+    done < "$tools_file"
 }
 
 # Optional provider-produced image for image preview/viewer acceptance: each
@@ -141,6 +192,11 @@ while IFS= read -r frame; do
                     '{type:"command_lifecycle",command_uuid:$uuid,state:"started"}'
                 jq -cn --arg session "$session" --arg model "$model" \
                     '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286",model:$model}'
+                if [ -n "$task_scene" ]; then
+                    task_receipt_turn
+                    busy=false
+                    continue
+                fi
                 # Optional provider failure for a prompt with an image, settled
                 # before any reply as an expired login does.
                 if [ -s "$config/fixture-image-prompt-error" ] &&
@@ -160,6 +216,7 @@ while IFS= read -r frame; do
                     continue
                 fi
                 if [ "$verbosity" = 1 ]; then verbosity_turn; fi
+                if [ -f "$tools_file" ]; then tools_turn; fi
                 if [ -f "$fixture_image" ]; then image_turn; fi
                 # A Markdown file in the config directory can stand in for the
                 # answer, so rendering and long-transcript checks need no live

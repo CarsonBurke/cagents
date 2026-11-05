@@ -223,7 +223,9 @@ Close to finish after daemon restart. A terminal receipt proves its root and PTY
 owner were released (active close also stops the inspected terminal family); it
 makes no claim about previously disowned processes outside that family. Native
 provider holders separately reap all owned provider/tool descendants before
-confirming their release.
+confirming their release. While they run, native holders and retained Claude
+actors also reap tool processes that their provider left behind and that have
+exited, without signalling any process that is still running.
 The live emulator's screen before an unexpected crash is unavailable; the UI
 warns once for the affected pane, preserves subsequent output, and requests that
 foreground programs redraw through the PTY. That redraw temporarily toggles one
@@ -465,15 +467,11 @@ without that feature are production builds.
 
 Manual sidebar order is stored by the selected device daemon and shared across windows. Drag worktree or channel titles within a project to arrange them; the project menu’s **Reset sidebar order** restores automatic channel and worktree sorting. Missing worktree paths retain their position if they reappear. The registry bounds each retained order at 4096 entries; resetting also discards obsolete paths. Navigation changes require a matched CLI, UI and daemon (wire protocol 56).
 
-### Automatic merged worktree cleanup
+### Merged worktree notices
 
-Settings → General → **Merged worktree cleanup** is disabled by default. When enabled, sidebar PR refreshes propose one clean, inactive GitHub worktree at a time. The daemon confirms that its exact branch and current commit were merged before removing its directory and catalog entry. Branches remain intact. Cleanup never forces Git removal, discards changes, closes sessions, or removes the primary checkout, main branches, locked worktrees, selected scopes, or open editors.
-
-Cleanup waits for every hosted process and accepted/background operation to retire. Offline GitHub, unknown ownership, pending saves, and older windows or independent editors without directory protection all postpone removal. Inactive file-list browser tabs can be retired with the removed worktree. An independent ceditor window conservatively protects its original startup folders until that editor process exits, including folders whose startup tabs have since closed.
+Settings → General → **Merged worktrees** is disabled by default. When enabled, sidebar PR refreshes look for GitHub worktrees whose exact branch and current commit were merged, one at a time, and show a notice naming what deleting each would discard, such as uncommitted changes or an ignored `.env`. The worktree, its catalog entry and its branch are always kept: an inventory cannot exclude files another program writes later, so only an explicitly confirmed **Delete worktree** removes it. The daemon refuses automatic-removal requests from older clients. See [Merged worktree notices and ignored files](configuration.md#merged-worktree-notices-and-ignored-files).
 
 Directory protection covers both the pathname and a held directory identity. Moving an open checkout with `git worktree move` preserves its protection, and replacing its old pathname does not bypass the original path lease.
-
-Independent editor detection covers the installed `ceditor` and `ceditor-development` executable names. If Linux hides an executable path, the census checks only its main-thread process name: an editor name postpones cleanup, while an unrelated hardened process does not. Custom-renamed editor binaries are outside this identity contract.
 
 Use matched CLI, UI, daemon, and ceditor builds when enabling this option (wire protocol 66).
 

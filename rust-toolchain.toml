@@ -1,0 +1,5 @@
+# CI, the release container and `rust-version` all build with this toolchain.
+[toolchain]
+channel = "1.93.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

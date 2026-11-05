@@ -129,14 +129,18 @@ class PackageDependencies(unittest.TestCase):
         self.binaries = self.work / "target/release"
         self.tools.mkdir()
         self.binaries.mkdir(parents=True)
-        # These are deliberately shell fixtures, never application ELFs. Only
-        # the fake CLI protocol query executes; UI/daemon execution fails.
+        # Shell fixtures, never application ELFs. Only version queries and the
+        # fake CLI protocol query execute; UI/daemon startup still fails.
         fixtures = {
             self.tools / "cargo": '#!/bin/sh\n[ "$1" = tree ] || exit 91\nprintf "fixture v1\\n"\n',
             self.tools / "strip": "#!/bin/sh\nexit 0\n",
-            self.binaries / "cagents": '#!/bin/sh\n[ "$*" = "daemon protocol-version" ] || exit 92\nprintf "1\\n"\n',
-            self.binaries / "cagents-ui": "#!/bin/sh\nexit 93\n",
-            self.binaries / "cagentsd": "#!/bin/sh\nexit 94\n",
+            self.binaries / "cagents": '#!/bin/sh\ncase "$*" in\n'
+            f'--version) printf "cagents {VERSION}\\n" ;;\n'
+            "'daemon protocol-version') printf '1\\n' ;;\n*) exit 92 ;;\nesac\n",
+            self.binaries / "cagents-ui": '#!/bin/sh\n[ "$*" = --version ] || exit 93\n'
+            f'printf "cagents-ui {VERSION}\\n"\n',
+            self.binaries / "cagentsd": '#!/bin/sh\n[ "$*" = --version ] || exit 94\n'
+            f'printf "cagentsd {VERSION}\\n"\n',
         }
         for path, contents in fixtures.items():
             path.write_text(contents)
@@ -181,7 +185,20 @@ class PackageDependencies(unittest.TestCase):
         failures = failures or {}
         warnings = warnings or {}
         source = (
-            '#!/bin/sh\n[ "$#" = 3 ] && [ "$1" = --wide ] '
+            '#!/bin/sh\n'
+            # Full UI font visibility is a separate pre-publication inspection.
+            # Keep this log/count dedicated to the existing GLIBC version needs.
+            'if [ "$#" = 3 ] && [ "$1" = --wide ] && [ "$2" = --dyn-syms ]; then\n'
+            '  [ "${3##*/}" = cagents-ui ] || exit 95\n'
+            '  cat <<EOF\n'
+            "Symbol table '.dynsym' contains 2 entries:\n"
+            ' Num: Value Size Type Bind Vis Ndx Name\n'
+            ' 0: 0000000000000000 0 NOTYPE LOCAL DEFAULT UND\n'
+            ' 1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND FT_Init_FreeType\n'
+            'EOF\n'
+            '  exit 0\n'
+            'fi\n'
+            '[ "$#" = 3 ] && [ "$1" = --wide ] '
             '&& [ "$2" = --version-info ] || exit 95\n'
             f'printf "%s\\n" "${{3##*/}}" >> {shlex.quote(str(self.invocations))}\n'
             'case ${3##*/} in\n'

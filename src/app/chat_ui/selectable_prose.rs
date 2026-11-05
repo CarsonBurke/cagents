@@ -13,7 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 type ParagraphBuffer = <cosmic::Renderer as TextRenderer>::Paragraph;
 
 static NEXT_SELECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-static ACTIVE_SELECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+application_atomic!(fn active_selection() -> AtomicU64);
 
 pub(super) struct State {
     pub(super) identity: u64,
@@ -1155,7 +1155,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 state.focused = position.is_some() && cursor.is_over(*viewport);
                 if state.focused {
-                    ACTIVE_SELECTION.store(state.identity, Ordering::Relaxed);
+                    active_selection().store(state.identity, Ordering::Relaxed);
                     state.anchor = self.hit(state, position.unwrap());
                     state.end = state.anchor;
                     state.dragging = true;
@@ -1195,7 +1195,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 modifiers,
                 ..
             }) if state.focused
-                && ACTIVE_SELECTION.load(Ordering::Relaxed) == state.identity
+                && active_selection().load(Ordering::Relaxed) == state.identity
                 && modifiers.command() =>
             {
                 if key.eq_ignore_ascii_case("c") && state.anchor != state.end {
