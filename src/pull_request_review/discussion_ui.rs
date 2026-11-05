@@ -111,6 +111,8 @@ pub(super) struct DiscussionState {
     submitting: bool,
     saving_composer: bool,
     discarding: bool,
+    /// The open discard confirmation was reached from the composer.
+    discard_from_composer: bool,
     /// What the write in flight reports once GitHub applies it.
     applied_notice: &'static str,
     unknown: Option<String>,
@@ -140,6 +142,7 @@ impl Default for DiscussionState {
             submitting: false,
             saving_composer: false,
             discarding: false,
+            discard_from_composer: false,
             applied_notice: "Review updated on GitHub.",
             unknown: None,
             loading: false,
@@ -515,9 +518,16 @@ impl State {
                     // A refused submission is reported where it was made; the
                     // pane's notice would sit underneath the open popover.
                     Outcome::Refused(message) if self.discussion.submitting => {
-                        self.discussion.submit_error = Some(message)
+                        self.discussion.submit_error =
+                            Some(format!("GitHub didn’t accept the review. {message}"))
                     }
-                    Outcome::Refused(message) => self.notice = Some(message),
+                    // Out from under the popover, where its notice shows.
+                    Outcome::Refused(message) => {
+                        if self.discussion.discarding {
+                            self.discussion.review_open = false;
+                        }
+                        self.notice = Some(message)
+                    }
                     // Every review write is blocked until this is resolved,
                     // and its resolution lives in the pane's notice slot.
                     Outcome::Unknown(message) => {
@@ -622,7 +632,12 @@ impl State {
                     Err(error) => self.notice = Some(error),
                 }
             }
-            Action::CancelDiscard => self.discussion.discard_confirmation = None,
+            Action::CancelDiscard => {
+                self.discussion.discard_confirmation = None;
+                if std::mem::take(&mut self.discussion.discard_from_composer) {
+                    self.discussion.review_open = false;
+                }
+            }
             _ if !self.can_mutate_discussion() => return ActionTask::none(),
             Action::Begin(anchor) => {
                 if self
@@ -787,7 +802,8 @@ impl State {
                     self.discussion.discard_confirmation =
                         Some((authority.clone(), pending.id.clone()));
                     // The composer offers this too; its confirmation lives
-                    // in the review popover.
+                    // in the review popover, and Keep review leads back.
+                    self.discussion.discard_from_composer = !self.discussion.review_open;
                     self.discussion.review_open = true;
                 }
             }
@@ -1092,86 +1108,93 @@ impl State {
             );
             }
             let own = self.context.as_ref().is_some_and(|c| c.viewer_is_author);
-            if own {
-                rows.push(design::caption("GitHub allows comments on your own pull request, but not approval or requests for changes.").into());
-            }
-            let mut editor = text_editor::TextEditor::new(&self.discussion.summary)
-                .placeholder("Leave a comment on the pull request (optional)")
-                .padding(space::M)
-                .height(96);
-            if !self.discussion.busy {
-                editor = editor.on_action(Action::Summary);
-            }
-            rows.push(editor.into());
-            let mut choices: Vec<Element<'_, Action>> = [
-                (
-                    ReviewEvent::Comment,
-                    "Submit general feedback without explicit approval.",
-                ),
-                (
-                    ReviewEvent::Approve,
-                    "Give your approval to merge these changes.",
-                ),
-                (
-                    ReviewEvent::RequestChanges,
-                    "Submit feedback that must be addressed before merging.",
-                ),
-            ]
-            .into_iter()
-            .map(|(event, description)| {
-                event_choice(
-                    event,
-                    description,
-                    event == self.discussion.event,
-                    enabled && (!own || event == ReviewEvent::Comment),
-                )
-            })
-            .collect();
-            if own {
-                choices.push(
-                    design::caption(
-                        "You can’t approve or request changes on your own pull request.",
-                    )
-                    .wrapping(iced::widget::text::Wrapping::Word)
-                    .into(),
-                );
-            }
-            rows.push(
-                widget::column::with_children(choices)
-                    .spacing(space::XXS)
-                    .into(),
-            );
             let drafting = self.discussion.composer.is_some();
-            if drafting {
-                if let Some(composer) = &self.discussion.composer {
-                    let mut editor = text_editor::TextEditor::new(&composer.content).height(100);
-                    if !self.discussion.busy {
-                        editor = editor.on_action(Action::Composer);
-                    }
-                    rows.push(editor.into());
-                    rows.push(
-                        crate::ui_controls::button::quiet("Discard local comment")
-                            .on_press_maybe(self.can_discard_draft().then_some(Action::Cancel))
-                            .into(),
-                    );
-                }
-                rows.push(
-                    design::caption("Save or cancel the comment you’re writing before submitting.")
-                        .class(cosmic::theme::Text::Custom(design::warning_text))
-                        .wrapping(iced::widget::text::Wrapping::Word)
-                        .into(),
-                );
-            }
             let empty_comment = self.discussion.event == ReviewEvent::Comment
                 && self.discussion.summary.text().trim().is_empty()
                 && pending == 0;
-            if empty_comment {
-                rows.push(
-                    design::caption(
-                        "Write a summary or add a pending comment to submit a Comment review.",
+            // None of these can be used until the old review is discarded,
+            // which leaves Discard as the way forward.
+            if !old_head {
+                if own {
+                    rows.push(design::caption("GitHub allows comments on your own pull request, but not approval or requests for changes.").into());
+                }
+                let mut editor = text_editor::TextEditor::new(&self.discussion.summary)
+                    .placeholder("Leave a comment on the pull request (optional)")
+                    .padding(space::M)
+                    .height(96);
+                if !self.discussion.busy {
+                    editor = editor.on_action(Action::Summary);
+                }
+                rows.push(editor.into());
+                let mut choices: Vec<Element<'_, Action>> = [
+                    (
+                        ReviewEvent::Comment,
+                        "Submit general feedback without explicit approval.",
+                    ),
+                    (
+                        ReviewEvent::Approve,
+                        "Give your approval to merge these changes.",
+                    ),
+                    (
+                        ReviewEvent::RequestChanges,
+                        "Submit feedback that must be addressed before merging.",
+                    ),
+                ]
+                .into_iter()
+                .map(|(event, description)| {
+                    event_choice(
+                        event,
+                        description,
+                        event == self.discussion.event,
+                        enabled && (!own || event == ReviewEvent::Comment),
                     )
-                    .into(),
+                })
+                .collect();
+                if own {
+                    choices.push(
+                        design::caption(
+                            "You can’t approve or request changes on your own pull request.",
+                        )
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .into(),
+                    );
+                }
+                rows.push(
+                    widget::column::with_children(choices)
+                        .spacing(space::XXS)
+                        .into(),
                 );
+                if drafting {
+                    if let Some(composer) = &self.discussion.composer {
+                        let mut editor =
+                            text_editor::TextEditor::new(&composer.content).height(100);
+                        if !self.discussion.busy {
+                            editor = editor.on_action(Action::Composer);
+                        }
+                        rows.push(editor.into());
+                        rows.push(
+                            crate::ui_controls::button::quiet("Discard local comment")
+                                .on_press_maybe(self.can_discard_draft().then_some(Action::Cancel))
+                                .into(),
+                        );
+                    }
+                    rows.push(
+                        design::caption(
+                            "Save or cancel the comment you’re writing before submitting.",
+                        )
+                        .class(cosmic::theme::Text::Custom(design::warning_text))
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .into(),
+                    );
+                }
+                if empty_comment {
+                    rows.push(
+                        design::caption(
+                            "Write a summary or add a pending comment to submit a Comment review.",
+                        )
+                        .into(),
+                    );
+                }
             }
             rows.push(popup_actions(
                 crate::ui_controls::button::secondary("Cancel").on_press(Action::CloseReview),
@@ -1199,7 +1222,7 @@ impl State {
             // Just above the actions, where the eye returns after submitting.
             rows.insert(
                 rows.len() - 1,
-                design::caption(format!("GitHub didn’t accept the review. {error}"))
+                design::caption(error.as_str())
                     .class(cosmic::theme::Text::Custom(design::warning_text))
                     .wrapping(iced::widget::text::Wrapping::Word)
                     .into(),
@@ -2612,6 +2635,35 @@ mod tests {
     }
 
     #[test]
+    fn a_discard_detour_from_the_composer_returns_there_however_it_ends() {
+        let mut state = ready();
+        with_old_head_review(&mut state);
+        drop(state.update_discussion(Action::PrepareDiscard));
+        drop(state.update_discussion(Action::CancelDiscard));
+        assert!(
+            !state.discussion.review_open,
+            "Keep review returns to the composer"
+        );
+
+        // Started from the popover, Keep review stays there.
+        drop(state.update_discussion(Action::ToggleReview));
+        drop(state.update_discussion(Action::PrepareDiscard));
+        drop(state.update_discussion(Action::CancelDiscard));
+        assert!(state.discussion.review_open);
+        drop(state.update_discussion(Action::CloseReview));
+
+        // A refusal is reported in the pane, so the popover must not cover it.
+        drop(state.update_discussion(Action::PrepareDiscard));
+        drop(state.update_discussion(Action::ConfirmDiscard));
+        drop(state.update_discussion(Action::Finished {
+            generation: state.generation,
+            outcome: Outcome::Refused("Review is gone.".into()),
+        }));
+        assert!(!state.discussion.review_open);
+        assert_eq!(state.notice.as_deref(), Some("Review is gone."));
+    }
+
+    #[test]
     fn unknown_write_does_not_offer_an_automatic_retry() {
         let mut state = ready();
         drop(state.update_discussion(Action::Begin(anchor())));
@@ -2741,7 +2793,10 @@ mod tests {
         }));
         assert!(state.discussion.review_open);
         assert_eq!(state.discussion.summary.text().trim(), "Needs work");
-        assert_eq!(state.discussion.submit_error.as_deref(), Some("changed"));
+        assert_eq!(
+            state.discussion.submit_error.as_deref(),
+            Some("GitHub didn’t accept the review. changed")
+        );
         assert!(
             state.notice.is_none(),
             "the refusal belongs in the popover, not under it"
