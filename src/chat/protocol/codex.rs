@@ -3541,7 +3541,10 @@ fn error_text(error: &Value, is_child: bool) -> String {
     match error["message"].as_str() {
         Some(message) => message.to_owned(),
         None if is_child => error.to_string(),
-        None => "Codex reported an error without a readable message".into(),
+        None => error.as_str().map_or_else(
+            || "Codex reported an error without a readable message".into(),
+            str::to_owned,
+        ),
     }
 }
 
@@ -6357,6 +6360,25 @@ mod tests {
             .receive(failed("next-turn", "Usage limit · resets 3:40pm"))
             .unwrap();
         assert_eq!(notices(different), 1, "another turn's failure is its own");
+    }
+
+    #[test]
+    fn a_parent_error_reads_as_its_message_its_string_or_a_sentence() {
+        for (error, expected) in [
+            (json!({"message":"Usage limit"}), "Usage limit"),
+            (json!("boom"), "boom"),
+            (
+                json!({"code":429}),
+                "Codex reported an error without a readable message",
+            ),
+            (
+                Value::Null,
+                "Codex reported an error without a readable message",
+            ),
+        ] {
+            assert_eq!(error_text(&error, false), expected);
+        }
+        assert_eq!(error_text(&json!("boom"), true), "\"boom\"");
     }
 
     #[test]
