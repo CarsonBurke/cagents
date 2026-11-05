@@ -750,8 +750,8 @@ class PreflightCancellation(unittest.TestCase):
                 self.assertTrue(self.slot_is_free())
 
 
-class MemoryAdmission(unittest.TestCase):
-    """Two slots, one held by a gated build that records its expected cost."""
+class TwoSlots(unittest.TestCase):
+    """Two private slots, one of which a gated build can hold."""
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-memory-")
@@ -763,7 +763,8 @@ class MemoryAdmission(unittest.TestCase):
         self.env = {
             key: value for key, value in os.environ.items()
             if not key.startswith("CAGENTS_BUILD_") and key != "CARGO_BUILD_JOBS"
-        } | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_SLOTS": "2"}
+        } | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_SLOTS": "2",
+              "CAGENTS_BUILD_CPU_PRESSURE": "0"}
 
     def hold(self, cost):
         holder = subprocess.Popen(
@@ -787,6 +788,10 @@ class MemoryAdmission(unittest.TestCase):
             env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
             capture_output=True, text=True, timeout=timeout,
         )
+
+
+class MemoryAdmission(TwoSlots):
+    """One slot held by a gated build that records its expected cost."""
 
     def test_a_build_that_fits_starts_beside_a_running_one(self):
         self.hold(1)
@@ -838,15 +843,20 @@ class MemoryAdmission(unittest.TestCase):
         except subprocess.TimeoutExpired:
             waiter.kill()
             status = waiter.wait()
-            self.assertNotIn("unbound", waiter.stderr.read())
+            stderr = waiter.stderr.read()
+            self.assertNotIn("unbound", stderr)
         else:
-            self.assertEqual(status, 0, waiter.stderr.read())
+            stderr = waiter.stderr.read()
+            self.assertEqual(status, 0, stderr)
+        # Its missing cost file is expected, not an error to report.
+        self.assertNotIn("No such file", stderr)
         waiter.stderr.close()
 
     def test_an_invalid_cost_is_refused(self):
         result = self.build("08", timeout=10)
         self.assertEqual(result.returncode, 2)
         self.assertIn("CAGENTS_BUILD_COST_GIB", result.stderr)
+
 
 ADMISSION_FLOCK = r'''#!/usr/bin/python3
 import json
@@ -1094,6 +1104,152 @@ class AdmissionTimeout(unittest.TestCase):
             _stdout, stderr = process.communicate("", timeout=5)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertNotIn("timed out", stderr.lower())
+
+class CpuPressureAdmission(TwoSlots):
+    """Two slots and memory to spare; the CPU pressure comes from a fixture."""
+
+    def setUp(self):
+        super().setUp()
+        self.pressure = self.root / "pressure"
+        self.env |= {
+            "CAGENTS_BUILD_CPU_PRESSURE": "60", "CAGENTS_BUILD_CPU_SETTLE_SECS": "0",
+            "CAGENTS_BUILD_CPU_PRESSURE_FILE": str(self.pressure),
+        }
+
+    def report(self, some, full="0.00"):
+        self.pressure.write_text(
+            f"some avg10={some} avg60=40.12 avg300=38.40 total=30831090039\n"
+            f"full avg10={full} avg60=0.00 avg300=0.00 total=0\n")
+
+    def test_a_build_starts_beside_a_running_one_while_cpus_have_room(self):
+        self.report("59.99", full="99.00")
+        self.hold(1)
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting", result.stderr)
+
+    def test_a_build_waits_while_cpu_pressure_is_at_the_limit(self):
+        self.report("60.00")
+        self.hold(1)
+        waiter = subprocess.Popen(
+            [str(self.gate), "exec", "true"], env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"},
+            cwd=self.root, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(waiter.stderr.close)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            waiter.wait(timeout=2)
+        # Pressure falling admits it beside the running build.
+        self.report("12.50")
+        self.assertEqual(waiter.wait(timeout=10), 0)
+        self.assertIsNone(self.holder.poll())
+        self.assertIn("CPUs busy (60% pressure, limit 60%)", waiter.stderr.read())
+
+    def test_a_lone_build_starts_whatever_the_pressure(self):
+        self.report("100.00")
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_build_waits_until_the_newest_one_can_show_in_the_pressure(self):
+        self.report("0.00")
+        self.hold(1)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            subprocess.run(
+                [str(self.gate), "exec", "true"],
+                env=self.env | {"CAGENTS_BUILD_COST_GIB": "1", "CAGENTS_BUILD_CPU_SETTLE_SECS": "3600"},
+                cwd=self.root, capture_output=True, timeout=2)
+
+    def test_a_host_without_pressure_reports_has_room(self):
+        self.hold(1)
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_zero_disables_the_pressure_limit(self):
+        self.report("100.00")
+        self.env["CAGENTS_BUILD_CPU_PRESSURE"] = "0"
+        self.hold(1)
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_invalid_limits_are_refused(self):
+        for name, value in (("CAGENTS_BUILD_CPU_PRESSURE", "060"),
+                            ("CAGENTS_BUILD_CPU_PRESSURE", "101"),
+                            ("CAGENTS_BUILD_CPU_PRESSURE", "high"),
+                            ("CAGENTS_BUILD_CPU_SETTLE_SECS", "-1")):
+            self.env[name] = value
+            result = self.build(1, timeout=10)
+            self.assertEqual(result.returncode, 2, (name, value))
+            self.assertIn(name, result.stderr)
+            del self.env[name]
+
+    def held_slot(self, index, sidecar):
+        """Holds slot `index` with a plain `flock` and prices it with `sidecar`,
+        a gate's cost file, whose holder is this test."""
+        path = self.root / ("slot.lock" if index == 0 else f"slot.lock.{index}")
+        holder = subprocess.Popen(
+            ["flock", path, "sh", "-c",
+             f"touch {path}.held; while [ ! -e {self.root}/release ]; do sleep 0.05; done"])
+        self.addCleanup(holder.wait, 10)
+        self.addCleanup((self.root / "release").touch)
+        while not Path(f"{path}.held").exists():
+            time.sleep(0.02)
+        Path(f"{path}.cost").write_text(sidecar.format(pid=os.getpid()))
+
+    @staticmethod
+    def uptime():
+        return int(float(Path("/proc/uptime").read_text().split()[0]))
+
+    def test_the_newest_of_several_running_builds_must_have_settled(self):
+        self.report("0.00")
+        self.env |= {"CAGENTS_BUILD_SLOTS": "3", "CAGENTS_BUILD_CPU_SETTLE_SECS": "60"}
+        self.held_slot(1, f"{{pid}} 1\n{self.uptime() - 600}\n")
+        self.held_slot(2, f"{{pid}} 1\n{self.uptime()}\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=2)
+
+    def test_a_start_from_before_a_reboot_has_settled(self):
+        self.report("0.00")
+        self.env |= {"CAGENTS_BUILD_SLOTS": "3", "CAGENTS_BUILD_CPU_SETTLE_SECS": "60"}
+        self.held_slot(1, f"{{pid}} 1\n{self.uptime() + 10**6}\n")
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_settled_and_undated_running_builds_leave_room(self):
+        # A build priced by a gate that does not date its start is not waited for.
+        self.report("0.00")
+        self.env |= {"CAGENTS_BUILD_SLOTS": "3", "CAGENTS_BUILD_CPU_SETTLE_SECS": "60"}
+        self.held_slot(1, f"{{pid}} 1\n{self.uptime() - 600}\n")
+        self.held_slot(2, "{pid} 1\n")
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_dated_cost_still_reads_as_a_cost_to_gates_that_only_price(self):
+        self.report("0.00")
+        self.hold(1)
+        cost = next(self.root.glob("slot.lock*.cost")).read_text()
+        # The one-line read of gates that predate dated starts.
+        result = subprocess.run(
+            ["sh", "-c", 'read -r holder claimed; printf "%s:%s" "$holder" "$claimed"'],
+            input=cost, capture_output=True, text=True, check=True)
+        holder, claimed = result.stdout.split(":")
+        self.assertEqual(int(holder), self.holder.pid)
+        self.assertEqual(int(claimed), 2**20)
+
+    def test_an_unreadable_pressure_report_leaves_room(self):
+        self.pressure.write_text("some total=12\n")
+        self.hold(1)
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_default_slots_are_capped_at_four(self):
+        del self.env["CAGENTS_BUILD_SLOTS"]
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        slots = {path.name for path in self.root.glob("slot.lock*")
+                 if not path.name.endswith((".queue", ".cost"))}
+        self.assertLessEqual(slots, {"slot.lock", "slot.lock.1", "slot.lock.2", "slot.lock.3"})
+        memory_gib = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
+        if os.cpu_count() >= 20 and memory_gib >= 28:
+            self.assertEqual(len(slots), 4)
+
 
 
 if __name__ == "__main__":
