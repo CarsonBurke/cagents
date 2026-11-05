@@ -9,8 +9,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
-const PART_BYTES: usize = 128 * 1024;
-const WINDOW_BYTES: usize = 3 * 1024 * 1024;
+const PART_BYTES: usize = crate::chat::TRANSCRIPT_PART_BYTES;
+const WINDOW_BYTES: usize = crate::chat::TRANSCRIPT_WINDOW_BYTES;
 const WINDOW_ITEMS: usize = 128;
 // Leave room between provider items for overlapping history pages to supply
 // missing records without renumbering the whole conversation on every page.
@@ -1292,9 +1292,15 @@ impl Store {
                 // A part's identity carries its field ranges and layout so
                 // disclosure state cannot move to different bytes on rewrite.
                 let item_id = if part > 0 {
-                    std::borrow::Cow::Owned(format!(
-                        "{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}"
-                    ))
+                    std::borrow::Cow::Owned(
+                        crate::chat::TranscriptPart {
+                            item: &id,
+                            index: part,
+                            layout: kind,
+                            fields: [(start0, end0), (start1, end1)],
+                        }
+                        .id(),
+                    )
                 } else {
                     std::borrow::Cow::Borrowed(base.id.as_str())
                 };

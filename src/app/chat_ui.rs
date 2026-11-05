@@ -81,6 +81,7 @@ mod hover;
 pub(super) mod images;
 mod layout;
 mod literal_content;
+mod logical_prose;
 mod markdown;
 mod markdown_source;
 mod monospace;
@@ -331,6 +332,8 @@ pub enum Action {
     Copy(Target, String, CopyPart),
     CopyMessage(Target, String, Option<chat::TextCopySource>),
     MessageCopied(Target, String, text_copy::Request, Result<String, String>),
+    /// A complete message read for a window that shows only part of it.
+    LogicalProseRead(Target, chat::TextCopySource, Result<String, String>),
     MarkdownPrepared(Target, String, u64, preparation::Ready),
     LocalPromptPrepared(Target, u64, preparation::Ready),
     RetryMarkdown(Target),
@@ -494,6 +497,7 @@ impl Action {
                 | Self::ChangesLoaded(..)
                 | Self::ChangedFileResolved(..)
                 | Self::MessageCopied(..)
+                | Self::LogicalProseRead(..)
                 | Self::Attached(..)
                 | Self::PastedImage(..)
                 | Self::PastedText(..)
@@ -2226,6 +2230,8 @@ pub(super) struct Runtime {
     composer_actions: bool,
     branch_picker: bool,
     changes: changes::State,
+    /// Joins the parts of a long message back into one before presentation.
+    logical_prose: logical_prose::State,
     fork_requested: bool,
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
@@ -2475,6 +2481,19 @@ fn submission(
             mode,
         }),
     }
+}
+
+/// Whether `current` only appends to `previous`. The client's wire lineage
+/// proves it for provider items; a long message presented as one is a new
+/// item on each publication, so its source's append-only revision proves it.
+fn known_append(
+    handle: Option<&Arc<ClientHandle>>,
+    prose: &logical_prose::State,
+    previous: &Arc<chat::Item>,
+    current: &Arc<chat::Item>,
+) -> bool {
+    handle.is_some_and(|handle| handle.known_append(previous, current))
+        || prose.proves(previous, current)
 }
 
 impl Runtime {
@@ -3175,6 +3194,7 @@ impl Runtime {
             composer_actions: false,
             branch_picker: false,
             changes: changes::State::default(),
+            logical_prose: logical_prose::State::default(),
             fork_requested: false,
             fork_seen: None,
             files: None,
@@ -3904,9 +3924,7 @@ impl Runtime {
                             (ItemContent::Text { text: old, thinking: a, phase: x },
                              ItemContent::Text { text: next, thinking: b, phase: y })
                             if old.len() == next.len() && a == b && x == y)
-                        && handle
-                            .as_ref()
-                            .is_some_and(|handle| handle.known_append(previous, item))
+                        && known_append(handle.as_ref(), &self.logical_prose, previous, item)
                 });
                 let metadata_reused = metadata_proven
                     && self.preparation.retarget_metadata(
@@ -3939,9 +3957,7 @@ impl Runtime {
                         previous.role == item.role
                             && ChangeToken::of(&previous.content).shape
                                 == ChangeToken::of(&item.content).shape
-                            && handle
-                                .as_ref()
-                                .is_some_and(|handle| handle.known_append(previous, item))
+                            && known_append(handle.as_ref(), &self.logical_prose, previous, item)
                     });
                 // Bytes alone do not bound rich-block parsing or thousands
                 // of tiny fences. Every changed prose publication goes to the
@@ -3951,13 +3967,17 @@ impl Runtime {
                         item,
                         growing && (!reader_only || coordinated),
                         theme,
-                        |old, new| {
-                            handle
-                                .as_ref()
-                                .is_some_and(|handle| handle.known_append(old, new))
-                        },
+                        |old, new| known_append(handle.as_ref(), &self.logical_prose, old, new),
                     );
-                    if replaced && !exact && !proven_from_cache {
+                    // A presentation that reaches further into the same
+                    // revision of a long message is not an append when its
+                    // window starts elsewhere, but what is shown stays true
+                    // of it until the worker finishes.
+                    let superseded = current
+                        .filter(|cached| !cached.placeholder)
+                        .and_then(|cached| cached.item.as_ref())
+                        .is_some_and(|previous| self.logical_prose.supersedes(previous, item));
+                    if replaced && !exact && !proven_from_cache && !superseded {
                         let replacement = CachedItem::preparing_replacement(
                             item,
                             theme,
@@ -4001,9 +4021,7 @@ impl Runtime {
                 .and_then(|cached| cached.item.as_ref())
                 .filter(|previous| !Arc::ptr_eq(previous, item))
                 .is_some_and(|previous| {
-                    handle
-                        .as_ref()
-                        .is_some_and(|handle| handle.known_append(previous, item))
+                    known_append(handle.as_ref(), &self.logical_prose, previous, item)
                 });
             if let Some(cached) = cache.get_mut(&item.id) {
                 cached.reader_memory = self.scroll_memory.clone();
@@ -4197,6 +4215,7 @@ impl Runtime {
             self.source_clock = source_clock;
             return;
         }
+        let mut snapshot = self.logical_prose.project(snapshot);
         self.scroll_memory.latest_source(
             self.page_request
                 .filter(|(page, _)| *page == view::Page::Latest)
@@ -4777,6 +4796,7 @@ impl Runtime {
         let bytes = self.snapshot.transcript_bytes();
         let cache_entries = self.cache.len();
         self.release_transcript_caches();
+        self.logical_prose.release();
         Arc::make_mut(&mut self.snapshot).evict_transcript();
         if self.history_cursor.is_none() {
             self.history = Vec::new();
@@ -7169,6 +7189,7 @@ impl Cagents {
             if let CardRuntime::Chat(runtime) = card {
                 subscriptions.extend(images::subscriptions(runtime));
                 if runtime.visible.load(Ordering::Relaxed) {
+                    subscriptions.extend(logical_prose::subscriptions(runtime));
                     subscriptions.extend(runtime.preparation.subscriptions(runtime.target));
                     subscriptions.extend(runtime.thumbnails.subscriptions(runtime.target));
                 }
@@ -11650,6 +11671,16 @@ impl Cagents {
             }
             Action::MessageCopied(target, id, request, result) => {
                 return self.finish_message_copy(target, id, request, result);
+            }
+            Action::LogicalProseRead(target, source, result) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && runtime.logical_prose.complete(&source, result)
+                    && runtime.visible.load(Ordering::Relaxed)
+                    && let Some(raw) = runtime.logical_prose.raw()
+                {
+                    let clock = runtime.source_clock;
+                    runtime.install_snapshot(raw, clock);
+                }
             }
             Action::Copy(target, id, part) => {
                 text_copy::invalidate();
@@ -27973,6 +28004,195 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+    #[test]
+    fn a_long_answer_is_presented_and_copied_as_one_logical_message() {
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let part = chat::TRANSCRIPT_PART_BYTES;
+        let mut message = "Intro paragraph.\n\n```rust\n".to_owned();
+        message.push_str(&"let crab = \"🦀\";\n".repeat(part / 12));
+        message.push_str("```\n\nAfter the fence.\n");
+        let source = chat::TextCopySource {
+            cache: uuid::Uuid::new_v4(),
+            scope: chat::TextCopyScope::Conversation,
+            token: 7,
+            revision: 1,
+            bytes: message.len() as u64,
+        };
+        let publish = |window: std::ops::Range<usize>| {
+            let mut snapshot = (*handle.snapshot()).clone();
+            let items = logical_prose::parts("answer", &message, window);
+            snapshot.text_copy_sources.conversation = vec![Some(source.clone()); items.len()];
+            snapshot.items = items;
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+        };
+        // The window holds every part: they are joined with no read.
+        publish(0..usize::MAX);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.snapshot.items.len(), 1);
+        let joined = runtime.snapshot.items[0].clone();
+        assert_eq!(joined.id, "answer");
+        assert!(matches!(&joined.content, ItemContent::Text { text, .. } if *text == message));
+        assert_eq!(runtime.message_copy_source(&joined), Some(source.clone()));
+        assert!(runtime.logical_prose.request().is_none());
+        // The window holds only the tail: the whole message is read, then shown.
+        publish(1..usize::MAX);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime
+                .logical_prose
+                .request()
+                .map(|(read, _)| read.clone()),
+            Some(source.clone())
+        );
+        drop(app.handle_chat_ui(Action::LogicalProseRead(
+            target,
+            source.clone(),
+            Ok(message.clone()),
+        )));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.snapshot.items.len(), 1);
+        assert!(matches!(
+            &runtime.snapshot.items[0].content,
+            ItemContent::Text { text, .. } if *text == message
+        ));
+        assert!(runtime.logical_prose.request().is_none());
+        // Hiding the pane releases the complete text with the presentation.
+        app.chat_runtime_mut(target).unwrap().show(false);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert!(chat_runtime(&app, card).logical_prose.raw().is_none());
+    }
+    #[test]
+    fn a_long_answer_keeps_its_prepared_text_while_parts_are_appended() {
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (_card, target, handle) = history_fixture(&mut app);
+        let part = chat::TRANSCRIPT_PART_BYTES;
+        let message = "- list item that streams in\n".repeat(4 * part / 28);
+        let source = |bytes: usize, revision: u64| chat::TextCopySource {
+            cache: uuid::Uuid::from_u128(766),
+            scope: chat::TextCopyScope::Conversation,
+            token: 7,
+            revision,
+            bytes: bytes as u64,
+        };
+        let publish = |end: usize, revision: u64| {
+            let body = &message[..end];
+            let mut snapshot = (*handle.snapshot()).clone();
+            let items = logical_prose::parts("answer", body, 0..usize::MAX);
+            snapshot.text_copy_sources.conversation =
+                vec![Some(source(body.len(), revision)); items.len()];
+            snapshot.items = items;
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+        };
+        publish(part / 2, 1);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        preparation::drain_fixture(runtime);
+        assert!(!runtime.cache["answer"].placeholder);
+        // Each append crosses into another part, so every publication joins
+        // into a new item; the prepared text stays shown until the next is ready.
+        for end in [part + part / 2, 2 * part + part / 2, message.len()] {
+            publish(end, 1);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.refresh();
+            assert!(
+                !runtime.cache["answer"].placeholder,
+                "an append to {end} bytes blanked the answer"
+            );
+            preparation::drain_fixture(runtime);
+            assert!(!runtime.cache["answer"].placeholder);
+        }
+        // A rewrite is not an append and waits for its own preparation.
+        publish(message.len() - 1, 2);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        assert!(runtime.cache["answer"].placeholder);
+    }
+    #[test]
+    fn a_long_answer_streaming_past_its_window_never_blanks() {
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let part = chat::TRANSCRIPT_PART_BYTES;
+        let message = "- list item that streams in\n".repeat(12 * part / 28);
+        let source = |bytes: usize| chat::TextCopySource {
+            cache: uuid::Uuid::from_u128(767),
+            scope: chat::TextCopyScope::Conversation,
+            token: 7,
+            revision: 1,
+            bytes: bytes as u64,
+        };
+        // The store's window holds the last three parts of what has arrived.
+        let publish = |end: usize| {
+            let body = &message[..end];
+            let count = body.len().div_ceil(part);
+            let mut snapshot = (*handle.snapshot()).clone();
+            let items = logical_prose::parts("answer", body, count.saturating_sub(3)..count);
+            snapshot.text_copy_sources.conversation = vec![Some(source(end)); items.len()];
+            snapshot.items = items;
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+        };
+        let deliver = |app: &mut Cagents| {
+            let read = chat_runtime(app, card)
+                .logical_prose
+                .request()
+                .map(|(read, _)| read.clone());
+            if let Some(read) = read {
+                let text = message[..read.bytes as usize].to_owned();
+                drop(app.handle_chat_ui(Action::LogicalProseRead(target, read, Ok(text))));
+            }
+        };
+        let shown = |app: &Cagents| {
+            let runtime = chat_runtime(app, card);
+            assert_eq!(runtime.snapshot.items.len(), 1);
+            match &runtime.snapshot.items[0].content {
+                ItemContent::Text { text, .. } => text.clone(),
+                _ => unreachable!(),
+            }
+        };
+        publish(4 * part);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        preparation::drain_fixture(runtime);
+        // Steps of half a part. Reads arrive promptly at first, then stall for
+        // long enough that the window moves past the last one.
+        let mut end = 4 * part;
+        let mut step = 0;
+        while end < message.len() {
+            end = (end + part / 2).min(message.len());
+            step += 1;
+            publish(end);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.refresh();
+            assert!(
+                !runtime.cache["answer"].placeholder,
+                "growth to {end} bytes blanked the answer"
+            );
+            if !(8..14).contains(&step) {
+                deliver(&mut app);
+                assert!(
+                    !chat_runtime(&app, card).cache["answer"].placeholder,
+                    "the complete read at {end} bytes blanked the answer"
+                );
+            }
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            assert!(!chat_runtime(&app, card).cache["answer"].placeholder);
+            if step < 8 {
+                // Reads made before the window outran them show the whole answer.
+                assert_eq!(shown(&app), message[..end]);
+            }
+        }
+        deliver(&mut app);
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert_eq!(shown(&app), message);
     }
     struct LiveSharedRecovery {
         app: Cagents,
