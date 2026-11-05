@@ -607,11 +607,13 @@ fixture and authority requirements.
 
 The helper fixes `--locked --no-default-features --package cagents --lib` and
 selects only the requested CLI, HOST or UI boundary. It preserves the caller's
-Cargo environment, stdin, test exit status and cancellation. It invokes Cargo
-once through `scripts/cargo-gate`, then performs discovery and exact execution
-without Cargo. Set the usual `CARGO_BUILD_JOBS`, `CARGO_TARGET_DIR` and
-`CAGENTS_BUILD_LOCK` as needed. Keep source and target unchanged until the
-command finishes; a detected executable replacement is refused.
+Cargo environment, stdin, test exit status and cancellation. It submits one
+test-compilation command through `scripts/cargo-gate`, then performs discovery
+and exact execution without Cargo. Set the usual `CARGO_BUILD_JOBS`,
+`CARGO_TARGET_DIR` and `CAGENTS_BUILD_LOCK` as needed. The gate's existing build
+directory seeding policy also applies; `CAGENTS_BUILD_SEED=0` disables it. Keep
+source and target unchanged until the command finishes; a detected executable
+replacement is refused.
 
 Run the helper outside `cargo-gate exec`, a parent `flock`, or a coordinator's
 held build lease. It refuses inherited admission because a child cannot release

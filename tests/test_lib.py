@@ -140,6 +140,8 @@ class TestLib(unittest.TestCase):
         scripts.mkdir()
         for name in ("test-lib", "cargo-gate", "cargo-gate-command.py"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
+        if (ROOT / "scripts/seed-build-dir").exists():
+            shutil.copy2(ROOT / "scripts/seed-build-dir", scripts / "seed-build-dir")
         (self.root / "Cargo.toml").write_text("# private fake Cargo manifest\n")
         (self.root / "bin").mkdir()
         for path in (self.root / "bin/cargo", self.root / "libtest"):
@@ -154,6 +156,7 @@ class TestLib(unittest.TestCase):
             "CODEX_HOME": str(self.root / "private-codex"),
             "CAGENTS_AGENT_AUTHORITY": "fixture-agent-authority",
             "CAGENTS_BUILD_LOCK": str(self.lock), "CAGENTS_BUILD_SLOTS": "1",
+            "CAGENTS_BUILD_SEED": "0",
             "CARGO_BUILD_JOBS": "1", "TEST_ROOT": str(self.root),
             "TMPDIR": str(self.root / "tmp"), "LC_ALL": "C",
         }
@@ -385,6 +388,15 @@ class TestLib(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.events("compiler")[0]["held"])
         self.assertFalse(self.events("test")[0]["held"])
+
+    def test_relative_lock_is_resolved_from_the_gate_package_cwd(self):
+        with self.lock.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self.invoke("cli", "module::one", pass_fds=(lock.fileno(),),
+                                 env=self.env | {"CAGENTS_BUILD_LOCK": "slot.lock"})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("inherited descriptor holds build admission", result.stderr)
+        self.assertEqual(self.events(), [])
 
     def test_unrelated_holder_is_waited_for_instead_of_falsely_refused(self):
         with self.lock.open("a") as holder:

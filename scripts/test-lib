@@ -76,8 +76,8 @@ def main():
             parser.error("--prefix requires a literal module prefix ending in ::")
     if args.test_threads is not None and args.test_threads < 1:
         parser.error("--test-threads must be positive")
-    outside_admission()
     os.chdir(ROOT)
+    outside_admission()
     child = None
     starting = False
     cancellation = 0
