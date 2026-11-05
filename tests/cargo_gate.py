@@ -486,5 +486,269 @@ with pathlib.Path({str(self.root / 'cargo-calls')!r}).open('a') as calls:
                 calls.unlink()
 
 
+PREFLIGHT_TOOL = r'''#!/usr/bin/python3
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+root = Path(os.environ["FIXTURE_ROOT"])
+config = json.loads((root / "control.json").read_text())
+program = Path(sys.argv[0]).name
+phase = ("metadata" if program == "cargo" and sys.argv[1:2] == ["metadata"] else
+         "compiler" if program == "cargo" else
+         "guard" if program == "build-disk-guard" else "seed")
+with open(os.environ["CAGENTS_BUILD_LOCK"], "a") as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        held = False
+    except BlockingIOError:
+        held = True
+event = dict(phase=phase, pid=os.getpid(), arguments=sys.argv[1:], held=held,
+             marker=os.environ.get("CAGENTS_BUILD_SLOT_HELD", ""),
+             protected={name: os.environ[name] for name in
+                        ("HOME", "CODEX_HOME", "CAGENTS_AGENT_AUTHORITY")})
+
+def record(entry):
+    with (root / "calls.jsonl").open("a") as output:
+        output.write(json.dumps(entry) + "\n")
+
+def interrupted(number, _frame):
+    (root / (phase + ".signalled")).write_text(str(number))
+    deadline = time.monotonic() + 4
+    while not (root / "release").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    raise SystemExit(128 + number)
+
+for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+    signal.signal(number, interrupted)
+record(event)
+if config.get("hold") == phase:
+    receipt = root / (phase + ".ready")
+    receipt.with_suffix(".tmp").write_text(json.dumps(event))
+    receipt.with_suffix(".tmp").replace(receipt)
+    deadline = time.monotonic() + 6
+    while not (root / "release").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not (root / "release").exists():
+        raise SystemExit(95)
+
+if phase == "metadata":
+    if config.get("metadata_exit"):
+        raise SystemExit(config["metadata_exit"])
+    print(json.dumps(dict(build_directory=config.get("build_directory", str(root / "owned-build"))),
+                     separators=(",", ":")))
+elif phase == "compiler":
+    data = sys.stdin.buffer.read()
+    if "FIXTURE_OUTPUT_FD" in os.environ:
+        os.write(int(os.environ["FIXTURE_OUTPUT_FD"]), data)
+    record(dict(phase="compiler-stdin", stdin=data.decode()))
+    print("private compiler output")
+raise SystemExit(config.get(phase + "_exit", 0))
+'''
+
+
+class PreflightCancellation(unittest.TestCase):
+    """Actual gate preflight with private fake tools and exact child custody."""
+
+    @classmethod
+    def setUpClass(cls):
+        if sys.platform != "linux" or not hasattr(os, "pidfd_open"):
+            raise unittest.SkipTest("Linux pidfds are required")
+        cls.libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        if cls.libc.prctl(37, ctypes.byref(previous), 0, 0, 0):
+            raise OSError(ctypes.get_errno(), "cannot inspect child subreaper")
+        cls.previous_subreaper = previous.value
+        if cls.libc.prctl(36, 1, 0, 0, 0):
+            raise OSError(ctypes.get_errno(), "cannot own orphaned fixture descendants")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.libc.prctl(36, cls.previous_subreaper, 0, 0, 0)
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="gate-preflight-", dir="/tmp")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        for name in ("cargo-gate", "cargo-gate-command.py"):
+            shutil.copy2(ROOT / "scripts" / name, self.root / name)
+        (self.root / "bin").mkdir()
+        for name in ("bin/cargo", "build-disk-guard", "seed-build-dir"):
+            path = self.root / name
+            path.write_text(PREFLIGHT_TOOL)
+            path.chmod(0o700)
+        for name in ("home", "codex", "tmp"):
+            (self.root / name).mkdir(mode=0o700)
+        self.lock = self.root / "slot.lock"
+        self.env = {
+            "PATH": str(self.root / "bin") + ":/usr/bin:/bin",
+            "HOME": str(self.root / "home"), "CODEX_HOME": str(self.root / "codex"),
+            "CAGENTS_AGENT_AUTHORITY": "private-preflight-authority",
+            "CAGENTS_BUILD_LOCK": str(self.lock), "CAGENTS_BUILD_SLOTS": "1",
+            "CARGO_BUILD_JOBS": "1", "FIXTURE_ROOT": str(self.root),
+            "TMPDIR": str(self.root / "tmp"), "LC_ALL": "C",
+        }
+        self.children = []
+        self.descendants = []
+        self.addCleanup(self.cleanup_processes)
+        self.configure()
+
+    def configure(self, **config):
+        (self.root / "control.json").write_text(json.dumps(config))
+
+    def cleanup_processes(self):
+        (self.root / "release").touch()
+        for _pid, pidfd in self.descendants:
+            if not select.select([pidfd], [], [], 0)[0]:
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        for process in self.children:
+            if process.poll() is None:
+                # Only this fixture's unreaped session leader reserves this
+                # group ID; all its descendants are inert private tools.
+                os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=5)
+        for pid, pidfd in self.descendants:
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            os.close(pidfd)
+
+    def clear(self):
+        for name in ("calls.jsonl", "release"):
+            (self.root / name).unlink(missing_ok=True)
+        for pattern in ("*.ready", "*.signalled"):
+            for path in self.root.glob(pattern):
+                path.unlink()
+
+    def start(self, *, environment=None, pass_fds=()):
+        process = subprocess.Popen(
+            [str(self.root / "cargo-gate"), "test", "--locked", "--no-run"],
+            cwd=self.root, env=self.env if environment is None else environment,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True, pass_fds=pass_fds,
+        )
+        self.children.append(process)
+        return process
+
+    def calls(self):
+        path = self.root / "calls.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def slot_is_free(self):
+        with self.lock.open("a") as slot:
+            try:
+                fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                return False
+
+    def wait_for(self, predicate, label, timeout=5):
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() >= deadline:
+                self.fail("timed out waiting for " + label)
+            time.sleep(0.01)
+
+    def assert_preflight_unslotted(self, calls):
+        for event in calls:
+            if event["phase"] not in ("compiler", "compiler-stdin"):
+                self.assertFalse(event["held"], event)
+                self.assertFalse(event["marker"], event)
+                self.assertEqual(event["protected"], {
+                    name: self.env[name] for name in ("HOME", "CODEX_HOME", "CAGENTS_AGENT_AUTHORITY")
+                })
+
+    def test_each_preflight_phase_forwards_cancellation_and_drains_before_exit(self):
+        for phase in ("metadata", "guard", "seed"):
+            for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+                with self.subTest(phase=phase, signal=number):
+                    self.clear()
+                    self.configure(hold=phase)
+                    process = self.start()
+                    ready = self.root / (phase + ".ready")
+                    self.wait_for(ready.exists, phase + " ready")
+                    pid = json.loads(ready.read_text())["pid"]
+                    pidfd = os.pidfd_open(pid)
+                    self.descendants.append((pid, pidfd))
+                    self.assertTrue(self.slot_is_free())
+                    process.send_signal(number)
+                    deadline = time.monotonic() + 1
+                    receipt = self.root / (phase + ".signalled")
+                    while not receipt.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    forwarded = receipt.exists()
+                    running = process.poll() is None
+                    child_alive = not select.select([pidfd], [], [], 0)[0]
+                    slot_free = self.slot_is_free()
+                    (self.root / "release").touch()
+                    _stdout, stderr = process.communicate("", timeout=5)
+                    self.wait_for(lambda: bool(select.select([pidfd], [], [], 0)[0]), "exact child cleanup")
+                    try:
+                        caller_reaped = os.waitpid(pid, os.WNOHANG)[0] == pid
+                    except ChildProcessError:
+                        caller_reaped = False
+                    calls = self.calls()
+                    late_builds = [event for event in calls if event["phase"] == "compiler"]
+                    observation = dict(forwarded=forwarded, gate_running=running,
+                                       child_alive=child_alive, late_builds=late_builds,
+                                       caller_had_to_reap_child=caller_reaped)
+                    self.assertTrue(forwarded, observation)
+                    self.assertTrue(running, "gate exited before its exact owned child cleaned up")
+                    self.assertTrue(child_alive, "fixture cleanup hold was not exercised")
+                    self.assertTrue(slot_free, "preflight must not occupy build admission")
+                    self.assertEqual(process.returncode, 128 + number, stderr)
+                    self.assertEqual(late_builds, [], "cancellation must not reach the compiler")
+                    self.assert_preflight_unslotted(calls)
+                    self.assertTrue(select.select([pidfd], [], [], 0)[0])
+                    self.assertFalse(caller_reaped, "gate left an owned preflight child for its caller to reap")
+                    self.assertTrue(self.slot_is_free())
+
+    def test_policy_marker_stdin_descriptor_and_compile_exit_are_preserved(self):
+        for config, expected, phases in (
+            ({"compiler_exit": 17}, 17, ["metadata", "guard", "seed", "compiler", "compiler-stdin"]),
+            ({"guard_exit": 2}, 2, ["metadata", "guard"]),
+            ({"seed_exit": 19}, 0, ["metadata", "guard", "seed", "compiler", "compiler-stdin"]),
+        ):
+            with self.subTest(config=config):
+                self.clear()
+                self.configure(**config)
+                with (self.root / "caller-output").open("w") as output:
+                    process = self.start(environment=self.env | {"FIXTURE_OUTPUT_FD": str(output.fileno())},
+                                         pass_fds=(output.fileno(),))
+                    stdout, stderr = process.communicate("synthetic caller stdin\n", timeout=5)
+                self.assertEqual(process.returncode, expected, stderr)
+                calls = self.calls()
+                self.assertEqual([event["phase"] for event in calls], phases)
+                self.assert_preflight_unslotted(calls)
+                if "compiler" in phases:
+                    compiler = next(event for event in calls if event["phase"] == "compiler")
+                    self.assertTrue(compiler["held"], compiler)
+                    self.assertTrue(compiler["marker"], compiler)
+                    self.assertEqual((self.root / "caller-output").read_text(), "synthetic caller stdin\n")
+                    self.assertEqual(stdout, "private compiler output\n")
+                else:
+                    self.assertEqual(stdout, "")
+                    self.assertEqual((self.root / "caller-output").read_text(), "")
+                self.assertTrue(self.slot_is_free())
+
+    def test_failed_or_empty_metadata_still_skips_helpers_and_builds(self):
+        for config in ({"metadata_exit": 37}, {"build_directory": ""}):
+            with self.subTest(config=config):
+                self.clear()
+                self.configure(guard_exit=2, **config)
+                process = self.start()
+                _stdout, stderr = process.communicate("", timeout=5)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertEqual([event["phase"] for event in self.calls()],
+                                 ["metadata", "compiler", "compiler-stdin"])
+                self.assert_preflight_unslotted(self.calls())
+                self.assertTrue(self.slot_is_free())
+
+
 if __name__ == "__main__":
     unittest.main()
