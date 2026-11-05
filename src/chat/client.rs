@@ -7335,7 +7335,10 @@ mod tests {
         impl Drop for CallbackOwner {
             fn drop(&mut self) {
                 let _ = self.0.send(thread::current().id());
-                panic!("fixture callback owner destructor");
+                // A second panic while unwinding would abort the whole test binary.
+                if !thread::panicking() {
+                    panic!("fixture callback owner destructor");
+                }
             }
         }
         let (destroyed, destruction) = std::sync::mpsc::channel();
