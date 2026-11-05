@@ -1427,7 +1427,7 @@ impl CachedItem {
             + self
                 .blocks
                 .values()
-                .map(prose::CodeBlock::retained_span_bytes)
+                .map(prose::CodeBlock::retained_bytes)
                 .sum::<usize>()
             + self.preview.retained_bytes()
             + self
@@ -14718,10 +14718,7 @@ mod tests {
         assert_eq!(parsed_codes(cached), parsed_codes(&expected));
         for (key, block) in &expected.blocks {
             for dark in [false, true] {
-                assert_eq!(
-                    cached.blocks[key].spans(dark).as_ref(),
-                    block.spans(dark).as_ref()
-                );
+                assert_eq!(cached.blocks[key].highlight(dark), block.highlight(dark));
             }
         }
         // A new child item ends the previous item's continuation, even while
@@ -14778,10 +14775,7 @@ mod tests {
             assert_eq!(parsed_codes(cached), parsed_codes(&expected));
             for (key, block) in &expected.blocks {
                 for dark in [false, true] {
-                    assert_eq!(
-                        cached.blocks[key].spans(dark).as_ref(),
-                        block.spans(dark).as_ref()
-                    );
+                    assert_eq!(cached.blocks[key].highlight(dark), block.highlight(dark));
                 }
             }
         }
@@ -25764,14 +25758,20 @@ mod tests {
         let spans: Vec<_> = cached
             .blocks
             .iter()
-            .map(|(key, block)| (*key, block.spans(false).clone(), block.spans(true).clone()))
+            .map(|(key, block)| {
+                (
+                    *key,
+                    block.highlight(false).clone(),
+                    block.highlight(true).clone(),
+                )
+            })
             .collect();
         cached.suspend_continuations();
         assert_eq!(cached.revision, revision);
         assert_eq!(shown(&cached), displayed);
         for (key, light, dark) in spans {
-            assert!(Arc::ptr_eq(&light, cached.blocks[&key].spans(false)));
-            assert!(Arc::ptr_eq(&dark, cached.blocks[&key].spans(true)));
+            assert!(light.ptr_eq(cached.blocks[&key].highlight(false)));
+            assert!(dark.ptr_eq(cached.blocks[&key].highlight(true)));
         }
         cached.extend(&body, false, theme);
         let fresh = CachedItem::new(&text(&body), theme);
@@ -25926,8 +25926,8 @@ mod tests {
                 let streamed = streamed.blocks.get(key).expect("the same fence");
                 for dark in [false, true] {
                     assert_eq!(
-                        streamed.spans(dark).as_ref(),
-                        block.spans(dark).as_ref(),
+                        streamed.highlight(dark),
+                        block.highlight(dark),
                         "in pieces of {step}"
                     );
                 }
@@ -25953,12 +25953,13 @@ mod tests {
                 .map(|span| span.text.as_ref())
                 .collect::<String>()
         };
+        let code = "fn main() {}\nlet x = 1;\n";
         let block = cached
-            .block(Some("rust"), "fn main() {}\nlet x = 1;\n")
+            .block(Some("rust"), code)
             .expect("the Rust fence is cached");
         for dark in [false, true] {
-            let spans = block.spans(dark);
-            assert_eq!(text_of(spans), "fn main() {}\nlet x = 1;\n");
+            let spans = block.highlight(dark).all(code);
+            assert_eq!(text_of(&spans), code);
             assert!(
                 spans.iter().any(|span| span.color.is_some()),
                 "a keyword takes a color"
@@ -25967,8 +25968,9 @@ mod tests {
         let plain = cached
             .block(None, "plain\n")
             .expect("an unnamed fence is cached too");
-        assert_eq!(text_of(plain.spans(true)), "plain\n");
-        assert!(plain.spans(true).iter().all(|span| span.color.is_none()));
+        let spans = plain.highlight(true).all("plain\n");
+        assert_eq!(text_of(&spans), "plain\n");
+        assert!(spans.iter().all(|span| span.color.is_none()));
         assert!(cached.block(Some("rust"), "fn other() {}\n").is_none());
     }
 
@@ -26231,7 +26233,11 @@ mod tests {
             .block(Some("rust,ignore"), "fn main() {}\n")
             .expect("the fence is cached under the info string the parser hands over");
         assert!(
-            block.spans(true).iter().any(|span| span.color.is_some()),
+            block
+                .highlight(true)
+                .all("fn main() {}\n")
+                .iter()
+                .any(|span| span.color.is_some()),
             "a keyword takes a color"
         );
     }

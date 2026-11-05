@@ -3712,7 +3712,7 @@ mod tests {
         let horizontal_id = block_id(neighbor, None, identity);
         let wanted_body = prose::code_text(
             Arc::from("wanted line\n".repeat(5000)),
-            Arc::from([]),
+            None,
             iced::Pixels(14.0),
             iced::Font::MONOSPACE,
             wanted,
@@ -4331,7 +4331,7 @@ mod tests {
         let byte = line.len() * 1500;
         let text = prose::code_text(
             source,
-            Arc::from([]),
+            None,
             design::TEXT_BODY.into(),
             iced::Font::MONOSPACE,
             target,

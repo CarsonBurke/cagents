@@ -11514,7 +11514,7 @@ mod tests {
                 let body = if raw_code {
                     let code = prose::code_text(
                         code_source.clone(),
-                        Arc::from([]),
+                        None,
                         design::TEXT_BODY.into(),
                         iced::Font::MONOSPACE,
                         target,
