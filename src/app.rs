@@ -14841,9 +14841,13 @@ impl Application for Cagents {
                     Err(error) => Some(error),
                 };
                 if let Some(error) = failure {
-                    self.status = Some(TransientNotice::error(format!(
-                        "Terminal handoff acknowledgement is pending; it will retry after saving recovers or the window refreshes: {error}"
-                    )));
+                    self.status = Some(
+                        TransientNotice::error("Return to terminal is not saved yet").with_details(
+                            format!(
+                                "The terminal keeps running here. Saving retries when storage recovers or this window refreshes; closing the pane ends the terminal and clears the change.\n\n{error}"
+                            ),
+                        ),
+                    );
                     Task::none()
                 } else {
                     self.commit_terminal_handoffs()
@@ -20326,7 +20330,7 @@ mod tests {
             .notices
             .entries
             .iter()
-            .map(|entry| entry.notice.message.as_str())
+            .map(|entry| entry.notice.details.as_deref().unwrap_or_default())
             .collect::<Vec<_>>();
         assert!(
             notices
