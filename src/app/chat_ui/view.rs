@@ -374,12 +374,15 @@ fn queue_waiting_on(snapshot: &chat::Snapshot) -> Option<&'static str> {
     if !snapshot.requests.is_empty() {
         return Some("waiting for your decision");
     }
-    if snapshot
+    match snapshot
         .subagents
         .iter()
-        .any(|agent| agent.status == chat::ToolStatus::Running && !agent.background)
+        .filter(|agent| agent.status == chat::ToolStatus::Running && !agent.background)
+        .count()
     {
-        return Some("waiting for the subagent to return");
+        0 => {}
+        1 => return Some("waiting for the subagent to return"),
+        _ => return Some("waiting for the subagents to return"),
     }
     Some(if activity_label(snapshot) == "Running command" {
         "waiting for this command to finish"
@@ -2680,8 +2683,10 @@ impl Runtime {
             // but a walk through sent messages that has begun keeps the keys.
             // A press while one is already on its way back is still about
             // the queue, and is not left to fall through to that walk.
-            let take_back =
-                !recall_newer && (self.newest_take_back().is_some() || !self.recalling.is_empty());
+            let take_back = !recall_newer
+                && (self.newest_take_back().is_some()
+                    || !self.recalling.is_empty()
+                    || self.snapshot.send_now.is_some_and(chat::SendNow::in_flight));
             crate::ui_controls::field::editor("Message", &self.composer)
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder(placeholder)

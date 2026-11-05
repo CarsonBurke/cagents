@@ -648,9 +648,14 @@ impl Claude {
         if !admitted {
             return;
         }
-        // Naming no message counts everything waiting, which is what the one
-        // queue-level action promises.
-        match self.control(json!({"subtype":"interrupt", "send_now":true})) {
+        // Once the request acts, everything queued goes with the message it
+        // names. Naming none is documented to count everything too, but only
+        // this form has been seen delivering.
+        let Some(oldest) = self.queued.first().map(|message| message.id.clone()) else {
+            self.set_send_now(None, step);
+            return;
+        };
+        match self.control(json!({"subtype":"interrupt", "send_now":true, "message_uuid":oldest})) {
             Ok(request) => {
                 self.send_now_request = Some(SendNowRequest {
                     id: string(&request.writes[0], "request_id").into(),
@@ -670,6 +675,13 @@ impl Claude {
     /// The queue has changed under the request.
     fn settle_send_now(&mut self, step: &mut Step) {
         let done = match &self.send_now_request {
+            // A refusal answered for what was waiting then, not for what
+            // waits now.
+            Some(request) if self.send_now == Some(chat::SendNow::Declined) => !self
+                .queued
+                .iter()
+                .map(|queued| &queued.id)
+                .eq(request.messages.iter()),
             Some(request) => !self
                 .queued
                 .iter()
@@ -727,15 +739,33 @@ impl Claude {
         if string(frame, "subtype") == "task_started" {
             self.command_tasks.retain(|known| known.id != task);
             if string(frame, "task_type") == "local_bash" && frame["owned_by_subagent"] != true {
+                let tool = frame["tool_use_id"].as_str();
+                // The call's own input is the model's word that this command
+                // runs in the background, whatever the task reports of it.
+                let background = frame["is_backgrounded"] == true
+                    || tool
+                        .and_then(|tool| self.tool_inputs.get(&ScopedId::new(None, tool)))
+                        .and_then(|input| serde_json::from_str::<Value>(input).ok())
+                        .is_some_and(|input| input["run_in_background"] == true);
                 self.command_tasks.push_back(CommandTask {
                     id: task.into(),
-                    tool: frame["tool_use_id"].as_str().map(str::to_owned),
+                    tool: tool.map(str::to_owned),
                     description: string(frame, "description").into(),
-                    background: frame["is_backgrounded"] == true,
+                    background,
                     stopping: false,
                 });
                 if self.command_tasks.len() > MAX_TOOLS {
                     self.command_tasks.pop_front();
+                }
+                // Its result may already have read as the command finishing.
+                if background
+                    && let Some(tool) = tool
+                    && let Some(item) = self.tools.get_mut(&ScopedId::new(None, tool))
+                    && let ItemContent::Command { status, .. } = &mut item.content
+                    && *status != ToolStatus::Running
+                {
+                    *status = ToolStatus::Running;
+                    step.events.push(Event::Item(item.clone()));
                 }
             }
         } else if let Some(known) = self.command_tasks.iter_mut().find(|known| known.id == task) {
@@ -2797,9 +2827,6 @@ impl Adapter for Claude {
                                     Some("stopped") => chat::SendNow::Stopped,
                                     _ => chat::SendNow::Declined,
                                 };
-                                if state == chat::SendNow::Declined {
-                                    self.send_now_request = None;
-                                }
                                 self.set_send_now(Some(state), &mut step);
                             }
                         }
@@ -13272,6 +13299,51 @@ mod tests {
         }
 
         #[test]
+        fn a_subagent_outlives_a_reply_stopped_to_deliver() {
+            let replay = trace!("sn_streaming_bg");
+            assert!(
+                replay
+                    .send_now_states()
+                    .contains(&Some(chat::SendNow::Stopped))
+            );
+            assert!(replay.errors().is_empty(), "{:?}", replay.errors());
+            let tool = "toolu_018NLfSywq1Yp4KyVobDrEy8";
+            let statuses: Vec<_> = replay
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Subagent { id, status, .. } if id == tool => Some(*status),
+                    _ => None,
+                })
+                .collect();
+            assert!(!statuses.contains(&ToolStatus::Stopped), "{statuses:?}");
+            assert_eq!(statuses.last(), Some(&ToolStatus::Succeeded));
+            assert!(
+                replay
+                    .shown_text()
+                    .iter()
+                    .any(|(_, text)| text.contains("BANANA"))
+            );
+        }
+
+        #[test]
+        fn a_message_queued_for_the_turn_end_goes_too() {
+            let replay = trace!("sn_fg_bash_later");
+            assert!(
+                replay
+                    .send_now_states()
+                    .contains(&Some(chat::SendNow::Delivering))
+            );
+            assert!(replay.adapter.queued.is_empty());
+            assert!(
+                replay
+                    .shown_text()
+                    .iter()
+                    .any(|(_, text)| text.contains("BANANA"))
+            );
+        }
+
+        #[test]
         fn a_moved_foreground_agent_becomes_a_background_subagent() {
             let replay = trace!("sn_fg_agent_next");
             assert_eq!(
@@ -13298,6 +13370,18 @@ mod tests {
                     .count(),
                 1
             );
+            // It is the request the recording made: naming the oldest.
+            let oldest = replay
+                .writes
+                .iter()
+                .find(|write| write["priority"] == "next")
+                .unwrap();
+            let request = replay
+                .writes
+                .iter()
+                .find(|write| write["request"]["send_now"] == true)
+                .unwrap();
+            assert_eq!(request["request"]["message_uuid"], oldest["uuid"]);
             assert!(replay.adapter.queued.is_empty());
             let text = replay.shown_text();
             assert!(text.iter().any(|(_, text)| text.contains("BANANA")));
@@ -13373,10 +13457,9 @@ mod tests {
         }
 
         #[test]
-        fn nothing_waiting_is_not_a_failure() {
+        fn asking_with_nothing_queued_writes_nothing() {
             let replay = trace!("sn_nothing");
             assert!(replay.errors().is_empty());
-            // The recording asked with nothing queued. Nothing is sent or shown.
             assert!(replay.send_now_states().is_empty());
             assert!(
                 !replay
@@ -13642,6 +13725,82 @@ mod tests {
                 event,
                 Event::Error { message, .. } if message == "API Error: overloaded"
             )));
+        }
+
+        #[test]
+        fn a_refusal_lasts_only_while_the_queue_it_answered_stands() {
+            let mut adapter = working();
+            let first = adapter
+                .send_prompt("first".into(), vec![], PromptMode::Steer)
+                .unwrap()
+                .writes[0]["uuid"]
+                .clone();
+            queued(&mut adapter, &first);
+            let request = adapter.command(Command::SendQueuedNow).unwrap().writes[0].clone();
+            adapter
+                .receive(json!({"type":"control_response","response":{
+                    "subtype":"success",
+                    "request_id":request["request_id"],
+                    "response":{"still_queued":[],"send_now":"nothing_waiting"}}}))
+                .unwrap();
+            assert_eq!(adapter.send_now, Some(chat::SendNow::Declined));
+            // The same message reported again has not changed what was asked.
+            queued(&mut adapter, &first);
+            assert_eq!(adapter.send_now, Some(chat::SendNow::Declined));
+            let second = adapter
+                .send_prompt("second".into(), vec![], PromptMode::Steer)
+                .unwrap()
+                .writes[0]["uuid"]
+                .clone();
+            queued(&mut adapter, &second);
+            assert_eq!(adapter.send_now, None);
+        }
+
+        #[test]
+        fn a_command_started_in_the_background_is_listed_and_running() {
+            // No recording shows this order or what the task reports here.
+            let mut adapter = working();
+            adapter
+                .receive(json!({"type":"assistant","uuid":"a1","message":{"id":"m1","content":[
+                    {"type":"tool_use","id":"t1","name":"Bash",
+                     "input":{"command":"sleep 99","run_in_background":true}}]}}))
+                .unwrap();
+            adapter
+                .receive(json!({"type":"user","uuid":"u1","message":{"content":[
+                    {"type":"tool_result","tool_use_id":"t1",
+                     "content":"Command running in background with ID: b1"}]}}))
+                .unwrap();
+            let step = adapter
+                .receive(json!({"type":"system","subtype":"task_started","uuid":"s1",
+                    "task_id":"b1","tool_use_id":"t1","task_type":"local_bash",
+                    "description":"Sleep"}))
+                .unwrap();
+            assert!(step.events.iter().any(|event| matches!(
+                event,
+                Event::BackgroundCommands(commands) if commands.iter().any(|c| c.id == "b1")
+            )));
+            assert!(step.events.iter().any(|event| matches!(
+                event,
+                Event::Item(Item {
+                    content: ItemContent::Command { status: ToolStatus::Running, .. },
+                    ..
+                })
+            )));
+        }
+
+        #[test]
+        fn a_foreground_command_is_not_offered_as_a_background_one() {
+            let mut adapter = working();
+            adapter
+                .receive(json!({"type":"assistant","uuid":"a1","message":{"id":"m1","content":[
+                    {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 99"}}]}}))
+                .unwrap();
+            adapter
+                .receive(json!({"type":"system","subtype":"task_started","uuid":"s1",
+                    "task_id":"b1","tool_use_id":"t1","task_type":"local_bash",
+                    "description":"Sleep"}))
+                .unwrap();
+            assert!(adapter.background_commands().is_empty());
         }
 
         #[test]

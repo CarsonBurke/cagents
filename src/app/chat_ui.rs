@@ -2726,6 +2726,7 @@ impl Runtime {
             && message.editable
             && !self.taken_back.contains(&message.id)
             && !self.is_recalling(&message.id)
+            && !self.snapshot.send_now.is_some_and(chat::SendNow::in_flight)
     }
 
     fn is_recalling(&self, id: &str) -> bool {
@@ -4383,6 +4384,14 @@ impl Runtime {
                 && !snapshot.busy
         {
             self.interrupt_armed = None;
+        }
+        // The queue can take longer to leave than a press stays quiet, and
+        // the press was about it for as long as it was on its way.
+        if self.send_now_pressed.is_some()
+            && self.snapshot.send_now.is_some_and(chat::SendNow::in_flight)
+            && !snapshot.send_now.is_some_and(chat::SendNow::in_flight)
+        {
+            self.send_now_pressed = Some(Instant::now());
         }
         self.last_presented_tail = snapshot
             .items
@@ -19795,10 +19804,82 @@ mod tests {
         // A subagent's report arriving does not take the confirmation away.
         show_chat_snapshot_for_test(&mut app, card, idle.clone());
         assert!(chat_runtime(&app, card).interrupt_armed.is_some());
-        // Nor does it survive what it named ending.
+        // The second press is the stop.
+        drop(app.handle_chat_ui(Action::Interrupt(target)));
+        assert!(chat_runtime(&app, card).interrupt_armed.is_none());
+        assert!(chat_runtime(&app, card).pending.is_some());
+        settle(&mut app, card, Ok(()));
+        // A confirmation does not survive what it named ending.
+        drop(app.handle_chat_ui(Action::Interrupt(target)));
+        assert!(chat_runtime(&app, card).interrupt_armed.is_some());
         idle.subagents[0].status = chat::ToolStatus::Succeeded;
         show_chat_snapshot_for_test(&mut app, card, idle);
         assert!(chat_runtime(&app, card).interrupt_armed.is_none());
+    }
+
+    #[test]
+    fn escape_stays_quiet_past_a_slow_delivery() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = subagent_turn(&mut app, card, &["a"]);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.send_now = Some(chat::SendNow::Delivering);
+        show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
+        // Pressed long enough ago that only the delivery ending can keep it quiet.
+        let long_ago = Instant::now() - 4 * SEND_NOW_ESCAPE_QUIET;
+        app.chat_runtime_mut(target).unwrap().send_now_pressed = Some(long_ago);
+        snapshot.send_now = None;
+        snapshot.queued_messages.clear();
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        drop(app.handle_chat_ui(Action::EscapeTurn(target)));
+        assert!(chat_runtime(&app, card).interrupt_armed.is_none());
+        assert!(chat_runtime(&app, card).pending.is_none());
+    }
+
+    #[test]
+    fn escape_sends_the_queue_with_no_subagent_at_stake() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = subagent_turn(&mut app, card, &["a"]);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.subagents.clear();
+        show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
+        drop(app.handle_chat_ui(Action::EscapeTurn(target)));
+        // Only sending the queue marks the press; a stop would leave it unset.
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.pending.is_some());
+        assert!(runtime.send_now_pressed.is_some());
+        settle(&mut app, card, Ok(()));
+        // Once the provider has refused, the press is a plain stop.
+        app.chat_runtime_mut(target).unwrap().send_now_pressed = None;
+        snapshot.send_now = Some(chat::SendNow::Declined);
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        drop(app.handle_chat_ui(Action::EscapeTurn(target)));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.pending.is_some());
+        assert!(runtime.send_now_pressed.is_none());
+    }
+
+    #[test]
+    fn a_message_on_its_way_cannot_be_taken_back() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = subagent_turn(&mut app, card, &["a"]);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.capabilities.queue_remove = true;
+        snapshot.queued_messages[0].editable = true;
+        show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
+        assert!(chat_runtime(&app, card).newest_take_back().is_some());
+        snapshot.send_now = Some(chat::SendNow::Stopped);
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        assert!(chat_runtime(&app, card).newest_take_back().is_none());
+        drop(app.handle_chat_ui(Action::TakeBackQueued(target, None)));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.pending.is_none());
+        assert!(runtime.recalling.is_empty());
     }
 
     /// Answers the command `card` is waiting on with `result`.
