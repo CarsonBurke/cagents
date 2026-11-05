@@ -3150,6 +3150,14 @@ impl Adapter for Codex {
                             .unwrap_or_else(|| turn["error"].to_string()),
                         fatal: false,
                     });
+                } else if current && method == "turn/completed" && turn["status"] == "failed" {
+                    // The outcome takes its reason from this turn's latest
+                    // error. Without one of its own, an earlier warning, such
+                    // as a subagent that could not be stopped, would stand in.
+                    step.events.push(Event::Error {
+                        message: "Codex reported the turn failed without a reason".into(),
+                        fatal: false,
+                    });
                 }
                 step.events.extend(finished);
                 if method == "turn/completed" {
@@ -7332,6 +7340,29 @@ mod tests {
             })
         );
         assert!(updates.try_iter().any(|update| matches!(update, chat::runtime::Update::AttentionContext { evidence: evidence, .. } if evidence.key == "codex:thread-exact:current" && evidence.kind == Kind::Failed)));
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn codex_failed_completion_without_an_error_states_that_itself() {
+        let (handle, _updates, frames, _) = controlled_runtime_frames(adapter());
+        feed_frames(
+            &handle,
+            &frames,
+            vec![turn_frame("thread-exact", "current", "inProgress")],
+        );
+        feed_frames(
+            &handle,
+            &frames,
+            vec![turn_frame("thread-exact", "current", "failed")],
+        );
+        let after = handle.snapshot(None).unwrap();
+        assert_eq!(
+            after.outcome,
+            Some(crate::agent::ActivityOutcome::Failed {
+                reason: "Codex reported the turn failed without a reason".into()
+            })
+        );
         handle.close().unwrap();
     }
 
