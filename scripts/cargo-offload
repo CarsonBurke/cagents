@@ -242,6 +242,30 @@ def temporary_directory(slot):
     return path
 
 
+def clear(path):
+    """Removes a directory tree, including directories a test left without
+    owner permissions."""
+    def retry(function, failed, _error):
+        parent = os.path.dirname(failed)
+        for directory in (parent, failed):
+            try:
+                if os.path.isdir(directory) and not os.path.islink(directory):
+                    os.chmod(directory, 0o700)
+            except OSError:
+                pass
+        try:
+            if os.path.isdir(failed) and not os.path.islink(failed):
+                shutil.rmtree(failed, ignore_errors=True)
+            else:
+                function(failed)
+        except OSError:
+            pass
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry)
+    else:
+        shutil.rmtree(path, onerror=retry)
+
+
 def enclosing_checkout(path):
     """A Git marker above `path`, under which tests that check Git ancestry
     fail, or None."""
@@ -386,8 +410,8 @@ elif command == "run":
     # limited to 108 bytes. The slot runs one command at a time, so whatever
     # the last one left there is stale.
     environment["TMPDIR"] = temporary = temporary_directory(base)
-    shutil.rmtree(temporary, ignore_errors=True)
-    os.makedirs(temporary, mode=0o700)
+    clear(temporary)
+    os.makedirs(temporary, mode=0o700, exist_ok=True)
 
     # build.rs asks Git for the version stamp only when it is not given; the
     # slot is not a repository, and whatever encloses it is not this one.

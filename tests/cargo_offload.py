@@ -16,6 +16,7 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -151,6 +152,22 @@ class EnclosingCheckout(unittest.TestCase):
             Path(root, "a", ".git").rmdir()
             Path(deep, ".git").write_text("gitdir: x")
             self.assertIsNone(scope["enclosing_checkout"](str(deep)))
+
+
+class Clear(unittest.TestCase):
+    def test_directories_left_without_permissions_are_removed(self):
+        tree = ast.parse(offload.REMOTE_AGENT)
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.FunctionDef) and node.name == "clear")
+        scope = {"os": os, "shutil": shutil, "sys": sys}
+        exec(compile(ast.Module([function], []), "agent", "exec"), scope)
+        with tempfile.TemporaryDirectory() as root:
+            locked = Path(root, "t", "a", "target")
+            (locked / "deep").mkdir(parents=True)
+            (locked / "deep" / "file").write_text("")
+            locked.chmod(0)
+            scope["clear"](str(Path(root, "t")))
+            self.assertFalse(Path(root, "t").exists())
 
 
 class TemporaryDirectory(unittest.TestCase):
