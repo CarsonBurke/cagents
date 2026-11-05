@@ -145,6 +145,11 @@ fn installer_entrypoints_refuse_inherited_callers_before_tools_or_purge() {
                     String::from_utf8_lossy(&output.stderr).contains("require your own terminal"),
                     "{script}: {output:?}"
                 );
+                let message = String::from_utf8_lossy(&output.stderr);
+                assert!(message.contains("Cagents terminals are hosted sessions."));
+                assert!(message.contains(
+                    "A person must run this command from a system terminal outside cagents."
+                ));
                 assert!(output.stdout.is_empty());
                 assert!(!root.path().join("tool-invoked").exists());
                 for leaf in ["data", "config", "cache"] {

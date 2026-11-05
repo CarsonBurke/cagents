@@ -1571,9 +1571,32 @@ impl Registry {
 
     /// Called after confirmed runtime teardown, never before requesting it.
     pub(crate) fn close_agent(&mut self, origin: &Origin, id: AgentId) -> Result<Agent, String> {
-        if self.pending_agent_launch(id)?.is_some() {
-            return Err("The pending provider launch has not been conclusively retired".into());
-        }
+        self.close_agent_checked(origin, id, None)
+    }
+
+    /// A dispatch failure may leave no reusable provider because startup never
+    /// created one, or its launch owner conclusively retired it. Absence of a
+    /// bound session alone is not that proof: require the exact failed,
+    /// unstarted dispatch and no outstanding private launch in the same write
+    /// transaction that retires the empty agent.
+    pub(crate) fn close_unstarted_automation_agent(
+        &mut self,
+        expected_agent: &Agent,
+        expected_run: &Run,
+    ) -> Result<Agent, String> {
+        self.close_agent_checked(
+            &expected_agent.origin,
+            expected_agent.id,
+            Some((expected_agent, expected_run)),
+        )
+    }
+
+    fn close_agent_checked(
+        &mut self,
+        origin: &Origin,
+        id: AgentId,
+        unstarted: Option<(&Agent, &Run)>,
+    ) -> Result<Agent, String> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1581,6 +1604,58 @@ impl Registry {
         let mut agent = read_agent(&tx, id)?;
         if &agent.origin != origin {
             return Err("This caller does not own the agent".into());
+        }
+        let pending: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_launches WHERE agent=?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if pending {
+            return Err("The pending provider launch has not been conclusively retired".into());
+        }
+        if let Some((expected_agent, expected_run)) = unstarted {
+            let latest: String = tx
+                .query_row(
+                    "SELECT record FROM agent_runs WHERE agent=?1 ORDER BY rowid DESC LIMIT 1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let claimed: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_dispatches WHERE run=?1)",
+                    [expected_run.id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let interactive: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_policies WHERE agent=?1 AND interactive=1)",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if agent != *expected_agent
+                || agent.closed
+                || !matches!(agent.origin, Origin::Automation { .. })
+                || agent.session.is_some()
+                || agent.console.is_some()
+                || expected_run.agent != id
+                || expected_run.state != State::Failed
+                || expected_run.started_ms.is_some()
+                || expected_run.provider_key.is_some()
+                || expected_run.finished_ms.is_none()
+                || decode::<Run>(&latest)? != *expected_run
+                || !claimed
+                || interactive
+            {
+                return Err(
+                    "The exact failed dispatch no longer proves an unstarted automation agent"
+                        .into(),
+                );
+            }
         }
         let active: bool = tx
             .query_row(
@@ -1913,6 +1988,148 @@ mod tests {
         model::ProjectKind,
         workspace_model::ModelEdit,
     };
+
+    #[test]
+    fn unstarted_automation_close_requires_exact_failed_dispatch_and_no_custody() {
+        for case in [
+            "unstarted",
+            "pending",
+            "bound",
+            "interactive",
+            "newer_accepted",
+            "newer_failed",
+            "started",
+            "interrupted",
+            "unclaimed",
+            "cancelled",
+            "changed_run",
+            "user_owned",
+            "rollback",
+        ] {
+            let (mut registry, _directory, request) = fixture();
+            let origin = if case == "user_owned" {
+                Origin::User
+            } else {
+                Origin::Automation {
+                    id: uuid::Uuid::new_v4(),
+                }
+            };
+            let accepted = registry.submit_agent(&origin, &request, 1).unwrap();
+            // This model-only fixture installs the dispatch claim directly;
+            // the private-daemon contract exercises the real claim/launcher.
+            if case != "unclaimed" {
+                registry
+                    .db
+                    .execute(
+                        "INSERT INTO agent_dispatches(run, claimed_at) VALUES (?1, 2)",
+                        [accepted.run.id.to_string()],
+                    )
+                    .unwrap();
+            }
+            let current = if case == "started" {
+                registry
+                    .update_agent_run(
+                        accepted.run.id,
+                        accepted.run.revision,
+                        Update::Started {
+                            provider_key: "confirmed-provider-turn".into(),
+                        },
+                        3,
+                    )
+                    .unwrap()
+            } else {
+                accepted.run
+            };
+            let state = match case {
+                "interrupted" => State::Interrupted,
+                "cancelled" => State::Cancelled,
+                _ => State::Failed,
+            };
+            let mut failed = registry
+                .update_agent_run(
+                    current.id,
+                    current.revision,
+                    Update::Finished {
+                        state,
+                        result: ResultSummary {
+                            diagnostic: Some("Original provider startup failure".into()),
+                            ..Default::default()
+                        },
+                    },
+                    4,
+                )
+                .unwrap();
+            let expected_agent = registry.agent(accepted.agent.id).unwrap();
+            match case {
+                "pending" => registry
+                    .reserve_agent_launch(accepted.agent.id, &source())
+                    .unwrap(),
+                "bound" => {
+                    registry
+                        .bind_agent(accepted.agent.id, None, source())
+                        .unwrap();
+                }
+                "interactive" => registry
+                    .claim_agent_interaction(accepted.agent.id, None)
+                    .unwrap(),
+                "newer_accepted" | "newer_failed" => {
+                    let next = registry
+                        .submit_agent(
+                            &origin,
+                            &Submit {
+                                destination: Destination::Existing(accepted.agent.id),
+                                idempotency_key: "newer-acceptance".into(),
+                                ..request.clone()
+                            },
+                            5,
+                        )
+                        .unwrap();
+                    if case == "newer_failed" {
+                        registry
+                            .update_agent_run(
+                                next.run.id,
+                                next.run.revision,
+                                Update::Finished {
+                                    state: State::Failed,
+                                    result: ResultSummary::default(),
+                                },
+                                6,
+                            )
+                            .unwrap();
+                    }
+                }
+                "changed_run" => failed.result.diagnostic = Some("Stale receipt".into()),
+                "rollback" => registry.db.execute_batch("CREATE TRIGGER refuse_empty_close BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture close failure'); END;").unwrap(),
+                _ => {}
+            }
+            let before_agent = registry.agent(accepted.agent.id).unwrap();
+            let before_run = registry.agent_run(current.id).unwrap();
+            let before_model = registry.model().unwrap();
+            let before_pending = registry.pending_agent_launch(accepted.agent.id).unwrap();
+            let result = registry.close_unstarted_automation_agent(&expected_agent, &failed);
+            assert_eq!(result.is_ok(), case == "unstarted", "{case}: {result:?}");
+            if case == "unstarted" {
+                assert!(registry.agent(accepted.agent.id).unwrap().closed);
+            } else {
+                assert_eq!(
+                    registry.agent(accepted.agent.id).unwrap(),
+                    before_agent,
+                    "{case}"
+                );
+                assert_eq!(registry.model().unwrap(), before_model, "{case}");
+            }
+            assert_eq!(
+                registry.agent_run(current.id).unwrap(),
+                before_run,
+                "{case}"
+            );
+            assert_eq!(
+                registry.pending_agent_launch(accepted.agent.id).unwrap(),
+                before_pending,
+                "{case}"
+            );
+        }
+    }
 
     fn source() -> HostedSession {
         HostedSession::Chat(crate::chat::Session {
