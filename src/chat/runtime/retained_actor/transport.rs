@@ -584,11 +584,9 @@ impl RemoteActor {
         if self.0.close_only {
             return Err(close_only_refusal());
         }
-        let control =
-            registry::connect_until(&self.0.socket, deadline).map_err(|error| error.to_string())?;
-        verify_peer(&control, &self.0.identity.record)?;
-        deadline_io::send_until(
-            &control,
+        let resolved: Result<chat::Session, String> = exchange(
+            &self.0.socket,
+            &self.0.identity.record,
             &Invocation {
                 proof: self.0.proof.clone(),
                 epoch: Some(self.0.epoch),
@@ -597,8 +595,6 @@ impl RemoteActor {
             },
             deadline,
         )?;
-        let resolved: Result<chat::Session, String> =
-            deadline_io::receive_until(&control, deadline)?;
         let resolved = resolved?;
         if resolved.id != self.0.identity.record.terminal
             || resolved.proof.as_ref() != Some(&self.0.proof)
@@ -922,14 +918,12 @@ impl RemoteActor {
         deadline: Instant,
     ) -> Result<ActorInspection, String> {
         if Instant::now() >= deadline {
-            return Err("Retained actor inspection deadline expired".into());
+            return Err("Retained actor deadline expired before the `inspect` request".into());
         }
         validate_record(record)?;
-        let control =
-            registry::connect_until(socket, deadline).map_err(|error| error.to_string())?;
-        verify_peer(&control, record)?;
-        deadline_io::send_until(
-            &control,
+        let response: Result<ActorInspection, String> = exchange(
+            socket,
+            record,
             &Invocation {
                 proof,
                 epoch: None,
@@ -938,8 +932,6 @@ impl RemoteActor {
             },
             deadline,
         )?;
-        let response: Result<ActorInspection, String> =
-            deadline_io::receive_until(&control, deadline)?;
         let response = response?;
         if response.identity.record != *record || response.source.id != record.terminal {
             return Err("Retained actor inspection returned another exact holder identity".into());
@@ -990,11 +982,9 @@ impl RemoteActor {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         validate_record(record)?;
-        let control =
-            registry::connect_until(socket, deadline).map_err(|error| error.to_string())?;
-        verify_peer(&control, record)?;
-        deadline_io::send_until(
-            &control,
+        let attached: Result<Attached, String> = exchange(
+            socket,
+            record,
             &Invocation {
                 proof: proof.clone(),
                 epoch: None,
@@ -1003,7 +993,6 @@ impl RemoteActor {
             },
             deadline,
         )?;
-        let attached: Result<Attached, String> = deadline_io::receive_until(&control, deadline)?;
         let attached = attached?;
         if &attached.identity.record != record || attached.close_only != close_only {
             return Err("Retained actor changed identity during attachment".into());
@@ -1303,29 +1292,33 @@ impl RemoteActor {
             return Err(close_only_refusal());
         }
         let deadline = Instant::now() + TIMEOUT;
-        let control =
-            registry::connect_until(&self.0.socket, deadline).map_err(|error| error.to_string())?;
-        verify_peer(&control, &self.0.identity.record)?;
-        deadline_io::send_until(
-            &control,
-            &Invocation {
-                proof: self.0.proof.clone(),
-                epoch: Some(self.0.epoch),
-                method: "pinned_directory".into(),
-                args: Value::Null,
-            },
-            deadline,
-        )?;
-        let (response, mut descriptors) = crate::descriptor_frame::receive_json_with_fds_until::<
-            Result<crate::agent_execution::DirectoryIdentity, String>,
-        >(
-            &control,
-            deadline,
-            MAX_FRAME,
-            1,
-            crate::descriptor_frame::FrameByteOrder::LittleEndian,
-        )?;
-        verify_peer(&control, &self.0.identity.record)?;
+        let (response, mut descriptors) = (|| {
+            let control = registry::connect_until(&self.0.socket, deadline)
+                .map_err(|error| error.to_string())?;
+            verify_peer(&control, &self.0.identity.record)?;
+            deadline_io::send_until(
+                &control,
+                &Invocation {
+                    proof: self.0.proof.clone(),
+                    epoch: Some(self.0.epoch),
+                    method: "pinned_directory".into(),
+                    args: Value::Null,
+                },
+                deadline,
+            )?;
+            let received = crate::descriptor_frame::receive_json_with_fds_until::<
+                Result<crate::agent_execution::DirectoryIdentity, String>,
+            >(
+                &control,
+                deadline,
+                MAX_FRAME,
+                1,
+                crate::descriptor_frame::FrameByteOrder::LittleEndian,
+            )?;
+            verify_peer(&control, &self.0.identity.record)?;
+            Ok::<_, String>(received)
+        })()
+        .map_err(|error| format!("{error} during the retained actor `pinned_directory` request"))?;
         match response {
             Err(error) => Err(error),
             Ok(identity) => {
@@ -1353,11 +1346,9 @@ impl RemoteActor {
         if self.0.close_only && !close_only_method(method) {
             return Err(close_only_refusal());
         }
-        let control =
-            registry::connect_until(&self.0.socket, deadline).map_err(|error| error.to_string())?;
-        verify_peer(&control, &self.0.identity.record)?;
-        deadline_io::send_until(
-            &control,
+        let response: Result<Value, String> = exchange(
+            &self.0.socket,
+            &self.0.identity.record,
             &Invocation {
                 proof: self.0.proof.clone(),
                 epoch: Some(self.0.epoch),
@@ -1366,7 +1357,6 @@ impl RemoteActor {
             },
             deadline,
         )?;
-        let response: Result<Value, String> = deadline_io::receive_until(&control, deadline)?;
         serde_json::from_value(response?).map_err(|error| error.to_string())
     }
     pub fn enqueue(
@@ -3144,6 +3134,30 @@ fn validate_record(record: &Record) -> Result<(), String> {
         return Err("Native holder is incompatible with retained Claude actor protocol; no input was replayed".into());
     }
     Ok(())
+}
+/// One request to the exact helper behind `socket`, within one absolute
+/// deadline. A transport failure names the request it interrupted; the
+/// helper's own result is returned unchanged in the decoded frame, so callers
+/// can still match the helper's refusals.
+fn exchange<T: DeserializeOwned>(
+    socket: &std::path::Path,
+    record: &Record,
+    invocation: &Invocation,
+    deadline: Instant,
+) -> Result<T, String> {
+    (|| {
+        let control =
+            registry::connect_until(socket, deadline).map_err(|error| error.to_string())?;
+        verify_peer(&control, record)?;
+        deadline_io::send_until(&control, invocation, deadline)?;
+        deadline_io::receive_until(&control, deadline)
+    })()
+    .map_err(|error| {
+        format!(
+            "{error} during the retained actor `{}` request",
+            invocation.method
+        )
+    })
 }
 fn verify_peer(control: &UnixStream, record: &Record) -> Result<(), String> {
     let credentials = peer(control)?;

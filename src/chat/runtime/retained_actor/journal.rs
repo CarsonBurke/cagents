@@ -96,7 +96,19 @@ impl Journal {
         let retention = crate::transcript_cache::ActorJournalRetention::create(directory, &created)
             .map_err(|error| error.to_string())?;
         let db = Connection::open(path).map_err(|error| error.to_string())?;
-        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
+        // This journal lives exactly as long as its helper process: it is
+        // created exclusively above and never reopened. It must survive a
+        // daemon crash or upgrade, which the live helper and the kernel page
+        // cache already guarantee. An OS crash ends the helper and invalidates
+        // its boot-bound records, so fsync protects no reachable reader. Each
+        // fsync also stalls the helper's single request loop, by seconds on a
+        // host with heavy write load, so RPCs queued behind it can miss their
+        // deadlines (#2180). Commits therefore reach the kernel without fsync.
+        //
+        // Keep the rollback journal: closing a WAL connection checkpoints
+        // into this file after its drained disposition records the file's
+        // size and mtime, so the cache could never reclaim it.
+        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF;
             CREATE TABLE outcomes(sequence INTEGER PRIMARY KEY AUTOINCREMENT,payload BLOB NOT NULL);
             CREATE TABLE retained_runs(run TEXT PRIMARY KEY,finished INTEGER);
             CREATE TABLE inputs(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL,hash BLOB NOT NULL,state BLOB NOT NULL);
@@ -139,8 +151,8 @@ impl Journal {
         if bytes.len() > 4 * 1024 * 1024 {
             return Err("Retained source lineage capacity reached".into());
         }
-        // synchronous=FULL is established at journal creation. Publish the
-        // in-memory view only after the exact aggregate commits successfully.
+        // Publish the in-memory view only after the exact aggregate commits
+        // successfully.
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
         tx.execute(
             "INSERT INTO metadata(key,value) VALUES('published_sources',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -731,6 +743,37 @@ mod tests {
         bytes
             .map(|bytes| serde_json::from_slice(&bytes).unwrap())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn commits_skip_fsync_and_keep_a_reclaimable_rollback_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        // 0 is OFF: the helper's request loop never waits for the disk.
+        let synchronous: i64 = journal
+            .db
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 0);
+        let mode: String = journal
+            .db
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        // A committed write is visible to another reader without fsync, and
+        // leaves no sidecar that would change the file after its disposition.
+        let source = super::super::transport::fixture_source();
+        journal.remember_published_source(&source).unwrap();
+        assert_eq!(durable_sources(root.path()), vec![source]);
+        for sidecar in ["-journal", "-wal", "-shm"] {
+            assert!(
+                !root
+                    .path()
+                    .join(format!("actor-journal.sqlite{sidecar}"))
+                    .exists(),
+                "{sidecar}"
+            );
+        }
     }
 
     #[test]
