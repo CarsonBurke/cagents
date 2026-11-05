@@ -2,7 +2,7 @@
 //! message has to end up attached to that conversation, not left on a draft
 //! that offers to start it again.
 use super::*;
-use crate::workspace_model::views::{Pane, Scope, View};
+use crate::workspace_model::views::{Change, Pane, Scope, View};
 
 struct Peer {
     app: Cagents,
@@ -93,6 +93,15 @@ fn peer() -> Peer {
     Arc::make_mut(&mut app.durable).active_channel = Some(channel);
     app.workspace_model.identity = uuid::Uuid::new_v4();
     app.workspace_model.sequence = 1;
+    app.workspace_model
+        .channels
+        .push(crate::workspace_model::ModelChannel {
+            id: channel,
+            repository: std::path::PathBuf::from("/repo/.git"),
+            title: String::new(),
+            title_source: Default::default(),
+            ordinal: 1,
+        });
     app.workspace_model.views.push(View {
         revision: 1,
         ..View::empty(channel)
@@ -295,6 +304,102 @@ fn a_start_given_up_elsewhere_returns_an_attaching_window_to_the_draft() {
     assert_eq!(draft_runtime(&peer.app, peer.card).session, peer.draft);
 }
 
+/// A window that finished attaching, with its own session update still
+/// waiting for the host's answer.
+fn attached_with_update_pending(peer: &mut Peer) -> (uuid::Uuid, Change) {
+    write(&mut peer.app, peer.card, "not sent yet");
+    attach_started(peer);
+    let target = attempt_target(peer);
+    let handle = super::tests::fixture_handle(&peer.app, peer.card, Some("provider-conversation"));
+    drop(peer.app.update(Message::ChatUi(Action::Ready(
+        target,
+        Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+    ))));
+    assert!(!peer.app.chat_is_draft(peer.card));
+    let (operation, _, change) = peer.app.shared_views.pending.first().unwrap().clone();
+    (operation, change)
+}
+
+fn assert_back_on_the_draft(peer: &Peer) {
+    let runtime = draft_runtime(&peer.app, peer.card);
+    assert_eq!(runtime.session, peer.draft);
+    assert_eq!(runtime.unsent_text(), "not sent yet");
+    assert!(peer.app.chat_ui.retiring.is_empty());
+}
+
+/// The host took this window's update before the other window gave the start
+/// up: the attachment is dropped, not retired.
+#[test]
+fn a_start_given_up_after_attaching_returns_the_window_to_the_draft() {
+    let mut peer = peer();
+    let (operation, _) = attached_with_update_pending(&mut peer);
+    let kind = peer.app.card_state(peer.card).unwrap().kind.clone();
+    drop(project(&mut peer.app, peer.channel, peer.card, kind));
+    peer.app
+        .acknowledge_view_edit(Scope::Channel(peer.channel), Some(operation));
+    assert!(peer.app.shared_views.pending.is_empty());
+
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(peer.draft.clone()),
+    ));
+
+    assert_back_on_the_draft(&peer);
+}
+
+/// The other window gave the start up first, so the host refuses this window's
+/// update. The refusal must not leave it attached to the abandoned start.
+#[test]
+fn a_start_given_up_before_the_update_lands_returns_the_window_to_the_draft() {
+    let mut peer = peer();
+    let (operation, change) = attached_with_update_pending(&mut peer);
+    let mut model = peer.app.workspace_model.clone();
+    let view = model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == Scope::Channel(peer.channel))
+        .unwrap();
+    view.revision += 1;
+    view.panes[0].kind = CardKind::Chat(peer.draft.clone());
+    model.sequence += 1;
+
+    drop(peer.app.refuse_conflicting_view_update(
+        Scope::Channel(peer.channel),
+        operation,
+        change,
+        model,
+        "The workspace view changed".into(),
+    ));
+
+    assert_back_on_the_draft(&peer);
+}
+
+/// A connection that arrives after the other window gave the start up is
+/// dropped: it neither replaces the draft nor retires anything.
+#[test]
+fn a_late_connection_after_a_start_given_up_elsewhere_changes_nothing() {
+    let mut peer = peer();
+    attach_started(&mut peer);
+    let target = attempt_target(&peer);
+    let handle = super::tests::fixture_handle(&peer.app, peer.card, Some("provider-conversation"));
+
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(peer.draft.clone()),
+    ));
+    drop(peer.app.update(Message::ChatUi(Action::Ready(
+        target,
+        Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+    ))));
+
+    assert_eq!(draft_runtime(&peer.app, peer.card).session, peer.draft);
+    assert!(peer.app.chat_ui.retiring.is_empty());
+}
+
 /// An attachment that already failed is not left on the failure when the
 /// window it was attaching to goes back to its draft.
 #[test]
@@ -454,7 +559,7 @@ fn session_update(peer: &mut Peer, publish: chat::Session, current: chat::Sessio
         scope: None,
         kind,
     };
-    let change = crate::workspace_model::views::Change::Update {
+    let change = Change::Update {
         before: pane(CardKind::Chat(peer.draft.clone())),
         pane: pane(CardKind::Chat(publish)),
     };
@@ -542,4 +647,16 @@ fn what_this_window_wrote_is_in_the_composer_once_attached() {
     assert!(!runtime.is_draft());
     assert_eq!(runtime.unsent_text(), "not sent yet");
     assert!(!peer.app.chat_ui.drafts.contains_key(&peer.card));
+}
+
+/// A refused edit that changed no session can be a lost name or width, so it
+/// is not mistaken for a session update another window already made.
+#[test]
+fn losing_a_race_with_no_session_change_still_warns() {
+    let mut peer = peer();
+    let unchanged = peer.draft.clone();
+
+    session_update(&mut peer, unchanged.clone(), unchanged);
+
+    assert!(warned_of_refused_update(&peer));
 }

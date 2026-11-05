@@ -6184,6 +6184,8 @@ impl Cagents {
         self.stash_unsent_chat_draft(card);
         self.cards.remove(&card);
         self.lifecycle.remove(card);
+        self.resolve_notice(NoticeKey::ChatAttach(card));
+        self.observe_agent_activity_for_card(card, None);
         true
     }
 
