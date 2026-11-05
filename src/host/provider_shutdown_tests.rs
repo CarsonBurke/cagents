@@ -484,6 +484,7 @@ fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
     let source = chat::Session {
         id,
         launch: chat::Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Codex,
             recipe: LaunchRecipe {
                 program: "codex".into(),

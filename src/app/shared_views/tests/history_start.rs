@@ -395,6 +395,7 @@ fn begin_history() -> (tempfile::TempDir, Cagents, Scope, Task<Message>) {
             owned_codex_listener: None,
             native_continuity: Default::default(),
             launch: Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 session_id: Some("00000000-0000-4000-8000-000000000001".into()),
                 recipe: LaunchRecipe {

@@ -6150,6 +6150,7 @@ mod tests {
         retained.kind = CardKind::Chat(crate::chat::Session {
             id: "30000000-0000-4000-8000-000000000002".parse().unwrap(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 recipe: LaunchRecipe {
                     program: "claude".into(),
@@ -7599,6 +7600,7 @@ mod tests {
             owned_codex_listener: None,
             id: source.id,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider,
                 recipe: source.launch.clone(),
                 session_id: Some(id.into()),
@@ -9551,6 +9553,7 @@ mod tests {
                 owned_codex_listener: None,
                 id,
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider,
                     recipe,
                     session_id: None,

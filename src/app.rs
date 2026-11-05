@@ -6459,6 +6459,10 @@ impl Cagents {
                 session.transcript_path = transcript_path_for(&session.launch, session.id);
             }
             CardKind::Chat(session) => {
+                session.launch.draft_model = self.chat_model_for_duplicate(source_id, session);
+                // A clone asks for a new listener rather than inheriting the
+                // source conversation's allocation and continuity.
+                session.reset_owned_codex_listener();
                 let Some(recipe) =
                     crate::model::agent_recovery::fresh_recipe(&session.launch.recipe)
                 else {
@@ -7578,10 +7582,11 @@ impl Cagents {
         if let Some(session) = &self.session {
             let adoptions = std::mem::take(&mut self.shared_views.adoptions);
             let restorations = std::mem::take(&mut self.shared_views.restorations);
-            if adoptions.is_empty() && restorations.is_empty() {
+            let chats = std::mem::take(&mut self.shared_views.chat_replacements);
+            if adoptions.is_empty() && restorations.is_empty() && chats.is_empty() {
                 session.snapshot(saved);
             } else {
-                session.snapshot_terminal_panes(saved, adoptions, restorations);
+                session.snapshot_shared_panes(saved, adoptions, restorations, chats);
             }
         }
     }
@@ -26654,6 +26659,7 @@ mod tests {
                     owned_codex_listener: None,
                     id: TerminalId::new(),
                     launch: crate::chat::Launch {
+                        draft_model: None,
                         provider: crate::agent::Provider::Claude,
                         recipe,
                         session_id: None,
@@ -26754,6 +26760,7 @@ mod tests {
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Claude,
                 recipe,
                 session_id: Some(conversation.into()),

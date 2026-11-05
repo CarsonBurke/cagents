@@ -61,6 +61,7 @@ impl Fixture {
         let source = Session {
             id: TerminalId::new(),
             launch: chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 recipe: crate::model::LaunchRecipe {
                     program: "claude".into(),

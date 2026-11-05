@@ -640,6 +640,7 @@ mod tests {
         let unnamed = Session {
             id,
             launch: Launch {
+                draft_model: None,
                 provider: crate::agent::Provider::Codex,
                 recipe: LaunchRecipe {
                     program: "codex".into(),

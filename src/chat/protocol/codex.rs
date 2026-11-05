@@ -4139,6 +4139,7 @@ mod tests {
 
     fn owned_listener_test_launch(home: &std::path::Path) -> Launch {
         Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Codex,
             session_id: None,
             recipe: crate::model::LaunchRecipe {
@@ -5486,6 +5487,7 @@ mod tests {
         let socket = directory.join("app-server-control.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let launch = Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Codex,
             session_id: None,
             recipe: crate::model::LaunchRecipe {
@@ -7116,6 +7118,7 @@ mod tests {
         let socket = directory.path().join("shared.sock");
         let _server = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let launch = Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Codex,
             session_id: Some("thread-exact".into()),
             recipe: crate::model::LaunchRecipe {
@@ -7170,6 +7173,7 @@ mod tests {
     fn a_new_thread_carries_the_terminal_bypass_into_its_own_settings() {
         let directory = tempfile::tempdir().unwrap();
         let launch = Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Codex,
             session_id: None,
             recipe: crate::model::LaunchRecipe {
@@ -7203,6 +7207,7 @@ mod tests {
     fn a_new_thread_takes_its_reasoning_effort_as_a_start_override() {
         let directory = tempfile::tempdir().unwrap();
         let launch = |arguments: &[&str]| Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Codex,
             session_id: None,
             recipe: crate::model::LaunchRecipe {

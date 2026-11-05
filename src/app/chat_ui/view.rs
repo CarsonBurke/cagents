@@ -3448,23 +3448,17 @@ impl Runtime {
                 .reasoning
                 .iter()
                 .position(|reasoning| Some(reasoning) == snapshot.reasoning.as_ref());
+            let label = snapshot.reasoning.as_deref().unwrap_or("Reasoning");
             if transitioning {
-                controls.push(
-                    design::caption(
-                        selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
-                    )
-                    .into(),
-                );
+                controls.push(design::caption(label).into());
             } else {
                 let open = self.reasoning_picker;
-                let anchor = widget::button::custom(design::caption(
-                    selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
-                ))
-                .name("Choose reasoning effort")
-                .id(card_control_id(target.card, "chat-reasoning-picker"))
-                .class(crate::ui_controls::control_style(open, None))
-                .padding(CONTROL_PADDING)
-                .on_press(action(Action::ReasoningPicker(target, !open)));
+                let anchor = widget::button::custom(design::caption(label))
+                    .name("Choose reasoning effort")
+                    .id(card_control_id(target.card, "chat-reasoning-picker"))
+                    .class(crate::ui_controls::control_style(open, None))
+                    .padding(CONTROL_PADDING)
+                    .on_press(action(Action::ReasoningPicker(target, !open)));
                 let choices = open.then(|| {
                     widget::column::with_children(
                         model
@@ -3502,6 +3496,10 @@ impl Runtime {
                     action(Action::ReasoningPicker(target, false)),
                 ));
             }
+        } else if draft && let Some(reasoning) = snapshot.reasoning.as_deref() {
+            // Another window may know a model this catalog has not listed
+            // yet. Its selected effort still belongs to the shared draft.
+            controls.push(design::caption(reasoning).into());
         }
         if !snapshot.capabilities.permission_modes.is_empty() {
             let modes = &snapshot.capabilities.permission_modes;
@@ -6756,6 +6754,7 @@ mod tests {
             let session = chat::Session {
                 id: crate::model::TerminalId::new(),
                 launch: chat::Launch {
+                    draft_model: None,
                     provider,
                     recipe: crate::model::LaunchRecipe::shell(PathBuf::from("/unused")).unwrap(),
                     session_id: None,
@@ -6812,6 +6811,66 @@ mod tests {
         assert!(!live.is_draft());
         assert!(live.handle().is_some());
         assert_eq!(live.conversation_status(false), (None, "Ready".into()));
+    }
+
+    #[test]
+    fn draft_model_effort_remains_visible_before_this_window_lists_its_choices() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.into());
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        for models in [
+            vec![],
+            vec![chat::Model {
+                id: "shared-model".into(),
+                label: "shared-model".into(),
+                reasoning: vec!["low".into()],
+            }],
+        ] {
+            let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+            runtime.connection = Connection::Draft;
+            runtime.snapshot = Arc::new(draft_snapshot(
+                runtime.session.launch.provider,
+                models,
+                Some("shared-model".into()),
+                Some("high".into()),
+            ));
+            for width in [280.0, 720.0] {
+                let controls = runtime.session_controls(false, None, Vec::new(), &shortcuts);
+                let mut element: Element<'_, Message> = widget::row::with_children(controls).into();
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 100.0)),
+                );
+                let mut texts = Texts::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut texts,
+                );
+                assert!(
+                    texts.0.iter().any(|text| text == "shared-model"),
+                    "{:?}",
+                    texts.0
+                );
+                assert!(texts.0.iter().any(|text| text == "high"), "{:?}", texts.0);
+            }
+        }
     }
 
     #[test]
@@ -11820,6 +11879,7 @@ mod tests {
             chat::Session {
                 id: crate::model::TerminalId::new(),
                 launch: chat::Launch {
+                    draft_model: None,
                     provider: Provider::Claude,
                     recipe: crate::model::LaunchRecipe::shell(PathBuf::from("/unused")).unwrap(),
                     session_id: None,

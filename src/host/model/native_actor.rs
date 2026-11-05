@@ -337,6 +337,7 @@ mod tests {
         let source = chat::Session {
             id: TerminalId::new(),
             launch: chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 recipe: LaunchRecipe {
                     program: "claude".into(),
@@ -513,6 +514,7 @@ mod tests {
         let source = chat::Session {
             id: TerminalId::new(),
             launch: chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 recipe: LaunchRecipe {
                     program: "claude".into(),

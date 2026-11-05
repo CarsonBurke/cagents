@@ -34,6 +34,7 @@ fn removal_retires_only_completed_missing_providers_from_a_proven_previous_boot(
                     unset_environment: Default::default(),
                 },
                 session_id: Some(Uuid::new_v4().to_string()),
+                draft_model: None,
             },
             native_continuity: Default::default(),
             proof: (case != 3).then_some(proof),

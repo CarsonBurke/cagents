@@ -371,6 +371,7 @@ mod tests {
         canonical.kind = CardKind::Chat(crate::chat::Session {
             id: terminal.id,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 recipe: terminal.launch.clone(),
                 session_id: None,

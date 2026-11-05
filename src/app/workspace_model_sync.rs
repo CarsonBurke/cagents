@@ -431,6 +431,15 @@ fn source_update_conflicts(
             })
 }
 
+#[cfg(test)]
+pub(in crate::app) fn source_update_conflicts_for_test(
+    model: &WorkspaceModel,
+    scope: &crate::workspace_model::views::Scope,
+    change: &crate::workspace_model::views::Change,
+) -> bool {
+    source_update_conflicts(model, scope, change)
+}
+
 /// What adopting one shared row asked of the window.
 enum Adoption {
     /// The window's own store changed.
@@ -861,7 +870,12 @@ impl Cagents {
         if self.durable.workspace_model_identity == Some(identity) {
             return;
         }
+        // A pending automatic composer is a window navigation intent, not
+        // authority from the old registry. The new scope must initialize
+        // before that exact still-selected intent can open anything.
+        let deferred_default = self.shared_views.deferred_default.take();
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
+        self.shared_views.deferred_default = deferred_default;
         self.clear_closed_chat_drafts();
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);
@@ -2284,6 +2298,7 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 session_id: None,
                 recipe: LaunchRecipe {
@@ -2514,6 +2529,7 @@ mod tests {
                 terminal: None,
                 owned_codex_listener: None,
                 launch: crate::chat::Launch {
+                    draft_model: None,
                     provider: Provider::Claude,
                     session_id: None,
                     recipe: LaunchRecipe {
@@ -2930,6 +2946,7 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 session_id: None,
                 recipe: LaunchRecipe {

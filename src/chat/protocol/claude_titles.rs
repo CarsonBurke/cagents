@@ -223,6 +223,7 @@ mod tests {
             .unwrap();
         }
         let mut launch = Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Claude,
             session_id: Some(id.into()),
             recipe: crate::model::LaunchRecipe {
@@ -354,6 +355,7 @@ mod tests {
         std::fs::create_dir_all(&parent).unwrap();
         let path = parent.join(format!("{id}.jsonl"));
         let launch = Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Claude,
             session_id: Some(id.clone()),
             recipe: crate::model::LaunchRecipe {

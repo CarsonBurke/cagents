@@ -880,6 +880,7 @@ mod managed_display_tests {
         let native = crate::chat::Session {
             id: console.id,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 session_id: Some("existing-conversation".into()),
                 recipe,

@@ -2,6 +2,7 @@
 //! Stores remain read-only. Exact retained providers missing from startup
 //! discovery may be authenticated through Resolve; no launch recipe is run.
 mod current;
+mod legacy_session;
 mod v68;
 mod v77;
 #[cfg(test)]
@@ -539,6 +540,7 @@ mod tests {
         Session {
             id: TerminalId::new(),
             launch: Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 recipe: LaunchRecipe {
                     program: "claude".into(),

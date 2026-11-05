@@ -1,5 +1,6 @@
 //! Deliberately restricted reader for the protocol-68 source schema at 503a3319573cfa19d54e4450894bd94ded0c4d65.
 //! Never use this client for ordinary connections or provider attachment.
+use super::legacy_session::LegacySession;
 use crate::{chat::Session, model::HostSessionProof, terminal::ipc};
 use serde::{
     Deserialize, Serialize,
@@ -52,7 +53,7 @@ impl Serialize for Request<'_> {
                     "ResolveUpgradeChat",
                     1,
                 )?;
-                value.serialize_field("source", source)?;
+                value.serialize_field("source", &LegacySession::from((*source).clone()))?;
                 value.end()
             }
         }
@@ -136,11 +137,11 @@ struct Connected {
 }
 #[derive(Deserialize)]
 struct Listed {
-    sessions: Vec<Session>,
+    sessions: Vec<LegacySession>,
 }
 #[derive(Deserialize)]
 struct Resolved {
-    session: Session,
+    session: LegacySession,
 }
 struct EmptyResume;
 impl<'de> Deserialize<'de> for EmptyResume {
@@ -183,11 +184,13 @@ impl<'de> Deserialize<'de> for Response {
                     }
                     13 => {
                         let value: Listed = payload.newtype_variant()?;
-                        Ok(Response::Listed(value.sessions))
+                        Ok(Response::Listed(
+                            value.sessions.into_iter().map(Session::from).collect(),
+                        ))
                     }
                     18 => {
                         let value: Resolved = payload.newtype_variant()?;
-                        Ok(Response::Resolved(value.session))
+                        Ok(Response::Resolved(value.session.into()))
                     }
                     _ => Err(de::Error::custom(
                         "source response is outside the read-only compatibility contract",

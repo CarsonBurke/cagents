@@ -415,6 +415,7 @@ mod tests {
             Provider::Omp => "PI_CODING_AGENT_DIR",
         };
         Launch {
+            draft_model: None,
             provider,
             recipe: LaunchRecipe {
                 unset_environment: Default::default(),

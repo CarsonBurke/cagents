@@ -3169,6 +3169,7 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
     let source = Session {
         id: TerminalId::new(),
         launch: chat::Launch {
+            draft_model: None,
             provider: Provider::Claude,
             recipe: crate::model::LaunchRecipe {
                 program: provider.to_string_lossy().into_owned(),
@@ -3735,6 +3736,7 @@ fn unattached_claude_cleanup_refuses_unsupported_protocol_before_reservation() {
     let source = Session {
         id: TerminalId::new(),
         launch: chat::Launch {
+            draft_model: None,
             provider: Provider::Claude,
             recipe: crate::model::LaunchRecipe {
                 program: "/not-a-real-provider".into(),

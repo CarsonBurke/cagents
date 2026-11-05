@@ -409,6 +409,7 @@ fn cached_chat() -> (Cagents, ChannelId, ChannelId, Pane, uuid::Uuid) {
     pane.kind = CardKind::Chat(Session {
         id: TerminalId::new(),
         launch: Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Claude,
             session_id: Some("00000000-0000-4000-8000-000000000001".into()),
             recipe: LaunchRecipe {

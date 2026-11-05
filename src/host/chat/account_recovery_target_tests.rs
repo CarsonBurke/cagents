@@ -160,6 +160,7 @@ done
         proof: Some(proof),
         terminal: None,
         launch: chat::Launch {
+            draft_model: None,
             provider: Provider::Claude,
             session_id: Some(CONVERSATION.into()),
             recipe: LaunchRecipe {

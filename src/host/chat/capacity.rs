@@ -225,6 +225,7 @@ mod tests {
         Session {
             id: TerminalId::new(),
             launch: chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 session_id: None,
                 recipe: crate::model::LaunchRecipe {

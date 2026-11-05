@@ -245,6 +245,7 @@ mod tests {
                     owned_codex_listener: None,
                     native_continuity: Default::default(),
                     launch: crate::chat::Launch {
+                        draft_model: None,
                         provider: crate::agent::Provider::Codex,
                         session_id: None,
                         recipe: LaunchRecipe {

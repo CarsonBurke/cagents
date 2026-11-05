@@ -2277,6 +2277,7 @@ mod tests {
         let session = crate::chat::Session {
             id: crate::model::TerminalId::new(),
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider,
                 recipe: crate::model::LaunchRecipe {
                     program: "/bin/sh".into(),

@@ -652,6 +652,7 @@ fn confirmed_reconnect_only_actor_is_not_a_source_update_acknowledgment() {
     let source = Session {
         id: TerminalId::new(),
         launch: Launch {
+            draft_model: None,
             provider: Provider::Codex,
             recipe,
             session_id: Some(THREAD.into()),
@@ -786,6 +787,7 @@ impl Fixture {
         let mut source = Session {
             id: TerminalId::new(),
             launch: Launch {
+                draft_model: None,
                 provider: Provider::Codex,
                 recipe: LaunchRecipe {
                     program: program.to_string_lossy().into_owned(),

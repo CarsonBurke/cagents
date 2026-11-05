@@ -3920,6 +3920,7 @@ pub(in crate::host) mod tests {
         let source = Session {
             id: identity.record.terminal,
             launch: chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 recipe: LaunchRecipe::shell("/".into()).unwrap(),
                 session_id: Some(uuid::Uuid::new_v4().to_string()),
@@ -3975,6 +3976,7 @@ pub(in crate::host) mod tests {
         let root = tempfile::tempdir().unwrap();
         for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
             let mut launch = chat::Launch {
+                draft_model: None,
                 provider,
                 session_id: None,
                 recipe: LaunchRecipe {
@@ -4087,6 +4089,7 @@ pub(in crate::host) mod tests {
                 } >= 0
             );
             let mut launch = chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 session_id: Some(CONVERSATION.into()),
                 recipe: LaunchRecipe {
@@ -4224,6 +4227,7 @@ pub(in crate::host) mod tests {
             watches.push(watcher);
         }
         let launch = chat::Launch {
+            draft_model: None,
             provider: Provider::Claude,
             session_id: Some(ID.into()),
             recipe: LaunchRecipe {
@@ -4297,6 +4301,7 @@ pub(in crate::host) mod tests {
             proof: None,
             terminal: None,
             launch: chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 recipe: LaunchRecipe {
                     program: "/bin/false".into(),
@@ -4345,6 +4350,7 @@ pub(in crate::host) mod tests {
     #[test]
     fn an_upgrade_restores_the_environment_a_chat_actually_started_with() {
         let launch = chat::Launch {
+            draft_model: None,
             provider: Provider::Omp,
             recipe: LaunchRecipe {
                 unset_environment: Default::default(),
@@ -4389,6 +4395,7 @@ pub(in crate::host) mod tests {
             "/selected".into(),
         );
         let launch = chat::Launch {
+            draft_model: None,
             provider: Provider::Claude,
             recipe: LaunchRecipe {
                 program: "claude".into(),
@@ -4451,6 +4458,7 @@ pub(in crate::host) mod tests {
         };
         let expected = bind_session(&recipe, SELECTED).unwrap();
         let launch = chat::Launch {
+            draft_model: None,
             provider: Provider::Codex,
             recipe: expected.clone(),
             session_id: Some(SELECTED.into()),
@@ -4628,6 +4636,7 @@ pub(in crate::host) mod tests {
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: chat::Launch {
+                draft_model: None,
                 provider: Provider::Codex,
                 recipe: LaunchRecipe {
                     unset_environment: Default::default(),
@@ -4706,6 +4715,7 @@ for line in sys.stdin:
             host_incarnation: HostIncarnation::new("new-incarnation"),
         };
         let launch = chat::Launch {
+            draft_model: None,
             provider: Provider::Omp,
             recipe: LaunchRecipe {
                 unset_environment: Default::default(),
@@ -5752,6 +5762,7 @@ done
             proof: Some(proof),
             terminal: None,
             launch: chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 session_id: Some(conversation.into()),
                 recipe: LaunchRecipe {
@@ -6014,6 +6025,7 @@ done
             native_continuity: Default::default(),
             owned_codex_listener: None,
             launch: chat::Launch {
+                draft_model: None,
                 provider: Provider::Codex,
                 recipe: LaunchRecipe {
                     unset_environment: Default::default(),
@@ -6111,6 +6123,7 @@ done
             proof: None,
             terminal: None,
             launch: chat::Launch {
+                draft_model: None,
                 provider: Provider::Codex,
                 recipe: recipe.clone(),
                 session_id: Some(identity.into()),
@@ -6422,6 +6435,7 @@ done
             owned_codex_listener: None,
             id: chat_id,
             launch: chat::Launch {
+                draft_model: None,
                 provider: if return_terminal {
                     Provider::Claude
                 } else {
@@ -6589,6 +6603,7 @@ done
                         owned_codex_listener: None,
                         id: chat_id,
                         launch: chat::Launch {
+                            draft_model: None,
                             provider: Provider::Claude,
                             recipe,
                             session_id: None,

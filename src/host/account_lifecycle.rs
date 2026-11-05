@@ -1298,6 +1298,7 @@ pub(crate) mod tests {
             proof: None,
             terminal: None,
             launch: crate::chat::Launch {
+                draft_model: None,
                 provider: Provider::Claude,
                 session_id: Some(uuid::Uuid::new_v4().to_string()),
                 recipe: crate::model::LaunchRecipe {
@@ -1401,6 +1402,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let launch = crate::chat::Launch {
+            draft_model: None,
             provider: Provider::Codex,
             session_id: Some(uuid::Uuid::new_v4().to_string()),
             recipe: crate::model::LaunchRecipe {

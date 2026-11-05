@@ -195,7 +195,10 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 148 carries a draft's chosen model and effort in its shared Launch.
+/// The optional field defaults in persisted JSON, but changes positional
+/// postcard requests, responses and shared views, so all peers must match.
+pub const PROTOCOL_VERSION: u16 = 148;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -2090,6 +2093,98 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn draft_model_choices_round_trip_through_ipc_and_shared_panes_and_default_in_old_json() {
+        use crate::{
+            agent::Provider,
+            chat::{DraftModel, Launch, Session},
+        };
+        let session = Session {
+            id: TerminalId::new(),
+            launch: Launch {
+                provider: Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: vec!["--remote".into(), "unix://".into()],
+                    working_directory: "/workspace/chat-fixture".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: None,
+                draft_model: None,
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        for choice in [
+            None,
+            Some(DraftModel {
+                model: "shared-model".into(),
+                reasoning: Some("high".into()),
+            }),
+        ] {
+            let mut session = session.clone();
+            session.launch.draft_model = choice;
+            let request = ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: 19,
+                proof: None,
+                request: ClientRequest::ChatStart {
+                    session: session.clone(),
+                    source: None,
+                    terminate_source: false,
+                    execution_environment: Default::default(),
+                },
+            };
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &request).unwrap();
+            assert_eq!(
+                read_frame::<ClientEnvelope>(&mut Cursor::new(bytes)).unwrap(),
+                Some(request)
+            );
+            let response = ServerResponse::ChatAttached {
+                session: session.clone(),
+                snapshot: crate::chat::Snapshot::default(),
+            };
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &response).unwrap();
+            assert_eq!(
+                read_frame::<ServerResponse>(&mut Cursor::new(bytes)).unwrap(),
+                Some(response)
+            );
+            let pane = crate::workspace_model::views::Pane {
+                id: crate::model::CardId::new(),
+                title: "Shared draft".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 0.5,
+                kind: crate::model::CardKind::Chat(session.clone()),
+                scope: None,
+            };
+            let bytes = postcard::to_stdvec(&pane).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<crate::workspace_model::views::Pane>(&bytes).unwrap(),
+                pane
+            );
+
+            let mut legacy = serde_json::to_value(&session).unwrap();
+            legacy["launch"]
+                .as_object_mut()
+                .unwrap()
+                .remove("draft_model");
+            let decoded: Session = serde_json::from_value(legacy).unwrap();
+            assert_eq!(decoded.launch.draft_model, None);
+            assert_eq!(decoded.launch.recipe, session.launch.recipe);
+            assert!(decoded.is_unstarted());
+        }
+        assert!(
+            PROTOCOL_VERSION > 128,
+            "the installed positional layout must not be reused"
+        );
+    }
 
     #[test]
     fn scrollback_options_keep_legacy_json_and_positional_wire_bytes() {

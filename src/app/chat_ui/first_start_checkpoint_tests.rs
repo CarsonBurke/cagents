@@ -58,6 +58,31 @@ fn fixture_for_provider(provider: Provider) -> (Cagents, tempfile::TempDir, Card
     (app, directory, card, target)
 }
 
+fn choose_checkpoint_model(app: &mut Cagents, target: Target) -> chat::DraftModel {
+    drop(app.observe_listed_models(
+        Provider::Codex,
+        vec![chat::Model {
+            id: "checkpoint-model".into(),
+            label: "Checkpoint model".into(),
+            reasoning: vec!["low".into(), "high".into()],
+        }],
+    ));
+    drop(app.handle_chat_ui(Action::DraftModel(
+        target,
+        Provider::Codex,
+        Some("checkpoint-model".into()),
+    )));
+    drop(app.handle_chat_ui(Action::Reasoning(
+        target,
+        "checkpoint-model".into(),
+        "high".into(),
+    )));
+    chat::DraftModel {
+        model: "checkpoint-model".into(),
+        reasoning: Some("high".into()),
+    }
+}
+
 /// Drive only the save Task. Provider-start Tasks returned by the reducer
 /// below are deliberately not polled against a user's daemon or executable.
 pub(super) fn checkpoint(task: Task<Message>) -> (Target, uuid::Uuid, Result<(), String>) {
@@ -120,7 +145,10 @@ fn no_starter(app: &Cagents, card: CardId) {
 #[test]
 fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_or_starting() {
     let (mut app, _directory, card, target) = fixture();
+    let choice = choose_checkpoint_model(&mut app, target);
+    let pair = Some((choice.model.clone(), choice.reasoning.clone()));
     let source = runtime(&app, card).session.clone();
+    assert_eq!(source.launch.draft_model.as_ref(), Some(&choice));
     let images = runtime(&app, card).attachments.clone();
     let channel = crate::model::ChannelId::new();
     Arc::make_mut(&mut app.durable)
@@ -141,6 +169,8 @@ fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_o
     let task = app.start_chat_draft(target);
     let candidate = app.chat_ui.draft_checkpoints[&card].candidate.clone();
     assert_ne!(candidate.id, source.id);
+    assert_eq!(candidate.launch.draft_model.as_ref(), Some(&choice));
+    assert_eq!(app.chat_ui.draft_checkpoints[&card].model, pair);
     assert!(matches!(
         app.chat_ui.phases.get(&card),
         Some(Phase::SavingDraft { .. })
@@ -153,6 +183,15 @@ fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_o
     );
     assert_eq!(runtime(&app, card).attachments, images);
     assert!(runtime(&app, card).queued.is_none());
+    // A queued effort action cannot edit the shared source while its save
+    // fixes the candidate, even though the draft runtime still exists.
+    drop(app.handle_chat_ui(Action::Reasoning(
+        target,
+        choice.model.clone(),
+        "low".into(),
+    )));
+    assert_eq!(runtime(&app, card).session, source);
+    assert_eq!(runtime(&app, card).snapshot.reasoning, choice.reasoning);
     // An unrelated autosave still stores B but never publishes B as the
     // window's shared/public source before its writer receipt.
     app.persist();
@@ -177,12 +216,26 @@ fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_o
     let saved = stored(&app, card);
     assert_eq!(saved.id, candidate.id);
     assert!(saved.is_unstarted());
+    assert_eq!(saved.launch.draft_model.as_ref(), Some(&choice));
     let store = app.session.as_ref().unwrap().operation_store();
     let restored = store.load_workspace(app.durable.id, None).unwrap().unwrap();
     assert_eq!(restored.chat_drafts[&card], "First prompt remains local");
     assert_eq!(restored.chat_draft_attachments[&card], images);
     assert_eq!(runtime(&app, card).session, source);
     let start = app.draft_start_checkpointed(target, attempt, result);
+    let queued = runtime(&app, card).queued.as_ref().unwrap();
+    assert_eq!(queued.draft.launch.draft_model.as_ref(), Some(&choice));
+    assert_eq!(queued.model, pair);
+    assert_eq!(
+        app.chat_ui
+            .attempt(card)
+            .unwrap()
+            .session
+            .launch
+            .draft_model
+            .as_ref(),
+        Some(&choice)
+    );
     assert!(
         matches!(app.chat_ui.phases.get(&card), Some(Phase::Starting(a)) if a.session.id == candidate.id)
     );
@@ -221,6 +274,11 @@ fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_o
     );
     // A real start-failure reducer, before any user item was accepted,
     // returns the original captured prompt and images to the composer.
+    app.remember_chat_model(
+        Provider::Codex,
+        Some("another-drafts-model".into()),
+        Some("low".into()),
+    );
     let started = app.chat_ui.attempt(card).unwrap().target;
     drop(app.handle_chat_ui(Action::Ready(
         started,
@@ -234,6 +292,11 @@ fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_o
     );
     assert_eq!(runtime(&app, card).attachments, images);
     assert!(runtime(&app, card).queued.is_none());
+    assert_eq!(
+        runtime(&app, card).session.launch.draft_model.as_ref(),
+        Some(&choice)
+    );
+    assert_eq!(draft_model_for_test(&app, card).as_ref(), Some(&choice));
     app.persist();
     app.session
         .as_ref()
@@ -243,6 +306,10 @@ fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_o
     let restored = store.load_workspace(app.durable.id, None).unwrap().unwrap();
     assert_eq!(restored.chat_drafts[&card], "First prompt remains local");
     assert_eq!(restored.chat_draft_attachments[&card], images);
+    assert_eq!(
+        stored(&app, card).launch.draft_model.as_ref(),
+        Some(&choice)
+    );
 }
 
 #[test]
@@ -709,58 +776,98 @@ fn changed_draft_or_source_and_stale_checkpoint_cannot_authorize_first_start() {
 
 #[test]
 fn options_another_window_chose_during_the_first_save_leave_the_draft_sendable() {
-    let (mut app, _directory, card, target) = fixture();
-    let task = app.start_chat_draft(target);
-    let (target, attempt, result) = checkpoint(task);
-    assert!(result.is_ok());
-    // The shared projection installs the peer's recipe on the card; the draft
-    // keeps its launch while its first save is in flight.
-    let CardKind::Chat(chosen) = &mut app.card_state_mut(card).unwrap().kind else {
-        unreachable!()
-    };
-    chosen
-        .launch
-        .recipe
-        .arguments
-        .push("chosen in another window".into());
-    let chosen = chosen.clone();
-    drop(app.adopt_shared_draft_session(card, &chosen));
-    assert_ne!(runtime(&app, card).session, chosen);
+    for change in ["recipe", "model", "effort", "default"] {
+        let (mut app, _directory, card, target) = fixture();
+        let original = choose_checkpoint_model(&mut app, target);
+        let task = app.start_chat_draft(target);
+        let (target, attempt, result) = checkpoint(task);
+        assert!(result.is_ok());
+        // The shared projection installs the peer's options on the card; the
+        // draft keeps its launch while the first save is in flight. The new
+        // typed choices must invalidate that save even when the recipe and
+        // conversation id remain unchanged.
+        let CardKind::Chat(chosen) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        let original_recipe = chosen.launch.recipe.clone();
+        let original_id = chosen.id;
+        match change {
+            "recipe" => chosen
+                .launch
+                .recipe
+                .arguments
+                .push("chosen in another window".into()),
+            "model" => chosen.launch.draft_model.as_mut().unwrap().model = "peer-model".into(),
+            "effort" => chosen.launch.draft_model.as_mut().unwrap().reasoning = Some("low".into()),
+            "default" => chosen.launch.draft_model = None,
+            _ => unreachable!(),
+        }
+        let chosen = chosen.clone();
+        if change != "recipe" {
+            assert_eq!(chosen.launch.recipe, original_recipe);
+        }
+        assert_eq!(chosen.id, original_id);
+        let expected_pair = chosen
+            .launch
+            .draft_model
+            .as_ref()
+            .map(|choice| (choice.model.clone(), choice.reasoning.clone()));
+        drop(app.adopt_shared_draft_session(card, &chosen));
+        assert_ne!(runtime(&app, card).session, chosen, "{change}");
+        assert_eq!(draft_model_for_test(&app, card).as_ref(), Some(&original));
 
-    drop(app.draft_start_checkpointed(target, attempt, result));
-    no_starter(&app, card);
-    assert_eq!(runtime(&app, card).session, chosen);
-    assert_eq!(
-        runtime(&app, card).composer.text(),
-        "First prompt remains local"
-    );
-    assert!(
-        runtime(&app, card)
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("changed in another window")),
-        "a Send that started nothing must say why"
-    );
-    app.session
-        .as_ref()
-        .unwrap()
-        .flush(Duration::from_secs(5))
-        .unwrap();
-    assert_eq!(stored(&app, card), chosen);
+        drop(app.draft_start_checkpointed(target, attempt, result));
+        no_starter(&app, card);
+        assert_eq!(runtime(&app, card).session, chosen, "{change}");
+        assert_eq!(
+            draft_model_for_test(&app, card),
+            chosen.launch.draft_model,
+            "{change}"
+        );
+        assert_eq!(
+            runtime(&app, card).composer.text(),
+            "First prompt remains local"
+        );
+        assert!(
+            runtime(&app, card)
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("changed in another window")),
+            "a Send that started nothing must say why: {change}"
+        );
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(stored(&app, card), chosen, "{change}");
 
-    // Send works again, and starts on the options the other window chose.
-    let retry = app.start_chat_draft(target);
-    let (target, attempt, result) = checkpoint(retry);
-    assert!(result.is_ok());
-    drop(app.draft_start_checkpointed(target, attempt, result));
-    let attempted = app
-        .chat_ui
-        .attempt(card)
-        .expect("retry starts")
-        .session
-        .clone();
-    assert_eq!(attempted.launch.recipe, chosen.launch.recipe);
-    assert_ne!(attempted.id, chosen.id);
+        // Send works again, and starts on the options the other window chose.
+        let retry = app.start_chat_draft(target);
+        let (target, attempt, result) = checkpoint(retry);
+        assert!(result.is_ok());
+        drop(app.draft_start_checkpointed(target, attempt, result));
+        let attempted = app
+            .chat_ui
+            .attempt(card)
+            .expect("retry starts")
+            .session
+            .clone();
+        assert_eq!(attempted.launch, chosen.launch, "{change}");
+        assert_ne!(attempted.id, chosen.id);
+        let queued = runtime(&app, card).queued.as_ref().unwrap();
+        assert_eq!(queued.model, expected_pair, "{change}");
+        assert_eq!(
+            queued.draft.launch.draft_model, chosen.launch.draft_model,
+            "{change}"
+        );
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(stored(&app, card), attempted, "{change}");
+    }
 }
 
 #[test]

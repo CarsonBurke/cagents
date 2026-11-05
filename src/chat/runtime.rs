@@ -7316,6 +7316,7 @@ mod tests {
         )).unwrap();
         std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
         let launch = super::super::Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Claude,
             recipe: crate::model::LaunchRecipe {
                 program: provider.to_string_lossy().into_owned(),
@@ -7413,6 +7414,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
         let launch = super::super::Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Claude,
             recipe: crate::model::LaunchRecipe {
                 program: provider.to_string_lossy().into_owned(),
@@ -7525,6 +7527,7 @@ mod tests {
         };
         assert!(ProcessSpec::from(&recipe).stdout_noise.is_none());
         let launch = super::super::Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Claude,
             recipe,
             session_id: None,
@@ -7677,6 +7680,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
         let launch = super::super::Launch {
+            draft_model: None,
             provider: crate::agent::Provider::Claude,
             recipe: crate::model::LaunchRecipe {
                 program: provider.to_string_lossy().into_owned(),
