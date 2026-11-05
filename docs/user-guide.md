@@ -641,7 +641,7 @@ opens its run under **Automations**, with a trail back to the list, and
 survives provider cleanup. Removing a definition prevents future runs and
 retains its past runs.
 Removal first closes an idle reused agent. Resolve active or uncertain work
-before removing its automation; **View active run** or **View latest run** opens
+before removing its automation; **View run** or **View latest run** opens
 the relevant run for inspection and agent recovery.
 
 The same operations are available without a window:
