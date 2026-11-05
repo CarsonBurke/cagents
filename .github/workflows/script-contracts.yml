@@ -219,6 +219,7 @@ jobs:
               ("native evidence", "scripts/native-evidence", "tests/native_evidence.py"),
               ("build directory seeding", "scripts/seed-build-dir", "tests/seed_build_dir.py"),
               ("build disk guard and gate install", "scripts/build-disk-guard", "tests/build_disk_guard.py"),
+              ("build offload", "scripts/cargo-offload", "tests/cargo_offload.py"),
               ("focused lib tests", "scripts/test-lib", "tests/test_lib.py"),
           ):
               source_present = present(Path(source))
