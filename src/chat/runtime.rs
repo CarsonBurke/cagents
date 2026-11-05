@@ -2080,8 +2080,12 @@ impl Actor {
         let mut garbage_total = 0u64;
         let mut last_ignored = None;
         let mut startup_progress = self.started;
+        // A closed input pipe can precede publication of the provider's exit.
+        // Stop writing, but keep draining its already-readable diagnosis for
+        // the same bounded grace used by protocol EOF below.
+        let mut stdin_closed: Option<(String, Instant)> = None;
         loop {
-            if self.stop.load(Ordering::Acquire) {
+            if stdin_closed.is_none() && self.stop.load(Ordering::Acquire) {
                 if closing.is_none() {
                     closing = Some(Instant::now());
                 }
@@ -2108,7 +2112,9 @@ impl Actor {
                     ));
                 }
             }
-            self.drain_commands(closing.is_some())?;
+            if stdin_closed.is_none() {
+                self.drain_commands(closing.is_some())?;
+            }
             // Parse every frame that already arrived. Gating this on an empty stdin
             // queue froze streaming for a whole turn against any provider that reads
             // stdin only between turns, then killed the session by blaming its
@@ -2179,12 +2185,36 @@ impl Actor {
             if self.output.len() > FRAME_LIMIT {
                 return Err("Provider stdout frame exceeds 32 MiB".into());
             }
+            if let Some((error, at)) = &stdin_closed
+                && ((!frames_ready && stdout_eof && stderr_eof)
+                    || at.elapsed() >= PROTOCOL_EXIT_GRACE)
+            {
+                let grace = PROTOCOL_EXIT_GRACE.saturating_sub(at.elapsed());
+                let message = match self
+                    .child
+                    .as_ref()
+                    .ok_or("Provider process unavailable")?
+                    .observe_exit_within(grace)
+                {
+                    Ok(Some(status)) if !status.success() => {
+                        format!("Provider exited with {status}. {error}")
+                    }
+                    // A successful exit cannot turn undelivered input into a
+                    // successful conversation or hide its write failure.
+                    Ok(Some(status)) => format!("{error}; provider exited with {status}"),
+                    Ok(None) => error.clone(),
+                    Err(observation) => {
+                        format!("{error}; provider exit status unavailable: {observation}")
+                    }
+                };
+                return Err(with_ignored_output(&message, &last_ignored));
+            }
             // Only a genuinely incomplete line is on the framing deadline.
             if frames_ready || self.output.is_empty() {
                 partial_started = None;
             } else {
                 let since = partial_started.get_or_insert_with(Instant::now);
-                if since.elapsed() > IO_TIMEOUT {
+                if stdin_closed.is_none() && since.elapsed() > IO_TIMEOUT {
                     return Err(with_ignored_output(
                         "Provider JSON frame remained incomplete or blocked for 30 seconds",
                         &last_ignored,
@@ -2226,7 +2256,8 @@ impl Actor {
                     &last_ignored,
                 ));
             }
-            if (!self.first_frame || self.adapter.initialization_pending())
+            if stdin_closed.is_none()
+                && (!self.first_frame || self.adapter.initialization_pending())
                 && startup_expired(self.started, startup_progress, Instant::now())
             {
                 return Err(with_ignored_output(
@@ -2238,9 +2269,10 @@ impl Actor {
                     &last_ignored,
                 ));
             }
-            if self
-                .write_started
-                .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
+            if stdin_closed.is_none()
+                && self
+                    .write_started
+                    .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
             {
                 return Err("Provider stdin stalled for 30 seconds".into());
             }
@@ -2273,7 +2305,7 @@ impl Actor {
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: if self.pending.is_empty() {
+                    fd: if self.pending.is_empty() || stdin_closed.is_some() {
                         -1
                     } else {
                         stdin.as_raw_fd()
@@ -2283,9 +2315,16 @@ impl Actor {
                 },
             ];
             let timeout = if frames_ready
-                || (self.queued <= QUEUE_BACKPRESSURE && !self.incoming.is_empty())
+                || (stdin_closed.is_none()
+                    && self.queued <= QUEUE_BACKPRESSURE
+                    && !self.incoming.is_empty())
             {
                 0
+            } else if let Some((_, at)) = &stdin_closed {
+                PROTOCOL_EXIT_GRACE
+                    .saturating_sub(at.elapsed())
+                    .as_nanos()
+                    .div_ceil(1_000_000) as i32
             } else if self.dirty && self.visible.load(Ordering::Acquire) {
                 50
             } else if !self.first_frame
@@ -2311,7 +2350,9 @@ impl Actor {
             if fds[3].revents != 0 {
                 if let Some(line) = self.pending.front() {
                     match stdin.write(&line[self.offset..]) {
-                        Ok(0) => return Err("Provider closed stdin".into()),
+                        Ok(0) => {
+                            stdin_closed = Some(("Provider closed stdin".into(), Instant::now()));
+                        }
                         Ok(n) => {
                             self.offset += n;
                             self.queued -= n;
@@ -2326,6 +2367,9 @@ impl Actor {
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                            stdin_closed = Some((format!("Provider stdin: {e}"), Instant::now()));
+                        }
                         Err(e) => return Err(format!("Provider stdin: {e}")),
                     }
                 }
@@ -8101,6 +8145,176 @@ mod tests {
             descendant.reaped = true;
             assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
         }
+    }
+
+    #[test]
+    fn claude_initialization_write_failure_retains_exit_and_diagnostics() {
+        // The real adapter retries an unsupported optional initialize setting.
+        // Closing stdin before that response guarantees the retry cannot be
+        // delivered; the diagnostic tail also requires continued stderr reads.
+        let (_directory, handle) = claude_initialization_pipe(
+            "import os\n\
+             os.close(0)\n\
+             print('wrapper diagnostic', flush=True)\n\
+             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'error', 'request_id': request['request_id'], 'error': 'Unsupported initialize option'}}), flush=True)\n\
+             sys.stderr.write('z' * 20000 + 'Claude fixture exit diagnostic\\n')\n\
+             sys.stderr.flush()\n\
+             sys.exit(75)\n",
+        );
+        let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(3));
+        let failure = handle.failure().unwrap();
+        assert!(
+            failure.starts_with("Provider exited with exit status: 75"),
+            "{failure}"
+        );
+        assert!(failure.contains("Provider stdin: Broken pipe"), "{failure}");
+        let error = snapshot.error.as_deref().unwrap();
+        assert!(error.contains("Claude fixture exit diagnostic"), "{error}");
+        assert!(
+            error.contains("Last ignored output: wrapper diagnostic"),
+            "{error}"
+        );
+        assert!(error.len() < 17000);
+        assert!(!snapshot.ready);
+    }
+
+    #[test]
+    fn closed_stdin_uses_exact_exit_without_losing_readable_diagnostics() {
+        for (tail, expected) in [
+            ("os._exit(75)", "exit status: 75"),
+            ("os.kill(os.getpid(), signal.SIGTERM)", "signal: 15"),
+        ] {
+            let (_directory, handle) = closed_stdin_fixture(tail, |_| {});
+            let provider = handle.0.provider_process.lock().unwrap().clone().unwrap();
+            let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(3));
+            let failure = handle.failure().unwrap();
+            assert!(failure.starts_with("Provider exited with"), "{failure}");
+            assert!(failure.contains(expected), "{failure}");
+            assert!(failure.contains("Provider stdin: Broken pipe"), "{failure}");
+            assert!(
+                failure.contains("Last ignored output: wrapper diagnostic"),
+                "{failure}"
+            );
+            let error = snapshot.error.as_deref().unwrap();
+            assert!(error.contains(&failure), "{error}");
+            assert!(error.contains("fixture stderr tail"), "{error}");
+            assert!(error.len() < 17000, "stderr diagnosis must remain bounded");
+            assert!(
+                !provider.is_current(),
+                "the original provider must be retired"
+            );
+            assert!(
+                handle.owns_work(),
+                "a known failure still protects the conversation"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_stdin_preserves_live_and_successful_writer_failures_and_close() {
+        for (tail, cancel) in [
+            ("signal.pause()", false),
+            ("os._exit(0)", false),
+            ("signal.pause()", true),
+        ] {
+            let (ready, readiness) = crossbeam_channel::bounded(1);
+            let (_directory, handle) = closed_stdin_fixture(tail, move |update| {
+                if matches!(update, Update::Ready) {
+                    let _ = ready.try_send(());
+                }
+            });
+            let provider = handle.0.provider_process.lock().unwrap().clone().unwrap();
+            if cancel {
+                readiness.recv_timeout(Duration::from_secs(3)).unwrap();
+                // Cancellation can race the failed write and its bounded
+                // diagnostic drain; it still joins the same cleanup owner.
+                handle.close().unwrap();
+            }
+            let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(3));
+            let failure = handle.failure().unwrap();
+            assert!(
+                failure.starts_with("Provider stdin: Broken pipe"),
+                "{failure}"
+            );
+            if tail == "os._exit(0)" {
+                assert!(failure.contains("exit status: 0"), "{failure}");
+            } else {
+                assert!(!failure.contains("provider exited with"), "{failure}");
+            }
+            assert!(snapshot.error.as_deref().unwrap().contains(&failure));
+            assert!(handle.is_completed());
+            assert!(
+                handle.owns_work(),
+                "closed input is never a successful turn"
+            );
+            assert!(
+                !provider.is_current(),
+                "the original provider must be retired"
+            );
+        }
+    }
+
+    /// The provider closes input before its first frame. Only receipt of that
+    /// frame queues a write, so this always exercises EPIPE rather than racing
+    /// between EOF and a successfully flushed initialization. The two files
+    /// synchronize publication of fresh stdout/stderr with that queued write.
+    fn closed_stdin_fixture(
+        tail: &str,
+        notify: impl Fn(Update) + Send + Sync + 'static,
+    ) -> (tempfile::TempDir, LocalHandle) {
+        struct ClosedInput(std::path::PathBuf);
+        impl Adapter for ClosedInput {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture does not accept external commands".into())
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                assert_eq!(frame, json!({"closed": true}));
+                std::fs::write(self.0.join("release-input"), b"release").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !self.0.join("diagnostics-ready").exists() {
+                    if Instant::now() >= deadline {
+                        return Err("fixture diagnosis publication timed out".into());
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok(Step {
+                    writes: vec![json!({"undelivered": true})],
+                    events: vec![Event::Ready(true)],
+                    ..Step::default()
+                })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let body = format!(
+            "import os, pathlib, signal, sys, time\n\
+             os.close(0)\n\
+             print('{{\"closed\":true}}', flush=True)\n\
+             while not pathlib.Path('release-input').exists(): time.sleep(0.001)\n\
+             print('wrapper diagnostic', flush=True)\n\
+             print('fixture stderr began', file=sys.stderr, flush=True)\n\
+             pathlib.Path('diagnostics-ready').touch()\n\
+             sys.stderr.write('z' * 20000 + 'fixture stderr tail\\n')\n\
+             sys.stderr.flush()\n{tail}\n"
+        );
+        let spec = ProcessSpec {
+            stdout_noise: Some(|_| false),
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/python3".into(),
+            arguments: vec!["-c".into(), body],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(ClosedInput(directory.path().into()));
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, notify).unwrap();
+        (directory, handle)
     }
 
     #[test]
