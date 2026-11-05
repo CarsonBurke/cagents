@@ -66,7 +66,7 @@ pub(super) fn reconcile(
         explicit_retry,
         &socket,
         Path::new("/proc"),
-        registered_holder,
+        holder_of_kind,
     )
     .inspect_err(|error| {
         tracing::warn!(terminal = %id, explicit_retry, %error, "terminal recovery refused");
@@ -79,13 +79,7 @@ pub(super) fn inspect_saved_at(
     session: TerminalSession,
     socket: &Path,
 ) -> Result<RecoveredTerminal, String> {
-    reconcile_with(
-        session,
-        false,
-        socket,
-        Path::new("/proc"),
-        registered_holder,
-    )
+    reconcile_with(session, false, socket, Path::new("/proc"), holder_of_kind)
 }
 
 fn reconcile_with(
@@ -93,7 +87,10 @@ fn reconcile_with(
     explicit_retry: bool,
     socket: &Path,
     proc_root: &Path,
-    holder: impl Fn(crate::model::TerminalId) -> Result<Option<i32>, String>,
+    holder: impl Fn(
+        crate::model::TerminalId,
+        crate::daemon::holder_registry::Kind,
+    ) -> Result<Option<i32>, String>,
 ) -> Result<RecoveredTerminal, String> {
     let expected = session
         .continuity
@@ -264,17 +261,41 @@ fn reconcile_with(
         return Err("the saved agent conversation is already hosted by another terminal; preserving the live session".into());
     }
     // A holder doesn't carry the terminal's markers, so the scan below can't see
-    // one, and nothing the daemon lists accounts for it.
+    // one. Only a terminal the daemon saw exit keeps a holder with nothing running
+    // in it, there to keep the output. A terminal handed over lists without an
+    // exit and may still be running. A native provider can outlive its terminal.
+    use crate::daemon::holder_registry::Kind;
     for terminal in [session.id, replacement_id] {
-        if let Some(pid) = holder(terminal)
-            .map_err(|error| format!("cannot check for a process behind this terminal: {error}"))?
-        {
-            return Err(format!(
-                "Process {pid} may still be running this terminal, but the daemon isn't showing it. Starting the terminal again would run a second copy, so nothing was started."
-            ));
+        let exited = terminals.iter().any(|listed| {
+            listed.session.id == terminal
+                && matches!(
+                    listed.session.continuity,
+                    crate::model::TerminalContinuity::RelaunchAvailable {
+                        last_exit: Some(_),
+                        ..
+                    }
+                )
+        });
+        for kind in [Kind::Terminal, Kind::Native] {
+            if exited && kind == Kind::Terminal {
+                continue;
+            }
+            if let Some(pid) = holder(terminal, kind).map_err(|error| {
+                format!("cannot check for a process behind this terminal: {error}")
+            })? {
+                return Err(format!(
+                    "This terminal may still be running in process {pid}, which the daemon isn't showing, {NOTHING_STARTED}: a second copy would run beside it. If you no longer need what it was running, stop that process, then use Retry or Close again. Otherwise leave the pane in place."
+                ));
+            }
         }
     }
-    ensure_no_surviving_process(&session, owner, proc_root)?;
+    if let Some(survivor) = crate::upgrade::surviving_process(&session, owner, proc_root)? {
+        return Err(survivor_refusal(
+            &survivor,
+            NOTHING_STARTED,
+            "use Retry or Close again",
+        ));
+    }
     // Recheck the lease after process inspection. If discovery raced replacement,
     // do not authorize a launch against either incarnation.
     if crate::daemon::replacement_owner(socket, &proof)
@@ -343,11 +364,19 @@ const LEASE_WAIT: Duration = if cfg!(test) {
     Duration::from_secs(5)
 };
 
+fn holder_of_kind(
+    terminal: crate::model::TerminalId,
+    kind: crate::daemon::holder_registry::Kind,
+) -> Result<Option<i32>, String> {
+    crate::daemon::holder_registry::holding_process(terminal, kind)
+        .map_err(|error| error.to_string())
+}
+
 /// A holder that this daemon didn't adopt is alive, and unlisted, by design.
 fn registered_holder(terminal: crate::model::TerminalId) -> Result<Option<i32>, String> {
-    use crate::daemon::holder_registry::{Kind, holding_process};
+    use crate::daemon::holder_registry::Kind;
     for kind in [Kind::Terminal, Kind::Native] {
-        if let Some(pid) = holding_process(terminal, kind).map_err(|error| error.to_string())? {
+        if let Some(pid) = holder_of_kind(terminal, kind)? {
             return Ok(Some(pid));
         }
     }
@@ -450,7 +479,11 @@ fn prove_not_hosted_at(
             cannot_confirm()
         })?
     {
-        return Err(survivor_refusal(&survivor));
+        return Err(survivor_refusal(
+            &survivor,
+            "so the pane was kept",
+            "close the pane again",
+        ));
     }
     if crate::daemon::replacement_owner(socket, &current).map_err(|_| UNREACHABLE)? != owner {
         return Err(UNREACHABLE.into());
@@ -458,7 +491,19 @@ fn prove_not_hosted_at(
     Ok(())
 }
 
-fn survivor_refusal(survivor: &crate::upgrade::SurvivingProcess) -> String {
+const NOTHING_STARTED: &str = "so nothing was started";
+
+/// A refusal written for the reader. Any other start error is a raw backend
+/// string, which a failed pane doesn't show or copy.
+pub(super) fn is_retry_refusal(error: &str) -> bool {
+    error.contains(NOTHING_STARTED)
+}
+
+fn survivor_refusal(
+    survivor: &crate::upgrade::SurvivingProcess,
+    outcome: &str,
+    next: &str,
+) -> String {
     use crate::upgrade::SurvivorLink;
     let process = match &survivor.name {
         Some(name) => format!("{name} (PID {})", survivor.pid),
@@ -466,13 +511,13 @@ fn survivor_refusal(survivor: &crate::upgrade::SurvivingProcess) -> String {
     };
     match &survivor.link {
         SurvivorLink::Lineage => format!(
-            "{process}, started by this terminal, is still running, so the pane was kept. Stop it, then close the pane again."
+            "{process}, started by this terminal, is still running, {outcome}. Stop it, then {next}."
         ),
         SurvivorLink::Conversation => format!(
-            "{process} is still running this terminal's conversation, so the pane was kept. Stop it, then close the pane again."
+            "{process} is still running this terminal's conversation, {outcome}. Stop it, then {next}."
         ),
         SurvivorLink::Unit(unit) => format!(
-            "{process} is running in {unit}, the systemd unit this terminal was launched in, so the pane was kept. If it came from this terminal, stop it, then close the pane again. Otherwise the pane stays until that process exits."
+            "{process} is running in {unit}, the systemd unit this terminal was launched in, {outcome}. If it came from this terminal, stop it, then {next}. Otherwise the pane stays until that process exits."
         ),
     }
 }
@@ -1090,12 +1135,119 @@ mod tests {
             let replacement_proof = proof("replacement");
             let _lease = lease(directory.path(), &replacement_proof);
             let server = discovery(&socket, replacement_proof, Vec::new(), 1);
-            let result = reconcile_with(original, true, &socket, directory.path(), |terminal| {
-                holder(terminal == id)
-            });
+            let result =
+                reconcile_with(original, true, &socket, directory.path(), |terminal, _| {
+                    holder(terminal == id)
+                });
             server.join().unwrap();
             assert!(result.is_err());
         }
+    }
+
+    /// A finished terminal's holder stays up to keep its output. The daemon lists
+    /// that terminal as ready to run again, so its holder isn't a hidden process.
+    #[test]
+    fn retry_restarts_a_finished_terminal_the_daemon_lists_despite_its_holder() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("live");
+        let original = session(directory.path(), &owner);
+        let id = original.id;
+        let listed = exited(id, &original.launch);
+        let _lease = lease(directory.path(), &owner);
+        let server = discovery(&socket, owner, vec![listed], 2);
+        let recovered = reconcile_with(
+            original,
+            true,
+            &socket,
+            directory.path(),
+            |terminal, kind| {
+                Ok(
+                    (terminal == id && kind == crate::daemon::holder_registry::Kind::Terminal)
+                        .then_some(4242),
+                )
+            },
+        );
+        // Checked first: a refusal never makes the probes the server waits for.
+        let recovered = recovered.unwrap();
+        server.join().unwrap();
+        assert_ne!(recovered.session.id, id);
+    }
+
+    /// A terminal handed over to another owner lists as ready to run again with
+    /// no recorded exit, while its process is still running.
+    #[test]
+    fn retry_refuses_beside_the_holder_of_a_terminal_with_no_recorded_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("live");
+        let original = session(directory.path(), &owner);
+        let id = original.id;
+        let listed = TerminalDescriptor::relaunchable(id, original.launch.clone(), None);
+        let _lease = lease(directory.path(), &owner);
+        let server = discovery(&socket, owner, vec![listed], 1);
+        let recovered = reconcile_with(original, true, &socket, directory.path(), |terminal, _| {
+            Ok((terminal == id).then_some(4242))
+        });
+        server.join().unwrap();
+        assert!(recovered.is_err());
+    }
+
+    /// A completed terminal can still own a native provider, under the same ID.
+    #[test]
+    fn retry_refuses_beside_a_native_holder_of_a_terminal_that_exited() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("live");
+        let original = session(directory.path(), &owner);
+        let id = original.id;
+        let listed = exited(id, &original.launch);
+        let _lease = lease(directory.path(), &owner);
+        let server = discovery(&socket, owner, vec![listed], 1);
+        let recovered = reconcile_with(
+            original,
+            true,
+            &socket,
+            directory.path(),
+            |terminal, kind| {
+                Ok(
+                    (terminal == id && kind == crate::daemon::holder_registry::Kind::Native)
+                        .then_some(4242),
+                )
+            },
+        );
+        server.join().unwrap();
+        assert!(recovered.is_err());
+    }
+
+    /// The refusal is shown on the pane, so it names the process to stop and not
+    /// the identifiers behind it.
+    #[test]
+    fn retry_refuses_beside_a_marked_process_in_words_a_reader_can_act_on() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let original = session(directory.path(), &proof("old"));
+        let id = original.id;
+        let process = directory.path().join("42");
+        fs::create_dir(&process).unwrap();
+        fs::write(process.join("stat"), b"42 (sleep) S 1 42 42").unwrap();
+        fs::write(process.join("cmdline"), b"/bin/sleep\0").unwrap();
+        fs::write(
+            process.join("environ"),
+            format!("CAGENTS_TERMINAL_ID={id}\0"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(directory.path(), process.join("cwd")).unwrap();
+        let replacement_proof = proof("replacement");
+        let _lease = lease(directory.path(), &replacement_proof);
+        let server = discovery(&socket, replacement_proof, Vec::new(), 1);
+        let error = reconcile_at(original, true, &socket, directory.path())
+            .err()
+            .unwrap();
+        server.join().unwrap();
+        assert!(is_retry_refusal(&error), "{error}");
+        assert!(error.contains("PID 42"), "{error}");
+        assert!(!error.contains(&id.to_string()), "{error}");
     }
 
     #[test]
@@ -1414,7 +1566,7 @@ mod tests {
         socket: &Path,
         proc_root: &Path,
     ) -> Result<RecoveredTerminal, String> {
-        reconcile_with(session, explicit_retry, socket, proc_root, no_holder)
+        reconcile_with(session, explicit_retry, socket, proc_root, |_, _| Ok(None))
     }
 
     fn other_boot(incarnation: &str) -> HostSessionProof {
@@ -1422,6 +1574,19 @@ mod tests {
             boot_id: crate::model::BootId::new("a-previous-boot"),
             ..proof(incarnation)
         }
+    }
+
+    fn exited(id: crate::model::TerminalId, launch: &LaunchRecipe) -> TerminalDescriptor {
+        let mut listed = TerminalDescriptor::relaunchable(id, launch.clone(), None);
+        listed.session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: launch.clone(),
+            last_exit: Some(crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            }),
+        };
+        listed
     }
 
     fn descriptor(session: &TerminalSession) -> TerminalDescriptor {
