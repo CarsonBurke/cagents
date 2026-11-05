@@ -607,20 +607,14 @@ fn status_caption(text: String, tone: Tone) -> Element<'static, Message> {
 }
 
 impl Runtime {
-    /// What an agent of this conversation is called: its subagent's type or
-    /// description where this conversation lists it, else its short ID.
+    /// Use the same reported name as child navigation. A task describes the
+    /// work, not its agent; an unknown child still uses its short ID.
     pub(super) fn agent_name(&self, id: &str) -> String {
         self.snapshot
             .subagents
             .iter()
             .find(|agent| agent.id == id)
-            .map(|agent| {
-                [&agent.kind, &agent.description]
-                    .into_iter()
-                    .find(|name| !name.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| short_id(id).to_owned())
-            })
+            .map(|agent| Self::native_child_name(agent).to_owned())
             .unwrap_or_else(|| short_id(id).to_owned())
     }
 
