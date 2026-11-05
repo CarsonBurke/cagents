@@ -342,13 +342,15 @@ release() {
     exec 9>&-
 }
 
-# Runs a command while this shell holds the slot. Descriptors 8 and 9
-# stay here, so a lingering child such as a compiler cache server cannot keep
+# Runs one owned command, either before admission (empty marker) or in this
+# gate's slot. Descriptors 8 and 9 stay here, so a lingering child cannot keep
 # the slot. On cancellation the supervisor drains the command's descendants
-# before returning. CAGENTS_BUILD_SLOT_HELD names this gate, so nested commands
-# use its slot. A private receipt forwards signals without signalling a helper
-# PID that wait might just have reaped; the helper also handles direct signals.
-held() {
+# before returning. A private receipt forwards signals without signalling a
+# helper PID that wait might just have reaped; the helper also handles direct
+# signals.
+supervised() {
+    slot_marker=$1
+    shift
     command_state=$(mktemp -d "${TMPDIR:-/tmp}/cagents-cargo-command.XXXXXXXX") || return "$?"
     cancelled=0
     interrupted=false
@@ -359,7 +361,7 @@ held() {
     # POSIX shells may replace async stdin with /dev/null before applying
     # redirections. Save the caller's stdin on the now-free queue descriptor.
     exec 8<&0
-    CAGENTS_BUILD_SLOT_HELD=$$ python3 "$(dirname "$0")/cargo-gate-command.py" \
+    CAGENTS_BUILD_SLOT_HELD=$slot_marker python3 "$(dirname "$0")/cargo-gate-command.py" \
         "$command_state/cancelled" "$@" 0<&8 8>&- 9>&- &
     child=$!
     exec 8<&-
@@ -374,6 +376,11 @@ held() {
     rm -rf "$command_state"
     [ "$cancelled" -eq 0 ] || status=$((128 + cancelled))
     return "$status"
+}
+
+# Nested commands use this gate's slot only after it has been acquired.
+held() {
+    supervised "$$" "$@"
 }
 
 interrupt() {
@@ -462,12 +469,19 @@ fi
 guard=$(dirname "$0")/build-disk-guard
 seed=$(dirname "$0")/seed-build-dir
 if [ -x "$guard" ] || [ -x "$seed" ]; then
-    build_dir=$(cargo metadata --format-version 1 --no-deps 2>/dev/null |
-        sed -n 's/.*"build_directory":"\([^"]*\)".*/\1/p') || build_dir=
-    if [ -n "$build_dir" ]; then
-        [ ! -x "$guard" ] || "$guard" "$build_dir" || exit "$?"
-        [ ! -x "$seed" ] || "$seed" --to "$build_dir" || :
-    fi
+    # Keep ownership in the original gate shell: supervising only the metadata
+    # command substitution would leave the outer gate unable to cancel it.
+    # Preflight has no slot, even when an obsolete marker was inherited.
+    supervised '' /bin/sh -c '
+        guard=$1
+        seed=$2
+        build_dir=$(cargo metadata --format-version 1 --no-deps 2>/dev/null |
+            sed -n '\''s/.*"build_directory":"\([^"]*\)".*/\1/p'\'') || build_dir=
+        if [ -n "$build_dir" ]; then
+            [ ! -x "$guard" ] || "$guard" "$build_dir" || exit "$?"
+            [ ! -x "$seed" ] || "$seed" --to "$build_dir" || :
+        fi
+    ' cargo-gate-preflight "$guard" "$seed" || exit "$?"
 fi
 
 if [ "$mode" = exec ]; then

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Supervise one held command without passing its build-slot descriptors on."""
+"""Supervise one owned command without passing build-slot descriptors on."""
 
 import ctypes
 import errno
