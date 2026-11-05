@@ -756,10 +756,37 @@ fn menu_row<'a>(
             .spacing(step::GAP_S)
             .align_y(Alignment::Center),
     )
-    .class(crate::ui_controls::control_style(highlighted, None))
+    .class(menu_row_style(highlighted))
     .padding(iced::Padding::from([0.0, step::GAP_S]))
     .height(Length::Fixed(COMPLETION_ROW))
     .width(Length::Fill)
+}
+
+/// A list row's surfaces, with the ring buttons draw for keyboard focus, so
+/// the row Tab reached does not read as the one under the pointer.
+fn menu_row_style(highlighted: bool) -> cosmic::theme::Button {
+    let cosmic::theme::Button::Custom {
+        active,
+        disabled,
+        hovered,
+        pressed,
+    } = crate::ui_controls::control_style(highlighted, None)
+    else {
+        unreachable!("control_style draws a custom button");
+    };
+    let ring = |mut style: widget::button::Style, focused: bool, theme: &cosmic::Theme| {
+        if focused {
+            style.outline_width = design::BORDER_WIDTH;
+            style.outline_color = design::accent_color(theme);
+        }
+        style
+    };
+    cosmic::theme::Button::Custom {
+        active: Box::new(move |focused, theme| ring(active(focused, theme), focused, theme)),
+        disabled,
+        hovered: Box::new(move |focused, theme| ring(hovered(focused, theme), focused, theme)),
+        pressed: Box::new(move |focused, theme| ring(pressed(focused, theme), focused, theme)),
+    }
 }
 
 /// The height of one completion row and of the list showing `count` of them.
