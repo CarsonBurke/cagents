@@ -1513,11 +1513,14 @@ impl Cagents {
                         self.shared_views.blocked_aliases.insert(alias, shared.id);
                         // Every reconcile lands here while the card waits; once is enough.
                         if !previously_blocked.contains_key(&alias) {
-                            self.status = Some(TransientNotice::warning(self.alias_held_notice(
-                                alias,
-                                shared,
-                                &view.scope,
-                            )));
+                            self.status = Some(
+                                TransientNotice::warning(self.alias_held_notice(
+                                    alias,
+                                    shared,
+                                    &view.scope,
+                                ))
+                                .with_key(NoticeKey::SessionHeld(alias)),
+                            );
                         }
                         continue;
                     }
@@ -1555,7 +1558,13 @@ impl Cagents {
             }
             let carried = matches!(shared.kind, CardKind::Chat(_))
                 && self.carry_chat_draft_to_pane(alias, shared.id);
-            if carried || previously_blocked.contains_key(&alias) {
+            // Unsent text left the view the person was typing in, and a
+            // confirmation retires before they may look up, so that one stays.
+            if carried {
+                self.status = Some(TransientNotice::warning(
+                    self.alias_moved_notice(alias, &shared, &scope, carried),
+                ));
+            } else if previously_blocked.contains_key(&alias) {
                 self.status = Some(TransientNotice::success(
                     self.alias_moved_notice(alias, &shared, &scope, carried),
                 ));

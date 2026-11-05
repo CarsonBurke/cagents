@@ -287,6 +287,8 @@ impl NoticeSeverity {
 enum NoticeKey {
     /// Opening the conversation in this card, or switching its terminal to one.
     ChatAttach(CardId),
+    /// An attached session's card staying here until its unfinished work clears.
+    SessionHeld(CardId),
     /// Saving the account that one sign-in produced.
     SignIn(uuid::Uuid),
     /// Adding an existing account home from the accounts table.
@@ -12219,7 +12221,7 @@ impl Cagents {
             .entries
             .iter()
             .filter_map(|entry| match entry.notice.key {
-                Some(key @ NoticeKey::ChatAttach(card))
+                Some(key @ (NoticeKey::ChatAttach(card) | NoticeKey::SessionHeld(card)))
                     if self
                         .card_state(card)
                         .is_none_or(|state| !state.existence.is_open()) =>

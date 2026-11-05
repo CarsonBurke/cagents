@@ -21035,6 +21035,25 @@ mod tests {
             app.chat_ui.drafts.get(&held).map(String::as_str),
             Some("waiting")
         );
+        // What was promised is withdrawn, and where the text went stays up.
+        let keys = app
+            .notices
+            .recent()
+            .map(|entry| (entry.notice.severity, entry.notice.key))
+            .collect::<Vec<_>>();
+        assert!(
+            !keys
+                .iter()
+                .any(|(_, key)| *key == Some(crate::app::NoticeKey::SessionHeld(card))),
+            "{keys:?}"
+        );
+        assert!(
+            app.notices.recent().any(|entry| {
+                entry.notice.severity == NoticeSeverity::Warning
+                    && entry.notice.message.contains("with what you hadn't sent")
+            }),
+            "{keys:?}"
+        );
     }
 
     #[test]
