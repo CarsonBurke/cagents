@@ -442,7 +442,7 @@ fn hosted_kind(client: &mut ControlClient, entry: &Entry) -> Result<CardKind, Ap
         return Err(AppError::new(
             "invalid_target",
             format!(
-                "Session {} belongs to an earlier daemon run and can't be attached. Reopen it with Resume conversation in the app.",
+                "Session {} belongs to an earlier daemon run and can't be attached.",
                 entry.id
             ),
         ));
