@@ -82,10 +82,8 @@ pub(crate) fn execute(
             )
             .map(Reply::History),
     }
-    .map_err(|error| {
-        crate::github::polling::failed(&repository.host, &error);
-        error.to_string()
-    })
+    // The GitHub service already charged this failure to the host budget.
+    .map_err(|error| error.to_string())
 }
 
 impl super::State {

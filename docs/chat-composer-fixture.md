@@ -25,7 +25,11 @@ runner and every CLI command with the same fixture environment:
 
 ```sh
 fixture_env() {
-  env -u CAGENTS_AGENT_AUTHORITY -u CLAUDE_CONFIG_DIR \
+  if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
+    printf '%s\n' 'This fixture requires a genuine User shell; inherited agent authority was not modified.' >&2
+    return 77
+  fi
+  env -u CLAUDE_CONFIG_DIR \
     HOME="$fixture_root/home" XDG_RUNTIME_DIR="$fixture_runtime" \
     XDG_DATA_HOME="$fixture_root/data" XDG_CONFIG_HOME="$fixture_root/config" \
     XDG_CACHE_HOME="$fixture_root/cache" PATH="$fixture_root/bin:$PATH" \
@@ -36,9 +40,10 @@ fixture_env scripts/run-development --browserless --debug --log-file "$fixture_r
 ```
 
 Keep the existing Cargo target/cache configuration when using a worktree; do
-not start another build while the runner builds its matched executables. For
-a nested Niri session, use `niri-harness session start ... --no-window-wait`
-with a wrapper containing that runner command. Before replacing
+not start another build while the runner builds its matched executables. If the
+harness help exposes `session start NAME --root ROOT --cmd CMD`, start a nested
+Niri session with `niri-harness session start composer --root "$fixture_root/niri" --no-window-wait --cmd WRAPPER`,
+where `WRAPPER` is a shell command that runs the fixture runner script. Before replacing
 `XDG_RUNTIME_DIR`, convert the inherited relative `WAYLAND_DISPLAY` to an
 absolute path (`$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`). Keep the inherited
 `NIRI_SOCKET`, and use only this owned nested session for input and screenshots.

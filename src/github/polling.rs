@@ -267,4 +267,38 @@ mod tests {
         assert!(!ready(host, true));
         BUDGETS.lock().unwrap().remove(host);
     }
+
+    #[test]
+    fn any_completed_request_clears_a_transient_backoff() {
+        struct Healthy;
+        impl ProcessExecutor for Healthy {
+            fn execute(
+                &self,
+                _: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                Ok(ProcessOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    signal: None,
+                    stdout: br#"{"data":{"viewer":{"login":"octo"}}}"#.to_vec(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+        let repository =
+            GitHubRepoKey::new("polling-recover.invalid", None, "owner", "repo").unwrap();
+        failed(&repository.host, &GitHubError::Inspection("offline".into()));
+        assert!(!ready(&repository.host, false));
+        // A surface other than the one that backed off completes a request.
+        GitHubService::new("gh", Arc::new(Healthy))
+            .graphql(
+                &repository,
+                "query{viewer{login}}",
+                Vec::new(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(ready(&repository.host, false));
+    }
 }

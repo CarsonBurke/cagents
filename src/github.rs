@@ -28,6 +28,7 @@ pub mod checkout;
 pub mod polling;
 mod review_batches;
 mod review_refresh;
+pub mod review_actions;
 pub mod review_requests;
 pub use review_batches::VIEWED_BATCH_SIZE;
 pub use review_refresh::ReviewRefresh;
@@ -1243,6 +1244,18 @@ pub trait GitHubReviewApi: Send + Sync {
         cancellation: &CancellationToken,
     ) -> Result<Vec<PullRequest>, GitHubError>;
 
+    fn search_pull_requests(
+        &self,
+        _repository: &GitHubRepoKey,
+        _query: &str,
+        _cursor: Option<&str>,
+        _cancellation: &CancellationToken,
+    ) -> Result<PullRequestPage, GitHubError> {
+        Err(GitHubError::Inspection(
+            "Repository search is unavailable".into(),
+        ))
+    }
+
     fn pull_request_page(
         &self,
         repository: &GitHubRepoKey,
@@ -2017,6 +2030,49 @@ impl<E: ProcessExecutor> GitHubService<E> {
         result
     }
 
+    /// Like [`Self::graphql`], but a response whose only errors are
+    /// `NOT_FOUND` is an answer: the missing objects are `null` in its data.
+    pub(crate) fn graphql_allowing_not_found(
+        &self,
+        repository: &GitHubRepoKey,
+        query: &str,
+        variables: Vec<(&str, GraphQlValue)>,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, GitHubError> {
+        repository.validate()?;
+        if let Some(limit) = polling::rate_limit(&repository.host) {
+            return Err(GitHubError::RateLimited { limit });
+        }
+        let command = self.graphql_command(repository, query, variables);
+        let output = self
+            .execute(&command, cancellation)
+            .map_err(GitHubError::from);
+        if let Ok(output) = &output
+            && !output.success
+            && let Some(data) = not_found_data(graphql_body(&output.stdout))
+        {
+            // The answer is complete, but its headers can still exhaust the
+            // host's quota, exactly as for a successful request.
+            let headers = &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
+            match polling::RateLimit::classify(&String::from_utf8_lossy(headers), polling::now()) {
+                Some(limit) => {
+                    polling::failed(&repository.host, &GitHubError::RateLimited { limit })
+                }
+                None => polling::succeeded(&repository.host),
+            }
+            return Ok(data);
+        }
+        let output = charge_host(
+            repository,
+            output.and_then(|output| self.checked_output(output, repository)),
+        )?;
+        let result = attach_process(parse_graphql(&output.stdout), &output);
+        if let Err(error) = &result {
+            polling::failed(&repository.host, error);
+        }
+        result
+    }
+
     fn pull_request_variables(key: &PullRequestKey) -> Vec<(&'static str, GraphQlValue)> {
         vec![
             ("owner", key.repository.owner.as_str().into()),
@@ -2323,10 +2379,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .execute(command, cancellation)
             .map_err(GitHubError::from)
             .and_then(|output| self.checked_output(output, repository));
-        if let Err(error) = &result {
-            polling::failed(&repository.host, error);
-        }
-        result
+        charge_host(repository, result)
     }
 
     fn checked_output(
@@ -2583,6 +2636,16 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
     ) -> Result<PullRequest, GitHubError> {
         self.view(key, cancellation)
     }
+    fn search_pull_requests(
+        &self,
+        repository: &GitHubRepoKey,
+        query: &str,
+        cursor: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestPage, GitHubError> {
+        self.search_pull_request_page(repository, query, cursor, cancellation)
+    }
+
     fn pull_request_page(
         &self,
         repository: &GitHubRepoKey,
@@ -2591,7 +2654,9 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
     ) -> Result<PullRequestPage, GitHubError> {
         // Creation order is stable while checks and review state change.
         // Updated-order cursors can skip rows as older PRs receive activity.
-        let query = "query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){pullRequests(first:50,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:DESC}){nodes{id number title state isDraft headRefName headRefOid baseRefName baseRefOid author{login} updatedAt url reviewDecision commits(last:1){nodes{commit{statusCheckRollup{state}}}}} pageInfo{hasNextPage endCursor}}}}";
+        let query = format!(
+            "query($owner:String!,$name:String!,$cursor:String){{repository(owner:$owner,name:$name){{pullRequests(first:50,after:$cursor,states:OPEN,orderBy:{{field:CREATED_AT,direction:DESC}}){{nodes{{{BROWSER_PULL_REQUEST_FIELDS}}} pageInfo{{hasNextPage endCursor}}}}}}}}"
+        );
         let mut variables = vec![
             ("owner", repository.owner.as_str().into()),
             ("name", repository.name.as_str().into()),
@@ -2599,7 +2664,7 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
         if let Some(cursor) = cursor {
             variables.push(("cursor", cursor.into()));
         }
-        let data = self.graphql(repository, query, variables, cancellation)?;
+        let data = self.graphql(repository, &query, variables, cancellation)?;
         let connection: Connection<serde_json::Value> =
             decode_value(data.pointer("/repository/pullRequests").ok_or_else(|| {
                 GitHubError::Inspection("GitHub returned no pull request page.".into())
@@ -2609,18 +2674,11 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
         } else {
             None
         };
-        let pull_requests = connection.nodes.into_iter().map(|mut value| {
-            // The aggregate state is enough for the browser filter; the
-            // detailed review header loads individual checks on demand.
-            if let Some(state) = value.pointer("/commits/nodes/0/commit/statusCheckRollup/state").and_then(serde_json::Value::as_str).map(str::to_owned) {
-                value["statusCheckRollup"] = serde_json::json!([{
-                    "__typename":"StatusContext", "context":"All checks", "state":state, "targetUrl":null
-                }]);
-            }
-            let pull_request: PullRequest = decode_value(&value)?;
-            validate_pull_request(&pull_request, repository)?;
-            Ok(pull_request)
-        }).collect::<Result<Vec<_>, GitHubError>>()?;
+        let pull_requests = connection
+            .nodes
+            .into_iter()
+            .map(|value| decode_browser_pull_request(value, repository))
+            .collect::<Result<Vec<_>, GitHubError>>()?;
         Ok(PullRequestPage {
             pull_requests,
             next_cursor: next,
@@ -3142,6 +3200,38 @@ pub fn parse_pull_request(
     Ok(pull_request)
 }
 
+/// GraphQL selection for one browser row. Every source of browser rows (open
+/// pages, repository search, exact number) selects the same fields so a row's
+/// check summary and filter membership do not depend on how it was found.
+pub(crate) const BROWSER_PULL_REQUEST_FIELDS: &str = "id number title state isDraft headRefName headRefOid baseRefName baseRefOid author{login} updatedAt url reviewDecision headRepository{name owner{login}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}";
+
+/// Decode a row selected with [`BROWSER_PULL_REQUEST_FIELDS`].
+pub(crate) fn decode_browser_pull_request(
+    mut value: serde_json::Value,
+    repository: &GitHubRepoKey,
+) -> Result<PullRequest, GitHubError> {
+    // The aggregate state is enough for the browser filter; the detailed
+    // review header loads individual checks on demand.
+    if let Some(state) = value
+        .pointer("/commits/nodes/0/commit/statusCheckRollup/state")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    {
+        value["statusCheckRollup"] = serde_json::json!([{
+            "__typename": "StatusContext",
+            "context": "All checks",
+            "state": state,
+            "targetUrl": null
+        }]);
+    }
+    if let Some(owner) = value.pointer("/headRepository/owner").cloned() {
+        value["headRepositoryOwner"] = owner;
+    }
+    let pull_request: PullRequest = decode_value(&value)?;
+    validate_pull_request(&pull_request, repository)?;
+    Ok(pull_request)
+}
+
 fn validate_pull_request(
     pull_request: &PullRequest,
     repository: &GitHubRepoKey,
@@ -3278,6 +3368,50 @@ fn graphql_body(mut bytes: &[u8]) -> &[u8] {
         bytes = &bytes[boundary..];
     }
     bytes
+}
+
+/// Every gh call shares the host budget, so any completed request is evidence
+/// the host recovered, not only the surface that backed off.
+fn charge_host<T>(
+    repository: &GitHubRepoKey,
+    result: Result<T, GitHubError>,
+) -> Result<T, GitHubError> {
+    match &result {
+        Ok(_) => polling::succeeded(&repository.host),
+        Err(error) => polling::failed(&repository.host, error),
+    }
+    result
+}
+
+/// The data of a GraphQL envelope whose errors all say a nested object is
+/// missing: each is `NOT_FOUND` at a path whose parent object was found. A
+/// missing top-level object, such as a renamed or inaccessible repository,
+/// stays a failure.
+fn not_found_data(output: &[u8]) -> Option<serde_json::Value> {
+    let mut envelope: serde_json::Value = serde_json::from_slice(output).ok()?;
+    let data = envelope.as_object_mut()?.remove("data")?;
+    let errors = envelope.get("errors")?.as_array()?;
+    let nested_not_found = |error: &serde_json::Value| {
+        error.get("type").and_then(serde_json::Value::as_str) == Some("NOT_FOUND")
+            && error
+                .get("path")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|path| path.split_last())
+                .is_some_and(|(_, parent)| {
+                    !parent.is_empty()
+                        && parent
+                            .iter()
+                            .try_fold(&data, |value, segment| match segment {
+                                serde_json::Value::String(key) => value.get(key.as_str()),
+                                serde_json::Value::Number(index) => {
+                                    value.get(usize::try_from(index.as_u64()?).ok()?)
+                                }
+                                _ => None,
+                            })
+                            .is_some_and(serde_json::Value::is_object)
+                })
+    };
+    (data.is_object() && !errors.is_empty() && errors.iter().all(nested_not_found)).then_some(data)
 }
 
 fn parse_graphql(output: &[u8]) -> Result<serde_json::Value, GitHubError> {
