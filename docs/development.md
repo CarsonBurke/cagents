@@ -440,8 +440,9 @@ credentials (containing `TOKEN`, `KEY`, `SECRET`, `PASS`, `AUTH`,
 `CREDENTIAL` or `COOKIE`). They travel on the connection's standard input,
 not its command line. This user's Cargo `[profile]` settings are applied
 there; its build settings, such as `jobs` and `build-dir`, describe this host
-and are not. Cargo's registry and Git caches, the toolchain and temporary
-files on the host are its own, shared with anything else built there.
+and are not. Each slot's commands get a private `TMPDIR` in the slot, emptied before the
+next command there. Cargo's registry and Git caches and the toolchain on the
+host are shared with anything else built there; Cargo locks its caches itself.
 
 ### Compilation jobs and shared build directories
 

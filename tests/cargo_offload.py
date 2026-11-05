@@ -297,6 +297,25 @@ class StandInHost(unittest.TestCase):
         self.assertFalse((slot / "src/extra.rs").exists())
         self.assertTrue((slot / "target").is_dir())
 
+    def test_temporary_files_go_in_the_slot_and_do_not_outlive_the_next_command(self):
+        tmp = self.host_home / ".cache/cagents-offload/crate/slot-0/tmp"
+        (self.crate / "build.rs").write_text(textwrap.dedent("""
+            fn main() {
+                let dir = std::env::temp_dir();
+                assert!(dir.ends_with("slot-0/tmp"), "{}", dir.display());
+                std::fs::write(dir.join("left-behind"), "").unwrap();
+                println!("cargo:rerun-if-changed=build.rs");
+            }
+        """))
+        env = self.remote_env()
+        result = self.gate_run("check", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((tmp / "left-behind").exists())
+        (self.crate / "src/main.rs").write_text('fn main() { println!("changed"); }\n')
+        result = self.gate_run("check", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((tmp / "left-behind").exists())
+
     def test_a_failing_build_keeps_cargos_exit_status(self):
         (self.crate / "src/main.rs").write_text("fn main() { missing(); }\n")
         result = self.gate_run("check", env=self.remote_env())

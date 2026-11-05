@@ -329,6 +329,13 @@ elif command == "run":
     fcntl.flock(running, fcntl.LOCK_EX)
     os.chdir(os.path.join(base, "src", directory))
     environment = dict(os.environ, **environment)
+    # Temporary files go in the slot, on its disk, rather than in the host's
+    # /tmp, which may be memory and which others use. The slot runs one
+    # command at a time, so whatever the last one left there is stale.
+    temporary = os.path.join(base, "tmp")
+    shutil.rmtree(temporary, ignore_errors=True)
+    os.makedirs(temporary, mode=0o700)
+    environment["TMPDIR"] = temporary
     # build.rs asks Git for the version stamp only when it is not given; the
     # slot is not a repository, and whatever encloses it is not this one.
     environment["GIT_CEILING_DIRECTORIES"] = os.path.dirname(base)
