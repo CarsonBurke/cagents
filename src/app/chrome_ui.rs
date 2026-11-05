@@ -1236,10 +1236,26 @@ mod tests {
         const WINDOW: Size = Size::new(600.0, 300.0);
         const ANCHOR: Point = Point::new(20.0, 16.0);
 
+        #[derive(Default)]
+        struct Clipboard(Vec<String>);
+
+        impl iced::advanced::Clipboard for Clipboard {
+            fn read(&self, _: clipboard::Kind) -> Option<String> {
+                None
+            }
+
+            fn write(&mut self, kind: clipboard::Kind, contents: String) {
+                if matches!(kind, clipboard::Kind::Standard) {
+                    self.0.push(contents);
+                }
+            }
+        }
+
         struct Frames {
             cache: Cache,
             cursor: Point,
             find_bounds: Option<iced::Rectangle>,
+            clipboard: Clipboard,
         }
 
         impl Default for Frames {
@@ -1248,6 +1264,7 @@ mod tests {
                     cache: Cache::new(),
                     cursor: ANCHOR,
                     find_bounds: None,
+                    clipboard: Clipboard::default(),
                 }
             }
         }
@@ -1314,7 +1331,7 @@ mod tests {
                 events,
                 cursor,
                 renderer,
-                &mut clipboard::Null,
+                &mut frames.clipboard,
                 &mut messages,
             );
             frames.cache = ui.into_cache();
@@ -1482,9 +1499,8 @@ mod tests {
             );
             if find_menu {
                 assert_eq!(statuses, [Status::Captured]);
-                // Text-menu actions currently lack keyboard activation
-                // metadata. Its captured Enter still cannot also step find.
                 assert!(messages.is_empty(), "the text menu owns Enter");
+                assert_eq!(frames.clipboard.0, ["needle"], "Copy runs exactly once");
                 assert!(app.terminal_find[&card].focused);
             } else if menu_steps > 0 {
                 assert_eq!(statuses, [Status::Captured]);

@@ -22,12 +22,12 @@ use iced_runtime::platform_specific::wayland::CornerRadius;
 
 #[cfg(wayland_platform)]
 use crate::surface::action::LiveSettings;
-use crate::widget::RcElementWrapper;
 #[cfg(wayland_platform)]
 use crate::widget::menu::StyleSheet;
 use crate::widget::menu::{
     self, CloseCondition, ItemHeight, ItemWidth, Menu, MenuBarState, PathHighlight, menu_roots_diff,
 };
+use crate::widget::{RcElementWrapper, RcWrapper};
 use crate::{theme, widget};
 
 use iced_core::layout::Limits;
@@ -283,28 +283,27 @@ pub(crate) enum TextCtxAction {
     SelectAll,
 }
 
+fn text_menu_item(label: &'static str, action: TextCtxAction) -> menu::Tree<TextCtxAction> {
+    let mut item = menu::Tree::from(crate::Element::from(
+        menu::menu_button(vec![widget::text(label).into()]).on_press(action),
+    ));
+    item.keyboard_action = Some(RcWrapper::new(action));
+    item
+}
+
 fn build_menu_roots(is_editable: bool, has_selection: bool) -> Vec<menu::Tree<TextCtxAction>> {
     let mut items = Vec::with_capacity(4);
 
     if is_editable && has_selection {
-        items.push(menu::Tree::from(crate::Element::from(
-            menu::menu_button(vec![widget::text("Cut").into()]).on_press(TextCtxAction::Cut),
-        )));
+        items.push(text_menu_item("Cut", TextCtxAction::Cut));
     }
     if has_selection {
-        items.push(menu::Tree::from(crate::Element::from(
-            menu::menu_button(vec![widget::text("Copy").into()]).on_press(TextCtxAction::Copy),
-        )));
+        items.push(text_menu_item("Copy", TextCtxAction::Copy));
     }
     if is_editable {
-        items.push(menu::Tree::from(crate::Element::from(
-            menu::menu_button(vec![widget::text("Paste").into()]).on_press(TextCtxAction::Paste),
-        )));
+        items.push(text_menu_item("Paste", TextCtxAction::Paste));
     }
-    items.push(menu::Tree::from(crate::Element::from(
-        menu::menu_button(vec![widget::text("Select All").into()])
-            .on_press(TextCtxAction::SelectAll),
-    )));
+    items.push(text_menu_item("Select All", TextCtxAction::SelectAll));
 
     vec![menu::Tree::with_children(
         RcElementWrapper::new(crate::Element::from(widget::Row::new())),
