@@ -98,15 +98,22 @@ class SeedBuildDirApplicability(unittest.TestCase):
                 break
         return subprocess.CompletedProcess(blocks, result.returncode, stdout, stderr)
 
+    def other_shell_scripts(self, root):
+        """The scripts the shell-syntax step checks besides the seeder's, as a
+        head that predates the seeder still has them."""
+        (root / "scripts").mkdir()
+        for line in self.syntax_block.splitlines():
+            words = line.split()
+            if len(words) == 3 and words[:2] in (["sh", "-n"], ["bash", "-n"]):
+                if words[2] != self.source and words[2].startswith("scripts/"):
+                    (root / words[2]).write_text("#!/bin/sh\nexit 0\n")
+
     def assert_not_executed(self, root):
         self.assertFalse((root / "calls.json").exists())
 
     def test_old_head_without_seeder_passes_all_seeder_workflow_steps(self):
         root = self.case("old-head")
-        (root / "scripts").mkdir()
-        # Other shell-syntax inputs remain present at this historical head.
-        for name in ("run-development", "check-format"):
-            (root / "scripts" / name).write_text("#!/bin/sh\nexit 0\n")
+        self.other_shell_scripts(root)
         result = self.invoke(root, whole_seeder_path=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Not applicable: build directory seeding (source and fixture both absent at this head)\n",
@@ -117,9 +124,7 @@ class SeedBuildDirApplicability(unittest.TestCase):
 
     def test_shell_syntax_step_also_accepts_a_head_without_the_seeder(self):
         root = self.case("old-shell-syntax")
-        (root / "scripts").mkdir()
-        for name in ("run-development", "check-format"):
-            (root / "scripts" / name).write_text("#!/bin/sh\nexit 0\n")
+        self.other_shell_scripts(root)
         result = self.invoke(root, blocks=[self.syntax_block])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_not_executed(root)

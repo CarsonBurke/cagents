@@ -2499,7 +2499,7 @@ mod tests {
         assert_eq!(
             app.notices
                 .recent()
-                .map(|entry| entry.notice.key)
+                .map(|entry| entry.notice.key.clone())
                 .collect::<Vec<_>>(),
             [Some(NoticeKey::ChatAttach(card))],
             "an open pane keeps its report; one that is gone has none"
