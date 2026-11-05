@@ -120,8 +120,8 @@ pub(super) struct Preview {
     pub(super) text: String,
     pub(super) tail: String,
     language: Language,
-    /// The text highlighted in both palettes, drawn from on every frame.
-    block: prose::CodeBlock,
+    /// The text drawn in each palette, drawn from on every frame.
+    spans: [Arc<[iced::widget::text::Span<'static, markdown::Uri>]>; 2],
     theme: crate::settings::EditorSyntaxTheme,
 }
 
@@ -307,13 +307,20 @@ impl Preview {
             text: String::new(),
             tail: String::new(),
             language: Language::Plain,
-            block: prose::CodeBlock::new(None, "", theme),
+            spans: prose::CodeBlock::drawn(None, "", theme),
             theme,
         }
     }
 
     pub(super) fn retained_bytes(&self) -> usize {
-        self.text.capacity() + self.tail.capacity() + self.block.retained_span_bytes()
+        self.text.capacity()
+            + self.tail.capacity()
+            + self
+                .spans
+                .iter()
+                .flat_map(|spans| spans.iter())
+                .map(|span| std::mem::size_of_val(span) + span.text.len())
+                .sum::<usize>()
     }
 
     pub(super) fn update(
@@ -393,31 +400,32 @@ impl Preview {
         {
             return Self { tail, ..previous };
         }
-        let block = prose::CodeBlock::new(language.token(), &text, theme);
+        let spans = prose::CodeBlock::drawn(language.token(), &text, theme);
         Self {
             text,
             tail,
             language,
-            block,
+            spans,
             theme,
         }
     }
 
     pub(super) fn rehighlight(&mut self, theme: crate::settings::EditorSyntaxTheme) {
         self.theme = theme;
-        self.block = prose::CodeBlock::new(self.language.token(), &self.text, theme);
+        self.spans = prose::CodeBlock::drawn(self.language.token(), &self.text, theme);
     }
 
     pub(super) fn view(&self) -> Element<'static, Message> {
-        let text = iced::widget::rich_text(self.block.spans(cosmic::theme::is_dark()).clone())
-            .font(iced::Font::MONOSPACE)
-            .size(design::TEXT_BODY)
-            .line_height(1.3)
-            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-            .width(Length::Fill)
-            .ellipsize(iced::advanced::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(2),
-            ));
+        let text =
+            iced::widget::rich_text(self.spans[usize::from(cosmic::theme::is_dark())].clone())
+                .font(iced::Font::MONOSPACE)
+                .size(design::TEXT_BODY)
+                .line_height(1.3)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .width(Length::Fill)
+                .ellipsize(iced::advanced::text::Ellipsize::End(
+                    iced::advanced::text::EllipsizeHeightLimit::Lines(2),
+                ));
         // Rich text keeps the full paragraph's intrinsic height even with a
         // line-count ellipsis. Supply the matching layout limit as well;
         // Shrink preserves a single row for short previews.
@@ -479,7 +487,7 @@ impl ToolText {
                 .syntax
                 .borrow()
                 .as_ref()
-                .map_or(0, |(_, block)| block.retained_span_bytes())
+                .map_or(0, |(_, block)| block.retained_bytes())
     }
 
     pub(super) fn update(previous: Option<Self>, text: &str, language: Language) -> Self {
@@ -614,10 +622,9 @@ impl ToolText {
                 prose::CodeBlock::new(self.language.token(), &self.text, theme),
             ));
         }
-        let spans = syntax
+        let highlight = syntax
             .as_ref()
-            .map(|(_, block)| block.spans(cosmic::theme::is_dark()).clone())
-            .unwrap_or_else(|| Arc::from([]));
+            .map(|(_, block)| block.highlight(cosmic::theme::is_dark()).clone());
         let logical_id = logical.as_ref().map(|logical| logical.identity);
         let previous_width = reader.as_ref().map_or(0.0, |(memory, context, identity)| {
             memory.reader_width_for(
@@ -628,7 +635,7 @@ impl ToolText {
         });
         let body = widget::container(prose::code_text(
             self.text.clone(),
-            spans,
+            highlight,
             design::TEXT_BODY.into(),
             iced::Font::MONOSPACE,
             target,
@@ -791,32 +798,34 @@ mod tests {
             .as_ref()
             .unwrap()
             .1
-            .spans(cosmic::theme::is_dark())
+            .highlight(cosmic::theme::is_dark())
             .clone();
         read(&block);
-        assert!(Arc::ptr_eq(
-            &first,
-            block
-                .syntax
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .1
-                .spans(cosmic::theme::is_dark())
-        ));
+        assert!(
+            first.ptr_eq(
+                block
+                    .syntax
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .highlight(cosmic::theme::is_dark())
+            )
+        );
         let appended = format!("{source}next\n");
         block = ToolText::update(Some(block), &appended, Language::Shell);
         assert_eq!(read(&block).as_ref(), appended);
-        assert!(!Arc::ptr_eq(
-            &first,
-            block
-                .syntax
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .1
-                .spans(cosmic::theme::is_dark())
-        ));
+        assert!(
+            !first.ptr_eq(
+                block
+                    .syntax
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .highlight(cosmic::theme::is_dark())
+            )
+        );
     }
 
     #[test]
@@ -1375,14 +1384,14 @@ mod tests {
         );
         // New output moves the tail and leaves the highlighted command alone.
         let before = Preview::update(None, &command("", "cargo test", Run, "one\n"), theme);
-        let spans = before.block.spans(true).clone();
+        let spans = before.spans[1].clone();
         let after = Preview::update(
             Some(before),
             &command("", "cargo test", Run, "one\ntwo\n"),
             theme,
         );
         assert_eq!(after.tail, "two");
-        assert!(Arc::ptr_eq(&spans, after.block.spans(true)));
+        assert!(Arc::ptr_eq(&spans, &after.spans[1]));
     }
 
     /// A failed command's row shows why it failed, not the summary or noise
@@ -1729,11 +1738,11 @@ mod tests {
         );
         assert_eq!(preview.language, Language::Shell);
         for dark in [false, true] {
-            assert!(preview.block.spans(dark).len() > 1);
+            assert!(preview.spans[usize::from(dark)].len() > 1);
         }
-        let previous = preview.block.spans(true).clone();
+        let previous = preview.spans[1].clone();
         preview.rehighlight(crate::settings::EditorSyntaxTheme::SolarizedDark);
-        assert_ne!(*preview.block.spans(true), previous);
+        assert_ne!(*preview.spans[1], *previous);
     }
 
     #[test]
