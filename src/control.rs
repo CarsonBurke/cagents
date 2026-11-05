@@ -2350,7 +2350,15 @@ where
     if std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some()
         && let Some(message) = user_only_message
     {
-        emit_error(cli.json, &AppError::new("permission_denied", message));
+        emit_error(
+            cli.json,
+            &AppError::new(
+                "permission_denied",
+                format!(
+                    "{message}. Cagents terminals are hosted sessions. A person must run this command from a system terminal outside cagents."
+                ),
+            ),
+        );
         return ExitCode::FAILURE;
     }
 
@@ -4532,6 +4540,15 @@ mod tests {
                                 "permission_denied"
                             }
                 }));
+                if case != "user" {
+                    assert!(errors.iter().all(|error| {
+                        let message = error["error"]["message"].as_str().unwrap();
+                        message.contains("Cagents terminals are hosted sessions.")
+                            && message.contains(
+                                "A person must run this command from a system terminal outside cagents.",
+                            )
+                    }));
+                }
             }
             return;
         };

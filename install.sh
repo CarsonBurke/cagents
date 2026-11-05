@@ -98,7 +98,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "${CAGENTS_AGENT_AUTHORITY+x}" = x ]; then
-    fail 'installation and removal require your own terminal; hosted sessions cannot change the installation'
+    fail 'installation and removal require your own terminal; hosted sessions cannot change the installation. Cagents terminals are hosted sessions. A person must run this command from a system terminal outside cagents.'
 fi
 
 if [ "$STAGE_ONLY" -eq 1 ]; then
