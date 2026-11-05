@@ -27,7 +27,7 @@ def send(value):
 
 
 if sys.argv[1:] == ["--version"]:
-    print("2.1.286 (offline unknown-frame fixture)")
+    print("2.1.296 (offline unknown-frame fixture)")
     raise SystemExit
 
 session = argument("--session-id") or argument("--resume") or str(uuid.uuid4())
