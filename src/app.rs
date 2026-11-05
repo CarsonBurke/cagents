@@ -5859,12 +5859,7 @@ impl Cagents {
         visible: bool,
         explicit_retry: bool,
     ) -> Task<Message> {
-        if self.shared_views.defaults.contains_key(&card)
-            || self.durable.pending_terminal_creations.contains(&card)
-            || (self.shared_views.attached.contains(&card)
-                && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
-                && !explicit_retry)
-        {
+        if self.terminal_start_held(card, explicit_retry) {
             return Task::none();
         }
         // A restored recipe is presentation until its exact attachment has
@@ -14551,6 +14546,10 @@ impl Application for Cagents {
                     | chat_ui::Action::Dropped(..),
                 )
                 | Message::TerminalDropped { .. } => {
+                    // The refusal answers the `+` menu's choice as a chooser would.
+                    if let Message::ChatUi(chat_ui::Action::Attach(target)) = &message {
+                        self.close_composer_actions(*target);
+                    }
                     self.status = Some(TransientNotice::warning(
                         "File attachments require transfer to the selected device; use files already on that device",
                     ));
@@ -14860,9 +14859,9 @@ impl Application for Cagents {
                 self.refresh_ui.projects.remove(&project_id);
                 self.refresh_ui.finished(
                     project_id,
-                    result.as_ref().is_ok_and(|loaded| {
-                        !matches!(loaded.github, GitHubAvailability::Failed { .. })
-                    }),
+                    result
+                        .as_ref()
+                        .is_ok_and(|loaded| loaded.github.refresh_succeeded()),
                 );
                 let mut task = Task::none();
                 match result {
@@ -19366,7 +19365,7 @@ fn load_repository_github(
             return Err(GitHubAvailability::NotAssociated);
         }
         let key = github
-            .resolve_repository(&repository.selected_path, &cancellation)
+            .resolve_repository(&repository.selected_path, &remotes, &cancellation)
             .map_err(GitHubAvailability::from_error)?;
         let auth = github
             .auth_status(&key, &cancellation)
@@ -19405,6 +19404,7 @@ fn load_repository_github(
                 }
             }
         }
+        crate::github::polling::succeeded(&key.host);
         Ok(GitHubAvailability::Ready {
             repository_key: key,
             pull_requests: pull_requests

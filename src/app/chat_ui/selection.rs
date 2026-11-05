@@ -2030,7 +2030,7 @@ mod tests {
             ] {
                 let code = prose::code_text(
                     source.clone(),
-                    Arc::from([]),
+                    None,
                     14.0.into(),
                     iced::Font::MONOSPACE,
                     target,
