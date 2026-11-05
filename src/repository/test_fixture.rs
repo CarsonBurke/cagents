@@ -103,7 +103,8 @@ pub(crate) fn isolated_fixture_case(qualified: &str) -> bool {
             .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
         "exact selector must run one owning case: {stdout}\n{stderr}"
     );
-    print!("{stdout}");
-    eprint!("{stderr}");
+    // The outer harness owns the result stream. Keep successful child output
+    // private so its libtest summary cannot be mistaken for another outer test.
+    // The assertions above include both bounded streams when the child fails.
     true
 }
