@@ -1474,45 +1474,27 @@ impl<Message> VirtualCard<'_, Message> {
         &self,
         state: &Tree,
         layout: Layout<'_>,
+        offset: Vector,
         cursor: mouse::Cursor,
-        viewport: &Rectangle,
+        visible: &Rectangle,
     ) -> iced_accessibility::A11yTree {
-        // Accessibility traversal has no renderer translation. Its caller has
-        // already put this layout in screen space and consumed that offset.
-        // Retained/overscan and travelling destination panes remain mounted,
-        // but their bodies are not exposed before they actually enter view.
+        // `layout` carries no virtual offset, so every descendant reports its
+        // bounds in strip coordinates; they are clipped to what is in view
+        // and moved by the camera's `offset` once, here. Retained, overscan
+        // and travelling panes stay mounted, but expose no body before they
+        // enter view.
         let slot = Rectangle {
             width: self.width,
             ..layout.bounds()
         };
         let Some(clip) = slot
-            .intersection(viewport)
+            .intersection(visible)
             .filter(|clip| clip.width > 0.0 && clip.height > 0.0)
         else {
             return iced_accessibility::A11yTree::default();
         };
         let mut accessible = self.content.as_widget().a11y_nodes(layout, state, cursor);
-        for roots in [true, false] {
-            let nodes = if roots {
-                accessible.root_mut()
-            } else {
-                accessible.children_mut()
-            };
-            for accessible_node in nodes {
-                let node = accessible_node.node_mut();
-                if let Some(bounds) = node.bounds() {
-                    let x0 = bounds.x0.max(f64::from(clip.x));
-                    let y0 = bounds.y0.max(f64::from(clip.y));
-                    let x1 = bounds.x1.min(f64::from(clip.x + clip.width));
-                    let y1 = bounds.y1.min(f64::from(clip.y + clip.height));
-                    if x1 <= x0 || y1 <= y0 {
-                        node.set_hidden();
-                    } else {
-                        node.set_bounds(iced_accessibility::accesskit::Rect::new(x0, y0, x1, y1));
-                    }
-                }
-            }
-        }
+        crate::ui_controls::accessible_bounds::place(&mut accessible, offset, Some(clip));
         accessible
     }
 
@@ -1570,11 +1552,13 @@ impl<'a, Message> VirtualStrip<'a, Message> {
         }
     }
 
-    fn a11y_viewport(&self, layout: Layout<'_>) -> Rectangle {
+    /// The part of the strip the camera shows, in strip coordinates.
+    fn a11y_visible(&self, layout: Layout<'_>) -> Rectangle {
+        let bounds = layout.bounds();
         Rectangle {
-            width: self.viewport_width.min(layout.bounds().width).max(0.0),
-            ..layout.bounds()
-        }
+            width: self.viewport_width.min(bounds.width).max(0.0),
+            ..bounds
+        } + layout.virtual_offset()
     }
 }
 
@@ -1761,7 +1745,7 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        let a11y_viewport = self.a11y_viewport(layout);
+        let a11y_visible = self.a11y_visible(layout);
         for ((card, state), child_layout) in self
             .cards
             .iter_mut()
@@ -1771,11 +1755,10 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             let a11y_target_visible = if let Event::A11y(target, _) = event {
                 let accessible = card.a11y_nodes(
                     state,
-                    child_layout
-                        .translated(-layout.virtual_offset())
-                        .with_virtual_offset(Vector::ZERO),
+                    child_layout.with_virtual_offset(Vector::ZERO),
+                    layout.virtual_offset(),
                     mouse::Cursor::Unavailable,
-                    &a11y_viewport,
+                    &a11y_visible,
                 );
                 let target = iced_accessibility::A11yId::from(target.clone());
                 Some(
@@ -1928,7 +1911,7 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
         state: &Tree,
         cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
-        let viewport = self.a11y_viewport(layout);
+        let visible = self.a11y_visible(layout);
         iced_accessibility::A11yTree::join(
             self.cards
                 .iter()
@@ -1937,11 +1920,10 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
                 .map(|((card, child_state), child_layout)| {
                     card.a11y_nodes(
                         child_state,
-                        child_layout
-                            .translated(-layout.virtual_offset())
-                            .with_virtual_offset(Vector::ZERO),
+                        child_layout.with_virtual_offset(Vector::ZERO),
+                        layout.virtual_offset(),
                         cursor,
-                        &viewport,
+                        &visible,
                     )
                 }),
         )
@@ -2870,6 +2852,7 @@ mod tests {
         let make = |index: usize| -> Element<'_, ()> {
             VirtualStrip {
                 total_width: 320.0,
+                viewport_width: 320.0,
                 retained: retained.clone(),
                 focused: Some(ids[index]),
                 cards: vec![VirtualCard {
@@ -4760,7 +4743,7 @@ mod tests {
                                         .width(100.0)
                                         .on_press(index as u8),
                                 )
-                                .push(widget::Space::with_width(100.0))
+                                .push(widget::Space::new().width(100.0))
                                 .push(
                                     cosmic::widget::button::text("Add account")
                                         .name(format!("late-action-{index}"))
@@ -4774,7 +4757,7 @@ mod tests {
                                 .width(Length::Fill),
                         )
                         .push(
-                            crate::ui_controls::editable::TextInput::new(
+                            crate::ui_controls::field::TextInput::new(
                                 format!("draft-{index}"),
                                 format!("retained-{index}"),
                             )
@@ -4790,7 +4773,7 @@ mod tests {
                         // Include a travelling focus destination, not merely
                         // the projection's current geometric visible band.
                         on_screen: true,
-                        content: CardSurface::new(content.into()).into(),
+                        content: CardSurface::new(content).into(),
                     }
                 })
                 .collect();
@@ -5029,13 +5012,13 @@ mod tests {
         let card_id = CardId::new();
         let inner = widget::scrollable(
             widget::Column::new()
-                .push(widget::Space::with_height(80.0))
+                .push(widget::Space::new().height(80.0))
                 .push(
-                    crate::ui_controls::editable::TextInput::new("nested draft", "kept")
+                    crate::ui_controls::field::TextInput::new("nested draft", "kept")
                         .id(editor.clone())
                         .on_input(|_| 1_u8),
                 )
-                .push(widget::Space::with_height(400.0)),
+                .push(widget::Space::new().height(400.0)),
         )
         .id(inner_id.clone())
         .width(Length::Fill)
@@ -5051,7 +5034,7 @@ mod tests {
                 width: 320.0,
                 content_width: 320.0,
                 on_screen: true,
-                content: CardSurface::new(inner.into()).into(),
+                content: CardSurface::new(inner).into(),
             }],
         };
         let mut element: Element<'_, u8> = widget::scrollable(strip)
