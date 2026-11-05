@@ -480,10 +480,12 @@ fn dispatch(
                     && !record.handle.is_completed()
             })
             .ok_or_else(|| {
-                before(
-                    "The exact hosted conversation is unavailable; its prompt was not resent"
-                        .into(),
-                )
+                before(if session.lost_holder_history(state.proof()).is_some() {
+                    "This agent's provider stopped when the computer restarted, so this prompt was not delivered. Choose Resume conversation in its pane, then send it again."
+                        .into()
+                } else {
+                    "The exact hosted conversation is unavailable; its prompt was not resent".into()
+                })
             })?;
         (record.session.clone(), record.handle.clone())
     } else {

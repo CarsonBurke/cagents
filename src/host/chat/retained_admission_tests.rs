@@ -774,12 +774,34 @@ fn lost_holder_case(name: &str, managed: bool, mail: bool) {
                     1,
                 )
                 .unwrap();
+            // A spawn binds the descriptor it started with, before Claude reports
+            // a conversation. Only the shared pane hears about that afterwards.
+            let mut spawned = original.clone();
+            spawned.launch.session_id = None;
             registry
                 .bind_agent(
                     accepted.agent.id,
                     None,
-                    crate::agent_execution::HostedSession::Chat(original.clone()),
+                    crate::agent_execution::HostedSession::Chat(spawned),
                 )
+                .unwrap();
+            registry
+                .apply(&crate::workspace_model::ModelEdit::SeedView {
+                    scope: crate::workspace_model::views::Scope::Worktree {
+                        repository: project.clone(),
+                        path: project.clone(),
+                    },
+                    panes: vec![crate::workspace_model::views::Pane {
+                        id: crate::model::CardId::from_uuid(accepted.agent.id.as_uuid()),
+                        title: "Agent".into(),
+                        user_title: None,
+                        pending_terminal_start: false,
+                        width_fraction: 0.5,
+                        scope: None,
+                        kind: crate::model::CardKind::Chat(original.clone()),
+                    }],
+                    closed: vec![],
+                })
                 .unwrap();
         }
 
@@ -867,6 +889,7 @@ fn lost_holder_case(name: &str, managed: bool, mail: bool) {
             ("agent_authorities", "source"),
             ("native_actor_ownerships", "ownership"),
             ("agents", "record"),
+            ("shared_views", "panes"),
         ]
     } else {
         &[
@@ -914,13 +937,12 @@ fn lost_holder_case(name: &str, managed: bool, mail: bool) {
         })
     };
     if managed {
-        // What daemon startup does to a run it cannot prove finished.
-        super::super::agent_execution::registry(&host)
-            .unwrap()
-            .lock()
-            .unwrap()
-            .interrupt_unproven_agent_runs(2)
-            .unwrap();
+        // What daemon startup does for the agent's identity, and to a run it
+        // cannot prove finished.
+        let registry = super::super::agent_execution::registry(&host).unwrap();
+        let mut registry = registry.lock().unwrap();
+        registry.learn_lost_agent_conversations(&proof).unwrap();
+        registry.interrupt_unproven_agent_runs(2).unwrap();
     }
     let lost_agent = agent_state();
 

@@ -41,7 +41,8 @@ pub(in crate::host) fn earlier_boot_self_authority(
 
 /// `reader` is the saved reader of this agent's own provider, lost with an
 /// earlier boot. The conversation must be the agent's own: a capability may lag
-/// a later-learned identity, but an agent's record may not.
+/// a later-learned identity, but `learn_lost_agent_conversations` has settled
+/// the agent's record by the time any client can ask.
 fn lost_provider_reader(expected: &HostedSession, reader: &HostedSession) -> bool {
     matches!((expected, reader), (HostedSession::Chat(expected), HostedSession::Chat(reader))
         if crate::chat::is_lost_holder_history(expected, reader))
@@ -278,6 +279,67 @@ impl Registry {
             blockers.push("Additional agent launches must settle before updating".into());
         }
         Ok(blockers)
+    }
+
+    /// An agent's record keeps the descriptor its spawn bound, so it never names
+    /// the conversation Claude reported afterwards; the agent's shared pane does.
+    /// Once a changed boot has ended that exact process, nothing can move the
+    /// conversation again, so the record takes it from the pane and every later
+    /// proof (reader, Resume, Close) has one answer. A pane of another process,
+    /// or an agent of this boot, teaches nothing.
+    pub(in crate::host) fn learn_lost_agent_conversations(
+        &mut self,
+        live: &crate::model::HostSessionProof,
+    ) -> Result<(), String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let records = tx
+            .prepare("SELECT record FROM agents WHERE closed=0 AND session_id IS NOT NULL")
+            .map_err(|error| error.to_string())?
+            .query_map([], |row| row.get::<_, String>(0))
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|error| error.to_string())?;
+        let mut learned = false;
+        for record in records {
+            let mut agent: Agent = decode(&record)?;
+            let automated = matches!(agent.origin, Origin::Automation { .. });
+            let Some(HostedSession::Chat(bound)) = &mut agent.session else {
+                continue;
+            };
+            if automated || bound.launch.session_id.is_some() {
+                continue;
+            }
+            let Some(crate::model::CardKind::Chat(pane)) =
+                super::views::agent_pane(&tx, agent.id)?.map(|pane| pane.kind)
+            else {
+                continue;
+            };
+            if !crate::agent_execution::same_chat_process(bound, &pane) {
+                continue;
+            }
+            let mut named = bound.clone();
+            named.launch.session_id = pane.launch.session_id;
+            if named.lost_holder_history(live).is_none() {
+                continue;
+            }
+            *bound = named;
+            tx.execute(
+                "UPDATE agents SET record=?2 WHERE id=?1",
+                params![agent.id.to_string(), encode(&agent)?],
+            )
+            .map_err(|error| error.to_string())?;
+            learned = true;
+        }
+        if learned {
+            tx.execute(
+                "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// Whether every durable claim on `reader`'s allocation is its own record
@@ -2962,6 +3024,112 @@ mod tests {
                     case == 0 || case == 6,
                     "pending_only={pending_only} case={case}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_lost_agent_learns_its_conversation_only_from_its_own_panes_exact_process() {
+        use crate::{
+            model::{CardId, CardKind},
+            workspace_model::views::{Pane, Scope},
+        };
+        let live = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("host"),
+            boot_id: crate::model::BootId::new("after-reboot"),
+            host_incarnation: crate::model::HostIncarnation::new("new"),
+        };
+        // 0 learns. 1 same boot, 2 another process's pane, 3 a pane that never
+        // heard an ID, 4 no pane, 5 a scheduled agent, 6 a record that already
+        // has its conversation.
+        for case in 0..7 {
+            let (mut registry, directory, request) = fixture();
+            let origin = if case == 5 {
+                Origin::Automation {
+                    id: uuid::Uuid::new_v4(),
+                }
+            } else {
+                Origin::User
+            };
+            let accepted = registry.submit_agent(&origin, &request, 1).unwrap();
+            let HostedSession::Chat(mut pane) = source() else {
+                unreachable!()
+            };
+            pane.native_continuity =
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            if case == 1 {
+                pane.proof.as_mut().unwrap().boot_id = live.boot_id.clone();
+            }
+            let conversation = pane.launch.session_id.clone();
+            let mut spawned = pane.clone();
+            if case != 6 {
+                spawned.launch.session_id = None;
+            }
+            registry
+                .bind_agent(
+                    accepted.agent.id,
+                    None,
+                    HostedSession::Chat(spawned.clone()),
+                )
+                .unwrap();
+            let repository = directory.path().to_owned();
+            if case == 2 {
+                pane.launch.recipe.program = "/another/claude".into();
+            }
+            if case == 3 {
+                pane.launch.session_id = None;
+            }
+            if case == 6 {
+                pane.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            }
+            if case != 4 {
+                registry
+                    .apply(&ModelEdit::SeedView {
+                        scope: Scope::Worktree {
+                            repository: repository.clone(),
+                            path: repository,
+                        },
+                        panes: vec![Pane {
+                            id: CardId::from_uuid(accepted.agent.id.as_uuid()),
+                            title: "agent".into(),
+                            user_title: None,
+                            pending_terminal_start: false,
+                            width_fraction: 0.5,
+                            scope: None,
+                            kind: CardKind::Chat(pane),
+                        }],
+                        closed: vec![],
+                    })
+                    .unwrap();
+            }
+            let sequence = |registry: &Registry| -> u64 {
+                registry
+                    .db
+                    .query_row("SELECT sequence FROM metadata WHERE key=0", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            };
+            let before = sequence(&registry);
+            registry.learn_lost_agent_conversations(&live).unwrap();
+            let bound = registry.agent(accepted.agent.id).unwrap().session.unwrap();
+            let HostedSession::Chat(bound) = bound else {
+                unreachable!()
+            };
+            if case == 0 {
+                assert_eq!(bound.launch.session_id, conversation);
+                assert_eq!(sequence(&registry), before + 1);
+                // Settled once: asking again changes nothing.
+                registry.learn_lost_agent_conversations(&live).unwrap();
+                assert_eq!(sequence(&registry), before + 1);
+                let reader = bound.lost_holder_history(&live).unwrap();
+                assert!(lost_provider_reader(
+                    &HostedSession::Chat(bound),
+                    &HostedSession::Chat(reader)
+                ));
+            } else {
+                assert_eq!(bound, spawned, "case {case}");
+                assert_eq!(sequence(&registry), before, "case {case}");
             }
         }
     }

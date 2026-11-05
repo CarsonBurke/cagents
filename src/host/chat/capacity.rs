@@ -1167,6 +1167,89 @@ exit 0
         }
     }
 
+    #[test]
+    fn a_prompt_to_a_lost_agent_says_how_to_get_it_back_and_starts_nothing() {
+        use crate::agent_execution::{
+            Destination, HostedSession, Operation, Origin, State, Submit, Update,
+        };
+        let host = host();
+        let rows = [user_row("u1", "lost agent question", None)];
+        let (directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        // Its last prompt finished: unfinished work is refused before dispatch.
+        let accepted = {
+            let mut registry = registry.lock().unwrap();
+            registry
+                .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                    repository: directory.path().to_owned(),
+                    name: "Fixture".into(),
+                    kind: crate::model::ProjectKind::Folder,
+                })
+                .unwrap();
+            let accepted = registry
+                .submit_agent(
+                    &Origin::User,
+                    &lost_submit(directory.path(), "lost-agent"),
+                    1,
+                )
+                .unwrap();
+            registry
+                .bind_agent(accepted.agent.id, None, HostedSession::Chat(source.clone()))
+                .unwrap();
+            let started = registry
+                .update_agent_run(
+                    accepted.run.id,
+                    accepted.run.revision,
+                    Update::Started {
+                        provider_key: "lost-agent-turn".into(),
+                    },
+                    2,
+                )
+                .unwrap();
+            registry
+                .update_agent_run(
+                    accepted.run.id,
+                    started.revision,
+                    Update::Finished {
+                        state: State::Succeeded,
+                        result: Default::default(),
+                    },
+                    3,
+                )
+                .unwrap();
+            accepted
+        };
+        let submitted = super::super::super::agent_execution::process(
+            &host,
+            Default::default(),
+            Operation::Submit(Submit {
+                name: None,
+                destination: Destination::Existing(accepted.agent.id),
+                prompt: "after the restart".into(),
+                idempotency_key: "after-the-restart".into(),
+            }),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let run = loop {
+            let run = registry
+                .lock()
+                .unwrap()
+                .latest_agent_run(accepted.agent.id)
+                .unwrap();
+            if run.id != accepted.run.id && run.state == State::Failed {
+                break run;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{submitted:?} {run:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let diagnostic = run.result.diagnostic.unwrap();
+        assert!(diagnostic.contains("Resume conversation"), "{diagnostic}");
+        assert!(!marker.exists(), "a prompt started no provider");
+    }
+
     fn agent_open(host: &SharedHost, id: crate::model::AgentId) -> bool {
         let registry = host.lock().unwrap().execution_registry.clone().unwrap();
         let open = !registry.lock().unwrap().agent(id).unwrap().closed;
