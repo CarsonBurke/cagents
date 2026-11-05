@@ -12378,14 +12378,7 @@ mod tests {
     }
 
     async fn finish_navigation_task(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
-        use cosmic::iced::futures::StreamExt;
-        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
-            while let Some(action) = stream.next().await {
-                if let iced::runtime::Action::Output(action) = action {
-                    drop(runtime.update(action));
-                }
-            }
-        }
+        drop(super::retained_save_tests::finish(runtime, task).await);
     }
 
     #[tokio::test]
@@ -12900,6 +12893,10 @@ mod tests {
         };
         let task = runtime.retarget_file(card, text_view.clone());
         finish_navigation_task(&mut runtime, task).await;
+        assert!(matches!(runtime.document, DocumentState::Editable(_)));
+        assert_eq!(runtime.selected_path(), Some(Path::new("notes.txt")));
+        assert_eq!(runtime.editor_text().as_deref(), Some("unsaved baseline"));
+        assert!(runtime.editable_surface_visible());
         drop(runtime.update(RepositoryAction::EditorAction {
             card,
             action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
