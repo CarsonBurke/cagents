@@ -54,8 +54,11 @@ struct Hydrated {
 }
 
 /// The bytes of one message that a presented text item holds. Within one
-/// [`Key`] the source only grows by appending, so an item holding a longer
-/// range from the same start extends one holding a shorter range.
+/// [`Key`] the source only grows by appending: the store bumps the revision on
+/// any change it has not verified as an append, and publishes each item with
+/// its source. Nothing here checks the text again, so an item holding a longer
+/// range from the same start extends one holding a shorter range on the
+/// strength of that store rule alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Span {
     item: String,
@@ -218,6 +221,19 @@ impl State {
         }
     }
 
+    /// Whether `current` reaches at least as far into the same revision of
+    /// the same message as `previous`. It may start elsewhere, so it is not an
+    /// append, but everything `previous` shows is still true of the message:
+    /// it can stay on screen while `current` is prepared.
+    pub(super) fn supersedes(&self, previous: &Arc<chat::Item>, current: &Arc<chat::Item>) -> bool {
+        match (self.span(previous), self.span(current)) {
+            (Some(old), Some(new)) => {
+                old.item == new.item && old.key == new.key && old.end <= new.end
+            }
+            _ => false,
+        }
+    }
+
     /// Presents `raw` with each message's parts joined. Returns `raw` itself
     /// when no message in it is cut.
     pub(super) fn project(&mut self, raw: Arc<Snapshot>) -> Arc<Snapshot> {
@@ -247,15 +263,18 @@ impl State {
                     source.is_none_or(|source| run.start == 0 && source.bytes as usize <= run.end);
                 // A complete read supplies everything up to its own length;
                 // parts the window holds beyond it are a later append.
-                let hydrated = (!complete)
+                let stored = (!complete)
                     .then(|| key.as_ref().and_then(|key| self.hydrated.get(key)))
                     .flatten()
-                    .filter(|hydrated| hydrated.text.len() >= run.start)
                     .map(|hydrated| hydrated.text.clone());
+                let hydrated = stored.clone().filter(|text| text.len() >= run.start);
                 if !complete && let (Some(source), Some(key)) = (source, &key) {
-                    // A read already made covers what this window shows; the
-                    // window pages before it needs anything appended since.
-                    if hydrated.is_none() {
+                    // While a message streams, the window slides forward past
+                    // what the last read covers. Read it again once the window
+                    // has moved half its length, so a fresh read arrives
+                    // before the stored one stops reaching the window.
+                    let slack = (run.end - run.start) / 2;
+                    if stored.is_none_or(|text| text.len() < run.start + slack) {
                         wanted.push(source.clone());
                     }
                     needed.insert(key.clone());
@@ -270,7 +289,12 @@ impl State {
                 let joined = hydrated
                     .as_ref()
                     .map_or(run.end - run.start, |text| text.len().max(run.end));
-                let joins = joined <= preparation::SOURCE_BYTES && !merged.contains_key(run.item);
+                let fits = joined <= preparation::SOURCE_BYTES;
+                if !fits && let Some(key) = &key {
+                    // A read this message has outgrown is never used again.
+                    needed.remove(key);
+                }
+                let joins = fits && !merged.contains_key(run.item);
                 if !joins {
                     unjoined = run.parts.end;
                 }
@@ -741,6 +765,41 @@ mod tests {
             state.request().is_none(),
             "the resident tail completes the earlier read"
         );
+    }
+
+    #[test]
+    fn a_window_sliding_past_its_read_asks_for_a_fresh_one_before_losing_it() {
+        let message = "streamed line\n".repeat(16 * PART / 14);
+        let window = |end: usize| {
+            let count = end.div_ceil(PART);
+            snapshot(
+                parts("answer", &message[..end], count - 3..count),
+                Some(source(end)),
+            )
+        };
+        let mut state = State::default();
+        state.project(window(6 * PART));
+        assert!(state.complete(&source(6 * PART), Ok(message[..6 * PART].to_owned())));
+        let mut end = 6 * PART;
+        // While the window still starts inside the read, every publication
+        // shows the whole message; a fresh read is asked for before it ends.
+        let asked = loop {
+            end += PART / 4;
+            let projected = state.project(window(end));
+            assert_eq!(body(&projected.items[0]), &message[..end]);
+            if let Some((read, _)) = state.request() {
+                break read.clone();
+            }
+        };
+        assert_eq!(asked, source(end));
+        let start = (end.div_ceil(PART) - 3) * PART;
+        assert!(
+            start + PART <= 6 * PART,
+            "asked with {} bytes of the read still ahead of the window",
+            6 * PART - start
+        );
+        assert!(state.complete(&asked, Ok(message[..end].to_owned())));
+        assert!(state.request().is_none());
     }
 
     #[test]
