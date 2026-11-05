@@ -313,6 +313,20 @@ exit 83
                      if path.name.startswith(".run-development-started")]
         self.assertEqual(leftovers, [])
 
+    def test_nested_only_refuses_the_callers_desktop_before_building(self):
+        result = subprocess.run(
+            [str(self.runner), "--browserless"], cwd=self.root,
+            env=dict(self.env, CAGENTS_DEVELOPMENT_NESTED_ONLY="1", XDG_RUNTIME_DIR="/run/user/1000"),
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("not a niri-harness session", result.stderr)
+        self.assertFalse(self.cargo_calls.exists(), "the refused launch built")
+        session_runtime = self.root / "nh-fixture"
+        session_runtime.mkdir()
+        self.assert_built("--browserless", CAGENTS_DEVELOPMENT_NESTED_ONLY="1",
+                          XDG_RUNTIME_DIR=str(session_runtime))
+
     def test_the_other_lane_rebuilds_and_invalidates_this_one(self):
         self.assert_built("--browserless")
         self.assert_built()

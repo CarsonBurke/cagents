@@ -223,6 +223,15 @@ ignores it. The runner sets it for `--instance` and clears it otherwise, so an
 inherited value never selects an instance. Provider accounts and tools keep
 the caller's `HOME`, so an instance's agents use the same provider sign-ins.
 
+The runner starts the session without the caller's `WAYLAND_DISPLAY`,
+`WAYLAND_SOCKET`, `NIRI_SOCKET`, `DISPLAY` and `XAUTHORITY`, and stops an
+instance's daemon through `niri-harness exec`, so nothing it runs for an
+instance can reach the caller's desktop. Agents should also set
+`CAGENTS_DEVELOPMENT_NESTED_ONLY=1`: the runner then refuses to start a UI
+without `--instance` unless it runs inside a session through
+`niri-harness --session NAME exec -- scripts/run-development ...`, so a failed
+nested session cannot put a UI on the user's desktop.
+
 Stopping a harness session deletes its runtime directory, so stop an instance
 with `--stop-instance`, which stops its daemon first. `niri-harness stop` alone
 leaves that daemon running without a socket. An instance's storage remains

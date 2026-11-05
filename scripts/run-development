@@ -73,6 +73,9 @@ Options:
 
 Environment:
   CAGENTS_ZIG      Absolute Zig path; zig env must report an executable named zig
+  CAGENTS_DEVELOPMENT_NESTED_ONLY=1
+                   Refuse to start a UI on the caller's own desktop: start it
+                   with --instance, or inside a session through niri-harness exec
 USAGE
             exit 0
             ;;
@@ -107,6 +110,18 @@ if [ -n "$instance" ]; then
 else
     # The flags choose the instance, never an inherited environment.
     unset CAGENTS_DEVELOPMENT_INSTANCE
+    # Agents opt in so that a failed nested session can never put their UI on
+    # the user's desktop. niri-harness exec gives each command a session's
+    # private runtime directory and removes the caller's display variables.
+    if [ "${CAGENTS_DEVELOPMENT_NESTED_ONLY:-}" = 1 ]; then
+        case ${XDG_RUNTIME_DIR:-} in
+            */nh-?*) ;;
+            *)
+                printf '%s\n' "CAGENTS_DEVELOPMENT_NESTED_ONLY is set and this is not a niri-harness session; use --instance NAME or niri-harness --session NAME exec -- scripts/run-development ..." >&2
+                exit 2
+                ;;
+        esac
+    fi
 fi
 
 if [ "$hot" = true ]; then
@@ -395,14 +410,14 @@ run_cli() {
 
 # The CLI this checkout last built, so stopping an instance does not wait for
 # a build when one exists.
-instance_cli() {
+instance_cli_path() {
     find_products
     if [ ! -x "$products/cagents" ]; then
         # shellcheck disable=SC2086 # empty when the default features apply
         "$root/scripts/cargo-gate" build --locked --profile dev-runtime $default_features \
-            --features development --bin cagents
+            --features development --bin cagents >&2
     fi
-    run_cli "$@"
+    printf '%s\n' "$products/cagents"
 }
 
 # The instance's daemon lives in the harness session's private runtime
@@ -413,14 +428,13 @@ stop_instance_session() {
         eval "$harness_env"
         printf '%s' "$XDG_RUNTIME_DIR"
     )
-    (
-        eval "$harness_env"
-        socket=$XDG_RUNTIME_DIR/cagents-development-$instance/cagentsd.sock
-        if [ -e "$socket" ]; then
-            if ! output=$(instance_cli daemon stop-for-rebuild --including-subagents 2>&1); then
-                printf '%s\n' "$output" >&2
-                exit 1
-            fi
+    socket=$runtime/cagents-development-$instance/cagentsd.sock
+    if [ -e "$socket" ]; then
+        # Through the session's own environment, never the caller's desktop.
+        # A session that is no longer live refuses; the sweep below then ends
+        # the daemon with the rest of the session's processes.
+        if output=$(niri-harness exec --session "$harness_session" -- \
+            "$(instance_cli_path)" daemon stop-for-rebuild --including-subagents 2>&1); then
             remaining=100
             while [ -e "$socket" ]; do
                 if [ "$remaining" -eq 0 ]; then
@@ -430,8 +444,11 @@ stop_instance_session() {
                 remaining=$((remaining - 1))
                 sleep 0.05
             done
+        elif niri-harness exec --session "$harness_session" -- true 2>/dev/null; then
+            printf '%s\n' "$output" >&2
+            exit 1
         fi
-    )
+    fi
     # The harness reports a runtime it could not remove; the sweep below
     # removes it, so only a failure that leaves it behind is worth showing.
     harness_output=$(niri-harness --session "$harness_session" stop 2>&1 >/dev/null) || :
@@ -497,7 +514,10 @@ if [ -n "$instance" ]; then
     fi
     # Its own bus and runtime directory keep the instance's application ID,
     # activation sockets and daemon apart from every other session.
-    niri-harness start --backend headless --name "$harness_session" --timeout 180 -- \
+    # Without the caller's display variables, nothing in the session can fall
+    # back to the caller's desktop.
+    env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u DISPLAY -u XAUTHORITY \
+        niri-harness start --backend headless --name "$harness_session" --timeout 180 -- \
         "$products/cagents-ui" "$@"
     printf '%s\n' \
         "Instance $instance is running in niri-harness session $harness_session." \
