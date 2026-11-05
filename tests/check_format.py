@@ -21,6 +21,7 @@ CHECKER = ROOT / "scripts/check-format"
 CACHE_HELPER = ROOT / "scripts/check-format-cache.py"
 INCLUDED = (
     "src/modules.rs",
+    "src/app/repository_clone_lsp_ownership_tests.rs",
     "src/control/handshake_deadline_tests.rs",
     "src/terminal/worker/bounded_input_tests.rs",
     "src/host/model/views/placement_tests.rs",
