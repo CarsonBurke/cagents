@@ -110,6 +110,7 @@ pub(super) struct DiscussionState {
     busy: bool,
     submitting: bool,
     saving_composer: bool,
+    discarding: bool,
     /// What the write in flight reports once GitHub applies it.
     applied_notice: &'static str,
     unknown: Option<String>,
@@ -138,6 +139,7 @@ impl Default for DiscussionState {
             busy: false,
             submitting: false,
             saving_composer: false,
+            discarding: false,
             applied_notice: "Review updated on GitHub.",
             unknown: None,
             loading: false,
@@ -347,6 +349,7 @@ impl State {
                 | Mutation::Reply { .. }
                 | Mutation::Edit { .. }
         );
+        self.discussion.discarding = matches!(mutation, Mutation::Discard { .. });
         self.discussion.applied_notice = match &mutation {
             Mutation::Comment { single: true, .. }
             | Mutation::FileComment { single: true, .. }
@@ -494,6 +497,11 @@ impl State {
                     Outcome::Applied => {
                         if self.discussion.saving_composer {
                             self.discussion.composer = None;
+                        }
+                        // Discarding is a detour, wherever it started; the
+                        // composer it leads back to is under the popover.
+                        if self.discussion.discarding {
+                            self.discussion.review_open = false;
                         }
                         self.notice = Some(if self.discussion.submitting {
                             self.discussion.summary = text_editor::Content::new();
@@ -985,7 +993,7 @@ impl State {
         let mut rows: Vec<Element<'_, Action>> = Vec::new();
         if let Some((authority, _)) = &self.discussion.discard_confirmation {
             rows.push(design::heading("Discard pending review?").into());
-            rows.push(design::body(format!("This deletes the pending review and all {} draft comments from GitHub. Your local composer is kept.", authority.context.pending.as_ref().map_or(0, |pending| pending.comment_count))).into());
+            rows.push(design::body(format!("This deletes the pending review and {} from GitHub. Your local composer is kept.", match authority.context.pending.as_ref().map_or(0, |pending| pending.comment_count) { 1 => "its draft comment".to_owned(), count => format!("all {count} draft comments") })).into());
             rows.push(popup_actions(
                 crate::ui_controls::button::secondary("Keep review")
                     .on_press(Action::CancelDiscard),
@@ -2581,6 +2589,7 @@ mod tests {
             outcome: Outcome::Applied,
         }));
         assert_eq!(state.notice.as_deref(), Some("Pending review discarded."));
+        assert!(!state.discussion.review_open, "back to the composer");
     }
 
     #[test]
