@@ -4,7 +4,7 @@ use crate::{model::TerminalId, terminal::TerminalRetirement};
 use std::{
     collections::BTreeSet,
     fs::File,
-    sync::Arc,
+    sync::{Arc, RwLock, RwLockWriteGuard, TryLockError},
     time::{Duration, Instant},
 };
 
@@ -18,6 +18,7 @@ pub(super) struct Lifecycle {
     retention_error_reported: bool,
     idle: IdleTimer,
     waiting: Vec<Arc<File>>,
+    settlement_retry: Option<Instant>,
 }
 
 impl Lifecycle {
@@ -33,6 +34,7 @@ impl Lifecycle {
                 ),
             ),
             waiting: Vec::new(),
+            settlement_retry: None,
         }
     }
 
@@ -43,6 +45,7 @@ impl Lifecycle {
             retention_error_reported: false,
             idle: IdleTimer::new(false, Duration::ZERO),
             waiting: Vec::new(),
+            settlement_retry: None,
         }
     }
 
@@ -51,8 +54,9 @@ impl Lifecycle {
     }
 
     pub(super) fn maintain(&mut self, host: &SharedHost, connected: bool) -> Option<Instant> {
+        self.settlement_retry = None;
         self.settle_retirements(host);
-        let retention = self.maintain_retention(host);
+        let retention = earliest(self.maintain_retention(host), self.settlement_retry);
         if !self.idle.enabled {
             return retention;
         }
@@ -100,10 +104,7 @@ impl Lifecycle {
             false
         };
         let idle = self.idle.update(now, idle);
-        match (retention, idle) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        earliest(retention, idle)
     }
 
     fn settle_retirements(&mut self, host: &SharedHost) {
@@ -155,7 +156,10 @@ impl Lifecycle {
         if ready.is_empty() {
             return;
         }
-        let admission = gate.write().unwrap_or_else(|p| p.into_inner());
+        let Some(admission) = try_admission(&gate) else {
+            self.settlement_retry = Some(Instant::now() + RETENTION_RETRY);
+            return;
+        };
         let candidates = ready
             .iter()
             .filter_map(|(id, _, _, result)| matches!(result, Some(Ok(()))).then_some(*id))
@@ -197,9 +201,16 @@ impl Lifecycle {
                         "A saved pane claimed this terminal while cleanup settled; result retained"
                             .into(),
                     ),
-                    Err(error) => Some(format!(
-                        "Terminal cleanup finished but pane ownership is unknown: {error}"
-                    )),
+                    // Uncertainty is not a failure: the released holder stays
+                    // released, and the census decides on a later retry.
+                    Err(error) => {
+                        if !self.retention_error_reported {
+                            tracing::warn!(%error, "Terminal cleanup finished but pane ownership is unknown");
+                            self.retention_error_reported = true;
+                        }
+                        self.settlement_retry = Some(Instant::now() + RETENTION_RETRY);
+                        continue;
+                    }
                 },
                 None => continue,
             };
@@ -232,23 +243,43 @@ impl Lifecycle {
         if deadline > now {
             return Some(deadline);
         }
-        let admission = gate.write().unwrap_or_else(|p| p.into_inner());
-        let candidates = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .expired_terminal_handles(now, self.retention, &BTreeSet::new())
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect::<BTreeSet<TerminalId>>();
-        let pinned = registry
-            .ok_or_else(|| "The workspace registry is unavailable".to_owned())
-            .and_then(|registry| {
-                registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .pinned_terminals(&candidates)
-            });
-        let pinned = match pinned {
+        let expired = || {
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .expired_terminal_handles(now, self.retention, &BTreeSet::new())
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<BTreeSet<TerminalId>>()
+        };
+        let census = |candidates: &BTreeSet<TerminalId>| {
+            registry
+                .as_ref()
+                .ok_or_else(|| "The workspace registry is unavailable".to_owned())
+                .and_then(|registry| {
+                    registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .pinned_terminals(candidates)
+                })
+        };
+        // Any wake reaches here while a saved pane's expired terminal exists.
+        // A writer queued at the gate holds back every new reader, including
+        // terminal input, until the slowest shared request ends. So settle
+        // pinned candidates without it, and never queue for the rest.
+        let unfenced = expired();
+        if let Ok(pinned) = census(&unfenced)
+            && unfenced.is_subset(&pinned)
+        {
+            self.retention_error_reported = false;
+            return host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .terminal_retention_deadline(self.retention, &pinned);
+        }
+        let Some(admission) = try_admission(&gate) else {
+            return Some(Instant::now() + RETENTION_RETRY);
+        };
+        let pinned = match census(&expired()) {
             Ok(pinned) => {
                 self.retention_error_reported = false;
                 pinned
@@ -290,6 +321,21 @@ impl Lifecycle {
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
             .terminal_retention_deadline(self.retention, &pinned)
+    }
+}
+
+fn try_admission(gate: &RwLock<()>) -> Option<RwLockWriteGuard<'_, ()>> {
+    match gate.try_write() {
+        Ok(admission) => Some(admission),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -891,6 +937,115 @@ mod tests {
         };
         drop(retired); // fixture owner settles outside HostState, after proof
         assert!(host.lock().unwrap().list(1).is_empty());
+    }
+
+    /// A slow shared request holds the gate's read side. Maintenance must not
+    /// queue a writer behind it, or every new reader, including terminal input,
+    /// would wait for that unrelated request to finish.
+    #[test]
+    fn retention_never_queues_a_gate_writer_behind_a_slow_shared_request() {
+        if isolated_lifecycle_case() {
+            return;
+        }
+        fn maintain_unblocked(
+            mut lifecycle: Lifecycle,
+            host: &SharedHost,
+        ) -> (Lifecycle, Option<Instant>) {
+            let (done, finished) = std::sync::mpsc::channel();
+            let host = host.clone();
+            std::thread::spawn(move || {
+                let deadline = lifecycle.maintain(&host, true);
+                done.send((lifecycle, deadline)).unwrap();
+            });
+            finished
+                .recv_timeout(Duration::from_secs(5))
+                .expect("maintenance waited for a slow shared request")
+        }
+        let (host, _lease, paths, _db_path) = fixture_host();
+        let proof = host.lock().unwrap().proof().clone();
+        let source = TerminalSession {
+            id: TerminalId::new(),
+            launch: LaunchRecipe {
+                program: "/bin/sh".into(),
+                arguments: vec!["-c".into(), "exit 0".into()],
+                working_directory: paths.directory.clone(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::DetachedSameBoot {
+                host_session_id: proof.host_session_id.clone(),
+                boot_id: proof.boot_id.clone(),
+                host_incarnation: proof.host_incarnation.clone(),
+            },
+        };
+        let recovery = crate::terminal::holder::Recovery {
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            relaunches: Vec::new(),
+            options: Default::default(),
+            execution_environment: None,
+            execution_recipe: None,
+        };
+        let handle = TerminalHandle::spawn(
+            source.clone(),
+            TerminalConfig {
+                holder_recovery: Some(recovery),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        wait_until(|| handle.is_completed());
+        let (registry, gate) = {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.reserve_spawn(source.id).unwrap();
+            state
+                .finish_spawn(1, source.clone(), handle.clone(), false)
+                .unwrap();
+            let registry = state.execution_registry.clone().unwrap();
+            let gate = state.control_gate.clone();
+            drop(state.unregister_client(1));
+            (registry, gate)
+        };
+        registry
+            .lock()
+            .unwrap()
+            .pin_window_terminals(&[source.id])
+            .unwrap();
+        let slow_request = gate.read().unwrap();
+        let lifecycle = Lifecycle::testing(Duration::ZERO);
+
+        // A saved pane's expired terminal needs no writer at all.
+        let (lifecycle, deadline) = maintain_unblocked(lifecycle, &host);
+        assert_eq!(deadline, None, "a pinned terminal arms no deadline");
+        assert!(host.lock().unwrap().terminal_retirements.is_empty());
+
+        // A due terminal waits for the gate on a timer instead of queueing.
+        {
+            let mut registry = registry.lock().unwrap();
+            let generation = registry
+                .retention_pin_generation(source.id)
+                .unwrap()
+                .unwrap();
+            registry
+                .forget_retention_pin(source.id, &generation)
+                .unwrap();
+        }
+        let (mut lifecycle, deadline) = maintain_unblocked(lifecycle, &host);
+        assert!(deadline.is_some_and(|deadline| deadline > Instant::now()));
+        assert!(host.lock().unwrap().terminal_retirements.is_empty());
+
+        drop(slow_request);
+        wait_until(|| {
+            lifecycle.maintain(&host, true);
+            host.lock().unwrap().list(1).is_empty()
+        });
     }
 
     #[test]
