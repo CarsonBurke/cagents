@@ -802,12 +802,23 @@ prepare_link_parent() {
 }
 
 desktop_exec_escape() {
-    printf '%s' "$1" | sed \
+    desktop_exec_quoted=$(printf '%s' "$1" | sed \
         -e 's/\\/\\\\/g' \
         -e 's/"/\\"/g' \
         -e 's/`/\\`/g' \
         -e 's/\$/\\$/g' \
-        -e 's/%/%%/g'
+        -e 's/%/%%/g')
+    # Desktop-entry string unescaping happens before Exec argument parsing.
+    desktop_string_escape "$desktop_exec_quoted"
+}
+
+desktop_string_escape() {
+    printf '%s\n' "$1" | sed \
+        -e ':join' -e '$!{N;b join;}' \
+        -e 's/\\/\\\\/g' \
+        -e 's/\t/\\t/g' \
+        -e 's/\r/\\r/g' \
+        -e 's/\n/\\n/g'
 }
 
 check_link_destination "$BIN_LINK" "$BIN_TARGET"
@@ -829,13 +840,20 @@ tar --no-same-owner --no-same-permissions -xzf "$ARCHIVE_PATH" -C "$INSTALL_STAG
     || fail 'archive extraction failed'
 AUTOSTART_EXEC=$(desktop_exec_escape "$BIN_TARGET")
 DESKTOP_EXEC=$(desktop_exec_escape "$BIN_TARGET")
-DESKTOP_ICON=$PREFIX/current/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg
+# GLib checks the executable exists before expanding %% in Exec. Keep paths
+# containing percent signs out of that lookup and only in positional arguments.
+DESKTOP_EXEC_PREFIX=
+case $BIN_TARGET in
+    *%*) DESKTOP_EXEC_PREFIX='/bin/sh -c "exec \\"\\$@\\"" cagents-desktop ' ;;
+esac
+DESKTOP_TRY_EXEC=$(desktop_string_escape "$BIN_TARGET")
+DESKTOP_ICON=$(desktop_string_escape "$PREFIX/current/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg")
 DESKTOP_FILE=$INSTALL_STAGE/$TOP_LEVEL/share/applications/dev.cagents.Cagents.desktop
 {
     while IFS= read -r line || [ -n "$line" ]; do
         case $line in
-            Exec=*) printf 'Exec="%s" ui\n' "$DESKTOP_EXEC" ;;
-            TryExec=*) printf 'TryExec=%s\n' "$BIN_TARGET" ;;
+            Exec=*) printf 'Exec=%s"%s" ui\n' "$DESKTOP_EXEC_PREFIX" "$DESKTOP_EXEC" ;;
+            TryExec=*) printf 'TryExec=%s\n' "$DESKTOP_TRY_EXEC" ;;
             Icon=*) printf 'Icon=%s\n' "$DESKTOP_ICON" ;;
             *) printf '%s\n' "$line" ;;
         esac
@@ -850,7 +868,7 @@ mv "$DESKTOP_FILE.rewritten" "$DESKTOP_FILE" \
         'Type=Application' \
         'Name=cagents daemon' \
         'Comment=Keep cagents sessions available in the system tray'
-    printf 'Exec="%s" daemon start\n' "$AUTOSTART_EXEC"
+    printf 'Exec=%s"%s" daemon start\n' "$DESKTOP_EXEC_PREFIX" "$AUTOSTART_EXEC"
     printf '%s\n' \
         'Terminal=false' \
         'NoDisplay=true' \
