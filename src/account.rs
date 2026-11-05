@@ -40,6 +40,8 @@ pub mod preferences;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod probe;
 #[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod recovery;
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod registry;
 pub mod remote;
 pub mod routing;
