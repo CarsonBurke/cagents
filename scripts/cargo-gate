@@ -1,0 +1,353 @@
+#!/bin/sh
+# Run a Cargo command in one of a few shared build slots.
+#
+# Checkouts on one host share its memory, not a build directory: each worktree
+# has its own. One global lock idles most of the CPU while a single slow crate
+# compiles, and while tests run. This admits a few builds at once, sized by
+# memory, and runs tests and programs after their build has left its slot.
+set -eu
+
+program=cargo-gate
+fail() {
+    printf '%s: %s\n' "$program" "$*" >&2
+    exit 2
+}
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/cargo-gate [cargo] SUBCOMMAND [ARGS...]
+       scripts/cargo-gate exec COMMAND [ARGS...]
+
+Runs `cargo SUBCOMMAND ARGS...` once a build slot is free. For `test`,
+`bench` and `run`, only the build (`--no-run`, or `build`) holds the slot; the
+tests or program run afterwards without it.
+
+`exec` runs any command, such as a script of several Cargo builds, in one
+slot held until it exits: a drop-in for `flock /var/tmp/cagents-cargo.lock
+COMMAND`. Gated commands inside it run in that slot without waiting. Prefer
+gating each Cargo command, so tests run outside the slot.
+
+Environment:
+  CAGENTS_BUILD_SLOTS    Concurrent builds; default: one per 8 GiB of RAM
+                         after an 8 GiB reserve, at most one per 8 CPUs
+  CAGENTS_BUILD_LOCK     First slot's lock file; the others add .1, .2, ...
+                         (default /var/tmp/cagents-cargo.lock)
+  CARGO_BUILD_JOBS       With several slots, set or capped to CPUs divided by
+                         slots, at least 2
+
+Slot 0 is the plain lock file, so a command still run under
+`flock /var/tmp/cagents-cargo.lock` occupies exactly one slot.
+EOF
+}
+
+[ "$#" -gt 0 ] || { usage >&2; exit 2; }
+case $1 in
+    -h|--help) usage; exit 0 ;;
+    cargo) shift ;;
+esac
+[ "$#" -gt 0 ] || fail 'missing Cargo subcommand'
+if [ "$1" = exec ]; then
+    shift
+    [ "$#" -gt 0 ] || fail 'missing command for exec'
+    mode=exec
+else
+    mode=cargo
+fi
+
+# The machine's CPUs, not this process's share: nproc follows affinity and
+# OMP_NUM_THREADS, and a narrow caller would otherwise think it was alone.
+cpus=$(getconf _NPROCESSORS_ONLN)
+memory_kib=$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\) kB$/\1/p' /proc/meminfo)
+[ -n "$memory_kib" ] || fail 'cannot read MemTotal from /proc/meminfo'
+# A cagents build peaked at 6.5 GiB of anonymous memory with 12 jobs.
+slot_kib=$((8 * 1024 * 1024))
+if [ -n "${CAGENTS_BUILD_SLOTS:-}" ]; then
+    slots=$CAGENTS_BUILD_SLOTS
+    case $slots in ''|*[!0-9]*|0*) fail 'CAGENTS_BUILD_SLOTS must be a positive integer' ;; esac
+else
+    slots=$(((memory_kib - 8 * 1024 * 1024) / slot_kib))
+    [ "$slots" -le $((cpus / 8)) ] || slots=$((cpus / 8))
+    [ "$slots" -ge 1 ] || slots=1
+fi
+# With several slots, each build gets an equal share of the CPUs, replacing the
+# repository's two-job default and capping a larger CARGO_BUILD_JOBS. A lone
+# slot keeps Cargo's configured jobs. `-j` on the command still wins.
+if [ "$slots" -gt 1 ]; then
+    share=$((cpus / slots))
+    [ "$share" -ge 2 ] || share=2
+    case ${CARGO_BUILD_JOBS:-} in
+        ''|*[!0-9]*|0*) CARGO_BUILD_JOBS=$share ;;
+        *) [ "$CARGO_BUILD_JOBS" -le "$share" ] || CARGO_BUILD_JOBS=$share ;;
+    esac
+    export CARGO_BUILD_JOBS
+fi
+
+lock=${CAGENTS_BUILD_LOCK:-/var/tmp/cagents-cargo.lock}
+
+available_kib() {
+    available=$(sed -n 's/^MemAvailable:[[:space:]]*\([0-9]*\) kB$/\1/p' /proc/meminfo)
+    printf '%s' "${available:-0}"
+}
+
+announce() {
+    if [ "$announced" = false ]; then
+        printf '%s: waiting for one of %s build slots\n' "$program" "$slots" >&2
+        announced=true
+    fi
+}
+
+slot_path() {
+    if [ "$1" -eq 0 ]; then printf '%s' "$lock"; else printf '%s.%s' "$lock" "$1"; fi
+}
+
+# Whether every slot other than $1 is free. Only gated waiters take the
+# extra slots, and they hold the queue lock while choosing one.
+others_idle() {
+    other=0
+    while [ "$other" -lt "$slots" ]; do
+        if [ "$other" -ne "$1" ]; then
+            exec 7>>"$(slot_path "$other")"
+            flock -n 7 || { exec 7>&-; return 1; }
+            exec 7>&-
+        fi
+        other=$((other + 1))
+    done
+}
+
+# Holds a slot on descriptor 9 until release. Gated waiters line up on a
+# queue lock, and the one at its head takes the first slot that frees. Plain
+# `flock` callers take only slot 0 and wait for it in the kernel, which
+# admits waiters in arrival order; the head waiter queues there too, through
+# a background `flock` on a descriptor it shares, so it keeps its place
+# instead of losing every release of slot 0. Meanwhile it polls the slots
+# that only gated builds use.
+acquire() {
+    announced=false
+    waited_since=$(date +%s)
+    exec 8>>"$lock.queue"
+    flock -n 8 || { announce; flock 8; }
+    waiter=
+    # A queued request outliving this gate would take slot 0 for a moment.
+    trap 'withdraw; exit 130' INT
+    trap 'withdraw; exit 143' TERM
+    trap 'withdraw; exit 129' HUP
+    while :; do
+        if [ -z "$waiter" ]; then
+            exec 6>>"$lock"
+            flock 6 &
+            waiter=$!
+        fi
+        # The shared descriptor locks only once the queued request is granted:
+        # the kernel never leaves slot 0 free while a request waits for it.
+        if flock -n 6; then
+            kill "$waiter" 2>/dev/null || :
+            wait "$waiter" || :
+            waiter=
+            exec 9>&6 6>&-
+            if [ "$(available_kib)" -ge "$slot_kib" ] || others_idle 0; then
+                index=0
+                trap - INT TERM HUP
+                admitted
+                return
+            fi
+            flock -u 9
+            exec 9>&-
+            sleep 0.5
+            continue
+        fi
+        # Queue again if the request itself was killed.
+        if waiter_gone; then
+            wait "$waiter" || :
+            waiter=
+            exec 6>&-
+            continue
+        fi
+        index=$slots
+        while [ "$index" -gt 1 ]; do
+            index=$((index - 1))
+            exec 9>>"$(slot_path "$index")"
+            if flock -n 9; then
+                # Start beside other builds only when the memory a build needs
+                # is free now; a lone build always starts.
+                if [ "$(available_kib)" -ge "$slot_kib" ] || others_idle "$index"; then
+                    withdraw
+                    trap - INT TERM HUP
+                    admitted
+                    return
+                fi
+                flock -u 9
+            fi
+            exec 9>&-
+        done
+        announce
+        sleep 0.2
+    done
+}
+
+# Withdraws the queued request for slot 0. Closing the last descriptor on it
+# also gives the slot back if the request was granted meanwhile.
+withdraw() {
+    if [ -n "$waiter" ]; then
+        kill "$waiter" 2>/dev/null || :
+        wait "$waiter" || :
+    fi
+    exec 6>&-
+    waiter=
+}
+
+# Whether the queued request has exited; an unreaped one is a zombie.
+waiter_gone() {
+    state=$(sed -n 's/^[0-9]* (.*) \(.\) .*/\1/p' /proc/"$waiter"/stat 2>/dev/null) || return 0
+    [ -z "$state" ] || [ "$state" = Z ]
+}
+
+admitted() {
+    exec 8>&-
+    waited=$(($(date +%s) - waited_since))
+    if [ "$waited" -gt 1 ]; then
+        printf '%s: admitted to slot %s after %ss\n' "$program" "$index" "$waited" >&2
+    fi
+}
+
+release() {
+    exec 9>&-
+}
+
+# Runs a shell function while this shell holds the slot. Descriptors 8 and 9
+# stay here, so a lingering child such as a compiler cache server cannot keep
+# the slot; a signal to the gate reaches the command, and the slot is released
+# only once it has exited. CAGENTS_BUILD_SLOT_HELD names this gate, so gated
+# commands inside run in its slot only while it is still running. An
+# asynchronous command starts with SIGINT and SIGQUIT ignored; restore them so
+# an interrupted command and its children stop.
+held() {
+    (
+        trap - INT QUIT
+        CAGENTS_BUILD_SLOT_HELD=$$
+        export CAGENTS_BUILD_SLOT_HELD
+        "$@"
+    ) 0<&0 8>&- 9>&- &
+    child=$!
+    trap 'kill -s TERM "$child" 2>/dev/null' INT TERM HUP
+    status=0
+    wait "$child" || status=$?
+    while kill -0 "$child" 2>/dev/null; do
+        status=0
+        wait "$child" || status=$?
+    done
+    trap - INT TERM HUP
+    return "$status"
+}
+
+run_cargo() {
+    exec cargo "$@"
+}
+
+run_command() {
+    exec "$@"
+}
+
+# The build half of `test`, `bench` or `run`. Arguments after `--` belong to
+# the tests or program, not Cargo.
+build_phase() {
+    ended=false
+    for argument do
+        shift
+        [ "$argument" != -- ] || ended=true
+        [ "$ended" = true ] || set -- "$@" "$argument"
+    done
+    if [ "$subcommand" = run ]; then
+        exec cargo build "$@"
+    fi
+    exec cargo "$subcommand" --no-run "$@"
+}
+
+# Whether a gate that is still running admitted this command, which inherits
+# its slot. The marker can outlive that gate in a long-lived child.
+inside_gate() {
+    case ${CAGENTS_BUILD_SLOT_HELD:-} in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    # The gate runs as `sh PATH/cargo-gate ...`; its script is the second
+    # argument.
+    script=$(tr '\0' '\n' 2>/dev/null </proc/"$CAGENTS_BUILD_SLOT_HELD"/cmdline | sed -n 2p) ||
+        return 1
+    case $script in
+        cargo-gate|*/cargo-gate|*/cagents-cargo-gate) return 0 ;;
+    esac
+    return 1
+}
+
+# Whether this process inherited a descriptor holding a slot lock, as under
+# `flock /var/tmp/cagents-cargo.lock scripts/run-development`. Its holder is an
+# ancestor, so waiting for another slot could wait on itself. The slot counts
+# only if another descriptor cannot take it while the inherited one can: the
+# lock belongs to the inherited descriptor, not to an unrelated build.
+inherits_slot() {
+    held=$(readlink -f "$lock")
+    for descriptor in /proc/$$/fd/*; do
+        path=$(readlink "$descriptor") || continue
+        case $path in
+            "$held"|"$held".[0-9]|"$held".[0-9][0-9])
+                inherited=${descriptor##*/}
+                # Probe on a descriptor this process does not already use.
+                probe=3
+                while [ -e /proc/$$/fd/$probe ]; do probe=$((probe + 1)); done
+                [ "$probe" -le 9 ] || continue
+                eval "exec $probe>>\"\$path\""
+                if flock -n "$probe"; then
+                    eval "exec $probe>&-"
+                    continue
+                fi
+                eval "exec $probe>&-"
+                if flock -n "$inherited"; then
+                    return 0
+                fi
+                ;;
+        esac
+    done
+    return 1
+}
+
+# Already inside a slot: a gated command running Cargo again, or a caller
+# that took the lock itself.
+if inside_gate || inherits_slot; then
+    [ "$mode" = exec ] || set -- cargo "$@"
+    exec "$@"
+fi
+
+if [ "$mode" = exec ]; then
+    acquire
+    status=0
+    held run_command "$@" || status=$?
+    release
+    exit "$status"
+fi
+
+subcommand=$1
+shift
+
+# Cargo cannot build doctests without running them, so a doctest command
+# keeps its slot throughout. A command that only builds needs no split.
+runs_separately=false
+case $subcommand in
+    test|bench|run) runs_separately=true ;;
+esac
+for argument do
+    case $argument in
+        --) break ;;
+        --doc|--no-run) runs_separately=false ;;
+    esac
+done
+
+acquire
+status=0
+if [ "$runs_separately" = true ]; then
+    held build_phase "$@" || status=$?
+    release
+    [ "$status" -eq 0 ] || exit "$status"
+    exec cargo "$subcommand" "$@"
+fi
+held run_cargo "$subcommand" "$@" || status=$?
+release
+exit "$status"
