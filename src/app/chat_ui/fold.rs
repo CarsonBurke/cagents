@@ -8,13 +8,14 @@
 
 use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
-    widget::{Operation, Tree, tree},
+    widget::{self, Operation, Tree, operation, tree},
 };
 use cosmic::iced::{
     Background, Border, Color, Event, Gradient, Length, Point, Radians, Rectangle, Shadow, Size,
     Vector, gradient::Linear, mouse,
 };
 use cosmic::{Element, Renderer, Theme};
+use std::any::Any;
 
 /// How tall a fold may be before it folds. Content up to a third taller is
 /// shown whole: folding away a line or two saves the reader nothing.
@@ -105,6 +106,72 @@ impl<Message> Fold<'_, Message> {
     }
 }
 
+/// Passes an operation through to cut content, leaving out the controls the
+/// cut hides. Keyboard traversal then skips what the reader cannot see, as
+/// assistive technology does. A control that already holds focus is still
+/// offered, so traversal can move focus off it.
+struct ShownFocus<'a> {
+    inner: &'a mut dyn Operation,
+    shown: Rectangle,
+}
+
+impl Operation for ShownFocus<'_> {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        let shown = self.shown;
+        self.inner.traverse(&mut |inner| {
+            operate(&mut ShownFocus { inner, shown });
+        });
+    }
+
+    fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+        self.inner.container(id, bounds);
+    }
+
+    fn scrollable(
+        &mut self,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        translation: Vector,
+        state: &mut dyn operation::Scrollable,
+    ) {
+        self.inner
+            .scrollable(id, bounds, content_bounds, translation, state);
+    }
+
+    fn focusable(
+        &mut self,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if state.is_focused() || bounds.y < self.shown.y + self.shown.height {
+            self.inner.focusable(id, bounds, state);
+        }
+    }
+
+    fn text_input(
+        &mut self,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        state: &mut dyn operation::TextInput,
+    ) {
+        self.inner.text_input(id, bounds, state);
+    }
+
+    fn text(&mut self, id: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+        self.inner.text(id, bounds, text);
+    }
+
+    fn custom(&mut self, id: Option<&widget::Id>, bounds: Rectangle, state: &mut dyn Any) {
+        self.inner.custom(id, bounds, state);
+    }
+
+    fn finish(&self) -> operation::Outcome<()> {
+        self.inner.finish()
+    }
+}
+
 impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State>()
@@ -179,10 +246,28 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         };
         let content = content.with_virtual_offset(layout.virtual_offset());
         let toggle = toggle.with_virtual_offset(layout.virtual_offset());
-        self.content
-            .as_widget_mut()
-            .operate(&mut tree.children[0], content, renderer, operation);
-        if tree.state.downcast_ref::<State>().tall {
+        let state = tree.state.downcast_ref::<State>();
+        let tall = state.tall;
+        if state.cut {
+            let mut shown = ShownFocus {
+                inner: operation,
+                shown: Self::shown(state, layout),
+            };
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                content,
+                renderer,
+                &mut shown,
+            );
+        } else {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                content,
+                renderer,
+                operation,
+            );
+        }
+        if tall {
             self.toggle
                 .as_widget_mut()
                 .operate(&mut tree.children[1], toggle, renderer, operation);
@@ -576,6 +661,89 @@ mod tests {
         assert_eq!(
             named(Role::Paragraph, "Show more").bounds(),
             Some(Rect::new(23.0, 165.0, 123.0, 185.0))
+        );
+    }
+
+    /// Keyboard traversal reaches what the fold shows, and leaves out what it
+    /// cuts, unless that control already has focus and must be able to lose
+    /// it.
+    #[test]
+    fn fold_offers_cut_controls_to_keyboard_traversal_only_while_they_hold_focus() {
+        use crate::workspace_widget::forwarding_test::{Press, native_button};
+
+        /// The controls traversal is offered, top first, and whether each
+        /// has focus. Focuses the one at `focus`, if any.
+        struct Offered {
+            focus: Option<usize>,
+            seen: Vec<(f32, bool)>,
+        }
+        impl Operation for Offered {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if self.focus == Some(self.seen.len()) {
+                    state.focus();
+                }
+                self.seen.push((bounds.y, state.is_focused()));
+            }
+        }
+
+        let renderer = renderer();
+        let build = |folded| {
+            fold(
+                cosmic::widget::column::with_children(vec![
+                    native_button("Kept", Size::new(100.0, 80.0)),
+                    native_button("Cut", Size::new(100.0, 130.0)),
+                ]),
+                native_button("Show more", Size::new(100.0, 20.0)),
+                folded,
+                80.0,
+                10.0,
+                |_| Color::BLACK,
+            )
+        };
+        let mut tree = Tree::new(&build(false));
+        let mut offered = |widget: &mut Element<'_, Press>, tree: &mut Tree, focus| {
+            tree.diff(widget.as_widget_mut());
+            let node = widget.as_widget_mut().layout(
+                tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(100.0, 500.0)),
+            );
+            let mut offered = Offered {
+                focus,
+                seen: Vec::new(),
+            };
+            widget.as_widget_mut().operate(
+                tree,
+                Layout::new(&node).with_virtual_offset(Vector::new(0.0, -35.0)),
+                &renderer,
+                &mut offered,
+            );
+            offered.seen
+        };
+
+        // The fold shows 80 px, where the cut control starts. Folded, it is
+        // skipped; the toggle below the cut is not.
+        assert_eq!(
+            offered(&mut build(true), &mut tree, None),
+            vec![(0.0, false), (90.0, false)]
+        );
+        // Unfolded, everything is offered. Focus the control the fold cuts.
+        assert_eq!(
+            offered(&mut build(false), &mut tree, Some(1)),
+            vec![(0.0, false), (80.0, true), (220.0, false)]
+        );
+        // Folding again keeps offering it while it holds focus.
+        assert_eq!(
+            offered(&mut build(true), &mut tree, None),
+            vec![(0.0, false), (80.0, true), (90.0, false)]
         );
     }
 
