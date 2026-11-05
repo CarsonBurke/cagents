@@ -901,6 +901,7 @@ pub(super) fn process(
         }
         Operation::Requests(id) => {
             let (_, _, handle) = owned_provider(host, &authority, id)?;
+            refresh_retained_requests(&handle);
             Ok(Reply::Requests(displayed_requests(&handle)))
         }
         Operation::Control { agent, command } => {
@@ -945,6 +946,14 @@ fn owned_provider(
             .ok_or("The agent's provider is no longer live")?
     };
     Ok((agent, run, handle))
+}
+
+/// A retained provider reports its run Waiting through the durable outbox,
+/// which can overtake the proxy's cached metadata, so a caller reading a
+/// Waiting run's requests refreshes that metadata first. A failed refresh
+/// leaves the cached requests, which the actor's own pump keeps converging.
+fn refresh_retained_requests(handle: &chat::runtime::Handle) {
+    let _ = handle.refresh_retained_state();
 }
 
 /// Pending requests as a caller may see them: a secret field's prefilled
@@ -1010,6 +1019,7 @@ fn control(
             action,
             answers,
         } => {
+            refresh_retained_requests(&handle);
             let requests = handle.requests();
             let request = requests
                 .iter()
