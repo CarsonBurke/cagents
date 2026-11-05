@@ -382,7 +382,54 @@ and `-j` takes precedence for a single invocation; with several build slots,
 `scripts/cargo-gate` sets or caps `CARGO_BUILD_JOBS` to a share of the CPUs.
 Run the isolated feature lanes one after another, each through the gate.
 
-Worktrees can share Cargo's target and build directories. Cargo makes path
+Give each worktree its own build directory, which the user-wide
+`build-dir = "/var/tmp/cargo-build{workspace-root}/target"` setting already
+does; do not point several worktrees at one with `CARGO_BUILD_BUILD_DIR`.
+Cargo names a workspace crate's artifacts by its path relative to the
+workspace, so worktrees on different commits overwrite each other's `cagents`
+and vendored crates, and each build after another worktree's recompiles them:
+1–3 minutes of a build slot every time. A new worktree does not need to start
+cold. Before its first gated build, `scripts/cargo-gate` runs
+`scripts/seed-build-dir`, which copies the main checkout's compiled
+dependencies into the new build directory with btrfs reflinks. The copy takes
+under a minute and shares file data with the main checkout's until either side
+rewrites a file, so it costs only file system metadata. Cargo then rebuilds
+what differs: this checkout's own and vendored crates, which depend on the
+checkout path, and the crates that depend on them. Incremental caches are not
+copied. Seeding does nothing on a file system without reflinks, when the main
+checkout has no build, for a directory that has been built in, or with
+`CAGENTS_BUILD_SEED=0`; run `scripts/seed-build-dir` by hand to seed a
+directory a plain `cargo` would create. Seeded directories carry Cargo's
+`CACHEDIR.TAG`, so `prune-cargo-build-dirs` reclaims them after their worktree
+is removed.
+
+The gate's helpers run from the gate's own directory. Install a changed gate
+for every checkout with `scripts/install-cargo-gate`, never by copying
+`scripts/cargo-gate` alone: it stages the gate with its helpers, checks that
+the staged gate runs a command, renames them into `/var/tmp`, and checks the
+result.
+
+Build directories share one disk. When the file system holding them has less
+than twice a floor free (5% of its size, at most 64 GiB), `scripts/cargo-gate`
+runs `scripts/build-disk-guard`, which reclaims removed worktrees' build
+directories at once with `prune-cargo-build-dirs`, at most every ten minutes
+across the host; idle live worktrees' are left to the pruner's own schedule.
+Below the floor it refuses the build and says why. Remove worktrees you no
+longer need; their build directories follow. Set `CAGENTS_BUILD_FREE_FLOOR_GIB`
+to change the floor, or `0` to disable the guard.
+
+The build script that stamps `--version` reruns only when the stamp could
+change, because each rerun recompiles `cagents`. It watches this checkout's
+`HEAD` and `HEAD` reflog. While the checkout is clean it also watches the
+compiled sources (`src`, `crates`, `vendor`, `assets`, `packaging`,
+`fixtures`, `tests/fixtures`, the manifest, lockfile, toolchain, Cargo
+configuration and build script), and while it is dirty, the index, which
+restoring or stashing rewrites. It reads `git status` without refreshing the
+index, and it does not watch the shared `packed-refs`, which pruning or
+deleting any branch rewrites. An edit outside those sources, or undoing an edit
+by hand, updates the `.dirty` suffix at the next rerun.
+
+Worktrees that do share a build directory stay correct. Cargo makes path
 packages relocatable and compares source timestamps, so an older checkout can
 otherwise reuse another checkout's code and version stamp. The local Cargo
 configuration supplies `CAGENTS_CHECKOUT_ROOT`; our workspace crates track it
