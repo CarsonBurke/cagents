@@ -373,8 +373,8 @@ caller holds. Set `CAGENTS_BUILD_SLOTS` to override the count.
 Admission waits are unbounded by default. To give one invocation a budget,
 set `CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS` to a positive integer, for example
 `CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS=120 scripts/cargo-gate check --locked --no-default-features --bin cagents`.
-The single budget includes metadata, disk reclamation/seeding, queue and
-slot/memory waits. Expiry exits 124 after withdrawing owned waiters and cleaning
+The single budget includes metadata, disk reclamation/seeding, queue, slot,
+memory and CPU waits. Expiry exits 124 after withdrawing owned waiters and cleaning
 up preflight descendants; polling and the existing cleanup grace can delay
 exit. Once a slot is admitted, the build and subsequent tests/program have no
 admission timeout. Commands already inside a held slot still run directly.

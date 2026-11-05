@@ -986,7 +986,7 @@ class AdmissionTimeout(unittest.TestCase):
         self.assertEqual([event["phase"] for event in self.fixture.calls()], ["metadata", "guard", "seed"])
 
     def test_queue_base_and_no_fit_expiry_withdraws_owned_waiter_and_preserves_holder(self):
-        for kind in ("queue", "base", "memory"):
+        for kind in ("queue", "base", "memory", "cpu-pressure", "cpu-settle"):
             with self.subTest(kind=kind):
                 self.reset()
                 root = self.fixture.root
@@ -996,7 +996,19 @@ class AdmissionTimeout(unittest.TestCase):
                     cost.write_text("outside-holder-sentinel\n")
                 environment = self.fixture.env.copy()
                 if kind == "memory":
-                    environment |= {"CAGENTS_BUILD_SLOTS":"2", "CAGENTS_BUILD_COST_GIB":"1000000"}
+                    environment |= {"CAGENTS_BUILD_SLOTS":"2", "CAGENTS_BUILD_COST_GIB":"1000000",
+                                    "CAGENTS_BUILD_CPU_PRESSURE":"0"}
+                if kind.startswith("cpu-"):
+                    pressure = root / "cpu-pressure"
+                    pressure.write_text("some avg10=" + ("99.00" if kind == "cpu-pressure" else "0.00")
+                                        + " avg60=0.00 avg300=0.00 total=0\n")
+                    since = Path("/proc/uptime").read_text().split()[0].split(".")[0]
+                    cost.write_text(f"{os.getpid()} 0\n{since}\n")
+                    environment |= {"CAGENTS_BUILD_SLOTS":"2", "CAGENTS_BUILD_COST_GIB":"1",
+                                    "CAGENTS_BUILD_CPU_PRESSURE_FILE":str(pressure),
+                                    "CAGENTS_BUILD_CPU_PRESSURE":"60",
+                                    "CAGENTS_BUILD_CPU_SETTLE_SECS":"0" if kind == "cpu-pressure" else "3600"}
+                expected_cost = cost.read_text() if kind != "queue" else None
                 with path.open("a") as holder:
                     fcntl.flock(holder, fcntl.LOCK_EX)
                     process = self.fixture.start(environment=environment)
@@ -1008,7 +1020,9 @@ class AdmissionTimeout(unittest.TestCase):
                     self.assertIn("admission", stderr.lower())
                     self.assertFalse(caller_reaped)
                     if kind != "queue":
-                        self.assertEqual(cost.read_text(), "outside-holder-sentinel\n")
+                        self.assertEqual(cost.read_text(), expected_cost)
+                    if kind == "cpu-pressure":
+                        self.assertIn("CPUs busy (99% pressure, limit 60%)", stderr)
                     self.assertNotIn("compiler", [event["phase"] for event in self.fixture.calls()])
                 self.assertTrue(self.fixture.slot_is_free())
                 with (root / "slot.lock.queue").open("a") as queue:
