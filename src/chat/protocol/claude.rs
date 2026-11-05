@@ -13192,7 +13192,6 @@ mod tests {
                 .iter()
                 .find(|write| write["request"]["send_now"] == true)
                 .unwrap();
-            assert!(write["request"].get("message_uuid").is_none());
             assert!(write["request"].get("_cagents_turn").is_none());
         }
 
@@ -13374,7 +13373,11 @@ mod tests {
             let oldest = replay
                 .writes
                 .iter()
-                .find(|write| write["priority"] == "next")
+                .find(|write| {
+                    write["message"]["content"][0]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("BANANA"))
+                })
                 .unwrap();
             let request = replay
                 .writes
@@ -13582,7 +13585,7 @@ mod tests {
                 .unwrap();
             assert_eq!(step.writes.len(), 1);
             assert_eq!(step.writes[0]["request"]["send_now"], true);
-            assert!(step.writes[0]["request"].get("message_uuid").is_none());
+            assert_eq!(step.writes[0]["request"]["message_uuid"], first);
             // Nor is pressing again once it has been written.
             assert!(
                 adapter
