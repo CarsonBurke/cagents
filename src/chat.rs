@@ -1431,10 +1431,62 @@ pub struct TextCopySource {
     pub bytes: u64,
 }
 
+/// A transcript item's body is presented in parts of at most this many bytes,
+/// so one enormous message or tool output stays pageable.
+pub const TRANSCRIPT_PART_BYTES: usize = 128 * 1024;
+
+/// Where a presented part after the first sits in its transcript item. The
+/// first part keeps the item's own ID; each later part's ID names the item,
+/// the part's position, the item's layout and the byte range it shows of each
+/// paged field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptPart<'a> {
+    pub item: &'a str,
+    pub index: usize,
+    pub layout: &'a str,
+    pub fields: [(usize, usize); 2],
+}
+
+impl<'a> TranscriptPart<'a> {
+    const MARKER: &'static str = ":native-part:";
+
+    pub fn id(&self) -> String {
+        let [(start0, end0), (start1, end1)] = self.fields;
+        format!(
+            "{}{}{}:{}:{start0}-{end0}:{start1}-{end1}",
+            self.item,
+            Self::MARKER,
+            self.index,
+            self.layout
+        )
+    }
+
+    /// Reads a later part's ID. A provider's own ID can contain the marker,
+    /// so a match is only a claim that callers check against the bytes.
+    pub fn parse(id: &'a str) -> Option<Self> {
+        let (item, rest) = id.rsplit_once(Self::MARKER)?;
+        let mut fields = rest.split(':');
+        let index = fields.next()?.parse().ok().filter(|index| *index > 0)?;
+        let layout = fields.next()?;
+        let mut range = || {
+            let (start, end) = fields.next()?.split_once('-')?;
+            let range = (start.parse().ok()?, end.parse().ok()?);
+            (range.0 <= range.1).then_some(range)
+        };
+        let ranges = [range()?, range()?];
+        fields.next().is_none().then_some(Self {
+            item,
+            index,
+            layout,
+            fields: ranges,
+        })
+    }
+}
+
 /// Keep each reply at the existing transcript chunk size, far below the IPC
 /// frame ceiling. A single clipboard operation may collect one 30 MiB Claude
 /// envelope, with headroom; longer accumulated streams fail explicitly.
-pub const TEXT_COPY_PAGE_BYTES: usize = 128 * 1024;
+pub const TEXT_COPY_PAGE_BYTES: usize = TRANSCRIPT_PART_BYTES;
 pub const TEXT_COPY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2637,6 +2689,31 @@ mod retained_native_pair_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transcript_part_ids_round_trip_and_reject_partial_claims() {
+        let part = super::TranscriptPart {
+            item: "msg:native-part:opaque",
+            index: 3,
+            layout: "text",
+            fields: [(262_144, 393_216), (0, 0)],
+        };
+        let id = part.id();
+        assert_eq!(
+            id,
+            "msg:native-part:opaque:native-part:3:text:262144-393216:0-0"
+        );
+        assert_eq!(super::TranscriptPart::parse(&id), Some(part));
+        for claim in [
+            "opaque:native-part:1",
+            "msg:native-part:0:text:0-1:0-0",
+            "msg:native-part:1:text:9-1:0-0",
+            "msg:native-part:1:text:0-1:0-0:extra",
+            "msg:native-part:x:text:0-1:0-0",
+        ] {
+            assert_eq!(super::TranscriptPart::parse(claim), None, "{claim}");
+        }
+    }
+
     #[test]
     fn request_kind_roundtrips_and_legacy_json_requires_explicit_approval() {
         let legacy = serde_json::json!({"id":"request","title":"Prompt","description":"","fields":[],"actions":[]});
