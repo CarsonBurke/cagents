@@ -191,6 +191,33 @@ impl std::fmt::Debug for Ready {
     }
 }
 
+impl Ready {
+    /// Turns a started reply into a retryable failure, returning the actor the
+    /// start produced so the caller decides what becomes of it.
+    fn fail(&self, message: String) -> Option<Arc<ClientHandle>> {
+        let mut reply = self.0.lock().ok()?;
+        let started = reply.take().and_then(Result::ok);
+        *reply = Some(Err(chat::StartFailure::retry(message)));
+        started
+    }
+}
+
+/// Waits for the session writer's answer to a card rebind.
+async fn rebind_receipt(
+    receipt: Result<std::sync::mpsc::Receiver<Result<(), String>>, String>,
+) -> Result<(), String> {
+    let receipt = receipt?;
+    tokio::task::spawn_blocking(move || {
+        receipt
+            .recv()
+            .map_err(|error| format!("Session writer disconnected: {error}"))
+            .and_then(|result| result)
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result)
+}
+
 #[derive(Debug, Clone)]
 pub enum CopyPart {
     Text,
@@ -242,6 +269,7 @@ pub enum Action {
     Ready(Target, Ready),
     AccountCommitted(Target, Ready, Result<(), String>),
     UpgradeCommitted(Target, Ready, Result<(), String>),
+    ResumeCommitted(Target, Ready, Result<(), String>),
     RetainedCopyCommitted(CardId, Result<(), String>),
     /// The result of giving up a conversation's daemon actor after its card
     /// stopped holding it: a closed card, an abandoned start, or a start that
@@ -497,6 +525,7 @@ impl Action {
                 | Self::FlowReady(..)
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
+                | Self::ResumeCommitted(..)
                 | Self::RetainedCopyCommitted(..)
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
@@ -609,6 +638,9 @@ struct Attempt {
     session: chat::Session,
     recovery: Option<AccountRecovery>,
     upgrade_committed: bool,
+    /// Whether the daemon-prepared successor of a stranded retained card has
+    /// been saved in that card's place.
+    resume_committed: bool,
     /// Exact authoritative target; only authenticated upgrade resolution may bind its draft.
     upgrade_admission: Option<chat::Session>,
 }
@@ -5412,6 +5444,39 @@ fn retire_conversation(
     handle: Option<Arc<ClientHandle>>,
     session: Option<chat::Session>,
 ) -> Result<(), String> {
+    end_conversation(handle, session, super::channel_ui::close_sessions)
+}
+
+/// Closes a conversation the reader closed, like [`retire_conversation`],
+/// and also retires the agent still bound to it after a daemon stop. Giving
+/// up a failed start must not do that, so only an explicit Close comes here.
+///
+/// A reopened conversation that was given no work yet leaves its agent
+/// stopped when its process closes, as a reopening its card gave up would; so
+/// a live conversation's agent is retired by its session once it has closed.
+fn close_conversation(
+    handle: Option<Arc<ClientHandle>>,
+    session: Option<chat::Session>,
+) -> Result<(), String> {
+    let live = handle.is_some();
+    end_conversation(
+        handle,
+        session.clone(),
+        super::channel_ui::close_sessions_retiring_agents,
+    )?;
+    match session {
+        Some(session) if live => {
+            super::channel_ui::close_sessions_retiring_agents(vec![CardKind::Chat(session)])
+        }
+        _ => Ok(()),
+    }
+}
+
+fn end_conversation(
+    handle: Option<Arc<ClientHandle>>,
+    session: Option<chat::Session>,
+    close: fn(Vec<CardKind>) -> Result<(), String>,
+) -> Result<(), String> {
     let refused = match handle.map(|handle| handle.close()) {
         Some(Ok(())) => return Ok(()),
         Some(Err(error)) => Some(error),
@@ -5420,12 +5485,10 @@ fn retire_conversation(
     let Some(session) = session else {
         return refused.map_or(Ok(()), Err);
     };
-    super::channel_ui::close_sessions(vec![CardKind::Chat(session)]).map_err(
-        |error| match refused {
-            Some(refused) => format!("{refused}; {error}"),
-            None => error,
-        },
-    )
+    close(vec![CardKind::Chat(session)]).map_err(|error| match refused {
+        Some(refused) => format!("{refused}; {error}"),
+        None => error,
+    })
 }
 
 /// The CLI the daemon still runs for a Codex thread, if any.
@@ -6526,6 +6589,7 @@ impl Cagents {
                 intent: chat::Intent::Restore,
                 session: replacement.clone(),
                 upgrade_committed: false,
+                resume_committed: false,
                 upgrade_admission: None,
                 recovery: Some(AccountRecovery {
                     source: source.clone(),
@@ -8151,7 +8215,7 @@ impl Cagents {
             return cosmic::task::future(async move {
                 let saved = session.clone();
                 let result =
-                    tokio::task::spawn_blocking(move || retire_conversation(handle, Some(saved)))
+                    tokio::task::spawn_blocking(move || close_conversation(handle, Some(saved)))
                         .await
                         .map_err(|error| error.to_string())
                         .and_then(|result| result);
@@ -8164,7 +8228,7 @@ impl Cagents {
         let retire = if pending {
             Task::none()
         } else {
-            self.retire_chat(card, handle, Some(session))
+            self.end_chat(card, handle, Some(session), close_conversation)
         };
         Task::batch([retire, remove])
     }
@@ -8175,6 +8239,16 @@ impl Cagents {
         card: CardId,
         handle: Option<Arc<ClientHandle>>,
         session: Option<chat::Session>,
+    ) -> Task<Message> {
+        self.end_chat(card, handle, session, retire_conversation)
+    }
+
+    fn end_chat(
+        &mut self,
+        card: CardId,
+        handle: Option<Arc<ClientHandle>>,
+        session: Option<chat::Session>,
+        end: fn(Option<Arc<ClientHandle>>, Option<chat::Session>) -> Result<(), String>,
     ) -> Task<Message> {
         // Dropping the handle only disconnects this card; the pane keeps the session.
         let handle_session = handle.as_ref().map(|handle| handle.session().id);
@@ -8188,7 +8262,7 @@ impl Cagents {
         let target = self.chat_ui.next_target(card);
         self.chat_ui.retiring.insert(target);
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || retire_conversation(handle, session))
+            let result = tokio::task::spawn_blocking(move || end(handle, session))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
@@ -8438,6 +8512,7 @@ impl Cagents {
                 session: session.clone(),
                 recovery: None,
                 upgrade_committed: false,
+                resume_committed: false,
                 upgrade_admission: upgrade_admission.clone(),
             }),
         );
@@ -9972,12 +10047,44 @@ impl Cagents {
                             attempt.upgrade_committed = true;
                         }
                     }
-                    Err(error) => {
-                        if let Ok(mut reply) = ready.0.lock() {
-                            *reply = Some(Err(chat::StartFailure::retry(format!(
-                                "The upgraded conversation was not saved: {error}. Its saved identity is retained; retry to reconnect."
-                            ))));
+                    Err(failure) => {
+                        // The upgraded actor keeps the card's own chat ID, so
+                        // it is the conversation the card still names: it is
+                        // let go, not closed, and a retry reconnects to it.
+                        drop(ready.fail(format!(
+                            "The upgraded conversation was not saved: {failure}. Its saved identity is retained; retry to reconnect."
+                        )));
+                    }
+                }
+                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+            }
+            Action::ResumeCommitted(target, ready, result) => {
+                match result {
+                    Ok(()) => {
+                        if let Some(Phase::Starting(attempt)) =
+                            self.chat_ui.phases.get_mut(&target.card)
+                            && attempt.target == target
+                        {
+                            attempt.resume_committed = true;
                         }
+                    }
+                    Err(failure) => {
+                        // The successor runs under a new chat ID that the card
+                        // may not name, so it is closed rather than left running
+                        // beside the conversation the card still names. Nothing
+                        // was sent to it, so closing it loses nothing; were the
+                        // rebind in fact committed, the card reopens the closed
+                        // successor from its saved history.
+                        let started = ready.fail(format!(
+                            "The reopened conversation was not saved: {failure}. Its saved identity is retained; retry to reopen it."
+                        ));
+                        let retire = started.map_or_else(Task::none, |handle| {
+                            self.retire_chat(target.card, Some(handle), None)
+                        });
+                        return Task::batch([
+                            retire,
+                            self.update(Message::ChatUi(Action::Ready(target, ready))),
+                        ]);
                     }
                 }
                 return self.update(Message::ChatUi(Action::Ready(target, ready)));
@@ -9993,12 +10100,12 @@ impl Cagents {
                             recovery.committed = true;
                         }
                     }
-                    Err(error) => {
-                        if let Ok(mut reply) = ready.0.lock() {
-                            *reply = Some(Err(chat::StartFailure::retry(format!(
-                                "The account change was not saved: {error}. The original conversation is retained."
-                            ))));
-                        }
+                    Err(failure) => {
+                        // The failed start then closes the replacement by its
+                        // chat ID, as for any account recovery that failed.
+                        drop(ready.fail(format!(
+                            "The account change was not saved: {failure}. The original conversation is retained."
+                        )));
                     }
                 }
                 return self.update(Message::ChatUi(Action::Ready(target, ready)));
@@ -10034,6 +10141,11 @@ impl Cagents {
                     .ok()
                     .and_then(|handle| handle.upgrade_recovery())
                     .map(|(source, _)| source);
+                let resumed_source = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|handle| handle.resumed_from())
+                    .cloned();
                 if !self.card_state(target.card).is_some_and(|card| {
                     card.existence.is_open()
                         && match &card.kind {
@@ -10043,6 +10155,7 @@ impl Cagents {
                                         account_source
                                             .as_ref()
                                             .or(upgrade_source)
+                                            .or(resumed_source.as_ref())
                                             .map_or(session.id == attempt.session.id, |source| {
                                                 session == source
                                             })
@@ -10151,21 +10264,47 @@ impl Cagents {
                                     .insert(target.card, Phase::Starting(attempt));
                                 let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
                                 return cosmic::task::future(async move {
-                                    let result = match receipt {
-                                        Ok(receipt) => tokio::task::spawn_blocking(move || {
-                                            receipt
-                                                .recv()
-                                                .map_err(|error| {
-                                                    format!("Session writer disconnected: {error}")
-                                                })
-                                                .and_then(|result| result)
-                                        })
-                                        .await
-                                        .map_err(|error| error.to_string())
-                                        .and_then(|result| result),
-                                        Err(error) => Err(error),
-                                    };
+                                    let result = rebind_receipt(receipt).await;
                                     Message::ChatUi(Action::UpgradeCommitted(target, ready, result))
+                                });
+                            }
+                        }
+                        if let Some(source) = &resumed_source {
+                            let replacement = handle.session();
+                            if account_source.is_some()
+                                || source != &attempt.session
+                                || !chat::is_retained_resume_commit(source, &replacement)
+                                // A successor started on a saved conversation
+                                // names it in its first snapshot; one that the
+                                // daemon proved has none starts its own.
+                                || replacement.launch.session_id.as_ref().is_some_and(|id| {
+                                    handle.snapshot().session_id.as_ref() != Some(id)
+                                })
+                            {
+                                self.status = Some(TransientNotice::error(
+                                    "The reopened conversation did not match the saved one. Its saved identity is retained.",
+                                ));
+                                return self.retire_chat(target.card, Some(handle), None);
+                            }
+                            if !attempt.resume_committed {
+                                let receipt = self
+                                    .session
+                                    .as_ref()
+                                    .ok_or_else(|| "Session storage is unavailable".to_owned())
+                                    .and_then(|writer| {
+                                        writer.rebind_chat_resume(
+                                            target.card,
+                                            source.clone(),
+                                            replacement,
+                                        )
+                                    });
+                                self.chat_ui
+                                    .phases
+                                    .insert(target.card, Phase::Starting(attempt));
+                                let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
+                                return cosmic::task::future(async move {
+                                    let result = rebind_receipt(receipt).await;
+                                    Message::ChatUi(Action::ResumeCommitted(target, ready, result))
                                 });
                             }
                         }
@@ -10201,20 +10340,7 @@ impl Cagents {
                                     });
                                 let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
                                 return cosmic::task::future(async move {
-                                    let result = match receipt {
-                                        Ok(receipt) => tokio::task::spawn_blocking(move || {
-                                            receipt
-                                                .recv()
-                                                .map_err(|error| {
-                                                    format!("Session writer disconnected: {error}")
-                                                })
-                                                .and_then(|result| result)
-                                        })
-                                        .await
-                                        .map_err(|error| error.to_string())
-                                        .and_then(|result| result),
-                                        Err(error) => Err(error),
-                                    };
+                                    let result = rebind_receipt(receipt).await;
                                     Message::ChatUi(Action::AccountCommitted(target, ready, result))
                                 });
                             }
@@ -10301,7 +10427,10 @@ impl Cagents {
                         }
                         self.chat_ui.explicit_starts.remove(&target.card);
                         self.resolve_notice(NoticeKey::ChatAttach(target.card));
-                        if account_source.is_some() || attempt.upgrade_admission.is_some() {
+                        if account_source.is_some()
+                            || resumed_source.is_some()
+                            || attempt.upgrade_admission.is_some()
+                        {
                             // Shared projection may already hold the canonical
                             // descriptor. Still save the confirmed draft and
                             // removal of its pending marker after the receipt.
@@ -22223,6 +22352,146 @@ mod tests {
         }
     }
 
+    /// A stranded retained card is rebound to its started successor only once
+    /// the store has it; until then, and when the store refuses it or the card
+    /// closes meanwhile, the card names its source and the successor is
+    /// closed rather than left running beside it.
+    #[test]
+    fn a_resumed_successor_replaces_its_card_only_after_the_store_commits_it() {
+        for outcome in ["committed", "refused", "closed"] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("state.sqlite3"),
+                crate::model::BootId::new("boot-test"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            let mut source = chat::fresh_session(
+                Provider::Claude,
+                TerminalId::new(),
+                directory.path().into(),
+                &crate::account::Account::system(Provider::Claude),
+            )
+            .unwrap();
+            source.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
+            source.proof = Some(crate::model::HostSessionProof {
+                host_session_id: "old-host".into(),
+                boot_id: "fixture-boot".into(),
+                host_incarnation: "old-incarnation".into(),
+            });
+            source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            drop(app.insert_chat_card(source.clone(), None, None));
+            let card = app.workspace.focused().unwrap();
+            app.persist();
+            let store = app.session.as_ref().unwrap().operation_store();
+            let stored = |app: &Cagents| {
+                app.session
+                    .as_ref()
+                    .unwrap()
+                    .flush(Duration::from_secs(10))
+                    .unwrap();
+                store.load_card(card, None).unwrap().unwrap()
+            };
+            assert_eq!(stored(&app).kind, CardKind::Chat(source.clone()));
+            let mut successor = source.clone();
+            successor.id = TerminalId::new();
+            successor.proof = Some(crate::model::HostSessionProof {
+                host_session_id: "fixture-host".into(),
+                boot_id: "fixture-boot".into(),
+                host_incarnation: "fixture-incarnation".into(),
+            });
+            let handle = Arc::new(ClientHandle::fixture_resumed(
+                source.clone(),
+                successor.clone(),
+                Snapshot {
+                    ready: true,
+                    session_id: successor.launch.session_id.clone(),
+                    native_continuity: successor.native_continuity.clone(),
+                    ..Snapshot::default()
+                },
+            ));
+            if outcome == "refused" {
+                // Another writer re-pointed the card first.
+                let mut competing = source.clone();
+                competing.id = TerminalId::new();
+                competing.proof = successor.proof.clone();
+                store.rebind_chat_resume(card, &source, &competing).unwrap();
+            }
+            let target = chat_runtime_attempt(&app, card);
+            let task = app.update(Message::ChatUi(Action::Ready(
+                target,
+                Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+            )));
+            assert!(app.chat_start_pending(card), "the commit is awaited");
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone()),
+                "the card names its source until the store has the successor"
+            );
+            if outcome == "closed" {
+                close_chat(&mut app, card);
+            }
+            let reply = resume_commit_reply(task);
+            let committed = matches!(
+                &reply,
+                Message::ChatUi(Action::ResumeCommitted(_, _, Ok(())))
+            );
+            assert_eq!(committed, outcome != "refused", "{outcome}");
+            let _ = app.update(reply);
+            match outcome {
+                "committed" => {
+                    assert_eq!(
+                        app.card_state(card).unwrap().kind,
+                        CardKind::Chat(successor.clone())
+                    );
+                    assert_eq!(stored(&app).kind, CardKind::Chat(successor.clone()));
+                    assert!(app.chat_ui.retiring.iter().all(|t| t.card != card));
+                }
+                "refused" => {
+                    assert_eq!(
+                        app.card_state(card).unwrap().kind,
+                        CardKind::Chat(source.clone())
+                    );
+                    assert!(matches!(
+                        app.cards.get(&card),
+                        Some(CardRuntime::Failed(_)) | Some(CardRuntime::Chat(_))
+                    ));
+                    retired(&mut app, card);
+                }
+                _ => {
+                    assert!(!stored(&app).existence.is_open());
+                    assert!(!app.cards.contains_key(&card));
+                    retired(&mut app, card);
+                }
+            }
+        }
+    }
+
+    fn resume_commit_reply(task: Task<Message>) -> Message {
+        use cosmic::iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
+                    while let Some(action) = stream.next().await {
+                        if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                            message @ Message::ChatUi(Action::ResumeCommitted(..)),
+                        )) = action
+                        {
+                            return message;
+                        }
+                    }
+                    panic!("resume commit produced no acknowledgment");
+                })
+                .await
+                .expect("session writer did not acknowledge the resume within 10 seconds")
+            })
+    }
+
     #[test]
     fn retained_chat_close_and_channel_move_do_not_overtake_each_other() {
         use crate::{
@@ -23836,6 +24105,12 @@ mod tests {
         saved.session.launch.recipe.program = "claude".into();
         saved.session.launch.recipe.arguments.clear();
         saved.session.launch.recipe.working_directory = project.path().join("removed");
+        // It ran before it was closed, so it carries that start's proof.
+        saved.session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "saved-owner".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "saved-incarnation".into(),
+        });
         let provider_id = saved.session.launch.session_id.clone();
         let _ = app.resume_saved_conversation(saved);
         let reopened = app.workspace.focused().unwrap();
@@ -25346,6 +25621,7 @@ mod tests {
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
+                    resume_committed: false,
                     upgrade_admission: None,
                 }),
             );
@@ -25404,6 +25680,7 @@ mod tests {
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
+                        resume_committed: false,
                         upgrade_admission: None,
                     }),
                 );
@@ -29804,6 +30081,7 @@ mod tests {
                         submit: None,
                     }),
                     upgrade_committed: false,
+                    resume_committed: false,
                     upgrade_admission: None,
                 }),
                 "return" => Phase::Returning {
@@ -29821,6 +30099,7 @@ mod tests {
                         session: other,
                         recovery: None,
                         upgrade_committed: false,
+                        resume_committed: false,
                         upgrade_admission: None,
                     })
                 }
@@ -30105,6 +30384,7 @@ mod tests {
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
+                    resume_committed: false,
                     upgrade_admission: None,
                 }),
             );
@@ -30183,6 +30463,7 @@ mod tests {
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
+                        resume_committed: false,
                         upgrade_admission: None,
                     }),
                 );

@@ -303,16 +303,26 @@ fn retired_execution_routes_cold_close_reconcile_and_disk_resume_without_live_ad
         "unproved actor must remain retained without blocking daemon reconciliation"
     );
     assert!(super::native_cleanup::close_retained(&successor, &canonical).is_err());
-    assert!(
-        process_inner(
-            &successor,
-            0,
-            ClientRequest::ChatPrepareResume {
-                source: canonical.clone()
-            }
-        )
-        .is_err()
-    );
+    // Without its receipt the exit stays unproved for retirement, but the
+    // helper, provider and their process group are all gone: that proves the
+    // actor abandoned, so the conversation reopens as a distinct successor
+    // instead of stranding the card.
+    let ServerResponse::ChatResumePrepared { session: abandoned } = process_inner(
+        &successor,
+        0,
+        ClientRequest::ChatPrepareResume {
+            source: canonical.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_ne!(abandoned.id, canonical.id);
+    assert_eq!(abandoned.launch, canonical.launch);
+    assert!(matches!(
+        abandoned.native_continuity,
+        chat::NativeContinuity::ReconnectOnly
+    ));
     {
         let state = successor.lock().unwrap();
         assert!(

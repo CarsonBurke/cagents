@@ -745,6 +745,136 @@ pub(super) fn restore(
     restore_actor(host, client, requested, proof, owner, true, None)
 }
 
+/// An ordinary daemon exit closes each provider, then retires its helper once
+/// the final outcomes are committed. A daemon that ends between the two (a
+/// final commit failed, an attention wait timed out, or it was killed) leaves
+/// the helper closed but still owning the conversation. Adopted as a live
+/// attachment, that helper strands its pane: a closed actor cannot resolve a
+/// recovery source, and its owner blocks a resume. Finish the same exit
+/// instead, through the checks the exiting daemon would have made, so the
+/// conversation reopens from saved history as after any other stop.
+///
+/// Returns false, changing nothing, unless the helper reports its provider
+/// exited and its retirement is still pending. The close itself is proved
+/// after attaching, since the final publication names the attaching daemon.
+pub(in crate::host) fn finish_interrupted_exit(
+    host: &SharedHost,
+    owner: &crate::daemon::holder_registry::Record,
+) -> Result<bool, String> {
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    let inspection = Handle::inspect_remote(owner, proof.clone())?;
+    if &inspection.identity.record != owner
+        || inspection.source.launch.provider != Provider::Claude
+        || inspection.state.owns_work
+        || !inspection.state.close.exited
+        || !matches!(
+            Handle::inspect_retained_retirement(owner, &proof)?,
+            RetirementInspection::Running
+        )
+    {
+        return Ok(false);
+    }
+    // The explicit Close path, ending the agent as a stop. Attaching for
+    // cleanup republishes the closed snapshot under this daemon, and
+    // finish_close then proves that exact descriptor closed. A failure keeps
+    // the close-only attachment, which an explicit Close retries.
+    close_with_target(
+        host,
+        &inspection.source,
+        Some(owner.clone()),
+        None,
+        None,
+        Ending::Stopped,
+    )?;
+    Ok(true)
+}
+
+/// [`finish_interrupted_exit`] for the helper that owns `session`, when no
+/// attachment holds it, for an owner startup discovery did not finish.
+pub(in crate::host) fn finish_interrupted_exit_of(
+    host: &SharedHost,
+    session: &Session,
+) -> Result<bool, String> {
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    if session.launch.provider != Provider::Claude
+        || host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .contains_key(&session.id)
+    {
+        return Ok(false);
+    }
+    let directory = registry::directory(Kind::Native)?;
+    match registry::recovery_candidate(&registry::socket(&directory, session.id), Kind::Native)? {
+        Some(owner) if Handle::is_remote_record(&owner) => finish_interrupted_exit(host, &owner),
+        _ => Ok(false),
+    }
+}
+
+/// Whether `issued`'s paired CLI view has no worker here and its original
+/// holder left an exact close receipt, so cleanup may proceed without it.
+fn paired_view_proved_closed(
+    host: &SharedHost,
+    issued: &Session,
+    pair: Option<&crate::terminal::holder::Record>,
+    proof: &HostSessionProof,
+) -> Result<bool, String> {
+    let (Some(terminal), Some(pair)) = (&issued.terminal, pair) else {
+        return Ok(false);
+    };
+    if terminal.id != pair.terminal
+        || pair.terminal != issued.id
+        || host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .terminals
+            .contains_key(&terminal.id)
+    {
+        return Ok(false);
+    }
+    let original = issued
+        .proof
+        .as_ref()
+        .ok_or("The retained Claude pair lacks its issuing daemon proof")?;
+    let role = crate::daemon::holder_registry::OriginalRole::authenticated(pair, original, proof)?;
+    crate::terminal::holder::cleanup::confirmed_owner_with_role(pair, proof, role.as_ref())
+}
+
+/// An ordinary exit ends a retained actor's paired CLI view with it. Closing
+/// the view through its holder leaves the close receipt a later resume needs
+/// to prove the view released the conversation; the terminal shutdown that
+/// follows would only hang it up, which proves nothing to the next daemon.
+pub(in crate::host) fn close_paired_view(host: &SharedHost, id: TerminalId) -> Result<(), String> {
+    let (terminal, worker, proof) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(record) = state.chats.get(&id) else {
+            return Ok(());
+        };
+        let (Some(terminal), Some(worker)) = (&record.session.terminal, &record.paired_terminal)
+        else {
+            return Ok(());
+        };
+        if record.handle.actor_identity().is_none() || worker.holder_identity().is_none() {
+            return Ok(());
+        }
+        if !state.terminals.get(&terminal.id).is_some_and(|current| {
+            current.handle.same_worker(worker)
+                && super::matches_paired_terminal(&current.session, terminal, state.proof())
+        }) {
+            return Err(
+                "The paired CLI view changed before shutdown; its owner was preserved".into(),
+            );
+        }
+        (terminal.clone(), worker.clone(), state.proof().clone())
+    };
+    worker.close_with_receipt(&terminal, &proof)
+}
+
 /// A failed cleanup attachment is not a user request to return to a terminal.
 /// Restore its still-running owner through normal installation, retaining the
 /// old cleanup record until the helper and durable registry acknowledge it.
@@ -897,6 +1027,16 @@ fn restore_actor(
     // A presentation alias predating the console cannot release its current
     // exact paired worker. Only authenticated helper metadata names that pair.
     session.terminal = inspection.source.terminal.clone();
+    // A paired CLI view whose worker is gone may have been closed by the
+    // exit that left this helper. Only its original holder's exact close
+    // receipt lets cleanup proceed without it; no terminal worker is touched.
+    let pair_closed = !publish_snapshot
+        && paired_view_proved_closed(
+            host,
+            &inspection.source,
+            inspection.paired_holder.as_ref(),
+            proof,
+        )?;
     let paired = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         match (&mut session.terminal, inspection.paired_holder.as_ref()) {
@@ -907,6 +1047,18 @@ fn restore_actor(
             // it owns neither pair nor console; no terminal worker is touched.
             (Some(_), None) if !publish_snapshot && inspection.execution_console.is_none() => {
                 session.terminal = None;
+                None
+            }
+            // The helper keeps naming the closed pair, so its retirement
+            // still carries the evidence a resume rechecks.
+            (Some(terminal), Some(_))
+                if pair_closed && !state.terminals.contains_key(&terminal.id) =>
+            {
+                terminal.continuity = crate::model::TerminalContinuity::Live {
+                    host_session_id: proof.host_session_id.clone(),
+                    boot_id: proof.boot_id.clone(),
+                    host_incarnation: proof.host_incarnation.clone(),
+                };
                 None
             }
             (Some(terminal), Some(owner)) => {
@@ -988,6 +1140,7 @@ fn restore_actor(
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pair_unchanged = match (&record.session.terminal, &paired) {
         (None, None) => true,
+        (Some(terminal), None) => pair_closed && !state.terminals.contains_key(&terminal.id),
         (Some(terminal), Some(handle)) => {
             state.terminals.get(&terminal.id).is_some_and(|current| {
                 current.handle.same_worker(handle)
@@ -1096,7 +1249,7 @@ pub(super) fn close_unattached(
     requested: &Session,
     discovered: Option<crate::daemon::holder_registry::Record>,
 ) -> Result<(), String> {
-    close_with_target(host, requested, discovered, None, None)
+    close_with_target(host, requested, discovered, None, None, Ending::Closed)
 }
 
 /// A hosted close must retain its exact admission capability across cleanup.
@@ -1106,7 +1259,33 @@ pub(super) fn close_captured(
     target: &super::CloseTarget,
     closing: Option<&super::capacity::Reservation>,
 ) -> Result<(), String> {
-    close_with_target(host, requested, None, Some(target), closing)
+    close_with_target(host, requested, None, Some(target), closing, Ending::Closed)
+}
+
+/// What a retained cleanup ends besides the helper and its provider.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// The person closed the conversation: its agent and attention close too.
+    Closed,
+    /// A daemon stop ended it: the agent keeps its pane and channel, and its
+    /// final attention stays, so the conversation resumes in place.
+    Stopped,
+}
+
+impl Ending {
+    fn preflight(self, host: &SharedHost, source: &Session) -> Result<(), String> {
+        match self {
+            Self::Closed => super::super::agent_execution::preflight_retirement(host, source),
+            Self::Stopped => Ok(()),
+        }
+    }
+
+    fn end(self, host: &SharedHost, source: &Session) -> Result<(), String> {
+        match self {
+            Self::Closed => super::super::agent_execution::retired(host, source),
+            Self::Stopped => super::super::agent_execution::stopped(host, source),
+        }
+    }
 }
 
 fn close_with_target(
@@ -1115,6 +1294,7 @@ fn close_with_target(
     discovered: Option<crate::daemon::holder_registry::Record>,
     expected: Option<&super::CloseTarget>,
     closing: Option<&super::capacity::Reservation>,
+    ending: Ending,
 ) -> Result<(), String> {
     struct Reservation {
         host: SharedHost,
@@ -1166,7 +1346,7 @@ fn close_with_target(
         .contains_key(&requested.id);
     if !present {
         if let Some(verified) = cleanup_retirement(host, requested, &proof, discovered.as_ref())? {
-            return close_verified_unattached(host, requested, &proof, verified);
+            return close_verified_unattached(host, requested, &proof, verified, ending);
         }
         let owner = discovered.as_ref().ok_or("No authenticated retained Claude actor is available; its saved descriptor was preserved")?;
         if !Handle::is_remote_record(owner) {
@@ -1239,6 +1419,13 @@ fn close_with_target(
                 }
                 Some((terminal.clone(), current.handle.clone()))
             }
+            // Cleanup attached without a worker for a view proved closed; the
+            // helper's pair is rechecked below before anything is ended.
+            (Some(terminal), None)
+                if record.handle.is_close_only() && !state.terminals.contains_key(&terminal.id) =>
+            {
+                None
+            }
             _ => return Err("Retained Claude pairing lacks its exact worker evidence".into()),
         };
         (
@@ -1248,7 +1435,7 @@ fn close_with_target(
             super::CloseTarget::from_record(record),
         )
     };
-    super::super::agent_execution::preflight_retirement(host, &source)?;
+    ending.preflight(host, &source)?;
     // Authenticate all managed execution aliases before a destructive effect.
     let registry = super::super::agent_execution::registry(host)?;
     let sources = registry
@@ -1258,7 +1445,7 @@ fn close_with_target(
     let identity = handle
         .actor_identity()
         .ok_or("Retained cleanup lost its actor identity")?;
-    let (issued, lineage, scope, retired) =
+    let (issued, lineage, scope, pair_holder, retired) =
         match Handle::inspect_retained_retirement(&identity.record, &proof)? {
             RetirementInspection::Running => {
                 let inspection = Handle::inspect_remote(&identity.record, proof.clone())?;
@@ -1269,6 +1456,7 @@ fn close_with_target(
                     inspection.source,
                     inspection.previous_sources,
                     inspection.launch_account_scope,
+                    inspection.paired_holder,
                     None,
                 )
             }
@@ -1281,6 +1469,7 @@ fn close_with_target(
                     receipt.source.clone(),
                     receipt.previous_sources.clone(),
                     receipt.launch_account_scope.clone(),
+                    receipt.paired_holder.clone(),
                     Some(verified),
                 )
             }
@@ -1295,6 +1484,14 @@ fn close_with_target(
         &lineage,
         scope.as_ref().map_err(String::as_str),
     )?;
+    if paired.is_none()
+        && source.terminal.is_some()
+        && !paired_view_proved_closed(host, &issued, pair_holder.as_ref(), &proof)?
+    {
+        return Err(
+            "The retained Claude pair has no exact close proof; no pair was released".into(),
+        );
+    }
     for retained in &sources {
         let crate::agent_execution::HostedSession::Chat(current) = retained else {
             return Err("Retained execution ownership changed to another surface".into());
@@ -1305,10 +1502,12 @@ fn close_with_target(
                     .into(),
             );
         }
-        registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .preflight_agent_retirement(retained)?;
+        if ending == Ending::Closed {
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .preflight_agent_retirement(retained)?;
+        }
     }
     target
         .require_current(host)
@@ -1347,7 +1546,7 @@ fn close_with_target(
         .require_current(host)
         .map_err(|error| error.message)?;
     // Keep the closed record retryable until durable process retirement succeeds.
-    super::super::agent_execution::retired(host, &source)?;
+    ending.end(host, &source)?;
     let removed = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.proof() != &proof
@@ -1388,7 +1587,9 @@ fn close_with_target(
             state.native_actor_startups.remove(&source.id);
         }
         state.native_adoption_failures.clear(source.id);
-        if let Some(notifications) = &state.notifications {
+        if ending == Ending::Closed
+            && let Some(notifications) = &state.notifications
+        {
             notifications.retire(source.id);
         }
         state.inventory_generation += 1;
@@ -1462,6 +1663,7 @@ fn close_verified_unattached(
     requested: &Session,
     proof: &HostSessionProof,
     verified: VerifiedRetirement,
+    ending: Ending,
 ) -> Result<(), String> {
     let receipt = verified.receipt();
     verify_close_ownership(
@@ -1532,10 +1734,12 @@ fn close_verified_unattached(
         if source != &receipt.source && !receipt.previous_sources.contains(source) {
             return Err("Retained cleanup execution is outside the exact issued lineage".into());
         }
-        registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .preflight_agent_retirement(retained)?;
+        if ending == Ending::Closed {
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .preflight_agent_retirement(retained)?;
+        }
     }
     registry
         .lock()
@@ -1552,7 +1756,7 @@ fn close_verified_unattached(
         )?;
     for retained in &aliases {
         if let crate::agent_execution::HostedSession::Chat(source) = retained {
-            super::super::agent_execution::retired(host, source)?;
+            ending.end(host, source)?;
         }
     }
     {
@@ -1575,7 +1779,9 @@ fn close_verified_unattached(
             state.retire_terminal(requested.id);
         }
         state.native_adoption_failures.clear(requested.id);
-        if let Some(notifications) = &state.notifications {
+        if ending == Ending::Closed
+            && let Some(notifications) = &state.notifications
+        {
             notifications.retire(requested.id);
         }
         state.inventory_generation += 1;
@@ -1840,7 +2046,12 @@ pub(in crate::host) fn reconcile_retired_actors(host: &SharedHost) -> Result<(),
                 // A crash can follow receipt commit but precede capability
                 // retirement. The existing process-identity CAS preserves any
                 // newer authority; this grants no execution from an archive.
-                super::super::agent_execution::retired(host, retired.source())?;
+                // Every ordinary daemon stop leaves such a receipt, so finish
+                // only the process end here: closing the agent or its pane
+                // would undo the resumable stop. An explicit Close interrupted
+                // between its receipt and registry commit stays open but
+                // closable, since the receipt proves its process ended.
+                super::super::agent_execution::stopped(host, retired.source())?;
                 continue;
             }
             let retirement = Handle::inspect_retained_retirement(ownership.owner(), &proof)?;
@@ -1966,6 +2177,10 @@ pub(in crate::host) fn reconcile_retired_actors(host: &SharedHost) -> Result<(),
                         .map_err(String::as_str),
                     receipt.confirmed_session.as_deref(),
                 )?;
+            // The receipt proves the process ended. Record that like any other
+            // stop, so its agent stays open and a resumed successor can adopt
+            // it this boot, not only after the next startup.
+            super::super::agent_execution::stopped(host, &receipt.source)?;
         }
     }
 }

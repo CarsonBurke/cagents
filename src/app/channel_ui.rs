@@ -62,7 +62,20 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
                 }
                 continue;
             };
-            if let Err(error) = client.close_chat(live.clone()) {
+            let closed = client.close_chat(live.clone());
+            if closed.is_ok() && open_agents == OpenAgents::Retire {
+                // A reopened conversation that was given no work yet leaves
+                // its agent stopped when it closes, for a later reopening to
+                // take over. Closing it for good retires that agent too, read
+                // afresh since the close may already have retired it.
+                agents = None;
+                if bound_to_open_agent(live, read_open_agents(&mut agents, &mut client)?) {
+                    client
+                        .close_retained_chat(live.clone())
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            if let Err(error) = closed {
                 // Another window or a natural exit can win this race.
                 // Only a fresh inventory may turn a close error into success,
                 // read on a fresh connection: a failed request can leave this

@@ -189,6 +189,24 @@ impl Registry {
             .transpose()
     }
 
+    /// The open agents bound to another session of `successor`'s lineage: the
+    /// processes a resumed successor may take over once each is proven ended.
+    /// A session that started its own lineage has none.
+    pub(crate) fn lineage_agents(&self, successor: TerminalId) -> Result<Vec<Agent>, String> {
+        let Some(lineage) = self.session_lineage(successor)? else {
+            return Ok(Vec::new());
+        };
+        let mut members = self.lineage_members(lineage)?;
+        if !members.contains(&lineage.0) {
+            members.push(lineage.0);
+        }
+        let mut agents = Vec::new();
+        for member in members.into_iter().filter(|member| *member != successor) {
+            agents.extend(self.agent_for_session(member)?);
+        }
+        Ok(agents)
+    }
+
     /// Whether `id` was registered as a session or names a lineage.
     pub(crate) fn lineage_recorded(&self, id: TerminalId) -> Result<bool, String> {
         self.db
