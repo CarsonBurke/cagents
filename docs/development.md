@@ -782,9 +782,9 @@ be outside the account home reported by `getent passwd "$(id -u)"`, even when
 `HOME` points elsewhere: bundled-skill tests deliberately refuse installation
 beneath the passwd home. A private `~/.cot` therefore does not qualify.
 
-On fw16, `/opt/resolve/.cot` is the existing user-owned private disk-backed base
-used for this preparation. On another host, select and verify a suitable base;
-do not create directories in an unrelated application's tree or change shared
+Use a directory of our own under `/var/tmp`, such as `/var/tmp/ct`, created
+with `mkdir -m 700`. `/var/tmp` is disk-backed on fw16; verify it on another
+host. Do not borrow another application's tree, and do not change shared
 directories or Git markers. The **final** nested Unix
 socket path must be shorter than 108 bytes, including fixture suffixes. For
 example, `/.tmpXXXXXX/tmp/cagents-codex-<36-byte UUID>/control.sock` adds 79
@@ -792,8 +792,9 @@ bytes, so that layout requires a temporary base of at most 28 bytes. Longer
 fixture layouts need more room; a short base alone is not proof.
 
 ```sh
-# Set this only after verifying the base above; this value is specific to fw16.
-export CAGENTS_TEST_TMP_BASE=/opt/resolve/.cot
+# Set this only after verifying the base above.
+mkdir -p -m 700 /var/tmp/ct
+export CAGENTS_TEST_TMP_BASE=/var/tmp/ct
 (
     TMPDIR=$(mktemp -d "${CAGENTS_TEST_TMP_BASE:?}/tXXXXXX") || exit
     export TMPDIR
