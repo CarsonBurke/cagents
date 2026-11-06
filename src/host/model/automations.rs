@@ -3615,24 +3615,14 @@ mod tests {
 
     #[test]
     fn automation_lifecycle_audit_upgrade_does_not_attribute_missing_legacy_events() {
-        let (mut registry, directory, definition) = fixture();
+        let (mut registry, _directory, definition) = fixture();
         let created = registry
             .create_automation(definition, 100, test_identity())
             .unwrap();
-        registry
-            .db
-            .execute_batch(
-                "DROP TABLE automation_notifications;
-                 DROP TABLE channel_work_placement_epochs;
-                DROP TABLE channel_work_placement_clock;
-                DROP TABLE channel_work_operations;
-                DROP TABLE channel_work_entries;
-                DROP TABLE channel_work_homes;
-                DROP TABLE automation_lifecycle; PRAGMA user_version=15;",
-            )
-            .unwrap();
+        let legacy_path =
+            super::super::automation_proposals::published_fixture_from_rows(&registry, 15);
         drop(registry);
-        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let mut registry = Registry::at(&legacy_path).unwrap();
         let legacy = registry.automation_audit(created.id, None, 100).unwrap();
         assert!(legacy.events.is_empty() && legacy.earlier_events_unavailable);
         registry
@@ -3643,7 +3633,7 @@ mod tests {
         assert_eq!(current.events.len(), 1);
         assert_eq!(current.events[0].cause, LifecycleCause::Disabled);
         drop(registry);
-        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let registry = Registry::at(&legacy_path).unwrap();
         assert_eq!(
             registry.automation_audit(created.id, None, 100).unwrap(),
             current
