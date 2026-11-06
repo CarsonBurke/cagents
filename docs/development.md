@@ -762,9 +762,9 @@ command and its children in a systemd scope limited to 16 GiB of memory
 runaway just moves into swap. For scale, the whole UI lib test binary peaks at
 about 3 GiB and the host one at about 1 GiB. A native evidence session with 8 busy
 chats and 6 long terminals peaked at about 800 MiB, and the integrated app at about
-8 GiB after nine loads of deliberately heavy pages, about 1 GiB each, because Servo
-kept pages it had navigated away from. A long integrated session on heavy sites can
-reach the limit. The notice names the app and how to raise it.
+8 GiB after ten loads of deliberately heavy pages, apparently because Servo kept
+pages it had navigated away from. A long integrated session on heavy sites can reach
+the limit. The notice names the app and how to raise it.
 
 `scripts/cargo-gate test` and `bench` run under it, inside a held slot too, as do
 `scripts/test-lib`, the app in `scripts/run-development`, `--instance` included,
