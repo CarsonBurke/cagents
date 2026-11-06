@@ -402,11 +402,15 @@ locks and owned fixture processes only: `python3 tests/cargo_gate.py -v`.
 
 `scripts/lock-holders [LOCK...]` shows who holds each lock under
 `/var/tmp/cagents-*.lock*`, whether they or their descendants are using CPU, and who
-is waiting. It warns when no holder is a build or a session, which usually means a
-leftover process inherited the lock, and it notes a lock whose holders used no CPU
-during its one-second sample. A leftover that looks like a build, or a script that
-doesn't, can still fool the warning, so read the holders it lists. It only reads
-`/proc`, so ending a process stays your decision.
+is waiting. It notes a lock whose holders aren't a recognized build or session, and
+one whose holders used no CPU during its one-second sample. Neither makes a holder a
+leftover: a script can hold a lock and sleep between its own steps, and only its
+owner can say. Nor does a recognized name clear one: a leftover that looks like a
+build gets at most the idle note, so read the holders it lists. Process age isn't
+hold time: a process can start long before it takes a lock, or after the lock was
+taken if it inherited it. The kernel doesn't record when a lock was taken, but a
+holder that took the lock itself is marked, and took it at most its age ago. The tool
+only reads `/proc`, so ending a process stays your decision.
 
 The feature lanes coexist in one build directory: a no-op check of one lane
 stays a no-op after building the others. With a per-checkout build directory,
@@ -576,13 +580,20 @@ cold. Before its first gated build, `scripts/cargo-gate` runs
 `scripts/seed-build-dir`, which copies the main checkout's compiled
 dependencies into the new build directory with btrfs reflinks. The copy takes
 under a minute and shares file data with the main checkout's until either side
-rewrites a file, so it costs only file system metadata. Cargo then rebuilds
-what differs: this checkout's own and vendored crates, which depend on the
-checkout path, and the crates that depend on them. Incremental caches are not
-copied. Seeding does nothing on a file system without reflinks, when the main
-checkout has no build, for a directory that has been built in, or with
+rewrites a file, so it costs only file system metadata. Seeding leaves out the
+fingerprints of this checkout's own and vendored crates, the packages with no
+`source` in `Cargo.lock`, so Cargo always rebuilds them and the crates that
+depend on them. Cargo would otherwise judge them by source times alone, and a
+copied fingerprint can be newer than this checkout's different sources.
+Incremental caches are not copied. Seeding does nothing on a file system
+without reflinks, when the main checkout has no build or this checkout has no
+`Cargo.lock`, for a directory that has been built in, or with
 `CAGENTS_BUILD_SEED=0`; run `scripts/seed-build-dir` by hand to seed a
-directory a plain `cargo` would create. Seeded directories carry Cargo's
+directory a plain `cargo` would create. After copying a target by hand, run
+`scripts/seed-build-dir --forget-local TARGET` from the checkout that will build
+there, before its first build. It fails when it can't find this checkout's
+crates in `Cargo.lock`, or can't search or clean `TARGET`; a `TARGET` with no
+fingerprints has nothing to forget. Seeded directories carry Cargo's
 `CACHEDIR.TAG`, so `prune-cargo-build-dirs` reclaims them after their worktree
 is removed.
 

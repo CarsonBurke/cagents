@@ -399,6 +399,7 @@ enum ConversionCheckpoint {
 enum ChatRecoveryKind {
     Account,
     Upgrade,
+    Resume,
     #[cfg(feature = "ui")]
     AuthenticatedUpgrade(crate::chat::client::UpgradeRecovery),
 }
@@ -773,6 +774,17 @@ impl SessionRuntime {
     ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
     {
         self.rebind_chat(ChatRecoveryKind::Account, card_id, source, replacement)
+    }
+
+    /// Commit a daemon-prepared resume successor before activating the chat.
+    pub fn rebind_chat_resume(
+        &self,
+        card_id: CardId,
+        source: crate::chat::Session,
+        replacement: crate::chat::Session,
+    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
+    {
+        self.rebind_chat(ChatRecoveryKind::Resume, card_id, source, replacement)
     }
 
     /// Commit authenticated daemon-upgrade lineage before activating the chat.
@@ -1486,6 +1498,16 @@ trait SessionStore {
             "This store does not support upgrade recovery".into(),
         ))
     }
+    fn rebind_chat_resume(
+        &self,
+        _card_id: CardId,
+        _source: &crate::chat::Session,
+        _replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::InvalidState(
+            "This store does not support resume recovery".into(),
+        ))
+    }
     fn rebind_chat_account(
         &self,
         _card_id: CardId,
@@ -1595,6 +1617,14 @@ impl SessionStore for StateStore {
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
         StateStore::rebind_chat_account(self, card_id, source, replacement)
+    }
+    fn rebind_chat_resume(
+        &self,
+        card_id: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        StateStore::rebind_chat_resume(self, card_id, source, replacement)
     }
     fn replace_terminal_identity(
         &self,
@@ -1707,6 +1737,14 @@ impl SessionStore for Arc<StateStore> {
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
         StateStore::rebind_chat_account(self, card_id, source, replacement)
+    }
+    fn rebind_chat_resume(
+        &self,
+        card_id: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        StateStore::rebind_chat_resume(self, card_id, source, replacement)
     }
     fn replace_terminal_identity(
         &self,
@@ -2143,6 +2181,11 @@ impl PendingWrites {
                             &recovery.replacement,
                         ),
                         ChatRecoveryKind::Upgrade => store.rebind_chat_upgrade(
+                            recovery.card,
+                            &recovery.source,
+                            &recovery.replacement,
+                        ),
+                        ChatRecoveryKind::Resume => store.rebind_chat_resume(
                             recovery.card,
                             &recovery.source,
                             &recovery.replacement,

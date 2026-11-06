@@ -1,6 +1,8 @@
 #[cfg(all(test, target_os = "linux"))]
 mod paired_upgrade_tests;
 mod presentation;
+mod retention;
+pub(super) use retention::Retirement;
 mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
@@ -74,6 +76,7 @@ pub(crate) struct TerminalRecord {
     upgrade_relaunches: Vec<crate::terminal_ipc::UpgradeRelaunch>,
     running: bool,
     completion_observed: bool,
+    completed_at: Option<Instant>,
     last_exit: Option<TerminalExit>,
     event_sequence: u64,
     events: VecDeque<(u64, WireTerminalEvent)>,
@@ -253,6 +256,7 @@ pub(crate) struct HostState {
     /// made per-frame allocation scale with the number of attached views.
     proof: Arc<HostSessionProof>,
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
+    pub(super) terminal_retirements: BTreeMap<TerminalId, Retirement>,
     spawning: BTreeSet<TerminalId>,
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
@@ -263,7 +267,7 @@ pub(crate) struct HostState {
     /// permission to replay any recipe.
     retained_startup_checkpoint: Option<crate::upgrade::handoff::Checkpoint>,
     #[cfg(test)]
-    test_fail_startup_commit: Option<TerminalId>,
+    pub(super) test_fail_startup_commit: Option<TerminalId>,
     #[cfg(test)]
     test_checkpoint_failure_at: Option<(TerminalId, PathBuf)>,
     /// Covers the interval before a login's live TerminalRecord exists.
@@ -298,6 +302,11 @@ pub(crate) struct HostState {
     /// provider to become ready, before the prompt was submitted.
     pub(super) execution_gates:
         BTreeMap<crate::model::AgentId, Weak<Mutex<Option<super::agent_execution::Undelivered>>>>,
+    /// Resume successors that took over their agent when they started and
+    /// have been given no work since. Ending one gives the agent back stopped,
+    /// for the next resume to take over, rather than retiring it: until then
+    /// the successor is only a reopening its card may still give up.
+    pub(super) idle_adoptions: BTreeSet<TerminalId>,
     pub(super) execution_startups: BTreeMap<
         crate::model::AgentId,
         (
@@ -423,6 +432,7 @@ impl HostState {
             worktree_removals: Default::default(),
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
+            terminal_retirements: BTreeMap::new(),
             spawning: BTreeSet::new(),
             startup_custody: BTreeSet::new(),
             startup_recovery: None,
@@ -442,6 +452,7 @@ impl HostState {
             mailbox: None,
             mailbox_seal: None,
             execution_gates: BTreeMap::new(),
+            idle_adoptions: BTreeSet::new(),
             execution_startups: BTreeMap::new(),
             model_watchers: BTreeSet::new(),
             client_pids: BTreeMap::new(),
@@ -600,6 +611,24 @@ impl HostState {
         activation
     }
 
+    /// The sessions this publication adds to its window's live claim.
+    pub(super) fn notification_sessions_unclaimed(
+        &self,
+        presence: &crate::notifications::Presence,
+    ) -> Vec<TerminalId> {
+        presence
+            .sessions
+            .iter()
+            .filter(|session| {
+                !self.notification_watchers.values().any(|current| {
+                    current.destination() == presence.destination()
+                        && current.sessions.contains(session)
+                })
+            })
+            .copied()
+            .collect()
+    }
+
     pub(super) fn notification_presence(&mut self, presence: crate::notifications::Presence) {
         for (&client, current) in &mut self.notification_watchers {
             if current.destination() == presence.destination() {
@@ -718,6 +747,7 @@ impl HostState {
         origin: ClientId,
         edit: ModelEdit,
     ) -> Result<WorkspaceModel, ProtocolError> {
+        self.ensure_view_retention_available(&edit)?;
         let edit = edit
             .canonicalized()
             .map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false))?;
@@ -949,6 +979,7 @@ impl HostState {
         client_id: ClientId,
         terminal_id: TerminalId,
     ) -> Result<TerminalDescriptor, ProtocolError> {
+        self.ensure_retention_available(&[terminal_id])?;
         let record = self
             .terminals
             .get(&terminal_id)
@@ -1443,6 +1474,7 @@ impl HostState {
                 upgrade_relaunches: Vec::new(),
                 running: true,
                 completion_observed: false,
+                completed_at: None,
                 last_exit: None,
                 event_sequence: 0,
                 events: VecDeque::new(),
@@ -1828,6 +1860,9 @@ impl HostState {
         if self.shutting_down {
             return Err("Daemon is already shutting down".into());
         }
+        if !self.terminal_retirements.is_empty() {
+            return Err("Terminal retirement is not confirmed; retry after cleanup settles or explicitly close the retained result".into());
+        }
         if capability.proof != *self.proof {
             return Err("Daemon changed; obtain a new upgrade preflight".into());
         }
@@ -1958,6 +1993,11 @@ impl HostState {
         self.ordinary_exit_cleanup_pending
     }
 
+    pub(super) fn terminal_close_admission_open(&self) -> bool {
+        !self.ordinary_exit_registration_closed
+            && (!self.shutting_down || self.ordinary_exit_cleanup_pending)
+    }
+
     /// Called only after the exit caller holds the core's sealed absence
     /// proof. Includes clients registered during the pending cleanup interval.
     pub(super) fn close_ordinary_exit_registration(&mut self) -> Vec<Arc<DeliveryQueue>> {
@@ -1993,7 +2033,9 @@ impl HostState {
     }
 
     pub(super) fn ordinary_exit_cleanup_blocked(&self) -> bool {
-        self.startup_blocks_shutdown() || !self.checked_close_replies.is_empty()
+        self.startup_blocks_shutdown()
+            || !self.checked_close_replies.is_empty()
+            || !self.terminal_retirements.is_empty()
     }
 
     pub(super) fn startup_recovery(&self) -> Option<&str> {
@@ -4185,6 +4227,12 @@ fn start_terminal_view_owned_reserved(
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
+    // Adoption already inspected this holder's issued source. Keep that exact
+    // receipt alias in the independently installed owner, including when the
+    // startup commit fails; the relaunch projection has no ownership proof.
+    let install_session = previous
+        .as_ref()
+        .map_or_else(|| session.clone(), |previous| previous.source.clone());
     let holder_recovery = {
         let mut state = shared
             .lock()
@@ -4257,6 +4305,12 @@ fn start_terminal_view_owned_reserved(
             }
         })
     };
+    // Fresh holders receive this exact daemon-issued source. Retain it after
+    // successful startup instead of the caller's proofless relaunch projection.
+    // Adoption keeps its independently installed previous source above.
+    let registered_session = holder_recovery
+        .as_ref()
+        .map_or_else(|| session.clone(), |recovery| recovery.source.clone());
 
     let agent_authority = if paired {
         match super::agent_execution::registry(shared) {
@@ -4352,7 +4406,6 @@ fn start_terminal_view_owned_reserved(
     };
     let wake_redraw = Arc::clone(&redraw);
     let adopting = config.adoption.is_some();
-    let install_session = session.clone();
     let install_options = options.clone();
     let install_environment = retained_environment.clone();
     let install_execution = execution_recipe.clone();
@@ -4531,7 +4584,7 @@ fn start_terminal_view_owned_reserved(
         } else {
             state.finish_spawn_with_execution(
                 client_id,
-                session,
+                registered_session,
                 handle,
                 options.initially_visible,
                 execution_recipe.clone(),

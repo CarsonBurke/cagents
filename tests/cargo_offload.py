@@ -9,6 +9,7 @@ in a temporary directory. Cargo builds only a tiny private crate.
 import importlib.machinery
 import importlib.util
 import ast
+import contextlib
 import fcntl
 import json
 import os
@@ -37,6 +38,18 @@ def load_offload():
 
 
 offload = load_offload()
+
+
+def write_figures(directory, *, available_gib=1024, cpu=0, memory=0):
+    """A build host's memory and CPU figures, standing in for /proc. Unless a
+    test is about them, an idle, roomy host: admission otherwise holds builds
+    back by the real figures, which change as tests run."""
+    directory = Path(directory)
+    (directory / "pressure").mkdir(parents=True, exist_ok=True)
+    (directory / "meminfo").write_text(f"MemAvailable: {available_gib * 2**20} kB\n")
+    for resource_name, value in (("cpu", cpu), ("memory", memory)):
+        (directory / "pressure" / resource_name).write_text(
+            f"some avg10={value:.2f} avg60=0.00 avg300=0.00 total=0\n")
 
 
 class Parsing(unittest.TestCase):
@@ -510,7 +523,8 @@ if [ "$1" = marked ]; then
     shift
     cd "$HOME"
     exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
-        CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/stray/cof" sh -c "mkdir -p '$HOME/stray/.git'; $*"
+        CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/stray/cof" \
+        sh -c "mkdir -p '$HOME/stray/.git'; $*"
 fi
 shift
 cd "$HOME"
@@ -523,7 +537,7 @@ ulimit -Sn 256
 # removes.
 exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" \
     RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_BUILD_DIR="$HOME/build{workspace-root}/target" \
-    CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
+    CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
 """
 
 
@@ -545,6 +559,7 @@ class StandInHost(unittest.TestCase):
         self.gate = tools / "cargo-gate"
         self.host_home = self.root / "host"
         self.host_home.mkdir()
+        write_figures(self.host_home / "figures")
         self.crate = self.root / "crate"
         (self.crate / "src").mkdir(parents=True)
         (self.crate / "Cargo.toml").write_text(textwrap.dedent("""
@@ -556,6 +571,8 @@ class StandInHost(unittest.TestCase):
         """))
         (self.crate / "src/main.rs").write_text('fn main() { println!("probe"); }\n')
         (self.crate / ".gitignore").write_text("/target\n")
+        # A host's default toolchain may predate CARGO_BUILD_BUILD_DIR.
+        shutil.copy2(ROOT / "rust-toolchain.toml", self.crate)
         subprocess.run(["git", "init", "-q"], cwd=self.crate, check=True)
         home = Path.home()
         self.env = {
@@ -1265,13 +1282,31 @@ class RemoteRun(unittest.TestCase):
             lease.stdin.close()
             self.assertEqual(lease.wait(timeout=10), 0)
 
-    def lease(self, base, *, slots=2, build="", slot_disk=0):
+    @contextlib.contextmanager
+    def slots(self):
+        """A directory of slots, which leases still waiting would keep adding
+        to as it is removed."""
+        with tempfile.TemporaryDirectory() as base:
+            self.leases = []
+            try:
+                yield base
+            finally:
+                for lease in self.leases:
+                    lease.kill()
+                    lease.wait()
+
+    def lease(self, base, *, slots=2, build="", slot_disk=0, figures=None):
+        if figures is None:
+            figures = Path(base, "figures")
+            write_figures(figures)
         lease = subprocess.Popen(
             ["python3", "-c", offload.REMOTE_AGENT, "lease", base, str(slots), "key", "0", "",
              "", build],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
             env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof")),
-                              "CAGENTS_OFFLOAD_SLOT_DISK_BYTES": str(slot_disk)})
+                              "CAGENTS_OFFLOAD_SLOT_DISK_BYTES": str(slot_disk),
+                              "CAGENTS_OFFLOAD_FIGURES": str(figures)})
+        self.leases.append(lease)
         self.addCleanup(lease.stdout.close)
         self.addCleanup(lease.kill)
         return lease, offload.Lines(lease.stdout)
@@ -1289,7 +1324,7 @@ class RemoteRun(unittest.TestCase):
         return lock
 
     def test_a_further_slot_is_made_while_the_disk_holds_one(self):
-        with tempfile.TemporaryDirectory() as base:
+        with self.slots() as base:
             self.hold(base, 0, {"cost": 1, "pid": None})
             lease, lines = self.lease(base)
             self.assertEqual(json.loads(lines.next(10).removeprefix("slot ")),
@@ -1298,7 +1333,7 @@ class RemoteRun(unittest.TestCase):
     def test_no_further_slot_is_made_without_disk_for_one_or_beyond_the_most(self):
         for slots, slot_disk in ((2, 2**62), (1, 0)):
             with self.subTest(slots=slots, slot_disk=slot_disk), \
-                    tempfile.TemporaryDirectory() as base:
+                    self.slots() as base:
                 lock = self.hold(base, 0, {"cost": 1, "pid": None})
                 lease, lines = self.lease(base, slots=slots, slot_disk=slot_disk)
                 self.assertEqual(lines.next(10), "wait")
@@ -1309,7 +1344,7 @@ class RemoteRun(unittest.TestCase):
                 self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
 
     def test_slots_made_lately_count_as_full_until_they_fill(self):
-        with tempfile.TemporaryDirectory() as base:
+        with self.slots() as base:
             stat = os.statvfs(base)
             slot_disk = int(stat.f_bavail * stat.f_frsize * 0.6)
             self.hold(base, 0, {"cost": 1, "pid": None})
@@ -1323,7 +1358,7 @@ class RemoteRun(unittest.TestCase):
             self.assertFalse(Path(base, "slot-2").exists())
 
     def test_the_same_build_waits_for_its_slot_rather_than_build_again_elsewhere(self):
-        with tempfile.TemporaryDirectory() as base:
+        with self.slots() as base:
             lock = self.hold(base, 0, {"cost": 1, "pid": None, "build": "same", "key": "key"})
             lease, lines = self.lease(base, build="same")
             self.assertEqual(lines.next(10), "wait same")
@@ -1337,23 +1372,46 @@ class RemoteRun(unittest.TestCase):
             self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
 
     def test_a_build_that_waited_for_the_same_one_gets_back_in_line(self):
-        with tempfile.TemporaryDirectory() as base:
+        with self.slots() as base:
             lock = self.hold(base, 0, {"cost": 1, "pid": None, "build": "same", "key": "key"})
             waiter, waits = self.lease(base, slots=1, build="same")
             self.assertEqual(waits.next(10), "wait same")
-            # In line meanwhile, so first to the slot once it frees.
-            other, others = self.lease(base, slots=1, build="other")
-            self.assertEqual(others.next(10), "wait")
+            # The head of the line meanwhile, as another build would be.
+            line = open(Path(base, "queue"), "a")
+            self.addCleanup(line.close)
+            fcntl.flock(line, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(lock, fcntl.LOCK_UN)
-            self.assertEqual(json.loads(others.next(10).removeprefix("slot "))["index"], 0)
+            # The slot is free, and it still takes its turn.
             self.assertEqual(waits.next(10), "wait")
             with self.assertRaises(TimeoutError):
                 waits.next(1.5)
-            other.stdin.close()
+            line.close()
             self.assertEqual(json.loads(waits.next(10).removeprefix("slot "))["index"], 0)
 
+    def test_a_build_beside_another_waits_until_the_host_has_room(self):
+        for figures, reason in (({"cpu": 90}, "wait cpu 90 40"),
+                                ({"memory": 50}, "wait pressure 50 10"),
+                                ({"available_gib": 1}, "wait memory 1.0 9.0 1")):
+            with self.subTest(reason), self.slots() as base:
+                stand_in = Path(base, "figures")
+                write_figures(stand_in, **figures)
+                self.hold(base, 0, {"cost": 1, "pid": None})
+                _, lines = self.lease(base, figures=stand_in)
+                self.assertEqual(lines.next(10), reason)
+                with self.assertRaises(TimeoutError):
+                    lines.next(1.5)
+                write_figures(stand_in)
+                self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
+
+    def test_a_lone_build_starts_however_busy_the_host_is(self):
+        with self.slots() as base:
+            stand_in = Path(base, "figures")
+            write_figures(stand_in, available_gib=1, cpu=90, memory=50)
+            _, lines = self.lease(base, figures=stand_in)
+            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
+
     def test_the_same_build_from_another_checkout_is_not_waited_for(self):
-        with tempfile.TemporaryDirectory() as base:
+        with self.slots() as base:
             self.hold(base, 0, {"cost": 1, "pid": None, "build": "same", "key": "elsewhere"})
             lease, lines = self.lease(base, build="same")
             self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)

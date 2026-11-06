@@ -120,8 +120,15 @@ pub(super) fn read(
     Ok(receipt.snapshot)
 }
 fn read_receipt(record: &Record) -> Result<Receipt, String> {
-    let file = crate::secure_file::open_existing_private_file_readonly(&path(record)?)
-        .map_err(|error| error.to_string())?;
+    read_receipt_if_published(record)?
+        .ok_or_else(|| "The helper has not published its final retained snapshot".into())
+}
+fn read_receipt_if_published(record: &Record) -> Result<Option<Receipt>, String> {
+    let file = match crate::secure_file::open_existing_private_file_readonly(&path(record)?) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
     let mut bytes = Vec::new();
     file.take((MAX_FRAME + 1) as u64)
         .read_to_end(&mut bytes)
@@ -130,7 +137,7 @@ fn read_receipt(record: &Record) -> Result<Receipt, String> {
         return Err("Final retained snapshot is oversized".into());
     }
     let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    Ok(receipt)
+    Ok(Some(receipt))
 }
 fn validate_publication(
     receipt: &Receipt,
@@ -184,7 +191,12 @@ pub(super) fn close_proved(
     if !execution_exit::identity_absent(&identity.record.root)? {
         return Ok(false);
     }
-    read(identity, proof, source).map(|_| true)
+    // The helper publishes after its provider exits. Until then, closure is
+    // unproved rather than an error that would hide why the close failed.
+    let Some(receipt) = read_receipt_if_published(&identity.record)? else {
+        return Ok(false);
+    };
+    validate_publication(&receipt, identity, proof, source).map(|()| true)
 }
 const MAX_RETIREMENT: usize = 256 * 1024;
 #[derive(Serialize, Deserialize)]
@@ -507,6 +519,18 @@ mod tests {
         );
         receipt.snapshot.exited = false;
         assert!(validate_publication(&receipt, &identity, &proof, &source).is_err());
+    }
+    #[test]
+    fn an_unpublished_final_snapshot_leaves_close_unproved() {
+        let actor = RemoteActor::fixture();
+        let mut identity = actor.identity();
+        identity.record.root = reaped_process();
+        let proof = actor.proof();
+        let mut source = super::super::transport::fixture_source();
+        source.id = identity.record.terminal;
+        source.proof = Some(proof.clone());
+        assert_eq!(close_proved(&identity, &proof, &source), Ok(false));
+        assert!(read(&identity, &proof, &source).is_err());
     }
     #[test]
     fn retirement_cross_checks_final_tuple_without_reopening_a_removed_account_home() {
