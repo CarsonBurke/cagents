@@ -6591,13 +6591,17 @@ exec /bin/sleep 60
                 "the refusal lifts the fence"
             );
             // The refusal is the input's outcome: a late copy of its frame
-            // returns it even after the refusal's cause has cleared.
+            // returns it even after the refusal's cause has cleared. Once the
+            // caller has heard it, the proxy retires that receipt on its own
+            // worker, and from then on a late copy is refused as retired.
             toggle(&mut served.fixture.lock().unwrap().server, false);
-            let late = served.invoke_input(served.input_request(1)).unwrap();
-            assert_eq!(
-                serde_json::from_value::<InputReceipt>(late).unwrap().state,
-                InputState::Acknowledged(Err(expected.into()))
-            );
+            match served.invoke_input(served.input_request(1)) {
+                Ok(late) => assert_eq!(
+                    serde_json::from_value::<InputReceipt>(late).unwrap().state,
+                    InputState::Acknowledged(Err(expected.into()))
+                ),
+                Err(refusal) => assert!(refusal.contains("never replay"), "{refusal}"),
+            }
             // The next input is admitted.
             let next = actor.enqueue(None, Command::Refresh).unwrap();
             assert_eq!(next.recv_timeout(ACKNOWLEDGEMENT_WAIT).unwrap(), Ok(()));
