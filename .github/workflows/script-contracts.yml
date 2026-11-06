@@ -254,6 +254,7 @@ jobs:
       - name: Check shell syntax
         run: |
           sh -n scripts/run-development
+          [ ! -e scripts/refuse-compile ] || sh -n scripts/refuse-compile
           sh -n scripts/check-format
 
       - name: Check repository formatting
