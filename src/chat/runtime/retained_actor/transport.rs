@@ -528,6 +528,14 @@ impl RemoteActor {
         validate_evidence_record(record, proof)?;
         final_snapshot::inspect_retirement(record, proof)
     }
+    /// The exact helper and provider in this record ended without retirement
+    /// and left no process in the provider's group or the helper's session.
+    /// This proves no writer survives; it is never retirement evidence.
+    pub fn inspect_abandoned(record: &Record, proof: &HostSessionProof) -> Result<bool, String> {
+        authorize_reader(proof)?;
+        validate_evidence_record(record, proof)?;
+        super::execution_exit::abandoned(&record.holder, &record.root)
+    }
     pub fn retired_actor_receipt(
         record: &Record,
         proof: &HostSessionProof,

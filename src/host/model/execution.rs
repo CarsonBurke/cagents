@@ -184,7 +184,8 @@ impl Registry {
         self.db.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM agent_launches)
                 AND NOT EXISTS(SELECT 1 FROM agent_runs WHERE state IN ('accepted', 'running', 'waiting'))
-                AND NOT EXISTS(SELECT 1 FROM agents WHERE closed = 0 AND session_id IS NOT NULL)",
+                AND NOT EXISTS(SELECT 1 FROM agents a WHERE closed = 0 AND session_id IS NOT NULL
+                    AND json_extract(a.record, '$.process_end') IS NOT a.session_id)",
             [], |row| row.get(0),
         ).map_err(|error| error.to_string())
     }
@@ -1423,7 +1424,7 @@ impl Registry {
         source: &HostedSession,
         now_ms: u64,
     ) -> Result<bool, String> {
-        self.retire_agent_process_checked(source, now_ms, None)
+        self.end_agent_process(source, now_ms, ProcessEnd::Closed, None)
     }
 
     /// A previous-boot cleanup must not cancel work accepted by the
@@ -1446,13 +1447,29 @@ impl Registry {
             .session
             .as_ref()
             .ok_or("The saved provider is unavailable")?;
-        self.retire_agent_process_checked(source, now_ms, Some((agent, run)))
+        self.end_agent_process(source, now_ms, ProcessEnd::Closed, Some((agent, run)))
     }
 
-    fn retire_agent_process_checked(
+    /// Record that daemon shutdown stopped this exact process, after confirmed
+    /// teardown. Its delegated authority is revoked and unfinished runs are
+    /// cancelled with a stop diagnostic, never resent, so no later daemon can
+    /// act through this descriptor. The agent stays open with its pane and
+    /// placement, marked as ended ([`Self::agent_process_ended`]): the
+    /// conversation resumes in place, and [`Self::adopt_successor`] binds the
+    /// resumed process.
+    pub(crate) fn stop_agent_process(
         &mut self,
         source: &HostedSession,
         now_ms: u64,
+    ) -> Result<bool, String> {
+        self.end_agent_process(source, now_ms, ProcessEnd::Stopped, None)
+    }
+
+    fn end_agent_process(
+        &mut self,
+        source: &HostedSession,
+        now_ms: u64,
+        end: ProcessEnd,
         completed: Option<(&Agent, &Run)>,
     ) -> Result<bool, String> {
         let tx = self
@@ -1496,17 +1513,8 @@ impl Registry {
             )
             .map_err(|e| e.to_string())?;
         }
-        let record: Option<String> = tx
-            .query_row(
-                "SELECT a.record FROM agents a LEFT JOIN agent_launches p ON p.agent = a.id WHERE (a.session_id = ?1 OR p.session_id = ?1) AND a.closed = 0",
-                [source.id().to_string()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
         let mut changed = false;
-        if let Some(record) = record {
-            let mut agent: Agent = decode(&record)?;
+        if let Some(mut agent) = process_agent(&tx, source)? {
             let pending: Option<String> = tx
                 .query_row(
                     "SELECT source FROM agent_launches WHERE agent = ?1",
@@ -1524,14 +1532,27 @@ impl Registry {
                 .or(pending.as_ref())
                 .is_some_and(|expected| expected.same_process(source))
             {
+                // A launch that never bound has no conversation to resume, so
+                // even a daemon stop retires it as before.
+                let end = if pending.is_some() {
+                    ProcessEnd::Closed
+                } else {
+                    end
+                };
                 let records = tx.prepare("SELECT record FROM agent_runs WHERE agent = ?1 AND state IN ('accepted', 'running', 'waiting')")
                     .map_err(|e| e.to_string())?.query_map([agent.id.to_string()], |row| row.get::<_, String>(0))
                     .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|e| e.to_string())?;
                 for record in records {
                     let mut run: Run = decode(&record)?;
+                    // Teardown was confirmed, so this is a deliberate stop, not
+                    // lost evidence (`Interrupted`). Cancelled leaves the agent
+                    // free to take new work; nothing resends this prompt.
                     run.state = State::Cancelled;
                     if pending.is_some() {
                         run.result.diagnostic = Some("The provider was retired before its launch could be bound; no prompt was submitted".into());
+                    } else if end == ProcessEnd::Stopped {
+                        changed = true;
+                        run.result.diagnostic = Some("The agent's process stopped before this prompt finished, so its effects may be incomplete. It was not resent; inspect the conversation before sending more work.".into());
                     }
                     run.finished_ms = Some(now_ms);
                     run.revision = run
@@ -1541,32 +1562,165 @@ impl Registry {
                     tx.execute("UPDATE agent_runs SET state = 'cancelled', revision = ?2, record = ?3 WHERE id = ?1",
                         params![run.id.to_string(), run.revision, encode(&run)?]).map_err(|e| e.to_string())?;
                 }
-                // ChatClose and daemon shutdown retire through this path before
-                // the execution service can reach close_agent. Commit the pane
-                // tombstone here too, so a crash cannot publish a closed agent
-                // while leaving its exact retained presentation behind.
-                super::views::retire_agent(&tx, &agent)?;
-                agent.closed = true;
-                tx.execute(
-                    "DELETE FROM agent_launches WHERE agent = ?1",
-                    [agent.id.to_string()],
-                )
-                .map_err(|e| e.to_string())?;
-                tx.execute(
-                    "UPDATE agents SET closed = 1, record = ?2 WHERE id = ?1",
-                    params![agent.id.to_string(), encode(&agent)?],
-                )
-                .map_err(|e| e.to_string())?;
-                tx.execute(
-                    "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
-                    [],
-                )
-                .map_err(|e| e.to_string())?;
-                changed = true;
+                if end == ProcessEnd::Closed {
+                    tx.execute(
+                        "DELETE FROM agent_launches WHERE agent = ?1",
+                        [agent.id.to_string()],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    // ChatClose retires through this path before the execution
+                    // service can reach close_agent. Commit the pane tombstone
+                    // here too, so a crash cannot publish a closed agent while
+                    // leaving its exact retained presentation behind.
+                    super::views::retire_agent(&tx, &agent)?;
+                    agent.closed = true;
+                    tx.execute(
+                        "UPDATE agents SET closed = 1, record = ?2 WHERE id = ?1",
+                        params![agent.id.to_string(), encode(&agent)?],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    changed = true;
+                }
+                if end == ProcessEnd::Stopped {
+                    // Durable proof that this exact process ended, so the next
+                    // daemon can close the agent without it, or bind the
+                    // resumed successor.
+                    changed |= tx
+                        .execute(
+                            "UPDATE agents SET record = json_set(record, '$.process_end', ?2)
+                             WHERE id = ?1 AND json_extract(record, '$.process_end') IS NOT ?2",
+                            params![agent.id.to_string(), source.id().to_string()],
+                        )
+                        .map_err(|e| e.to_string())?
+                        > 0;
+                }
+                // Repeating a stop (startup reconciles every same-boot receipt)
+                // changes nothing public and announces nothing.
+                if changed {
+                    tx.execute(
+                        "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+                        [],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(changed)
+    }
+
+    /// Bind an agent that daemon shutdown stopped to the process that resumed
+    /// its conversation under a new chat ID, keeping its pane, placement and
+    /// channel. The predecessor must be the agent's exact recorded process and
+    /// be proven ended, by a recorded stop or an earlier boot, so the old and
+    /// new processes can never both act for the agent. Unfinished runs or a
+    /// pending launch refuse; runs that ended (including `Interrupted` ones a
+    /// crash recovery recorded) do not. Returns whether anything changed; no
+    /// authority is issued for the successor.
+    pub(crate) fn adopt_successor(
+        &mut self,
+        predecessor: &crate::chat::Session,
+        successor: &crate::chat::Session,
+    ) -> Result<bool, String> {
+        if successor.id == predecessor.id {
+            return Err("A resumed successor needs its own chat ID".into());
+        }
+        if successor.launch.provider != predecessor.launch.provider
+            || successor.launch.recipe.working_directory
+                != predecessor.launch.recipe.working_directory
+        {
+            return Err("The successor runs a different provider or directory".into());
+        }
+        let Some(boot) = successor
+            .proof
+            .as_ref()
+            .filter(|proof| proof.is_complete())
+            .map(|proof| proof.boot_id.clone())
+        else {
+            return Err("The successor has no complete process identity".into());
+        };
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let previous = HostedSession::Chat(predecessor.clone());
+        let Some(mut agent) = process_agent(&tx, &previous)? else {
+            return Ok(false);
+        };
+        if !agent
+            .session
+            .as_ref()
+            .is_some_and(|session| session.same_process(&previous))
+        {
+            return Ok(false);
+        }
+        let bound: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE session_id = ?1)",
+                [successor.id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if bound {
+            return Err("The successor already belongs to another agent".into());
+        }
+        // Only a recorded stop, or a boot the successor does not share, proves
+        // the predecessor can no longer act; a missing authority row does not,
+        // since some transports never hold one.
+        let stopped = process_ended(&tx, agent.id)?;
+        let earlier_boot = predecessor
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.boot_id != boot);
+        if !stopped && !earlier_boot {
+            return Err("The predecessor may still be running; stop it first".into());
+        }
+        // Any authority left from an earlier boot is stale. Rewriting the
+        // record below also drops the predecessor's stop marker.
+        tx.execute(
+            "DELETE FROM agent_authorities WHERE session_id = ?1",
+            [predecessor.id.to_string()],
+        )
+        .map_err(|error| error.to_string())?;
+        let unsettled: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent = ?1
+                     AND state IN ('accepted', 'running', 'waiting'))
+                 OR EXISTS(SELECT 1 FROM agent_launches WHERE agent = ?1)",
+                [agent.id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if unsettled {
+            return Err("The stopped agent still has unsettled work; it cannot be rebound".into());
+        }
+        let next = HostedSession::Chat(successor.clone());
+        super::views::rebind_agent_pane(&tx, agent.id, &previous, &next)?;
+        agent.session = Some(next);
+        agent.console = successor.terminal.clone();
+        tx.execute(
+            "UPDATE agents SET record = ?2, session_id = ?3 WHERE id = ?1",
+            params![
+                agent.id.to_string(),
+                encode(&agent)?,
+                successor.id.to_string()
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    /// Whether this open agent's bound process was proven to have ended (a
+    /// daemon stop) and nothing has resumed it yet. Closing such an agent
+    /// needs no teardown; its saved conversation is all that remains.
+    pub(crate) fn agent_process_ended(&self, id: AgentId) -> Result<bool, String> {
+        process_ended(&self.db, id)
     }
 
     /// Called after confirmed runtime teardown, never before requesting it.
@@ -1909,6 +2063,46 @@ fn check_parent_depth(db: &Connection, origin: &Origin) -> Result<(), String> {
         current = decode(&previous)?;
     }
     Ok(())
+}
+
+/// The open agent bound to this exact process, or launching it.
+fn process_agent(tx: &Transaction<'_>, source: &HostedSession) -> Result<Option<Agent>, String> {
+    tx.query_row(
+        "SELECT a.record FROM agents a LEFT JOIN agent_launches p ON p.agent = a.id WHERE (a.session_id = ?1 OR p.session_id = ?1) AND a.closed = 0",
+        [source.id().to_string()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())?
+    .map(|record| decode(&record))
+    .transpose()
+}
+
+/// Whether a daemon stop recorded that this open agent's bound process ended.
+///
+/// The stop stores the ended session ID as `process_end` in the agent's JSON
+/// record, outside the `Agent` type, which also crosses IPC. It counts only
+/// while it names the agent's current session, so binding a successor or
+/// closing the agent ends it. Older builds ignore the key, and a record they
+/// rewrite drops it, which only restores the older stop behavior.
+fn process_ended(tx: &Connection, agent: AgentId) -> Result<bool, String> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1 AND closed = 0
+             AND json_extract(record, '$.process_end') = session_id)",
+        [agent.to_string()],
+        |row| row.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Why a confirmed-stopped process ends its agent's execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessEnd {
+    /// The user or caller closed the agent: its pane and record retire too.
+    Closed,
+    /// Daemon shutdown stopped it: the agent, pane and placement stay, so
+    /// the conversation can resume in place under a successor process.
+    Stopped,
 }
 
 fn read_agent(db: &Connection, id: AgentId) -> Result<Agent, String> {
@@ -2819,6 +3013,291 @@ mod tests {
             }),
         };
         ended
+    }
+
+    /// A daemon stop ends the exact provider's authority and turn but keeps
+    /// the agent, its pane and its channel, so the conversation resumes in
+    /// place; an explicit Close of the same state still retires all three.
+    #[test]
+    fn daemon_stop_keeps_the_agent_pane_and_channel_that_close_retires() {
+        use crate::workspace_model::views::Scope;
+        for end in [ProcessEnd::Stopped, ProcessEnd::Closed] {
+            let (mut registry, directory, request) = fixture();
+            let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+            let source = source();
+            registry
+                .bind_agent(accepted.agent.id, None, source.clone())
+                .unwrap();
+            registry.register_agent_authority(&source).unwrap();
+            let started = registry
+                .update_agent_run(
+                    accepted.run.id,
+                    accepted.run.revision,
+                    Update::Started {
+                        provider_key: "turn".into(),
+                    },
+                    2,
+                )
+                .unwrap();
+            assert_eq!(started.state, State::Running);
+            let HostedSession::Chat(chat) = &source else {
+                unreachable!()
+            };
+            let channel = accepted.agent.channel().unwrap();
+            let scope = Scope::Channel(channel);
+            let pane = crate::workspace_model::views::Pane {
+                id: crate::model::CardId::from_uuid(accepted.agent.id.as_uuid()),
+                title: "Mid-turn agent".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 0.5,
+                kind: crate::model::CardKind::Chat(chat.clone()),
+                scope: None,
+            };
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: scope.clone(),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                })
+                .unwrap();
+
+            assert!(registry.end_agent_process(&source, 5, end, None).unwrap());
+
+            let agent = registry.agent(accepted.agent.id).unwrap();
+            let view = super::super::views::read(&registry.db, &scope).unwrap();
+            let run = registry.agent_run(accepted.run.id).unwrap();
+            // Either way the old descriptor can never act again, and the
+            // interrupted prompt is finished rather than left for a resend.
+            assert!(registry.retained_agent_authority(chat.id).is_err());
+            assert_eq!(run.state, State::Cancelled);
+            if end == ProcessEnd::Closed {
+                assert!(agent.closed);
+                assert!(view.panes.is_empty());
+                assert!(view.retired.contains(&pane.id));
+                continue;
+            }
+            assert!(!agent.closed, "a daemon stop must not close the agent");
+            assert_eq!(agent.session.as_ref(), Some(&source));
+            assert_eq!(view.panes, vec![pane.clone()], "the pane stays in place");
+            assert!(view.retired.is_empty());
+            assert!(registry.model().unwrap().channel(channel).is_some());
+            assert!(
+                run.result.diagnostic.as_deref().is_some_and(
+                    |text| text.contains("process stopped before this prompt finished")
+                ),
+                "{run:?}"
+            );
+
+            // Startup repeats the stop for every same-boot retirement receipt
+            // and interrupts unproven runs; neither may close or re-announce.
+            drop(registry);
+            let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+            let sequence = registry.execution_sequence().unwrap();
+            assert!(!registry.stop_agent_process(&source, 6).unwrap());
+            registry.interrupt_unproven_agent_runs(7).unwrap();
+            assert_eq!(registry.execution_sequence().unwrap(), sequence);
+            assert!(!registry.agent(accepted.agent.id).unwrap().closed);
+            assert_eq!(
+                super::super::views::read(&registry.db, &scope)
+                    .unwrap()
+                    .panes,
+                vec![pane.clone()]
+            );
+            assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+            // The stop recorded that the process ended: closing needs no
+            // teardown proof from it.
+            assert!(registry.agent_process_ended(accepted.agent.id).unwrap());
+            // Lookups by session still find it, so its card can close it.
+            assert_eq!(
+                registry.agent_for_session(chat.id).unwrap().map(|a| a.id),
+                Some(accepted.agent.id)
+            );
+            assert_eq!(
+                registry.active_agent_directories().unwrap(),
+                vec![directory.path().to_owned()],
+                "its directory stays protected for the resume"
+            );
+            assert!(registry.cleanup_execution_is_quiescent().unwrap());
+            // Moving the stopped card keeps the stop record.
+            let moved = Scope::Worktree {
+                repository: directory.path().into(),
+                path: directory.path().into(),
+            };
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    scope: scope.clone(),
+                    expected_revision: registry.view_revision(&scope).unwrap(),
+                    operation: uuid::Uuid::new_v4(),
+                    change: crate::workspace_model::views::Change::Transfer {
+                        id: pane.id,
+                        destination: moved.clone(),
+                        before: None,
+                    },
+                })
+                .unwrap();
+            assert_eq!(
+                registry.agent(accepted.agent.id).unwrap().placement,
+                Placement::Worktree {
+                    repository: directory.path().into(),
+                    path: directory.path().into(),
+                }
+            );
+            assert!(registry.agent_process_ended(accepted.agent.id).unwrap());
+            let scope = moved;
+
+            // The resumed conversation's process takes over the same agent
+            // and pane, now that the stop proved its predecessor ended.
+            let mut successor = chat.clone();
+            successor.id = crate::model::TerminalId::new();
+            if let Some(proof) = &mut successor.proof {
+                proof.host_incarnation = crate::model::HostIncarnation::new("new");
+            }
+            let mut other = registry;
+            assert!(other.adopt_successor(chat, &successor).unwrap());
+            let agent = other.agent(accepted.agent.id).unwrap();
+            assert_eq!(agent.session, Some(HostedSession::Chat(successor.clone())));
+            assert_eq!(
+                other.agent_for_session(successor.id).unwrap().map(|a| a.id),
+                Some(accepted.agent.id)
+            );
+            assert!(other.agent_for_session(chat.id).unwrap().is_none());
+            assert!(!other.agent_process_ended(accepted.agent.id).unwrap());
+            let view = super::super::views::read(&other.db, &scope).unwrap();
+            assert_eq!(view.panes.len(), 1);
+            assert_eq!(view.panes[0].id, pane.id);
+            assert_eq!(
+                view.panes[0].kind,
+                crate::model::CardKind::Chat(successor.clone())
+            );
+            assert!(
+                !other.adopt_successor(chat, &successor).unwrap(),
+                "a second adoption finds no agent on the predecessor"
+            );
+            // The adopted agent takes new work.
+            let follow_up = Submit {
+                destination: Destination::Existing(accepted.agent.id),
+                idempotency_key: "after-restart".into(),
+                ..request.clone()
+            };
+            other.submit_agent(&Origin::User, &follow_up, 8).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_successor_cannot_adopt_a_predecessor_that_still_holds_authority() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let source = source();
+        registry
+            .bind_agent(accepted.agent.id, None, source.clone())
+            .unwrap();
+        registry.register_agent_authority(&source).unwrap();
+        let HostedSession::Chat(chat) = &source else {
+            unreachable!()
+        };
+        let mut successor = chat.clone();
+        successor.id = crate::model::TerminalId::new();
+        assert!(
+            registry
+                .adopt_successor(chat, &successor)
+                .unwrap_err()
+                .contains("may still be running")
+        );
+        let mut provider = successor.clone();
+        provider.launch.provider = Provider::Codex;
+        assert!(registry.adopt_successor(chat, &provider).is_err());
+        assert!(registry.adopt_successor(chat, chat).is_err());
+        // A run left unsettled (no stop recorded it) also refuses.
+        registry.stop_agent_process(&source, 2).unwrap();
+        let follow_up = Submit {
+            destination: Destination::Existing(accepted.agent.id),
+            idempotency_key: "unsettled".into(),
+            ..request
+        };
+        registry.submit_agent(&Origin::User, &follow_up, 3).unwrap();
+        assert!(
+            registry
+                .adopt_successor(chat, &successor)
+                .unwrap_err()
+                .contains("unsettled work")
+        );
+        assert_eq!(
+            registry.agent(accepted.agent.id).unwrap().session,
+            Some(source.clone())
+        );
+        // Closing the stopped process's card still retires the agent, though
+        // its row no longer names the process.
+        assert!(registry.retire_agent_process(&source, 4).unwrap());
+        assert!(registry.agent(accepted.agent.id).unwrap().closed);
+        assert!(!registry.agent_process_ended(accepted.agent.id).unwrap());
+    }
+
+    /// The stop marker lives only in the stored JSON. A build without it, and
+    /// the IPC `Agent`, must read such a record unchanged.
+    #[test]
+    fn a_stop_marker_is_invisible_to_the_agent_shape_older_builds_decode() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let stopped = source();
+        registry
+            .bind_agent(accepted.agent.id, None, stopped.clone())
+            .unwrap();
+        registry.stop_agent_process(&stopped, 2).unwrap();
+        let record: String = registry
+            .db
+            .query_row(
+                "SELECT record FROM agents WHERE id = ?1",
+                [accepted.agent.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(raw["process_end"], stopped.id().to_string());
+        // `Agent` is the shape every older build decodes; it gains no field.
+        let decoded: Agent = decode(&record).unwrap();
+        assert_eq!(decoded, registry.agent(accepted.agent.id).unwrap());
+        assert!(!encode(&decoded).unwrap().contains("process_end"));
+    }
+
+    #[test]
+    fn a_successor_bound_to_another_agent_is_refused_readably() {
+        let (mut registry, _directory, request) = fixture();
+        let first = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let stopped = source();
+        registry
+            .bind_agent(first.agent.id, None, stopped.clone())
+            .unwrap();
+        let HostedSession::Chat(chat) = &stopped else {
+            unreachable!()
+        };
+        registry.stop_agent_process(&stopped, 3).unwrap();
+        let second = registry
+            .submit_agent(
+                &Origin::User,
+                &Submit {
+                    idempotency_key: "second".into(),
+                    ..request
+                },
+                4,
+            )
+            .unwrap();
+        let other = source();
+        registry
+            .bind_agent(second.agent.id, None, other.clone())
+            .unwrap();
+        let HostedSession::Chat(taken) = &other else {
+            unreachable!()
+        };
+        let mut successor = taken.clone();
+        successor.launch = chat.launch.clone();
+        assert!(
+            registry
+                .adopt_successor(chat, &successor)
+                .unwrap_err()
+                .contains("another agent")
+        );
+        assert!(registry.agent_process_ended(first.agent.id).unwrap());
     }
 
     #[test]

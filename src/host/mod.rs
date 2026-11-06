@@ -713,8 +713,10 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
                     // Closing the provider leaves its retained helper alive
                     // until final outcomes are durably committed and ACKed.
                     // Preserve that ownership on failure, before retiring the
-                    // delegated session record below.
-                    chat::retained_actor::finish_close(host, &chat, &session)
+                    // delegated session record below. A paired CLI view closes
+                    // first, with the proof its resume requires.
+                    chat::retained_actor::close_paired_view(host, session.id)
+                        .and_then(|()| chat::retained_actor::finish_close(host, &chat, &session))
                 } else {
                     Ok(())
                 }
@@ -722,11 +724,12 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         };
         match closed {
             Ok(()) if !upgrading => {
-                // Ordinary shutdown proved this exact provider stopped. Retire
-                // its delegated record before a new daemon can resume the UI
-                // descriptor with another proof; absence alone cannot do this.
-                if let Err(error) = agent_execution::retired(host, &session) {
-                    tracing::warn!(%error, "delegated provider retirement was not saved");
+                // Ordinary shutdown proved this exact provider stopped. End its
+                // delegated authority and runs before a new daemon can resume
+                // the UI descriptor with another proof; absence alone cannot do
+                // this. The agent, pane and channel stay so it resumes in place.
+                if let Err(error) = agent_execution::stopped(host, &session) {
+                    tracing::warn!(%error, "delegated provider stop was not saved");
                     if result.is_ok() {
                         result = Err(error);
                     }

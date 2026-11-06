@@ -302,6 +302,11 @@ pub(crate) struct HostState {
     /// provider to become ready, before the prompt was submitted.
     pub(super) execution_gates:
         BTreeMap<crate::model::AgentId, Weak<Mutex<Option<super::agent_execution::Undelivered>>>>,
+    /// Resume successors that took over their agent when they started and
+    /// have been given no work since. Ending one gives the agent back stopped,
+    /// for the next resume to take over, rather than retiring it: until then
+    /// the successor is only a reopening its card may still give up.
+    pub(super) idle_adoptions: BTreeSet<TerminalId>,
     pub(super) execution_startups: BTreeMap<
         crate::model::AgentId,
         (
@@ -447,6 +452,7 @@ impl HostState {
             mailbox: None,
             mailbox_seal: None,
             execution_gates: BTreeMap::new(),
+            idle_adoptions: BTreeSet::new(),
             execution_startups: BTreeMap::new(),
             model_watchers: BTreeSet::new(),
             client_pids: BTreeMap::new(),

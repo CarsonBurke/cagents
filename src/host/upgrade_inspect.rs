@@ -186,8 +186,11 @@ fn inspect(request: Request) -> Result<(), String> {
             Err(_) => failures.push(format!("Saved window {} has an unreadable or unsupported pane store; its contents were preserved.", window + 1)),
         }
     }
+    let evidence = ExecutionEvidence::load(&current_boot);
     let no_live_panes = saved.iter().all(|(_, kind)| match kind {
-        CardKind::Chat(session) => session.is_unstarted(),
+        CardKind::Chat(session) => {
+            session.is_unstarted() || evidence.classify(session) == SavedExecution::Ended
+        }
         CardKind::Terminal(session) => !terminal_requires_migration(session, &current_boot),
         _ => true,
     });
@@ -216,6 +219,10 @@ fn inspect(request: Request) -> Result<(), String> {
                 && !resolutions.iter().any(|(issued, _)| issued == source)
             {
                 let missing = !initial_inventory.iter().any(|live| live.id == source.id);
+                // Nothing of its old owner remains to adopt or preserve.
+                if missing && evidence.classify(source) == SavedExecution::Ended {
+                    continue;
+                }
                 let result = if missing && request.reconcile_retained {
                     reader
                         .reconcile_retained(source)
@@ -303,24 +310,26 @@ fn inspect(request: Request) -> Result<(), String> {
                 if cold_history.iter().any(|issued| issued == &source) {
                     continue;
                 }
-                if qualify_with_mode(
-                    &source,
-                    &inventory,
-                    proof,
-                    request.require_resumable,
-                    |source| {
-                        resolutions
-                            .iter()
-                            .find(|(issued, _)| issued == source)
-                            .map(|(_, result)| result.clone())
-                            .unwrap_or_else(|| Err("No authenticated source resolution".into()))
-                    },
-                )
-                .is_err()
+                if let Some(problem) =
+                    saved_chat_problem(card, &source, &inventory, &evidence, || {
+                        qualify_with_mode(
+                            &source,
+                            &inventory,
+                            proof,
+                            request.require_resumable,
+                            |source| {
+                                resolutions
+                                    .iter()
+                                    .find(|(issued, _)| issued == source)
+                                    .map(|(_, result)| result.clone())
+                                    .unwrap_or_else(|| {
+                                        Err("No authenticated source resolution".into())
+                                    })
+                            },
+                        )
+                    })
                 {
-                    failures.push(format!(
-                        "Saved conversation pane {card} needs exact conversation recovery."
-                    ));
+                    failures.push(problem);
                 }
             }
             _ => {}
@@ -343,6 +352,232 @@ fn terminal_requires_migration(
             .continuity
             .live_proof()
             .is_some_and(|proof| proof.is_complete() && &proof.boot_id != current_boot),
+    }
+}
+
+/// What read-only evidence proves about the old owner of a saved chat pane
+/// the source service does not list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SavedExecution {
+    /// No process of any owner it ever had can remain. Replacing the source
+    /// service cannot lose or strand work it no longer has; the destination
+    /// decides separately, through its own resume proof, whether to reopen it.
+    Ended,
+    /// A registered helper, its provider, or a process in their group or
+    /// session still exists outside the source inventory.
+    Running,
+    /// The pane has execution this evidence does not cover, or the evidence
+    /// is absent, foreign or unreadable.
+    Unproved,
+}
+
+/// The source daemon's own ownership evidence, read without its lease and
+/// without changing it. Retirement receipts stay lease-gated in the
+/// destination's resume path: this proves only an absence of execution.
+struct ExecutionEvidence {
+    boot: crate::model::BootId,
+    native_holders: Result<std::path::PathBuf, String>,
+    census: Result<Census, String>,
+    /// The census owners whose retirement is recorded, with what it confirmed.
+    retired: Result<Vec<crate::daemon::holder_registry::Record>, String>,
+}
+
+/// Every retained helper the durable census registered, by pane.
+type Census = Vec<(
+    crate::model::TerminalId,
+    crate::daemon::holder_registry::Record,
+)>;
+
+/// The census is a bounded roster, not a log; a larger one is not inspected.
+const MAX_CENSUS_ROWS: usize = 16 * 1024;
+
+impl ExecutionEvidence {
+    fn load(boot: &crate::model::BootId) -> Self {
+        let store = crate::instance::project_dirs()
+            .ok_or_else(|| "The data directory is unavailable".to_owned())
+            .map(|dirs| dirs.data_dir().join("workspace-model.sqlite3"));
+        Self {
+            boot: boot.clone(),
+            native_holders: crate::daemon::holder_registry::directory(
+                crate::daemon::holder_registry::Kind::Native,
+            ),
+            census: store.clone().and_then(|path| read_census(&path)),
+            retired: store.and_then(|path| read_retired_owners(&path)),
+        }
+    }
+
+    /// A kernel boot change ends every process of the saved boot. Within this
+    /// boot only a retained Claude actor has an owner roster: each helper
+    /// registers in the durable census once it answers, and its discovery
+    /// record is published shortly before that. Every owner either names must
+    /// be gone with its provider and nothing left in their process group or
+    /// session: the process proof the destination requires before it resumes
+    /// an abandoned actor, which a verified retirement also satisfies. A
+    /// restart still before its record is invisible here; `inspect` looks
+    /// twice, before resolution and against the final roster, to narrow it.
+    fn classify(&self, source: &Session) -> SavedExecution {
+        use crate::daemon::holder_registry::{self, Kind};
+        let Some(proof) = source.proof.as_ref().filter(|proof| proof.is_complete()) else {
+            return SavedExecution::Unproved;
+        };
+        if proof.boot_id != self.boot {
+            return SavedExecution::Ended;
+        }
+        // A paired console runs outside the actor; this roster cannot see it.
+        if !matches!(
+            source.native_continuity,
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+        ) || !source.has_valid_native_continuity()
+            || source.terminal.is_some()
+        {
+            return SavedExecution::Unproved;
+        }
+        let (Ok(census), Ok(native_holders)) = (&self.census, &self.native_holders) else {
+            return SavedExecution::Unproved;
+        };
+        let mut owners = census
+            .iter()
+            .filter(|(pane, _)| *pane == source.id)
+            .map(|(_, owner)| owner)
+            .collect::<Vec<_>>();
+        // No registered owner is no evidence that one ended.
+        if owners.is_empty() {
+            return SavedExecution::Unproved;
+        }
+        let discovered = match holder_registry::recovery_candidate(
+            &holder_registry::socket(native_holders, source.id),
+            Kind::Native,
+        ) {
+            Ok(discovered) => discovered,
+            Err(_) => return SavedExecution::Unproved,
+        };
+        owners.extend(&discovered);
+        // A pane that never learned its conversation resumes only the one a
+        // recorded retirement says its actor confirmed; without that record
+        // its ended actor leaves it nothing to reopen.
+        let unnamed = source.has_unnamed_retained_claude_actor();
+        let mut execution = SavedExecution::Ended;
+        for owner in owners.into_iter().filter(|owner| owner.boot == self.boot) {
+            match crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root) {
+                Ok(true) => {}
+                Ok(false) => execution = SavedExecution::Running,
+                Err(_) => return SavedExecution::Unproved,
+            }
+            if unnamed
+                && !self
+                    .retired
+                    .as_ref()
+                    .is_ok_and(|retired| retired.contains(owner))
+            {
+                return SavedExecution::Unproved;
+            }
+        }
+        execution
+    }
+}
+
+/// The census owners whose retirement the store records, read like the census.
+fn read_retired_owners(path: &Path) -> Result<Vec<crate::daemon::holder_registry::Record>, String> {
+    use rusqlite::{Connection, OpenFlags, config::DbConfig};
+    let db = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| error.to_string())?;
+    db.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+        .map_err(|error| error.to_string())?;
+    db.busy_timeout(Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
+    let mut statement = db
+        .prepare(
+            "SELECT o.ownership FROM native_actor_ownerships o \
+             JOIN native_actor_retirements r ON r.actor = o.actor ORDER BY o.actor LIMIT ?1",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([MAX_CENSUS_ROWS as i64 + 1], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let mut retired = Vec::new();
+    for (index, row) in rows.enumerate() {
+        if index >= MAX_CENSUS_ROWS {
+            return Err("The retained actor census exceeds its inspection bound".into());
+        }
+        let ownership: crate::host::model::NativeActorOwnership =
+            serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        retired.push(ownership.owner().clone());
+    }
+    Ok(retired)
+}
+
+/// One read transaction over the census, opened read-only: no schema
+/// admission, migration, checkpoint or lock beyond SQLite's shared read.
+fn read_census(path: &Path) -> Result<Census, String> {
+    use rusqlite::{Connection, OpenFlags, config::DbConfig};
+    let db = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| error.to_string())?;
+    db.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+        .map_err(|error| error.to_string())?;
+    db.busy_timeout(Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
+    let mut statement = db
+        .prepare("SELECT ownership FROM native_actor_ownerships ORDER BY actor LIMIT ?1")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([MAX_CENSUS_ROWS as i64 + 1], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let mut census = Vec::new();
+    for (index, row) in rows.enumerate() {
+        if index >= MAX_CENSUS_ROWS {
+            return Err("The retained actor census exceeds its inspection bound".into());
+        }
+        let ownership: crate::host::model::NativeActorOwnership =
+            serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        let owner = ownership.owner().clone();
+        if ownership.source().id != owner.terminal {
+            census.push((ownership.source().id, owner.clone()));
+        }
+        census.push((owner.terminal, owner));
+    }
+    Ok(census)
+}
+
+/// Classify again against the final roster: a pane adopted since the first
+/// look is held and qualifies like any live chat, and an owner that started
+/// since then is no longer Ended. Only a pane the source does not list and
+/// whose execution has ended is exempt from exact qualification.
+fn saved_chat_problem(
+    card: crate::model::CardId,
+    source: &Session,
+    inventory: &[Session],
+    evidence: &ExecutionEvidence,
+    qualify: impl FnOnce() -> Result<(), String>,
+) -> Option<String> {
+    let execution =
+        (!inventory.iter().any(|live| live.id == source.id)).then(|| evidence.classify(source));
+    if execution == Some(SavedExecution::Ended) {
+        return None;
+    }
+    qualify()
+        .err()
+        .map(|_| unqualified_chat_pane(card, execution))
+}
+
+fn unqualified_chat_pane(card: crate::model::CardId, execution: Option<SavedExecution>) -> String {
+    if execution == Some(SavedExecution::Running) {
+        format!(
+            "Saved conversation pane {card} still has provider processes the source service does not list; reopen or close that pane in the source app, then update."
+        )
+    } else {
+        format!("Saved conversation pane {card} needs exact conversation recovery.")
     }
 }
 
@@ -558,6 +793,280 @@ mod tests {
             owned_codex_listener: None,
             native_continuity: NativeContinuity::ReconnectOnly,
         }
+    }
+
+    fn retained_card(boot: BootId) -> Session {
+        let mut card = session();
+        card.native_continuity = NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        card.proof.as_mut().unwrap().boot_id = boot;
+        card
+    }
+
+    fn current_boot() -> BootId {
+        crate::daemon::read_boot_id().unwrap()
+    }
+
+    fn running_process() -> crate::daemon::holder_registry::Process {
+        crate::daemon::holder_registry::Process::read(std::process::id() as i32).unwrap()
+    }
+
+    /// The exact identity of a reaped child that led no process group or
+    /// session: an incarnation that no longer exists and left nothing behind.
+    fn ended_process() -> crate::daemon::holder_registry::Process {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let identity = crate::daemon::holder_registry::Process::read(child.id() as i32).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        identity
+    }
+
+    /// The helper identity a retained actor registers and publishes.
+    fn owner(
+        card: &Session,
+        holder: crate::daemon::holder_registry::Process,
+        root: crate::daemon::holder_registry::Process,
+    ) -> crate::daemon::holder_registry::Record {
+        use crate::daemon::holder_registry::{BuildIdentity, Kind, Record};
+        Record {
+            version: 4,
+            build: Some(BuildIdentity::current(Kind::Native)),
+            kind: Kind::Native,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot: current_boot(),
+            terminal: card.id,
+            holder,
+            root,
+        }
+    }
+
+    fn evidence(
+        holders: &Path,
+        census: Vec<(TerminalId, crate::daemon::holder_registry::Record)>,
+    ) -> ExecutionEvidence {
+        ExecutionEvidence {
+            boot: current_boot(),
+            native_holders: Ok(holders.to_owned()),
+            census: Ok(census),
+            retired: Ok(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn verified_retired_pane_read_from_the_real_census_has_nothing_to_preserve() {
+        use crate::account::scope::LaunchAccountScope;
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut issued = retained_card(current_boot());
+        issued.launch.session_id = None;
+        issued.launch.recipe.working_directory = root.path().into();
+        let mut card = issued.clone();
+        card.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let retired = owner(&card, ended_process(), ended_process());
+        let metadata = std::fs::metadata(root.path()).unwrap();
+        let scope = LaunchAccountScope {
+            provider: Provider::Claude,
+            canonical_home: root.path().canonicalize().unwrap(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            registered_id: None,
+            purge_ids: vec![],
+        };
+        let path = root.path().join("registry.sqlite3");
+        let actor = uuid::Uuid::new_v4();
+        let mut registry = crate::host::model::Registry::at(&path).unwrap();
+        registry
+            .register_native_actor_ownership(actor, &retired, &issued, Ok(&scope))
+            .unwrap();
+        registry
+            .commit_native_actor_retirement(
+                actor,
+                &retired,
+                &card,
+                Ok(&scope),
+                card.launch.session_id.as_deref(),
+            )
+            .unwrap();
+        // The census is read while its writer still holds the store open.
+        let census = read_census(&path).unwrap();
+        assert_eq!(census, vec![(card.id, retired.clone())]);
+        // Verified retirement removed the discovery record.
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut evidence = evidence(holders.path(), census);
+        assert_eq!(evidence.classify(&card), SavedExecution::Ended);
+        assert_eq!(
+            evidence.classify(&issued),
+            SavedExecution::Unproved,
+            "a pre-ID card reopens only what a recorded retirement confirmed"
+        );
+        evidence.retired = read_retired_owners(&path);
+        assert_eq!(evidence.retired, Ok(vec![retired.clone()]));
+        assert_eq!(
+            evidence.classify(&issued),
+            SavedExecution::Ended,
+            "a pre-ID card whose actor retired holds no live work either"
+        );
+        drop(registry);
+        assert!(read_census(&root.path().join("absent.sqlite3")).is_err());
+        assert!(
+            !root.path().join("absent.sqlite3").exists(),
+            "inspection never creates a store"
+        );
+    }
+
+    #[test]
+    fn previous_boot_pane_has_nothing_to_preserve_without_any_census() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut evidence = evidence(holders.path(), Vec::new());
+        evidence.census = Err("unreadable".into());
+        let mut card = retained_card(BootId::new("previous-boot"));
+        assert_eq!(evidence.classify(&card), SavedExecution::Ended);
+        card.native_continuity = NativeContinuity::ReconnectOnly;
+        card.launch.provider = Provider::Codex;
+        assert_eq!(
+            evidence.classify(&card),
+            SavedExecution::Ended,
+            "a kernel boot change ends every provider"
+        );
+    }
+
+    #[test]
+    fn abandoned_actor_is_ended_only_when_no_owner_process_survives() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let card = retained_card(current_boot());
+        let abandoned = owner(&card, ended_process(), ended_process());
+        // A stale discovery record of the same ended helper.
+        abandoned.create(holders.path()).unwrap();
+        let mut older_boot = abandoned.clone();
+        older_boot.boot = BootId::new("previous-boot");
+        older_boot.holder = running_process();
+        let census = vec![(card.id, abandoned.clone()), (card.id, older_boot)];
+        assert_eq!(
+            evidence(holders.path(), census).classify(&card),
+            SavedExecution::Ended
+        );
+        for (holder, root) in [
+            (running_process(), ended_process()),
+            (ended_process(), running_process()),
+        ] {
+            let card = retained_card(current_boot());
+            let census = vec![(card.id, owner(&card, holder, root))];
+            assert_eq!(
+                evidence(holders.path(), census).classify(&card),
+                SavedExecution::Running,
+                "a surviving helper or provider is live work"
+            );
+        }
+    }
+
+    #[test]
+    fn a_helper_not_yet_in_the_census_is_live_work() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let card = retained_card(current_boot());
+        // An earlier actor ended; a restart published its record but has not
+        // answered the census registration yet.
+        owner(&card, running_process(), running_process())
+            .create(holders.path())
+            .unwrap();
+        let census = vec![(card.id, owner(&card, ended_process(), ended_process()))];
+        assert_eq!(
+            evidence(holders.path(), census).classify(&card),
+            SavedExecution::Running
+        );
+    }
+
+    #[test]
+    fn same_boot_execution_without_complete_evidence_is_unproved() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let card = retained_card(current_boot());
+        let ended = vec![(card.id, owner(&card, ended_process(), ended_process()))];
+        assert_eq!(
+            evidence(holders.path(), Vec::new()).classify(&card),
+            SavedExecution::Unproved,
+            "no registered owner is no evidence that one ended"
+        );
+        let mut paired = card.clone();
+        paired.terminal = Some(
+            crate::terminal_ipc::TerminalDescriptor::relaunchable(
+                paired.id,
+                paired.launch.recipe.clone(),
+                None,
+            )
+            .session,
+        );
+        let mut unowned = card.clone();
+        unowned.proof = None;
+        let mut reconnect_only = card.clone();
+        reconnect_only.native_continuity = NativeContinuity::ReconnectOnly;
+        let mut codex = reconnect_only.clone();
+        codex.launch.provider = Provider::Codex;
+        for card in [paired, unowned, reconnect_only, codex] {
+            assert_eq!(
+                evidence(holders.path(), ended.clone()).classify(&card),
+                SavedExecution::Unproved
+            );
+        }
+        let mut unreadable = evidence(holders.path(), ended.clone());
+        unreadable.census = Err("unreadable".into());
+        assert_eq!(unreadable.classify(&card), SavedExecution::Unproved);
+        // Discovery evidence that cannot be authenticated is never absence.
+        std::fs::write(
+            crate::daemon::holder_registry::socket(holders.path(), card.id).with_extension("json"),
+            b"{\"not\":\"a record\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            evidence(holders.path(), ended).classify(&card),
+            SavedExecution::Unproved
+        );
+    }
+
+    #[test]
+    fn ended_panes_neither_hide_nor_join_a_live_refusal() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let retired = retained_card(current_boot());
+        let previous = retained_card(BootId::new("previous-boot"));
+        let live = retained_card(current_boot());
+        let held = retained_card(current_boot());
+        let census = vec![
+            (
+                retired.id,
+                owner(&retired, ended_process(), ended_process()),
+            ),
+            (live.id, owner(&live, running_process(), running_process())),
+            (held.id, owner(&held, ended_process(), ended_process())),
+        ];
+        let evidence = evidence(holders.path(), census);
+        let inventory = [held.clone()];
+        let (live_card, held_card) = (crate::model::CardId::new(), crate::model::CardId::new());
+        let mut failures = InspectionFailures::default();
+        for (card, source) in [
+            (crate::model::CardId::new(), &retired),
+            (live_card, &live),
+            (crate::model::CardId::new(), &previous),
+            (held_card, &held),
+        ] {
+            if let Some(problem) = saved_chat_problem(card, source, &inventory, &evidence, || {
+                Err("unqualified".into())
+            }) {
+                failures.push(problem);
+            }
+        }
+        let message = failures.finish().unwrap_err();
+        assert!(message.contains("2 saved-state problem(s)"), "{message}");
+        assert!(message.contains(&format!(
+            "Saved conversation pane {live_card} still has provider processes the source service does not list; reopen or close that pane in the source app, then update."
+        )));
+        // A listed chat is the source's live work and always qualifies exactly.
+        assert!(message.contains(&format!(
+            "Saved conversation pane {held_card} needs exact conversation recovery."
+        )));
+        assert!(
+            saved_chat_problem(live_card, &live, &inventory, &evidence, || Ok(())).is_none(),
+            "a live actor the source adopted and qualified is not a problem"
+        );
     }
 
     #[test]
