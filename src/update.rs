@@ -484,9 +484,7 @@ fn installed_update_worker(
     if served == window.version_root && !replaces_daemon {
         return Err(invalid("the installed application is already running"));
     }
-    let legacy_source = source_proof.is_some()
-        && matches!(source_protocol, 77 | 119)
-        && crate::terminal_ipc::PROTOCOL_VERSION > 77;
+    let legacy_source = source_proof.is_some() && is_bootstrapped_source(source_protocol);
     // The staged CLI can speak an older build of its exact current protocol.
     // Its source was authenticated above; a version-root difference is not a
     // reason to delegate the update back to that older build's updater.
@@ -507,9 +505,19 @@ fn candidate_can_upgrade_source(
     proof: Option<&crate::model::HostSessionProof>,
 ) -> bool {
     proof.is_some_and(crate::model::HostSessionProof::is_complete)
-        && ((matches!(protocol, 77 | 119) && crate::terminal_ipc::PROTOCOL_VERSION > 77)
+        && (is_bootstrapped_source(protocol)
             || (protocol == crate::terminal_ipc::PROTOCOL_VERSION
                 && daemon.is_some_and(|owner| owner.version_root != served)))
+}
+
+/// Older protocols whose update this release's worker performs itself, so
+/// its own inspector and preflight decide what the update must preserve. The
+/// install candidate line (128) is one: its own worker would apply its older
+/// preflight to the panes this release knows how to qualify.
+fn is_bootstrapped_source(protocol: u16) -> bool {
+    (matches!(protocol, 77 | 119) && crate::terminal_ipc::PROTOCOL_VERSION > 77)
+        || (protocol == crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
+            && crate::terminal_ipc::PROTOCOL_VERSION > crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL)
 }
 
 fn installation_worker_version(
@@ -2661,8 +2669,8 @@ sys.exit(7)
         })
         .unwrap();
         let mut other_reply =
-            postcard::to_stdvec(&(crate::terminal_ipc::PROTOCOL_VERSION - 1)).unwrap();
-        // Deliberately not a current or protocol77 envelope. Entry routing
+            postcard::to_stdvec(&(crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL - 1)).unwrap();
+        // Deliberately not a current, candidate-line or protocol77 envelope. Entry routing
         // must never decode this unknown source's response DTO.
         other_reply.extend_from_slice(b"opaque-unqualified-source-dto");
         let script = root.join("source.py");
@@ -2991,6 +2999,51 @@ finally:
             crate::terminal_ipc::PROTOCOL_VERSION,
             None
         ));
+        // The install candidate line's daemon is updated by this release's
+        // worker, so this release's inspector and preflight decide what the
+        // update preserves. Its older worker would apply its own preflight.
+        let candidate_line = crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL;
+        assert!(is_bootstrapped_source(candidate_line));
+        assert!(!is_bootstrapped_source(candidate_line - 1));
+        assert!(!is_bootstrapped_source(
+            crate::terminal_ipc::PROTOCOL_VERSION
+        ));
+        for daemon in [Some(&old), None] {
+            assert!(candidate_can_upgrade_source(
+                &new.version_root,
+                daemon,
+                candidate_line,
+                Some(&proof)
+            ));
+            assert_eq!(
+                installed_update_worker(
+                    &new,
+                    &new.version_root,
+                    daemon,
+                    candidate_line,
+                    Some(&proof)
+                )
+                .unwrap(),
+                "new"
+            );
+        }
+        assert!(!candidate_can_upgrade_source(
+            &new.version_root,
+            Some(&old),
+            candidate_line,
+            None
+        ));
+        assert_eq!(
+            installed_update_worker(
+                &new,
+                &new.version_root,
+                Some(&old),
+                candidate_line - 1,
+                Some(&proof)
+            )
+            .unwrap(),
+            "old"
+        );
         // The real entry decision must not mistake an already-served window
         // for a completed daemon migration. No-daemon/current observations keep
         // the old already-running refusal instead of granting a legacy route.
