@@ -405,16 +405,11 @@ impl Runtime {
         // the header's width rather than running out under them, so an open
         // step ends at one right edge.
         hover::beside_first(
-            widget::column::with_children(vec![
-                self.step_button(item, cached, open),
-                widget::container(detail)
-                    .padding(iced::Padding::from([0.0, GAP_S]).bottom(GAP_S))
-                    .width(Length::Fill)
-                    .into(),
-            ])
-            .spacing(GAP_XS)
-            .width(Length::Fill),
+            self.step_button(item, cached, open),
             self.message_copy(item),
+            widget::container(detail)
+                .padding(iced::Padding::from([0.0, GAP_S]).bottom(GAP_S))
+                .width(Length::Fill),
             GAP_XS,
         )
     }
