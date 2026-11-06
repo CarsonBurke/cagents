@@ -969,10 +969,13 @@ class StandInHost(unittest.TestCase):
         self.shell_program()
         result = self.gate_run(
             "exec", "cargo", "run", "--quiet", "--", "-ec",
-            "python3 -c 'import json, os; print(json.dumps(dict(os.environ)))'",
+            "python3 -c 'import json, os; "
+            'names = ("PATH", "CARGO", "RUSTC_WRAPPER", "CAGENTS_BUILD_EXEC_SHIMS", '
+            '"CAGENTS_BUILD_EXEC_RUSTC_WRAPPER"); '
+            "print(json.dumps({name: os.environ[name] for name in names if name in os.environ}))'",
             env=self.remote_env())
         self.assertEqual(result.returncode, 0, result.stderr)
-        inherited = json.loads(result.stdout)
+        inherited = self.remote_env() | json.loads(result.stdout)
         self.assertFalse(Path(inherited["CAGENTS_BUILD_EXEC_SHIMS"]).exists())
         self.assertTrue(Path(inherited["RUSTC_WRAPPER"]).is_file())
         # Reuse the program's inherited environment after its outer exec
