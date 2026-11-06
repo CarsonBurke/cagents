@@ -50,8 +50,8 @@ const RETRANSMIT_DELAY: Duration = Duration::from_millis(100);
 /// so a caller still waiting hears the outcome.
 const SETTLE_MARGIN: Duration = Duration::from_secs(1);
 /// How many times the helper is asked to settle an unconfirmed input before
-/// the proxy stops asking. Retries back off to `TIMEOUT`, so this spans up to
-/// about a minute: long enough for a busy journal to clear, and bounded for a
+/// the proxy stops asking. Until the input is overdue, retries back off to
+/// `TIMEOUT`, so this spans up to about a minute: long enough for a busy journal to clear, and bounded for a
 /// helper that keeps refusing, such as one that already retired the input.
 const SETTLE_ATTEMPTS: u32 = 12;
 /// How long new input waits on a helper that does not answer requests to
@@ -59,10 +59,11 @@ const SETTLE_ATTEMPTS: u32 = 12;
 /// `SETTLE_ATTEMPTS`, as the helper may return and settle it, but a helper
 /// that is alive and never answers in time, such as one wedged on its
 /// journal, would otherwise fence input for good. After this, new input is
-/// refused at once while the helper is still asked, every `OVERDUE_RETRY`.
+/// refused at once while the helper is still asked, backing off to
+/// `OVERDUE_RETRY` between requests.
 const SETTLE_LIMIT: Duration = Duration::from_secs(120);
-/// How often a helper is asked to settle an input once new input no longer
-/// waits for it. Each request can occupy the helper, and this pump, for up to
+/// The longest wait between requests to settle an input once new input no
+/// longer waits for it. Each request can occupy the helper, and this pump, for up to
 /// `TIMEOUT`, so a slow helper is not kept from serving state meanwhile.
 const OVERDUE_RETRY: Duration = Duration::from_secs(60);
 // These reach the person through the chat pane, attached to a message, a
@@ -6275,6 +6276,17 @@ exec /bin/sleep 60
             (true, 0, false, true),
             "a timeout is uncounted"
         );
+        let delay = |actor: &RemoteActor| {
+            let uncertain = actor.0.uncertain_input.lock().unwrap();
+            uncertain
+                .as_ref()
+                .unwrap()
+                .retransmit
+                .as_ref()
+                .unwrap()
+                .delay
+        };
+        assert_eq!(delay(&actor), TIMEOUT, "asked as often until overdue");
         // Past the limit, new input is refused at once.
         *actor
             .0
@@ -6293,16 +6305,6 @@ exec /bin/sleep 60
             helper.join().unwrap();
         });
         assert_eq!(state(&actor), (true, 0, true, true), "refused, still asked");
-        let delay = |actor: &RemoteActor| {
-            let uncertain = actor.0.uncertain_input.lock().unwrap();
-            uncertain
-                .as_ref()
-                .unwrap()
-                .retransmit
-                .as_ref()
-                .unwrap()
-                .delay
-        };
         assert!(delay(&actor) > TIMEOUT, "asked less often once overdue");
         let started = Instant::now();
         assert_eq!(
