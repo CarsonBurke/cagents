@@ -2179,8 +2179,8 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
 }
 
 #[test]
-fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery() {
-    if isolated("graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery")
+fn graceful_daemon_restart_keeps_delegated_agents_that_close_without_their_process() {
+    if isolated("graceful_daemon_restart_keeps_delegated_agents_that_close_without_their_process")
         .is_some()
     {
         return;
@@ -2205,6 +2205,17 @@ fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery
 
     super::super::finish_chat_shutdown(&host).unwrap();
     assert!(!host.lock().unwrap().chats[&source.id()].handle.owns_work());
+    // The stop ends the process, not the agent: it stays listed and its card
+    // can resume, but the stopped process can no longer act for it.
+    {
+        let registry = registry(&host).unwrap();
+        let registry = registry.lock().unwrap();
+        let stopped = registry.agent(agent.id).unwrap();
+        assert!(!stopped.closed);
+        assert_eq!(stopped.session.as_ref(), Some(&source));
+        assert!(registry.agent_process_ended(agent.id).unwrap());
+    }
+    assert!(origin(&host, &token).is_err());
     drop(host);
     let mut state = HostState::new(HostSessionProof {
         host_session_id: HostSessionId::new("restarted-execution-fixture"),
@@ -2213,8 +2224,41 @@ fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery
     });
     state.install_model(Registry::at(&path).unwrap());
     let restarted = Arc::new(crate::host::state::HostLock::new(state));
-    // The close command remains idempotent even though the old actor is gone
-    // and any UI resume would carry the new daemon's proof.
+    assert_eq!(
+        registry(&restarted)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agents(None)
+            .unwrap()
+            .len(),
+        1
+    );
+    // Work for the stopped agent is never sent to a process that is gone; it
+    // fails with a way forward instead.
+    let refused = submit(
+        &restarted,
+        &Authority::default(),
+        Submit {
+            name: None,
+            destination: Destination::Existing(agent.id),
+            prompt: "Never reaches the stopped provider".into(),
+            idempotency_key: "after-stop".into(),
+        },
+    )
+    .unwrap();
+    let refused = settled(&restarted, refused.run.id);
+    assert_eq!(refused.state, State::Failed, "{refused:?}");
+    assert!(
+        refused
+            .result
+            .diagnostic
+            .as_deref()
+            .is_some_and(|text| text.contains("reopen its conversation")),
+        "{refused:?}"
+    );
+    // Closing needs no teardown proof from the gone actor: the stop recorded
+    // that its process ended.
     assert!(
         close(&restarted, &Authority::default(), agent.id)
             .unwrap()
@@ -2230,9 +2274,12 @@ fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery
             .is_empty()
     );
     assert_eq!(
-        status(&restarted, &Authority::default(), agent.id)
+        registry(&restarted)
             .unwrap()
-            .1
+            .lock()
+            .unwrap()
+            .agent_run(accepted.run.id)
+            .unwrap()
             .state,
         State::Succeeded
     );
@@ -2249,8 +2296,8 @@ fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery
 }
 
 #[test]
-fn failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_saved() {
-    if isolated("failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_saved")
+fn failed_shutdown_stop_keeps_process_authority_until_the_stop_can_be_saved() {
+    if isolated("failed_shutdown_stop_keeps_process_authority_until_the_stop_can_be_saved")
         .is_some()
     {
         return;
@@ -2259,7 +2306,7 @@ fn failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_sav
     let accepted = submit(&host, &Authority::default(), request).unwrap();
     assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
     let fault = rusqlite::Connection::open(path).unwrap();
-    fault.execute_batch("CREATE TRIGGER refuse_shutdown_retirement BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture retirement unavailable'); END;").unwrap();
+    fault.execute_batch("CREATE TRIGGER refuse_shutdown_retirement BEFORE UPDATE OF record ON agents BEGIN SELECT RAISE(FAIL, 'fixture retirement unavailable'); END;").unwrap();
     assert!(
         super::super::finish_chat_shutdown(&host)
             .unwrap_err()
@@ -2282,10 +2329,26 @@ fn failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_sav
             .unwrap()
             .is_some()
     );
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_process_ended(accepted.agent.id)
+            .unwrap()
+    );
     fault
         .execute_batch("DROP TRIGGER refuse_shutdown_retirement")
         .unwrap();
     super::super::finish_chat_shutdown(&host).unwrap();
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_process_ended(accepted.agent.id)
+            .unwrap()
+    );
     assert!(
         close(&host, &Authority::default(), accepted.agent.id)
             .unwrap()
@@ -2434,7 +2497,7 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
     );
     super::super::finish_chat_shutdown(&host).unwrap();
     assert!(
-        registry(&host)
+        !registry(&host)
             .unwrap()
             .lock()
             .unwrap()

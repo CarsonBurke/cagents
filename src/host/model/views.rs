@@ -312,8 +312,12 @@ fn transfer_agent(
             return Ok(());
         }
         agent.placement = destination.clone();
+        // Keep a daemon stop's `process_end` marker, which lives only in the
+        // stored record: moving a stopped card must not make it unclosable.
         db.execute(
-            "UPDATE agents SET record=?2 WHERE id=?1",
+            "UPDATE agents SET record=CASE WHEN json_extract(record,'$.process_end') IS NULL THEN ?2
+                 ELSE json_set(?2,'$.process_end',json_extract(record,'$.process_end')) END
+             WHERE id=?1",
             params![
                 agent.id.to_string(),
                 serde_json::to_string(&agent).map_err(|error| error.to_string())?
@@ -828,6 +832,55 @@ pub(super) fn adopt_authenticated_agent_pane(
     // learning a previously unobserved provider thread. Preserve all placement,
     // presentation, retirement and naming state outside the descriptor itself.
     terminal_retention::sync_view_pins(db, &view.panes)?;
+    db.execute(
+        "UPDATE shared_views SET revision=?2, panes=?3 WHERE scope=?1",
+        params![
+            key(&scope)?,
+            view.revision,
+            serde_json::to_string(&view.panes).map_err(|error| error.to_string())?
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+/// Point a stopped agent's pane at the process that resumed it. Position,
+/// placement, presentation and naming are unchanged. A pane that is missing,
+/// retired or already shows another process is left alone; the agent itself
+/// still rebinds, so it is never stranded on an exited descriptor.
+pub(super) fn rebind_agent_pane(
+    db: &Connection,
+    agent: crate::model::AgentId,
+    predecessor: &crate::agent_execution::HostedSession,
+    successor: &crate::agent_execution::HostedSession,
+) -> Result<bool, String> {
+    use crate::{agent_execution::HostedSession, model::CardKind};
+    let HostedSession::Chat(next) = successor else {
+        return Ok(false);
+    };
+    let id = crate::model::CardId::from_uuid(agent.as_uuid());
+    let Some(scope) = owner(db, id)? else {
+        return Ok(false);
+    };
+    let mut view = read(db, &scope)?;
+    let before = view.clone();
+    if view.retired.contains(&id) {
+        return Ok(false);
+    }
+    let Some(pane) = view.panes.iter_mut().find(|pane| pane.id == id) else {
+        return Ok(false);
+    };
+    match &pane.kind {
+        CardKind::Chat(current)
+            if HostedSession::Chat(current.clone()).same_process(predecessor) => {}
+        _ => return Ok(false),
+    }
+    pane.kind = CardKind::Chat(next.clone());
+    view.revision = view
+        .revision
+        .checked_add(1)
+        .ok_or("view revision exhausted")?;
+    channel_work::placement::observe_view_transition(db, &before, &view)?;
     db.execute(
         "UPDATE shared_views SET revision=?2, panes=?3 WHERE scope=?1",
         params![

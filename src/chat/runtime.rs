@@ -29,6 +29,8 @@ mod handle;
 pub use handle::Handle;
 #[cfg(test)]
 pub(crate) use handle::RetainedInputOutcome;
+/// Process evidence only, without the reader lease: no retirement authority.
+pub(crate) use retained_actor::execution_exit::abandoned as retained_actor_abandoned;
 pub(crate) use retained_actor::transport::{
     ActorIdentity, RetirementInspection, VerifiedRetirement,
 };
@@ -1226,6 +1228,10 @@ impl LocalHandle {
             .unwrap_or_else(|p| p.into_inner())
             .session_id
             .clone()
+    }
+    /// Whether the provider answered its initialize handshake.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.0.state.lock().unwrap_or_else(|p| p.into_inner()).ready
     }
     /// Identity received from the provider, not the speculative launch selector.
     pub(crate) fn confirmed_session_id(&self) -> Option<String> {

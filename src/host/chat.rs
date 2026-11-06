@@ -1809,6 +1809,7 @@ fn start_with_execution(
                 let confirmation = confirm_saved_conversation(
                     &installed_handle,
                     expected,
+                    true,
                     Instant::now() + Duration::from_secs(15),
                     || {
                         crate::daemon::termination_requested()
@@ -2446,6 +2447,7 @@ fn recover_account(
     let confirmation = confirm_saved_conversation(
         &handle,
         source.launch.session_id.as_deref().unwrap(),
+        false,
         Instant::now() + Duration::from_secs(15),
         || crate::daemon::termination_requested(),
     );
@@ -2479,9 +2481,12 @@ fn recover_account(
     response
 }
 
+/// With `require_ready`, confirmation also waits for the provider to answer
+/// initialize, for a caller that goes on to require a ready provider.
 fn confirm_saved_conversation(
     handle: &Handle,
     expected: &str,
+    require_ready: bool,
     deadline: Instant,
     cancelled: impl Fn() -> bool,
 ) -> Result<(), String> {
@@ -2498,11 +2503,12 @@ fn confirm_saved_conversation(
             return Err("The provider exited before confirming the saved conversation; it remains unchanged".into());
         }
         if let Some(actual) = handle.confirmed_session_id() {
-            return if actual == expected {
-                Ok(())
-            } else {
-                Err("The provider opened a different conversation; the saved conversation is unchanged".into())
-            };
+            if actual != expected {
+                return Err("The provider opened a different conversation; the saved conversation is unchanged".into());
+            }
+            if !require_ready || handle.is_ready() {
+                return Ok(());
+            }
         }
         if Instant::now() >= deadline {
             return Err("The provider did not confirm the exact saved conversation in time; it remains unchanged".into());
@@ -2556,7 +2562,10 @@ fn process_inner(
                 .unwrap_or_else(|p| p.into_inner())
                 .proof()
                 .clone();
-            if !source.has_valid_native_continuity() || source.launch.session_id.is_none() {
+            let unnamed = source.has_unnamed_retained_claude_actor();
+            if !source.has_valid_native_continuity()
+                || (source.launch.session_id.is_none() && !unnamed)
+            {
                 return Err(error("Saved conversation has invalid continuity evidence"));
             }
             if let Some(session) =
@@ -2567,18 +2576,43 @@ fn process_inner(
             if let Some(session) = capacity::prepare_saved_history(host, &source)? {
                 return Ok(ServerResponse::ChatResumePrepared { session });
             }
+            // An unnamed pane resumes the conversation its ended actors
+            // confirmed, through the same checks as a named one; when they
+            // confirmed none, every actor's end is already proved and the
+            // pane starts a conversation in place.
+            let ended = source.clone();
+            let mut source = source;
+            let mut unconfirmed = false;
+            if unnamed {
+                match retained_resume::unnamed_conversation(host, &source).map_err(unavailable)? {
+                    Some(conversation) => source.launch.session_id = Some(conversation),
+                    None => unconfirmed = true,
+                }
+            }
             // Classify retained Claude execution before generic discovery:
             // an exited helper may still await its original parent's wait.
             // Errors/unproved exit never fall back to treating it as live.
-            let retirement = if source.launch.provider == Provider::Claude {
+            let retirement = if unconfirmed {
+                retained_resume::ResumeRetirement::Abandoned
+            } else if source.launch.provider == Provider::Claude {
                 retained_resume::inspect_resume_retirement(host, &source).map_err(unavailable)?
             } else {
-                None
+                retained_resume::ResumeRetirement::Unclassified
+            };
+            // A helper whose daemon exited between closing its provider and
+            // retiring it finishes that exit here, then classifies as retired.
+            let retirement = if !retirement.is_classified()
+                && retained_actor::finish_interrupted_exit_of(host, &ended).map_err(unavailable)?
+            {
+                retained_resume::inspect_resume_retirement(host, &source).map_err(unavailable)?
+            } else {
+                retirement
             };
             // A present owner must be restored, not replaced. Missing evidence
-            // is never proof of a completed close.
-            if retirement.is_none() && has_native_owner(&source)? {
-                return Ok(ServerResponse::ChatResumePrepared { session: source });
+            // is never proof of a completed close; a runtime record left by a
+            // proved retired or abandoned actor is not a present owner.
+            if !retirement.is_classified() && has_native_owner(&ended)? {
+                return Ok(ServerResponse::ChatResumePrepared { session: ended });
             }
             // A kernel boot change proves every process from the saved boot
             // is gone. Unlike missing runtime files within the same boot, it
@@ -2586,10 +2620,25 @@ fn process_inner(
             let previous_boot = source.proof.as_ref().is_some_and(|previous| {
                 previous.is_complete() && previous.boot_id != proof.boot_id
             });
-            let closed = if previous_boot {
+            let unstarted = if previous_boot || unconfirmed {
+                None
+            } else {
+                retained_resume::unstarted(host, &source).map_err(unavailable)?
+            };
+            // A successor no lineage records here resumes on its own, as any
+            // conversation reopened without an owner to take over.
+            if unstarted == Some(retained_resume::Unstarted::Unrecorded) {
+                let mut session = source;
+                session.id = TerminalId::new();
+                return Ok(ServerResponse::ChatResumePrepared { session });
+            }
+            let closed = if previous_boot
+                || unconfirmed
+                || unstarted == Some(retained_resume::Unstarted::InLineage)
+            {
                 true
             } else if source.launch.provider == Provider::Claude {
-                retained_resume::prepare_resume_verified(host, &source, retirement)
+                retained_resume::prepare_resume_verified(host, &source, retirement.verified())
                     .map_err(unavailable)?
             } else {
                 chat::native_holder::closed_source(&source, &proof)
@@ -2601,6 +2650,10 @@ fn process_inner(
                     "The old provider owner has no confirmed close receipt. Restore its original pane and close it before reopening; no replacement was started.",
                 ));
             }
+            // The old process is proved ended, as after a daemon stop: its
+            // authority and unfinished runs end and its agent stays open, so
+            // the successor's start can take the agent over.
+            super::agent_execution::stopped(host, &ended).map_err(unavailable)?;
             let predecessor = source.id;
             let root = source
                 .terminal
@@ -2732,7 +2785,8 @@ fn process_inner(
             } else {
                 client_session(host, session)
             };
-            start(
+            let id = session.id;
+            let response = start(
                 host,
                 client,
                 session,
@@ -2740,7 +2794,32 @@ fn process_inner(
                 terminate_source,
                 None,
                 execution_environment,
-            )
+            )?;
+            // A resumed conversation keeps the agent its stopped predecessor
+            // bound: its row, pane and channel move to the running successor.
+            // The provider already runs, so a refusal leaves the agent with
+            // the ended process (still closable) rather than failing the start.
+            let started = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .chats
+                .get(&id)
+                .map(|record| record.session.clone());
+            if let Some(started) = started {
+                match super::agent_execution::adopt_resumed(host, &started) {
+                    Ok(true) => {
+                        host.lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .idle_adoptions
+                            .insert(id);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(chat=%id, %error, "The resumed conversation did not take over its agent");
+                    }
+                }
+            }
+            Ok(response)
         }
         ClientRequest::ChatAttach { session } => {
             if let Some(response) = upgrade_resolution::attach(host, client, &session)? {
@@ -2869,6 +2948,9 @@ fn process_inner(
                         ServerResponse::ChatFileChangePatches { chat_id, page }
                     }
                 });
+            }
+            if command.gives_work() {
+                super::agent_execution::given_work(host, chat_id);
             }
             handle.command(command).map_err(unavailable)?;
             Ok(ServerResponse::Accepted)
@@ -6508,24 +6590,54 @@ done
         .unwrap();
         assert_eq!(handle.session_id().as_deref(), Some("saved-conversation"));
         assert!(
-            confirm_saved_conversation(&handle, "saved-conversation", Instant::now(), || false)
-                .is_err()
+            confirm_saved_conversation(
+                &handle,
+                "saved-conversation",
+                false,
+                Instant::now(),
+                || false
+            )
+            .is_err()
         );
         handle.command(Command::Interrupt).unwrap();
         confirm_saved_conversation(
             &handle,
             "saved-conversation",
+            false,
             Instant::now() + Duration::from_secs(5),
             || false,
         )
         .unwrap();
+        // A confirmed identity alone is not a provider that answered initialize.
         assert!(
-            confirm_saved_conversation(&handle, "another-conversation", Instant::now(), || false)
-                .is_err()
+            confirm_saved_conversation(
+                &handle,
+                "saved-conversation",
+                true,
+                Instant::now() + Duration::from_millis(100),
+                || false
+            )
+            .is_err()
         );
         assert!(
-            confirm_saved_conversation(&handle, "saved-conversation", Instant::now(), || true)
-                .is_err()
+            confirm_saved_conversation(
+                &handle,
+                "another-conversation",
+                false,
+                Instant::now(),
+                || false
+            )
+            .is_err()
+        );
+        assert!(
+            confirm_saved_conversation(
+                &handle,
+                "saved-conversation",
+                false,
+                Instant::now(),
+                || true
+            )
+            .is_err()
         );
         handle.close().unwrap();
     }

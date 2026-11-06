@@ -942,10 +942,16 @@ impl Context {
         // Fitting live content normally follows its end. But an earlier page
         // can prepend surviving rows to that same short transcript: preserve
         // the exchange the reader was looking at instead of jumping past it.
-        let prepended = self.rows.first().is_some_and(|old| {
-            rows.iter()
-                .any(|(id, bounds)| *id == old.id && bounds.y > old.bounds.y + 0.5)
-        });
+        // Only a transcript that fit had every row measured. In a longer one
+        // an unmounted row reports its group's placeholder bounds, and its
+        // measured position later lies below them: as the live window evicts
+        // the start of a long answer, that is not new history above the
+        // reader, who stays at the end.
+        let prepended = previous.travel() <= 0.5
+            && self.rows.first().is_some_and(|old| {
+                rows.iter()
+                    .any(|(id, bounds)| *id == old.id && bounds.y > old.bounds.y + 0.5)
+            });
         if !prepended
             && self.follow_end
             && !self.preserve.is_some_and(|preserve| preserve.arrived)
@@ -5163,6 +5169,34 @@ mod tests {
             reading().layout(None, &next, geometry(1500.0), Some(100.0)),
             Some(1100.0)
         );
+    }
+
+    #[test]
+    fn following_reader_stays_at_the_end_when_a_long_answer_window_slides() {
+        // A streaming answer longer than one transcript window is presented
+        // as parts. Parts outside the mounted range report their group's
+        // placeholder bounds, so the first remembered row can be a later part
+        // at the group's top.
+        let mut anchor = Anchor::default();
+        let parts = rows(&[
+            ("part-9", 0.0, 9000.0),
+            ("part-1", 0.0, 9000.0),
+            ("part-24", 8600.0, 400.0),
+        ]);
+        anchor.layout(None, &parts, geometry(9000.0), None);
+        assert_eq!(anchor.contexts[0].top, Some(8600.0));
+        // The window evicts the first part. The later part is now measured
+        // below its old placeholder, which is no history above the reader.
+        let slid = rows(&[
+            ("part-2", 0.0, 400.0),
+            ("part-9", 2800.0, 400.0),
+            ("part-25", 8500.0, 300.0),
+        ]);
+        assert_eq!(
+            anchor.layout(None, &slid, geometry(8800.0), Some(8600.0)),
+            None
+        );
+        assert_eq!(anchor.contexts[0].top, Some(8400.0));
     }
 
     #[test]

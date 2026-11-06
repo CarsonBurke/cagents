@@ -53,6 +53,15 @@ preview and confirm again. An update with **When idle** waits for background wor
 to finish; **Interrupt** previews which background tasks will stop. New affected
 tasks require fresh update confirmation.
 
+Stopping the daemon does not close its agents. Each agent's provider and any
+turn in progress end, and the stopped provider can no longer act for the agent,
+but the agent stays open: `agent list` still shows it, and its card stays in its
+channel, where its saved conversation can be resumed. A turn the stop cut short
+ends with a note that it may be incomplete and is never resent, so inspect the
+conversation before sending more work. Until the conversation is resumed, a new
+prompt to the agent fails without being sent. `agent close` still retires a
+stopped agent.
+
 Every command takes an agent by its exact name, or an agent or run by its whole ID or any unique prefix of one, matched against the caller's open agents and their latest runs; an ambiguous prefix fails and names the candidates. An agent handle stands for its latest run, and a run handle for its agent. A whole ID outside that list is passed on as an agent, or to `wait` as an older run. Names resolve without case sensitivity and take precedence over ID prefixes. People read eight-character IDs; JSON always carries whole ones.
 
 Human output is compact: one line per agent, and a run's state followed by the last 20 lines of its result (`--tail N`, or `--full`). `--json` before `agent` selects the regular CLI envelope. Spawn/send return `data.agent`, `data.run`, `data.created`, and `data.idempotency_key`, plus `data.timed_out` with `--wait`; status returns `data.agent`, `data.run`, and `data.timed_out`; wait always returns `data.results` (each with `agent`, `run`, and `outcome`), `data.timed_out`, `data.ended_by`, and the aggregate `data.outcome`; list returns `data.agents`; requests, answer, and interrupt return `data.requests`, the requests still pending.
