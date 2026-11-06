@@ -649,15 +649,12 @@ mod tests {
                 std::fs::read_to_string(fixture.linked.join("tracked")).unwrap(),
                 "hidden edit\n"
             );
-            git(
-                &fixture.linked,
-                &[
-                    "update-index",
-                    "--no-assume-unchanged",
-                    "--no-skip-worktree",
-                    "tracked",
-                ],
-            );
+            let clear = if flag == "--assume-unchanged" {
+                "--no-assume-unchanged"
+            } else {
+                "--no-skip-worktree"
+            };
+            git(&fixture.linked, &["update-index", clear, "tracked"]);
             git(&fixture.linked, &["restore", "tracked"]);
         }
     }
