@@ -652,6 +652,9 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
 /// provider aborts on any second prompt.
 #[test]
 fn named_claude_resume_after_lost_holder_sends_nothing() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     lost_holder_case(
         "named_claude_resume_after_lost_holder_sends_nothing",
         false,
@@ -661,6 +664,9 @@ fn named_claude_resume_after_lost_holder_sends_nothing() {
 
 #[test]
 fn named_claude_resume_of_lost_agent_rebinds_and_sends_nothing() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     lost_holder_case(
         "named_claude_resume_of_lost_agent_rebinds_and_sends_nothing",
         true,
@@ -670,6 +676,9 @@ fn named_claude_resume_of_lost_agent_rebinds_and_sends_nothing() {
 
 #[test]
 fn named_claude_resume_of_lost_agent_delivers_waiting_mail_once() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     lost_holder_case(
         "named_claude_resume_of_lost_agent_delivers_waiting_mail_once",
         true,
