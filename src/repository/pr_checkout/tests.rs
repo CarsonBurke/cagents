@@ -2669,7 +2669,7 @@ fn private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr() 
             .with_ansi(false)
             .with_max_level(tracing::Level::TRACE)
             .finish();
-        let failure = tracing::subscriber::with_default(subscriber, || {
+        let failure = crate::test_tracing::with_thread_subscriber(subscriber, || {
             tracing::warn!("private_fetch_capture_ready");
             fixture.apply(&plan).unwrap_err()
         });
