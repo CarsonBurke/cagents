@@ -1190,7 +1190,10 @@ mod tests {
             Ok((terminal == id).then_some(4242))
         });
         server.join().unwrap();
-        assert!(recovered.is_err());
+        let Err(reason) = recovered else {
+            panic!("nothing should start beside the holder");
+        };
+        assert!(reason.contains("process 4242"), "{reason}");
     }
 
     /// A completed terminal can still own a native provider, under the same ID.
@@ -1217,7 +1220,10 @@ mod tests {
             },
         );
         server.join().unwrap();
-        assert!(recovered.is_err());
+        let Err(reason) = recovered else {
+            panic!("nothing should start beside the holder");
+        };
+        assert!(reason.contains("process 4242"), "{reason}");
     }
 
     /// The refusal is shown on the pane, so it names the process to stop and not

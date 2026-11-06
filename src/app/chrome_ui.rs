@@ -67,6 +67,22 @@ pub(super) struct State {
 
 #[cfg(test)]
 mod tests {
+    /// A close that starts under a rename would have its message dropped, so the
+    /// pane stays queued until the rename ends.
+    #[test]
+    fn a_rename_holds_the_close_queue_until_it_ends() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.queue_card_close(card, false);
+        app.chrome_ui.rename = Some((RenameTarget::Pane(card), String::new()));
+        drop(app.next_queued_card_close());
+        assert_eq!(app.queued_card_closes.len(), 1);
+
+        app.chrome_ui.rename = None;
+        drop(app.next_queued_card_close());
+        assert!(app.queued_card_closes.is_empty());
+    }
+
     #[test]
     fn attention_popup_pages_unique_incidents_and_survives_an_empty_project_list() {
         let mut app = super::super::tests::context_inspector_test_app(false);

@@ -23757,11 +23757,24 @@ mod tests {
         let pane = saved_terminal_pane(&mut app);
         let _ = app.update(Message::CloseCard(chat));
         assert!(app.chat_close_owned(chat));
+        assert!(app.pane_close_owned(chat));
         let _ = app.update(Message::CloseCard(pane));
         assert_eq!(
             app.terminal_close.as_ref().map(|intent| intent.card),
             Some(pane)
         );
+    }
+
+    /// A chat runs its close beside the queue, so taking its turn and staying open
+    /// while it closes isn't being turned away.
+    #[test]
+    fn a_queued_chat_that_starts_closing_is_not_reported_as_kept() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let chat = failed_chat(&mut app);
+        app.queue_card_close(chat, false);
+        let _ = app.next_queued_card_close();
+        assert!(app.chat_close_owned(chat));
+        assert!(app.status.is_none(), "{:?}", errors(&app));
     }
 
     /// Close during a return has to be remembered then. Queued, it would come

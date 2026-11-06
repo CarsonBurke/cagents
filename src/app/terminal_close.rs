@@ -1407,6 +1407,89 @@ mod tests {
         );
     }
 
+    /// An update drops the message that starts the next pane, so the pane stays
+    /// queued until the update lets go.
+    #[test]
+    fn an_update_holds_the_queue_until_it_lets_go() {
+        let (mut app, first) = retry_close_fixture();
+        let behind = queued_terminal(&mut app, first);
+        app.queue_card_close(behind, false);
+        app.update_prepared = true;
+        drop(app.next_queued_card_close());
+        assert_eq!(app.queued_card_closes.len(), 1);
+        assert!(app.terminal_close.is_none());
+
+        app.update_prepared = false;
+        drop(app.next_queued_card_close());
+        assert_eq!(
+            app.terminal_close.as_ref().map(|intent| intent.card),
+            Some(behind)
+        );
+        assert!(app.status.is_none());
+    }
+
+    /// A pane behind a discard dialog or in a group is spoken for, so Retry can't
+    /// replace its terminal and another pane's close has to wait.
+    #[test]
+    fn a_pane_waiting_in_a_dirty_close_or_a_group_is_owned() {
+        let (mut app, first) = retry_close_fixture();
+        let behind = queued_terminal(&mut app, first);
+        let bystander = queued_terminal(&mut app, first);
+        app.cards.insert(
+            first,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(first))),
+        );
+        drop(app.update(Message::CloseCard(first)));
+        app.dirty_repository_close
+            .as_mut()
+            .unwrap()
+            .remaining
+            .push_back(behind);
+        assert!(app.pane_close_owned(first));
+        assert!(app.pane_close_owned(behind));
+        assert!(!app.pane_close_owned(bystander));
+        assert!(app.another_close_under_way(bystander));
+
+        app.dirty_repository_close = None;
+        assert!(!app.pane_close_owned(behind));
+        assert!(!app.another_close_under_way(bystander));
+
+        app.chrome_ui.closing_group = vec![behind];
+        assert!(app.pane_close_owned(behind));
+        assert!(!app.another_close_under_way(behind));
+        assert!(!app.pane_close_owned(bystander));
+        assert!(app.another_close_under_way(bystander));
+    }
+
+    /// The commit reached a pane that's still closing, so nothing has been lost
+    /// until that close finishes without another one.
+    #[test]
+    fn a_delivered_commit_is_given_up_only_once_nothing_is_closing_the_pane() {
+        let (mut app, first) = retry_close_fixture();
+        app.workspace.request_close(first).unwrap();
+        app.close_commit_delivered = Some(first);
+        app.completed_release = Some(first);
+        drop(app.settle_close_queue());
+        assert!(app.workspace.pending_close().is_some());
+
+        app.completed_release = None;
+        drop(app.settle_close_queue());
+        assert!(app.workspace.pending_close().is_none());
+        assert!(app.close_commit_delivered.is_none());
+    }
+
+    /// A close finishing after its first commit sends another, which the first
+    /// one's record mustn't cancel while it's on its way.
+    #[test]
+    fn a_fresh_commit_is_not_mistaken_for_the_delivered_one() {
+        let (mut app, first) = retry_close_fixture();
+        app.workspace.request_close(first).unwrap();
+        app.close_commit_delivered = Some(first);
+        drop(app.request_card_removal(first));
+        drop(app.settle_close_queue());
+        assert!(app.workspace.pending_close().is_some());
+    }
+
     /// Input stops while an update is being prepared, and a dropped commit is
     /// never sent again, so its reservation would block every later Close.
     #[test]
