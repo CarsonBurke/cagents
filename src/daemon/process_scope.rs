@@ -13,6 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod workload;
+pub(crate) use workload::{CommandStop, Killer, ProviderScope};
+
 const TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(10);
 const INVISIBLE_MANAGER: &str = "user manager peer is not visible and owned";
@@ -291,49 +294,95 @@ pub(crate) fn enroll_holder() -> io::Result<()> {
     if !manager_available() {
         return Ok(());
     }
-    enroll_process(std::process::id())
+    let pid = std::process::id();
+    with_verified_manager(ManagerNamespace::connect(), || {
+        enroll_proven_process(pid, false).map(drop)
+    })
 }
 
-/// Enroll an unreaped owned provider before its first prompt is submitted.
-/// The caller keeps the Child alive until this operation has completed.
-pub(crate) fn enroll_process(pid: u32) -> io::Result<()> {
+/// Enroll this holder in a divided scope before it starts its provider, so
+/// the provider begins in the holder's leaf and its commands can be kept
+/// apart once it runs (see [`ProviderScope::keep_commands_apart`]). The
+/// existing launch stays when no user manager or division is available.
+pub(crate) fn enroll_dividing_holder() -> io::Result<Option<ProviderScope>> {
     if !manager_available() {
-        return Ok(());
+        return Ok(None);
     }
-    with_verified_manager(ManagerNamespace::connect(), || enroll_proven_process(pid))
+    let pid = std::process::id();
+    let mut membership = None;
+    with_verified_manager(ManagerNamespace::connect(), || {
+        membership = Some(enroll_proven_process(pid, true)?);
+        Ok(())
+    })?;
+    let membership = membership.ok_or_else(|| io::Error::other("scope membership unknown"))?;
+    // A holder has no tracing subscriber; its daemon reports shared scopes.
+    Ok(Some(ProviderScope::divide(&membership, pid)?.0))
 }
 
-fn enroll_proven_process(pid: u32) -> io::Result<()> {
+/// Enroll an unreaped owned provider before its first prompt is submitted,
+/// then keep the commands it starts in leaves of their own (see
+/// [`workload`]). The caller keeps the Child alive until this returns.
+///
+/// `Ok(None)` keeps the existing launch: no OS user manager. A scope that
+/// could not be split stays one leaf, and is still returned so a memory kill
+/// of the provider can be recognized. `wake` is written once whenever a
+/// command is stopped for memory.
+pub(crate) fn enroll_provider(
+    pid: u32,
+    wake: Option<UnixStream>,
+) -> io::Result<Option<ProviderScope>> {
+    if !manager_available() {
+        return Ok(None);
+    }
+    let mut membership = None;
+    with_verified_manager(ManagerNamespace::connect(), || {
+        membership = Some(enroll_proven_process(pid, true)?);
+        Ok(())
+    })?;
+    let membership = membership.ok_or_else(|| io::Error::other("scope membership unknown"))?;
+    let (scope, unsplit) = ProviderScope::new(&membership, pid, wake)?;
+    if let Some(error) = unsplit {
+        tracing::warn!(%error, pid, "provider commands share its cgroup; a memory kill can end the provider with them");
+    }
+    Ok(Some(scope))
+}
+
+/// Delegation lets the provider's owner divide the scope; systemd leaves the
+/// cgroups below a delegated unit to it. Returns the confirmed membership.
+fn enroll_proven_process(pid: u32, delegate: bool) -> io::Result<String> {
     let unit = format!("cagents-session-{}.scope", uuid::Uuid::new_v4());
     let mut command = Command::new("busctl");
     command
         .env("XDG_RUNTIME_DIR", manager_runtime())
         .env_remove("DBUS_SESSION_BUS_ADDRESS");
+    command.args([
+        "--user",
+        "--timeout=1s",
+        "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "StartTransientUnit",
+        "ssa(sv)a(sa(sv))",
+        &unit,
+        "fail",
+        if delegate { "4" } else { "3" },
+        "PIDs",
+        "au",
+        "1",
+        &pid.to_string(),
+        "Slice",
+        "s",
+        "app.slice",
+        "CollectMode",
+        "s",
+        "inactive-or-failed",
+    ]);
+    if delegate {
+        command.args(["Delegate", "b", "true"]);
+    }
     command
-        .args([
-            "--user",
-            "--timeout=1s",
-            "call",
-            "org.freedesktop.systemd1",
-            "/org/freedesktop/systemd1",
-            "org.freedesktop.systemd1.Manager",
-            "StartTransientUnit",
-            "ssa(sv)a(sa(sv))",
-            &unit,
-            "fail",
-            "3",
-            "PIDs",
-            "au",
-            "1",
-            &pid.to_string(),
-            "Slice",
-            "s",
-            "app.slice",
-            "CollectMode",
-            "s",
-            "inactive-or-failed",
-            "0",
-        ])
+        .arg("0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -350,7 +399,7 @@ fn enroll_with(
     unit: &str,
     timeout: Duration,
     mut membership: impl FnMut() -> io::Result<String>,
-) -> io::Result<()> {
+) -> io::Result<String> {
     let started = Instant::now();
     // Held until this function's final wait. A retained actor's orphan sweep
     // must not consume the status this scope request is waiting for.
@@ -377,8 +426,9 @@ fn enroll_with(
     // StartTransientUnit acknowledges a queued job, not completed migration.
     // Verify the exact unique unit before any provider can inherit this scope.
     loop {
-        if membership()?.rsplit('/').next() == Some(unit) {
-            return Ok(());
+        let current = membership()?;
+        if current.rsplit('/').next() == Some(unit) {
+            return Ok(current);
         }
         if started.elapsed() >= timeout {
             return Err(io::Error::new(
@@ -388,6 +438,22 @@ fn enroll_with(
         }
         thread::sleep(POLL.min(timeout.saturating_sub(started.elapsed())));
     }
+}
+
+/// The session scope a membership path belongs to: the scope itself, or a
+/// leaf a provider scope was divided into.
+fn session_scope(membership: &str) -> Option<&str> {
+    let (parent, leaf) = membership.rsplit_once('/')?;
+    let scope = if leaf == "provider" || leaf.starts_with("command-") {
+        parent
+    } else {
+        membership
+    };
+    scope
+        .rsplit('/')
+        .next()
+        .is_some_and(|unit| unit.starts_with("cagents-session-") && unit.ends_with(".scope"))
+        .then_some(scope)
 }
 
 /// Holder constructors have no tracing subscriber. Their daemon logs degraded
@@ -401,13 +467,7 @@ pub(crate) fn warn_if_shared(holder: u32, root: u32) {
         let caller = cgroup(std::process::id())?;
         let owner = cgroup(holder)?;
         let provider = cgroup(root)?;
-        Ok::<_, io::Error>(
-            owner != caller
-                && provider == owner
-                && owner.rsplit('/').next().is_some_and(|unit| {
-                    unit.starts_with("cagents-session-") && unit.ends_with(".scope")
-                }),
-        )
+        Ok::<_, io::Error>(owner != caller && provider == owner && session_scope(&owner).is_some())
     })();
     if !matches!(isolated, Ok(true)) {
         tracing::warn!(
@@ -425,7 +485,10 @@ pub(crate) fn warn_if_bootstrap_shared(root: u32) {
     if !manager_available() {
         return;
     }
-    let Ok(expected) = cgroup(root) else {
+    let Some(expected) = cgroup(root)
+        .ok()
+        .and_then(|membership| session_scope(&membership).map(str::to_owned))
+    else {
         return;
     };
     let mut seen = std::collections::BTreeSet::from([root]);
@@ -445,7 +508,10 @@ pub(crate) fn warn_if_bootstrap_shared(root: u32) {
                 if !seen.insert(child) {
                     continue;
                 }
-                if cgroup(child).is_ok_and(|membership| membership != expected) {
+                // The provider's commands move to leaves of the same scope.
+                if cgroup(child)
+                    .is_ok_and(|membership| session_scope(&membership) != Some(expected.as_str()))
+                {
                     tracing::warn!(
                         root,
                         child,
@@ -709,6 +775,7 @@ pub(crate) mod tests {
             Duration::from_secs(1),
             || panic!("failed request must not verify membership"),
         )
+        .map(drop)
     }
     #[test]
     fn successful_request_requires_exact_confirmed_membership() {
@@ -765,12 +832,59 @@ pub(crate) mod tests {
         let owner = cgroup(holder).unwrap();
         assert_ne!(owner, cgroup(std::process::id()).unwrap());
         assert_eq!(owner, cgroup(root).unwrap());
-        assert!(
-            owner
-                .rsplit('/')
-                .next()
-                .unwrap()
-                .starts_with("cagents-session-")
-        );
+        assert!(session_scope(&owner).is_some(), "{owner}");
+    }
+
+    /// Each process `root` started has left its divided provider leaf for a
+    /// command leaf of the same scope.
+    pub(crate) fn assert_commands_apart(root: u32) {
+        let provider = cgroup(root).unwrap();
+        let Some(scope) = provider.strip_suffix("/provider") else {
+            eprintln!("command cgroups unqualified: provider scope undivided ({provider})");
+            return;
+        };
+        let children = std::fs::read_to_string(format!("/proc/{root}/task/{root}/children"))
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!children.is_empty(), "the provider started no command");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for child in children {
+            loop {
+                let leaf = cgroup(child).unwrap();
+                if leaf
+                    .strip_prefix(scope)
+                    .and_then(|name| name.strip_prefix("/command-"))
+                    .is_some()
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "command {child} stayed in {leaf}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    #[test]
+    fn a_divided_provider_scope_is_still_its_session_scope() {
+        let scope = "/user.slice/app.slice/cagents-session-a.scope";
+        for membership in [
+            scope.to_owned(),
+            format!("{scope}/provider"),
+            format!("{scope}/command-3"),
+        ] {
+            assert_eq!(session_scope(&membership), Some(scope), "{membership}");
+        }
+        for foreign in [
+            "/user.slice/app.slice/other.scope",
+            "/user.slice/app.slice/other.scope/provider",
+            "/user.slice/app.slice/cagents-session-a.scope/elsewhere",
+        ] {
+            assert_eq!(session_scope(foreign), None, "{foreign}");
+        }
     }
 }

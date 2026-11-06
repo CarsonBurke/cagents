@@ -1448,7 +1448,11 @@ extern "C" fn serve_if_requested() {
         };
         // This is an execed holder, not a post-fork pre_exec hook. Complete
         // scope enrollment before the provider's first process can exist.
-        let _ = crate::daemon::process_scope::enroll_holder();
+        // Divided, so the commands the provider starts get cgroups of their
+        // own: a memory kill then ends the command, not the conversation.
+        let mut scope = crate::daemon::process_scope::enroll_dividing_holder()
+            .ok()
+            .flatten();
         let mut residence = match Residence::start(spawn) {
             Ok(residence) => residence,
             Err(error) => {
@@ -1463,6 +1467,14 @@ extern "C" fn serve_if_requested() {
                 return Err(error);
             }
         };
+        if let Some(scope) = &mut scope {
+            // Without it the provider's commands stay in its cgroup, as before.
+            let _ = scope.keep_commands_apart(
+                residence.record.root.pid as u32,
+                vec![std::process::id()],
+                None,
+            );
+        }
         send(
             &control,
             &Report::Started {
@@ -2133,8 +2145,10 @@ exec /bin/sleep 60
             execution: Some(context.clone()),
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket { socket },
-            program: "/bin/sleep".into(),
-            arguments: vec!["60".into()],
+            // A provider running one command, so its cgroup and release
+            // cover the commands a provider starts.
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "/bin/sleep 60 & exec /bin/sleep 60".into()],
             working_directory: working.path().to_owned(),
             environment: Default::default(),
             unset_environment: Default::default(),
@@ -2166,6 +2180,7 @@ exec /bin/sleep 60
             record.holder.pid as u32,
             record.root.pid as u32,
         );
+        crate::daemon::process_scope::tests::assert_commands_apart(record.root.pid as u32);
         assert_eq!(
             std::fs::read_link(format!("/proc/{}/cwd", record.root.pid)).unwrap(),
             working.path()

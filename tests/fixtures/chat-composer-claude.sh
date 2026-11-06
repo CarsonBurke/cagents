@@ -228,6 +228,20 @@ frames_turn() {
     done < "$frames_file"
 }
 
+# Optional real command: every turn runs the first line of
+# fixture-run-command as a Bash call, in a child of this provider process as
+# Claude's Bash tool does, and reports its output and exit code. Checks of
+# where a provider's commands run, and of a command the system stops, use it.
+run_file=$config/fixture-run-command
+run_turn() {
+    id="run-$turn"
+    command=$(head -n 1 "$run_file")
+    emit_record "$(jq -cn --arg id "$id" --arg command "$command" '{type:"assistant",uuid:("fixture-"+$id),message:{id:("fixture-"+$id),role:"assistant",content:[{type:"tool_use",id:$id,name:"Bash",input:{command:$command,description:"Run the fixture command"}}]}}')"
+    status=0
+    output=$(sh -c "$command" 2>&1 </dev/null) || status=$?
+    emit_record "$(jq -cn --arg id "$id" --arg output "$output" --argjson status "$status" '{type:"user",uuid:("fixture-"+$id+"-result"),message:{role:"user",content:[{type:"tool_result",tool_use_id:$id,is_error:($status != 0),content:(if $status == 0 then $output else ($output + (if $output == "" then "" else "\n" end) + "Exit code \($status)") end)}]}}')"
+}
+
 # Optional provider-produced image for image preview/viewer acceptance: each
 # turn returns this PNG as a base64 block. Native launches drop CAGENTS_*
 # variables, so the provider home's fixture-image.png is the default.
@@ -353,6 +367,7 @@ while IFS= read -r frame; do
                 if [ "$subagents" = 1 ]; then subagents_turn; fi
                 if [ -f "$tools_file" ]; then tools_turn; fi
                 if [ -f "$frames_file" ]; then frames_turn; fi
+                if [ -s "$run_file" ]; then run_turn; fi
                 if [ -f "$fixture_image" ]; then image_turn; fi
                 # A Markdown file in the config directory can stand in for the
                 # answer, so rendering and long-transcript checks need no live

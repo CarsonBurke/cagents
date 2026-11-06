@@ -1483,6 +1483,9 @@ impl Runtime {
             chat::failure::FailureKind::Capacity => "Provider at capacity",
             chat::failure::FailureKind::Connection => "Connection interrupted",
             chat::failure::FailureKind::Interrupted => "Interrupted",
+            chat::failure::FailureKind::OutOfMemory => "Stopped: out of memory",
+            chat::failure::FailureKind::CommandOutOfMemory => "Command stopped: out of memory",
+            chat::failure::FailureKind::Exited => "Stopped unexpectedly",
         });
         let mut parts = Vec::new();
         if let Some(label) = failure_label {
