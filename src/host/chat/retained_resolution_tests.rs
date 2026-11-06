@@ -69,6 +69,7 @@ fn isolated() -> Option<PathBuf> {
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &test, "--nocapture"])
         .env_clear()
+        .envs(crate::retained_fixture::owner_env())
         .env(MODE, &test)
         .env(
             "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
@@ -375,6 +376,9 @@ impl Drop for Fixture {
 
 #[test]
 fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launching() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     fixture.rotate_host_without_discovery();
@@ -425,6 +429,9 @@ fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launchin
 
 #[test]
 fn real_failed_cleanup_attachment_recovers_the_same_provider_without_closing_it() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     fixture.rotate_host_without_discovery();
@@ -536,6 +543,9 @@ fn real_failed_cleanup_attachment_recovers_the_same_provider_without_closing_it(
 
 #[test]
 fn real_retained_claude_update_preview_preserves_pre_id_and_active_turns() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     let inspect = |host: &SharedHost| {
@@ -627,6 +637,9 @@ fn real_retained_claude_update_preview_preserves_pre_id_and_active_turns() {
 
 #[test]
 fn real_helper_resolution_grant_is_single_use_and_connection_scoped() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     fixture.rotate_host();
@@ -739,6 +752,9 @@ fn real_helper_resolution_grant_is_single_use_and_connection_scoped() {
 
 #[test]
 fn real_helper_epoch_rotation_between_resolve_and_attach_rejects_old_proxy() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     fixture.rotate_host();
@@ -785,6 +801,9 @@ fn real_helper_epoch_rotation_between_resolve_and_attach_rejects_old_proxy() {
 
 #[test]
 fn real_helper_resolution_learns_only_provider_confirmed_pre_id_identity() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     fixture.rotate_host();
@@ -862,6 +881,9 @@ fn real_helper_resolution_learns_only_provider_confirmed_pre_id_identity() {
 
 #[test]
 fn real_helper_epoch_rotation_after_snapshot_rejects_cached_hydration() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     fixture.rotate_host();
@@ -918,6 +940,9 @@ fn real_helper_epoch_rotation_after_snapshot_rejects_cached_hydration() {
 
 #[test]
 fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::with_reset(root, true);
     fixture
@@ -990,6 +1015,9 @@ fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage()
 
 #[test]
 fn real_helper_snapshot_publication_rechecks_exact_host_binding() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     for replace_proxy in [false, true] {
         let mut fixture = Fixture::new(root.clone());
@@ -1035,6 +1063,9 @@ fn real_helper_snapshot_publication_rechecks_exact_host_binding() {
 // and isolated() retain their original bounded real-helper ownership mechanics.
 #[test]
 fn real_retirement_commit_failure_cannot_reinstall_a_completed_cleanup_owner() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
     let original_scope = fixture.handle().launch_account_scope().unwrap().clone();

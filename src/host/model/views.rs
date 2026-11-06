@@ -546,7 +546,7 @@ pub(super) fn apply(
                 return Ok(false);
             }
             if view.revision != *expected_revision {
-                return Err("workspace view revision conflict".into());
+                return Err(Registry::VIEW_REVISION_CONFLICT.into());
             }
             changed = match change {
                 Change::Transfer {
@@ -720,6 +720,7 @@ impl Registry {
             .ok_or_else(|| "The primary chat is unavailable".into())
     }
 
+    pub(crate) const VIEW_REVISION_CONFLICT: &'static str = "workspace view revision conflict";
     pub(crate) const VIEW_SOURCE_CONFLICT: &'static str = "The pane source changed; refuse stale source intent and rebase presentation on the current pane";
 
     pub(crate) fn view_change_refusal(

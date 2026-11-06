@@ -18,7 +18,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     os::{
-        fd::{AsFd, AsRawFd, FromRawFd, RawFd},
+        fd::{AsRawFd, FromRawFd, RawFd},
         unix::{
             fs::MetadataExt,
             net::{UnixListener, UnixStream},
@@ -38,6 +38,8 @@ const ARGUMENT: &str = "--cagents-native-actor";
 pub(super) const PROTOCOL: u32 = 2;
 const CAPABILITY: &str = registry::RETAINED_CLAUDE_CAPABILITY;
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the serve loop checks admitted inputs for completion.
+const INPUT_COMPLETION_POLL: Duration = Duration::from_millis(20);
 /// How long a caller waits for an input's acknowledgement before reporting
 /// its outcome as unknown.
 const ACKNOWLEDGEMENT_WAIT: Duration = Duration::from_secs(10);
@@ -3050,8 +3052,12 @@ impl Server {
             &Ok::<_, String>(self.attached()?),
             Duration::from_secs(30),
         )?;
+        self.listener
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        let connections = connections::Connections::new()?;
         let mut orphans = OrphanSweep::new();
-        loop {
+        'serve: loop {
             orphans.run_if_due();
             self.finish_inputs();
             if !self.installed && disconnected(&startup)? {
@@ -3059,59 +3065,80 @@ impl Server {
                 reap_orphans()?;
                 break;
             }
-            match self.listener.accept() {
-                Ok((control, _)) => {
-                    let request = (|| {
-                        let request: Invocation = receive(&control, TIMEOUT)?;
-                        authorize(&control, &request.proof)?;
-                        Ok::<_, String>(request)
-                    })();
-                    if let Ok(request) = &request
-                        && request.method == "pinned_directory"
-                    {
-                        let pin = self.pinned_launch_directory(request);
-                        let response = pin
-                            .as_ref()
-                            .map(|(identity, _)| *identity)
-                            .map_err(Clone::clone);
-                        let descriptors: Vec<_> = pin
-                            .as_ref()
-                            .ok()
-                            .map(|(_, file)| vec![file.as_fd()])
-                            .unwrap_or_default();
-                        let _ = crate::descriptor_frame::send_json_with_fds_until(
-                            &control,
-                            &response,
-                            &descriptors,
-                            Instant::now() + TIMEOUT,
-                            MAX_FRAME,
-                            1,
-                            crate::descriptor_frame::FrameByteOrder::LittleEndian,
-                        );
-                        orphans.run();
-                        continue;
-                    }
-                    let mut finished = false;
-                    let response = request.and_then(|request| {
-                        let close = request.method == "retire";
-                        let result = self.invoke(request);
-                        finished = close && result.is_ok();
-                        result
-                    });
-                    // Authentication failures use the same result boundary. Only an
-                    // explicit retirement after durable semantic ACK exits the
-                    // helper; a lost provider-close reply retains its journal.
-                    let _ = send(&control, &response, TIMEOUT);
-                    if finished {
-                        break;
-                    }
+            let accepting = connections.has_capacity();
+            let mut events = vec![libc::pollfd {
+                fd: connections.wakeup(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            if accepting {
+                events.push(libc::pollfd {
+                    fd: self.listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            if !self.installed {
+                // Hangup is always reported; no other startup event matters.
+                events.push(libc::pollfd {
+                    fd: startup.as_raw_fd(),
+                    events: 0,
+                    revents: 0,
+                });
+            }
+            // An admitted input's completion has no wakeup of its own, so
+            // poll for it only while some are pending.
+            let mut wait = orphans.until_due();
+            if !self.pending.is_empty() {
+                wait = wait.min(INPUT_COMPLETION_POLL);
+            }
+            let millis = wait.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
+            // SAFETY: `events` stays live and initialized for this finite poll.
+            if unsafe { libc::poll(events.as_mut_ptr(), events.len() as libc::nfds_t, millis) } < 0
+            {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.to_string());
+            }
+            while accepting && connections.has_capacity() {
+                match self.listener.accept() {
+                    Ok((control, _)) => connections.admit(control),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            while let Some(call) = connections.next() {
+                // As before each accept: a hung-up uninstalled helper serves
+                // nothing more, so a queued `install` cannot outlive it.
+                if !self.installed && disconnected(&startup)? {
+                    continue 'serve;
+                }
+                self.finish_inputs();
+                if call.method() == "pinned_directory" {
+                    let (request, reply) = call.into_parts();
+                    reply.send(connections::Answer::Directory(
+                        self.pinned_launch_directory(&request),
+                    ));
                     orphans.run();
+                    continue;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(20))
+                let (request, reply) = call.into_parts();
+                let close = request.method == "retire";
+                let response = self.invoke(request);
+                // Only an explicit retirement after durable semantic ACK exits
+                // the helper; a lost provider-close reply retains its journal.
+                let finished = close && response.is_ok();
+                let delivery = reply.send(connections::Answer::Value(response));
+                if finished {
+                    // The client hears that retirement succeeded before the
+                    // helper removes its socket and record.
+                    delivery.wait();
+                    break 'serve;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error.to_string()),
+                orphans.run();
             }
         }
         if std::fs::symlink_metadata(&self.socket)
@@ -3260,6 +3287,10 @@ impl OrphanSweep {
         Self {
             due: Instant::now(),
         }
+    }
+
+    fn until_due(&self) -> Duration {
+        self.due.saturating_duration_since(Instant::now())
     }
 
     fn run_if_due(&mut self) {
@@ -3452,6 +3483,9 @@ mod tests {
 
     #[test]
     fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_RETAINED_SCOPE_FALLBACK_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -3616,6 +3650,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
 
     #[test]
     fn serving_actor_reaps_exited_adopted_orphans_without_touching_live_ones() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_RETAINED_ORPHAN_SWEEP_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -3786,6 +3823,15 @@ while IFS= read -r frame; do :; done
         resident_fixture_with_body(None)
     }
     fn resident_fixture_with_body(body: Option<String>) -> Fixture {
+        let (server, root) = resident_server(body);
+        Fixture {
+            server,
+            _root: root,
+        }
+    }
+    /// A resident fixture's parts, for a test that moves the server into
+    /// [`Server::serve`], which closes its actor on the way out.
+    pub(super) fn resident_server(body: Option<String>) -> (Server, tempfile::TempDir) {
         use crate::chat::protocol::{Adapter, Step};
         struct Idle;
         impl Adapter for Idle {
@@ -3859,8 +3905,8 @@ while IFS= read -r frame; do :; done
         let socket = root.path().join("fixture.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let metadata = std::fs::symlink_metadata(&socket).unwrap();
-        Fixture {
-            server: Server {
+        (
+            Server {
                 actor,
                 identity,
                 source,
@@ -3886,8 +3932,8 @@ while IFS= read -r frame; do :; done
                 attachment_preserved: false,
                 close_only: false,
             },
-            _root: root,
-        }
+            root,
+        )
     }
     #[test]
     fn continuity_loss_refuses_unchanged_presentation_without_mutating_source_or_copy() {
@@ -3963,6 +4009,9 @@ while IFS= read -r frame; do :; done
     }
     #[test]
     fn removed_or_replaced_home_can_only_adopt_the_exact_helper_for_close() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_RETAINED_CLOSE_ONLY_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -4185,6 +4234,9 @@ while IFS= read -r frame; do :; done
     }
     #[test]
     fn authenticated_directory_pin_keeps_original_after_replacement_and_epoch_change() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_RETAINED_DIRECTORY_PIN_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir().unwrap();
@@ -4383,6 +4435,9 @@ exec /bin/sleep 60
     }
     #[test]
     fn helper_restores_descriptor_seal_before_any_provider_exec() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_ACTOR_DESCRIPTOR_SEAL_TEST";
         if std::env::var_os(CHILD).is_none() {
             let isolated = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -5729,6 +5784,9 @@ exec /bin/sleep 60
     }
     #[test]
     fn adopted_real_helper_reclaims_prior_acknowledgements_before_more_than_capacity_commands() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_ACTOR_RECEIPT_RETIREMENT_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -6117,3 +6175,10 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "transport_deadline_tests.rs"]
 mod deadline_tests;
+
+#[path = "transport_connections.rs"]
+mod connections;
+
+#[cfg(test)]
+#[path = "transport_connection_tests.rs"]
+mod connection_tests;

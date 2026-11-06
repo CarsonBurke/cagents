@@ -24,7 +24,7 @@ jobs:
   contracts:
     name: Script contracts
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     defaults:
       run:
         shell: bash
@@ -254,6 +254,7 @@ jobs:
       - name: Check shell syntax
         run: |
           sh -n scripts/run-development
+          [ ! -e scripts/refuse-compile ] || sh -n scripts/refuse-compile
           sh -n scripts/check-format
 
       - name: Check repository formatting

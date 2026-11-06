@@ -7584,7 +7584,7 @@ mod tests {
             client: Arc::downgrade(&handle.inner),
             rows: rows.clone(),
         });
-        tracing::subscriber::with_default(subscriber, || {
+        crate::test_tracing::with_thread_subscriber(subscriber, || {
             handle.set_visible(false).unwrap();
             handle.set_visible(false).unwrap();
             assert!(handle.resident_snapshot_with_clock().is_none());

@@ -231,7 +231,74 @@ esac
 PATH=${zig_executable%/*}:$PATH
 export PATH
 
+# Whether this launch holds the native lock, on which every other native session
+# queues. An ancestor having it open covers `flock --close`, which keeps it in the
+# parent only. niri starts a session's programs detached, so ancestry stops there:
+# a launch in a nested session while the lock is held counts as under it.
+under_native_lock() {
+    native_lock=$(readlink -f -- "${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}" 2>/dev/null) || return 1
+    [ -f "$native_lock" ] && [ -r "$native_lock" ] || return 1
+    process=$$
+    while [ "${process:-0}" -gt 1 ]; do
+        for descriptor in "/proc/$process/fd/"*; do
+            [ "$(readlink -- "$descriptor" 2>/dev/null)" != "$native_lock" ] || return 0
+        done
+        process=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$process/status" 2>/dev/null) || return 1
+    done
+    in_nested_session && command -v flock >/dev/null 2>&1 && ! flock -n "$native_lock" true 2>/dev/null
+}
+
+in_nested_session() {
+    case ${XDG_RUNTIME_DIR:-} in
+        */nh-?*) return 0 ;;
+    esac
+    # niri names its socket with its process ID. One nested in another compositor
+    # inherited a display to draw on; a desktop's niri normally has none.
+    process=${NIRI_SOCKET:-}
+    process=${process%.sock}
+    process=${process##*.}
+    case $process in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$(cat "/proc/$process/comm" 2>/dev/null)" = niri ] || return 1
+    { tr '\0' '\n' <"/proc/$process/environ"; } 2>/dev/null | grep -Eq '^(WAYLAND_DISPLAY|DISPLAY)='
+}
+
+# Runs a build under the native lock, which may confirm the build is current but
+# must not compile, or queue for a build slot: a gate lock of its own takes it out
+# of the queue. Nothing else should take long, but a build script may still run and
+# Cargo may wait for another build using this target, so the time is bounded.
+# `timeout` runs in its own process group to end all of the build, which signals to
+# this launch's group then miss: it waits in the background so this shell's traps run
+# at once, and ending this shell, however that happens, sends `timeout` the TERM.
+without_compiling() {
+    seconds=${CAGENTS_NATIVE_LOCK_BUILD_SECONDS:-180}
+    case $seconds in
+        *[!0-9]* | 0 | 00*)
+            printf '%s\n' "CAGENTS_NATIVE_LOCK_BUILD_SECONDS must be a positive number of seconds: $seconds" >&2
+            return 2
+            ;;
+    esac
+    status=0
+    # The parent's death signal only covers a parent still alive when it's armed.
+    # shellcheck disable=SC2016 # expanded by the inner shell
+    setpriv --pdeathsig TERM sh -c '[ "$PPID" = "$1" ] || exit 143; shift; exec "$@"' guarded-build "$$" \
+        timeout "$seconds" env \
+        RUSTC_WRAPPER="$root/scripts/refuse-compile" CAGENTS_NATIVE_LOCK_HELD="$native_lock" \
+        CAGENTS_BUILD_LOCK="$products/.native-lock-gate" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
+        CAGENTS_BUILD_REMOTE=local "$@" &
+    wait "$!" || status=$?
+    if [ "$status" -eq 124 ]; then
+        printf '%s\n' "refusing to keep waiting while holding the native lock $native_lock: confirming that nothing needs compiling took over $seconds seconds. A build script may be running, or another build may be using this target." >&2
+    fi
+    return "$status"
+}
+
 if [ "$hot" = true ]; then
+    if under_native_lock; then
+        printf '%s\n' "refusing to hot reload while holding the native lock $native_lock: hot reload always builds, and other native sessions queue behind it." >&2
+        exit 78
+    fi
     # The helper owns locked builds, sibling staging and the read-only lock mount.
     set -- -- "$@"
     [ -z "$log_file" ] || set -- --log-file "$log_file" "$@"
@@ -268,6 +335,7 @@ find_products() {
 }
 products=
 build_dir=
+under_lock=false
 
 # Builds the matched set, each product through the gate: on the build host
 # each takes its own slot there and its executable comes back; with
@@ -277,6 +345,9 @@ build_dir=
 # graphs and make the UI compile Ghostty while making the daemon compile
 # libcosmic.
 build_products() {
+    if [ "$under_lock" = true ]; then
+        set -- without_compiling "$@"
+    fi
     # shellcheck disable=SC2016 # expanded by the inner shell
     "$@" sh -ec '
         gate=$1
@@ -540,6 +611,11 @@ fi
 if products_current; then
     printf '%s\n' 'The matched set is already built for this checkout; skipping the build.' >&2
 else
+    if under_native_lock; then
+        find_products
+        under_lock=true
+        printf '%s\n' "This launch holds the native lock $native_lock, so its build may only confirm that nothing needs compiling." >&2
+    fi
     build_and_record
 fi
 find_products
