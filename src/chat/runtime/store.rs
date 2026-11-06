@@ -288,7 +288,7 @@ impl Store {
                     }
                 }
             } else {
-                db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=1048576; PRAGMA foreign_keys=ON;").map_err(|error| error.to_string())?;
+                db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=1048576; PRAGMA busy_timeout=0; PRAGMA foreign_keys=ON;").map_err(|error| error.to_string())?;
             }
             db.execute_batch("CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
@@ -336,8 +336,10 @@ impl Store {
         result
     }
     /// A single large transaction can grow the WAL past the autocheckpoint
-    /// size; truncate it now rather than at the next write. Best-effort: a
-    /// busy checkpoint is retried after the next write.
+    /// size; truncate it now rather than at the next write. Best-effort: the
+    /// store is the file's only connection, so with no busy timeout a
+    /// checkpoint blocked by a reader returns at once and the next write
+    /// retries it.
     fn trim_wal(&self) {
         if fs::metadata(self.directory.join("transcript.sqlite-wal"))
             .is_ok_and(|wal| wal.len() > WAL_LIMIT)
@@ -1002,6 +1004,7 @@ impl Store {
                 self.latest_boundary = None;
                 self.dirty = true;
                 out.push(Event::Reset { reason });
+                self.trim_wal();
                 return Ok(out);
             }
             Event::HistoryLoading(false) => {
