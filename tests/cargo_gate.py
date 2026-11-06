@@ -2,10 +2,10 @@
 """Exercise held-command lifetime with private locks and owned processes only."""
 
 import contextlib
-import ctypes
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,9 +19,33 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Isolated Python (-I) leaves this directory off sys.path.
+_custody_spec = importlib.util.spec_from_file_location("fixture_custody", ROOT / "tests/fixture_custody.py")
+fixture_custody = importlib.util.module_from_spec(_custody_spec)
+_custody_spec.loader.exec_module(fixture_custody)
+FixtureDirectory = fixture_custody.FixtureDirectory
+
+
+def records(registry):
+    """A build registry's records of running builds, without its decision
+    lock or its records of waiting ones."""
+    return [path for path in registry.iterdir() if path.name.startswith(("gate-", "offload-"))]
+
+
+def start_time(pid):
+    return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+
+
+def uptime():
+    return int(float(Path("/proc/uptime").read_text().split()[0]))
+# Admission must not follow the memory pressure of the host running these
+# tests, nor its registry of real builds; the tests about either set them.
+os.environ["CAGENTS_BUILD_MEMORY_PRESSURE"] = "0"
+os.environ["CAGENTS_BUILD_REGISTRY"] = ""
 
 
 class CargoGateApplicability(unittest.TestCase):
@@ -519,17 +543,7 @@ class HeldCommand(unittest.TestCase):
     def setUpClass(cls):
         if sys.platform != "linux" or not hasattr(os, "pidfd_open"):
             raise unittest.SkipTest("Linux pidfds are required")
-        cls.libc = ctypes.CDLL(None, use_errno=True)
-        previous = ctypes.c_int()
-        if cls.libc.prctl(37, ctypes.byref(previous), 0, 0, 0):
-            raise OSError(ctypes.get_errno(), "cannot inspect child subreaper")
-        cls.previous_subreaper = previous.value
-        if cls.libc.prctl(36, 1, 0, 0, 0):
-            raise OSError(ctypes.get_errno(), "cannot own orphaned fixture descendants")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.libc.prctl(36, cls.previous_subreaper, 0, 0, 0)
+        # Importing fixture_custody made this process the gates' subreaper.
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-held-")
@@ -1194,17 +1208,7 @@ class PreflightCancellation(unittest.TestCase):
     def setUpClass(cls):
         if sys.platform != "linux" or not hasattr(os, "pidfd_open"):
             raise unittest.SkipTest("Linux pidfds are required")
-        cls.libc = ctypes.CDLL(None, use_errno=True)
-        previous = ctypes.c_int()
-        if cls.libc.prctl(37, ctypes.byref(previous), 0, 0, 0):
-            raise OSError(ctypes.get_errno(), "cannot inspect child subreaper")
-        cls.previous_subreaper = previous.value
-        if cls.libc.prctl(36, 1, 0, 0, 0):
-            raise OSError(ctypes.get_errno(), "cannot own orphaned fixture descendants")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.libc.prctl(36, cls.previous_subreaper, 0, 0, 0)
+        # Importing fixture_custody made this process the gates' subreaper.
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="gate-preflight-")
@@ -1414,9 +1418,9 @@ class TwoSlots(unittest.TestCase):
     """Two private slots, one of which a gated build can hold."""
 
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-memory-")
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.scope = FixtureDirectory(prefix="cagents-gate-memory-")
+        self.addCleanup(self.scope.close)
+        self.root = Path(self.scope.name)
         self.gate = self.root / "cargo-gate"
         shutil.copy2(ROOT / "scripts/cargo-gate", self.gate)
         shutil.copy2(ROOT / "scripts/cargo-gate-command.py", self.root / "cargo-gate-command.py")
@@ -1424,17 +1428,17 @@ class TwoSlots(unittest.TestCase):
             key: value for key, value in os.environ.items()
             if not key.startswith("CAGENTS_BUILD_") and key != "CARGO_BUILD_JOBS"
         } | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_SLOTS": "2",
-              "CAGENTS_BUILD_CPU_PRESSURE": "0", "CAGENTS_BUILD_REMOTE": "local",
+              "CAGENTS_BUILD_CPU_PRESSURE": "0", "CAGENTS_BUILD_MEMORY_PRESSURE": "0",
+              "CAGENTS_BUILD_REGISTRY": "", "CAGENTS_BUILD_REMOTE": "local",
               "CAGENTS_BUILD_INSTALLED_GATE": ""}
 
-    def hold(self, cost):
-        holder = subprocess.Popen(
+    def hold(self, cost, env=None, scope=None):
+        holder = (scope or self.scope).popen(
             [str(self.gate), "exec", "sh", "-c", f"touch {self.root}/held; "
              f"while [ ! -e {self.root}/release ]; do sleep 0.05; done"],
-            env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
+            env=(env or self.env) | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
             stderr=subprocess.DEVNULL,
         )
-        self.addCleanup(holder.wait, 10)
         self.holder = holder
         self.addCleanup((self.root / "release").touch)
         deadline = time.monotonic() + 10
@@ -1443,10 +1447,10 @@ class TwoSlots(unittest.TestCase):
             time.sleep(0.02)
         return holder
 
-    def build(self, cost, timeout):
-        return subprocess.run(
+    def build(self, cost, timeout, env=None):
+        return self.scope.run(
             [str(self.gate), "exec", "sh", "-c", 'printf "%s" "$CARGO_BUILD_JOBS"'],
-            env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
+            env=(env or self.env) | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
             capture_output=True, text=True, timeout=timeout,
         )
 
@@ -1538,16 +1542,17 @@ class MemoryAdmission(TwoSlots):
         self.assertEqual(int(result.stdout), max(4, min(8, os.cpu_count() // 2)))
 
     def test_a_slot_held_by_a_plain_flock_is_priced_not_fatal(self):
-        holder = subprocess.Popen(
+        holder = self.scope.popen(
             ["flock", self.root / "slot.lock", "sh", "-c",
              f"touch {self.root}/held; while [ ! -e {self.root}/release ]; do sleep 0.05; done"])
-        self.addCleanup(holder.wait, 10)
         self.addCleanup((self.root / "release").touch)
+        deadline = time.monotonic() + 10
         while not (self.root / "held").exists():
+            self.assertLess(time.monotonic(), deadline, "plain flock holder never admitted")
             time.sleep(0.02)
         # Priced as the largest build, so whether a small build fits depends
         # on this host; either way the gate admits or keeps waiting.
-        waiter = subprocess.Popen(
+        waiter = self.scope.popen(
             [str(self.gate), "exec", "true"], env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"},
             cwd=self.root, stderr=subprocess.PIPE, text=True)
         try:
@@ -1860,6 +1865,282 @@ class AdmissionTimeout(unittest.TestCase):
         self.assertEqual(process.returncode, 0, stderr)
         self.assertNotIn("timed out", stderr.lower())
 
+class HostRegistry(TwoSlots):
+    """Two slot families on one host, which a shared registry joins."""
+
+    def setUp(self):
+        super().setUp()
+        self.registry = self.root / "registry"
+        self.env["CAGENTS_BUILD_REGISTRY"] = str(self.registry)
+        self.other = self.env | {"CAGENTS_BUILD_LOCK": str(self.root / "other.lock"),
+                                 "CAGENTS_BUILD_SLOTS": "1"}
+
+    def test_a_build_in_another_family_is_priced_beside_this_one(self):
+        self.hold(1, env=self.other)
+        [entry] = records(self.registry)
+        self.assertEqual(entry.read_text().splitlines()[2], str(self.root / "other.lock"))
+        # Alone in its own family, it would start whatever its cost.
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(10**6, timeout=2)
+        (self.root / "release").touch()
+        self.holder.wait(timeout=10)
+        self.assertEqual(records(self.registry), [])
+        result = self.build(10**6, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_build_that_fits_beside_another_familys_shares_the_cpus(self):
+        self.hold(1, env=self.other)
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cpus = os.cpu_count()
+        self.assertEqual(int(result.stdout), max(4, min(8, cpus // 2)))
+
+    def test_an_offloaded_build_on_this_host_is_priced_too(self):
+        self.registry.mkdir()
+        lock_path = self.root / "slot-0-lock"
+        lock = lock_path.open("a")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # As scripts/cargo-offload records a leased slot before its command runs.
+        (self.registry / "offload-0").write_text(f"0 {10**6 * 2**20}\n0\n{lock_path}\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=2)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_record_whose_lock_is_free_or_gone_is_stale(self):
+        self.registry.mkdir()
+        (self.root / "free.lock").touch()
+        (self.registry / "gate-1").write_text(f"1 {10**6 * 2**20}\n0\n{self.root}/free.lock\n")
+        (self.registry / "gate-2").write_text(f"1 {10**6 * 2**20}\n0\n{self.root}/gone.lock\n")
+        result = self.build(10**6, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "gone.lock").exists())
+
+    def test_a_private_family_has_no_registry_unless_named(self):
+        # In a directory named as the shared locks are, as this suite's are,
+        # whose builds end before it is removed.
+        fixture = FixtureDirectory(prefix="cagents-gate-", dir="/var/tmp")
+        self.addCleanup(fixture.close)
+        lock = os.path.join(fixture.name, "slot.lock")
+        env = self.env | {"CAGENTS_BUILD_LOCK": lock}
+        del env["CAGENTS_BUILD_REGISTRY"]
+        def name(path):
+            return fixture.run(["cksum"], input=path.encode(), capture_output=True,
+                               check=True).stdout.split()[0].decode()
+        host = Path(f"/var/tmp/cagents-builds-{os.getuid()}")
+        self.hold(1, env=env, scope=fixture)
+        held = fixture.popen(
+            [str(self.gate), "exec", "sh", "-c", f"touch {self.root}/second; sleep 1"],
+            env=env | {"CAGENTS_BUILD_COST_GIB": "1"}, cwd=self.root,
+            stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 10
+        while not (self.root / "second").exists():
+            self.assertLess(time.monotonic(), deadline, "second build never admitted")
+            time.sleep(0.02)
+        for record in (f"gate-{name(lock)}", f"gate-{name(lock + '.1')}",
+                       f"wait-gate-{name(lock)}"):
+            self.assertFalse((host / record).exists(), record)
+        self.assertEqual(held.wait(timeout=10), 0)
+        (self.root / "release").touch()
+        self.holder.wait(timeout=10)
+        self.assertFalse(self.registry.exists())
+
+    def test_the_callers_descriptor_5_reaches_the_command(self):
+        output = self.root / "via-5"
+        result = self.scope.run(
+            ["sh", "-c", 'exec 5>"$1"; shift; exec "$@"', "sh", str(output),
+             str(self.gate), "exec", "sh", "-c", "echo via5 >&5"], env=self.env,
+            cwd=self.root, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.read_text(), "via5\n")
+
+    def test_a_registry_this_gate_cannot_write_leaves_its_family_alone(self):
+        for registry in ("/proc", str(self.root / "file")):
+            with self.subTest(registry=registry):
+                (self.root / "file").touch()
+                result = self.build(1, timeout=10, env=self.env | {"CAGENTS_BUILD_REGISTRY": registry})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("cannot use the build registry", result.stderr)
+
+    def test_a_family_waits_while_another_decides(self):
+        self.registry.mkdir()
+        with (self.registry / ".decision").open("a") as decision:
+            fcntl.flock(decision, fcntl.LOCK_EX)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.build(1, timeout=2)
+        self.assertEqual(self.build(1, timeout=10).returncode, 0)
+
+    def held_elsewhere(self, record):
+        """A build in another family, holding its lock, whose record is
+        `record` with `{lock}` for the lock's path."""
+        self.registry.mkdir(exist_ok=True)
+        path = self.root / "elsewhere.lock"
+        if not hasattr(self, "elsewhere"):
+            self.elsewhere = path.open("a")
+            self.addCleanup(self.elsewhere.close)
+            fcntl.flock(self.elsewhere, fcntl.LOCK_EX)
+        (self.registry / "gate-elsewhere").write_text(record.format(lock=path))
+
+    def with_memory(self, gib):
+        """This family's environment, on a host with `gib` GiB available."""
+        tools = self.root / "tools"
+        tools.mkdir(exist_ok=True)
+        meminfo = self.root / "meminfo"
+        meminfo.write_text(f"MemTotal: {64 * 2**20} kB\nMemAvailable: {gib * 2**20} kB\n")
+        sed = tools / "sed"
+        sed.write_text(
+            "#!/usr/bin/python3\nimport os,sys\n"
+            f"arguments = [{str(meminfo)!r} if argument == '/proc/meminfo' "
+            "else argument for argument in sys.argv[1:]]\n"
+            "os.execv('/usr/bin/sed', ['sed', *arguments])\n")
+        sed.chmod(0o700)
+        return self.env | {"PATH": f"{tools}:{self.env['PATH']}"}
+
+    def test_a_record_whose_holder_died_is_priced_at_the_largest_cost(self):
+        dead = self.scope.popen(["true"])
+        dead.wait()
+        env = self.with_memory(8)
+        self.held_elsewhere(f"{dead.pid} 1\n0\n{{lock}}\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=2, env=env)
+        # An offloaded build yet to start its command is priced at its cost.
+        self.held_elsewhere("0 1\n0\n{lock}\n")
+        self.assertEqual(self.build(1, timeout=10, env=env).returncode, 0)
+
+    def test_the_build_waiting_longest_starts_whatever_the_memory(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=2, env=env | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "0"})
+        result = self.build(1, timeout=10, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("refused room longest on this host", result.stderr)
+        self.assertEqual([path.name for path in self.registry.iterdir()
+                          if path.name.startswith("wait-")], [])
+
+    def test_a_build_that_comes_to_fit_is_not_admitted_as_overdue(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        # Another build admitted as overdue keeps this one from being so.
+        ramping = self.root / "ramping.lock"
+        with ramping.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            record = self.registry / "offload-ramping"
+            record.write_text(f"{os.getpid()} {8 * 2**20}\n{uptime()}\n{ramping}\noverdue\n")
+            waiter = self.scope.popen(
+                [str(self.gate), "exec", "true"], env=env | {"CAGENTS_BUILD_COST_GIB": "1"},
+                cwd=self.root, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(waiter.stderr.close)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                waiter.wait(timeout=3)
+            # Refused for longer than the priority time, it now fits: both
+            # changes in one decision, so the gate sees neither or both.
+            with (self.registry / ".decision").open("a") as decision:
+                fcntl.flock(decision, fcntl.LOCK_EX)
+                self.held_elsewhere(f"{os.getpid()} 1\n0\n{{lock}}\n")
+                record.unlink()
+            self.assertEqual(waiter.wait(timeout=10), 0)
+        self.assertNotIn("refused room longest", waiter.stderr.read())
+
+    def test_refusals_that_stopped_start_the_priority_time_again(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "5"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        waiter = self.scope.popen(
+            [str(self.gate), "exec", "true"], env=env | {"CAGENTS_BUILD_COST_GIB": "1"},
+            cwd=self.root, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(waiter.stderr.close)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            waiter.wait(timeout=1.5)
+        # No decision, and so no refusal, for longer than a refusal stays fresh.
+        with (self.registry / ".decision").open("a") as decision:
+            fcntl.flock(decision, fcntl.LOCK_EX)
+            time.sleep(11.5)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            waiter.wait(timeout=3)
+        self.assertEqual(waiter.wait(timeout=15), 0)
+        self.assertIn("refused room longest", waiter.stderr.read())
+
+    def test_one_overdue_build_ramps_up_at_a_time(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n{uptime()}\n{{lock}}\noverdue\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=3, env=env)
+        # Past its ramp-up, or with its holder gone, it no longer holds others back.
+        dead = self.scope.popen(["true"])
+        dead.wait()
+        for record in (f"{os.getpid()} {8 * 2**20}\n{uptime() - 600}\n{{lock}}\noverdue\n",
+                       f"{dead.pid} {8 * 2**20}\n{uptime()}\n{{lock}}\noverdue\n"):
+            with self.subTest(record=record):
+                self.held_elsewhere(record)
+                result = self.build(1, timeout=10, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("refused room longest", result.stderr)
+
+    def test_an_overdue_build_gives_way_to_one_refused_longer(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        older = self.registry / "wait-offload-older"
+        mine = f"{os.getpid()} {start_time(os.getpid())}"
+        older.write_text(f"{mine} {uptime() - 60} {uptime()}\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=3, env=env)
+        # Neither a build refused no longer, nor a record left by a process
+        # that has exited, is still waiting for room.
+        for record in (f"{mine} {uptime() - 60} {uptime() - 11}\n",
+                       f"{os.getpid()} {start_time(os.getpid()) + 1} {uptime() - 60} {uptime()}\n"):
+            with self.subTest(record=record):
+                older.write_text(record)
+                self.assertEqual(self.build(1, timeout=10, env=env).returncode, 0)
+
+
+class MemoryPressureAdmission(TwoSlots):
+    """Two slots and memory to spare; the memory pressure comes from a fixture."""
+
+    def setUp(self):
+        super().setUp()
+        self.pressure = self.root / "memory-pressure"
+        self.env |= {"CAGENTS_BUILD_MEMORY_PRESSURE": "10",
+                     "CAGENTS_BUILD_MEMORY_PRESSURE_FILE": str(self.pressure)}
+
+    def report(self, some):
+        self.pressure.write_text(
+            f"some avg10={some} avg60=4.00 avg300=2.00 total=1\n"
+            "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+
+    def test_a_build_waits_while_tasks_stall_on_memory(self):
+        self.report("10.00")
+        self.hold(1)
+        waiter = self.scope.popen(
+            [str(self.gate), "exec", "true"], env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"},
+            cwd=self.root, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(waiter.stderr.close)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            waiter.wait(timeout=2)
+        self.report("9.99")
+        self.assertEqual(waiter.wait(timeout=10), 0)
+        self.assertIn("memory under pressure (10%, limit 10%)", waiter.stderr.read())
+
+    def test_a_lone_build_starts_whatever_the_memory_pressure(self):
+        self.report("100.00")
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_zero_disables_and_invalid_limits_are_refused(self):
+        self.report("100.00")
+        self.env["CAGENTS_BUILD_MEMORY_PRESSURE"] = "0"
+        self.hold(1)
+        self.assertEqual(self.build(1, timeout=10).returncode, 0)
+        for value in ("010", "101", "high"):
+            result = self.scope.run(
+                [str(self.gate), "exec", "true"],
+                env=self.env | {"CAGENTS_BUILD_MEMORY_PRESSURE": value},
+                cwd=self.root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 2, value)
+            self.assertIn("CAGENTS_BUILD_MEMORY_PRESSURE", result.stderr)
+
+
 class CpuPressureAdmission(TwoSlots):
     """Two slots and memory to spare; the CPU pressure comes from a fixture."""
 
@@ -1886,7 +2167,7 @@ class CpuPressureAdmission(TwoSlots):
     def test_a_build_waits_while_cpu_pressure_is_at_the_limit(self):
         self.report("60.00")
         self.hold(1)
-        waiter = subprocess.Popen(
+        waiter = self.scope.popen(
             [str(self.gate), "exec", "true"], env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"},
             cwd=self.root, stderr=subprocess.PIPE, text=True)
         self.addCleanup(waiter.stderr.close)
@@ -1907,7 +2188,7 @@ class CpuPressureAdmission(TwoSlots):
         self.report("0.00")
         self.hold(1)
         with self.assertRaises(subprocess.TimeoutExpired):
-            subprocess.run(
+            self.scope.run(
                 [str(self.gate), "exec", "true"],
                 env=self.env | {"CAGENTS_BUILD_COST_GIB": "1", "CAGENTS_BUILD_CPU_SETTLE_SECS": "3600"},
                 cwd=self.root, capture_output=True, timeout=2)
@@ -1939,12 +2220,13 @@ class CpuPressureAdmission(TwoSlots):
         """Holds slot `index` with a plain `flock` and prices it with `sidecar`,
         a gate's cost file, whose holder is this test."""
         path = self.root / ("slot.lock" if index == 0 else f"slot.lock.{index}")
-        holder = subprocess.Popen(
+        holder = self.scope.popen(
             ["flock", path, "sh", "-c",
              f"touch {path}.held; while [ ! -e {self.root}/release ]; do sleep 0.05; done"])
-        self.addCleanup(holder.wait, 10)
         self.addCleanup((self.root / "release").touch)
+        deadline = time.monotonic() + 10
         while not Path(f"{path}.held").exists():
+            self.assertLess(time.monotonic(), deadline, "plain flock holder never admitted")
             time.sleep(0.02)
         Path(f"{path}.cost").write_text(sidecar.format(pid=os.getpid()))
 
@@ -1994,6 +2276,7 @@ class CpuPressureAdmission(TwoSlots):
             "FIXTURE_MEMINFO": str(memory), "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
             "CAGENTS_BUILD_SLOTS": "3", "CARGO_BUILD_JOBS": "1",
             "CAGENTS_BUILD_CPU_PRESSURE": "0" if disabled else "60",
+            "CAGENTS_BUILD_MEMORY_PRESSURE": "0",
             "CAGENTS_BUILD_CPU_SETTLE_SECS": "60",
             "CAGENTS_BUILD_CPU_PRESSURE_FILE": str(self.pressure),
             "CAGENTS_BUILD_COST_GIB": "7", "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1",
@@ -2011,7 +2294,7 @@ class CpuPressureAdmission(TwoSlots):
                 cost = Path(str(path) + ".cost")
                 cost.write_text(f"{os.getpid()} 1\n{dates[start]}\n")
                 costs[cost] = cost.read_bytes()
-            process = subprocess.Popen(
+            process = self.scope.popen(
                 [str(self.gate), "exec", "/bin/sh", "-c", 'printf admitted > "$1"',
                  "fixture", str(command)], cwd=self.root, env=environment,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -2067,7 +2350,7 @@ class CpuPressureAdmission(TwoSlots):
         self.hold(1)
         cost = next(self.root.glob("slot.lock*.cost")).read_text()
         # The one-line read of gates that predate dated starts.
-        result = subprocess.run(
+        result = self.scope.run(
             ["sh", "-c", 'read -r holder claimed; printf "%s:%s" "$holder" "$claimed"'],
             input=cost, capture_output=True, text=True, check=True)
         holder, claimed = result.stdout.split(":")
@@ -2091,6 +2374,33 @@ class CpuPressureAdmission(TwoSlots):
         if os.cpu_count() >= 20 and memory_gib >= 28:
             self.assertEqual(len(slots), 4)
 
+
+class FixtureCustody(unittest.TestCase):
+    def test_a_timed_out_command_and_its_new_session_child_end_before_the_directory_goes(self):
+        scope = FixtureDirectory()
+        self.addCleanup(scope.close)
+        root = Path(scope.name)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            # The command execs so nothing but the sweep can reap its children.
+            scope.run(["sh", "-c", f"sleep 60 & echo $! >{root}/ordinary; "
+                       f"setsid sleep 60 & echo $! >{root}/detached; exec sleep 60"], timeout=1)
+        pidfds = [os.pidfd_open(int((root / name).read_text())) for name in ("ordinary", "detached")]
+        self.addCleanup(lambda: [os.close(pidfd) for pidfd in pidfds])
+        # The command's group is gone; the child in its own session is not.
+        self.assertFalse(select.select([pidfds[1]], [], [], 0)[0])
+        settled = fixture_custody.settle
+        survivors = None
+
+        def settle():
+            nonlocal survivors
+            self.assertTrue(root.is_dir())
+            settled()
+            survivors = [pidfd for pidfd in pidfds if not select.select([pidfd], [], [], 0)[0]]
+
+        with unittest.mock.patch.object(fixture_custody, "settle", settle):
+            scope.close()
+        self.assertEqual(survivors, [])
+        self.assertFalse(root.exists())
 
 
 if __name__ == "__main__":

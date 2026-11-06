@@ -16400,6 +16400,9 @@ impl Application for Cagents {
                 if self.core.main_window_id() != Some(window) {
                     return Task::none();
                 }
+                // The workspace is on screen: a daemon startup notice has
+                // nothing left to explain.
+                instance::dismiss_startup_wait_notice();
                 let report = self.begin_startup_gate();
                 // window::run silently drops callbacks for windows that have not
                 // opened yet. Initialize only after iced acknowledges this one.
