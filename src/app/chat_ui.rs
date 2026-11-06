@@ -14956,7 +14956,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_chat_pins_selected_home_credential_policy_and_system_inherits() {
+    fn new_chat_pins_selected_home_credential_policy_and_system_resolves_the_default() {
         for provider in Account::PROVIDERS {
             for account in [
                 Account::system(provider),
@@ -14971,11 +14971,19 @@ mod tests {
                     false,
                 )
                 .unwrap();
-                let expected = account
+                let mut expected: std::collections::BTreeSet<String> = account
                     .credential_overrides()
                     .iter()
                     .map(|name| (*name).to_owned())
                     .collect();
+                // The system Claude login resolves the CLI's default home
+                // rather than one the spawning process inherited.
+                if account.is_system()
+                    && provider == Provider::Claude
+                    && account.launch_home().is_none()
+                {
+                    expected.insert("CLAUDE_CONFIG_DIR".to_owned());
+                }
                 assert_eq!(session.launch.recipe.unset_environment, expected);
                 for name in account.credential_overrides() {
                     assert!(!session.launch.recipe.environment.contains_key(*name));
