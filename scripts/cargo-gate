@@ -143,6 +143,11 @@ Environment:
                          default /var/tmp/cagents-builds-UID for a lock named
                          /var/tmp/cagents-*.lock, otherwise none; empty
                          disables
+  CAGENTS_BUILD_WAIT_PRIORITY_SECS
+                         Seconds after which the build that has waited
+                         longest on the host starts beside the running
+                         builds whatever their memory, one such build at a
+                         time; default 120; 0 disables
   CAGENTS_BUILD_COST_GIB Memory this build is expected to need at its peak;
                          default by kind, from 3 GiB for the CLI lane to
                          9 GiB for a UI build
@@ -257,11 +262,23 @@ lock=${CAGENTS_BUILD_LOCK:-/var/tmp/cagents-cargo.lock}
 if [ -n "${CAGENTS_BUILD_REGISTRY+set}" ]; then
     registry=$CAGENTS_BUILD_REGISTRY
 else
+    # Only locks directly in /var/tmp: a pattern's `*` matches `/` too, and a
+    # private family's lock may lie in a directory named like a shared one.
     case $lock in
-        /var/tmp/cagents-*.lock) registry=/var/tmp/cagents-builds-$(id -u) ;;
+        /var/tmp/cagents-*.lock)
+            case ${lock#/var/tmp/cagents-} in
+                */*) registry= ;;
+                *) registry=/var/tmp/cagents-builds-$(id -u) ;;
+            esac
+            ;;
         *) registry= ;;
     esac
 fi
+priority_secs=${CAGENTS_BUILD_WAIT_PRIORITY_SECS-120}
+case $priority_secs in
+    0) ;;
+    ''|*[!0-9]*|0*) fail 'CAGENTS_BUILD_WAIT_PRIORITY_SECS must be a whole number of seconds' ;;
+esac
 
 # The memory a build is expected to need at its peak, in KiB: the whole
 # process tree's resident memory, measured on this repository's builds with 8
@@ -369,7 +386,9 @@ memory_allows() {
 
 # Counts a running build whose record, read from standard input, is its
 # holder's PID and expected cost, then its start in seconds since boot. A
-# record whose holder has exited is priced as unknown: the largest cost.
+# record whose holder has exited is priced as unknown: the largest cost. PID
+# 0 is an offloaded build whose command has not started: its cost, with
+# nothing held yet.
 count_running() {
     running=$((running + 1))
     claim= holder= claimed= since=
@@ -377,11 +396,10 @@ count_running() {
     case $holder:$claimed in
         *[!0-9:]*|:*|*:) ;;
         *)
-            if [ -d "/proc/$holder" ]; then
+            if [ "$holder" -eq 0 ] || [ -d "/proc/$holder" ]; then
                 claim="$holder:$claimed"
-            else
-                claim="0:$claimed"
             fi
+            [ -n "$claim" ] || since=
             case $since in
                 ''|*[!0-9]*) ;;
                 *)
@@ -406,45 +424,118 @@ own_slot() {
     return 1
 }
 
+# Whether something holds the lock file `$1`. A child probes it, as the
+# admission decision holds descriptor 7.
+locked() {
+    if flock -n -E 75 "$1" true 2>/dev/null; then
+        return 1
+    else
+        [ "$?" -eq 75 ]
+    fi
+}
+
+# The lock named by the registry record `$1` while a build holds it: a record
+# of a free lock is stale. Only regular files are probed, as opening anything
+# else could fail or block.
+running_lock() {
+    case $1 in *.new) return 1 ;; esac
+    [ -f "$1" ] || return 1
+    held_lock=$(sed -n 3p "$1" 2>/dev/null) || return 1
+    [ -n "$held_lock" ] && [ -f "$held_lock" ] && locked "$held_lock"
+}
+
 # Counts the registry's builds in other families: each record names its slot's
-# lock, which its build holds while it runs; a record of a free lock is stale.
+# lock, which its build holds while it runs.
 count_registered() {
     [ -n "$registry" ] || return 0
-    for entry in "$registry"/*; do
-        [ -f "$entry" ] || continue
-        held_lock=$(sed -n 3p "$entry" 2>/dev/null) || continue
-        [ -n "$held_lock" ] && [ -e "$held_lock" ] || continue
-        ! own_slot "$held_lock" || continue
-        # A failed redirection on `exec` would end the shell.
-        [ -w "$held_lock" ] || continue
-        exec 7>>"$held_lock"
-        if flock -n 7; then
-            exec 7>&-
-            continue
-        fi
-        exec 7>&-
-        count_running <"$entry"
+    for entry in "$registry"/gate-* "$registry"/offload-*; do
+        running_lock "$entry" || continue
+        own_slot "$held_lock" || count_running <"$entry"
     done
 }
 
 # Families decide one at a time: from pricing the running builds until this
-# one's record is written, on descriptor 5, so two families cannot each admit
-# a build into the same free memory.
+# one's record is written, on descriptor 7, so two families cannot each admit
+# a build into the same free memory. A registry this gate cannot write leaves
+# it pricing its own family alone, as a failed redirection on `exec` would end
+# the shell.
 decide() {
+    deciding=
     [ -n "$registry" ] || return 0
-    mkdir -p -m 0700 "$registry" 2>/dev/null || return 0
-    exec 5>>"$registry/.decision"
-    flock 5
+    mkdir -p -m 0700 "$registry" 2>/dev/null || :
+    if [ -d "$registry" ] && [ -w "$registry" ] && {
+        [ ! -e "$registry/.decision" ] || { [ -f "$registry/.decision" ] && [ -w "$registry/.decision" ]; }
+    }; then
+        exec 7>>"$registry/.decision"
+        flock 7
+        deciding=yes
+    else
+        printf '%s: cannot use the build registry %s; pricing this slot family alone\n' \
+            "$program" "$registry" >&2
+        registry=
+    fi
 }
 
 decided() {
-    [ -n "$registry" ] || return 0
-    exec 5>&-
+    [ -z "$deciding" ] || exec 7>&-
+    deciding=
 }
 
 # The registry record of this family's slot `$1`.
 registry_entry() {
     printf '%s/gate-%s' "$registry" "$(printf '%s' "$1" | cksum | cut -d ' ' -f 1)"
+}
+
+# This family's record of the build waiting at the head of its queue.
+wait_entry() {
+    printf '%s/wait-gate-%s' "$registry" "$(printf '%s' "$lock" | cksum | cut -d ' ' -f 1)"
+}
+
+# When process `$1` started, in clock ticks since boot, to tell it from a
+# later process given its PID.
+start_time() {
+    sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -d ' ' -f 20
+}
+
+# Records this build as waiting, from when it asked for a slot, so another
+# family's build that waits longer can tell which of them is the oldest.
+record_wait() {
+    [ -n "$registry" ] && [ -z "$wait_recorded" ] || return 0
+    wait_recorded=yes
+    entry=$(wait_entry)
+    { printf '%s %s %s\n' "$$" "$(start_time "$$")" "$waited_since" >"$entry.new" &&
+        mv -f -- "$entry.new" "$entry"; } 2>/dev/null || :
+}
+
+forget_wait() {
+    [ -z "$wait_recorded" ] || rm -f -- "$(wait_entry)"
+    wait_recorded=
+}
+
+# Whether this build is overdue: it has waited the priority time, longer than
+# every other build waiting on the host, and no build admitted that way still
+# runs. It then starts whatever the memory, so a large build cannot wait
+# forever behind smaller ones that keep fitting, nor more than one such build
+# fill memory that the others are priced against.
+overdue() {
+    [ -n "$registry" ] && [ "$priority_secs" -gt 0 ] || return 1
+    [ $(($(date +%s) - waited_since)) -ge "$priority_secs" ] || return 1
+    mine=$(wait_entry)
+    for entry in "$registry"/wait-*; do
+        case $entry in "$mine"|*.new) continue ;; esac
+        [ -f "$entry" ] || continue
+        pid= started= since=
+        read -r pid started since <"$entry" 2>/dev/null || continue
+        case $pid:$started:$since in *[!0-9:]*|*::*|:*|*:) continue ;; esac
+        [ "$since" -lt "$waited_since" ] ||
+            { [ "$since" -eq "$waited_since" ] && [ "$pid" -lt "$$" ]; } || continue
+        [ "$(start_time "$pid")" = "$started" ] || continue
+        return 1
+    done
+    for entry in "$registry"/gate-* "$registry"/offload-*; do
+        [ "$(sed -n 4p "$entry" 2>/dev/null)" = overdue ] || continue
+        ! running_lock "$entry" || return 1
+    done
 }
 
 # Whether this build fits beside the builds in the slots other than $1: the
@@ -458,24 +549,27 @@ fits() {
     running=0
     claims=
     newest=
+    late=
     other=0
     while [ "$other" -lt "$slots" ]; do
         if [ "$other" -ne "$1" ]; then
             path=$(slot_path "$other")
-            exec 7>>"$path"
-            if ! flock -n 7; then
+            if locked "$path"; then
                 if [ -r "$path.cost" ]; then
                     count_running <"$path.cost"
                 else
                     count_running </dev/null
                 fi
             fi
-            exec 7>&-
         fi
         other=$((other + 1))
     done
     count_registered
     [ "$running" -gt 0 ] || return 0
+    if overdue; then
+        late=yes
+        return 0
+    fi
     cpu_allows || return 1
     memory_allows || return 1
     # One process listing prices every running build: its expected cost less
@@ -527,6 +621,7 @@ acquire() {
     memory_announced=false
     waited_since=$(date +%s)
     waiter=
+    wait_recorded=
     # Both queue and slot requests are private lock waiters, bound to this
     # gate's lifetime. The admitted command alone inherits caller descriptors.
     trap 'withdraw; exit 130' INT
@@ -570,6 +665,7 @@ acquire() {
                 admitted
                 return
             fi
+            record_wait
             decided
             flock -u 9
             exec 9>&-
@@ -610,6 +706,7 @@ acquire() {
             fi
             exec 9>&-
         done
+        [ "$fit" != no ] || record_wait
         decided
         announce
         sleep 0.2
@@ -638,6 +735,7 @@ withdraw() {
     fi
     exec 6>&-
     waiter=
+    forget_wait
 }
 
 # Whether the queued request has exited; an unreaped one is a zombie.
@@ -657,11 +755,16 @@ admitted() {
     # is a line of its own, which gates that only price builds do not read.
     since=$(uptime_seconds)
     printf '%s %s\n%s\n' "$$" "$cost" "$since" >"$(slot_path "$index").cost" 2>/dev/null || :
-    if [ -n "$registry" ] && mkdir -p -m 0700 "$registry" 2>/dev/null; then
-        printf '%s %s\n%s\n%s\n' "$$" "$cost" "$since" "$(slot_path "$index")" \
+    if [ -n "$registry" ]; then
+        # The fourth line marks a build admitted as overdue.
+        printf '%s %s\n%s\n%s\n%s\n' "$$" "$cost" "$since" "$(slot_path "$index")" "${late:+overdue}" \
             >"$(registry_entry "$(slot_path "$index")")" 2>/dev/null || :
+        forget_wait
     fi
     decided
+    if [ -n "$late" ]; then
+        printf '%s: waited longest on this host; starting beside the running builds\n' "$program" >&2
+    fi
     exec 8>&-
     # Each build gets a share of the CPUs among the builds running once it
     # starts, replacing the repository's two-job default and capping a larger

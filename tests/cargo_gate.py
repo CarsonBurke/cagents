@@ -25,8 +25,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def records(registry):
-    """A build registry's records, without its decision lock."""
-    return [path for path in registry.iterdir() if not path.name.startswith(".")]
+    """A build registry's records of running builds, without its decision
+    lock or its records of waiting ones."""
+    return [path for path in registry.iterdir() if path.name.startswith(("gate-", "offload-"))]
+
+
+def start_time(pid):
+    return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
 # Admission must not follow the memory pressure of the host running these
 # tests, nor its registry of real builds; the tests about either set them.
 os.environ["CAGENTS_BUILD_MEMORY_PRESSURE"] = "0"
@@ -1434,7 +1439,8 @@ class TwoSlots(unittest.TestCase):
             if not key.startswith("CAGENTS_BUILD_") and key != "CARGO_BUILD_JOBS"
         } | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_SLOTS": "2",
               "CAGENTS_BUILD_CPU_PRESSURE": "0", "CAGENTS_BUILD_MEMORY_PRESSURE": "0",
-              "CAGENTS_BUILD_REMOTE": "local", "CAGENTS_BUILD_INSTALLED_GATE": ""}
+              "CAGENTS_BUILD_REGISTRY": "", "CAGENTS_BUILD_REMOTE": "local",
+              "CAGENTS_BUILD_INSTALLED_GATE": ""}
 
     def hold(self, cost, env=None):
         holder = subprocess.Popen(
@@ -1452,10 +1458,10 @@ class TwoSlots(unittest.TestCase):
             time.sleep(0.02)
         return holder
 
-    def build(self, cost, timeout):
+    def build(self, cost, timeout, env=None):
         return subprocess.run(
             [str(self.gate), "exec", "sh", "-c", 'printf "%s" "$CARGO_BUILD_JOBS"'],
-            env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
+            env=(env or self.env) | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
             capture_output=True, text=True, timeout=timeout,
         )
 
@@ -1874,11 +1880,125 @@ class HostRegistry(TwoSlots):
         self.assertFalse((self.root / "gone.lock").exists())
 
     def test_a_private_family_has_no_registry_unless_named(self):
-        del self.env["CAGENTS_BUILD_REGISTRY"]
-        self.hold(1)
-        (self.root / "release").touch()
-        self.holder.wait(timeout=10)
+        # In a directory named as the shared locks are, as this suite's are.
+        with tempfile.TemporaryDirectory(prefix="cagents-gate-", dir="/var/tmp") as private:
+            lock = os.path.join(private, "slot.lock")
+            env = self.env | {"CAGENTS_BUILD_LOCK": lock}
+            del env["CAGENTS_BUILD_REGISTRY"]
+            def name(path):
+                return subprocess.run(["cksum"], input=path.encode(), capture_output=True,
+                                      check=True).stdout.split()[0].decode()
+            host = Path(f"/var/tmp/cagents-builds-{os.getuid()}")
+            self.hold(1, env=env)
+            held = subprocess.Popen(
+                [str(self.gate), "exec", "sh", "-c", f"touch {self.root}/second; sleep 1"],
+                env=env | {"CAGENTS_BUILD_COST_GIB": "1"}, cwd=self.root,
+                stderr=subprocess.DEVNULL)
+            deadline = time.monotonic() + 10
+            while not (self.root / "second").exists():
+                self.assertLess(time.monotonic(), deadline, "second build never admitted")
+                time.sleep(0.02)
+            for record in (f"gate-{name(lock)}", f"gate-{name(lock + '.1')}",
+                           f"wait-gate-{name(lock)}"):
+                self.assertFalse((host / record).exists(), record)
+            self.assertEqual(held.wait(timeout=10), 0)
+            (self.root / "release").touch()
+            self.holder.wait(timeout=10)
         self.assertFalse(self.registry.exists())
+
+    def test_the_callers_descriptor_5_reaches_the_command(self):
+        output = self.root / "via-5"
+        with output.open("w") as file:
+            os.dup2(file.fileno(), 5, inheritable=True)
+            try:
+                result = subprocess.run(
+                    [str(self.gate), "exec", "sh", "-c", "echo via5 >&5"], env=self.env,
+                    cwd=self.root, capture_output=True, text=True, timeout=10, pass_fds=(5,))
+            finally:
+                os.close(5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.read_text(), "via5\n")
+
+    def test_a_registry_this_gate_cannot_write_leaves_its_family_alone(self):
+        for registry in ("/proc", str(self.root / "file")):
+            with self.subTest(registry=registry):
+                (self.root / "file").touch()
+                result = self.build(1, timeout=10, env=self.env | {"CAGENTS_BUILD_REGISTRY": registry})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("cannot use the build registry", result.stderr)
+
+    def test_a_family_waits_while_another_decides(self):
+        self.registry.mkdir()
+        with (self.registry / ".decision").open("a") as decision:
+            fcntl.flock(decision, fcntl.LOCK_EX)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.build(1, timeout=2)
+        self.assertEqual(self.build(1, timeout=10).returncode, 0)
+
+    def held_elsewhere(self, record):
+        """A build in another family, holding its lock, whose record is
+        `record` with `{lock}` for the lock's path."""
+        self.registry.mkdir(exist_ok=True)
+        path = self.root / "elsewhere.lock"
+        if not hasattr(self, "elsewhere"):
+            self.elsewhere = path.open("a")
+            self.addCleanup(self.elsewhere.close)
+            fcntl.flock(self.elsewhere, fcntl.LOCK_EX)
+        (self.registry / "gate-elsewhere").write_text(record.format(lock=path))
+
+    def with_memory(self, gib):
+        """This family's environment, on a host with `gib` GiB available."""
+        tools = self.root / "tools"
+        tools.mkdir(exist_ok=True)
+        meminfo = self.root / "meminfo"
+        meminfo.write_text(f"MemTotal: {64 * 2**20} kB\nMemAvailable: {gib * 2**20} kB\n")
+        sed = tools / "sed"
+        sed.write_text(
+            "#!/usr/bin/python3\nimport os,sys\n"
+            f"arguments = [{str(meminfo)!r} if argument == '/proc/meminfo' "
+            "else argument for argument in sys.argv[1:]]\n"
+            "os.execv('/usr/bin/sed', ['sed', *arguments])\n")
+        sed.chmod(0o700)
+        return self.env | {"PATH": f"{tools}:{self.env['PATH']}"}
+
+    def test_a_record_whose_holder_died_is_priced_at_the_largest_cost(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        env = self.with_memory(8)
+        self.held_elsewhere(f"{dead.pid} 1\n0\n{{lock}}\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=2, env=env)
+        # An offloaded build yet to start its command is priced at its cost.
+        self.held_elsewhere("0 1\n0\n{lock}\n")
+        self.assertEqual(self.build(1, timeout=10, env=env).returncode, 0)
+
+    def test_the_build_waiting_longest_starts_whatever_the_memory(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=2, env=env | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "0"})
+        result = self.build(1, timeout=10, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("waited longest on this host", result.stderr)
+        self.assertEqual([path.name for path in self.registry.iterdir()
+                          if path.name.startswith("wait-")], [])
+
+    def test_one_overdue_build_runs_at_a_time(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\noverdue\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=3, env=env)
+
+    def test_an_overdue_build_gives_way_to_one_waiting_longer(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        older = self.registry / "wait-offload-older"
+        older.write_text(f"{os.getpid()} {start_time(os.getpid())} {int(time.time()) - 60}\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=3, env=env)
+        # A record left by a process that has exited is not a waiting build.
+        older.write_text(f"{os.getpid()} {start_time(os.getpid()) + 1} {int(time.time()) - 60}\n")
+        self.assertEqual(self.build(1, timeout=10, env=env).returncode, 0)
 
 
 class MemoryPressureAdmission(TwoSlots):

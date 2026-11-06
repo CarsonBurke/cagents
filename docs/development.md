@@ -358,8 +358,7 @@ when the memory available, less what the running builds are expected to take
 beyond what they already hold, covers its own, and while the kernel's memory
 pressure (`some avg10` in `/proc/pressure/memory`, the share of time some task
 stalled on reclaim) is below 10% (`CAGENTS_BUILD_MEMORY_PRESSURE`; `0` disables
-it). A lone build always starts, whatever the memory or pressure, so no build
-waits forever. Each build gets a
+it). A lone build always starts, whatever the memory or pressure. Each build gets a
 share of the CPUs among the builds running once it starts, between 4 and 8 (the
 jobs the costs were measured with) and at most half the CPUs, as
 `CARGO_BUILD_JOBS`, which also caps a larger value; `-j` still wins. For
@@ -381,9 +380,17 @@ family prices the others' running builds beside its own, and a build is lone
 only when nothing on the host builds. Without this each family filled the same
 memory: on fw16, three families admitted builds independently and the host
 swapped about 20 GiB each way every six minutes. A private family, such as a
-test's or a native session's own lock elsewhere, stays out of the registry
-unless the variable names one. A record whose lock is free is stale and
-ignored.
+test's or a native session's own lock elsewhere (including one in a directory
+under `/var/tmp` named like a shared lock), stays out of the registry unless
+the variable names one. A record whose lock is free is stale and ignored, and
+one whose holder has exited is priced at the largest cost. Families decide one
+at a time, under the registry's `.decision` lock. A slot held by a plain
+`flock`, or by a gate from before the registry, is priced only by its own
+family. So that no build waits forever behind smaller ones from other families
+that keep fitting, the build that has waited longest on the host, once it has
+waited 120 seconds (`CAGENTS_BUILD_WAIT_PRIORITY_SECS`; `0` disables it),
+starts beside the running builds whatever the memory or pressure, but only
+while no other build admitted that way still runs.
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock --close /var/tmp/cagents-cargo.lock` takes exactly

@@ -32,8 +32,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def records(registry):
-    """A build registry's records, without its decision lock."""
-    return [path for path in registry.iterdir() if not path.name.startswith(".")]
+    """A build registry's records of running builds, without its decision
+    lock or its records of waiting ones."""
+    return [path for path in registry.iterdir() if path.name.startswith(("gate-", "offload-"))]
 
 
 def load_offload():
@@ -1410,7 +1411,7 @@ class RemoteRun(unittest.TestCase):
                     lease.kill()
                     lease.wait()
 
-    def lease(self, base, *, slots=2, build="", slot_disk=0, figures=None, registry=""):
+    def lease(self, base, *, slots=2, build="", slot_disk=0, figures=None, registry="", env=None):
         if figures is None:
             figures = Path(base, "figures")
             write_figures(figures)
@@ -1421,7 +1422,7 @@ class RemoteRun(unittest.TestCase):
             env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof")),
                               "CAGENTS_BUILD_REGISTRY": str(registry),
                               "CAGENTS_OFFLOAD_SLOT_DISK_BYTES": str(slot_disk),
-                              "CAGENTS_OFFLOAD_FIGURES": str(figures)})
+                              "CAGENTS_OFFLOAD_FIGURES": str(figures)} | (env or {}))
         self.leases.append(lease)
         self.addCleanup(lease.stdout.close)
         self.addCleanup(lease.kill)
@@ -1553,12 +1554,49 @@ class RemoteRun(unittest.TestCase):
             lease, lines = self.lease(base, registry=registry)
             self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
             [entry] = records(registry)
-            first, _since, lock = entry.read_text().splitlines()
-            self.assertEqual(lock, os.path.join(base, "slot-0", "lock"))
+            first, _since, lock, late = entry.read_text().splitlines()
+            self.assertEqual(lock, os.path.join(os.path.realpath(base), "slot-0", "lock"))
             self.assertEqual(first, f"0 {9 * 2**20}")
+            self.assertEqual(late, "")
             lease.stdin.close()
             lease.wait(timeout=10)
             self.assertEqual(records(registry), [])
+
+    def test_a_slot_reached_through_a_symbolic_link_is_recorded_once(self):
+        with self.slots() as base, tempfile.TemporaryDirectory() as host:
+            registry = Path(host, "registry")
+            linked = Path(host, "linked")
+            linked.symlink_to(base)
+            lease, lines = self.lease(str(linked), registry=registry)
+            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
+            [entry] = records(registry)
+            self.assertEqual(entry.read_text().splitlines()[2],
+                             os.path.join(os.path.realpath(base), "slot-0", "lock"))
+            # As run records the build under the slot's real path.
+            agent = offload.REMOTE_AGENT.split("\nif command == ")[0]
+            subprocess.run(
+                ["python3", "-c", agent + "\nimport sys\nregister(sys.argv[2], 2**30, os.getpid())",
+                 "lease", os.path.join(os.path.realpath(base), "slot-0")],
+                env=os.environ | {"CAGENTS_BUILD_REGISTRY": str(registry)}, check=True)
+            self.assertEqual(records(registry), [entry])
+            lease.stdin.close()
+            lease.wait(timeout=10)
+            self.assertEqual(records(registry), [])
+
+    def test_the_build_waiting_longest_starts_whatever_the_memory(self):
+        with self.slots() as base, tempfile.TemporaryDirectory() as host:
+            registry = Path(host, "registry")
+            stand_in = Path(base, "figures")
+            write_figures(stand_in, available_gib=12)
+            self.registered_elsewhere(registry, 4 * 2**20)
+            _, lines = self.lease(base, figures=stand_in, registry=registry,
+                                  env={"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "2"})
+            self.assertEqual(lines.next(10).split()[:2], ["wait", "memory"])
+            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
+            entries = {path.name: path.read_text().splitlines() for path in records(registry)}
+            [mine] = [lines for name, lines in entries.items() if name.startswith("offload-")]
+            self.assertEqual(mine[3], "overdue")
+            self.assertFalse(any(path.name.startswith("wait-") for path in registry.iterdir()))
 
     def test_a_lone_build_starts_however_busy_the_host_is(self):
         with self.slots() as base:
