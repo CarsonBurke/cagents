@@ -279,7 +279,6 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
-    static TWENTY_FOUR: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -293,7 +292,6 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         21 => &TWENTY_ONE,
         22 => &TWENTY_TWO,
         23 => &TWENTY_THREE,
-        24 => &TWENTY_FOUR,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -798,15 +796,6 @@ mod tests {
             (18, "DROP TABLE channel_work_placement_epochs;"),
             (18, "DROP TABLE channel_work_placement_clock;"),
             (19, "DROP TABLE automation_notifications;"),
-            (23, "DROP INDEX agents_open_by_recency;"),
-            (23, "DROP TABLE retired_view_panes;"),
-            (23, "DROP TABLE compacted_view_operations;"),
-            (23, "DROP TABLE compacted_view_operation_scopes;"),
-            (23, "DROP INDEX compacted_view_operations_by_scope;"),
-            (
-                23,
-                "ALTER TABLE compacted_view_operations RENAME COLUMN operation TO changed_operation;",
-            ),
             (
                 19,
                 "ALTER TABLE automation_notifications RENAME COLUMN sequence TO changed_sequence;",
@@ -1098,11 +1087,6 @@ mod tests {
                 "automation_precheck_history_cleanup",
                 "automation_retired_manual_requests",
                 "automation_removed_history",
-                "retired_view_panes",
-                "compacted_view_operation_scopes",
-                "compacted_view_operations",
-                "compacted_view_operations_by_scope",
-                "agents_open_by_recency",
                 "global_pending_automation_proposals",
                 "automation_proposal_notifications",
                 "pending_automation_proposal_notifications",
@@ -1120,9 +1104,6 @@ mod tests {
                 "automation_run_attention",
                 "automation_precheck_history_cleanup",
                 "automation_retired_manual_requests",
-                "retired_view_panes",
-                "compacted_view_operation_scopes",
-                "compacted_view_operations",
                 "automation_proposal_notifications",
             ] {
                 assert_eq!(
@@ -1148,7 +1129,7 @@ mod tests {
                 .position(|tokens| tokens == column)
                 .unwrap();
             firing.3.drain(start..start + column.len());
-            // Schema24 appends exactly these checked delivery counters. Keep
+            // Schema23 appends exactly these checked delivery counters. Keep
             // the original published metadata DDL comparison after proving
             // and removing only their known token suffix.
             let metadata = inventory
@@ -1491,7 +1472,7 @@ mod tests {
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");
@@ -2104,5 +2085,4 @@ mod tests {
         }
         panic!("SIGKILL returned");
     }
-    include!("schema/history_tests.rs");
 }

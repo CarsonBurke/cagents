@@ -279,6 +279,7 @@ fn retired_precheck_worker_keeps_retry_custody_until_history_ack_commits() {
                 cleanup: Mutex::new(Some(std::fs::read_dir(&root).unwrap())),
                 attention: Mutex::default(),
                 notifications: Mutex::default(),
+                proposal_notifications: Mutex::default(),
             }));
             assert!(handle.0.workers.lock().unwrap().is_empty());
             assert!(

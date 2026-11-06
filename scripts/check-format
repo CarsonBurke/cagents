@@ -19,7 +19,6 @@ set -- --edition 2024 --check \
     src/control/handshake_deadline_tests.rs \
     src/terminal/worker/bounded_input_tests.rs \
     src/host/model/views/placement_tests.rs \
-    src/host/model/schema/history_tests.rs \
     tests/support/iced_tree.rs \
     tests/support/repository_scale.rs
 if [ "$cargo_status" -eq 0 ] && command -v python3 >/dev/null 2>&1; then

@@ -5073,9 +5073,15 @@ exec /bin/sleep 60
         }));
         let unavailable = remote.conversation_title_prefix();
         remote.0.state.clear_poison();
-        assert_eq!(busy.unwrap(), Err(super::super::TitleUnavailable::Busy));
+        assert_eq!(
+            busy.unwrap(),
+            Err(crate::chat::runtime::TitleUnavailable::Busy)
+        );
         assert!(poisoned.is_err());
-        assert_eq!(unavailable, Err(super::super::TitleUnavailable::Poisoned));
+        assert_eq!(
+            unavailable,
+            Err(crate::chat::runtime::TitleUnavailable::Poisoned)
+        );
         let mut resident = remote.state().as_ref().clone();
         resident.changed += 1;
         resident.title = None;

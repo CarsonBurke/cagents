@@ -273,7 +273,7 @@ impl Registry {
 pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> std::path::PathBuf {
     use std::os::unix::fs::OpenOptionsExt;
 
-    assert!([2, 3, 9, 10, 11, 12, 15, 16, 20, 21, 22, 23].contains(&version));
+    assert!([2, 3, 9, 10, 11, 12, 15, 16, 20, 21, 22].contains(&version));
     assert_eq!(
         source
             .db
@@ -332,17 +332,11 @@ pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> st
             .collect::<Vec<_>>()
             .join(",");
         // Keep rowid order for mailbox arrival and history22 backfill, even
-        // when timestamps are nonmonotonic. Only the published23 permanent
-        // UUID archive is WITHOUT ROWID; its declared key is deterministic.
-        let order = if table == quote("compacted_view_operations") {
-            quote("operation")
-        } else {
-            "rowid".into()
-        };
+        // when timestamps are nonmonotonic.
         let rows = {
             let mut statement = source
                 .db
-                .prepare(&format!("SELECT {selected} FROM {table} ORDER BY {order}"))
+                .prepare(&format!("SELECT {selected} FROM {table} ORDER BY rowid"))
                 .unwrap();
             statement
                 .query_map([], |row| {

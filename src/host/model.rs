@@ -53,7 +53,7 @@ mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 24;
+const SCHEMA_VERSION: u32 = 23;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -712,13 +712,9 @@ fn migrate_through(
         schema::migration_checkpoint(22)?;
     }
     if version < 23 && target >= 23 {
-        views::migrate_history(tx)?;
-        schema::migration_checkpoint(23)?;
-    }
-    if version < 24 && target >= 24 {
         automation_proposals::migrate_delivery(tx)?;
         automation_proposal_notifications::migrate(tx)?;
-        schema::migration_checkpoint(24)?;
+        schema::migration_checkpoint(23)?;
     }
     Ok(())
 }
@@ -1263,7 +1259,6 @@ mod tests {
                 .unwrap(),
             2
         );
-        assert_eq!(legacy.query_row::<u64, _, _>("SELECT count(*) FROM sqlite_schema WHERE name IN ('retired_view_panes','compacted_view_operations','compacted_view_operation_scopes')", [], |row| row.get(0)).unwrap(), 0);
         assert_eq!(
             legacy
                 .query_row::<u64, _, _>(

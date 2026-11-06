@@ -4887,6 +4887,7 @@ mod tests {
             working_directory: directory.path().into(),
             environment: Default::default(),
             unset_environment: Default::default(),
+            stdout_noise: None,
         };
         let mut initial = Step {
             events: vec![Event::Ready(true)],

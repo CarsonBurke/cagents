@@ -707,14 +707,9 @@ mod tests {
         names
             .into_iter()
             .map(|name| {
-                let order = if name == "compacted_view_operations" {
-                    "operation"
-                } else {
-                    "rowid"
-                };
                 let mut statement = db
                     .prepare(&format!(
-                        "SELECT * FROM \"{}\" ORDER BY {order}",
+                        "SELECT * FROM \"{}\" ORDER BY rowid",
                         name.replace('"', "\"\"")
                     ))
                     .unwrap();
@@ -783,16 +778,6 @@ mod tests {
                 super::super::SCHEMA_VERSION
             );
             let mut after = table_rows(&registry.db);
-            for table in [
-                "retired_view_panes",
-                "compacted_view_operation_scopes",
-                "compacted_view_operations",
-            ] {
-                assert!(
-                    after.remove(table).unwrap().is_empty(),
-                    "this fixture has no retired panes or receipt overflow"
-                );
-            }
             assert!(
                 after.remove("automation_run_attention").unwrap().is_empty(),
                 "the added run-attention table must not replay historical runs"
@@ -814,7 +799,7 @@ mod tests {
                     .remove("automation_proposal_notifications")
                     .unwrap()
                     .is_empty(),
-                "schema24 does not replay historical proposals"
+                "schema23 does not replay historical proposals"
             );
             let counters = after.get_mut("metadata").unwrap();
             assert_eq!(counters.len(), 1);

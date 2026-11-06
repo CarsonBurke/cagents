@@ -635,7 +635,15 @@ mod tests {
                 .unwrap(),
             11
         );
-        assert_eq!(db.query_row::<u64,_,_>("SELECT count(*) FROM sqlite_schema WHERE name IN ('mailbox_attention_heads','retired_view_panes','compacted_view_operations','compacted_view_operation_scopes')",[],|row|row.get(0)).unwrap(), 0);
+        assert_eq!(
+            db.query_row::<u64, _, _>(
+                "SELECT count(*) FROM sqlite_schema WHERE name='mailbox_attention_heads'",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            0
+        );
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
