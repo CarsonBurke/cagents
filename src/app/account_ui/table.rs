@@ -937,9 +937,9 @@ fn account_cell<'a>(
             .and_then(|identity| identity.disputed_by.as_deref());
         match (email == row_name, disputed) {
             (true, None) => {}
-            (true, Some(other)) => subtitle.push(format!("or {other}")),
+            (true, Some(other)) => subtitle.push(format!("Also recorded as {other}")),
             (false, None) => subtitle.push(email.to_owned()),
-            (false, Some(other)) => subtitle.push(format!("{email} or {other}")),
+            (false, Some(other)) => subtitle.push(format!("{email}, also recorded as {other}")),
         }
     }
     if account.account.is_system() {
