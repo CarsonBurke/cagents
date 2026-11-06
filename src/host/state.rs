@@ -4983,6 +4983,8 @@ fn not_found(terminal_id: TerminalId) -> ProtocolError {
 #[cfg(test)]
 mod bounded_input_upgrade_tests;
 #[cfg(test)]
+mod codex_durable_resume_tests;
+#[cfg(test)]
 mod native_upgrade_tests;
 #[cfg(test)]
 mod redraw_identity_tests;
