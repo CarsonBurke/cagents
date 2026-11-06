@@ -1091,19 +1091,23 @@ mod tests {
                     0
                 );
             }
-            // History22 appends only this column to an existing table. Compare
-            // the exact original published DDL after removing that known suffix.
+            // History22 adds only this column to an existing table. SQLite writes
+            // it after the last column, ahead of the table constraints. Compare
+            // the exact original published DDL after removing those tokens.
             let firing = inventory
                 .iter_mut()
                 .find(|object| object.1 == "automation_firings")
                 .unwrap();
-            let suffix = tokens(", previous_firing TEXT").unwrap();
-            let close = firing.3.len() - 2; // final ')' then STRICT
-            assert_eq!(&firing.3[close - suffix.len()..close], &suffix);
-            firing.3.drain(close - suffix.len()..close);
+            let column = tokens(", previous_firing TEXT").unwrap();
+            let start = firing
+                .3
+                .windows(column.len())
+                .position(|tokens| tokens == column)
+                .unwrap();
+            firing.3.drain(start..start + column.len());
             assert_eq!(
                 inventory, old_layout,
-                "only lifecycle/run outboxes, retention objects and the exact history suffix may be added"
+                "only lifecycle/run outboxes, retention objects and the exact history column may be added"
             );
             assert!(
                 registry
