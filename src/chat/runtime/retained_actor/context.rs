@@ -22,6 +22,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unavailable_scope_only_wakes_on_an_actual_transition() {
+        let (_root, mut remote, snapshot, _) = super::super::tests::legacy_context_fixture();
+        let notices = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = notices.clone();
+        let inner = Arc::get_mut(&mut remote.0).unwrap();
+        inner.launch_account_scope = Err("captured scope unavailable".into());
+        inner.notify = Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+        let mut scanner = CachedContext::default();
+        let mut session = None;
+        for _ in 0..3 {
+            remote.scan_context(&mut scanner, &mut session);
+        }
+        assert_eq!(notices.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            remote.project_snapshot(snapshot.clone()).items,
+            snapshot.items
+        );
+        {
+            let mut state = remote.0.state.lock().unwrap();
+            let state = Arc::make_mut(&mut state);
+            state.confirmed_session = None;
+            state.session_id = None;
+        }
+        for _ in 0..3 {
+            remote.scan_context(&mut scanner, &mut session);
+        }
+        assert_eq!(notices.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn late_provenance_resyncs_all_readers_and_context_appends_use_full_windows() {
         let (_root, mut remote, mut snapshot, path) = super::super::tests::legacy_context_fixture();
         let notices = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -194,8 +226,10 @@ impl RemoteActor {
         let changed = match (&session, &self.0.launch_account_scope) {
             (Some(session), Ok(scope)) => scanner.refresh(&self.0.source.launch, scope, session),
             _ => {
-                *scanner = CachedContext::default();
-                previous.is_some()
+                let empty = CachedContext::default();
+                let changed = !scanner.same_version(&empty);
+                *scanner = empty;
+                changed
             }
         };
         let notify = {
