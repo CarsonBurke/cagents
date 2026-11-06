@@ -280,7 +280,10 @@ without_compiling() {
             ;;
     esac
     status=0
-    setpriv --pdeathsig TERM timeout "$seconds" env \
+    # The parent's death signal only covers a parent still alive when it's armed.
+    # shellcheck disable=SC2016 # expanded by the inner shell
+    setpriv --pdeathsig TERM sh -c '[ "$PPID" = "$1" ] || exit 143; shift; exec "$@"' guarded-build "$$" \
+        timeout "$seconds" env \
         RUSTC_WRAPPER="$root/scripts/refuse-compile" CAGENTS_NATIVE_LOCK_HELD="$native_lock" \
         CAGENTS_BUILD_LOCK="$products/.native-lock-gate" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local "$@" &

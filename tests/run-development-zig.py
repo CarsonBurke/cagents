@@ -496,8 +496,37 @@ exit 83
                     time.sleep(0.05)
                 self.cargo_calls.unlink()
 
+    def test_a_launch_that_ends_before_its_build_can_follow_it_starts_no_build(self):
+        arming = self.root / "arming"
+        real = shutil.which("setpriv")
+        slow = self.root / "bin/setpriv"
+        slow.write_text(f'#!/bin/sh\n: >"{arming}"\nsleep 1\nexec "{real}" "$@"\n')
+        slow.chmod(0o755)
+        lock = self.root / "native-lock"
+        lock.touch()
+        holder = subprocess.Popen(
+            ["flock", str(lock), str(self.runner), "--browserless"], cwd=self.root,
+            env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock), "FAKE_BUILD_SECONDS": "60"},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+        self.addCleanup(holder.wait)
+        self.addCleanup(lambda: holder.poll() is None and holder.kill())
+        deadline = time.monotonic() + 8
+        while not arming.exists():
+            self.assertLess(time.monotonic(), deadline, "the build never began")
+            time.sleep(0.01)
+        runner = int(subprocess.run(
+            ["pgrep", "-P", str(holder.pid)], capture_output=True, text=True,
+        ).stdout.split()[0])
+        os.kill(runner, signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode != 0:
+            self.assertLess(time.monotonic(), deadline, "the build kept the native lock")
+            time.sleep(0.05)
+        self.assertFalse(self.cargo_calls.exists())
+
     def test_a_bound_that_is_not_a_positive_number_refuses_to_build(self):
-        for value in ("abc", "-1", "0", "0.5"):
+        for value in ("abc", "-1", "0", "00", "0.5"):
             with self.subTest(value=value):
                 result = self.under_native_lock(
                     "flock", "--close", CAGENTS_NATIVE_LOCK_BUILD_SECONDS=value,
