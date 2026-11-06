@@ -226,7 +226,7 @@ class TestLib(unittest.TestCase):
         return [event for event in events if phase is None or event["phase"] == phase]
 
     def clear(self):
-        for name in ("events.jsonl", "release", "pruned", "slot.lock.prune"):
+        for name in ("events.jsonl", "release", "pruned", "slot.lock.prune", "slot.lock.prune.done"):
             (self.root / name).unlink(missing_ok=True)
         for path in self.root.glob("*.ready"):
             path.unlink()
@@ -319,8 +319,9 @@ class TestLib(unittest.TestCase):
                 pruner = str(self.root / "pruner")
                 self.assertEqual(self.events("prune")[0]["arguments"],
                                  ["--apply", "--max-idle", "7", "--lock", pruner + ".lock",
-                                  "--log", pruner + ".tsv", "--keep", str(self.root / "owned-build"),
-                                  "--orphan-hours", "0", "--budget", "300"])
+                                  "--log", pruner + ".tsv", "--stamp", pruner + ".scheduled",
+                                  "--keep", str(self.root / "owned-build"),
+                                  "--orphan-hours", "0", "--budget", "300", "--wait"])
                 self.assertEqual(self.events("disk")[0]["arguments"], ["-Pk", "--", str(self.root)])
                 self.assertFalse(Path(str(self.lock) + ".queue").exists(), "guard must refuse before admission")
                 self.assert_no_test()
