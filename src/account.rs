@@ -317,13 +317,14 @@ pub const SELECTION_MARKER: &str = "CAGENTS_ACCOUNT_HOMES";
 /// account, and signing in to the system account signed the chosen
 /// account's home in to the system login.
 ///
-/// `CLAUDE_CONFIG_DIR` naming Claude Code's default `~/.claude` is dropped
-/// too. It selects no other home, only moves the login's record of who it is
-/// from `~/.claude.json` into that directory, and earlier cagents exported
-/// it for every system launch. Kept, a window, daemon or command started
-/// under such a launch would read and write a second record of who the
-/// system login is, unlike the reader's own `claude` and every other cagents
-/// process.
+/// Inside a cagents terminal, `CLAUDE_CONFIG_DIR` naming Claude Code's
+/// default `~/.claude` is dropped too. Earlier cagents exported it for every
+/// launch on the system login, and it selects no other home: it only moves
+/// the login's record of who it is from `~/.claude.json` into that
+/// directory. Kept, a window, daemon or command started from such a terminal
+/// would read and write a second record of who the system login is, unlike
+/// the reader's own `claude` and every other cagents process. Outside one,
+/// the variable is the reader's own setting and kept.
 pub fn inherited_selections(environment: &dyn Fn(&str) -> Option<String>) -> Vec<&'static str> {
     let marker = environment(SELECTION_MARKER).unwrap_or_default();
     Account::PROVIDERS
@@ -337,29 +338,31 @@ pub fn inherited_selections(environment: &dyn Fn(&str) -> Option<String>) -> Vec
             });
             (selected
                 || is_account_namespace(provider, Path::new(&value))
-                || names_claude_default(provider, Path::new(&value), environment))
+                || exported_claude_default(provider, Path::new(&value), environment))
             .then_some(variable)
         })
         .collect()
 }
 
-/// Whether `home` is Claude Code's default directory under `environment`'s
-/// `HOME`, however it is spelled.
-fn names_claude_default(
+/// Whether `home` is Claude Code's default directory as an earlier cagents
+/// terminal exported it: `environment`'s `HOME` joined with `.claude`,
+/// compared by path components, in a process started from a cagents
+/// terminal. Only a lexical comparison, as the account views read this on
+/// every render.
+fn exported_claude_default(
     provider: Provider,
     home: &Path,
     environment: &dyn Fn(&str) -> Option<String>,
 ) -> bool {
-    let Some(user) = environment("HOME").filter(|user| !user.is_empty()) else {
-        return false;
-    };
-    let default = Path::new(&user).join(".claude");
     provider == Provider::Claude
-        && home.is_absolute()
-        && (home == default
-            || std::fs::canonicalize(home)
-                .is_ok_and(|home| std::fs::canonicalize(&default).is_ok_and(|d| d == home)))
+        && environment(TERMINAL_MARKER).is_some_and(|terminal| !terminal.is_empty())
+        && environment("HOME")
+            .filter(|user| !user.is_empty())
+            .is_some_and(|user| home == Path::new(&user).join(".claude"))
 }
+
+/// Set in the environment of every terminal cagents starts.
+const TERMINAL_MARKER: &str = "CAGENTS_TERMINAL_ID";
 
 /// Forgets the provider homes this process inherited from an account
 /// cagents selected (see [`inherited_selections`]), so that neither it nor
@@ -579,9 +582,9 @@ impl Account {
     /// and the CLI resolves its own default.
     ///
     /// A managed, linked or selected device's home is always exported, as is
-    /// the system account's when cagents itself was started with one other
-    /// than the default (see [`inherited_selections`]), which every cagents
-    /// process started alike resolves the same. The system Claude login
+    /// the system account's when cagents itself was started with one, unless
+    /// it was inherited from a cagents launch (see [`inherited_selections`]);
+    /// every cagents process started alike resolves the same. The system Claude login
     /// otherwise exports nothing, so every launch reads
     /// the same records as the reader's own `claude`: Claude Code keeps who a
     /// login belongs to in its global configuration, which any explicit
@@ -1601,12 +1604,13 @@ mod tests {
             claude.launch_home_in(&chosen),
             Some(PathBuf::from("/home/a/claude-config"))
         );
-        // The default spelled out is no choice of another home, only the
-        // second record earlier cagents launches exported, however spelled.
+        // In a cagents terminal, the default spelled out is no choice of
+        // another home, only the second record earlier cagents exported.
         for spelled in ["/home/a/.claude", "/home/a/.claude/", "/home/a//.claude"] {
             let pinned = move |name: &str| match name {
                 "HOME" => Some("/home/a".to_owned()),
                 "CLAUDE_CONFIG_DIR" => Some(spelled.to_owned()),
+                "CAGENTS_TERMINAL_ID" => Some("terminal".to_owned()),
                 _ => None,
             };
             assert_eq!(inherited_selections(&pinned), ["CLAUDE_CONFIG_DIR"]);
@@ -1616,6 +1620,23 @@ mod tests {
                 Some(PathBuf::from("/home/a/.claude"))
             );
         }
+        // Outside one it is the reader's own setting, and Codex's default
+        // is never dropped.
+        let own = environment(&[
+            ("HOME", "/home/a"),
+            ("CLAUDE_CONFIG_DIR", "/home/a/.claude"),
+        ]);
+        assert!(inherited_selections(&own).is_empty());
+        assert_eq!(
+            claude.launch_home_in(&own),
+            Some(PathBuf::from("/home/a/.claude"))
+        );
+        let codex_default = environment(&[
+            ("HOME", "/home/a"),
+            ("CODEX_HOME", "/home/a/.claude"),
+            ("CAGENTS_TERMINAL_ID", "terminal"),
+        ]);
+        assert!(inherited_selections(&codex_default).is_empty());
         // One inherited from an account cagents selected is not.
         let selected = environment(&[
             ("HOME", "/home/a"),

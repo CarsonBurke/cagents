@@ -1008,19 +1008,20 @@ is also removed for provider/version compatibility.
 Every cagents terminal and conversation exports its account's home, and one on
 a managed or linked account also lists that home in `CAGENTS_ACCOUNT_HOMES`.
 The one exception is Claude's default home: unless cagents was started with
-`CLAUDE_CONFIG_DIR` naming another directory, a terminal, conversation or
-sign-in on the System default Claude login leaves `CLAUDE_CONFIG_DIR` unset, as
-your own shell does, whichever cagents process starts it. Claude Code keeps who
-a login is in `~/.claude.json`, and an explicit `CLAUDE_CONFIG_DIR=~/.claude`
-moves that record to `~/.claude/.claude.json` instead, although history and
-credentials stay in `~/.claude` either way. So cagents ignores that variable
-when it names `~/.claude`. Earlier versions of cagents exported it, so their
+`CLAUDE_CONFIG_DIR`, a terminal, conversation or sign-in on the System default
+Claude login leaves `CLAUDE_CONFIG_DIR` unset, as your own shell does, whichever
+cagents process starts it. Claude Code keeps who a login is in `~/.claude.json`,
+and an explicit `CLAUDE_CONFIG_DIR=~/.claude` moves that record to
+`~/.claude/.claude.json` instead, although history and credentials stay in
+`~/.claude` either way. If you set it yourself, cagents keeps it and uses that
+record too. Earlier versions of cagents exported it for every launch, so their
 conversations kept a second record; conversations saved then still resume with
 the setting they started with, and can rewrite that record. A cagents window,
-daemon, or `cagents` command started from one - by you or by an agent - ignores
-a variable that still holds the listed home, or any path inside a cagents
-`accounts/<provider>/<id>` directory, when deciding the system default. A
-daemon started before this protection keeps its environment until it restarts.
+daemon, or `cagents` command started from a cagents terminal - by you or by an
+agent - ignores a variable that still holds the listed home, any path inside a
+cagents `accounts/<provider>/<id>` directory, or `CLAUDE_CONFIG_DIR` naming
+`~/.claude`, when deciding the system default. A daemon started before this
+protection keeps its environment until it restarts.
 
 The Accounts pane flags a row whose home is not a login of its own: **Login
 changed** when a managed or linked home reports a different login than the one

@@ -2465,13 +2465,22 @@ cat >/dev/null
             _ => None,
         };
         assert_eq!(second_home(&system, &chosen), None);
-        // The default spelled out is no home of the reader's choosing.
-        let spelled = |name: &str| match name {
-            "HOME" => Some(home_text.clone()),
-            "CLAUDE_CONFIG_DIR" => Some(format!("{home_text}/.claude")),
-            _ => None,
+        // The default an earlier cagents terminal exported is no home of the
+        // reader's choosing; the same value set by the reader is.
+        let spelled = |terminal: bool| {
+            let home_text = home_text.clone();
+            move |name: &str| match name {
+                "HOME" => Some(home_text.clone()),
+                "CLAUDE_CONFIG_DIR" => Some(format!("{home_text}/.claude")),
+                "CAGENTS_TERMINAL_ID" if terminal => Some("terminal".to_owned()),
+                _ => None,
+            }
         };
-        assert_eq!(second_home(&system, &spelled), Some(home.join(".claude")));
+        assert_eq!(
+            second_home(&system, &spelled(true)),
+            Some(home.join(".claude"))
+        );
+        assert_eq!(second_home(&system, &spelled(false)), None);
         assert_eq!(
             second_home(&Account::system(Provider::Codex), &environment),
             None
