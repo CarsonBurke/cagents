@@ -4967,7 +4967,10 @@ fn exited_claude_card_resumes_its_conversation_once_in_the_same_daemon() {
     .unwrap() else {
         panic!("a stopped card must prepare its resume");
     };
-    assert!(chat::is_retained_resume_successor(&card, &successor));
+    assert!(
+        chat::is_retained_resume_successor(&card, &successor),
+        "not a successor of {card:?}: {successor:?}"
+    );
     assert_eq!(successor.launch.session_id, conversation);
     assert!(
         !host.lock().unwrap().chats.contains_key(&id),

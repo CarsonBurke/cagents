@@ -824,8 +824,10 @@ pub(in crate::host) fn finish_interrupted_exit_of(
 /// successor on the same conversation; nothing the actor held is resubmitted.
 ///
 /// Returns false, changing nothing, unless `source` names this daemon's
-/// attachment, its actor is retained, its provider has exited and it holds no
-/// work. A provider that is still running is never ended here.
+/// attachment, its actor is retained and its provider has exited. A provider
+/// that is still running is never ended here. An exit the provider did not
+/// choose, such as a kill, leaves a failure that keeps the actor owning work
+/// until someone answers it; resuming is that answer.
 pub(in crate::host) fn finish_exited_attachment(
     host: &SharedHost,
     source: &Session,
@@ -839,7 +841,6 @@ pub(in crate::host) fn finish_exited_attachment(
             || source.proof.as_ref() != Some(state.proof())
             || record.handle.actor_identity().is_none()
             || !record.handle.is_completed()
-            || record.handle.owns_work()
             || record.handle.is_close_only()
             || record.returning_terminal
         {
