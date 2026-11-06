@@ -748,6 +748,73 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// The candidate line (128) is spoken with this release's types, so the
+    /// messages an update exchanges with it must keep the variant positions
+    /// that line published. Moving one would silently mis-decode its replies.
+    #[test]
+    fn update_messages_keep_the_candidate_lines_variant_positions() {
+        let tag = |bytes: Vec<u8>| bytes[0];
+        let requests = [
+            (
+                ClientRequest::Connect {
+                    expected_host: None,
+                    resume: Vec::new(),
+                },
+                0,
+            ),
+            (ClientRequest::List, 1),
+            (ClientRequest::ChatList, 29),
+            (
+                ClientRequest::UpgradeImpact {
+                    policy: impact::Policy::WhenIdle,
+                },
+                36,
+            ),
+            (
+                ClientRequest::PrepareConfirmedUpgrade {
+                    impact: impact(),
+                    relaunch_agents: false,
+                },
+                37,
+            ),
+        ];
+        for (request, expected) in requests {
+            assert_eq!(tag(postcard::to_stdvec(&request).unwrap()), expected);
+        }
+        let responses = [
+            (
+                ServerResponse::Connected {
+                    proof: proof(),
+                    resumed: Vec::new(),
+                },
+                0,
+            ),
+            (
+                ServerResponse::Listed {
+                    terminals: Vec::new(),
+                },
+                1,
+            ),
+            (
+                ServerResponse::ChatListed {
+                    sessions: Vec::new(),
+                },
+                13,
+            ),
+            (ServerResponse::UpgradeImpact(impact()), 9),
+            (
+                ServerResponse::UpgradePrepared {
+                    terminals: 1,
+                    chats: 1,
+                },
+                17,
+            ),
+        ];
+        for (response, expected) in responses {
+            assert_eq!(tag(postcard::to_stdvec(&response).unwrap()), expected);
+        }
+    }
+
     /// The install candidate line's daemon (128) is reached through discovery
     /// and then this release's client speaking 128, through the preview and
     /// the confirmed preparation, and its update is this release's to run.
