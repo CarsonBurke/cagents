@@ -130,7 +130,7 @@ pub(super) fn apply(registry: &mut Registry, edit: &ModelEdit) -> Result<Applied
         }
     }
     registry.apply(edit).map_err(|error| {
-        if error == Registry::VIEW_SOURCE_CONFLICT || error == "workspace view revision conflict" {
+        if error == Registry::VIEW_SOURCE_CONFLICT || error == Registry::VIEW_REVISION_CONFLICT {
             return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
         }
         // Execution retirement may close the scope after the preflight read.
