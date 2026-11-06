@@ -14,7 +14,7 @@ set -eu
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=7
+gate_version=8
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -82,7 +82,8 @@ it builds on that host.
 With CAGENTS_BUILD_REMOTE=local, or on the build host itself, commands build
 here, each once a build slot is free. For `test`, `bench` and `run`, only the
 build (`--no-run`, or `build`) holds the slot; the tests or program run
-afterwards without it. `exec` holds one slot until COMMAND exits: a drop-in
+afterwards without it, tests and benchmarks under a memory limit
+(scripts/memory-capped, CAGENTS_MEMORY_MAX). `exec` holds one slot until COMMAND exits: a drop-in
 for `flock /var/tmp/cagents-cargo.lock COMMAND`, whose gated commands run in
 that slot without waiting.
 
@@ -624,6 +625,11 @@ build_phase() {
     fi
 }
 
+# Tests have no slot, but a runaway must not take the host with it.
+run_tests() {
+    [ ! -x "$here/memory-capped" ] || exec "$here/memory-capped" "$@"
+}
+
 # Whether a gate that is still running admitted this command, which inherits
 # its slot. The marker can outlive that gate in a long-lived child.
 inside_gate() {
@@ -771,7 +777,13 @@ fi
 # Building here. Already inside a slot: a gated command running Cargo again,
 # or a caller that took the lock itself.
 if inside_gate || inherits_slot || started_by_flock; then
-    [ "$mode" = exec ] || set -- "$cargo" "$@"
+    if [ "$mode" != exec ]; then
+        subcommand=$1
+        set -- "$cargo" "$@"
+        case $subcommand in
+            test|bench) run_tests "$@" ;;
+        esac
+    fi
     exec "$@"
 fi
 
@@ -840,6 +852,7 @@ if [ "$runs_separately" = true ]; then
     build_phase "$@" || status=$?
     release
     [ "$status" -eq 0 ] || exit "$status"
+    [ "$subcommand" = run ] || run_tests "$cargo" "$subcommand" "$@"
     exec "$cargo" "$subcommand" "$@"
 fi
 held "$cargo" "$subcommand" "$@" || status=$?

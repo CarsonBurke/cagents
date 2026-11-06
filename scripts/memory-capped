@@ -1,0 +1,116 @@
+#!/usr/bin/env -S python3 -I
+"""Runs a command in a systemd scope with a memory limit, so a runaway dies
+early instead of filling the host's memory and swap. Without a working scope
+the command runs anyway, uncapped, with a note."""
+import ctypes
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+PROGRAM = "memory-capped"
+DEFAULT_MAX = "16G"
+DEFAULT_SWAP_MAX = "4G"
+USAGE = f"""usage: {PROGRAM} COMMAND [ARGUMENT...]
+
+Environment:
+  CAGENTS_MEMORY_MAX       Memory limit for COMMAND and its children, such as
+                           24G (default {DEFAULT_MAX}); 0 runs without a limit
+  CAGENTS_MEMORY_SWAP_MAX  Swap they may use besides (default {DEFAULT_SWAP_MAX})
+
+A command already under a limit keeps that one. Over the limit, the whole scope
+is stopped and this exits 137. Interrupting this stops the scope too.
+"""
+UNITS = {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}
+PR_SET_PDEATHSIG = 1
+
+
+def size(setting, default):
+    text = os.environ.get(setting) or default
+    match = re.fullmatch(r"([0-9]+)([KMGT]?)", text)
+    if not match:
+        print(f"{PROGRAM}: {setting} must be a size such as 16G: {text}", file=sys.stderr)
+        raise SystemExit(2)
+    return int(match[1]) * UNITS[match[2]]
+
+
+def scope_command(unit, limit, swap):
+    return ["systemd-run", "--user", "--scope", "--quiet", *unit,
+            f"--property=MemoryMax={limit}", f"--property=MemorySwapMax={swap}",
+            "--property=OOMPolicy=stop", "--property=TimeoutStopSec=5", "--"]
+
+
+def scope_limits_memory(limit, swap):
+    """Whether a scope can be made here and its limit reaches its cgroup: no
+    user manager or a manager without the memory controller can't enforce one."""
+    report = 'cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"'
+    try:
+        found = subprocess.run([*scope_command(["--collect"], limit, swap), "/bin/sh", "-c", report],
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return found.returncode == 0 and found.stdout.strip() == str(limit)
+
+
+def follow_parent(parent):
+    """A killed wrapper takes its command with it, as if it had exec'd."""
+    ctypes.CDLL(None).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+    if os.getppid() != parent:
+        os._exit(143)
+
+
+def went_over(unit):
+    try:
+        result = subprocess.run(["systemctl", "--user", "show", unit, "--property=Result", "--value"],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        subprocess.run(["systemctl", "--user", "reset-failed", unit], stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.stdout.strip() == "oom-kill"
+
+
+def main():
+    command = sys.argv[1:]
+    if not command or command[0] in ("-h", "--help"):
+        print(USAGE, end="", file=sys.stdout if command else sys.stderr)
+        return 0 if command else 2
+    if os.environ.get("CAGENTS_MEMORY_MAX") == "0" or os.environ.get("CAGENTS_MEMORY_CAPPED"):
+        os.execvp(command[0], command)
+    limit = size("CAGENTS_MEMORY_MAX", DEFAULT_MAX)
+    swap = size("CAGENTS_MEMORY_SWAP_MAX", DEFAULT_SWAP_MAX)
+    if not scope_limits_memory(limit, swap):
+        print(f"{PROGRAM}: no systemd scope can limit memory here; running without a limit",
+              file=sys.stderr)
+        os.execvp(command[0], command)
+    unit = f"cagents-capped-{os.getpid()}-{time.monotonic_ns()}.scope"
+    parent = os.getpid()
+    # The command runs as this child: systemd-run execs it after making the scope.
+    child = subprocess.Popen([*scope_command([f"--unit={unit}"], limit, swap), *command],
+                             env=dict(os.environ, CAGENTS_MEMORY_CAPPED=unit),
+                             preexec_fn=lambda: follow_parent(parent))
+    interrupted = []
+
+    def forward(sent, _frame):
+        interrupted.append(sent)
+        child.send_signal(sent)
+
+    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        signal.signal(number, forward)
+    status = child.wait()
+    if interrupted:
+        # Whatever ignored the signal, such as a compositor, goes with the scope.
+        subprocess.run(["systemctl", "--user", "stop", "--no-block", unit], stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=30)
+    if status != 0 and went_over(unit):
+        print(f"{PROGRAM}: stopped `{command[0]}`, which went over its limit of {limit // 2**20} MiB "
+              f"of memory and {swap // 2**20} MiB of swap. If it isn't running away, raise "
+              "CAGENTS_MEMORY_MAX.", file=sys.stderr)
+        return 137
+    return 128 - status if status < 0 else status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

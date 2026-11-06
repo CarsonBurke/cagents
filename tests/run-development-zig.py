@@ -573,6 +573,14 @@ exit 83
         self.assert_skipped("--browserless")
         self.assert_skipped("--browserless")
 
+    def test_the_app_runs_under_a_memory_limit(self):
+        ran = self.root / "limited"
+        limit = self.runner.with_name("memory-capped")
+        limit.write_text(f'#!/bin/sh\necho "$1" >"{ran}"\nexec "$@"\n')
+        limit.chmod(0o755)
+        self.assert_built("--browserless")
+        self.assertTrue(ran.read_text().strip().endswith("/cagents-ui"))
+
     def test_a_launch_building_on_the_build_host_always_asks_it(self):
         # Cargo's dependency lists stay there, so nothing here can say the
         # products are current.

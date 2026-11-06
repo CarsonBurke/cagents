@@ -242,7 +242,7 @@ class InstalledGateSync(unittest.TestCase):
     """A gate change merged into main is installed by the next gate run."""
 
     files = ("cargo-gate", "cargo-gate-command.py", "cargo-gate-sync.py",
-             "cargo-gate-rustc-guard", "cargo-offload",
+             "cargo-gate-rustc-guard", "cargo-offload", "memory-capped",
              "seed-build-dir", "build-disk-guard", "install-cargo-gate")
 
     def setUp(self):
@@ -1347,6 +1347,49 @@ class TwoSlots(unittest.TestCase):
             env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
             capture_output=True, text=True, timeout=timeout,
         )
+
+
+class TestsUnderAMemoryLimit(TwoSlots):
+    """A stand-in limit beside the gate, recording what it is asked to run."""
+
+    def setUp(self):
+        super().setUp()
+        self.ran = self.root / "ran"
+        limit = self.root / "memory-capped"
+        limit.write_text(f'#!/bin/sh\necho "limited $*" >>"{self.ran}"\nexec "$@"\n')
+        limit.chmod(0o755)
+        cargo = self.root / "cargo"
+        cargo.write_text(f'#!/bin/sh\necho "cargo $*" >>"{self.ran}"\n')
+        cargo.chmod(0o755)
+        self.env["CAGENTS_BUILD_CARGO"] = str(cargo)
+        self.env["CAGENTS_BUILD_SEED"] = "0"
+
+    def gate_run(self, *arguments, wrapper=()):
+        result = subprocess.run([*wrapper, str(self.gate), *arguments], env=self.env, cwd=self.root,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [line.replace(str(self.root) + "/", "") for line in self.ran.read_text().splitlines()]
+
+    def test_tests_and_benchmarks_run_under_it_after_their_build_without_it(self):
+        for subcommand in ("test", "bench"):
+            with self.subTest(subcommand):
+                self.ran.unlink(missing_ok=True)
+                self.assertEqual(self.gate_run(subcommand, "--lib", "filter"), [
+                    f"cargo {subcommand} --no-run --lib filter",
+                    f"limited cargo {subcommand} --lib filter",
+                    f"cargo {subcommand} --lib filter",
+                ])
+
+    def test_a_program_or_a_build_does_not(self):
+        for arguments in (("run", "--bin", "app"), ("build",), ("test", "--no-run"), ("test", "--doc")):
+            with self.subTest(arguments):
+                self.ran.unlink(missing_ok=True)
+                self.assertNotIn("limited", "\n".join(self.gate_run(*arguments)))
+
+    def test_tests_inside_a_held_slot_run_under_it(self):
+        lines = self.gate_run("exec", str(self.gate), "test", "--lib")
+        self.assertIn("limited cargo test --lib", lines)
+        self.assertIn("cargo test --lib", lines)
 
 
 class MemoryAdmission(TwoSlots):

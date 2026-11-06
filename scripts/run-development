@@ -658,6 +658,7 @@ if [ "$fresh_daemon" = true ]; then
 fi
 
 run_ui() {
+    [ ! -x "$root/scripts/memory-capped" ] || exec "$root/scripts/memory-capped" "$products/cagents-ui" "$@"
     exec "$products/cagents-ui" "$@"
 }
 

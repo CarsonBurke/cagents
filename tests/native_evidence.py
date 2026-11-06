@@ -252,6 +252,10 @@ class Evidence(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_UN)
             return True
 
+    def test_a_session_has_a_memory_limit_made_before_its_private_environment(self):
+        source = (REPOSITORY / "scripts/native-evidence").read_text()
+        self.assertIn('"$tool_root/scripts/memory-capped" env -u DISPLAY', source)
+
     def test_inherited_authority_is_refused_and_never_removed(self) -> None:
         for name in AUTHORITY_NAMES:
             for value in ("", "token"):

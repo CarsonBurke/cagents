@@ -361,7 +361,8 @@ share of the CPUs among the builds running once it starts, between 4 and 8 (the
 jobs the costs were measured with) and at most half the CPUs, as
 `CARGO_BUILD_JOBS`, which also caps a larger value; `-j` still wins. For
 `test`, `bench` and `run` only the build holds a slot, and the tests or program
-run after it is released, so do not wrap the gate in another lock. Rustdoc
+run after it is released, so do not wrap the gate in another lock. Tests and
+benchmarks run under a memory limit; see [Memory limits](#memory-limits). Rustdoc
 compiles doctests while they run, so `cargo test --doc` keeps its slot
 throughout; a plain `cargo test` compiles its doctests after the slot is
 released. The development runner builds its matched set through the gate
@@ -707,6 +708,36 @@ Lowering Cargo concurrency does not reclaim memory held by other workloads or
 guarantee a build fits when RAM and swap are already under pressure. Browserless
 lanes avoid the large Servo/SpiderMonkey graph when embedded-browser behavior is
 not being changed.
+
+### Memory limits
+
+A runaway test can take the whole host with it: one mutation run reached 41 GiB
+of memory and 70 GiB of swap at about 18 GiB a minute, and FW16 stalled for about
+12 minutes until the kernel killed it. `scripts/memory-capped COMMAND` runs a
+command and its children in a systemd scope limited to 16 GiB of memory
+(`CAGENTS_MEMORY_MAX`; `0` turns the limit off) and 4 GiB of swap
+(`CAGENTS_MEMORY_SWAP_MAX`), stops the scope when they go over, says so and exits
+137. The swap limit matters as much as the memory one, because without it a
+runaway just moves into swap. For scale, the whole UI lib test binary peaks at
+about 3 GiB, and the host one at about 1 GiB.
+
+`scripts/cargo-gate test` and `bench` run under it, inside a held slot too, as do
+the app in `scripts/run-development` and a `scripts/native-evidence` session. It
+doesn't cover doctests, `cargo-gate run`, `--instance` sessions, tests run on a
+build host through `cargo-offload`, or a harness that runs Cargo or a test binary
+itself.
+
+**Writing a mutation harness:** a mutant can turn a bounded loop into an endless
+one that allocates, so run each mutant through `scripts/cargo-gate test` or put
+`scripts/memory-capped` in front of the command, and give it a lower limit than
+the default if you know what the tests need. Don't use `ulimit -v`: it limits
+address space rather than memory, and these binaries reserve far more than they
+touch. A `signal: 9` from a mutant is a result to read, and doesn't show that a
+test caught it. A test that allocates on purpose needs a ceiling of its own: a
+mutant may remove the very limit it was testing, and did.
+
+Where no scope can be made, as without a user manager, the command runs without a
+limit and says so.
 
 ### Process scope isolation
 
