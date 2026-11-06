@@ -45,6 +45,20 @@ const THREAD_RAIL_OFFSET: f32 =
 /// a static glyph for work in flight says only that something was running
 /// when the frame was drawn, so it is the animated indicator the rest of the
 /// shell uses for the same state.
+/// A row's heading on one line, cut short with an ellipsis where the pane
+/// is too narrow for it, filling what the row's other parts leave. The row's
+/// duration and status are laid out first, so they always stay in view; the
+/// whole of what was cut is in the open row.
+fn one_line<'a>(
+    text: cosmic::iced::widget::Text<'a, cosmic::Theme, cosmic::Renderer>,
+) -> cosmic::iced::widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
+    text.width(Length::Fill)
+        .wrapping(iced::widget::text::Wrapping::None)
+        .ellipsize(iced::advanced::text::Ellipsize::End(
+            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+        ))
+}
+
 fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<design::Tone>) {
     let glyph = |name: Icon, tone: Option<design::Tone>| {
         (
@@ -320,11 +334,10 @@ impl Runtime {
             }
             None => None,
         };
-        line.push(
-            design::heading(turn.summary.clone())
-                .width(Length::Fill)
-                .into(),
-        );
+        // One line, whatever the summary names: a group of one long
+        // command would otherwise wrap it across the pane and push its
+        // duration off the edge. Opening the group shows the whole command.
+        line.push(one_line(design::heading(turn.summary.clone())).into());
         // The one-second chat tick advances running timers even while a tool
         // is quiet. The label shares its cadence with the retained-turn cache.
         let elapsed = self
@@ -443,7 +456,7 @@ impl Runtime {
         let (verb, label) = match coordinated {
             Some(coordinated) => coordinated.line(&|id| self.listed_agent_name(id)),
             None => {
-                let (verb, label) = turn::step_title(&item.content);
+                let (verb, label) = turn::step_title(&item.content, cached.title_of(item));
                 (verb.to_owned(), label.into_owned())
             }
         };
@@ -475,7 +488,7 @@ impl Runtime {
         // row forgetting what is being built.
         let mut preview: Vec<Element<'static, Message>> = Vec::new();
         if let Some(coordinated) = coordinated {
-            preview.push(design::body(label.clone()).into());
+            preview.push(one_line(design::body(label.clone())).into());
             let arrived = coordinated.reading.outcome.messages.len();
             if arrived > 0 {
                 preview.push(
@@ -488,7 +501,7 @@ impl Runtime {
                 );
             }
         } else if matches!(item.content, ItemContent::Tool { .. }) {
-            preview.push(design::body(label.clone()).into());
+            preview.push(one_line(design::body(label.clone())).into());
             if !cached.preview.text.is_empty() {
                 preview.push(cached.preview.view());
             }

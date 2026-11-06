@@ -1175,11 +1175,15 @@ fn carry_step_disclosures(
     }
 }
 
-/// How a step stands when that is worth a word: still running, or ended
-/// without doing what it was asked. A step that worked says nothing, as its
-/// group's mark already does.
+/// How a step ended when that is worth a word: without doing what it was
+/// asked. A step that worked says nothing, as its group's mark already does,
+/// and one still running says so in its verb ("Running", "Editing").
 fn unsettled_word(status: chat::ToolStatus) -> Option<&'static str> {
-    (status != chat::ToolStatus::Succeeded).then(|| status_word(status))
+    let settled = matches!(
+        status,
+        chat::ToolStatus::Succeeded | chat::ToolStatus::Running
+    );
+    (!settled).then(|| status_word(status))
 }
 
 fn status_word(status: chat::ToolStatus) -> &'static str {
@@ -1374,6 +1378,9 @@ struct CachedItem {
     image_evicted: bool,
     /// What the step did to work with other agents, where it did.
     coordination: Option<Box<coordination::Coordinated>>,
+    /// What a plain tool call's row says it did, read from its input once
+    /// per change to the call rather than while drawing or regrouping.
+    title: Option<tool_title::Title>,
 }
 impl Drop for CachedItem {
     fn drop(&mut self) {
@@ -1395,6 +1402,19 @@ impl Drop for CachedItem {
                 prompt: self.prompt.take(),
             });
         }
+    }
+}
+
+/// What grouping reads from a transcript's presentations, each formed once
+/// per change to its item.
+struct Presentations<'c>(&'c HashMap<String, CachedItem>);
+
+impl<'c> turn::Presented<'c> for Presentations<'c> {
+    fn coordinated(&self, item: &chat::Item) -> Option<&'c coordination::Coordinated> {
+        self.0.get(&item.id)?.coordination.as_deref()
+    }
+    fn titled(&self, item: &chat::Item) -> Option<&'c tool_title::Title> {
+        self.0.get(&item.id)?.title_of(item)
     }
 }
 
@@ -1423,6 +1443,17 @@ fn recorded_message_stamp(
 }
 
 impl CachedItem {
+    /// What `item`'s row says it did, when this presentation was formed from
+    /// that very call. A presentation of an earlier state of the call, or one
+    /// still being prepared, has none to offer.
+    fn title_of(&self, item: &chat::Item) -> Option<&tool_title::Title> {
+        self.title.as_ref().filter(|_| {
+            self.item
+                .as_deref()
+                .is_some_and(|formed| std::ptr::eq(formed, item) || formed.content == item.content)
+        })
+    }
+
     fn preparing(item: &Arc<chat::Item>, theme: crate::settings::EditorSyntaxTheme) -> Self {
         let empty = ItemContent::Text {
             text: String::new(),
@@ -1541,6 +1572,28 @@ impl CachedItem {
                     .is_some_and(|item| std::ptr::eq(&item.content, content))
             })
             .and_then(|cached| cached.literal.take());
+        // A title is formed from the call's input, so the same call keeps
+        // the one it has; a toggle or a retheme does not read it again.
+        let title = match content {
+            ItemContent::Tool {
+                name,
+                input,
+                status,
+                ..
+            } => Some(
+                previous
+                    .as_mut()
+                    .filter(|cached| {
+                        cached
+                            .item
+                            .as_ref()
+                            .is_some_and(|item| std::ptr::eq(&item.content, content))
+                    })
+                    .and_then(|cached| cached.title.take())
+                    .unwrap_or_else(|| tool_title::Title::of(name, input, *status)),
+            ),
+            _ => None,
+        };
         let fresh_coordination = coordination.is_some();
         let retained_coordination = previous
             .as_mut()
@@ -1713,7 +1766,7 @@ impl CachedItem {
                 }
             )
             .then_some(expanded),
-            preview: tool_text::Preview::update(preview, content, theme),
+            preview: tool_text::Preview::update(preview, content, title.as_ref(), theme),
             tool_input,
             prepared_tools,
             tool_output,
@@ -1745,6 +1798,7 @@ impl CachedItem {
             coordination: coordination
                 .map(|prepared| Box::new(coordination::Coordinated::from_prepared(prepared)))
                 .or(retained_coordination),
+            title,
         };
         if expanded
             && matches!(
@@ -4502,9 +4556,11 @@ impl Runtime {
         prepared.install(cached, managed, expanded);
         self.resume_preparation();
         if regroup && self.selected_subagent.is_none() {
-            let turns = turn::group(&self.snapshot.items, &self.asked_after, |item| {
-                self.cache.get(&item.id)?.coordination.as_deref()
-            });
+            let turns = turn::group(
+                &self.snapshot.items,
+                &self.asked_after,
+                Presentations(&self.cache),
+            );
             carry_step_disclosures(
                 &mut self.opened,
                 &mut self.find_disclosure,
@@ -4919,11 +4975,7 @@ impl Runtime {
         let cache = &self.cache;
         let turns = (grouping_dirty
             || !turn::same_structure(&self.snapshot.items, &snapshot.items))
-        .then(|| {
-            turn::group(&snapshot.items, &self.asked_after, |item| {
-                cache.get(&item.id)?.coordination.as_deref()
-            })
-        });
+        .then(|| turn::group(&snapshot.items, &self.asked_after, Presentations(cache)));
         if let Some(turns) = &turns {
             carry_step_disclosures(
                 &mut self.opened,
@@ -16781,7 +16833,7 @@ mod tests {
                     at: None,
                 }],
                 &HashSet::new(),
-                |_| None,
+                Presentations(&HashMap::new()),
             );
             let _ = app.handle_chat_ui(Action::ToggleTurn(target, "u1".into()));
             assert_eq!(chat_runtime(&app, card).opened.get("u1"), Some(&!default));
