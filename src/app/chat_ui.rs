@@ -6559,9 +6559,7 @@ impl Cagents {
         replacement.id = TerminalId::new();
         replacement.proof = None;
         replacement.terminal = None;
-        let variable = account::home_variable(account.provider).unwrap();
         let names = account::credential_overrides(account.provider);
-        replacement.launch.recipe.environment.remove(variable);
         replacement
             .launch
             .recipe
@@ -6578,15 +6576,8 @@ impl Cagents {
                 .iter()
                 .map(|name| (*name).to_owned()),
         );
-        if let Some(home) = account.launch_home() {
-            let Some(home) = home.to_str() else {
-                return Task::none();
-            };
-            replacement
-                .launch
-                .recipe
-                .environment
-                .insert(variable.into(), home.into());
+        if account.bind_home(&mut replacement.launch.recipe).is_err() {
+            return Task::none();
         }
         if !chat::is_account_recovery(&source, &replacement) {
             return Task::none();

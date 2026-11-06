@@ -639,6 +639,8 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
     }
     for recipe in [&mut *original, &mut *candidate] {
         recipe.environment.remove(home);
+        // The system Claude login binds its home by leaving it unset.
+        recipe.unset_environment.remove(home);
         recipe
             .environment
             .retain(|name, _| !names.contains(&name.as_str()));
@@ -3005,6 +3007,16 @@ mod tests {
             system.launch_home()
         );
         assert_eq!(system.probe_environment(), None);
+        // Left unset rather than out, so a daemon started with its own
+        // `CLAUDE_CONFIG_DIR` does not hand it on.
+        assert_eq!(
+            session
+                .launch
+                .recipe
+                .unset_environment
+                .contains("CLAUDE_CONFIG_DIR"),
+            system.launch_home().is_none()
+        );
         if std::env::var_os("CLAUDE_CONFIG_DIR").is_none() {
             assert_eq!(system.launch_home(), None);
         }
@@ -3370,21 +3382,8 @@ pub(crate) fn fresh_session(
     if account.provider == provider
         && !(crate::device::is_remote()
             && matches!(account.home, crate::account::AccountHome::System))
-        && let Some(variable) = crate::account::home_variable(provider)
     {
-        match account.launch_home() {
-            Some(home) => {
-                let home = home.into_os_string().into_string().map_err(|_| {
-                    "The account's home is not a path a conversation can record".to_owned()
-                })?;
-                recipe.environment.insert(variable.to_owned(), home);
-            }
-            // The CLI resolves its own default, as in the reader's shell,
-            // whatever this process inherited.
-            None => {
-                recipe.environment.remove(variable);
-            }
-        }
+        account.bind_home(&mut recipe)?;
     }
     recipe
         .environment

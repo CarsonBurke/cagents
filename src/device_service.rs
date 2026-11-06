@@ -1891,16 +1891,10 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
             )
         })?;
     let mut environment = std::collections::BTreeMap::new();
-    if let (Some(variable), Some(home)) = (
-        crate::account::home_variable(account.provider),
-        account.launch_home(),
-    ) {
-        environment.insert(variable.to_owned(), home.display().to_string());
-    }
     if let Some(path) = search_path.and_then(|path| path.into_string().ok()) {
         environment.insert("PATH".into(), path);
     }
-    Ok(Reply::Login(crate::model::LaunchRecipe {
+    let mut recipe = crate::model::LaunchRecipe {
         program: program
             .into_os_string()
             .into_string()
@@ -1915,7 +1909,9 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
             .iter()
             .map(|name| (*name).to_owned())
             .collect(),
-    }))
+    };
+    account.bind_home(&mut recipe)?;
+    Ok(Reply::Login(recipe))
 }
 
 #[cfg(feature = "host")]

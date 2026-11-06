@@ -1684,18 +1684,12 @@ fn login_launch_with_path(
 ) -> Option<LaunchRecipe> {
     let command = login_arguments(account.provider, device)?;
     let mut environment = BTreeMap::new();
-    if let (Some(variable), Some(account_home)) = (
-        account::home_variable(account.provider),
-        account.launch_home(),
-    ) {
-        environment.insert(variable.to_owned(), account_home.display().to_string());
-    }
     // The CLI was found on the search path the reader's shell sets up, and
     // runs with it, as the probes run it.
     if let Some(path) = search_path.and_then(|path| path.to_str()) {
         environment.insert("PATH".into(), path.to_owned());
     }
-    Some(LaunchRecipe {
+    let mut recipe = LaunchRecipe {
         unset_environment: account
             .credential_overrides()
             .iter()
@@ -1708,7 +1702,9 @@ fn login_launch_with_path(
             .collect(),
         working_directory: home,
         environment,
-    })
+    };
+    account.bind_home(&mut recipe).ok()?;
+    Some(recipe)
 }
 
 /// Whether the sign-in `recipe` signs `account` in: whether it names the
@@ -1723,7 +1719,7 @@ fn signs_in(account: &Account, recipe: &LaunchRecipe) -> bool {
     let named = recipe
         .environment
         .get(variable)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty() && !recipe.unset_environment.contains(variable))
         .map(PathBuf::from);
     match named {
         Some(named) => account.resolved_home() == Some(named),
@@ -1778,6 +1774,11 @@ fn account_of_recipe<'a>(
     let system = accounts
         .iter()
         .find(|state| state.account.provider == provider && state.account.is_system());
+    if recipe.unset_environment.contains(variable) {
+        // The CLI resolves its default: the system account's, unless this
+        // window's system account names a home of its own.
+        return system.filter(|state| state.account.launch_home().is_none());
+    }
     let Some(chosen) = chosen else {
         return system;
     };
@@ -2301,10 +2302,12 @@ impl Cagents {
         let account = state.account.clone();
         let id = state.id.clone();
         let owner = state.owner;
-        // Only the system Claude login can have a second record.
+        // Only the system Claude login can have a second record, and only
+        // while it exports no home of its own (as the probe reads it).
         let settle = (std::mem::take(&mut state.settle_records)
             && account.provider == Provider::Claude
-            && matches!(account.home, account::AccountHome::System))
+            && matches!(account.home, account::AccountHome::System)
+            && account.launch_home().is_none())
         .then(|| cache.clone().zip(account.cache_key()))
         .flatten();
         let probe = cosmic::task::future(async move {
@@ -6500,6 +6503,11 @@ mod tests {
                 .as_deref()
                 .and_then(Path::to_str)
         );
+        // Unset when not exported, so the daemon's own value is not inherited.
+        assert_eq!(
+            launch.unset_environment.contains("CLAUDE_CONFIG_DIR"),
+            Account::system(Provider::Claude).launch_home().is_none()
+        );
         assert!(signs_in(&Account::system(Provider::Claude), &launch));
         assert_eq!(Provider::recognize_launch(&launch), None);
         assert!(is_sign_in(&launch));
@@ -6589,6 +6597,17 @@ mod tests {
             .environment
             .insert("CLAUDE_CONFIG_DIR".into(), "/somewhere/else".into());
         assert_eq!(found(&recipe), None);
+        // An unset home is the CLI's default: the system login's, unless
+        // this window's system account names a home of its own.
+        recipe.environment.remove("CLAUDE_CONFIG_DIR");
+        recipe.unset_environment.insert("CLAUDE_CONFIG_DIR".into());
+        assert_eq!(
+            found(&recipe),
+            Account::system(Provider::Claude)
+                .launch_home()
+                .is_none()
+                .then(|| Account::system(Provider::Claude).id())
+        );
     }
 }
 
@@ -8080,7 +8099,8 @@ mod app_tests {
                 other: "other@example.com".into(),
             })
         );
-        // Both names it might be are shown, wherever the row is named.
+        // Both names it might be are shown wherever the account is offered;
+        // its own row lists the other beneath the address it reports.
         assert!(
             app.account_ui
                 .display_name(state(0))

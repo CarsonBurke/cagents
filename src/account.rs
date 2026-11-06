@@ -574,6 +574,51 @@ impl Account {
         explicit.then_some(home)
     }
 
+    /// Binds `recipe`'s provider home to this account, replacing whatever
+    /// binding it had: exports [`Self::launch_home`], or, where that is
+    /// `None` for the system Claude login, unsets the variable, so the CLI
+    /// resolves its default as the reader's own `claude` and this account's
+    /// probe do, whatever the process that spawns it inherited. A daemon
+    /// started with its own `CLAUDE_CONFIG_DIR` would otherwise hand it on.
+    ///
+    /// Leaves `recipe` unchanged when the home is not a path it can record.
+    pub fn bind_home(&self, recipe: &mut crate::model::LaunchRecipe) -> Result<(), String> {
+        self.bind_home_in(recipe, &|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::bind_home`] against `environment`.
+    pub fn bind_home_in(
+        &self,
+        recipe: &mut crate::model::LaunchRecipe,
+        environment: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), String> {
+        let Some(variable) = home_variable(self.provider) else {
+            return Ok(());
+        };
+        let home = self
+            .launch_home_in(environment)
+            .map(|home| {
+                home.into_os_string()
+                    .into_string()
+                    .map_err(|_| "The account's home is not a path a launch can record".to_owned())
+            })
+            .transpose()?;
+        recipe.environment.remove(variable);
+        recipe.unset_environment.remove(variable);
+        match home {
+            Some(home) => {
+                recipe.environment.insert(variable.to_owned(), home);
+            }
+            None if self.provider == Provider::Claude
+                && matches!(self.home, AccountHome::System) =>
+            {
+                recipe.unset_environment.insert(variable.to_owned());
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
     /// The environment a probe of this account sets on the CLI.
     ///
     /// The system account sets nothing, so the CLI resolves its default
@@ -1567,6 +1612,75 @@ mod tests {
         );
         assert_ne!(managed.lock_name(), codex.lock_name());
         assert!(!managed.is_system() && codex.is_system());
+    }
+
+    /// A launch on the system Claude login unsets the home variable rather
+    /// than leaving it out, so a daemon started with its own
+    /// `CLAUDE_CONFIG_DIR` cannot hand it on and split the login's record
+    /// from the one its probe reads. Every other binding replaces the last.
+    #[test]
+    fn a_launch_binds_the_home_its_account_resolves_whatever_spawns_it() {
+        let environment = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        let user = environment(&[("HOME", "/home/a")]);
+        let chosen = environment(&[("HOME", "/home/a"), ("CLAUDE_CONFIG_DIR", "/chosen")]);
+        let recipe = || crate::model::LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: [("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude".into())].into(),
+            unset_environment: ["ANTHROPIC_API_KEY".into()].into(),
+        };
+        let bound = |account: &Account, environment: &dyn Fn(&str) -> Option<String>| {
+            let mut recipe = recipe();
+            account.bind_home_in(&mut recipe, environment).unwrap();
+            (recipe.environment, recipe.unset_environment)
+        };
+        let system = Account::system(Provider::Claude);
+        assert_eq!(
+            bound(&system, &user),
+            (
+                Default::default(),
+                ["ANTHROPIC_API_KEY".into(), "CLAUDE_CONFIG_DIR".into()].into()
+            )
+        );
+        assert_eq!(
+            bound(&system, &chosen),
+            (
+                [("CLAUDE_CONFIG_DIR".into(), "/chosen".into())].into(),
+                ["ANTHROPIC_API_KEY".into()].into()
+            )
+        );
+        // Moving a system launch onto another account exports its home
+        // instead of leaving the default unset.
+        let linked = Account::linked(
+            Provider::Claude,
+            uuid::Uuid::from_u128(2),
+            "/home/a/.claude-work".into(),
+        );
+        let mut moved = recipe();
+        system.bind_home_in(&mut moved, &user).unwrap();
+        linked.bind_home_in(&mut moved, &user).unwrap();
+        assert_eq!(
+            (moved.environment, moved.unset_environment),
+            (
+                [("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude-work".into())].into(),
+                ["ANTHROPIC_API_KEY".into()].into()
+            )
+        );
+        // Codex keeps its login in its home, which it always exports.
+        let (environment, unset) = bound(&Account::system(Provider::Codex), &user);
+        assert_eq!(
+            environment.get("CODEX_HOME").map(String::as_str),
+            Some("/home/a/.codex")
+        );
+        assert!(!unset.contains("CODEX_HOME"));
     }
 
     /// Regression for #520: a cagents process started from inside a

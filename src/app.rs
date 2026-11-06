@@ -6289,13 +6289,8 @@ impl Cagents {
                     .iter()
                     .map(|name| (*name).to_owned()),
             );
-            if let (Some(variable), Some(home)) =
-                (account::home_variable(provider), account.launch_home())
-            {
-                launch
-                    .environment
-                    .insert(variable.to_owned(), home.display().to_string());
-            }
+            // A home that is not a path the recipe can record stays unbound.
+            let _ = account.bind_home(&mut launch);
         }
         self.add_terminal_recipe(launch)
     }
