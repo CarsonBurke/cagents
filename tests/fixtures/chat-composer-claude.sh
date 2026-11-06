@@ -178,6 +178,35 @@ tools_turn() {
     done < "$tools_file"
 }
 
+# Optional raw stream: each line of fixture-frames.jsonl is one stream-json
+# frame, emitted in order on every turn before its answer, with "@TURN@" in any
+# string replaced by the turn number so IDs stay unique. Assistant and user
+# frames are also recorded in the synthetic history, as Claude records them;
+# system frames, such as a background task's lifecycle, are live only. A frame
+# with "_history": true is only recorded, as Claude records a queued
+# notification. A line {"_sleep": SECONDS} pauses, so a running state can be
+# observed.
+frames_file=$config/fixture-frames.jsonl
+frames_turn() {
+    while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        delay=$(printf '%s' "$spec" | jq -r '._sleep // empty')
+        if [ -n "$delay" ]; then
+            sleep "$delay"
+            continue
+        fi
+        frame=$(printf '%s' "$spec" | jq -c --arg turn "$turn" 'walk(if type == "string" then gsub("@TURN@"; $turn) else . end)')
+        if [ "$(printf '%s' "$frame" | jq -r '._history // false')" = true ]; then
+            printf '%s' "$frame" | jq -c --arg session "$session" 'del(._history) + {sessionId:$session}' >> "$history"
+            continue
+        fi
+        case $(printf '%s' "$frame" | jq -r '.type') in
+            assistant|user) emit_record "$frame" ;;
+            *) printf '%s\n' "$frame" ;;
+        esac
+    done < "$frames_file"
+}
+
 # Optional provider-produced image for image preview/viewer acceptance: each
 # turn returns this PNG as a base64 block. Native launches drop CAGENTS_*
 # variables, so the provider home's fixture-image.png is the default.
@@ -293,6 +322,7 @@ while IFS= read -r frame; do
                 if [ "$verbosity" = 1 ]; then verbosity_turn; fi
                 if [ "$subagents" = 1 ]; then subagents_turn; fi
                 if [ -f "$tools_file" ]; then tools_turn; fi
+                if [ -f "$frames_file" ]; then frames_turn; fi
                 if [ -f "$fixture_image" ]; then image_turn; fi
                 # A Markdown file in the config directory can stand in for the
                 # answer, so rendering and long-transcript checks need no live
