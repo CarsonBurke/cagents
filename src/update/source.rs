@@ -187,7 +187,8 @@ impl Client {
         protocol: u16,
     ) -> Result<Self, ControlError> {
         match protocol {
-            crate::terminal_ipc::PROTOCOL_VERSION => {
+            crate::terminal_ipc::PROTOCOL_VERSION
+            | crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL => {
                 let stream = crate::control::connect_control_socket(
                     socket,
                     deadline.saturating_duration_since(Instant::now()),
@@ -196,7 +197,10 @@ impl Client {
                 let peer = Peer::observe(&stream, socket).map_err(|error| {
                     ControlError::Configure(io::Error::other(error.to_string()))
                 })?;
-                let client = ControlClient::from_stream_with_deadline(stream, deadline)?;
+                // The candidate line differs only by its number and by
+                // StartupState, which the update never sends.
+                let client =
+                    ControlClient::from_stream_at_source_protocol(stream, deadline, protocol)?;
                 peer.verify(client.proof()).map_err(|error| {
                     ControlError::Configure(io::Error::other(error.to_string()))
                 })?;
@@ -214,7 +218,7 @@ impl Client {
 
     pub(crate) fn protocol(&self) -> u16 {
         match self {
-            Self::Current { .. } => crate::terminal_ipc::PROTOCOL_VERSION,
+            Self::Current { client, .. } => client.protocol(),
             Self::V77(_) => 77,
             Self::V119(_) => 119,
         }
@@ -336,6 +340,16 @@ impl InstalledIdentity {
     }
 }
 
+/// Sources this release can authenticate and update with its own worker.
+pub(super) fn is_qualified_source(protocol: u16) -> bool {
+    matches!(
+        protocol,
+        77 | 119
+            | crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
+            | crate::terminal_ipc::PROTOCOL_VERSION
+    )
+}
+
 /// Installed entry routing, not permission to decode or mutate an unknown
 /// source. Only its exact authenticated old executable may own that workflow.
 pub(super) fn inspect_installed_identity() -> Result<InstalledIdentity, UpdateError> {
@@ -348,7 +362,7 @@ pub(super) fn inspect_installed_identity() -> Result<InstalledIdentity, UpdateEr
     let deadline = Instant::now() + Duration::from_secs(5);
     match v77::discover_installed_protocol(&socket, deadline) {
         Ok((protocol, peer)) => {
-            if matches!(protocol, 77 | 119 | crate::terminal_ipc::PROTOCOL_VERSION) {
+            if is_qualified_source(protocol) {
                 let client = Client::connect_selected(&socket, deadline, protocol)
                     .map_err(|error| invalid(error.to_string()))?;
                 peer.verify(client.proof())?;

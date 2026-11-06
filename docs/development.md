@@ -355,8 +355,10 @@ GiB for a host build or test build, 9 GiB for a UI one and 8 GiB for an `exec`
 script such as the development runner; a slot held by a plain `flock` counts as
 9 GiB. `CAGENTS_BUILD_COST_GIB` overrides it. A build starts beside others only
 when the memory available, less what the running builds are expected to take
-beyond what they already hold, covers its own. A lone build always starts,
-whatever the memory or pressure, so no build waits forever. Each build gets a
+beyond what they already hold, covers its own, and while the kernel's memory
+pressure (`some avg10` in `/proc/pressure/memory`, the share of time some task
+stalled on reclaim) is below 10% (`CAGENTS_BUILD_MEMORY_PRESSURE`; `0` disables
+it). A lone build always starts, whatever the memory or pressure. Each build gets a
 share of the CPUs among the builds running once it starts, between 4 and 8 (the
 jobs the costs were measured with) and at most half the CPUs, as
 `CARGO_BUILD_JOBS`, which also caps a larger value; `-j` still wins. For
@@ -367,6 +369,34 @@ throughout; a plain `cargo test` compiles its doctests after the slot is
 released. The development runner builds its matched set through the gate
 itself, and skips the gate when the set is [already
 current](#up-to-date-launches).
+
+The running builds are those of the whole host, not only of one family of
+slots. Builds in the shared families, whose first lock is named
+`/var/tmp/cagents-*.lock` (such as `/var/tmp/cagents-cargo.lock` and
+`/var/tmp/cagents-fw16-cargo.lock`), and builds in the slots offloaded to the
+build host each record themselves in `/var/tmp/cagents-builds-UID`
+(`CAGENTS_BUILD_REGISTRY`; empty disables it), naming the lock they hold. Every
+family prices the others' running builds beside its own, and a build is lone
+only when nothing on the host builds. Without this each family filled the same
+memory: on fw16, three families admitted builds independently and the host
+swapped about 20 GiB each way every six minutes. A private family, such as a
+test's or a native session's own lock elsewhere (including one in a directory
+under `/var/tmp` named like a shared lock), stays out of the registry unless
+the variable names one. A record whose lock is free is stale and ignored, and
+one whose holder has exited is priced at the largest cost. Families decide one
+at a time, under the registry's `.decision` lock. A slot held by a plain
+`flock`, by a gate from before the registry or by an offload agent sent from
+such a checkout writes no record, so only its own family prices it.
+
+So that no build waits forever behind smaller ones from other families that
+keep fitting, a build refused room while it holds a free slot records itself
+as waiting. Once refused for 120 seconds (`CAGENTS_BUILD_WAIT_PRIORITY_SECS`,
+read on the host that admits the build; `0` disables it), the build refused
+longest on the host starts beside the running builds whatever the memory or
+pressure. Only one such build ramps up at a time: while one admitted that way
+started less than 10 minutes ago and its holder lives, the next waits. Time
+spent queued behind its own family, or waiting for one of its slots, does not
+count, and a build no longer refused for 10 seconds loses its place.
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock --close /var/tmp/cagents-cargo.lock` takes exactly
@@ -392,6 +422,11 @@ host](#building-on-another-host), each Cargo command in it goes there on its
 own. Building here, it holds one slot until the command exits, and gated
 commands inside it run in that slot; gating each Cargo command instead keeps
 test runs out of the slot.
+
+Queue and slot lock requests die with their gate, including when it is killed
+without a chance to handle a signal. Waiters retain only their lock descriptor
+and standard streams; inherited pipes and locks remain with the gate for the
+admitted command.
 
 Cancelling a held command keeps its slot until the command and its descendants
 have exited. The Linux Python 3 supervisor sends TERM, allows the command one
@@ -433,6 +468,9 @@ admission budget. A Cargo reached any other way inside COMMAND, by path,
 through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
 also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
 compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+Programs launched by `cargo run` inside that `exec` inherit the same Cargo
+shim and guard. Their named `cargo` reenters the gate after the program's
+build releases its slot; their absolute `$CARGO` cannot compile here.
 On the build host itself, or with
 `CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
 above. A gate without `scripts/cargo-offload` beside it refuses to build
@@ -467,7 +505,10 @@ running builds, only when the host's available memory, less what those builds
 are expected to take beyond what they already hold, covers this build's
 expected peak (at least 2 GiB), while the host's memory pressure (`some
 avg10` in `/proc/pressure/memory`) is below 10%, and while its CPU pressure
-(`/proc/pressure/cpu`) is below 40%; a lone build always starts. A plain
+(`/proc/pressure/cpu`) is below 40%; a lone build always starts. The running
+builds counted include those the host's own gate admits in its shared
+families, through the registry described [above](#sharing-a-host-between-several-checkouts),
+where these slots record their builds in turn. A plain
 `cargo test` runs its tests there, in the slot, which stays leased until they
 end. One build's
 steps share one ssh connection, which ends with it. Output streams back and
@@ -774,9 +815,9 @@ be outside the account home reported by `getent passwd "$(id -u)"`, even when
 `HOME` points elsewhere: bundled-skill tests deliberately refuse installation
 beneath the passwd home. A private `~/.cot` therefore does not qualify.
 
-On fw16, `/opt/resolve/.cot` is the existing user-owned private disk-backed base
-used for this preparation. On another host, select and verify a suitable base;
-do not create directories in an unrelated application's tree or change shared
+Use a directory of our own under `/var/tmp`, such as `/var/tmp/ct`, created
+with `mkdir -m 700`. `/var/tmp` is disk-backed on fw16; verify it on another
+host. Do not borrow another application's tree, and do not change shared
 directories or Git markers. The **final** nested Unix
 socket path must be shorter than 108 bytes, including fixture suffixes. For
 example, `/.tmpXXXXXX/tmp/cagents-codex-<36-byte UUID>/control.sock` adds 79
@@ -784,8 +825,9 @@ bytes, so that layout requires a temporary base of at most 28 bytes. Longer
 fixture layouts need more room; a short base alone is not proof.
 
 ```sh
-# Set this only after verifying the base above; this value is specific to fw16.
-export CAGENTS_TEST_TMP_BASE=/opt/resolve/.cot
+# Set this only after verifying the base above.
+mkdir -p -m 700 /var/tmp/ct
+export CAGENTS_TEST_TMP_BASE=/var/tmp/ct
 (
     TMPDIR=$(mktemp -d "${CAGENTS_TEST_TMP_BASE:?}/tXXXXXX") || exit
     export TMPDIR

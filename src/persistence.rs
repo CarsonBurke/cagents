@@ -4441,7 +4441,7 @@ fn validate_card_conversion(
                 };
             if !reattach
                 && (terminal.id == session.id
-                    || exact_chat_resume(&session).as_ref() != Some(&terminal.launch))
+                    || !session.launch.resumes_in_terminal(&terminal.launch))
             {
                 return Err(invalid());
             }
@@ -10097,6 +10097,148 @@ mod tests {
                 .kind,
             CardKind::Terminal(terminal)
         );
+    }
+
+    /// The daemon resumes a Claude chat's terminal under the mode the provider
+    /// last confirmed. Refusing that recipe left the window on a terminal
+    /// while storage kept the retired chat, for every mode Claude can report.
+    #[test]
+    fn a_claude_chat_converts_to_its_terminal_under_the_confirmed_permission_mode() {
+        for mode in [
+            None,
+            Some("manual"),
+            Some("default"),
+            Some("auto"),
+            Some("acceptEdits"),
+            Some("plan"),
+            Some("dontAsk"),
+            Some("bypassPermissions"),
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("chat.sqlite3");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut workspace, chat) = agent_workspace(crate::agent::Provider::Claude);
+            workspace.cards[0].kind = CardKind::Chat(chat.clone());
+            let mut lane = SaveLane::default();
+            lane.save(&store, &workspace).unwrap();
+
+            let recipe = chat
+                .launch
+                .terminal_recipe_with_permission_mode(mode)
+                .unwrap();
+            let terminal = TerminalSession {
+                owned_codex_listener: None,
+                recovery_origin: None,
+                predecessor: None,
+                id: TerminalId::new(),
+                launch: recipe.clone(),
+                continuity: TerminalContinuity::RelaunchAvailable {
+                    recipe,
+                    last_exit: None,
+                },
+                resume_hint: None,
+                transcript_path: chat.terminal.as_ref().unwrap().transcript_path.clone(),
+            };
+            workspace.cards[0].kind = CardKind::Terminal(terminal.clone());
+            lane.save(&store, &workspace).unwrap();
+            drop(store);
+
+            // A reopen restores the terminal, and the card can go back to
+            // chat from it with the mode still in force.
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            assert_eq!(
+                store
+                    .load_card(workspace.cards[0].id, None)
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                CardKind::Terminal(terminal.clone())
+            );
+            let resumed = terminal.agent_resume_recipe().unwrap();
+            assert_eq!(
+                mode.is_some(),
+                resumed
+                    .arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == "--permission-mode" && Some(pair[1].as_str()) == mode)
+            );
+            let again = crate::chat::Session {
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                id: terminal.id,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    recipe: resumed,
+                    session_id: chat.launch.session_id.clone(),
+                },
+                proof: None,
+                terminal: Some(terminal.clone()),
+            };
+            workspace.cards[0].kind = CardKind::Chat(again.clone());
+            lane.save(&store, &workspace).unwrap();
+
+            // The next return carries whatever mode the chat confirmed since.
+            let recipe = again
+                .launch
+                .terminal_recipe_with_permission_mode(Some("plan"))
+                .unwrap();
+            workspace.cards[0].kind = CardKind::Terminal(TerminalSession {
+                id: TerminalId::new(),
+                launch: recipe.clone(),
+                continuity: TerminalContinuity::RelaunchAvailable {
+                    recipe,
+                    last_exit: None,
+                },
+                ..terminal
+            });
+            lane.save(&store, &workspace).unwrap();
+        }
+    }
+
+    /// The mode is the only thing a handoff may add to the exact resume.
+    #[test]
+    fn a_chat_refuses_a_terminal_that_differs_from_its_resume_by_more_than_its_mode() {
+        let (workspace, chat) = agent_workspace(crate::agent::Provider::Claude);
+        drop(workspace);
+        let launch = &chat.launch;
+        let confirmed = launch
+            .terminal_recipe_with_permission_mode(Some("plan"))
+            .unwrap();
+        assert!(launch.resumes_in_terminal(&confirmed));
+        let mut other_conversation = launch.clone();
+        other_conversation.session_id = Some("88888888-1111-4111-8111-111111111111".into());
+        let mut extra_argument = confirmed.clone();
+        extra_argument
+            .arguments
+            .splice(0..0, ["--dangerously-skip-permissions".to_owned()]);
+        let mut unknown_mode = confirmed.clone();
+        *unknown_mode.arguments.last_mut().unwrap() = "anything".into();
+        let mut other_directory = confirmed.clone();
+        other_directory.working_directory = "/elsewhere".into();
+        let mut other_program = confirmed.clone();
+        other_program.program = "codex".into();
+        let mut other_environment = confirmed.clone();
+        other_environment
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "/another-account".into());
+        for wrong in [
+            extra_argument,
+            unknown_mode,
+            other_directory,
+            other_program,
+            other_environment,
+        ] {
+            assert!(!launch.resumes_in_terminal(&wrong), "{wrong:?}");
+        }
+        assert!(!other_conversation.resumes_in_terminal(&confirmed));
+
+        // Only Claude's terminal takes a mode from the provider.
+        let (_, codex) = agent_workspace(crate::agent::Provider::Codex);
+        let mut with_mode = codex.launch.terminal_recipe().unwrap();
+        with_mode
+            .arguments
+            .extend(["--permission-mode".into(), "plan".into()]);
+        assert!(!codex.launch.resumes_in_terminal(&with_mode));
     }
 
     /// A native Codex thread returns through a CLI view the daemon opens

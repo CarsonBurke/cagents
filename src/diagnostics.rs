@@ -673,6 +673,7 @@ pub struct Report {
     pub cli_protocol: u16,
     pub path: PathBuf,
     pub products: Vec<ProductReport>,
+    pub transcript_caches: Option<crate::transcript_cache::Usage>,
     pub holders_readable: bool,
     pub holders: Vec<HolderReport>,
 }
@@ -688,6 +689,13 @@ impl Report {
         let mut lines = vec![format!("cagents {} (protocol {})", self.cli_version, self.cli_protocol),
             format!("Private diagnostics: {}", self.path.display()),
             "Recorded evidence only; sibling versions and health are last observed, not a live check.".into()];
+        match &self.transcript_caches {
+            Some(usage) => lines.push(format!(
+                "Transcript caches: {} ({} bytes)",
+                usage.count, usage.bytes
+            )),
+            None => lines.push("Transcript caches: unavailable".into()),
+        }
         for product in &self.products {
             match &product.last_observed {
                 Some(last) => lines.push(format!("{}: last observed {} (protocol {}), {}; lifecycle {}; clean shutdown {}; persistence {}; skipped events {}; run {}", product.product.name(), last.version, last.protocol, relative_time(last.at_unix_ms, now), lifecycle_label(last.lifecycle), match last.clean_shutdown { Some(true) => "yes", Some(false) => "no", None => "unknown" }, persistence_label(last.persistence), last.skipped_events, last.run)),
@@ -852,14 +860,25 @@ fn event_label(value: Event) -> String {
     }
 }
 
-/// Reads recorded lifecycle evidence and a read-only procfs snapshot of live
-/// holders. It never starts services or connects to runtime sockets. Absence
-/// of recorded evidence is not proof of a clean shutdown.
+/// Reads recorded lifecycle evidence, transcript-cache file metadata and a
+/// read-only procfs snapshot of live holders. It never starts services or
+/// connects to runtime sockets. Missing evidence does not prove a clean shutdown.
 pub fn inspect() -> io::Result<Report> {
-    let mut report = inspect_at(state_path()?)?;
+    let runtime = crate::daemon::RuntimePaths::discover().ok();
+    let mut report = inspect_at_with_runtime(
+        state_path()?,
+        runtime.as_ref().map(|paths| paths.directory.as_path()),
+    )?;
     (report.holders_readable, report.holders) = observe_holders();
     Ok(report)
 }
+fn inspect_at_with_runtime(path: PathBuf, runtime_root: Option<&Path>) -> io::Result<Report> {
+    let mut report = inspect_at(path)?;
+    report.transcript_caches =
+        runtime_root.and_then(|root| crate::transcript_cache::usage(root).ok());
+    Ok(report)
+}
+
 fn inspect_at(path: PathBuf) -> io::Result<Report> {
     let (dir, readable) = match directory(&path, false) {
         Ok(dir) => (Some(dir), true),
@@ -882,6 +901,7 @@ fn inspect_at(path: PathBuf) -> io::Result<Report> {
         cli_protocol: crate::terminal::ipc::PROTOCOL_VERSION,
         path,
         products,
+        transcript_caches: None,
         holders_readable: true,
         holders: Vec::new(),
     })
@@ -956,6 +976,37 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
+    #[test]
+    fn transcript_cache_usage_reports_counts_zero_when_missing_and_null_on_failure() {
+        let (root, path) = fixture();
+        let runtime = root.path().join("runtime");
+        let missing = inspect_at_with_runtime(path.clone(), Some(&runtime)).unwrap();
+        assert!(missing.human().contains("Transcript caches: 0 (0 bytes)"));
+        assert!(!runtime.exists());
+
+        let cache = runtime.join(format!("chat-{}", Uuid::from_u128(1)));
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir(runtime.join(format!("chat-{}", Uuid::from_u128(2)))).unwrap();
+        std::fs::write(cache.join("transcript.sqlite"), b"private-payload").unwrap();
+        std::fs::write(cache.join("transcript.sqlite-wal"), [1, 2, 3]).unwrap();
+        let report = inspect_at_with_runtime(path.clone(), Some(&runtime)).unwrap();
+        assert!(report.human().contains("Transcript caches: 2 (18 bytes)"));
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains(r#""transcript_caches":{"count":2,"bytes":18}"#));
+        assert!(!json.contains("private-payload"));
+
+        let not_directory = root.path().join("not-a-directory");
+        std::fs::write(&not_directory, b"").unwrap();
+        for failed in [
+            inspect_at_with_runtime(path.clone(), None).unwrap(),
+            inspect_at_with_runtime(path.clone(), Some(&not_directory)).unwrap(),
+        ] {
+            assert!(serde_json::to_value(&failed).unwrap()["transcript_caches"].is_null());
+            assert!(failed.human().contains("Transcript caches: unavailable"));
+        }
+        assert!(!path.exists());
+    }
+
     #[test]
     fn after_exit_evidence_and_restart_do_not_invent_health() {
         let (_root, path) = fixture();
