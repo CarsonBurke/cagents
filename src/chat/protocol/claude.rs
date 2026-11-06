@@ -549,8 +549,10 @@ struct Claude {
     /// Running background tasks, oldest first.
     tasks: VecDeque<String>,
     /// Bounded origin metadata, not running state. Preserve the explicit
-    /// native kind through progress and terminal-notification replay.
-    report_tasks: VecDeque<(String, ReportTask)>,
+    /// native kind and the name the task started with through progress and
+    /// terminal-notification replay: a progress frame's description is what
+    /// the agent is doing now, such as "Running cat > …", not its name.
+    report_tasks: VecDeque<(String, ReportTask, String)>,
     /// Background tasks Claude Code reported a shell command started, and
     /// those a subagent started, oldest first. Only a task's start says
     /// either; its progress and notification frames do not repeat it.
@@ -5341,14 +5343,18 @@ impl Claude {
                 if string(frame, "subtype") == "task_started" {
                     // A new task identity binding retires any prior native
                     // origin, including reuse for a Bash or unknown task.
-                    self.report_tasks.retain(|(known, _)| known != task);
+                    self.report_tasks.retain(|(known, ..)| known != task);
                     if matches!(string(frame, "task_type"), "local_agent" | "local_workflow") {
                         let kind = if string(frame, "task_type") == "local_workflow" {
                             ReportTask::Workflow
                         } else {
                             ReportTask::Agent
                         };
-                        self.report_tasks.push_back((task.into(), kind));
+                        self.report_tasks.push_back((
+                            task.into(),
+                            kind,
+                            string(frame, "description").trim().into(),
+                        ));
                         if self.report_tasks.len() > MAX_TOOLS {
                             self.report_tasks.pop_front();
                         }
@@ -5361,15 +5367,22 @@ impl Claude {
                 // keeps out of the transcript, or out of the model's way, is not
                 // one the model acts on, and history never shows it.
                 if notification && !subagent && !foreground {
-                    let description = match &item.content {
-                        ItemContent::Tool { input, .. } => input.clone(),
-                        ItemContent::Command { label, .. } => label.clone(),
-                        _ => String::new(),
-                    };
-                    let kind = self
+                    let report = self
                         .report_tasks
                         .iter()
-                        .find_map(|(known, kind)| (known == task).then_some(*kind));
+                        .find(|(known, ..)| known == task)
+                        .map(|(_, kind, name)| (*kind, name.clone()));
+                    let (kind, description) = match report {
+                        Some((kind, name)) => (Some(kind), name),
+                        None => (
+                            None,
+                            match &item.content {
+                                ItemContent::Tool { input, .. } => input.clone(),
+                                ItemContent::Command { label, .. } => label.clone(),
+                                _ => String::new(),
+                            },
+                        ),
+                    };
                     let recorded = ["skip_transcript", "ambient"]
                         .iter()
                         .all(|key| frame.get(key).and_then(Value::as_bool) != Some(true));
@@ -11298,6 +11311,9 @@ mod tests {
             let mut adapter = Claude::default();
             adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":kind,"description":"Review"})).unwrap();
             adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"task","patch":{"summary":"Making progress"}})).unwrap();
+            // Claude Code 2.1.296 describes an agent's progress by its latest
+            // call; that is what it is doing, not what it is called.
+            adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"task","description":"Running cat > slow.py <<'PYEOF'\nim…","last_tool_name":"Bash"})).unwrap();
             let notification = json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Findings","uuid":"report"});
             let done = adapter.receive(notification.clone()).unwrap();
             assert!(done.events.iter().any(|event| matches!(event, Event::Item(Item {content:ItemContent::Delivery {kind, summary, body, .. }, .. }) if summary == heading && if report { *kind == DeliveryKind::Report && body == "Findings" } else { *kind == DeliveryKind::Notice && body.is_empty() })));
