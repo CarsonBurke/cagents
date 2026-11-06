@@ -772,26 +772,26 @@ fn child_picker_filters_full_names_and_keeps_order_during_status_changes() {
     ];
     let mut picker = child_navigation::Picker::new(&children);
     let order: Vec<_> = picker
-        .rows(&children)
+        .rows(&children, &Default::default())
         .iter()
         .map(|child| child.id.clone())
         .collect();
     children[1].status = ToolStatus::Failed;
     assert_eq!(
         picker
-            .rows(&children)
+            .rows(&children, &Default::default())
             .iter()
             .map(|child| child.id.clone())
             .collect::<Vec<_>>(),
         order
     );
     picker.query = "working".into();
-    assert_eq!(picker.rows(&children).len(), 1);
+    assert_eq!(picker.rows(&children, &Default::default()).len(), 1);
     picker.query.clear();
     picker.filter = child_navigation::Filter::Attention;
-    assert_eq!(picker.rows(&children).len(), 2);
+    assert_eq!(picker.rows(&children, &Default::default()).len(), 2);
     picker.filter = child_navigation::Filter::Working;
-    assert!(picker.rows(&children).is_empty());
+    assert!(picker.rows(&children, &Default::default()).is_empty());
 }
 
 #[test]
@@ -872,16 +872,11 @@ fn narrow_child_navigation_stays_bounded_with_a_thousand_long_names() {
                         .child_picker
                         .as_ref()
                         .unwrap()
-                        .rows(&runtime.snapshot.subagents)
+                        .rows(&runtime.snapshot.subagents, &runtime.child_ordinals)
                         .into_iter()
                         .take(24)
                         .map(|child| {
-                            format!(
-                                "{} · {} · {}",
-                                Runtime::native_child_name(child),
-                                Runtime::native_child_status(child),
-                                child.id
-                            )
+                            Runtime::child_choice_name(child, &runtime.child_label(child, 80))
                         })
                         .collect::<Vec<_>>();
                     actual.sort();
@@ -1019,16 +1014,9 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
                 "covered transcript actions must be absent from AX"
             );
             let expected: Vec<_> = picker
-                .rows(&live.snapshot.subagents)
+                .rows(&live.snapshot.subagents, &live.child_ordinals)
                 .into_iter()
-                .map(|child| {
-                    format!(
-                        "{} · {} · {}",
-                        Runtime::native_child_name(child),
-                        Runtime::native_child_status(child),
-                        child.id
-                    )
-                })
+                .map(|child| Runtime::child_choice_name(child, &live.child_label(child, 80)))
                 .collect();
             let actual: Vec<_> = current
                 .iter()
@@ -1060,7 +1048,7 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
     assert!(
         !empty
             .iter()
-            .any(|label| label.starts_with("Choose subagent:"))
+            .any(|label| label.starts_with("Search and filter subagents:"))
     );
     drop(app.handle_chat_ui(Action::SubagentPicker(target, false)));
     assert!(runtime(&app, target).child_picker.is_none());

@@ -267,9 +267,10 @@ impl Coordinated {
         })
     }
 
-    /// The step's verb and what it acted on, `name` naming an agent of this
-    /// conversation by its ID.
-    pub(super) fn line(&self, name: &dyn Fn(&str) -> String) -> (String, String) {
+    /// The step's verb and what it acted on, `listed` naming an agent this
+    /// conversation lists by its ID; any other is named by its short ID.
+    pub(super) fn line(&self, listed: &dyn Fn(&str) -> Option<String>) -> (String, String) {
+        let name = &|id: &str| listed(id).unwrap_or_else(|| short_id(id).to_owned());
         let names = |agents: &[String]| {
             agents
                 .iter()
@@ -282,7 +283,15 @@ impl Coordinated {
                 message_verb(message.kind),
                 recipient(message, &self.reading, name).plain(),
             ),
-            Kind::Spawn(spawn) => ("Started", started(spawn)),
+            // The started agent goes by its tab's name once it has one.
+            Kind::Spawn(spawn) => (
+                "Started",
+                match self.reading.subagents.as_slice() {
+                    [id] => listed(id),
+                    _ => None,
+                }
+                .unwrap_or_else(|| started(spawn)),
+            ),
             Kind::Act(act) => match act {
                 Act::Sessions => ("Listed", "live sessions".into()),
                 Act::Whoami => ("Looked up", "this session".into()),
@@ -317,7 +326,7 @@ impl Coordinated {
     /// The step's line with agents named by their IDs, for a summary formed
     /// where the conversation's subagents are not to hand.
     pub(super) fn summary(&self) -> String {
-        let (verb, label) = self.line(&|id| short_id(id).to_owned());
+        let (verb, label) = self.line(&|_| None);
         if label.is_empty() {
             verb
         } else {
@@ -607,21 +616,20 @@ fn status_caption(text: String, tone: Tone) -> Element<'static, Message> {
 }
 
 impl Runtime {
-    /// What an agent of this conversation is called: its subagent's type or
-    /// description where this conversation lists it, else its short ID.
+    /// What an agent of this conversation is called: the name its tab shows
+    /// where this conversation lists it, else its short ID.
     pub(super) fn agent_name(&self, id: &str) -> String {
+        self.listed_agent_name(id)
+            .unwrap_or_else(|| short_id(id).to_owned())
+    }
+
+    /// The name an agent's tab shows, where this conversation lists it.
+    pub(super) fn listed_agent_name(&self, id: &str) -> Option<String> {
         self.snapshot
             .subagents
             .iter()
             .find(|agent| agent.id == id)
-            .map(|agent| {
-                [&agent.kind, &agent.description]
-                    .into_iter()
-                    .find(|name| !name.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| short_id(id).to_owned())
-            })
-            .unwrap_or_else(|| short_id(id).to_owned())
+            .map(|agent| self.child_label(agent, 80).into_owned())
     }
 
     /// A message or a started agent, drawn as a card that shows its text.
@@ -858,14 +866,17 @@ impl Runtime {
             Some(state) => self.card_indicator(state.tool_status(), Icon::Agent),
             None => self.card_indicator(status, Icon::Agent),
         };
-        // The task is what readers scan for. Agent origin and launch options
-        // belong on their own secondary line, not inside the task name.
-        let primary = match spawn.agents.as_slice() {
-            [agent] if !agent.name.trim().is_empty() && agent.name != agent.kind => {
-                agent.name.clone()
-            }
+        // The agent is named as its tab names it. Its task describes it in
+        // the tooltip but never stands in for an absent name; agent origin
+        // and launch options belong on their own secondary line.
+        let primary = match reading.subagents.as_slice() {
+            [id] => self.listed_agent_name(id),
+            _ => None,
+        }
+        .unwrap_or_else(|| started(spawn));
+        let task = match spawn.agents.as_slice() {
             [agent] if !agent.description.trim().is_empty() => agent.description.clone(),
-            _ => started(spawn),
+            _ => primary.clone(),
         };
         rows.push(
             widget::row::with_children(vec![
@@ -880,7 +891,7 @@ impl Runtime {
                         80,
                     ))
                     .width(Length::Fill),
-                    primary.clone(),
+                    task,
                 )
                 .into(),
             ])
