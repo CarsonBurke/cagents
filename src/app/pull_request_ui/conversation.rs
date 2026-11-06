@@ -100,13 +100,23 @@ impl State {
         self.rows().iter().any(|row| names(row, key))
     }
 
-    /// The pull request the conversation worked on most: the daemon ranks
-    /// what it created first, then what it pushed, then the rest.
-    pub(super) fn leading(&self) -> Option<PullRequestKey> {
-        self.rows()
-            .iter()
-            .find(|row| row.relation.worked_on())
-            .and_then(row_key)
+    /// The pull request to show by default: what the conversation worked on
+    /// most, which the daemon ranks first by relation, then by recency. The
+    /// one already shown stays while it is listed as worked on and nothing
+    /// ranks above it by relation alone, so the detail does not jump between
+    /// two branches the conversation pushes to in turn.
+    pub(super) fn settled(&self, shown: Option<&PullRequestKey>) -> Option<PullRequestKey> {
+        let rows = self.rows();
+        let leading = rows.iter().find(|row| row.relation.worked_on())?;
+        if let Some(shown) = shown
+            && rows
+                .iter()
+                .find(|row| row.relation.worked_on() && names(row, shown))
+                .is_some_and(|row| row.relation <= leading.relation)
+        {
+            return Some(shown.clone());
+        }
+        row_key(leading)
     }
 
     /// Whether the conversation lists pull requests, or listed some before
@@ -596,6 +606,49 @@ mod tests {
             }),
             first,
         }
+    }
+
+    #[test]
+    fn the_default_stays_put_until_a_stronger_relation_leads() {
+        let mut state = State::default();
+        let conversation = TerminalId::new();
+        assert!(state.retarget(Some((CardId::new(), conversation))));
+        let key = |number| PullRequestKey::new(repo("me"), number).unwrap();
+        assert_eq!(state.settled(None), None);
+        state.update(listed(
+            conversation,
+            1,
+            vec![row(9, Relation::Pushed), row(4, Relation::Mentioned)],
+            true,
+        ));
+        let shown = state.settled(None);
+        assert_eq!(shown, Some(key(9)));
+        // A push to another branch puts it first, but it is no stronger.
+        state.update(listed(
+            conversation,
+            2,
+            vec![row(12, Relation::Pushed), row(9, Relation::Pushed)],
+            false,
+        ));
+        let shown = state.settled(shown.as_ref());
+        assert_eq!(shown, Some(key(9)));
+        // A pull request the conversation created leads.
+        state.update(listed(
+            conversation,
+            3,
+            vec![row(15, Relation::Created), row(9, Relation::Pushed)],
+            false,
+        ));
+        let shown = state.settled(shown.as_ref());
+        assert_eq!(shown, Some(key(15)));
+        // One no longer worked on gives way.
+        state.update(listed(
+            conversation,
+            4,
+            vec![row(12, Relation::Pushed), row(15, Relation::Mentioned)],
+            false,
+        ));
+        assert_eq!(state.settled(shown.as_ref()), Some(key(12)));
     }
 
     #[test]

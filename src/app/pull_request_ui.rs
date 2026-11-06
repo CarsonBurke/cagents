@@ -103,6 +103,12 @@ pub struct State {
     /// The worktree that was active when it was chosen: selecting another
     /// returns the detail to that worktree's branch.
     chosen_in: Option<ActiveWorktreeKey>,
+    /// Shown while nothing is chosen and the active branch has no pull
+    /// request of its own: what the conversation worked on most. It stays
+    /// put as the conversation works on, unless a stronger relation leads.
+    default: Option<PullRequestKey>,
+    /// The worktree that was active when `default` was settled.
+    default_in: Option<ActiveWorktreeKey>,
     conversation: conversation::State,
 }
 
@@ -1413,12 +1419,7 @@ impl Cagents {
     /// own, the one the conversation worked on most.
     fn shown_pull_request(&self) -> Option<PullRequestKey> {
         let state = &self.pull_request_inspector;
-        state.chosen.clone().or_else(|| {
-            if self.active_branch_pull_request().is_some() {
-                return None;
-            }
-            state.conversation.leading()
-        })
+        state.chosen.clone().or_else(|| state.default.clone())
     }
 
     /// Whether the inspected conversation names any pull request, which
@@ -1441,12 +1442,23 @@ impl Cagents {
 
     pub(super) fn sync_pull_request_inspector(&mut self) -> Task<Message> {
         let inspected = self.inspected_conversation();
-        let active = self.sidebar_state.active_worktree();
+        let active = self.sidebar_state.active_worktree().cloned();
+        let branch_has_one = self.active_branch_pull_request().is_some();
         let inspector = &mut self.pull_request_inspector;
-        if inspector.conversation.retarget(inspected) || inspector.chosen_in.as_ref() != active {
+        let retargeted = inspector.conversation.retarget(inspected);
+        if retargeted || inspector.chosen_in != active {
             inspector.chosen = None;
             inspector.chosen_in = None;
         }
+        if retargeted || inspector.default_in != active {
+            inspector.default = None;
+        }
+        inspector.default_in = active;
+        inspector.default = if branch_has_one {
+            None
+        } else {
+            inspector.conversation.settled(inspector.default.as_ref())
+        };
         if !self.context_inspector_open || self.context_tab != ContextTab::PullRequest {
             self.pull_request_inspector.source_key = None;
             return self
