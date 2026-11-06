@@ -1307,7 +1307,13 @@ impl LocalHandle {
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         (
-            state.is_working() || state.waiting || !state.requests.is_empty(),
+            state.is_working()
+                || state.waiting
+                || !state.requests.is_empty()
+                || state
+                    .subagents
+                    .iter()
+                    .any(|agent| agent.status == ToolStatus::Waiting),
             state.ready,
         )
     }
@@ -1331,7 +1337,7 @@ impl LocalHandle {
         state
             .subagents
             .iter()
-            .filter(|agent| agent.background && agent.status == ToolStatus::Running)
+            .filter(|agent| agent.background && agent.status.is_live())
             .map(|agent| agent.id.clone())
             .collect()
     }
@@ -3736,6 +3742,13 @@ fn apply_projected_event(
         Event::Exited { .. } => {
             state.prompt_suggestion = None;
             state.exited = true;
+            for agent in &mut state.subagents {
+                if agent.status == ToolStatus::Waiting {
+                    agent.status = ToolStatus::Stopped;
+                    agent.detail =
+                        "The provider exited before its background work reported back".to_owned();
+                }
+            }
             state.waiting = false;
             state.busy = false;
             state.ready = false;
@@ -3765,7 +3778,7 @@ fn trim_subagents(state: &mut Snapshot) {
         let Some(finished) = state
             .subagents
             .iter()
-            .position(|agent| agent.status != ToolStatus::Running)
+            .position(|agent| !agent.status.is_live())
         else {
             break;
         };
@@ -5655,6 +5668,57 @@ mod tests {
     }
 
     /// Readiness is what a sender waits on, so it ends with the provider.
+    #[test]
+    fn the_provider_exiting_closes_an_agent_waiting_on_its_background_work() {
+        let mut state = Snapshot::default();
+        let mut indices = Default::default();
+        for (id, status) in [
+            ("waiting", ToolStatus::Waiting),
+            ("done", ToolStatus::Succeeded),
+        ] {
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::Subagent {
+                    id: id.into(),
+                    kind: String::new(),
+                    description: String::new(),
+                    status: Some(status),
+                    background: Some(true),
+                    model: None,
+                    waiting: None,
+                    detail: Some("may be interim".into()),
+                },
+            );
+        }
+        apply_event(&mut state, &mut indices, Event::Exited { code: None });
+        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
+        assert!(state.subagents[0].detail.contains("provider exited"));
+        assert_eq!(state.subagents[1].status, ToolStatus::Succeeded);
+    }
+
+    #[test]
+    fn a_waiting_agent_outlives_the_finished_stamp_and_is_counted_as_background_work() {
+        let mut state = Snapshot::default();
+        let mut indices = Default::default();
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: "tool".into(),
+                kind: String::new(),
+                description: String::new(),
+                status: Some(ToolStatus::Waiting),
+                background: Some(true),
+                model: None,
+                waiting: None,
+                detail: None,
+            },
+        );
+        assert_eq!(state.activity(), ActivityState::Idle);
+        assert!(state.subagents[0].status.is_live());
+    }
+
     #[test]
     fn a_snapshot_is_ready_from_its_providers_word_until_it_exits() {
         let mut state = Snapshot::default();

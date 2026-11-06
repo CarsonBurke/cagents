@@ -195,7 +195,14 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+///
+/// Version 146 adds a tool status for an agent waiting on its own background
+/// work. It skips 128-145 because unmerged work already uses them for other
+/// formats: an installed `integration/install-candidate` build is 128 with an
+/// appended `StartupState` request and response, which this format doesn't
+/// have. The number alone cannot identify a format, so never reuse one that a
+/// build may have shipped.
+pub const PROTOCOL_VERSION: u16 = 146;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

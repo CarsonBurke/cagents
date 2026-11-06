@@ -1355,9 +1355,7 @@ impl Subagent {
     /// Running delegated work that cancelling the parent's turn would also
     /// stop, where the provider's interrupt does not spare it.
     pub fn stopped_by_interrupt(&self, capabilities: &Capabilities) -> bool {
-        self.status == ToolStatus::Running
-            && self.background
-            && capabilities.interrupt_stops_background
+        self.status.is_live() && self.background && capabilities.interrupt_stops_background
     }
 }
 
@@ -1776,6 +1774,20 @@ pub enum ToolStatus {
     /// Ended before it finished because it was asked to stop: cancelled by
     /// the user, or interrupted with the work that started it.
     Stopped,
+    /// A delegated agent that stopped with background work of its own still
+    /// running. It's alive and what it has reported may be interim, but it
+    /// isn't doing anything itself and may never report again, so it neither
+    /// counts as working nor as finished. A later notice settles it, any sign
+    /// of life returns it to `Running`, and a Stop or the provider exiting
+    /// ends it as `Stopped`. Its parent's turn ending doesn't change it.
+    Waiting,
+}
+
+impl ToolStatus {
+    /// Whether the agent or tool has yet to end.
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Running | Self::Waiting)
+    }
 }
 
 /// What a shell command was actually for.
@@ -2825,6 +2837,33 @@ mod tests {
                 request
             );
         }
+    }
+
+    #[test]
+    fn an_agent_waiting_on_its_background_work_neither_works_nor_asks_for_the_user() {
+        let mut snapshot = Snapshot::default();
+        snapshot.subagents.push(Subagent {
+            id: "tool".into(),
+            kind: String::new(),
+            description: String::new(),
+            status: ToolStatus::Waiting,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        });
+        assert!(!snapshot.is_working());
+        // `Waiting` means the person is needed, and nothing here needs them.
+        assert_eq!(snapshot.activity(), crate::agent::ActivityState::Idle);
+        // Stopping the turn ends it, so a person is warned as for running work.
+        let capabilities = Capabilities {
+            interrupt_stops_background: true,
+            ..Capabilities::default()
+        };
+        assert!(snapshot.subagents[0].stopped_by_interrupt(&capabilities));
+        snapshot.exited = true;
+        assert_eq!(snapshot.activity(), crate::agent::ActivityState::Unknown);
     }
 
     #[test]
