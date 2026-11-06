@@ -3847,6 +3847,16 @@ fn apply_projected_event(
             state.busy = false;
             state.ready = false;
             state.history_loading = false;
+            // Nothing the provider was doing outlives it; a step it left
+            // running would otherwise read as still working.
+            stop_running_steps(&mut state.items);
+            for agent in &mut state.subagents {
+                if agent.status == ToolStatus::Running {
+                    agent.status = ToolStatus::Stopped;
+                    agent.waiting = false;
+                }
+                stop_running_steps(&mut agent.items);
+            }
         }
         Event::ReadOnlyHistory { reason } => state.read_only_reason = Some(reason),
         Event::Ready(ready) => {
@@ -3860,6 +3870,17 @@ fn apply_projected_event(
         trim_subagents(state);
     }
     child_text_copy::finish(state, child_copy_update);
+}
+
+/// Marks the steps still running as stopped, copying only those items.
+fn stop_running_steps(items: &mut [Arc<Item>]) {
+    for item in items {
+        if item.content.status() == Some(ToolStatus::Running)
+            && let Some(status) = Arc::make_mut(item).content.status_mut()
+        {
+            *status = ToolStatus::Stopped;
+        }
+    }
 }
 
 /// Running task identities authorize interruption and idle waits. Retiring
@@ -5027,6 +5048,60 @@ mod tests {
         assert!(state.prompt_suggestion.is_none());
         apply_event(&mut state, &mut indices, suggestion());
         assert!(state.prompt_suggestion.is_none());
+    }
+
+    #[test]
+    fn steps_left_running_when_the_provider_exits_read_as_stopped() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let tool = |id: &str, status| Item {
+            started_at: None,
+            id: id.into(),
+            role: crate::chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Bash".into(),
+                input: "sleep 6001".into(),
+                output: String::new(),
+                status,
+            },
+            at: None,
+        };
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Item(tool("running", ToolStatus::Running)),
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Item(tool("done", ToolStatus::Succeeded)),
+        );
+        let finished = Arc::clone(&state.items[1]);
+        let agent = subagent(&mut state, "scout");
+        agent.waiting = true;
+        agent
+            .items
+            .push(Arc::new(tool("child", ToolStatus::Running)));
+        subagent(&mut state, "builder").status = ToolStatus::Failed;
+        apply_event(&mut state, &mut indices, Event::Exited { code: None });
+        let statuses: Vec<_> = state
+            .items
+            .iter()
+            .map(|item| item.content.status())
+            .collect();
+        assert_eq!(
+            statuses,
+            [Some(ToolStatus::Stopped), Some(ToolStatus::Succeeded)]
+        );
+        assert!(
+            Arc::ptr_eq(&finished, &state.items[1]),
+            "settled items are not copied"
+        );
+        let scout = &state.subagents[0];
+        assert_eq!(scout.status, ToolStatus::Stopped);
+        assert!(!scout.waiting);
+        assert_eq!(scout.items[0].content.status(), Some(ToolStatus::Stopped));
+        assert_eq!(state.subagents[1].status, ToolStatus::Failed);
     }
 
     #[test]
