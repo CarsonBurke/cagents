@@ -67,8 +67,13 @@ struct Document {
     /// Added after the first version, like `catalogs`: each account's
     /// settled disagreement between two records of its login, by account
     /// key. A build that predates it drops it when it writes, which only
-    /// shows a settled disagreement again until it is settled again.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// shows a settled disagreement again until it is settled again. Each
+    /// is read on its own, so one this build cannot read costs only itself.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "readable_settlements"
+    )]
     settled: BTreeMap<String, Settled>,
 }
 
@@ -77,14 +82,27 @@ struct Document {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Settled {
-    /// A sign-in that cagents ran for the account has just finished: the
-    /// record the CLI reads is the one that sign-in wrote, so the next
-    /// disagreement a probe sees is settled in its favour.
-    SignedIn,
+    /// A sign-in that cagents ran for the account finished at `at`, in Unix
+    /// milliseconds: the record the CLI reads is the one that sign-in wrote,
+    /// so the disagreement the probe that follows it sees is settled in its
+    /// favour (see [`super::claude::SIGN_IN_SETTLES_FOR`]).
+    SignedIn { at: u64 },
     /// The CLI's record, naming `reported`, was written by a sign-in after
     /// the other record, naming `other`: the disagreement between exactly
     /// these two is settled, and any other is shown again.
     Reported { reported: String, other: String },
+}
+
+fn readable_settlements<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Settled>, D::Error> {
+    let serde_json::Value::Object(settled) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(settled
+        .into_iter()
+        .filter_map(|(key, settled)| Some((key, Settled::deserialize(settled).ok()?)))
+        .collect())
 }
 
 /// Each provider's list is read on its own, so one this build cannot read -
@@ -218,20 +236,38 @@ impl Cache {
     /// Records how the disagreement over `key`'s login is settled, or with
     /// `None`, that nothing is.
     pub fn settle(&self, key: &str, settled: Option<Settled>) -> io::Result<()> {
+        self.settle_with(key, |_, _| ((), Some(settled)))
+    }
+
+    /// Decides how the disagreement over `key`'s login is settled from the
+    /// settlement on record and the identity last cached for `key`, with no
+    /// other window settling it in between. `decide` returns its answer and
+    /// `None` to leave the settlement, or the settlement to record instead.
+    pub fn settle_with<T>(
+        &self,
+        key: &str,
+        decide: impl FnOnce(Option<&Settled>, Option<&Identity>) -> (T, Option<Option<Settled>>),
+    ) -> io::Result<T> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         let _lock = self.lock(libc::LOCK_EX)?;
         let mut document = read_document(&self.path()).unwrap_or_default();
-        document.version = VERSION;
-        let changed = match settled {
-            Some(settled) => {
+        let previous = document
+            .entries
+            .get(key)
+            .and_then(|entry| entry.identity.as_ref());
+        let (answer, settle) = decide(document.settled.get(key), previous);
+        let changed = match settle {
+            None => false,
+            Some(Some(settled)) => {
                 document.settled.insert(key.to_owned(), settled.clone()) != Some(settled)
             }
-            None => document.settled.remove(key).is_some(),
+            Some(None) => document.settled.remove(key).is_some(),
         };
-        if !changed {
-            return Ok(());
+        if changed {
+            document.version = VERSION;
+            self.write(&document)?;
         }
-        self.write(&document)
+        Ok(answer)
     }
 
     /// Forgets the entries no account in `keep` refers to that are older
@@ -534,15 +570,19 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cache = Cache::at(directory.path());
         assert_eq!(cache.settled("system"), None);
-        cache.settle("system", Some(Settled::SignedIn)).unwrap();
+        cache
+            .settle("system", Some(Settled::SignedIn { at: 5 }))
+            .unwrap();
         cache.store("system", entry(1, "figures")).unwrap();
-        assert_eq!(cache.settled("system"), Some(Settled::SignedIn));
+        assert_eq!(cache.settled("system"), Some(Settled::SignedIn { at: 5 }));
         let settled = Settled::Reported {
             reported: "me@example.com".into(),
             other: "other@example.com".into(),
         };
         cache.settle("system", Some(settled.clone())).unwrap();
-        cache.settle("gone", Some(Settled::SignedIn)).unwrap();
+        cache
+            .settle("gone", Some(Settled::SignedIn { at: 5 }))
+            .unwrap();
         assert_eq!(cache.settled("system"), Some(settled.clone()));
         assert_eq!(cache.load(10).len(), 1);
         // An account no one refers to takes its settlement with it.
@@ -553,6 +593,48 @@ mod tests {
         assert_eq!(cache.settled("gone"), None);
         cache.settle("system", None).unwrap();
         assert_eq!(cache.settled("system"), None);
+    }
+
+    /// A settlement a later build records in a way this one cannot read
+    /// costs only itself, never the figures beside it.
+    #[test]
+    fn an_unreadable_settlement_costs_only_itself() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        cache.store("system", entry(1, "figures")).unwrap();
+        cache
+            .settle("work", Some(Settled::SignedIn { at: 5 }))
+            .unwrap();
+        let path = cache.path();
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["settled"]["system"] = serde_json::json!({"state": "from_a_later_build"});
+        std::fs::write(&path, document.to_string()).unwrap();
+        assert_eq!(cache.load(10).len(), 1);
+        assert_eq!(cache.settled("system"), None);
+        assert_eq!(cache.settled("work"), Some(Settled::SignedIn { at: 5 }));
+    }
+
+    /// The settlement and the identity last cached are read, and the new
+    /// settlement written, under one lock.
+    #[test]
+    fn a_settlement_is_decided_from_what_is_on_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        cache.store("system", entry(1, "figures")).unwrap();
+        let seen = cache
+            .settle_with("system", |settled, identity| {
+                assert_eq!(settled, None);
+                let email = identity.and_then(|identity| identity.email.clone());
+                (email, Some(Some(Settled::SignedIn { at: 7 })))
+            })
+            .unwrap();
+        assert_eq!(seen.as_deref(), Some("user@example.com"));
+        let kept = cache
+            .settle_with("system", |settled, _| (settled.cloned(), None))
+            .unwrap();
+        assert_eq!(kept, Some(Settled::SignedIn { at: 7 }));
+        assert_eq!(cache.settled("system"), Some(Settled::SignedIn { at: 7 }));
     }
 
     fn catalog(observed_at: u64, id: &str) -> Catalog {

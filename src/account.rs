@@ -549,27 +549,21 @@ impl Account {
     /// through its provider's home variable, or `None` when it exports none
     /// and the CLI resolves its own default.
     ///
-    /// A managed, linked or selected device's home is always exported. The
-    /// system account's home is exported when cagents itself was started
-    /// with one. Otherwise Claude Code's default is exported only while
-    /// `~/.claude.json` does not exist: Claude Code keeps who a login
-    /// belongs to in its global configuration, which an explicit
+    /// A managed, linked or selected device's home is always exported, as is
+    /// the system account's when cagents itself was started with one. The
+    /// system Claude login otherwise exports nothing, so every launch reads
+    /// the same records as the reader's own `claude`: Claude Code keeps who a
+    /// login belongs to in its global configuration, which any explicit
     /// `CLAUDE_CONFIG_DIR` moves from `~/.claude.json` into that directory -
     /// even when the variable names the default `~/.claude`. Exporting the
-    /// default beside an existing `~/.claude.json` therefore gives one login
-    /// two records of who it is: one that the reader's own `claude` and an
-    /// outside sign-in keep, and one that only cagents' launches see.
+    /// default would give one login two records of who it is, one that only
+    /// cagents' launches keep.
     pub fn launch_home(&self) -> Option<PathBuf> {
-        self.launch_home_in(&|name| std::env::var(name).ok(), &|path| path.exists())
+        self.launch_home_in(&|name| std::env::var(name).ok())
     }
 
-    /// [`Self::launch_home`] against `environment`, with `exists` saying
-    /// whether a file is there.
-    pub fn launch_home_in(
-        &self,
-        environment: &dyn Fn(&str) -> Option<String>,
-        exists: &dyn Fn(&Path) -> bool,
-    ) -> Option<PathBuf> {
+    /// [`Self::launch_home`] against `environment`.
+    pub fn launch_home_in(&self, environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
         let home = self.home_directory(environment)?;
         if !matches!(self.home, AccountHome::System) || self.provider != Provider::Claude {
             return Some(home);
@@ -577,22 +571,19 @@ impl Account {
         let variable = home_variable(self.provider)?;
         let explicit = environment(variable).is_some_and(|value| !value.is_empty())
             && !inherited_selections(environment).contains(&variable);
-        if explicit {
-            return Some(home);
-        }
-        let user_home = environment("HOME").filter(|value| !value.is_empty())?;
-        (!exists(&Path::new(&user_home).join(".claude.json"))).then_some(home)
+        explicit.then_some(home)
     }
 
-    /// The environment a probe of this account sets on the CLI: the same
-    /// home its launches export (see [`Self::launch_home`]), so the probe
-    /// reads the record of the login that its conversations and sign-ins
-    /// keep. A system account that exports nothing sets nothing, and the
-    /// CLI resolves its default exactly as it would in the user's own shell.
+    /// The environment a probe of this account sets on the CLI.
+    ///
+    /// The system account sets nothing, so the CLI resolves its default
+    /// exactly as it would in the user's own shell, and as the system
+    /// account's launches have it resolve (see [`Self::launch_home`]).
     pub fn probe_environment(&self) -> Option<(&'static str, PathBuf)> {
         match &self.home {
-            AccountHome::SystemAt { .. } | AccountHome::Brokered { .. } => None,
-            AccountHome::System => Some((home_variable(self.provider)?, self.launch_home()?)),
+            AccountHome::System | AccountHome::SystemAt { .. } | AccountHome::Brokered { .. } => {
+                None
+            }
             AccountHome::Managed { path, .. } | AccountHome::Linked { path, .. } => {
                 Some((home_variable(self.provider)?, path.clone()))
             }
@@ -618,7 +609,12 @@ impl Account {
 
 /// Who an account is signed in as. Only what the CLI reports as display
 /// metadata: never a token, a key, or anything that authorizes a request.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Records - the shared cache, a device's probe reply - keep every field.
+/// The daemon's binary wire keeps the fields it has always carried, in their
+/// order, so that adding [`Self::disputed_by`] did not change its protocol:
+/// what the wire's readers need of a dispute, they are told as a conflict.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Identity {
     pub email: Option<String>,
     pub organization: Option<String>,
@@ -636,8 +632,91 @@ pub struct Identity {
     /// says which is right, so the probe reports both rather than vouch for
     /// either. Only the system account's default home can have a second
     /// record.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disputed_by: Option<String>,
+}
+
+/// [`Identity`] as a record keeps it.
+#[derive(Deserialize)]
+#[serde(rename = "Identity")]
+struct IdentityRecord {
+    email: Option<String>,
+    organization: Option<String>,
+    plan: Option<String>,
+    #[serde(default)]
+    disputed_by: Option<String>,
+}
+
+/// [`IdentityRecord`], written.
+#[derive(Serialize)]
+#[serde(rename = "Identity")]
+struct IdentityRecordRef<'a> {
+    email: &'a Option<String>,
+    organization: &'a Option<String>,
+    plan: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disputed_by: Option<&'a String>,
+}
+
+/// [`Identity`] as the binary wire carries it.
+#[derive(Deserialize)]
+#[serde(rename = "Identity")]
+struct IdentityWire {
+    email: Option<String>,
+    organization: Option<String>,
+    plan: Option<String>,
+}
+
+/// [`IdentityWire`], written.
+#[derive(Serialize)]
+#[serde(rename = "Identity")]
+struct IdentityWireRef<'a> {
+    email: &'a Option<String>,
+    organization: &'a Option<String>,
+    plan: &'a Option<String>,
+}
+
+impl Serialize for Identity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (email, organization, plan) = (&self.email, &self.organization, &self.plan);
+        if serializer.is_human_readable() {
+            IdentityRecordRef {
+                email,
+                organization,
+                plan,
+                disputed_by: self.disputed_by.as_ref(),
+            }
+            .serialize(serializer)
+        } else {
+            IdentityWireRef {
+                email,
+                organization,
+                plan,
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Identity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let record = IdentityRecord::deserialize(deserializer)?;
+            Ok(Self {
+                email: record.email,
+                organization: record.organization,
+                plan: record.plan,
+                disputed_by: record.disputed_by,
+            })
+        } else {
+            let wire = IdentityWire::deserialize(deserializer)?;
+            Ok(Self {
+                email: wire.email,
+                organization: wire.organization,
+                plan: wire.plan,
+                disputed_by: None,
+            })
+        }
+    }
 }
 
 impl Identity {
@@ -888,24 +967,30 @@ impl UsageSnapshot {
             .or_else(|| tightest(&self.windows))
     }
 
-    /// When the weekly allowance shared by everything the account does next
-    /// resets, in Unix seconds, if it resets after `now`.
-    pub fn weekly_reset(&self, now: i64) -> Option<i64> {
+    /// Whether `self` and `other` are the figures of two separate
+    /// allowances, as of `now` in Unix seconds: a weekly window both report
+    /// under one key still runs in both and resets more than
+    /// [`RESET_TOLERANCE`] apart. One login seen through two homes draws on
+    /// one allowance, whose every window resets once.
+    pub fn separate_allowance(&self, other: &UsageSnapshot, now: i64) -> bool {
+        let running = |window: &UsageWindow| {
+            window.kind == WindowKind::Weekly
+                && window.resets_at.is_some_and(|resets_at| resets_at > now)
+        };
         self.windows
             .iter()
-            .filter(|window| window.kind == WindowKind::Weekly)
-            .find_map(|window| window.resets_at)
-            .filter(|resets_at| *resets_at > now)
-    }
-
-    /// Whether `self` and `other` are the figures of two separate
-    /// allowances, as of `now`: their weekly allowances both still run and
-    /// reset more than [`RESET_TOLERANCE`] apart. One login seen through two
-    /// homes draws on one allowance, which resets once.
-    pub fn separate_allowance(&self, other: &UsageSnapshot, now: i64) -> bool {
-        self.weekly_reset(now)
-            .zip(other.weekly_reset(now))
-            .is_some_and(|(mine, theirs)| mine.abs_diff(theirs) > RESET_TOLERANCE)
+            .filter(|window| running(window))
+            .any(|mine| {
+                other
+                    .windows
+                    .iter()
+                    .filter(|window| running(window) && window.key == mine.key)
+                    .any(|theirs| {
+                        mine.resets_at
+                            .zip(theirs.resets_at)
+                            .is_some_and(|(mine, theirs)| mine.abs_diff(theirs) > RESET_TOLERANCE)
+                    })
+            })
     }
 
     /// Recomputes the status from the windows after they changed, keeping a
@@ -1424,30 +1509,32 @@ mod tests {
             Some(PathBuf::from("/home/a/.codex"))
         );
         assert_eq!(codex.home_directory(&environment(&[])), None);
-        // The system Claude home is exported only where exporting it
-        // cannot split the login's record of who it is: beside an existing
-        // `~/.claude.json`, an explicit `CLAUDE_CONFIG_DIR=~/.claude` would
-        // have the CLI read and write `~/.claude/.claude.json` instead.
-        let global =
-            |present: bool| move |path: &Path| present && path == Path::new("/home/a/.claude.json");
+        assert_eq!(claude.probe_environment(), None);
+        // The system Claude login exports no home of its own, so the CLI
+        // reads `~/.claude.json` as in the reader's shell: an explicit
+        // `CLAUDE_CONFIG_DIR=~/.claude` would have it read and write
+        // `~/.claude/.claude.json` instead, a second record of who it is.
         let user = environment(&[("HOME", "/home/a")]);
-        assert_eq!(claude.launch_home_in(&user, &global(true)), None);
-        assert_eq!(
-            claude.launch_home_in(&user, &global(false)),
-            Some(PathBuf::from("/home/a/.claude"))
-        );
+        assert_eq!(claude.launch_home_in(&user), None);
         // A directory the reader started cagents with is theirs, and kept.
         let chosen = environment(&[
             ("HOME", "/home/a"),
             ("CLAUDE_CONFIG_DIR", "/home/a/.claude"),
         ]);
         assert_eq!(
-            claude.launch_home_in(&chosen, &global(true)),
+            claude.launch_home_in(&chosen),
             Some(PathBuf::from("/home/a/.claude"))
         );
+        // One inherited from an account cagents selected is not.
+        let selected = environment(&[
+            ("HOME", "/home/a"),
+            ("CLAUDE_CONFIG_DIR", "/home/a/.claude"),
+            (SELECTION_MARKER, "CLAUDE_CONFIG_DIR=/home/a/.claude"),
+        ]);
+        assert_eq!(claude.launch_home_in(&selected), None);
         // Codex keeps its login in its home either way.
         assert_eq!(
-            codex.launch_home_in(&user, &global(true)),
+            codex.launch_home_in(&user),
             Some(PathBuf::from("/home/a/.codex"))
         );
         // Every other home is the account's own and always exported.
@@ -1457,7 +1544,7 @@ mod tests {
             "/home/a/.claude-work".into(),
         );
         assert_eq!(
-            linked.launch_home_in(&user, &global(true)),
+            linked.launch_home_in(&user),
             Some(PathBuf::from("/home/a/.claude-work"))
         );
         let key = uuid::Uuid::from_u128(1);
@@ -1635,35 +1722,92 @@ mod tests {
         assert!(!disputed.same_login(&work) && !work.same_login(&disputed));
     }
 
+    /// A dispute is kept wherever an identity is recorded, and the daemon's
+    /// binary wire carries an identity exactly as before it existed.
+    #[test]
+    fn a_dispute_is_recorded_but_leaves_the_binary_wire_as_it_was() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Before {
+            email: Option<String>,
+            organization: Option<String>,
+            plan: Option<String>,
+        }
+        let disputed = Identity {
+            email: Some("me@example.com".into()),
+            organization: None,
+            plan: Some("max".into()),
+            disputed_by: Some("other@example.com".into()),
+        };
+        let before = Before {
+            email: disputed.email.clone(),
+            organization: None,
+            plan: disputed.plan.clone(),
+        };
+        let wire = postcard::to_allocvec(&disputed).unwrap();
+        assert_eq!(wire, postcard::to_allocvec(&before).unwrap());
+        assert_eq!(
+            postcard::from_bytes::<Identity>(&wire).unwrap(),
+            Identity {
+                disputed_by: None,
+                ..disputed.clone()
+            }
+        );
+        let record = serde_json::to_value(&disputed).unwrap();
+        assert_eq!(record["disputed_by"], "other@example.com");
+        assert_eq!(
+            serde_json::from_value::<Identity>(record).unwrap(),
+            disputed
+        );
+        // A record written before disputes existed, or of an undisputed
+        // login, reads as undisputed, and is written as it was.
+        let undisputed = serde_json::to_value(&before).unwrap();
+        let identity = serde_json::from_value::<Identity>(undisputed.clone()).unwrap();
+        assert_eq!(identity.disputed_by, None);
+        assert_eq!(serde_json::to_value(&identity).unwrap(), undisputed);
+        assert_eq!(
+            serde_json::from_value::<Identity>(serde_json::json!({})).unwrap(),
+            Identity::default()
+        );
+    }
+
     #[test]
     fn one_allowance_resets_once_and_only_running_windows_are_compared() {
-        let snapshot = |weekly: Option<i64>, session: Option<i64>| {
-            let window = |kind: WindowKind, resets_at: Option<i64>| UsageWindow {
-                key: format!("{kind:?}"),
-                kind,
-                label: String::new(),
-                used: 0.5,
-                resets_at,
-                span_secs: None,
-                binding: false,
-            };
+        let window = |key: &str, kind: WindowKind, resets_at: Option<i64>| UsageWindow {
+            key: key.into(),
+            kind,
+            label: String::new(),
+            used: 0.5,
+            resets_at,
+            span_secs: None,
+            binding: false,
+        };
+        let snapshot = |windows: Vec<UsageWindow>| {
             let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", 0);
-            snapshot.windows = vec![
-                window(WindowKind::Session, session),
-                window(WindowKind::Weekly, weekly),
-            ];
+            snapshot.windows = windows;
             snapshot
         };
         let now = 1_000_000;
-        let week = snapshot(Some(now + 86_400), Some(now + 60));
+        let weekly = |resets_at: i64| window("weekly_all", WindowKind::Weekly, Some(resets_at));
+        let week = snapshot(vec![
+            window("session", WindowKind::Session, Some(now + 60)),
+            weekly(now + 86_400),
+        ]);
         // Reported a moment apart, or rounded: one allowance.
-        assert!(!week.separate_allowance(&snapshot(Some(now + 86_400 + 1_800), None), now));
-        assert!(week.separate_allowance(&snapshot(Some(now + 3 * 86_400), Some(now + 60)), now));
+        assert!(!week.separate_allowance(&snapshot(vec![weekly(now + 86_400 + 1_800)]), now));
+        assert!(week.separate_allowance(&snapshot(vec![weekly(now + 3 * 86_400)]), now));
         // The session window says nothing about the weekly allowance.
-        assert!(!week.separate_allowance(&snapshot(None, Some(now + 9_000)), now));
+        let session = window("session", WindowKind::Session, Some(now + 9_000));
+        assert!(!week.separate_allowance(&snapshot(vec![session]), now));
         // A window that has already reset is a figure from before it.
-        assert!(!week.separate_allowance(&snapshot(Some(now - 3 * 86_400), None), now));
-        assert_eq!(week.weekly_reset(now), Some(now + 86_400));
+        assert!(!week.separate_allowance(&snapshot(vec![weekly(now - 3 * 86_400)]), now));
+        // Another weekly window of the same login - one model's, listed
+        // first by one report - resets on its own schedule, and is compared
+        // only with itself.
+        let model = |resets_at: i64| window("weekly_opus", WindowKind::Weekly, Some(resets_at));
+        let listed = snapshot(vec![model(now + 5 * 86_400), weekly(now + 86_400)]);
+        assert!(!week.separate_allowance(&listed, now));
+        assert!(!listed.separate_allowance(&week, now));
+        assert!(listed.separate_allowance(&snapshot(vec![model(now + 86_400)]), now));
     }
 
     #[test]

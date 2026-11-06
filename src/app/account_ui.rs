@@ -407,6 +407,19 @@ impl State {
     /// Omp's accounts is named with the service it signs in to, since one
     /// address can have a login with several.
     fn display_name(&self, account: &AccountState) -> String {
+        self.name(account, true)
+    }
+
+    /// What another row's message calls `account`: [`Self::display_name`],
+    /// but with the address it is listed as alone where its records name
+    /// two logins, which that row's own message explains.
+    fn referred_name(&self, account: &AccountState) -> String {
+        self.name(account, false)
+    }
+
+    /// [`Self::display_name`], naming both logins a disputed login's
+    /// records name when `both`.
+    fn name(&self, account: &AccountState, both: bool) -> String {
         if let Some(service) = account.account.brokered_service() {
             let service = omp::service_label(service);
             return match account.email(&self.registry) {
@@ -439,6 +452,7 @@ impl State {
                 .identity
                 .as_ref()
                 .and_then(|identity| identity.disputed_by.as_deref())
+                .filter(|_| both)
             {
                 Some(other) => format!("{email} or {other}"),
                 None => email.to_owned(),
@@ -511,7 +525,7 @@ impl State {
         for other in others {
             if home.is_some() && other.account.resolved_home() == home {
                 return Some(LoginConflict::SameHome {
-                    with: self.display_name(other),
+                    with: self.referred_name(other),
                 });
             }
             let (Some(mine), Some(theirs)) = (current, other.identity.as_ref()) else {
@@ -520,7 +534,7 @@ impl State {
             if !mine.claims_same_login(theirs) {
                 continue;
             }
-            let with = self.display_name(other);
+            let with = self.referred_name(other);
             if !mine.same_login(theirs) {
                 return Some(LoginConflict::Contradicted {
                     with,
@@ -824,7 +838,7 @@ impl LoginConflict {
                 "Signed in to the same login as {with}. Both draw on one allowance. Use Archive duplicate in the extra home's menu to keep its files, or sign it in to another login."
             ),
             Self::Disputed { reported, other } => format!(
-                "Claude Code has two records of who this login is. One names {reported}; the other, which conversations started by earlier versions of cagents read, names {other}. Only one is right, so these figures may be {other}'s. Sign in again to settle which login this is."
+                "Claude Code has two records of who this login is: one names {reported}, the other {other}. Only one is right, so these figures may be {other}'s. Sign in again to settle which login this is."
             ),
             Self::Contradicted {
                 with,
@@ -836,7 +850,7 @@ impl LoginConflict {
                 with,
                 because: Contradiction::SeparateAllowances,
             } => format!(
-                "Reports the same login as {with}, but their weekly limits reset at different times, so they are separate logins and at least one of them is named wrongly. Sign each in again to settle which login it is."
+                "Reports the same login as {with}, but their weekly limits reset at different times, so they are separate logins and at least one of them is named wrongly. Sign in again to settle which login this is."
             ),
         }
     }
@@ -1692,9 +1706,10 @@ fn login_launch_with_path(
 }
 
 /// Whether the sign-in `recipe` signs `account` in: whether it names the
-/// home a sign-in on the account exports (see [`Account::launch_home`]), or
-/// the account's home itself, as a sign-in started before cagents stopped
-/// exporting the system default named it.
+/// account's home, as every sign-in on an account with a home of its own
+/// does, and one started before cagents stopped exporting the system default
+/// did; or names none, as one on the system account does (see
+/// [`Account::launch_home`]).
 fn signs_in(account: &Account, recipe: &LaunchRecipe) -> bool {
     let Some(variable) = account::home_variable(account.provider) else {
         return false;
@@ -1706,7 +1721,7 @@ fn signs_in(account: &Account, recipe: &LaunchRecipe) -> bool {
         .map(PathBuf::from);
     match named {
         Some(named) => account.resolved_home() == Some(named),
-        None => account.is_system() && account.launch_home().is_none(),
+        None => account.is_system(),
     }
 }
 
@@ -2291,7 +2306,10 @@ impl Cagents {
                 && !crate::device::is_remote()
             {
                 let settled = tokio::task::spawn_blocking(move || {
-                    cache.settle(&key, Some(account::cache::Settled::SignedIn))
+                    let at = crate::chat::now_ms().ok_or_else(|| {
+                        std::io::Error::other("The system clock is before the Unix epoch")
+                    })?;
+                    cache.settle(&key, Some(account::cache::Settled::SignedIn { at }))
                 })
                 .await;
                 if let Ok(Err(error)) = settled {
@@ -5186,7 +5204,11 @@ impl Cagents {
             );
             let sign_in = match &conflict {
                 LoginConflict::Changed { added_as, .. } => Some(format!("Sign in as {added_as}")),
-                LoginConflict::Disputed { .. } => Some("Sign in again".to_owned()),
+                LoginConflict::Disputed { .. }
+                | LoginConflict::Contradicted {
+                    because: Contradiction::SeparateAllowances,
+                    ..
+                } => Some("Sign in again".to_owned()),
                 _ => None,
             };
             if let Some(sign_in) = sign_in {
@@ -6464,8 +6486,9 @@ mod tests {
                 .environment
                 .get("CLAUDE_CONFIG_DIR")
                 .map(String::as_str),
-            // The home every system launch exports: none beside an existing
-            // `~/.claude.json`, which an explicit default would move.
+            // The home every system launch exports: none unless cagents was
+            // started with one, since an explicit default would move the
+            // login's record out of `~/.claude.json`.
             Account::system(Provider::Claude)
                 .launch_home()
                 .as_deref()
@@ -7986,7 +8009,7 @@ mod app_tests {
 
     /// The answer a probe of `id` gives: `identity`, with a weekly allowance
     /// that resets at `weekly_reset`, in Unix seconds.
-    fn answered(
+    fn probe_answered(
         app: &mut Cagents,
         id: &AccountId,
         identity: Identity,
@@ -8039,9 +8062,9 @@ mod app_tests {
             disputed_by: Some("other@example.com".into()),
             ..email("same@example.com")
         };
-        let reply = answered(&mut app, &accounts[0].1, disputed, None);
+        let reply = probe_answered(&mut app, &accounts[0].1, disputed, None);
         let _ = app.update(reply);
-        let reply = answered(&mut app, &accounts[1].1, email("same@example.com"), None);
+        let reply = probe_answered(&mut app, &accounts[1].1, email("same@example.com"), None);
         let _ = app.update(reply);
         let state = |index: usize| app.account_ui.account(&accounts[index].1).unwrap();
         assert_eq!(
@@ -8052,17 +8075,29 @@ mod app_tests {
             })
         );
         // Both names it might be are shown, wherever the row is named.
-        assert_eq!(
-            app.account_ui.display_name(state(0)),
-            "same@example.com or other@example.com"
+        assert!(
+            app.account_ui
+                .display_name(state(0))
+                .ends_with("same@example.com or other@example.com")
         );
         // The row reporting the same login is not taken for its duplicate.
         assert_eq!(
             app.account_ui.login_conflict(state(1)),
             Some(LoginConflict::Contradicted {
-                with: app.account_ui.display_name(state(0)),
+                with: app.account_ui.referred_name(state(0)),
                 because: Contradiction::Disputed,
             })
+        );
+        // The other row's message names it by the address it reports; its
+        // own message names both.
+        let with = app.account_ui.referred_name(state(0));
+        assert!(with.ends_with("same@example.com") && !with.contains(" or "));
+        assert!(
+            app.account_ui
+                .login_conflict(state(1))
+                .unwrap()
+                .detail()
+                .starts_with(&format!("Reports the same login as {with}, but {with}'s"))
         );
         for index in [0, 1] {
             assert_eq!(
@@ -8077,26 +8112,25 @@ mod app_tests {
     #[test]
     fn one_login_reported_by_homes_with_separate_weekly_limits_is_an_identity_conflict() {
         let directory = tempfile::tempdir().unwrap();
-        let mut app = context_inspector_test_app(false);
         let now = (NOW / 1000) as i64;
         for (second_reset, separate) in [
             (now + 5 * 86_400, true),
             // Rounded, or reported a moment apart: still one allowance.
             (now + 2 * 86_400 + 1_800, false),
         ] {
-            let accounts = linked_logins(
-                &mut app,
-                directory.path().join(second_reset.to_string()).as_path(),
-                &["same@example.com", "same@example.com"],
-            );
-            let reply = answered(
+            let mut app = context_inspector_test_app(false);
+            let root = directory.path().join(second_reset.to_string());
+            std::fs::create_dir_all(&root).unwrap();
+            let accounts =
+                linked_logins(&mut app, &root, &["same@example.com", "same@example.com"]);
+            let reply = probe_answered(
                 &mut app,
                 &accounts[0].1,
                 email("same@example.com"),
                 Some(now + 2 * 86_400),
             );
             let _ = app.update(reply);
-            let reply = answered(
+            let reply = probe_answered(
                 &mut app,
                 &accounts[1].1,
                 email("same@example.com"),
@@ -8105,7 +8139,7 @@ mod app_tests {
             let _ = app.update(reply);
             app.account_ui.now_ms = NOW;
             let state = |index: usize| app.account_ui.account(&accounts[index].1).unwrap();
-            let with = app.account_ui.display_name(state(0));
+            let with = app.account_ui.referred_name(state(0));
             if separate {
                 assert_eq!(
                     app.account_ui.login_conflict(state(1)),

@@ -2981,9 +2981,9 @@ mod tests {
         assert!(project_session.launch.recipe.arguments.is_empty());
     }
 
-    /// A conversation on the system login exports the home its sign-in and
-    /// probe use: none beside an existing `~/.claude.json`, so the CLI keeps
-    /// one record of who the login is.
+    /// A conversation on the system login exports the home its sign-in
+    /// does, and its probe reads: none unless cagents was started with one,
+    /// so the CLI keeps one record of who the login is, in `~/.claude.json`.
     #[test]
     fn a_system_conversation_exports_the_home_its_probe_reads() {
         let system = crate::account::Account::system(Provider::Claude);
@@ -3003,10 +3003,10 @@ mod tests {
                 .map(std::path::PathBuf::from),
             system.launch_home()
         );
-        assert_eq!(
-            system.probe_environment().map(|(_, home)| home),
-            system.launch_home()
-        );
+        assert_eq!(system.probe_environment(), None);
+        if std::env::var_os("CLAUDE_CONFIG_DIR").is_none() {
+            assert_eq!(system.launch_home(), None);
+        }
     }
 
     #[test]

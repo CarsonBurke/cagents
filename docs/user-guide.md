@@ -1009,13 +1009,13 @@ Every cagents terminal and conversation exports its account's home, and one on
 a managed or linked account also lists that home in `CAGENTS_ACCOUNT_HOMES`.
 The one exception is Claude's default home: unless cagents was started with
 `CLAUDE_CONFIG_DIR`, a terminal, conversation or sign-in on the System default
-Claude login leaves `CLAUDE_CONFIG_DIR` unset whenever `~/.claude.json` exists,
-as your own shell does. Claude Code keeps who a login is in that file, and an
-explicit `CLAUDE_CONFIG_DIR=~/.claude` moves it to `~/.claude/.claude.json`
-instead. Earlier versions of cagents exported it, so their conversations kept a
-second record; conversations saved then still resume with the setting they
-started with. Where `~/.claude.json` does not exist, cagents exports
-`CLAUDE_CONFIG_DIR=~/.claude` as before. A
+Claude login leaves `CLAUDE_CONFIG_DIR` unset, as your own shell does. Claude
+Code keeps who a login is in `~/.claude.json`, and an explicit
+`CLAUDE_CONFIG_DIR=~/.claude` moves that record to `~/.claude/.claude.json`
+instead, although history and credentials stay in `~/.claude` either way.
+Earlier versions of cagents exported it, so their conversations kept a second
+record; conversations saved then still resume with the setting they started
+with, and can rewrite that record. A
 cagents window, daemon, or `cagents` command started from one - by you or by an
 agent - ignores a variable that still holds the listed home, or any path inside
 a cagents `accounts/<provider>/<id>` directory, when deciding the system
@@ -1034,8 +1034,8 @@ different logins: the row lists both, its figures may be either one's, and
 **Sign in again** settles it. Signing in again from your own terminal settles it
 as well when it changes the login `~/.claude.json` names. On another row, it
 reports the same login as a row whose records disagree, or as a row whose weekly
-limit resets at a different time, which one login's could not; sign each in
-again to settle which login it is. Neither row offers **Archive duplicate**, and
+limit resets at a different time, which one login's could not; **Sign in again**
+on a row whose limit differs settles which login it is. Neither row offers **Archive duplicate**, and
 neither prevents a new sign-in to that login.
 
 For an unchanged **Same login** row, its menu offers **Archive duplicate**.

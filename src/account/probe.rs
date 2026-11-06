@@ -124,6 +124,18 @@ pub enum Outcome {
 /// Unless `force`d, a cached answer another window observed within
 /// [`STALE_AFTER`] is returned instead of probing again.
 pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome {
+    let second_home = second_home(&account, &|name| std::env::var(name).ok());
+    run_reading(account, cache, force, second_home).await
+}
+
+/// [`run`], with `second_home` the home whose record of `account`'s login
+/// to compare the one the CLI reports with (see [`second_home`]).
+async fn run_reading(
+    account: Account,
+    cache: Option<Cache>,
+    force: bool,
+    second_home: Option<PathBuf>,
+) -> Outcome {
     let now = now_ms();
     let search_path = search_path().await;
     let setup = {
@@ -160,16 +172,13 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
         },
         Some(cache),
         Some(key),
-        Some(user_home),
-    ) = (
-        &mut outcome,
-        cache.clone(),
-        key.clone(),
-        split_records(&account),
-    ) {
+        Some(home),
+    ) = (&mut outcome, cache.clone(), key.clone(), second_home)
+    {
+        let other = second_login(&account, &program, search_path.as_deref(), &home).await;
         let reported = identity.clone();
         identity.disputed_by =
-            tokio::task::spawn_blocking(move || dispute(&user_home, &cache, &key, &reported))
+            tokio::task::spawn_blocking(move || dispute(other, &cache, &key, &reported, now_ms()))
                 .await
                 .ok()
                 .flatten();
@@ -915,50 +924,65 @@ async fn probe_claude_with_path(
     join_claude(run_json(status), claude_usage(usage)).await
 }
 
-/// The reader's home, where a second record of `account`'s login may be:
-/// when `account` is the system Claude login whose CLI resolves its default
-/// record, `~/.claude.json`, beside the record that earlier cagents launches
-/// kept in `~/.claude` (see [`Account::launch_home`]).
-fn split_records(account: &Account) -> Option<PathBuf> {
+/// The home whose record of `account`'s login may disagree with the one its
+/// CLI reports, in `environment`: when `account` is the system Claude login,
+/// whose CLI keeps its record in `~/.claude.json`, its home `~/.claude`,
+/// where launches that exported `CLAUDE_CONFIG_DIR=~/.claude` kept another
+/// (see [`Account::launch_home`]).
+fn second_home(account: &Account, environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
     if account.provider != Provider::Claude
         || !matches!(account.home, super::AccountHome::System)
-        || account.probe_environment().is_some()
+        || account.launch_home_in(environment).is_some()
     {
         return None;
     }
-    // Tests probe with the developer's own home; they reach [`dispute`]
-    // with fixture homes instead.
-    if cfg!(test) {
-        return None;
-    }
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
+    account.home_directory(environment)
 }
 
-/// The login a second record under `user_home` names where it disagrees
-/// with `reported` and no settlement filed under `key` in `cache` covers
-/// the disagreement; recording what settles it.
+/// What the record that `account`'s CLI keeps when `home` is exported as its
+/// configuration directory names, as that CLI reports it.
+async fn second_login(
+    account: &Account,
+    program: &Path,
+    search_path: Option<&OsStr>,
+    home: &Path,
+) -> super::claude::RecordedLogin {
+    use super::claude::RecordedLogin;
+    // Claude Code writes that record only while the directory is exported.
+    if !tokio::fs::try_exists(home.join(".claude.json"))
+        .await
+        .unwrap_or(false)
+    {
+        return RecordedLogin::Nobody;
+    }
+    let mut status = command_with_path(account, program, search_path);
+    status.env("CLAUDE_CONFIG_DIR", home);
+    status.args(["auth", "status", "--json"]);
+    match tokio::time::timeout(TIMEOUT, run_json(status)).await {
+        Ok(Ok(observed)) => RecordedLogin::reported(&observed.value),
+        _ => RecordedLogin::Unknown,
+    }
+}
+
+/// The login the second record, naming `other`, names where it disagrees
+/// with `reported` and no settlement filed under `key` in `cache` covers the
+/// disagreement, as of `now` in Unix milliseconds; recording what settles it.
 fn dispute(
-    user_home: &Path,
+    other: super::claude::RecordedLogin,
     cache: &super::cache::Cache,
     key: &str,
     reported: &Identity,
+    now: u64,
 ) -> Option<String> {
-    let other = super::claude::disputing_record(user_home, reported);
-    let settled = cache.settled(key);
-    let previous = cache
-        .load(u64::MAX)
-        .remove(key)
-        .and_then(|entry| entry.identity);
-    let (disputed_by, settle) =
-        super::claude::settle_dispute(reported, other, previous.as_ref(), settled.as_ref());
-    if let Some(settle) = settle
-        && let Err(error) = cache.settle(key, settle)
-    {
-        tracing::debug!(%error, "cannot record how the login's records were settled");
-    }
-    disputed_by
+    cache
+        .settle_with(key, |settled, previous| {
+            super::claude::settle_dispute(reported, other.clone(), previous, settled, now)
+        })
+        .unwrap_or_else(|error| {
+            // Without the settlement, the disagreement is reported as found.
+            tracing::debug!(%error, "cannot record how the login's records were settled");
+            super::claude::settle_dispute(reported, other, None, None, now).0
+        })
 }
 
 async fn join_claude(
@@ -2306,22 +2330,16 @@ cat >/dev/null
     /// login the CLI reported until a sign-in settles which is right.
     #[test]
     fn a_second_record_disputes_the_reported_login_until_a_sign_in_settles_it() {
+        use super::super::claude::RecordedLogin;
         let directory = tempfile::tempdir().unwrap();
-        let home = directory.path().join("home");
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
         let cache = Cache::at(directory.path().join("cache"));
+        const NOW: u64 = 1_000_000_000;
         let key = "claude:/home/a/.claude";
         let reported = |email: &str| Identity {
             email: Some(email.into()),
             ..Identity::default()
         };
-        let record = |email: &str| {
-            std::fs::write(
-                home.join(".claude").join(".claude.json"),
-                json!({"oauthAccount": {"emailAddress": email}}).to_string(),
-            )
-            .unwrap();
-        };
+        let names = |email: &str| RecordedLogin::Login(email.into());
         let observe = |identity: Identity, observed_at: u64| {
             cache
                 .store(
@@ -2333,65 +2351,158 @@ cat >/dev/null
                 )
                 .unwrap();
         };
+        let me = || reported("me@example.com");
         // Without a second record there is nothing to dispute.
         assert_eq!(
-            dispute(&home, &cache, key, &reported("me@example.com")),
+            dispute(RecordedLogin::Nobody, &cache, key, &me(), NOW),
             None
         );
 
-        record("other@example.com");
-        let disputed = dispute(&home, &cache, key, &reported("me@example.com"));
+        let disputed = dispute(names("other@example.com"), &cache, key, &me(), NOW);
         assert_eq!(disputed.as_deref(), Some("other@example.com"));
         observe(
             Identity {
                 disputed_by: disputed,
-                ..reported("me@example.com")
+                ..me()
             },
             1,
         );
         assert_eq!(
-            dispute(&home, &cache, key, &reported("me@example.com")).as_deref(),
+            dispute(names("other@example.com"), &cache, key, &me(), NOW).as_deref(),
             Some("other@example.com")
         );
 
         // A sign-in that cagents ran finishes; the next probe settles it.
         cache
-            .settle(key, Some(super::super::cache::Settled::SignedIn))
+            .settle(
+                key,
+                Some(super::super::cache::Settled::SignedIn { at: NOW - 1_000 }),
+            )
             .unwrap();
         assert_eq!(
-            dispute(&home, &cache, key, &reported("me@example.com")),
+            dispute(names("other@example.com"), &cache, key, &me(), NOW),
             None
         );
-        observe(reported("me@example.com"), 2);
+        observe(me(), 2);
         assert_eq!(
-            dispute(&home, &cache, key, &reported("me@example.com")),
+            dispute(names("other@example.com"), &cache, key, &me(), NOW),
             None
         );
 
         // The second record is written by a sign-in of its own: shown again.
-        record("third@example.com");
-        let disputed = dispute(&home, &cache, key, &reported("me@example.com"));
+        let disputed = dispute(names("third@example.com"), &cache, key, &me(), NOW);
         assert_eq!(disputed.as_deref(), Some("third@example.com"));
         observe(
             Identity {
                 disputed_by: disputed,
-                ..reported("me@example.com")
+                ..me()
             },
             3,
+        );
+        // A record the CLI could not report, or a probe that names no login,
+        // says nothing new: what was shown stays.
+        assert_eq!(
+            dispute(RecordedLogin::Unknown, &cache, key, &me(), NOW).as_deref(),
+            Some("third@example.com")
+        );
+        assert_eq!(
+            dispute(
+                names("third@example.com"),
+                &cache,
+                key,
+                &Identity::default(),
+                NOW
+            ),
+            None
+        );
+        assert_eq!(
+            dispute(names("third@example.com"), &cache, key, &me(), NOW).as_deref(),
+            Some("third@example.com")
         );
         // A sign-in in the reader's own terminal changes the login the CLI's
         // record names, which settles it too.
         assert_eq!(
-            dispute(&home, &cache, key, &reported("new@example.com")),
+            dispute(
+                names("third@example.com"),
+                &cache,
+                key,
+                &reported("new@example.com"),
+                NOW
+            ),
             None
         );
         // Records that come to agree leave nothing settled behind.
-        record("new@example.com");
         assert_eq!(
-            dispute(&home, &cache, key, &reported("new@example.com")),
+            dispute(
+                names("new@example.com"),
+                &cache,
+                key,
+                &reported("new@example.com"),
+                NOW
+            ),
             None
         );
         assert_eq!(cache.settled(key), None);
+    }
+
+    /// The second record is the one the CLI itself reports with the default
+    /// home exported, and only the system Claude login without a home of the
+    /// reader's choosing has one.
+    #[tokio::test]
+    async fn the_second_record_is_read_through_the_cli_with_the_default_home_exported() {
+        use super::super::claude::RecordedLogin;
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let home_text = home.to_str().unwrap().to_owned();
+        let environment = |name: &str| (name == "HOME").then(|| home_text.clone());
+        let system = Account::system(Provider::Claude);
+        let second = second_home(&system, &environment).unwrap();
+        assert_eq!(second, home.join(".claude"));
+        let chosen = |name: &str| match name {
+            "HOME" => Some(home_text.clone()),
+            "CLAUDE_CONFIG_DIR" => Some(format!("{home_text}/.claude")),
+            _ => None,
+        };
+        assert_eq!(second_home(&system, &chosen), None);
+        assert_eq!(
+            second_home(&Account::system(Provider::Codex), &environment),
+            None
+        );
+        let linked = Account::linked(Provider::Claude, uuid::Uuid::from_u128(2), home.clone());
+        assert_eq!(second_home(&linked, &environment), None);
+
+        let program = directory.path().join("claude");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+[ "$1 $2 $3" = "auth status --json" ] || exit 2
+case "$CLAUDE_CONFIG_DIR" in
+  */home/.claude) printf '{"loggedIn":true,"email":"other@example.com"}' ;;
+  *) exit 3 ;;
+esac
+"#,
+        )
+        .unwrap();
+        make_executable(&program);
+        // Claude Code has not kept a record there.
+        assert_eq!(
+            second_login(&system, &program, None, &second).await,
+            RecordedLogin::Nobody
+        );
+        std::fs::write(second.join(".claude.json"), "{}").unwrap();
+        assert_eq!(
+            second_login(&system, &program, None, &second).await,
+            RecordedLogin::Login("other@example.com".into())
+        );
+        // A CLI that fails says nothing either way.
+        let elsewhere = directory.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(".claude.json"), "{}").unwrap();
+        assert_eq!(
+            second_login(&system, &program, None, &elsewhere).await,
+            RecordedLogin::Unknown
+        );
     }
 
     #[tokio::test]
