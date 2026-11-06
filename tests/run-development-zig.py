@@ -150,6 +150,45 @@ exit 83
         self.assertEqual(calls, [], "Cargo could resolve the original unverified shim")
 
 
+@unittest.skipUnless(shutil.which("cargo"), "needs real Cargo")
+class RefuseCompile(unittest.TestCase):
+    """The wrapper against real Cargo: a current build passes and stays fresh, and
+    anything to compile fails naming the crate."""
+
+    def cargo(self, *arguments, **changes):
+        return subprocess.run(
+            ["cargo", "build", "--quiet", *arguments], cwd=self.crate,
+            env=os.environ | changes, capture_output=True, text=True, timeout=120,
+        )
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-refuse-compile-")
+        self.addCleanup(temporary.cleanup)
+        self.crate = Path(temporary.name)
+        (self.crate / "src").mkdir()
+        (self.crate / "Cargo.toml").write_text(
+            '[package]\nname = "probe"\nversion = "0.0.0"\nedition = "2021"\n')
+        (self.crate / "src/main.rs").write_text("fn main() {}\n")
+        self.wrapper = {"RUSTC_WRAPPER": str(SOURCE.with_name("refuse-compile")),
+                        "CAGENTS_NATIVE_LOCK_HELD": "/the/lock"}
+
+    def test_a_current_build_passes_and_a_stale_one_is_refused(self):
+        result = self.cargo()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        binary = self.crate / "target/debug/probe"
+        built = binary.stat().st_mtime_ns
+
+        result = self.cargo(**self.wrapper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(binary.stat().st_mtime_ns, built, "the wrapper made Cargo rebuild")
+
+        (self.crate / "src/main.rs").write_text("fn main() { println!(); }\n")
+        result = self.cargo(**self.wrapper)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing to compile probe while holding the native lock /the/lock", result.stderr)
+        self.assertEqual(binary.stat().st_mtime_ns, built)
+
+
 class LaunchFreshness(unittest.TestCase):
     """A launch whose matched set is built skips the build gate; anything that
     could make Cargo rebuild sends the launch back through it."""
@@ -231,6 +270,184 @@ exit 83
         result, calls = self.launch(*arguments, **changes)
         self.assertEqual(calls, [], "an up-to-date launch built")
         self.assertIn("skipping the build", result.stderr)
+
+    def under_native_lock(self, *holder, **changes):
+        """Launch below `holder`, which holds the native lock in a directory with a space."""
+        lock = self.root / "native lock"
+        lock.touch()
+        environment = self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock)} | changes
+        return subprocess.run(
+            [*holder, str(lock), str(self.runner), "--browserless"], cwd=self.root,
+            env=environment, capture_output=True, text=True, timeout=10,
+        )
+
+    def fake_cargo_reports_its_guard(self):
+        cargo = self.root / "bin/cargo"
+        text = cargo.read_text()
+        cargo.write_text(text.replace(
+            """    build)
+""", """    build)
+        printf 'wrapper=%s lock=%s seed=%s remote=%s\\n' "${RUSTC_WRAPPER:-}" "${CAGENTS_BUILD_LOCK:-}" "${CAGENTS_BUILD_SEED:-}" "${CAGENTS_BUILD_REMOTE:-}" >> "$GUARD_CALLS"
+""", 1))
+        guard_calls = self.root / "guard-calls"
+        self.env["GUARD_CALLS"] = str(guard_calls)
+        return guard_calls
+
+    def assert_compiling_is_forbidden(self, result, guard_calls):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("may only confirm that nothing needs compiling", result.stderr)
+        lines = guard_calls.read_text().splitlines()
+        self.assertEqual(len(lines), 3)
+        for line in lines:
+            self.assertIn(f"wrapper={self.runner.with_name('refuse-compile')} ", line)
+            self.assertNotIn(f"lock={self.env['CAGENTS_BUILD_LOCK']} ", line)
+            self.assertIn("seed=0 remote=local", line)
+        # The private lock doesn't outlive the launch.
+        self.assertEqual(list(Path(self.env["TMPDIR"]).glob("cagents-session-build.*")), [])
+
+    def private_temporary_directory(self):
+        temporary = self.root / "tmp"
+        temporary.mkdir()
+        self.env["TMPDIR"] = str(temporary)
+
+    def test_a_launch_below_the_lock_holder_cannot_compile(self):
+        self.private_temporary_directory()
+        guard_calls = self.fake_cargo_reports_its_guard()
+        for holder in (["flock"], ["flock", "--close"]):
+            with self.subTest(holder=holder):
+                result = self.under_native_lock(*holder)
+                self.assert_compiling_is_forbidden(result, guard_calls)
+                guard_calls.unlink()
+                self.touch_source()
+
+    def touch_source(self):
+        self.source.write_text(self.source.read_text() + "\n")
+
+    def test_a_grandchild_of_the_lock_holder_cannot_compile(self):
+        self.private_temporary_directory()
+        guard_calls = self.fake_cargo_reports_its_guard()
+        lock = self.root / "native-lock"
+        lock.touch()
+        result = subprocess.run(
+            ["flock", "--close", str(lock), "sh", "-c", f'"{self.runner}" --browserless; exit $?'],
+            cwd=self.root, env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock)},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assert_compiling_is_forbidden(result, guard_calls)
+
+    def test_a_symlinked_lock_path_is_the_same_lock(self):
+        self.private_temporary_directory()
+        guard_calls = self.fake_cargo_reports_its_guard()
+        lock = self.root / "real-lock"
+        lock.touch()
+        link = self.root / "linked-lock"
+        link.symlink_to(lock)
+        result = subprocess.run(
+            ["flock", "--close", str(lock), str(self.runner), "--browserless"],
+            cwd=self.root, env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(link)},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assert_compiling_is_forbidden(result, guard_calls)
+
+    def holding_the_lock_elsewhere(self):
+        lock = self.root / "native-lock"
+        lock.touch()
+        holder = subprocess.Popen(["flock", "--close", str(lock), "sleep", "30"], start_new_session=True)
+        self.addCleanup(holder.wait)
+        self.addCleanup(os.killpg, holder.pid, signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        return lock
+
+    def test_a_harness_session_counts_as_under_a_held_lock(self):
+        self.private_temporary_directory()
+        guard_calls = self.fake_cargo_reports_its_guard()
+        lock = self.holding_the_lock_elsewhere()
+        session_runtime = self.root / "nh-fixture"
+        session_runtime.mkdir()
+        # A compositor below something named niri-harness, as `session start` leaves it.
+        fake_harness = self.root / "niri-harness"
+        fake_harness.write_text("#!/bin/sh\nsleep 30 &\necho $! > \"$1\"\nwait\n")
+        fake_harness.chmod(0o755)
+        for name, changes, make_compositor in (
+            ("exec", {"XDG_RUNTIME_DIR": str(session_runtime)}, False),
+            ("session start", {}, True),
+        ):
+            with self.subTest(route=name):
+                changes = dict(changes)
+                if make_compositor:
+                    pid_file = self.root / "compositor-pid"
+                    harness = subprocess.Popen([str(fake_harness), str(pid_file)], start_new_session=True)
+                    self.addCleanup(harness.wait)
+                    self.addCleanup(os.killpg, harness.pid, signal.SIGKILL)
+                    deadline = time.monotonic() + 5
+                    while not pid_file.exists() or not pid_file.read_text().strip():
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(0.01)
+                    changes["NIRI_SOCKET"] = f"/run/user/1000/niri.wayland-2.{pid_file.read_text().strip()}.sock"
+                environment = self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock)} | changes
+                result = subprocess.run(
+                    [str(self.runner), "--browserless"], cwd=self.root, env=environment,
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assert_compiling_is_forbidden(result, guard_calls)
+                guard_calls.unlink()
+                self.touch_source()
+
+    def test_the_desktops_compositor_and_a_free_lock_do_not_count(self):
+        self.private_temporary_directory()
+        guard_calls = self.fake_cargo_reports_its_guard()
+        lock = self.holding_the_lock_elsewhere()
+        session_runtime = self.root / "nh-fixture"
+        session_runtime.mkdir()
+        free = self.root / "free-lock"
+        free.touch()
+        for name, changes in (
+            ("someone else holds it", {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock)}),
+            # This test's own process isn't below any niri-harness.
+            ("desktop compositor", {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock),
+                                    "NIRI_SOCKET": f"/run/user/1000/niri.wayland-1.{os.getpid()}.sock"}),
+            ("harness session, lock free", {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(free),
+                                            "XDG_RUNTIME_DIR": str(session_runtime)}),
+            ("no lock file", {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(self.root / "missing/lock"),
+                              "XDG_RUNTIME_DIR": str(session_runtime)}),
+        ):
+            with self.subTest(case=name):
+                result, _calls = self.launch("--browserless", **changes)
+                self.assertNotIn("may only confirm", result.stderr)
+                self.assertIn(f"lock={self.env['CAGENTS_BUILD_LOCK']} ", guard_calls.read_text().splitlines()[0])
+                self.assertIn("wrapper= ", guard_calls.read_text().splitlines()[0])
+                guard_calls.unlink()
+                self.touch_source()
+
+    def test_a_current_launch_holding_the_lock_starts_without_cargo(self):
+        self.assert_built("--browserless")
+        result = self.under_native_lock("flock", "--close")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("skipping the build", result.stderr)
+        self.assertFalse(self.cargo_calls.exists())
+
+    def test_a_refused_build_fails_the_launch_and_leaves_no_private_lock(self):
+        self.private_temporary_directory()
+        result = self.under_native_lock("flock", "--close", FAKE_FAIL_BINARY="cagents-ui")
+        self.assertEqual(result.returncode, 101, result.stderr)
+        self.assertEqual(list(Path(self.env["TMPDIR"]).glob("cagents-session-build.*")), [])
+
+    def test_a_hot_launch_holding_the_native_lock_refuses(self):
+        lock = self.root / "native-lock"
+        lock.touch()
+        hot = self.runner.with_name("hot-development")
+        hot.write_text('#!/bin/sh\nexit 0\n')
+        hot.chmod(0o755)
+        result = subprocess.run(
+            ["flock", "--close", str(lock), str(self.runner), "--hot"], cwd=self.root,
+            env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock)},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 78, result.stderr)
+        self.assertIn("hot reload always builds", result.stderr)
 
     def test_up_to_date_launch_skips_the_build(self):
         self.assert_built("--browserless")

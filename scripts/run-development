@@ -231,7 +231,65 @@ esac
 PATH=${zig_executable%/*}:$PATH
 export PATH
 
+# Whether this launch holds the native lock, on which every other native session
+# queues. An ancestor having it open covers `flock --close`, which keeps it in the
+# parent only. KWin starts a nested session's programs detached, so ancestry stops
+# there: a niri-harness session running while the lock is held counts as under it.
+under_native_lock() {
+    native_lock=$(readlink -f -- "${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}" 2>/dev/null) || return 1
+    [ -f "$native_lock" ] || return 1
+    process=$$
+    while [ "${process:-0}" -gt 1 ]; do
+        for descriptor in "/proc/$process/fd/"*; do
+            [ "$(readlink -- "$descriptor" 2>/dev/null)" != "$native_lock" ] || return 0
+        done
+        process=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$process/status" 2>/dev/null) || return 1
+    done
+    in_harness_session && command -v flock >/dev/null 2>&1 && ! flock -n "$native_lock" true 2>/dev/null
+}
+
+in_harness_session() {
+    case ${XDG_RUNTIME_DIR:-} in
+        */nh-?*) return 0 ;;
+    esac
+    # niri names its socket with its process ID.
+    process=${NIRI_SOCKET:-}
+    process=${process%.sock}
+    process=${process##*.}
+    case $process in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    while [ "${process:-0}" -gt 1 ]; do
+        [ "$(cat "/proc/$process/comm" 2>/dev/null)" != niri-harness ] || return 0
+        process=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$process/status" 2>/dev/null) || return 1
+    done
+    return 1
+}
+
+# A launch holding the native lock may confirm the build is current, but must not
+# compile, or queue for a build slot. Its own lock takes it out of the queue.
+build_unless_compiling_under_native_lock() {
+    if ! under_native_lock; then
+        build_and_record
+        return
+    fi
+    printf '%s\n' "This launch holds the native lock $native_lock, so its build may only confirm that nothing needs compiling." >&2
+    private_lock=$(mktemp -d "${TMPDIR:-/tmp}/cagents-session-build.XXXXXX")
+    status=0
+    (
+        export RUSTC_WRAPPER="$root/scripts/refuse-compile" CAGENTS_NATIVE_LOCK_HELD="$native_lock" \
+            CAGENTS_BUILD_LOCK="$private_lock/lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 CAGENTS_BUILD_REMOTE=local
+        build_and_record
+    ) || status=$?
+    rm -rf -- "$private_lock"
+    return "$status"
+}
+
 if [ "$hot" = true ]; then
+    if under_native_lock; then
+        printf '%s\n' "refusing to hot reload while holding the native lock $native_lock: hot reload always builds, and other native sessions queue behind it." >&2
+        exit 78
+    fi
     # The helper owns locked builds, sibling staging and the read-only lock mount.
     set -- -- "$@"
     [ -z "$log_file" ] || set -- --log-file "$log_file" "$@"
@@ -540,7 +598,7 @@ fi
 if products_current; then
     printf '%s\n' 'The matched set is already built for this checkout; skipping the build.' >&2
 else
-    build_and_record
+    build_unless_compiling_under_native_lock
 fi
 find_products
 
