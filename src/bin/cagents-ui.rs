@@ -8,7 +8,9 @@ use cagents::instance::{
 };
 use cosmic::{Core, app::cosmic::Cosmic, iced};
 
-#[cfg(test)]
+// The hot-reload root compiles this file with the application's modules, tests
+// included, and its `cagents` is itself, so the refusal doesn't belong there.
+#[cfg(all(test, not(feature = "hot-reload")))]
 cagents::refuse_filtered_test_run!();
 
 const PRODUCT: &str = "cagents-ui";
