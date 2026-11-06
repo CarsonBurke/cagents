@@ -3125,7 +3125,9 @@ impl Runtime {
                             } else {
                                 design::muted_icon_color
                             }))
-                            .on_press_maybe(available.then(|| action(Action::Submit(target, mode))))
+                            .on_press_maybe(
+                                available.then(|| action(Action::SubmitControl(target, mode))),
+                            )
                             .into()
                     }
                     Trailing::Stop => self.stop_control(available),

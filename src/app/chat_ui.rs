@@ -317,6 +317,11 @@ pub enum Action {
         Result<Vec<Attachment>, String>,
     ),
     Submit(Target, PromptMode),
+    /// A press of one of the composer's send controls. It submits like
+    /// [`Action::Submit`], then returns the keyboard to the draft: the control
+    /// shows only while there is a draft, so the one just pressed is gone
+    /// once the draft is sent, and its focus would otherwise go with it.
+    SubmitControl(Target, PromptMode),
     /// Recalls the message sent before the one the composer shows, or the
     /// unsent draft again once the recall has walked forward past the newest.
     HistoryOlder(Target),
@@ -11170,6 +11175,25 @@ impl Cagents {
                     }
                 }
             }
+            Action::SubmitControl(target, mode) => {
+                let submitted = self.handle_chat_ui(Action::Submit(target, mode));
+                // A picker the draft named, `/permissions` or `/resume`, takes
+                // the keyboard itself.
+                // Starting a draft can replace its runtime, so the card, not
+                // the generation, names the composer that keeps the keyboard.
+                let composer = match self.cards.get(&target.card) {
+                    Some(CardRuntime::Chat(runtime)) => !runtime.permission_picker,
+                    _ => false,
+                };
+                if self.resume_ui.open || !composer {
+                    return submitted;
+                }
+                return Task::batch([
+                    submitted,
+                    iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
+                        .map(cosmic::Action::App),
+                ]);
+            }
             Action::Submit(target, mode) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -14662,6 +14686,41 @@ mod tests {
             .iter()
             .map(|attachment| attachment.path.as_path())
             .collect()
+    }
+
+    /// The send controls show only beside a draft, so the one a keyboard
+    /// user pressed is gone once the draft is sent. Its press hands the
+    /// keyboard back to the composer rather than to nothing, unless the draft
+    /// named a picker that takes the keyboard itself.
+    #[test]
+    fn a_pressed_send_control_returns_the_keyboard_to_the_composer() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("send-control"));
+        let composer = card_control_id(card, "chat-composer");
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = true;
+        snapshot.capabilities.queue = false;
+        snapshot.capabilities.permission_modes = vec!["manual".into(), "auto".into()];
+        runtime.replace_draft(text_editor::Content::with_text("next task"));
+        let target = runtime.target;
+        let task = app.handle_chat_ui(Action::SubmitControl(target, PromptMode::Queue));
+        assert_eq!(chat_runtime(&app, card).followups[0].text, "next task");
+        assert!(chat_runtime(&app, card).composer.text().trim().is_empty());
+        assert_eq!(task_focuses(task, &composer), (true, false));
+
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("/permissions"));
+        let task = app.handle_chat_ui(Action::SubmitControl(target, PromptMode::Queue));
+        assert!(chat_runtime(&app, card).permission_picker);
+        assert!(
+            !task_focuses(task, &composer).0,
+            "the permissions picker keeps the keyboard it was opened with"
+        );
     }
 
     #[test]
