@@ -154,6 +154,24 @@ class InARealScope(unittest.TestCase):
             env=self.env, capture_output=True, text=True, timeout=60)
         self.assertRegex(escaped.stdout.strip(), r"^cagents-capped-.*\.scope$", escaped.stderr)
 
+    def test_a_replaced_runtime_directory_keeps_the_limit_and_the_command_keeps_it(self):
+        # As in a fixture or a nested session, where systemd's tools can't find
+        # the user manager from these variables.
+        replaced = {"XDG_RUNTIME_DIR": str(self.root), "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent"}
+        self.env |= replaced
+        result = self.run_tool("sh", "-c", f'{LEAF}; echo "$XDG_RUNTIME_DIR $DBUS_SESSION_BUS_ADDRESS"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        leaf, variables = result.stdout.split("\n", 1)
+        self.assertRegex(leaf, r"^cagents-capped-.*\.scope$", result.stderr)
+        self.assertEqual(variables.strip(), f"{self.root} unix:path=/nonexistent")
+        self.env.pop("DBUS_SESSION_BUS_ADDRESS")
+        result = self.run_tool("sh", "-c", 'echo "${DBUS_SESSION_BUS_ADDRESS-unset}"')
+        self.assertEqual(result.stdout.strip(), "unset", result.stderr)
+        ceiling = "chunks = [bytearray(b'x') * (16 * 2**20) for _ in range(64)]"
+        result = self.run_tool(sys.executable, "-I", "-c", ceiling)
+        self.assertEqual(result.returncode, 137, result.stderr)
+        self.assertIn("over its limit", result.stderr)
+
     def test_a_missing_command_fails_as_it_would_alone(self):
         result = self.run_tool(str(self.root / "absent"))
         self.assertNotEqual(result.returncode, 0)

@@ -581,6 +581,17 @@ exit 83
         self.assert_built("--browserless")
         self.assertTrue(ran.read_text().strip().endswith("/cagents-ui"))
 
+    def test_the_memory_limit_speaks_to_the_terminal_and_the_app_to_the_log(self):
+        limit = self.runner.with_name("memory-capped")
+        limit.write_text('#!/bin/sh\n"$@"\necho limit-message >&2\n')
+        limit.chmod(0o755)
+        log = self.root / "ui.log"
+        result, _ = self.launch("--browserless", "--log-file", str(log))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("limit-message", result.stderr)
+        self.assertTrue(log.exists())
+        self.assertNotIn("limit-message", log.read_text())
+
     def test_a_launch_building_on_the_build_host_always_asks_it(self):
         # Cargo's dependency lists stay there, so nothing here can say the
         # products are current.

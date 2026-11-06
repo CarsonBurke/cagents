@@ -722,10 +722,10 @@ runaway just moves into swap. For scale, the whole UI lib test binary peaks at
 about 3 GiB, and the host one at about 1 GiB.
 
 `scripts/cargo-gate test` and `bench` run under it, inside a held slot too, as do
-the app in `scripts/run-development` and a `scripts/native-evidence` session. It
-doesn't cover doctests, `cargo-gate run`, `--instance` sessions, tests run on a
-build host through `cargo-offload`, or a harness that runs Cargo or a test binary
-itself.
+the app in `scripts/run-development`, `--instance` included, and a
+`scripts/native-evidence` session. It doesn't cover doctests, `cargo-gate run`,
+`--hot`, tests run on a build host through `cargo-offload`, or a harness that runs
+Cargo or a test binary itself.
 
 **Writing a mutation harness:** a mutant can turn a bounded loop into an endless
 one that allocates, so run each mutant through `scripts/cargo-gate test` or put

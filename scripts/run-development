@@ -627,13 +627,15 @@ if [ -n "$instance" ]; then
         printf '%s\n' "Replacing instance $instance stops its terminal/chat jobs and all their background subagents." >&2
         stop_instance_session
     fi
+    capped=
+    [ ! -x "$root/scripts/memory-capped" ] || capped=$root/scripts/memory-capped
     # Its own bus and runtime directory keep the instance's application ID,
     # activation sockets and daemon apart from every other session.
     # Without the caller's display variables, nothing in the session can fall
     # back to the caller's desktop.
     env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u DISPLAY -u XAUTHORITY \
         niri-harness start --backend headless --name "$harness_session" --timeout 180 -- \
-        "$products/cagents-ui" "$@"
+        ${capped:+"$capped"} "$products/cagents-ui" "$@"
     printf '%s\n' \
         "Instance $instance is running in niri-harness session $harness_session." \
         "  observe: niri-harness --session $harness_session observe" \
@@ -657,13 +659,14 @@ if [ "$fresh_daemon" = true ]; then
     done
 fi
 
-run_ui() {
-    [ ! -x "$root/scripts/memory-capped" ] || exec "$root/scripts/memory-capped" "$products/cagents-ui" "$@"
-    exec "$products/cagents-ui" "$@"
-}
-
 if [ -n "$log_file" ]; then
     printf '%s\n' "writing UI diagnostics to $log_file"
-    run_ui "$@" >"$log_file" 2>&1
+    # Only the app's output goes there: a person watching this terminal needs to
+    # hear from the memory limit if it stops the app.
+    # shellcheck disable=SC2016 # expanded by the inner shell
+    set -- sh -c 'log_file=$1; shift; exec "$@" >"$log_file" 2>&1' run-ui "$log_file" "$products/cagents-ui" "$@"
+else
+    set -- "$products/cagents-ui" "$@"
 fi
-run_ui "$@"
+[ ! -x "$root/scripts/memory-capped" ] || set -- "$root/scripts/memory-capped" "$@"
+exec "$@"

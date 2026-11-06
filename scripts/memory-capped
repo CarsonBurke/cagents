@@ -26,6 +26,22 @@ is stopped and this exits 137. Interrupting this stops the scope too.
 UNITS = {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}
 PR_SET_PDEATHSIG = 1
 UNIT_PREFIX = "cagents-capped-"
+# A fixture or a nested session replaces these, which hides the user manager
+# from systemd's tools. The command gets them back inside its scope.
+MANAGER_VARIABLES = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+
+
+def manager_environment():
+    found = {key: value for key, value in os.environ.items() if key not in MANAGER_VARIABLES}
+    return found | {"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}
+
+
+def with_own_environment(command):
+    """COMMAND as it would run with this process's variables, not the manager's."""
+    settings = [f"{name}={os.environ[name]}" if name in os.environ else f"--unset={name}"
+                for name in MANAGER_VARIABLES]
+    return ["env", *sorted(settings, key=lambda setting: not setting.startswith("--")),
+            "sh", "-c", 'exec "$@"', PROGRAM, *command]
 
 
 def size(setting, default):
@@ -60,7 +76,8 @@ def scope_limits_memory(limit, swap):
     report = 'cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"'
     try:
         found = subprocess.run([*scope_command(["--collect"], limit, swap), "/bin/sh", "-c", report],
-                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+                               env=manager_environment())
     except (OSError, subprocess.SubprocessError):
         return False
     return found.returncode == 0 and found.stdout.strip() == str(limit)
@@ -76,9 +93,10 @@ def follow_parent(parent):
 def went_over(unit):
     try:
         result = subprocess.run(["systemctl", "--user", "show", unit, "--property=Result", "--value"],
-                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+                                env=manager_environment())
         subprocess.run(["systemctl", "--user", "reset-failed", unit], stdin=subprocess.DEVNULL,
-                       capture_output=True, timeout=30)
+                       capture_output=True, timeout=30, env=manager_environment())
     except (OSError, subprocess.SubprocessError):
         return False
     return result.stdout.strip() == "oom-kill"
@@ -100,8 +118,9 @@ def main():
     unit = f"{UNIT_PREFIX}{os.getpid()}-{time.monotonic_ns()}.scope"
     parent = os.getpid()
     # The command runs as this child: systemd-run execs it after making the scope.
-    child = subprocess.Popen([*scope_command([f"--unit={unit}"], limit, swap), *command],
-                             preexec_fn=lambda: follow_parent(parent))
+    child = subprocess.Popen([*scope_command([f"--unit={unit}"], limit, swap),
+                              *with_own_environment(command)],
+                             env=manager_environment(), preexec_fn=lambda: follow_parent(parent))
     interrupted = []
 
     def forward(sent, _frame):
@@ -114,7 +133,7 @@ def main():
     if interrupted:
         # Whatever ignored the signal, such as a compositor, goes with the scope.
         subprocess.run(["systemctl", "--user", "stop", "--no-block", unit], stdin=subprocess.DEVNULL,
-                       capture_output=True, timeout=30)
+                       capture_output=True, timeout=30, env=manager_environment())
     if status != 0 and went_over(unit):
         print(f"{PROGRAM}: stopped `{command[0]}`, which went over its limit of {limit // 2**20} MiB "
               f"of memory and {swap // 2**20} MiB of swap. If it isn't running away, raise "
