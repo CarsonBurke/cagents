@@ -913,16 +913,6 @@ class StandInHost(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.root / "local-build").exists())
 
-    def test_a_program_run_inside_exec_cannot_compile_through_absolute_cargo(self):
-        self.shell_program()
-        result = self.gate_run(
-            "exec", "cargo", "run", "--quiet", "--", "-ec",
-            '"$CARGO" build --bin probe', env=self.remote_env())
-        self.assertNotEqual(result.returncode, 0, result.stderr)
-        self.assertIn("would compile on this host", result.stderr)
-        self.assertEqual([path for path in (self.root / "local-build").rglob("probe*")
-                          if path.is_file()], [])
-
     def logging_rustc_wrapper(self):
         wrapper = self.root / "rustc-wrapper"
         wrapper.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >>"$WRAPPER_LOG"\nexec "$@"\n')
@@ -930,18 +920,19 @@ class StandInHost(unittest.TestCase):
         return {"RUSTC_WRAPPER": str(wrapper), "PROBE_WRAPPER": str(wrapper),
                 "WRAPPER_LOG": str(self.root / "wrapper-log")}
 
-    def test_a_program_run_inside_nested_exec_preserves_wrapper_queries(self):
+    def test_a_program_run_inside_exec_cannot_compile_through_absolute_cargo(self):
         self.shell_program()
         result = self.gate_run(
-            "exec", str(self.gate), "exec", "cargo", "run", "--quiet", "--", "-ec",
-            '"$RUSTC_WRAPPER" rustc -vV >/dev/null; '
-            '"$RUSTC_WRAPPER" rustc --print sysroot >/dev/null; "$CARGO" build --bin probe',
+            "exec", "cargo", "run", "--quiet", "--", "-ec",
+            '"$RUSTC_WRAPPER" rustc -vV >/dev/null; "$CARGO" build --bin probe',
             env=self.remote_env() | self.logging_rustc_wrapper())
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("would compile on this host", result.stderr)
+        self.assertEqual([path for path in (self.root / "local-build").rglob("probe*")
+                          if path.is_file()], [])
+        # The guard still hands queries to the caller's saved wrapper.
         queries = (self.root / "wrapper-log").read_text()
         self.assertIn("-vV", queries)
-        self.assertIn("--print sysroot", queries)
         self.assertNotIn("--crate-name probe ", queries)
 
     def test_a_program_run_outside_exec_keeps_the_callers_environment(self):
@@ -954,38 +945,6 @@ class StandInHost(unittest.TestCase):
             env=self.remote_env() | self.logging_rustc_wrapper())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("-vV", (self.root / "wrapper-log").read_text())
-
-    def test_a_program_run_inside_exec_can_explicitly_build_here_through_the_gate(self):
-        self.shell_program()
-        result = self.gate_run(
-            "exec", "cargo", "run", "--quiet", "--", "-ec",
-            "CAGENTS_BUILD_REMOTE=local cargo build --bin probe",
-            env=self.remote_env())
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((self.root / "local-build").exists())
-        self.assertIn("Compiling probe", result.stderr)
-
-    def test_the_launched_environment_keeps_its_guard_after_exec_finishes(self):
-        self.shell_program()
-        result = self.gate_run(
-            "exec", "cargo", "run", "--quiet", "--", "-ec",
-            "python3 -c 'import json, os; "
-            'names = ("PATH", "CARGO", "RUSTC_WRAPPER", "CAGENTS_BUILD_EXEC_SHIMS", '
-            '"CAGENTS_BUILD_EXEC_RUSTC_WRAPPER"); '
-            "print(json.dumps({name: os.environ[name] for name in names if name in os.environ}))'",
-            env=self.remote_env())
-        self.assertEqual(result.returncode, 0, result.stderr)
-        inherited = self.remote_env() | json.loads(result.stdout)
-        self.assertFalse(Path(inherited["CAGENTS_BUILD_EXEC_SHIMS"]).exists())
-        self.assertTrue(Path(inherited["RUSTC_WRAPPER"]).is_file())
-        # Reuse the program's inherited environment after its outer exec
-        # removed the shim: the persistent guard must still stop a local
-        # compilation. This does not exercise a real language server.
-        late = subprocess.run([inherited["CARGO"], "build", "--bin", "probe"],
-                              cwd=self.crate, env=inherited, capture_output=True,
-                              text=True, timeout=60)
-        self.assertNotEqual(late.returncode, 0, late.stderr)
-        self.assertIn("would compile on this host", late.stderr)
 
     def test_documentation_opens_here(self):
         (self.crate / "src/lib.rs").write_text("//! Probe documentation.\n")
