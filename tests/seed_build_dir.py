@@ -365,10 +365,18 @@ class CopiedFingerprints(unittest.TestCase):
 
     def test_forgetting_refuses_an_empty_path(self):
         # `find "/"` would otherwise search the whole host for fingerprints to remove.
+        # A stand-in, so that a regression here reports itself rather than doing that.
         worktree = self.worktree("worktree")
-        result = subprocess.run([SEED, "--forget-local", ""], cwd=worktree, env=self.env,
+        tools = worktree / "tools"
+        tools.mkdir()
+        searched = worktree / "searched"
+        (tools / "find").write_text(f'#!/bin/sh\ntouch "{searched}"\n')
+        (tools / "find").chmod(0o755)
+        result = subprocess.run([SEED, "--forget-local", ""], cwd=worktree,
+                                env={**self.env, "PATH": f"{tools}:{os.environ['PATH']}"},
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 2)
+        self.assertFalse(searched.exists())
 
     def test_a_lock_file_awk_could_not_finish_is_not_believed(self):
         worktree = self.worktree("worktree")
@@ -504,6 +512,14 @@ class SeedBuildDir(unittest.TestCase):
             capture_output=True, text=True, timeout=60,
         )
 
+    def seed_to_cargos_choice(self, tools):
+        """Seed with no --to, under a `cargo` from `tools` that says where to."""
+        return subprocess.run(
+            [str(SEED), "--from", str(self.source)], cwd=self.checkout,
+            env={**self.env, "PATH": f"{tools}:{os.environ['PATH']}"},
+            capture_output=True, text=True, timeout=60,
+        )
+
     def fingerprints(self, *names):
         for name in names:
             (self.source / "debug/.fingerprint" / name).mkdir(parents=True)
@@ -603,14 +619,10 @@ class SeedBuildDir(unittest.TestCase):
             with self.subTest(metadata=metadata):
                 shutil.rmtree(self.destination, ignore_errors=True)
                 cargo.write_text(f"""#!/bin/sh
-printf '%s\\n' '{{{metadata}}}'
+printf '%s\\n' '{{"workspace_root":"{self.checkout}",{metadata}}}'
 """)
                 cargo.chmod(0o755)
-                result = subprocess.run(
-                    [str(SEED), "--from", str(self.source)], cwd=self.root,
-                    env={**self.env, "PATH": f"{tools}:{os.environ['PATH']}"},
-                    capture_output=True, text=True, timeout=60,
-                )
+                result = self.seed_to_cargos_choice(tools)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((self.destination / "debug/deps/libzstd-1.rlib").read_bytes(), b"rlib")
                 self.assertFalse(wrong.exists())
@@ -620,11 +632,7 @@ printf '%s\\n' '{{{metadata}}}'
         tools.mkdir()
         (tools / "cargo").write_text("#!/bin/sh\nexit 37\n")
         (tools / "cargo").chmod(0o755)
-        result = subprocess.run(
-            [str(SEED), "--from", str(self.source)], cwd=self.root,
-            env={**self.env, "PATH": f"{tools}:{os.environ['PATH']}"},
-            capture_output=True, text=True, timeout=60,
-        )
+        result = self.seed_to_cargos_choice(tools)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.destination.exists())
 
