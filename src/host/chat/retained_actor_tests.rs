@@ -4161,6 +4161,19 @@ fn unattached_claude_cleanup_refuses_unsupported_protocol_before_reservation() {
     assert!(state.native_closing.is_empty());
 }
 
+/// Kills an actor the way a crash takes it down with its daemon, helper
+/// first. A helper still alive when its provider dies terminates the
+/// provider's whole process group, which would remove a survivor the test
+/// means to leave behind.
+fn kill_helper_then_provider(record: &crate::daemon::holder_registry::Record) {
+    for process in [&record.holder, &record.root] {
+        unsafe {
+            libc::kill(process.pid, libc::SIGKILL);
+        }
+        wait_until(|| !process.is_current(), "the killed actor never exited");
+    }
+}
+
 /// A same-boot actor that died without writing retirement grants disk resume
 /// only once its helper, its provider and every process left in either's
 /// process group or session are gone. A survivor in the provider's group
@@ -4312,15 +4325,7 @@ fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
     drop(handle);
     drop(host);
     drop(lease);
-    for process in [&identity.record.root, &identity.record.holder] {
-        unsafe {
-            libc::kill(process.pid, libc::SIGKILL);
-        }
-    }
-    wait_until(
-        || !identity.record.holder.is_current() && !identity.record.root.is_current(),
-        "the killed actor never exited",
-    );
+    kill_helper_then_provider(&identity.record);
     let next = proof("successor");
     let _lease = crate::daemon::HostLease::acquire(&paths, &next).unwrap();
     let mut state = HostState::new(next.clone());
@@ -4533,11 +4538,7 @@ fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
         drop(notifications);
         drop(host);
         drop(lease);
-        for process in [&identity.record.root, &identity.record.holder] {
-            unsafe {
-                libc::kill(process.pid, libc::SIGKILL);
-            }
-        }
+        kill_helper_then_provider(&identity.record);
     } else {
         // An ordinary close retires the actor with a verified receipt that
         // records the conversation it confirmed, if any.
