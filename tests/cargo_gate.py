@@ -1966,7 +1966,7 @@ class HostRegistry(TwoSlots):
             self.build(1, timeout=2, env=env | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "0"})
         result = self.build(1, timeout=10, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("waited longest on this host", result.stderr)
+        self.assertIn("refused room longest on this host", result.stderr)
         self.assertEqual([path.name for path in self.registry.iterdir()
                           if path.name.startswith("wait-")], [])
 
@@ -1985,11 +1985,32 @@ class HostRegistry(TwoSlots):
             self.addCleanup(waiter.stderr.close)
             with self.assertRaises(subprocess.TimeoutExpired):
                 waiter.wait(timeout=3)
-            # Refused for longer than the priority time, it now fits.
-            self.held_elsewhere(f"{os.getpid()} 1\n0\n{{lock}}\n")
-            record.unlink()
+            # Refused for longer than the priority time, it now fits: both
+            # changes in one decision, so the gate sees neither or both.
+            with (self.registry / ".decision").open("a") as decision:
+                fcntl.flock(decision, fcntl.LOCK_EX)
+                self.held_elsewhere(f"{os.getpid()} 1\n0\n{{lock}}\n")
+                record.unlink()
             self.assertEqual(waiter.wait(timeout=10), 0)
-        self.assertNotIn("waited longest", waiter.stderr.read())
+        self.assertNotIn("refused room longest", waiter.stderr.read())
+
+    def test_refusals_that_stopped_start_the_priority_time_again(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "5"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        waiter = self.scope.popen(
+            [str(self.gate), "exec", "true"], env=env | {"CAGENTS_BUILD_COST_GIB": "1"},
+            cwd=self.root, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(waiter.stderr.close)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            waiter.wait(timeout=1.5)
+        # No decision, and so no refusal, for longer than a refusal stays fresh.
+        with (self.registry / ".decision").open("a") as decision:
+            fcntl.flock(decision, fcntl.LOCK_EX)
+            time.sleep(11.5)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            waiter.wait(timeout=3)
+        self.assertEqual(waiter.wait(timeout=15), 0)
+        self.assertIn("refused room longest", waiter.stderr.read())
 
     def test_one_overdue_build_ramps_up_at_a_time(self):
         env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
@@ -2005,7 +2026,7 @@ class HostRegistry(TwoSlots):
                 self.held_elsewhere(record)
                 result = self.build(1, timeout=10, env=env)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("waited longest", result.stderr)
+                self.assertIn("refused room longest", result.stderr)
 
     def test_an_overdue_build_gives_way_to_one_refused_longer(self):
         env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}

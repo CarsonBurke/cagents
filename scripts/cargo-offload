@@ -1034,7 +1034,8 @@ if command == "lease":
         # host's other slot families neither miss it nor count it waiting.
         with deciding():
             why = room(base, slot, cost)
-            late = why is not None and refused_since is not None and overdue(slot, refused_since)
+            late = (why is not None and refused_since is not None
+                    and uptime() - refused_last <= WAIT_FRESH and overdue(slot, refused_since))
             if why is None or late:
                 register(slot, cost, None, overdue=late)
                 forget_wait(slot)

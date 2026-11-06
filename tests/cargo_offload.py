@@ -1597,14 +1597,16 @@ class RemoteRun(unittest.TestCase):
         pid = os.getpid()
         started = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
         for name, record in (
-                ("wait-gate-older", f"{pid} {started} {self.uptime() - 60} {self.uptime()}\n"),
-                ("gate-ramping", f"{pid} {{kib}}\n{self.uptime()}\n{{lock}}\noverdue\n")):
+                ("wait-gate-older", "{pid} {started} {older} {now}\n"),
+                ("gate-ramping", "{pid} {{kib}}\n{now}\n{{lock}}\noverdue\n")):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as host, \
                     self.slots() as base:
                 registry = Path(host, "registry")
                 stand_in = Path(base, "figures")
                 write_figures(stand_in, available_gib=12)
                 self.registered_elsewhere(registry, 4 * 2**20)
+                now = self.uptime()
+                record = record.format(pid=pid, started=started, older=now - 60, now=now)
                 if name.startswith("wait-"):
                     (registry / name).write_text(record)
                 else:

@@ -536,7 +536,7 @@ forget_wait() {
 ramping() {
     [ "$(sed -n 4p "$1" 2>/dev/null)" = overdue ] || return 1
     holder= claimed= started=
-    { read -r holder claimed; read -r started; } <"$1" 2>/dev/null || return 1
+    { read -r holder claimed; read -r started; } 2>/dev/null <"$1" || return 1
     case $holder:$started in *[!0-9:]*|:*|*:) return 1 ;; esac
     [ $(($2 - started)) -lt "$overdue_ramp" ] || return 1
     [ "$holder" -eq 0 ] || [ -d "/proc/$holder" ] || return 1
@@ -551,6 +551,8 @@ ramping() {
 overdue() {
     [ -n "$registry" ] && [ "$priority_secs" -gt 0 ] && [ -n "$refused_since" ] || return 1
     now=$(uptime_seconds)
+    # Refusals that stopped, while it waited for a slot, start again.
+    [ $((now - refused_last)) -le "$wait_fresh" ] || return 1
     [ $((now - refused_since)) -ge "$priority_secs" ] || return 1
     mine=$(wait_entry)
     for entry in "$registry"/wait-*; do
@@ -789,7 +791,7 @@ admitted() {
     fi
     decided
     if [ -n "$late" ]; then
-        printf '%s: waited longest on this host; starting beside the running builds\n' "$program" >&2
+        printf '%s: refused room longest on this host; starting beside the running builds\n' "$program" >&2
     fi
     exec 8>&-
     # Each build gets a share of the CPUs among the builds running once it
