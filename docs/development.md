@@ -591,7 +591,9 @@ without reflinks, when the main checkout has no build or this checkout has no
 `CAGENTS_BUILD_SEED=0`; run `scripts/seed-build-dir` by hand to seed a
 directory a plain `cargo` would create. After copying a target by hand, run
 `scripts/seed-build-dir --forget-local TARGET` from the checkout that will build
-there, before its first build; it fails when `TARGET` holds no build. Seeded directories carry Cargo's
+there, before its first build. It fails when it can't find this checkout's
+crates in `Cargo.lock`, or can't search or clean `TARGET`; a `TARGET` with no
+fingerprints has nothing to forget. Seeded directories carry Cargo's
 `CACHEDIR.TAG`, so `prune-cargo-build-dirs` reclaims them after their worktree
 is removed.
 

@@ -342,17 +342,65 @@ class CopiedFingerprints(unittest.TestCase):
 
     def test_forgetting_refuses_what_it_cannot_do(self):
         worktree = self.worktree("worktree")
-        (worktree / "unbuilt").mkdir()
-        result = subprocess.run([SEED, "--forget-local", "unbuilt"], cwd=worktree, env=self.env,
+        result = subprocess.run([SEED, "--forget-local", "missing"], cwd=worktree, env=self.env,
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("no build to forget", result.stderr)
+        self.assertIn("could not forget", result.stderr)
         (worktree / "Cargo.lock").write_text("")
         result = subprocess.run([SEED, "--forget-local", self.main / "target"], cwd=worktree, env=self.env,
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn("names no crate", result.stderr)
         self.assertNotEqual(list((self.main / "target/debug/.fingerprint").glob("probe-*")), [])
+
+    def test_a_directory_without_fingerprints_has_nothing_to_forget(self):
+        worktree = self.worktree("worktree")
+        (worktree / "executables/debug").mkdir(parents=True)
+        (worktree / "executables/debug/probe").write_text("program")
+        subprocess.run([SEED, "--forget-local", "executables"], cwd=worktree, env=self.env, check=True)
+        self.assertTrue((worktree / "executables/debug/probe").is_file())
+
+    def test_forgetting_reaches_a_profile_of_any_name_at_any_depth(self):
+        worktree = self.worktree("worktree")
+        fingerprints = self.main / "target/debug/.fingerprint"
+        for profile in ("deps", "examples", "incremental", "a/b/c/d/release"):
+            copy = worktree / "target" / profile / ".fingerprint"
+            shutil.copytree(fingerprints, copy, symlinks=True)
+        subprocess.run([SEED, "--forget-local", "target"], cwd=worktree, env=self.env, check=True)
+        self.assertEqual(list((worktree / "target").rglob(".fingerprint/probe-*")), [])
+
+    def test_a_fingerprint_that_could_not_be_removed_fails_in_any_profile(self):
+        worktree = self.worktree("worktree")
+        for profile in ("debug", "release"):
+            shutil.copytree(self.main / "target/debug/.fingerprint",
+                            worktree / "target" / profile / ".fingerprint", symlinks=True)
+        tools = self.root / "tools"
+        tools.mkdir()
+        rm = tools / "rm"
+        for failing in ("debug", "release"):
+            with self.subTest(failing=failing):
+                rm.write_text(f'#!/bin/sh\ncase "$*" in *"/{failing}/"*) exit 1;; esac\nexit 0\n')
+                rm.chmod(0o755)
+                env = {**self.env, "PATH": f"{tools}:{self.env['PATH']}"}
+                result = subprocess.run([SEED, "--forget-local", "target"], cwd=worktree, env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("could not forget", result.stderr)
+
+    def test_a_directory_that_could_not_be_searched_fails(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads the unreadable directory")
+        worktree = self.worktree("worktree")
+        shutil.copytree(self.main / "target/debug/.fingerprint",
+                        worktree / "target/debug/.fingerprint", symlinks=True)
+        hidden = worktree / "target/release"
+        hidden.mkdir()
+        hidden.chmod(0)
+        self.addCleanup(hidden.chmod, 0o700)
+        result = subprocess.run([SEED, "--forget-local", "target"], cwd=worktree, env=self.env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("could not forget", result.stderr)
 
     def test_a_stray_lock_file_is_not_taken_for_the_workspaces(self):
         worktree = self.worktree("worktree")

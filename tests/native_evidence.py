@@ -417,6 +417,22 @@ class Evidence(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in copied.iterdir()), ["zstd-sys-2c3d"])
         self.assertTrue((fingerprints / "cagents-0a1b").is_dir())
 
+    def test_a_seed_target_with_only_executables_is_still_a_seed(self) -> None:
+        # What an offloaded build leaves here: its executables come back, its fingerprints don't.
+        probe = self.root / "reflink-probe"
+        probe.touch()
+        if subprocess.run(["cp", "--reflink=always", probe, f"{probe}-copy"],
+                          capture_output=True).returncode != 0:
+            self.skipTest("this file system cannot reflink")
+        self.built("before")
+        seed = self.task / "target-before"
+        self.assertEqual(list(seed.rglob(".fingerprint")), [])
+        after = self.checkout("after")
+        (after / "Cargo.lock").write_text('[[package]]\nname = "cagents"\nversion = "0.1.0"\n')
+        self.run_tool("build", "after", str(after), "--seed-target", str(seed))
+        self.assertTrue((self.task / "target-after").is_dir())
+        self.assertFalse((self.task / "target-after.partial").exists())
+
     def test_a_failed_seed_copy_cannot_pass_as_the_seeds_build(self) -> None:
         if os.geteuid() == 0:
             self.skipTest("root reads the unreadable file")
