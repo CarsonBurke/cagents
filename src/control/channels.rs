@@ -1206,7 +1206,7 @@ mod tests {
                 sessions,
                 chats: vec![],
                 terminals: vec![],
-                edits: vec![],
+                edits: vec![Some(model.clone())],
             }
             .serve(server_stream);
             let mut client = ControlClient::from_stream(client_stream).unwrap();
