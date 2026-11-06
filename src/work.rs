@@ -599,7 +599,9 @@ pub enum TranscriptCoverage {
     Partial,
     /// This provider's transcripts are not read.
     Unsupported,
-    Unavailable { reason: String },
+    Unavailable {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

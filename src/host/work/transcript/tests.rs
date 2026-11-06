@@ -22,7 +22,13 @@ fn read(format: Format, subagent: bool, lines: &[Value]) -> Vec<(Reference, Rela
     }
     found
         .into_iter()
-        .map(|found| (found.signal.reference, found.signal.relation, found.by_subagent))
+        .map(|found| {
+            (
+                found.signal.reference,
+                found.signal.relation,
+                found.by_subagent,
+            )
+        })
         .collect()
 }
 
@@ -114,7 +120,10 @@ fn harness_text_and_reads_are_not_mentions() {
             claude_result("t2", json!("https://github.com/o/r/pull/10"), false),
         ],
     );
-    assert_eq!(found, vec![(Reference::Number(6), Relation::Mentioned, false)]);
+    assert_eq!(
+        found,
+        vec![(Reference::Number(6), Relation::Mentioned, false)]
+    );
 }
 
 #[test]
@@ -127,12 +136,17 @@ fn subagent_lines_and_reports_are_marked_as_such() {
             claude_result("t1", json!("Switched to branch 'feat'"), false),
         ],
     );
-    assert_eq!(found, vec![(Reference::Number(3), Relation::CheckedOut, true)]);
+    assert_eq!(
+        found,
+        vec![(Reference::Number(3), Relation::CheckedOut, true)]
+    );
     let sidechain = read(
         Format::Claude,
         false,
-        &[json!({"type": "assistant", "isSidechain": true, "message": {"content": [
-            {"type": "text", "text": "Done: https://github.com/o/r/pull/4"}]}})],
+        &[
+            json!({"type": "assistant", "isSidechain": true, "message": {"content": [
+            {"type": "text", "text": "Done: https://github.com/o/r/pull/4"}]}}),
+        ],
     );
     assert_eq!(sidechain, vec![(key(4), Relation::Mentioned, true)]);
     // A delegated agent's report reaches the conversation as its result.

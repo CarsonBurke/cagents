@@ -1187,7 +1187,9 @@ pub(crate) fn pull_request_glyph<'a, Message: 'a>(
     match pull_request.state {
         PullRequestState::Merged => glyph(Icon::MergedPullRequest, merged_color),
         PullRequestState::Closed => glyph(Icon::ClosedPullRequest, design::destructive_color),
-        PullRequestState::Open if pull_request.draft => glyph(Icon::PullRequest, design::muted_color),
+        PullRequestState::Open if pull_request.draft => {
+            glyph(Icon::PullRequest, design::muted_color)
+        }
         PullRequestState::Open => glyph(Icon::PullRequest, design::success_color),
     }
 }

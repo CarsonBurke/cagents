@@ -122,19 +122,18 @@ impl Observed {
         let Some(checked) = self.checked else {
             return true;
         };
-        let wait = if self.missing {
-            NOT_A_PULL_REQUEST_FOR
-        } else if self.failures > 0 {
-            backoff(self.failures)
-        } else if self
-            .pull_request
-            .as_ref()
-            .is_some_and(|pull_request| pull_request.state != crate::work::PullRequestState::Open)
-        {
-            FINISHED_FOR
-        } else {
-            OPEN_FOR
-        };
+        let wait =
+            if self.missing {
+                NOT_A_PULL_REQUEST_FOR
+            } else if self.failures > 0 {
+                backoff(self.failures)
+            } else if self.pull_request.as_ref().is_some_and(|pull_request| {
+                pull_request.state != crate::work::PullRequestState::Open
+            }) {
+                FINISHED_FOR
+            } else {
+                OPEN_FOR
+            };
         checked.elapsed() >= wait
     }
 }
@@ -250,7 +249,9 @@ struct ProjectFacts {
 
 impl ProjectFacts {
     fn repository(&self) -> Option<&GitHubRepoKey> {
-        self.snapshot.as_deref().map(|snapshot| &snapshot.repository)
+        self.snapshot
+            .as_deref()
+            .map(|snapshot| &snapshot.repository)
     }
 
     /// The worktree containing `directory`, the deepest when they nest.
@@ -557,10 +558,9 @@ impl Handle {
                     if let Some(found) = &found
                         && let Ok(key) = PullRequestKey::new(base.clone(), found.number)
                     {
-                        state.observed.insert(
-                            (&key).into(),
-                            observed_now(board::convert(found, false)),
-                        );
+                        state
+                            .observed
+                            .insert((&key).into(), observed_now(board::convert(found, false)));
                     }
                     state.branches.insert(
                         (base_key, branch),
@@ -624,8 +624,7 @@ fn not_a_pull_request(error: &GitHubError) -> bool {
         GitHubError::InvalidResponse { source, .. } => return not_a_pull_request(source),
         error => error.to_string(),
     };
-    text.contains("Could not resolve to a PullRequest")
-        || text.contains("no pull requests found")
+    text.contains("Could not resolve to a PullRequest") || text.contains("no pull requests found")
 }
 
 /// A conversation's references, worked-on first, strongest first, then most
@@ -813,8 +812,8 @@ fn assemble(
             }) && !watched.references.iter().any(|(reference, _)| {
                 matches!(reference, Reference::PullRequest(other) if *other == key)
             });
-            let pull_request =
-                listed.or_else(|| observation.and_then(|observation| observation.pull_request.clone()));
+            let pull_request = listed
+                .or_else(|| observation.and_then(|observation| observation.pull_request.clone()));
             if pull_request.is_none() && named_by_number && !current_branch {
                 return None;
             }
@@ -960,7 +959,8 @@ fn read(watched: &mut Watched) {
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
-                path.extension().is_some_and(|extension| extension == "jsonl")
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
                     && path
                         .file_name()
                         .and_then(|name| name.to_str())
@@ -968,7 +968,12 @@ fn read(watched: &mut Watched) {
             })
             .collect::<Vec<_>>();
         children.sort();
-        files.extend(children.into_iter().take(SUBAGENTS).map(|path| (path, true)));
+        files.extend(
+            children
+                .into_iter()
+                .take(SUBAGENTS)
+                .map(|path| (path, true)),
+        );
     }
     let mut complete = true;
     let mut unavailable = None;
@@ -1007,7 +1012,10 @@ fn read_file(
     let file = File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
     }
     let identity = (metadata.dev(), metadata.ino());
     let size = metadata.len();
@@ -1016,8 +1024,8 @@ fn read_file(
         // Starting mid-file, the first line is whole only when the byte
         // before it ends a line.
         let mut before = [0];
-        let mid_line =
-            start > 0 && (file.read_exact_at(&mut before, start - 1).is_err() || before[0] != b'\n');
+        let mid_line = start > 0
+            && (file.read_exact_at(&mut before, start - 1).is_err() || before[0] != b'\n');
         Cursor {
             identity,
             offset: start,

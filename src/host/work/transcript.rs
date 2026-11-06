@@ -32,10 +32,15 @@ pub(super) struct Found {
 
 #[derive(Debug, Clone)]
 enum Call {
-    Shell { script: String },
+    Shell {
+        script: String,
+    },
     /// A delegated agent: its result is its report, read as prose.
     Agent,
-    Tool { name: String, input: String },
+    Tool {
+        name: String,
+        input: String,
+    },
 }
 
 /// One transcript file's reading state between lines.
@@ -80,7 +85,9 @@ impl Reader {
 
     fn settle(&mut self, id: &str, output: &str, succeeded: Option<bool>) -> Vec<Signal> {
         match self.pending.remove(id) {
-            Some(Call::Shell { script }) => pull_request_signals::command(&script, output, succeeded),
+            Some(Call::Shell { script }) => {
+                pull_request_signals::command(&script, output, succeeded)
+            }
             Some(Call::Agent) => pull_request_signals::prose(output),
             Some(Call::Tool { name, input }) => pull_request_signals::tool(&name, &input, output),
             None => Vec::new(),
@@ -221,7 +228,9 @@ impl Reader {
             Some("custom_tool_call") if payload["name"] == "apply_patch" => {
                 signals.extend(patch_files(payload["input"].as_str().unwrap_or("")));
             }
-            Some("function_call_output" | "local_shell_call_output" | "custom_tool_call_output") => {
+            Some(
+                "function_call_output" | "local_shell_call_output" | "custom_tool_call_output",
+            ) => {
                 let id = payload["call_id"].as_str().unwrap_or("");
                 let (output, succeeded) = codex_output(&payload["output"]);
                 signals.extend(self.settle(id, &output, succeeded));

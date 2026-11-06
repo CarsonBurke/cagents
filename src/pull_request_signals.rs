@@ -140,10 +140,9 @@ fn script(
             "gh" => gh(rest, output, succeeded, &directory, signals),
             // Codex runs every command as `bash -lc '…'`.
             "bash" | "sh" | "zsh" | "dash" if depth < 2 => {
-                if let Some(at) = rest
-                    .iter()
-                    .position(|arg| arg.starts_with('-') && !arg.starts_with("--") && arg.ends_with('c'))
-                    && let Some(inner) = rest.get(at + 1)
+                if let Some(at) = rest.iter().position(|arg| {
+                    arg.starts_with('-') && !arg.starts_with("--") && arg.ends_with('c')
+                }) && let Some(inner) = rest.get(at + 1)
                 {
                     script(inner, output, succeeded, depth + 1, signals);
                 }
@@ -501,7 +500,9 @@ fn push(
     for refspec in refspecs {
         let refspec = refspec.trim_start_matches('+');
         let destination = refspec.rsplit_once(':').map_or(refspec, |(_, to)| to);
-        let destination = destination.strip_prefix("refs/heads/").unwrap_or(destination);
+        let destination = destination
+            .strip_prefix("refs/heads/")
+            .unwrap_or(destination);
         if destination == "HEAD" || destination.is_empty() {
             signals.push(signal(
                 Reference::CurrentBranch {
@@ -858,7 +859,10 @@ fn outside_code(text: &str) -> Vec<String> {
 fn json_pull_request(input: &str) -> Option<PullRequestKey> {
     let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
     let owner = value.get("owner")?.as_str()?;
-    let name = value.get("repo").or_else(|| value.get("repository"))?.as_str()?;
+    let name = value
+        .get("repo")
+        .or_else(|| value.get("repository"))?
+        .as_str()?;
     let number = ["pull_number", "pullNumber", "number", "pr_number"]
         .iter()
         .find_map(|field| {

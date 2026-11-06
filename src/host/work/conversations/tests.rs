@@ -105,7 +105,14 @@ fn resolved(reference: &Reference, facts: &Facts) -> Option<PullRequestKeyOrd> {
 fn rows(list: &ConversationPullRequests) -> Vec<(u64, Relation, bool, bool)> {
     list.pull_requests
         .iter()
-        .map(|row| (row.number, row.relation, row.current_branch, row.by_subagent))
+        .map(|row| {
+            (
+                row.number,
+                row.relation,
+                row.current_branch,
+                row.by_subagent,
+            )
+        })
         .collect()
 }
 
@@ -115,7 +122,10 @@ fn references_resolve_through_the_project_s_board() {
     // A bare number belongs to the conversation's repository.
     assert_eq!(resolved(&Reference::Number(9), &facts), Some(key("me", 9)));
     // A branch the board lists resolves without asking GitHub.
-    assert_eq!(resolved(&branch(Some("me"), "feat"), &facts), Some(key("me", 1)));
+    assert_eq!(
+        resolved(&branch(Some("me"), "feat"), &facts),
+        Some(key("me", 1))
+    );
     assert_eq!(resolved(&branch(None, "old"), &facts), Some(key("me", 2)));
     // An edit in a worktree points at that worktree's branch, even from a
     // relative path through `..`.
@@ -191,13 +201,28 @@ fn a_branch_known_to_have_no_pull_request_is_not_asked_about_again_soon() {
 fn the_list_ranks_worked_on_first_and_marks_the_current_branch() {
     let facts = facts("/w/app/.worktrees/feat");
     let watched = watched(&[
-        (Reference::PullRequest(key("me", 2)), Relation::Mentioned, false),
-        (Reference::PullRequest(key("other", 7)), Relation::Mentioned, false),
-        (Reference::PullRequest(key("me", 2)), Relation::Reviewed, false),
+        (
+            Reference::PullRequest(key("me", 2)),
+            Relation::Mentioned,
+            false,
+        ),
+        (
+            Reference::PullRequest(key("other", 7)),
+            Relation::Mentioned,
+            false,
+        ),
+        (
+            Reference::PullRequest(key("me", 2)),
+            Relation::Reviewed,
+            false,
+        ),
         (branch(None, "feat"), Relation::Pushed, false),
     ]);
     let mut observed = BTreeMap::new();
-    observed.insert(key("other", 7), observed_now(board::convert(&listed(7, "x", "OPEN"), false)));
+    observed.insert(
+        key("other", 7),
+        observed_now(board::convert(&listed(7, "x", "OPEN"), false)),
+    );
     let list = assemble(&watched, Some(&facts), &observed, &BTreeMap::new(), None);
     assert_eq!(list.repository, Some(repo("me")));
     assert_eq!(
@@ -220,7 +245,13 @@ fn the_list_ranks_worked_on_first_and_marks_the_current_branch() {
 #[test]
 fn the_current_branch_s_pull_request_is_listed_before_anything_touches_it() {
     let facts = facts("/w/app/.worktrees/feat/src");
-    let list = assemble(&Watched::new(), Some(&facts), &BTreeMap::new(), &BTreeMap::new(), None);
+    let list = assemble(
+        &Watched::new(),
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
     assert_eq!(rows(&list), vec![(1, Relation::CheckedOut, true, false)]);
     // On a branch without one, there is nothing.
     let list = assemble(
@@ -240,10 +271,17 @@ fn numbers_appear_only_once_github_says_they_are_pull_requests() {
         (Reference::Number(40), Relation::Mentioned, false),
         (Reference::Number(41), Relation::Mentioned, false),
         (Reference::Number(42), Relation::Mentioned, false),
-        (Reference::PullRequest(key("me", 43)), Relation::Mentioned, false),
+        (
+            Reference::PullRequest(key("me", 43)),
+            Relation::Mentioned,
+            false,
+        ),
     ]);
     let mut observed = BTreeMap::new();
-    observed.insert(key("me", 40), observed_now(board::convert(&listed(40, "x", "OPEN"), false)));
+    observed.insert(
+        key("me", 40),
+        observed_now(board::convert(&listed(40, "x", "OPEN"), false)),
+    );
     observed.insert(
         key("me", 41),
         Observed {
@@ -258,7 +296,11 @@ fn numbers_appear_only_once_github_says_they_are_pull_requests() {
     // #41 is an issue and #42 is not known yet; a URL names a pull request
     // even before its state is.
     assert_eq!(numbers, vec![40, 43]);
-    let unknown = list.pull_requests.iter().find(|row| row.number == 43).unwrap();
+    let unknown = list
+        .pull_requests
+        .iter()
+        .find(|row| row.number == 43)
+        .unwrap();
     assert!(unknown.pull_request.is_none());
     assert!(unknown.observed_at_unix_ms.is_none());
 }
@@ -267,14 +309,32 @@ fn numbers_appear_only_once_github_says_they_are_pull_requests() {
 fn a_pull_request_is_by_a_subagent_only_when_every_signal_was() {
     let facts = facts("/w/app");
     let watched = watched(&[
-        (Reference::PullRequest(key("me", 5)), Relation::Created, true),
-        (Reference::PullRequest(key("me", 6)), Relation::Created, true),
+        (
+            Reference::PullRequest(key("me", 5)),
+            Relation::Created,
+            true,
+        ),
+        (
+            Reference::PullRequest(key("me", 6)),
+            Relation::Created,
+            true,
+        ),
         (Reference::Number(6), Relation::Mentioned, false),
         // The same pull request by URL and by its branch is one row.
         (branch(None, "old"), Relation::Pushed, true),
-        (Reference::PullRequest(key("me", 2)), Relation::Mentioned, false),
+        (
+            Reference::PullRequest(key("me", 2)),
+            Relation::Mentioned,
+            false,
+        ),
     ]);
-    let list = assemble(&watched, Some(&facts), &BTreeMap::new(), &BTreeMap::new(), None);
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
     let mut found = rows(&list);
     found.sort();
     assert_eq!(
@@ -290,7 +350,11 @@ fn a_pull_request_is_by_a_subagent_only_when_every_signal_was() {
 #[test]
 fn the_list_carries_why_github_could_not_be_asked() {
     let mut facts = facts("/w/app");
-    let watched = watched(&[(Reference::PullRequest(key("me", 2)), Relation::Mentioned, false)]);
+    let watched = watched(&[(
+        Reference::PullRequest(key("me", 2)),
+        Relation::Mentioned,
+        false,
+    )]);
     let list = assemble(
         &watched,
         Some(&facts),
@@ -301,7 +365,13 @@ fn the_list_carries_why_github_could_not_be_asked() {
     assert_eq!(list.forge_error.as_deref(), Some("gh: rate limited"));
     // The board's own poll failing says more about the project than a lookup.
     facts.project.as_mut().unwrap().forge_error = Some("gh is not signed in".into());
-    let list = assemble(&watched, Some(&facts), &BTreeMap::new(), &BTreeMap::new(), None);
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
     assert_eq!(list.forge_error.as_deref(), Some("gh is not signed in"));
     // What the board listed is still shown.
     assert!(list.pull_requests[0].pull_request.is_some());
@@ -309,15 +379,30 @@ fn the_list_carries_why_github_could_not_be_asked() {
 
 #[test]
 fn many_mentions_drop_the_oldest_mention_before_any_work() {
-    let mut signals = vec![(Reference::PullRequest(key("me", 1)), Relation::Pushed, false)];
-    signals.extend(
-        (100..100 + REFERENCES as u64 + 5)
-            .map(|number| (Reference::PullRequest(key("me", number)), Relation::Mentioned, false)),
-    );
+    let mut signals = vec![(
+        Reference::PullRequest(key("me", 1)),
+        Relation::Pushed,
+        false,
+    )];
+    signals.extend((100..100 + REFERENCES as u64 + 5).map(|number| {
+        (
+            Reference::PullRequest(key("me", number)),
+            Relation::Mentioned,
+            false,
+        )
+    }));
     let watched = watched(&signals);
     assert_eq!(watched.references.len(), REFERENCES);
-    assert!(watched.references.contains_key(&Reference::PullRequest(key("me", 1))));
-    assert!(!watched.references.contains_key(&Reference::PullRequest(key("me", 100))));
+    assert!(
+        watched
+            .references
+            .contains_key(&Reference::PullRequest(key("me", 1)))
+    );
+    assert!(
+        !watched
+            .references
+            .contains_key(&Reference::PullRequest(key("me", 100)))
+    );
 }
 
 #[test]
@@ -401,7 +486,10 @@ fn a_transcript_is_read_as_it_grows_one_whole_line_at_a_time() {
     let mut watched = Watched::new();
     watched.source = located(&file.0);
     read(&mut watched);
-    assert!(matches!(watched.coverage, TranscriptCoverage::Unavailable { .. }));
+    assert!(matches!(
+        watched.coverage,
+        TranscriptCoverage::Unavailable { .. }
+    ));
 
     file.append(&mention(1));
     let second = mention(2);

@@ -1,9 +1,9 @@
 use super::*;
-use crate::github_identity::PullRequestKey;
 use crate::github::{
     PullRequest, PullRequestComment, PullRequestConversation, PullRequestInspection,
     PullRequestReviewThread,
 };
+use crate::github_identity::PullRequestKey;
 use cosmic::widget::markdown;
 
 mod conversation;
@@ -1230,7 +1230,10 @@ impl Cagents {
                 return self.sync_pull_request_inspector();
             }
             Action::Conversation(watch) => {
-                drop(self.pull_request_inspector.update(Action::Conversation(watch)));
+                drop(
+                    self.pull_request_inspector
+                        .update(Action::Conversation(watch)),
+                );
                 // A pull request the conversation no longer lists is no
                 // longer one to show for it.
                 let inspector = &mut self.pull_request_inspector;
@@ -1372,7 +1375,9 @@ impl Cagents {
             .find(|project| project.id == source.key.project_id)?
             .worktrees
             .iter()
-            .find(|row| row.path == source.key.canonical_path && row.branch.as_deref() == Some(branch))?
+            .find(|row| {
+                row.path == source.key.canonical_path && row.branch.as_deref() == Some(branch)
+            })?
             .pull_request()?
             .number;
         PullRequestKey::new(repository.clone(), number).ok()
@@ -1539,17 +1544,21 @@ impl Cagents {
                 .is_some_and(|source| {
                     state.source_key.as_ref() == Some(&source.key)
                         && source.data_state == SidebarDataState::Ready
-                        && state.source_target.as_ref().and_then(Target::branch).is_some_and(|target| {
-                            target.worktree == source.key.canonical_path
-                                && source.branch.as_ref().map(|branch| branch.as_str())
-                                    == Some(target.branch.as_str())
-                                && source.head_oid.as_deref() == target.head_oid.as_deref()
-                                && self
-                                    .github_availability
-                                    .get(&source.key.project_id)
-                                    .and_then(GitHubAvailability::repository_key)
-                                    == Some(&target.repository)
-                        })
+                        && state
+                            .source_target
+                            .as_ref()
+                            .and_then(Target::branch)
+                            .is_some_and(|target| {
+                                target.worktree == source.key.canonical_path
+                                    && source.branch.as_ref().map(|branch| branch.as_str())
+                                        == Some(target.branch.as_str())
+                                    && source.head_oid.as_deref() == target.head_oid.as_deref()
+                                    && self
+                                        .github_availability
+                                        .get(&source.key.project_id)
+                                        .and_then(GitHubAvailability::repository_key)
+                                        == Some(&target.repository)
+                            })
                 })
     }
 
@@ -1569,7 +1578,9 @@ impl Cagents {
                 .pull_request_inspector
                 .target
                 .as_ref()
-                .is_none_or(|target| !crate::github::polling::ready(&target.repository().host, false))
+                .is_none_or(|target| {
+                    !crate::github::polling::ready(&target.repository().host, false)
+                })
         {
             return Task::none();
         }
@@ -1611,10 +1622,9 @@ impl Cagents {
         let content: Element<'_, Action> = match list {
             Some(list) => widget::column::with_children(vec![
                 widget::container(
-                    widget::scrollable(
-                        widget::container(list)
-                            .padding(design::with_vertical_rail(Padding::from([space::S, space::S]))),
-                    )
+                    widget::scrollable(widget::container(list).padding(
+                        design::with_vertical_rail(Padding::from([space::S, space::S])),
+                    ))
                     .direction(iced::widget::scrollable::Direction::Vertical(
                         design::scrollbar(),
                     ))
@@ -1851,8 +1861,12 @@ mod tests {
         ));
         assert!(!app.pull_request_inspector.loading);
         // A later full snapshot catching up to the ref-only result starts no duplicate work.
-        app.sidebar_model.source_control.as_mut().unwrap().head_oid =
-            observed.branch().unwrap().head_oid.clone().map(String::into_boxed_str);
+        app.sidebar_model.source_control.as_mut().unwrap().head_oid = observed
+            .branch()
+            .unwrap()
+            .head_oid
+            .clone()
+            .map(String::into_boxed_str);
         drop(app.sync_pull_request_inspector());
         assert_eq!(app.pull_request_inspector.generation, generation);
         assert_eq!(app.pull_request_inspector.target.as_ref(), Some(&observed));
@@ -2342,12 +2356,7 @@ mod tests {
         (app, conversation, terminal_id)
     }
 
-    fn listed(
-        conversation: TerminalId,
-        revision: u64,
-        numbers: &[u64],
-        first: bool,
-    ) -> Action {
+    fn listed(conversation: TerminalId, revision: u64, numbers: &[u64], first: bool) -> Action {
         let repository = GitHubRepoKey::new("chosen-inspector.invalid", None, "o", "r").unwrap();
         Action::Conversation(conversation::Watch::Listed {
             conversation,

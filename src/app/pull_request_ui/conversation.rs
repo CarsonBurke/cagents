@@ -3,7 +3,9 @@
 //! request detail; choosing one shows it there.
 
 use super::*;
-use crate::work::{ConversationPullRequest, ConversationPullRequests, Relation, TranscriptCoverage};
+use crate::work::{
+    ConversationPullRequest, ConversationPullRequests, Relation, TranscriptCoverage,
+};
 use cosmic::iced::futures::SinkExt;
 
 /// Mentions listed before the rest are folded behind "Show N more".
@@ -86,7 +88,9 @@ impl State {
     }
 
     pub(super) fn lists(&self, key: &PullRequestKey) -> bool {
-        self.rows().iter().any(|row| row_key(row).as_ref() == Some(key))
+        self.rows()
+            .iter()
+            .any(|row| row_key(row).as_ref() == Some(key))
     }
 }
 
@@ -164,8 +168,8 @@ fn watch(
     hangup: &Mutex<Option<crate::control::Hangup>>,
 ) -> Result<(), crate::control::ControlError> {
     // Never start a daemon merely to watch it.
-    let socket =
-        crate::terminal::ipc::daemon_socket_path().map_err(crate::control::ControlError::Connect)?;
+    let socket = crate::terminal::ipc::daemon_socket_path()
+        .map_err(crate::control::ControlError::Connect)?;
     let mut client = crate::control::ControlClient::connect(&socket)?;
     *hangup.lock().unwrap_or_else(|p| p.into_inner()) = Some(client.hangup()?);
     if sender.is_closed() {
@@ -284,7 +288,10 @@ pub(super) fn view<'a>(
 }
 
 fn worked_on_empty(list: &ConversationPullRequests) -> bool {
-    !list.pull_requests.iter().any(|row| row.relation.worked_on())
+    !list
+        .pull_requests
+        .iter()
+        .any(|row| row.relation.worked_on())
 }
 
 /// Why the list may be incomplete or out of date, when it may be.
@@ -516,7 +523,12 @@ mod tests {
         }
     }
 
-    fn listed(conversation: TerminalId, revision: u64, rows: Vec<ConversationPullRequest>, first: bool) -> Watch {
+    fn listed(
+        conversation: TerminalId,
+        revision: u64,
+        rows: Vec<ConversationPullRequest>,
+        first: bool,
+    ) -> Watch {
         Watch::Listed {
             conversation,
             revision,
@@ -539,13 +551,23 @@ mod tests {
         assert!(state.retarget(Some((card, conversation))));
         // Another card focused in the workspace keeps the conversation.
         assert!(!state.retarget(Some((card, conversation))));
-        state.update(listed(conversation, 2, vec![row(1, Relation::Created)], true));
+        state.update(listed(
+            conversation,
+            2,
+            vec![row(1, Relation::Created)],
+            true,
+        ));
         assert_eq!(state.rows().len(), 1);
         // An older revision on the same connection is not newer.
         state.update(listed(conversation, 1, Vec::new(), false));
         assert_eq!(state.rows().len(), 1);
         // A reconnection starts its revisions again.
-        state.update(listed(conversation, 1, vec![row(1, Relation::Created), row(2, Relation::Mentioned)], true));
+        state.update(listed(
+            conversation,
+            1,
+            vec![row(1, Relation::Created), row(2, Relation::Mentioned)],
+            true,
+        ));
         assert_eq!(state.rows().len(), 2);
         assert!(state.lists(&PullRequestKey::new(repo("me"), 2).unwrap()));
         // Another conversation's list is not this one's.

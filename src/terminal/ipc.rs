@@ -557,7 +557,9 @@ pub enum ClientRequest {
     /// worked on or mentioned and returns them, as
     /// [`crate::work::Response::WatchingConversation`]. Each later change
     /// arrives as [`ServerMessage::ConversationPullRequests`].
-    WatchConversationPullRequests { conversation: TerminalId },
+    WatchConversationPullRequests {
+        conversation: TerminalId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

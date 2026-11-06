@@ -3,8 +3,8 @@
 use super::*;
 use crate::work::{
     ActivitySource, Board, CheckOutcome, Column, ConversationPullRequests, Forge, Item, Keep,
-    PullRequestState, Removal,
-    RemovalPlan, Removed, Request, Response, Review, SavedSnapshot, Scope,
+    PullRequestState, Removal, RemovalPlan, Removed, Request, Response, Review, SavedSnapshot,
+    Scope,
 };
 
 /// How long a board may wait on its first scan or a fresh rescan, on top of

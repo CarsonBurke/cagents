@@ -82,7 +82,11 @@ fn forced_and_fast_forward_updates_count_but_rejections_and_deletions_do_not() {
         ! [rejected]        stale -> stale (non-fast-forward)\n \
         - [deleted]         gone\n \
         * [new tag]         v1 -> v1\n";
-    let signals = command("git push origin fast forced stale :gone v1", output, Some(false));
+    let signals = command(
+        "git push origin fast forced stale :gone v1",
+        output,
+        Some(false),
+    );
     assert_eq!(
         of(&signals),
         vec![
@@ -119,7 +123,14 @@ fn a_quiet_push_falls_back_to_its_arguments_only_when_it_worked() {
     );
     assert!(command("git push -q origin feat", "", Some(false)).is_empty());
     assert!(command("git push -q origin feat", "", None).is_empty());
-    assert!(command("git push origin feat", "Everything up-to-date\n", Some(true)).is_empty());
+    assert!(
+        command(
+            "git push origin feat",
+            "Everything up-to-date\n",
+            Some(true)
+        )
+        .is_empty()
+    );
     assert!(command("git push --delete origin feat", "", Some(true)).is_empty());
 }
 
@@ -143,7 +154,11 @@ fn gh_pr_subcommands_rank_by_what_they_do() {
     }
     // A failed action named the pull request but did no work on it.
     assert_eq!(
-        of(&command("gh pr merge 12", "X Pull request is not mergeable", Some(false))),
+        of(&command(
+            "gh pr merge 12",
+            "X Pull request is not mergeable",
+            Some(false)
+        )),
         vec![(Reference::Number(12), Relation::Mentioned)]
     );
     // Listing pull requests names none in particular.
@@ -157,7 +172,11 @@ fn gh_selectors_resolve_repository_urls_and_branches() {
         vec![(key("up", "r", 7), Relation::Mentioned)]
     );
     assert_eq!(
-        of(&command("gh --repo=ghe.example.com/up/r pr merge 7", "", Some(true))),
+        of(&command(
+            "gh --repo=ghe.example.com/up/r pr merge 7",
+            "",
+            Some(true)
+        )),
         vec![(
             Reference::PullRequest(PullRequestKeyOrd {
                 repository: RepoKeyOrd {
@@ -172,7 +191,11 @@ fn gh_selectors_resolve_repository_urls_and_branches() {
         )]
     );
     assert_eq!(
-        of(&command("gh pr checkout https://github.com/up/r/pull/8/files", "", Some(true))),
+        of(&command(
+            "gh pr checkout https://github.com/up/r/pull/8/files",
+            "",
+            Some(true)
+        )),
         vec![(key("up", "r", 8), Relation::CheckedOut)]
     );
     assert_eq!(
@@ -180,7 +203,11 @@ fn gh_selectors_resolve_repository_urls_and_branches() {
         vec![(branch(None, "fix-it"), Relation::CheckedOut)]
     );
     assert_eq!(
-        of(&command("cd ../wt && gh pr merge --auto --squash", "", Some(true))),
+        of(&command(
+            "cd ../wt && gh pr merge --auto --squash",
+            "",
+            Some(true)
+        )),
         vec![(
             Reference::CurrentBranch {
                 directory: Some("../wt".into())
@@ -197,7 +224,11 @@ fn checkouts_name_branches_but_not_paths_commits_or_the_previous_branch() {
         vec![(branch(None, "feat"), Relation::CheckedOut)]
     );
     assert_eq!(
-        of(&command("git switch -c new-thing origin/main", "", Some(true))),
+        of(&command(
+            "git switch -c new-thing origin/main",
+            "",
+            Some(true)
+        )),
         vec![(branch(None, "new-thing"), Relation::CheckedOut)]
     );
     assert_eq!(
@@ -205,11 +236,19 @@ fn checkouts_name_branches_but_not_paths_commits_or_the_previous_branch() {
         vec![(branch(None, "feat"), Relation::CheckedOut)]
     );
     assert_eq!(
-        of(&command("git worktree add .worktrees/x feat/x", "", Some(true))),
+        of(&command(
+            "git worktree add .worktrees/x feat/x",
+            "",
+            Some(true)
+        )),
         vec![(branch(None, "feat/x"), Relation::CheckedOut)]
     );
     assert_eq!(
-        of(&command("git worktree add -b feat/y .worktrees/y origin/main", "", Some(true))),
+        of(&command(
+            "git worktree add -b feat/y .worktrees/y origin/main",
+            "",
+            Some(true)
+        )),
         vec![(branch(None, "feat/y"), Relation::CheckedOut)]
     );
     assert!(command("git checkout -- src/app.rs", "", Some(true)).is_empty());
@@ -282,7 +321,14 @@ fn forge_tools_create_update_and_name_pull_requests() {
         // conversation pointed at.
         vec![(key("o", "r", 13), Relation::Mentioned)]
     );
-    assert!(tool("Read", r#"{"file_path":"/x"}"#, "#12 https://github.com/o/r/pull/1").is_empty());
+    assert!(
+        tool(
+            "Read",
+            r#"{"file_path":"/x"}"#,
+            "#12 https://github.com/o/r/pull/1"
+        )
+        .is_empty()
+    );
 }
 
 #[test]
