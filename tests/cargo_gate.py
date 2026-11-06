@@ -557,8 +557,9 @@ class HeldCommand(unittest.TestCase):
         self.addCleanup(self.cleanup_processes)
 
     def cleanup_processes(self):
-        # Every pidfd comes from this fixture's private ready receipt. Release
-        # graceful handlers first, then kill only the original owned handles.
+        # Every pidfd comes from a private ready receipt or a verified child
+        # of this fixture's live gate. Release graceful handlers first, then
+        # kill only the original owned handles.
         (self.root / "release").touch()
         for _pid, pidfd in self.descendants:
             if not select.select([pidfd], [], [], 0)[0]:
@@ -705,11 +706,15 @@ while True:
 
     def test_stdin_and_caller_descriptor_reach_the_command(self):
         with (self.root / "caller-output").open("w") as output:
-            result = self.run_gate(
-                "exec", sys.executable, "-c",
-                "import os,sys; os.write(int(sys.argv[1]), sys.stdin.buffer.read())",
-                str(output.fileno()), pass_fds=(output.fileno(),), input="caller data\n",
-            )
+            descriptor = fcntl.fcntl(output.fileno(), fcntl.F_DUPFD_CLOEXEC, 20)
+            try:
+                result = self.run_gate(
+                    "exec", sys.executable, "-c",
+                    "import os,sys; os.write(int(sys.argv[1]), sys.stdin.buffer.read())",
+                    str(descriptor), pass_fds=(descriptor,), input="caller data\n",
+                )
+            finally:
+                os.close(descriptor)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "caller-output").read_text(), "caller data\n")
 
@@ -953,6 +958,111 @@ exec sleep 60
         time.sleep(1)
         self.assertIsNone(child.poll(), "only a running flock's slot counts")
 
+    def wait_for_gate_request(self, gate):
+        """Pin this private gate's waiting tree until its lock waiter blocks."""
+        pinned = {pid for pid, _pidfd in self.descendants}
+
+        def requesting():
+            parents = [gate.pid]
+            found = False
+            for parent in parents:
+                try:
+                    children = Path(f"/proc/{parent}/task/{parent}/children").read_text().split()
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                for value in children:
+                    pid = int(value)
+                    try:
+                        pidfd = os.pidfd_open(pid)
+                    except ProcessLookupError:
+                        continue
+                    try:
+                        # Bind the handle to this still-live owned parent before
+                        # registering it for cleanup; a recycled unrelated PID
+                        # must never become a fixture descendant.
+                        stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+                        if int(stat[1]) != parent:
+                            continue
+                        if pid not in pinned:
+                            self.descendants.append((pid, pidfd))
+                            pinned.add(pid)
+                            pidfd = None
+                        parents.append(pid)
+                        arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                        found |= b"--wait-lock" in arguments and "lock" in Path(f"/proc/{pid}/wchan").read_text()
+                    except (FileNotFoundError, ProcessLookupError):
+                        pass
+                    finally:
+                        if pidfd is not None:
+                            os.close(pidfd)
+            return found
+
+        self.wait_for(requesting, "the gate's owned lock request")
+
+    def assert_killed_waiter_releases_callers(self, *, behind_head):
+        self.hold_slot_elsewhere()
+        slot_holder = self.children[-1]
+        head = None
+        if behind_head:
+            head = subprocess.Popen(
+                [str(self.gate), "exec", "true"], env=self.env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+            self.children.append(head)
+            self.addCleanup(self.end_group, head.pid)
+            self.wait_for(lambda: self.is_locked(f"{self.lock}.queue"), "the live queue head")
+            self.wait_for_gate_request(head)
+
+        unrelated = self.root / "unrelated.lock"
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader)
+        descriptor = fcntl.fcntl(writer, fcntl.F_DUPFD_CLOEXEC, 20)
+        os.close(writer)
+        try:
+            with unrelated.open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                inherited_lock = fcntl.fcntl(lock.fileno(), fcntl.F_DUPFD_CLOEXEC, 20)
+                try:
+                    gate = subprocess.Popen(
+                        [str(self.gate), "exec", "true"], env=self.env,
+                        pass_fds=(descriptor, inherited_lock),
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+                    )
+                finally:
+                    os.close(inherited_lock)
+        finally:
+            os.close(descriptor)
+        self.children.append(gate)
+        self.addCleanup(self.end_group, gate.pid)
+        self.wait_for_gate_request(gate)
+        self.assertTrue(self.is_locked(unrelated), "the gate inherited the caller's lock")
+        self.assertFalse(select.select([reader], [], [], 0)[0], "the gate inherited the extra pipe")
+        gate.kill()
+        deadline = time.monotonic() + 1
+        gate.wait(timeout=1)
+        pending = {gate.stdout.fileno(): "stdout", gate.stderr.fileno(): "stderr", reader: "extra pipe"}
+        while pending or self.is_locked(unrelated):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            for stream in select.select(list(pending), [], [], min(remaining, 0.01))[0]:
+                if not os.read(stream, 4096):
+                    pending.pop(stream)
+        self.assertIsNone(slot_holder.poll(), "the original slot holder must stay alive")
+        self.assertFalse(self.slot_is_free(), "the original slot must stay occupied")
+        if head is not None:
+            self.assertIsNone(head.poll(), "the live queue head must stay alive")
+            self.assertTrue(self.is_locked(f"{self.lock}.queue"), "the live head keeps its queue")
+        retained = dict(streams=list(pending.values()), unrelated_lock_held=self.is_locked(unrelated))
+        self.assertEqual(retained, dict(streams=[], unrelated_lock_held=False),
+                         "killed waiter retained caller resources beyond one second")
+
+    def test_killed_queue_head_releases_extra_descriptors_without_releasing_holder(self):
+        self.assert_killed_waiter_releases_callers(behind_head=False)
+
+    def test_killed_waiter_behind_live_head_releases_all_caller_descriptors(self):
+        self.assert_killed_waiter_releases_callers(behind_head=True)
+
     def test_a_killed_gate_leaves_nobody_holding_the_queue(self):
         self.hold_slot_elsewhere()
         gate = subprocess.Popen(
@@ -963,18 +1073,10 @@ exec sleep 60
         self.addCleanup(self.end_group, gate.pid)
         queue = Path(f"{self.lock}.queue")
         self.wait_for(lambda: self.is_locked(queue), "the gate at the head of the queue")
-        children = Path(f"/proc/{gate.pid}/task/{gate.pid}/children")
-        def requesting():
-            return any(
-                Path(f"/proc/{pid}/comm").read_text().strip() == "flock"
-                for pid in children.read_text().split()
-                if Path(f"/proc/{pid}/comm").exists()
-            )
-        self.wait_for(requesting, "the gate's request for the slot")
+        self.wait_for_gate_request(gate)
         gate.kill()
         gate.wait(timeout=5)
         self.wait_for(lambda: not self.is_locked(queue), "the queue to free")
-        # Its request is still waiting for the slot, without the caller's streams.
         # Read to EOF without blocking: anything the gate wrote first also reads ready.
         for stream in (gate.stdout, gate.stderr):
             deadline = time.monotonic() + 5
@@ -1105,7 +1207,7 @@ class PreflightCancellation(unittest.TestCase):
         cls.libc.prctl(36, cls.previous_subreaper, 0, 0, 0)
 
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="gate-preflight-", dir="/tmp")
+        temporary = tempfile.TemporaryDirectory(prefix="gate-preflight-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         for name in ("cargo-gate", "cargo-gate-command.py"):
@@ -1463,7 +1565,6 @@ class MemoryAdmission(TwoSlots):
 
 
 ADMISSION_FLOCK = r'''#!/usr/bin/python3
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -1471,15 +1572,6 @@ import sys
 import time
 root = Path(os.environ["FIXTURE_ROOT"])
 arguments = sys.argv[1:]
-if arguments in (["6"], ["8"]):
-    info = os.fstat(int(arguments[0]))
-    for kind, name in (("queue", "slot.lock.queue"), ("base", "slot.lock")):
-        path = root / name
-        if path.exists() and (info.st_dev, info.st_ino) == (path.stat().st_dev, path.stat().st_ino):
-            suffix = os.environ.get("FIXTURE_ORDER_ID", "")
-            receipt = root / (kind + ("-" + suffix if suffix else "") + ".waiting")
-            receipt.with_suffix(".tmp").write_text(json.dumps({"pid":os.getpid()}))
-            receipt.with_suffix(".tmp").replace(receipt)
 if arguments == ["-n", "6"] and os.environ.get("FIXTURE_GRANT_DELAY"):
     info = os.fstat(6)
     base = root / "slot.lock"
@@ -1535,12 +1627,51 @@ class AdmissionTimeout(unittest.TestCase):
                 path.unlink()
         self.fixture.configure(fast_cancel=True, **config)
 
-    def pin(self, receipt):
-        self.fixture.wait_for(receipt.exists, receipt.name)
-        pid = json.loads(receipt.read_text())["pid"]
-        pidfd = os.pidfd_open(pid)
-        self.fixture.descendants.append((pid, pidfd))
-        return pid, pidfd
+    def pin(self, receipt, *, process=None):
+        if process is None:
+            self.fixture.wait_for(receipt.exists, receipt.name)
+            pid = json.loads(receipt.read_text())["pid"]
+            pidfd = os.pidfd_open(pid)
+            self.fixture.descendants.append((pid, pidfd))
+            return pid, pidfd
+        # Observe the actual helper blocked on the exact private lock. No
+        # receipt from a PATH-interposed flock establishes helper readiness.
+        lock = self.fixture.root / ("slot.lock.queue" if receipt.name.startswith("queue") else "slot.lock")
+        owned = None
+
+        def waiting():
+            nonlocal owned
+            children = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text().split()
+            for value in children:
+                pid = int(value)
+                try:
+                    pidfd = os.pidfd_open(pid)
+                except ProcessLookupError:
+                    continue
+                try:
+                    stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+                    arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                    if int(stat[1]) != process.pid or b"--wait-lock" not in arguments:
+                        continue
+                    index = arguments.index(b"--wait-lock")
+                    descriptor = int(arguments[index + 2])
+                    observed = Path(f"/proc/{pid}/fd/{descriptor}").stat()
+                    expected = lock.stat()
+                    if ((observed.st_dev, observed.st_ino) == (expected.st_dev, expected.st_ino)
+                            and "lock" in Path(f"/proc/{pid}/wchan").read_text()):
+                        owned = pid, pidfd
+                        self.fixture.descendants.append(owned)
+                        pidfd = None
+                        return True
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
+                finally:
+                    if pidfd is not None:
+                        os.close(pidfd)
+            return False
+
+        self.fixture.wait_for(waiting, "native lock waiter for " + receipt.name)
+        return owned
 
     def retire(self, owned):
         pid, pidfd = owned
@@ -1617,12 +1748,13 @@ class AdmissionTimeout(unittest.TestCase):
                 with path.open("a") as holder:
                     fcntl.flock(holder, fcntl.LOCK_EX)
                     process = self.fixture.start(environment=environment)
-                    owned = self.pin(root / ("queue.waiting" if kind == "queue" else "base.waiting"))
+                    owned = self.pin(root / ("queue.waiting" if kind == "queue" else "base.waiting"), process=process)
                     completed, _stdout, stderr = self.finish_blocked(process, holder)
                     caller_reaped = self.retire(owned)
                     self.assertTrue(completed, "gate required its outside holder to release")
                     self.assertEqual(process.returncode, 124, stderr)
                     self.assertIn("admission", stderr.lower())
+                    self.assertEqual(stderr.count("build admission timed out"), 1, stderr)
                     self.assertFalse(caller_reaped)
                     if kind != "queue":
                         self.assertEqual(cost.read_text(), expected_cost)
@@ -1641,7 +1773,7 @@ class AdmissionTimeout(unittest.TestCase):
                 with (self.fixture.root / "slot.lock.queue").open("a") as holder:
                     fcntl.flock(holder, fcntl.LOCK_EX)
                     process = self.fixture.start(environment=self.fixture.env | {self.setting:"5"})
-                    owned = self.pin(self.fixture.root / "queue.waiting")
+                    owned = self.pin(self.fixture.root / "queue.waiting", process=process)
                     process.send_signal(number)
                     completed, _stdout, stderr = self.finish_blocked(process, holder, seconds=1)
                     caller_reaped = self.retire(owned)
@@ -1661,10 +1793,7 @@ class AdmissionTimeout(unittest.TestCase):
                 process = self.fixture.start(environment=self.fixture.env | {
                     self.setting:"5", "FIXTURE_ORDER_ID":identifier})
                 processes.append(process)
-                pid, _pidfd = self.pin(root / ("queue-" + identifier + ".waiting"))
-                # Recorder readiness precedes exec. Confirm the first real
-                # flock is kernel-blocked before submitting the next one.
-                self.fixture.wait_for(lambda: "lock" in Path(f"/proc/{pid}/wchan").read_text(), "kernel FIFO waiter")
+                self.pin(root / ("queue-" + identifier + ".waiting"), process=process)
             fcntl.flock(holder, fcntl.LOCK_UN)
             for process in processes:
                 _stdout, stderr = process.communicate("", timeout=5)
@@ -1716,7 +1845,7 @@ class AdmissionTimeout(unittest.TestCase):
         with (self.fixture.root / "slot.lock.queue").open("a") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX)
             process = self.fixture.start(environment=environment)
-            self.pin(self.fixture.root / "queue.waiting")
+            self.pin(self.fixture.root / "queue.waiting", process=process)
             time.sleep(0.35)
             self.assertIsNone(process.poll())
             self.assertNotIn("compiler", [event["phase"] for event in self.fixture.calls()])

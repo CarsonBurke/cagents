@@ -893,6 +893,59 @@ class StandInHost(unittest.TestCase):
                                ">/dev/null && printf ok", env=self.remote_env(), timeout=60)
         self.assertEqual((result.returncode, result.stdout), (0, "ok"), result.stderr)
 
+    def shell_program(self):
+        # Exercise Offload.launch with a real Cargo-built program, which runs
+        # the commands after the remote lease and its children have ended.
+        (self.crate / "src/main.rs").write_text(textwrap.dedent("""
+            fn main() {
+                let status = std::process::Command::new("sh")
+                    .args(std::env::args().skip(1)).status().unwrap();
+                std::process::exit(status.code().unwrap_or(127));
+            }
+        """))
+
+    def test_a_program_run_inside_exec_reenters_the_gate_for_named_cargo(self):
+        self.shell_program()
+        result = self.gate_run(
+            "exec", "cargo", "run", "--quiet", "--", "-ec",
+            "cargo build --bin probe; cargo metadata --format-version 1 >/dev/null",
+            env=self.remote_env() | {"CAGENTS_BUILD_REMOTE_SLOTS": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "local-build").exists())
+
+    def logging_rustc_wrapper(self):
+        wrapper = self.root / "rustc-wrapper"
+        wrapper.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >>"$WRAPPER_LOG"\nexec "$@"\n')
+        wrapper.chmod(0o755)
+        return {"RUSTC_WRAPPER": str(wrapper), "PROBE_WRAPPER": str(wrapper),
+                "WRAPPER_LOG": str(self.root / "wrapper-log")}
+
+    def test_a_program_run_inside_exec_cannot_compile_through_absolute_cargo(self):
+        self.shell_program()
+        result = self.gate_run(
+            "exec", "cargo", "run", "--quiet", "--", "-ec",
+            '"$RUSTC_WRAPPER" rustc -vV >/dev/null; "$CARGO" build --bin probe',
+            env=self.remote_env() | self.logging_rustc_wrapper())
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("would compile on this host", result.stderr)
+        self.assertEqual([path for path in (self.root / "local-build").rglob("probe*")
+                          if path.is_file()], [])
+        # The guard still hands queries to the caller's saved wrapper.
+        queries = (self.root / "wrapper-log").read_text()
+        self.assertIn("-vV", queries)
+        self.assertNotIn("--crate-name probe ", queries)
+
+    def test_a_program_run_outside_exec_keeps_the_callers_environment(self):
+        self.shell_program()
+        result = self.gate_run(
+            "run", "--quiet", "--", "-ec",
+            'test "$RUSTC_WRAPPER" = "$PROBE_WRAPPER"; '
+            'test -z "${CAGENTS_BUILD_EXEC_SHIMS-}"; '
+            '"$RUSTC_WRAPPER" rustc -vV >/dev/null',
+            env=self.remote_env() | self.logging_rustc_wrapper())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-vV", (self.root / "wrapper-log").read_text())
+
     def test_documentation_opens_here(self):
         (self.crate / "src/lib.rs").write_text("//! Probe documentation.\n")
         opened = self.root / "opened"

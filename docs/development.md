@@ -394,6 +394,11 @@ own. Building here, it holds one slot until the command exits, and gated
 commands inside it run in that slot; gating each Cargo command instead keeps
 test runs out of the slot.
 
+Queue and slot lock requests die with their gate, including when it is killed
+without a chance to handle a signal. Waiters retain only their lock descriptor
+and standard streams; inherited pipes and locks remain with the gate for the
+admitted command.
+
 Cancelling a held command keeps its slot until the command and its descendants
 have exited. The Linux Python 3 supervisor sends TERM, allows the command one
 shared two-second grace period, then kills and reaps remaining descendants,
@@ -434,6 +439,9 @@ admission budget. A Cargo reached any other way inside COMMAND, by path,
 through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
 also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
 compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+Programs launched by `cargo run` inside that `exec` inherit the same Cargo
+shim and guard. Their named `cargo` reenters the gate after the program's
+build releases its slot; their absolute `$CARGO` cannot compile here.
 On the build host itself, or with
 `CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
 above. A gate without `scripts/cargo-offload` beside it refuses to build
