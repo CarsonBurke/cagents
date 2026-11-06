@@ -637,7 +637,7 @@ impl Cagents {
                     iced::clipboard::write(text).map(cosmic::Action::App)
                 }
                 Command::Transcript if self.saved_terminal_diagnostics_allowed(card) => {
-                    self.update_terminal_failure(terminal_failure::Action::Reveal(card))
+                    self.reveal_terminal_transcript(card)
                 }
                 Command::Folder => self.update(Message::OpenRepository),
                 Command::NewTerminal => self.update(Message::NewTerminal),
