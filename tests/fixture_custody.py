@@ -40,9 +40,15 @@ def _children():
 
 
 def _stop(processes):
-    """Ends each command's process group: SIGTERM, a short grace, then SIGKILL."""
+    """Ends each running command's process group: SIGTERM, a short grace, then SIGKILL.
+
+    A reaped leader's pid may already belong to another group, so only
+    leaders not yet reaped are signalled; the sweep ends their groups' rest.
+    """
     for number in (signal.SIGTERM, signal.SIGKILL):
         for process in processes:
+            if process.poll() is not None:
+                continue
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(process.pid, number)
         deadline = time.monotonic() + GRACE_SECONDS

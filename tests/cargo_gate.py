@@ -2044,12 +2044,13 @@ class FixtureCustody(unittest.TestCase):
         # The command's group is gone; the child in its own session is not.
         self.assertFalse(select.select([pidfds[1]], [], [], 0)[0])
         settled = fixture_custody.settle
-        survivors = []
+        survivors = None
 
         def settle():
+            nonlocal survivors
             self.assertTrue(root.is_dir())
             settled()
-            survivors.extend(pidfd for pidfd in pidfds if not select.select([pidfd], [], [], 0)[0])
+            survivors = [pidfd for pidfd in pidfds if not select.select([pidfd], [], [], 0)[0]]
 
         with unittest.mock.patch.object(fixture_custody, "settle", settle):
             scope.close()
