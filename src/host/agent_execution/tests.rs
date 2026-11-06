@@ -4574,6 +4574,32 @@ fn unavailable_retained_startup_snapshot_preserves_owner_and_returns_interrupted
 }
 
 #[test]
+fn startup_readiness_retries_an_unanswered_snapshot_within_its_budget() {
+    // One missed helper RPC is not evidence of exit: the readiness wait keeps
+    // asking until its own budget ends, then preserves ownership as before.
+    let (handle, _) = chat::runtime::Handle::fixture_remote_attachment_pair();
+    let start = Instant::now();
+    let result = await_provider_ready_until(&handle, start + Duration::from_millis(300));
+    assert!(start.elapsed() >= Duration::from_millis(300));
+    assert!(
+        matches!(&result, Err((State::Interrupted, reason)) if reason.contains("ownership was preserved")),
+        "{result:?}"
+    );
+    assert!(handle.owns_work());
+
+    // An attachment that already recorded its failure does not wait out the
+    // budget.
+    let failed = chat::runtime::Handle::fixture_failed_remote();
+    let start = Instant::now();
+    let result = await_provider_ready_until(&failed, start + Duration::from_secs(30));
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(
+        matches!(&result, Err((State::Interrupted, _))),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn execution_gates_reclaim_failed_and_repeated_close_churn() {
     if isolated("execution_gates_reclaim_failed_and_repeated_close_churn").is_some() {
         return;

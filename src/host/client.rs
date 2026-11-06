@@ -875,7 +875,7 @@ fn finish_terminal_close(
         ));
     }
     if let Ok(Some(generation)) = &close.generation {
-        // This fsync runs outside the writer. The DELETE fences itself on the
+        // This commit runs outside the writer. The DELETE fences itself on the
         // generation, and the fresh read below refuses any newer publication.
         drop(admission);
         let result = super::agent_execution::registry(host).and_then(|registry| {
@@ -1012,7 +1012,12 @@ pub(super) fn process_request(
             ensure_control_open(host)?;
             super::agent_execution::terminals::admit(host, client_id, &request)?;
         }
-        let reservation = super::account_lifecycle::Reservation::for_operation(host, operation)?;
+        let reservation = match operation {
+            crate::account::remote::Operation::Restore { .. } => {
+                super::account_lifecycle::reserve_restore(host, operation)?
+            }
+            _ => super::account_lifecycle::Reservation::for_operation(host, operation)?,
+        };
         let value = crate::account::remote::execute_reserved(operation.clone(), &reservation)
             .map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
@@ -1277,35 +1282,37 @@ pub(super) fn process_request(
                 ));
             }
             if presence.application == crate::notifications::Application::Cagents {
-                let (registry, claimed) = {
+                let (registry, unclaimed) = {
                     let state = host.lock().unwrap_or_else(|p| p.into_inner());
                     state.ensure_retention_available(&presence.sessions)?;
                     (
                         state.execution_registry.clone(),
-                        state.notification_sessions_claimed(&presence),
+                        state.notification_sessions_unclaimed(&presence),
                     )
                 };
                 // The shared control reader spans selection and publication;
                 // automatic cleanup takes its writer before reserving an ID.
-                // Disconnect is not card closure, so these pins are durable.
+                // Disconnect is not card closure, so these pins outlive it.
                 if let Some(registry) = registry {
                     let internal =
                         |message| ProtocolError::new(ProtocolErrorCode::Internal, message, true);
                     let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
                     // Windows republish on any workspace change. Only a new
-                    // claim, or a pin that a close removed, needs this fsync.
-                    let mut pinned = claimed;
+                    // claim, or a pin that a close removed, needs a write, and
+                    // rotating any other would refuse its close in progress.
+                    let mut claims = unclaimed;
                     for terminal in &presence.sessions {
-                        pinned = pinned
+                        if !claims.contains(terminal)
                             && registry
                                 .retention_pin_generation(*terminal)
                                 .map_err(internal)?
-                                .is_some();
+                                .is_none()
+                        {
+                            claims.push(*terminal);
+                        }
                     }
-                    if !pinned {
-                        registry
-                            .pin_window_terminals(&presence.sessions)
-                            .map_err(internal)?;
+                    if !claims.is_empty() {
+                        registry.pin_window_terminals(&claims).map_err(internal)?;
                     }
                 }
                 // Missing Registry keeps the old UI delivery behavior. The
@@ -3076,7 +3083,7 @@ pub(in crate::host) mod tests {
     }
 
     #[test]
-    fn republishing_an_unchanged_window_commits_only_to_restore_its_claim() {
+    fn republishing_a_window_writes_only_new_or_restored_claims() {
         let (host, _directory, session, _handle) = retention_client_host("republish");
         let id = session.id;
         host.lock().unwrap().register_client(7);
@@ -3096,12 +3103,14 @@ pub(in crate::host) mod tests {
         publish(terminal_presence(id));
         assert_eq!(retention_pin_generation(&host, id), claimed);
 
-        // Dropping another card from the window claims nothing new either.
+        // Adding a card leaves the existing claim, so its close can proceed,
+        // and dropping that card again claims nothing new.
         let other = TerminalId::new();
         let mut both = terminal_presence(id);
         both.sessions.push(other);
         publish(both);
-        let claimed = retention_pin_generation(&host, id);
+        assert_eq!(retention_pin_generation(&host, id), claimed);
+        assert!(retention_pin_generation(&host, other).unwrap().is_some());
         publish(terminal_presence(id));
         assert_eq!(retention_pin_generation(&host, id), claimed);
 

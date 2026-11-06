@@ -1972,6 +1972,60 @@ mod tests {
     }
 
     #[test]
+    fn review_inspector_manual_refresh_preserves_content_during_server_pause() {
+        let mut target = target();
+        target.repository =
+            GitHubRepoKey::new("review-inspector-pause.invalid", None, "o", "r").unwrap();
+        crate::github::polling::failed(
+            &target.repository.host,
+            &crate::github::GitHubError::RateLimited {
+                limit: crate::github::polling::RateLimit {
+                    retry_at: crate::github::polling::now() + 120,
+                },
+            },
+        );
+        let mut state = State::default();
+        state.target = Some(target.clone());
+        state.generation = 9;
+        state.loaded = true;
+        drop(state.update(Action::Refresh));
+        assert!(!state.loading);
+        assert!(state.loaded);
+        assert_eq!(state.generation, 9);
+        assert_eq!(state.target.as_ref(), Some(&target));
+        assert!(
+            state
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("GitHub rate limit reached")
+        );
+    }
+
+    #[test]
+    fn review_inspector_automatic_refresh_honors_backoff_and_manual_refresh_bypasses_it() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let mut target = target();
+        target.repository =
+            GitHubRepoKey::new("review-inspector-backoff.invalid", None, "o", "r").unwrap();
+        crate::github::polling::failed(
+            &target.repository.host,
+            &crate::github::GitHubError::Inspection("offline".into()),
+        );
+        app.context_inspector_open = true;
+        app.context_tab = ContextTab::PullRequest;
+        app.pull_request_inspector = State::default();
+        app.pull_request_inspector.target = Some(target);
+        app.pull_request_inspector.generation = 5;
+        drop(app.maybe_refresh_pull_request());
+        assert!(!app.pull_request_inspector.loading);
+        assert_eq!(app.pull_request_inspector.generation, 5);
+        drop(app.pull_request_inspector.update(Action::Refresh));
+        assert!(app.pull_request_inspector.loading);
+        assert_eq!(app.pull_request_inspector.generation, 6);
+    }
+
+    #[test]
     fn lost_authority_discards_pending_and_loaded_content() {
         let target = target();
         let mut state = State::default();

@@ -145,8 +145,7 @@ enum SourceData {
     Code {
         text: Arc<str>,
         range: std::ops::Range<usize>,
-        spans: Arc<[Span<'static, markdown::Uri>]>,
-        starts: Arc<[usize]>,
+        highlight: Option<prose::Highlight>,
         source: reader_source::Source,
     },
     Styled(Arc<[Span<'static, markdown::Uri>]>),
@@ -197,29 +196,15 @@ impl SourceData {
     fn presentation_changed(&self, previous: &Self) -> bool {
         match (self, previous) {
             (
-                Self::Code { range, spans, .. },
+                Self::Code {
+                    range, highlight, ..
+                },
                 Self::Code {
                     range: old,
-                    spans: old_spans,
+                    highlight: old_highlight,
                     ..
                 },
-            ) => {
-                range.end != old.end
-                    || (!Arc::ptr_eq(spans, old_spans)
-                        && (spans.len() != old_spans.len()
-                            || !spans.iter().zip(old_spans.iter()).all(|(a, b)| {
-                                a == b
-                                    && match (&a.link, &b.link) {
-                                        (None, None) => true,
-                                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                                        _ => false,
-                                    }
-                                    && a.highlight == b.highlight
-                                    && a.padding == b.padding
-                                    && a.underline == b.underline
-                                    && a.strikethrough == b.strikethrough
-                            })))
-            }
+            ) => range.end != old.end || highlight != old_highlight,
             _ => self.len() != previous.len(),
         }
     }
@@ -237,15 +222,13 @@ impl SourceData {
             Self::Code {
                 text,
                 range,
-                spans,
-                starts,
+                highlight,
                 ..
             } => {
                 let plain: Arc<str> = Arc::from(&text[range.clone()]);
-                let spans = if spans.is_empty() {
-                    vec![Span::new(plain.to_string())].into()
-                } else {
-                    prose::sliced_spans(spans, starts, range.clone())
+                let spans = match highlight {
+                    Some(highlight) => highlight.spans(text, range.clone()),
+                    None => vec![Span::new(plain.to_string())].into(),
                 };
                 (spans, plain)
             }
@@ -281,8 +264,7 @@ impl Cache {
         identity: u64,
         text: Arc<str>,
         range: std::ops::Range<usize>,
-        spans: Arc<[Span<'static, markdown::Uri>]>,
-        starts: Arc<[usize]>,
+        highlight: Option<prose::Highlight>,
         source: reader_source::Source,
     ) -> Handle {
         self.source_entry(
@@ -290,8 +272,7 @@ impl Cache {
             SourceData::Code {
                 text,
                 range,
-                spans,
-                starts,
+                highlight,
                 source,
             },
         )
@@ -1389,7 +1370,7 @@ pub(super) fn paint(
         (matches, design::accent_wash(theme)),
         (
             std::slice::from_ref(&selection),
-            design::accent_color(theme),
+            design::selection_wash(theme),
         ),
     ] {
         visit_range_bounds(projection, ranges, |bounds| {
@@ -1751,8 +1732,7 @@ fn code_flow_preserves_full_physical_line_context_without_sync_shaping() {
             42,
             text.clone(),
             0..text.len(),
-            Arc::from([]),
-            vec![0].into(),
+            None,
             reader_source::Source::new(&source),
         );
         flow.borrow_mut()
@@ -1959,7 +1939,7 @@ fn projected_selection_and_find_keep_native_ligature_caret_regions() {
             let color = if find {
                 design::accent_wash(&cosmic::theme::active())
             } else {
-                design::accent_color(&cosmic::theme::active())
+                design::selection_wash(&cosmic::theme::active())
             }
             .into_rgba8();
             for part in 0..count {
@@ -2210,8 +2190,7 @@ fn code_and_styled_flow_sources_share_one_final_retirement_across_request_clones
             SourceData::Code {
                 text: text.clone(),
                 range: 0..text.len(),
-                spans: spans.clone(),
-                starts: Arc::from([0]),
+                highlight: None,
                 source: reader_source::Source::new(&text),
             }
         } else {

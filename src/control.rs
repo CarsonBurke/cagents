@@ -78,6 +78,10 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 // A live close may outlast a slow commit or shared request at the daemon's fence
 // before its own teardown. Timing out earlier would call that wait unresponsive.
 const TERMINAL_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
+// A window's claim may wait out another writer's slow commit to reach the
+// registry. It retries in the background, so that wait is not an unresponsive
+// daemon either.
+const NOTIFICATION_PRESENCE_TIMEOUT: Duration = Duration::from_secs(20);
 // Close is acknowledged only after interruption and process teardown. Allow
 // those grace periods plus time to schedule the worker and deliver its reply.
 const CHAT_CLOSE_TIMEOUT: Duration = crate::chat::INTERRUPT_TIMEOUT
@@ -637,6 +641,9 @@ pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Resu
     }
 }
 
+/// How long a window waits for the device to answer one device operation.
+pub const DEVICE_OPERATION_DEADLINE: Duration = Duration::from_secs(120);
+
 impl ControlClient {
     /// Connect and complete a proof-pinning handshake with no expected proof.
     pub fn connect(socket_path: &Path) -> Result<Self, ControlError> {
@@ -854,7 +861,13 @@ impl ControlClient {
         &mut self,
         presence: crate::notifications::Presence,
     ) -> Result<(), ControlError> {
-        self.accepted(ClientRequest::NotificationPresence { presence })
+        match self.request_with_deadline(
+            ClientRequest::NotificationPresence { presence },
+            Instant::now() + NOTIFICATION_PRESENCE_TIMEOUT,
+        )? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response("request acceptance", &response)),
+        }
     }
 
     pub fn notification_preferences(
@@ -1586,7 +1599,7 @@ impl ControlClient {
     ) -> Result<crate::device_service::Reply, ControlError> {
         match self.request_with_deadline(
             ClientRequest::DeviceOperation { operation },
-            Instant::now() + Duration::from_secs(120),
+            Instant::now() + DEVICE_OPERATION_DEADLINE,
         )? {
             ServerResponse::DeviceOperation { reply } => Ok(reply),
             response => Err(unexpected_response("device operation", &response)),
@@ -6826,6 +6839,49 @@ mod tests {
                 terminal::ipc::TerminalCloseResult::Closed
             );
         }
+    }
+
+    #[test]
+    fn window_claims_outlast_the_ordinary_reply_timeout() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pinned = proof("presence-owner", "boot", "incarnation");
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, pinned.clone(), pinned.clone()),
+            )
+            .unwrap();
+            let claim: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(
+                claim.request,
+                ClientRequest::NotificationPresence { .. }
+            ));
+            thread::sleep(IO_TIMEOUT + Duration::from_millis(500));
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(claim.request_id),
+                    proof: pinned,
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    },
+                },
+            )
+            .unwrap();
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        client
+            .notification_presence(crate::notifications::Presence {
+                window: "window".into(),
+                application: Default::default(),
+                focused_target: None,
+                sessions: Vec::new(),
+                focused: None,
+            })
+            .unwrap();
+        server.join().unwrap();
     }
 
     #[test]

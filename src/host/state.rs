@@ -605,17 +605,22 @@ impl HostState {
         activation
     }
 
-    pub(super) fn notification_sessions_claimed(
+    /// The sessions this publication adds to its window's live claim.
+    pub(super) fn notification_sessions_unclaimed(
         &self,
         presence: &crate::notifications::Presence,
-    ) -> bool {
-        self.notification_watchers.values().any(|current| {
-            current.destination() == presence.destination()
-                && presence
-                    .sessions
-                    .iter()
-                    .all(|session| current.sessions.contains(session))
-        })
+    ) -> Vec<TerminalId> {
+        presence
+            .sessions
+            .iter()
+            .filter(|session| {
+                !self.notification_watchers.values().any(|current| {
+                    current.destination() == presence.destination()
+                        && current.sessions.contains(session)
+                })
+            })
+            .copied()
+            .collect()
     }
 
     pub(super) fn notification_presence(&mut self, presence: crate::notifications::Presence) {
