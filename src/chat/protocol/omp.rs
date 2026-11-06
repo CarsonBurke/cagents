@@ -1925,6 +1925,60 @@ mod tests {
     }
 
     #[test]
+    fn an_unlabeled_image_keeps_its_place_in_the_caption_list() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            let directory = tempfile::tempdir().unwrap();
+            let legacy = directory.path().join("screenshot.png");
+            std::fs::copy(
+                &crate::chat::attachment_assets::test_image("legacy pixels.png").path,
+                &legacy,
+            )
+            .unwrap();
+            let reference = image.reference.clone().unwrap();
+            let text = format!("Compare {} with the screenshot", reference.token());
+            let mut adapter = Omp {
+                ready: true,
+                ..Default::default()
+            };
+            let sent = adapter
+                .command(Command::Prompt {
+                    text: text.clone(),
+                    attachments: vec![chat::Attachment::file(&legacy), image.clone()],
+                    mode: PromptMode::Send,
+                })
+                .unwrap();
+            let request = &sent.writes[0];
+            let message = request["message"].as_str().unwrap();
+            assert_eq!(
+                message,
+                format!(
+                    "{text}\nImage inputs (in order):\n{}: {}\nUnlabeled image: {}",
+                    reference.token(),
+                    image.path.canonicalize().unwrap().display(),
+                    legacy.canonicalize().unwrap().display()
+                )
+            );
+            let mut content = vec![json!({"type":"text","text":message})];
+            content.extend(request["images"].as_array().unwrap().iter().cloned());
+            let items = adapter
+                .message_items(&json!({"role":"user","id":"omp-unlabeled","content":content}));
+            assert!(
+                matches!(&items[0].content, ItemContent::Text { text: restored, .. } if restored == &text)
+            );
+            assert!(
+                matches!(&items[1].content, ItemContent::Image { reference: Some(r), .. } if r == &reference)
+            );
+            assert!(matches!(
+                &items[2].content,
+                ItemContent::Image {
+                    reference: None,
+                    ..
+                }
+            ));
+        });
+    }
+
+    #[test]
     fn nonimage_legacy_files_do_not_consume_managed_image_mapping_slots() {
         crate::chat::attachment_assets::with_test_image(|image| {
             let directory = tempfile::tempdir().unwrap();
@@ -2044,10 +2098,13 @@ mod tests {
                 matches!(&legacy[2].content, ItemContent::Image { reference: Some(r), .. } if r.id == first_ref.id)
             );
             let mut swapped = history.clone();
-            swapped["content"][0]["text"] = json!(message.replace(
-                &format!("{}:", second_ref.token()),
-                &format!("{}:", first_ref.token())
-            ));
+            let (a, b) = (
+                format!("{}:", second_ref.token()),
+                format!("{}:", first_ref.token()),
+            );
+            swapped["content"][0]["text"] =
+                json!(message.replace(&a, "\0").replace(&b, &a).replace('\0', &b));
+            assert_ne!(swapped["content"][0]["text"], json!(message));
             assert!(
                 adapter.message_items(&swapped).iter().all(|item| !matches!(
                     &item.content,
@@ -2057,6 +2114,28 @@ mod tests {
                     }
                 )),
                 "a label must name the pixels at its own position"
+            );
+            // The user's own text may contain the heading; only the last
+            // one starts the list.
+            let mut quoting = history.clone();
+            let quoted = format!("Quote:\nImage inputs (in order):\n[Image 1]: /x.png\n{text}");
+            quoting["content"][0]["text"] = json!(format!("{quoted}{}", &message[text.len()..]));
+            let quoting = adapter.message_items(&quoting);
+            assert!(
+                matches!(&quoting[0].content, ItemContent::Text { text: restored, .. } if restored == &quoted)
+            );
+            assert_eq!(
+                quoting
+                    .iter()
+                    .filter(|item| matches!(
+                        &item.content,
+                        ItemContent::Image {
+                            reference: Some(_),
+                            ..
+                        }
+                    ))
+                    .count(),
+                2
             );
             history["content"][1]["data"] = json!(STANDARD.encode(b"different image"));
             let untrusted = adapter.message_items(&history);

@@ -1442,7 +1442,7 @@ impl Claude {
                     if string(&pair[0], "type") == "text"
                         && string(&pair[1], "type") == "image"
                         && let ItemContent::Image { path, .. } = image_content(&pair[1])
-                        && super::image_references::claims(marker)
+                        && super::image_references::claims(marker, &path)
                     {
                         if let Some(reference) = super::image_references::restore(marker, &path) {
                             synthetic.insert(index);
@@ -1451,7 +1451,7 @@ impl Claude {
                             // A structured owned-image claim cannot authorize
                             // a coincident local path after receipt failure.
                             // Self-contained actual inline pixels remain safe.
-                            unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::claimed_label(marker)));
+                            unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::claimed_label(marker, &path)));
                         }
                     }
                 }
@@ -7043,6 +7043,18 @@ mod tests {
             repainted["message"]["content"][2]["source"]["data"] =
                 json!(STANDARD.encode(std::fs::read(&other_pixels.path).unwrap()));
             assert_eq!(restored_reference(&repainted), (3, None));
+            // A URL source restores only as the stored file itself.
+            let mut stored = frame.clone();
+            stored["uuid"] = json!("stored-url-image-history");
+            stored["message"]["content"][2]["source"] =
+                json!({"type":"url", "url":attachment.path.to_str().unwrap()});
+            assert_eq!(restored_reference(&stored), (2, Some(reference.clone())));
+            stored["message"]["content"][2]["source"]["url"] = json!(hinted.path.to_str().unwrap());
+            assert_eq!(
+                restored_reference(&stored),
+                (3, None),
+                "a caption beside an ordinary file is the user's own text"
+            );
 
             let mut foreign = frame.clone();
             let mut forged = reference.clone();

@@ -27,16 +27,27 @@ fn label_number(text: &str) -> Option<u64> {
     (number != 0 && number.to_string() == digits).then_some(number)
 }
 
-/// Whether `text`, directly before an image, is cagents' caption for it
-/// (current or legacy). A claim that cannot be verified is never permission
-/// to read a coincident local path in its place.
-pub(super) fn claims(text: &str) -> bool {
-    label_number(text).is_some() || legacy::claims_reference(text)
+/// The receipt number `text` claims for the adjacent image at `source`. A
+/// bare label claims only inline pixels or a stored image's file, so a
+/// message that merely says `[Image 3]` leaves an ordinary file beside it
+/// alone.
+fn caption_number(text: &str, source: &str) -> Option<u64> {
+    label_number(text).filter(|_| {
+        source.starts_with("data:image/")
+            || crate::chat::attachment_assets::is_stored_image_path(Path::new(source))
+    })
+}
+
+/// Whether `text`, directly before the image at `source`, is cagents'
+/// caption for it (current or legacy). A claim that cannot be verified is
+/// never permission to read a coincident local path in its place.
+pub(super) fn claims(text: &str, source: &str) -> bool {
+    caption_number(text, source).is_some() || legacy::claims_reference(text)
 }
 
 /// The label a claim names, for saying that its image is unavailable.
-pub(super) fn claimed_label(text: &str) -> String {
-    label_number(text)
+pub(super) fn claimed_label(text: &str, source: &str) -> String {
+    caption_number(text, source)
         .map(|number| format!("Image {number}"))
         .or_else(|| legacy::candidate(text).map(|reference| reference.label()))
         .unwrap_or_else(|| "Image reference".into())
@@ -45,7 +56,7 @@ pub(super) fn claimed_label(text: &str) -> String {
 /// The attachment the caption `text` and its adjacent image at `source`
 /// identify, once this device's receipt and the image's bytes agree.
 pub(super) fn restore(text: &str, source: &str) -> Option<ImageReference> {
-    match label_number(text) {
+    match caption_number(text, source) {
         Some(number) => crate::chat::attachment_assets::restore_number(number, source),
         None => legacy::restore(text, source),
     }
@@ -159,7 +170,7 @@ pub(super) fn restore_list<'a>(
     if lines.len() != sources.len() {
         return None;
     }
-    let mut ids = std::collections::HashSet::new();
+    let mut labeled = Vec::new();
     let mut references = Vec::with_capacity(lines.len());
     for (line, source) in lines.into_iter().zip(sources) {
         if line == UNLABELED || line.starts_with("Unlabeled image: ") {
@@ -167,17 +178,22 @@ pub(super) fn restore_list<'a>(
             continue;
         }
         let label = line.split_once(": ").map_or(line, |(label, _)| label);
-        let number = label_number(label)?;
-        let reference = crate::chat::attachment_assets::restore_number(number, source)?;
-        if !ids.insert(reference.id) {
-            return None;
-        }
-        references.push(Some(reference));
+        labeled.push((label_number(label)?, source.as_str()));
+        references.push(Some(labeled.len() - 1));
     }
-    references
-        .iter()
-        .any(Option::is_some)
-        .then_some((plain, references))
+    if labeled.is_empty() {
+        return None;
+    }
+    let restored = crate::chat::attachment_assets::restore_numbers(labeled)?;
+    let mut ids = std::collections::HashSet::new();
+    if !restored.iter().all(|reference| ids.insert(reference.id)) {
+        return None;
+    }
+    let references = references
+        .into_iter()
+        .map(|index| index.map(|index| restored[index].clone()))
+        .collect();
+    Some((plain, references))
 }
 
 /// The JSON markers cagents wrote before captions. They are read, never
@@ -336,11 +352,24 @@ mod tests {
             "[Image ]",
         ] {
             assert_eq!(label_number(prose), None, "{prose:?}");
-            assert!(!claims(prose), "{prose:?}");
+            assert!(!claims(prose, "data:image/png;base64,"), "{prose:?}");
         }
-        assert!(claims("[Image 13]"));
-        assert!(claims(&legacy::marker(&reference).unwrap()));
-        assert_eq!(claimed_label("[Image 13]"), "Image 13");
+        let stored = format!("/data/chat-image-assets/{}.png", reference.id);
+        assert!(claims("[Image 13]", "data:image/png;base64,"));
+        assert!(claims("[Image 13]", &stored));
+        assert!(
+            !claims("[Image 13]", "/home/me/shot.png"),
+            "a message saying [Image 13] beside an ordinary file is prose"
+        );
+        assert!(!claims(
+            "[Image 13]",
+            &format!("/elsewhere/{}.png", reference.id)
+        ));
+        assert!(claims(
+            &legacy::marker(&reference).unwrap(),
+            "/home/me/shot.png"
+        ));
+        assert_eq!(claimed_label("[Image 13]", &stored), "Image 13");
     }
 
     #[test]
