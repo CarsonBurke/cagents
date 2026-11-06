@@ -144,10 +144,11 @@ Environment:
                          /var/tmp/cagents-*.lock, otherwise none; empty
                          disables
   CAGENTS_BUILD_WAIT_PRIORITY_SECS
-                         Seconds after which the build that has waited
-                         longest on the host starts beside the running
-                         builds whatever their memory, one such build at a
-                         time; default 120; 0 disables
+                         Seconds refused room with a free slot after which
+                         the build refused longest on the host starts beside
+                         the running builds whatever their memory, while no
+                         other build admitted so is ramping up; default 120;
+                         0 disables
   CAGENTS_BUILD_COST_GIB Memory this build is expected to need at its peak;
                          default by kind, from 3 GiB for the CLI lane to
                          9 GiB for a UI build
@@ -279,6 +280,10 @@ case $priority_secs in
     0) ;;
     ''|*[!0-9]*|0*) fail 'CAGENTS_BUILD_WAIT_PRIORITY_SECS must be a whole number of seconds' ;;
 esac
+# How recently a waiting build must have been refused room to keep its place,
+# and how long a build admitted as overdue keeps the next one waiting.
+wait_fresh=10
+overdue_ramp=600
 
 # The memory a build is expected to need at its peak, in KiB: the whole
 # process tree's resident memory, measured on this repository's builds with 8
@@ -497,44 +502,71 @@ start_time() {
     sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -d ' ' -f 20
 }
 
-# Records this build as waiting, from when it asked for a slot, so another
-# family's build that waits longer can tell which of them is the oldest.
-record_wait() {
-    [ -n "$registry" ] && [ -z "$wait_recorded" ] || return 0
-    wait_recorded=yes
+# Records this build as refused room while it holds a free slot, refreshed
+# every couple of seconds while that lasts, so another family's build can tell
+# which of them has been refused longest. A build refused again within
+# `wait_fresh` seconds keeps its place; one waiting for a slot of its own
+# family is not refused room, and its record goes stale. Times are seconds
+# since boot, which the wall clock's steps cannot reorder.
+record_refusal() {
+    [ -n "$registry" ] || return 0
+    now=$(uptime_seconds)
+    if [ -z "$refused_since" ] || [ $((now - refused_last)) -gt "$wait_fresh" ]; then
+        refused_since=$now
+    fi
+    refused_last=$now
+    [ -z "$refused_written" ] || [ $((now - refused_written)) -ge 2 ] || return 0
+    refused_written=$now
     entry=$(wait_entry)
-    { printf '%s %s %s\n' "$$" "$(start_time "$$")" "$waited_since" >"$entry.new" &&
-        mv -f -- "$entry.new" "$entry"; } 2>/dev/null || :
+    if { printf '%s %s %s %s\n' "$$" "$(start_time "$$")" "$refused_since" "$now" >"$entry.new" &&
+        mv -f -- "$entry.new" "$entry"; } 2>/dev/null; then
+        wait_recorded=yes
+    fi
 }
 
 forget_wait() {
-    [ -z "$wait_recorded" ] || rm -f -- "$(wait_entry)"
+    [ -z "$wait_recorded" ] || rm -f -- "$(wait_entry)" 2>/dev/null || :
     wait_recorded=
 }
 
-# Whether this build is overdue: it has waited the priority time, longer than
-# every other build waiting on the host, and no build admitted that way still
-# runs. It then starts whatever the memory, so a large build cannot wait
-# forever behind smaller ones that keep fitting, nor more than one such build
-# fill memory that the others are priced against.
+# Whether the registry record `$1` is of a build admitted as overdue that may
+# still be ramping up at second `$2` since boot: its holder lives, it started
+# less than `overdue_ramp` seconds before, and it holds its lock. After that,
+# what it has yet to take is priced as any running build's is.
+ramping() {
+    [ "$(sed -n 4p "$1" 2>/dev/null)" = overdue ] || return 1
+    holder= claimed= started=
+    { read -r holder claimed; read -r started; } <"$1" 2>/dev/null || return 1
+    case $holder:$started in *[!0-9:]*|:*|*:) return 1 ;; esac
+    [ $(($2 - started)) -lt "$overdue_ramp" ] || return 1
+    [ "$holder" -eq 0 ] || [ -d "/proc/$holder" ] || return 1
+    running_lock "$1"
+}
+
+# Whether this build, refused room, is overdue: it has been refused for the
+# priority time, longer than every other build refused on the host now, and
+# no build admitted that way is still ramping up. It then starts whatever the
+# memory, so a large build cannot wait forever behind smaller ones that keep
+# fitting, nor several such builds fill memory at once.
 overdue() {
-    [ -n "$registry" ] && [ "$priority_secs" -gt 0 ] || return 1
-    [ $(($(date +%s) - waited_since)) -ge "$priority_secs" ] || return 1
+    [ -n "$registry" ] && [ "$priority_secs" -gt 0 ] && [ -n "$refused_since" ] || return 1
+    now=$(uptime_seconds)
+    [ $((now - refused_since)) -ge "$priority_secs" ] || return 1
     mine=$(wait_entry)
     for entry in "$registry"/wait-*; do
         case $entry in "$mine"|*.new) continue ;; esac
         [ -f "$entry" ] || continue
-        pid= started= since=
-        read -r pid started since <"$entry" 2>/dev/null || continue
-        case $pid:$started:$since in *[!0-9:]*|*::*|:*|*:) continue ;; esac
-        [ "$since" -lt "$waited_since" ] ||
-            { [ "$since" -eq "$waited_since" ] && [ "$pid" -lt "$$" ]; } || continue
+        pid= started= since= last=
+        read -r pid started since last <"$entry" 2>/dev/null || continue
+        case $pid:$started:$since:$last in *[!0-9:]*|*::*|:*|*:) continue ;; esac
+        [ $((now - last)) -le "$wait_fresh" ] || continue
+        [ "$since" -lt "$refused_since" ] ||
+            { [ "$since" -eq "$refused_since" ] && [ "$pid" -lt "$$" ]; } || continue
         [ "$(start_time "$pid")" = "$started" ] || continue
         return 1
     done
     for entry in "$registry"/gate-* "$registry"/offload-*; do
-        [ "$(sed -n 4p "$entry" 2>/dev/null)" = overdue ] || continue
-        ! running_lock "$entry" || return 1
+        ! ramping "$entry" "$now" || return 1
     done
 }
 
@@ -566,12 +598,16 @@ fits() {
     done
     count_registered
     [ "$running" -gt 0 ] || return 0
-    if overdue; then
-        late=yes
+    if cpu_allows && memory_allows && memory_fits; then
         return 0
     fi
-    cpu_allows || return 1
-    memory_allows || return 1
+    overdue || return 1
+    late=yes
+}
+
+# Whether the memory free now, less what the running builds in `claims` are
+# expected to take beyond what they already hold, covers this build's cost.
+memory_fits() {
     # One process listing prices every running build: its expected cost less
     # the resident memory of its process tree so far.
     outstanding=$(ps -e -o pid= -o ppid= -o rss= 2>/dev/null | awk -v claims="$claims" '
@@ -595,19 +631,6 @@ fits() {
     [ $(($(available_kib) - outstanding)) -ge "$cost" ]
 }
 
-# Whether every slot other than $1 is free.
-others_idle() {
-    other=0
-    while [ "$other" -lt "$slots" ]; do
-        if [ "$other" -ne "$1" ]; then
-            exec 7>>"$(slot_path "$other")"
-            flock -n 7 || { exec 7>&-; return 1; }
-            exec 7>&-
-        fi
-        other=$((other + 1))
-    done
-}
-
 # Holds a slot on descriptor 9 until release. Gated waiters line up on a
 # queue lock, and the one at its head takes the first slot that frees. Plain
 # `flock` callers take only slot 0 and wait for it in the kernel, which
@@ -622,6 +645,9 @@ acquire() {
     waited_since=$(date +%s)
     waiter=
     wait_recorded=
+    refused_since=
+    refused_last=
+    refused_written=
     # Both queue and slot requests are private lock waiters, bound to this
     # gate's lifetime. The admitted command alone inherits caller descriptors.
     trap 'withdraw; exit 130' INT
@@ -665,7 +691,7 @@ acquire() {
                 admitted
                 return
             fi
-            record_wait
+            record_refusal
             decided
             flock -u 9
             exec 9>&-
@@ -706,7 +732,7 @@ acquire() {
             fi
             exec 9>&-
         done
-        [ "$fit" != no ] || record_wait
+        [ "$fit" != no ] || record_refusal
         decided
         announce
         sleep 0.2

@@ -728,10 +728,18 @@ class deciding:
             self.lock.close()
 
 
-# After this long, the build that has waited longest on the host starts
-# beside the running builds whatever their memory, one such build at a time,
-# as scripts/cargo-gate admits its own.
-WAIT_PRIORITY = int(os.environ.get("CAGENTS_BUILD_WAIT_PRIORITY_SECS") or 120)
+# Once refused room this long, the build refused longest on the host starts
+# beside the running builds whatever their memory, as scripts/cargo-gate
+# admits its own: while a build admitted that way may still be ramping up,
+# none other is. This host's setting, as the gate reads its own.
+try:
+    WAIT_PRIORITY = max(0, int(os.environ.get("CAGENTS_BUILD_WAIT_PRIORITY_SECS") or 120))
+except ValueError:
+    WAIT_PRIORITY = 120
+# How recently a waiting build must have been refused room to keep its place,
+# and how long a build admitted as overdue keeps the next one waiting.
+WAIT_FRESH = 10
+OVERDUE_RAMP = 600
 
 
 def registry_entry(slot, kind="offload-"):
@@ -761,8 +769,7 @@ def register(slot, cost, pid, overdue=None):
             overdue = False
     try:
         os.makedirs(REGISTRY, mode=0o700, exist_ok=True)
-        with open("/proc/uptime") as file:
-            since = int(float(file.read().split()[0]))
+        since = uptime()
         lock = os.path.join(os.path.realpath(slot), "lock")
         write_record(entry, f"{pid or 0} {cost // 1024}\n{since}\n{lock}\n"
                             f"{'overdue' if overdue else ''}\n")
@@ -779,13 +786,21 @@ def start_time(pid):
         return None
 
 
-def record_wait(slot, since):
-    """Records the build in `slot` as waiting since `since`, so that another
-    family's build that waits longer can tell which of them is the oldest."""
+def uptime():
+    """Seconds since boot, which the wall clock's steps cannot reorder."""
+    with open("/proc/uptime") as file:
+        return int(float(file.read().split()[0]))
+
+
+def record_refusal(slot, since, now):
+    """Records the build in `slot` as refused room since `since` and again at
+    `now`, so that another family's build can tell which of them has been
+    refused longest."""
     if REGISTRY:
         try:
             pid = os.getpid()
-            write_record(registry_entry(slot, "wait-offload-"), f"{pid} {start_time(pid)} {since}\n")
+            write_record(registry_entry(slot, "wait-offload-"),
+                         f"{pid} {start_time(pid)} {since} {now}\n")
         except OSError:
             pass
 
@@ -799,10 +814,13 @@ def forget_wait(slot):
 
 
 def overdue(slot, since):
-    """Whether the build waiting in `slot` since `since` has waited the
-    priority time, longer than every other build waiting on the host, and no
-    build admitted that way still runs."""
-    if not REGISTRY or WAIT_PRIORITY <= 0 or time.time() - since < WAIT_PRIORITY:
+    """Whether the build in `slot`, refused room since `since`, has been
+    refused for the priority time, longer than every other build refused on
+    the host now, and no build admitted that way may still be ramping up."""
+    if not REGISTRY or WAIT_PRIORITY <= 0:
+        return False
+    now = uptime()
+    if now - since < WAIT_PRIORITY:
         return False
     mine, pid = registry_entry(slot, "wait-offload-"), os.getpid()
     try:
@@ -820,14 +838,22 @@ def overdue(slot, since):
             continue
         if name.startswith("wait-") and path != mine:
             try:
-                other, started, other_since = (int(field) for field in text[0].split())
+                other, started, other_since, last = (int(field) for field in text[0].split())
             except ValueError:
                 continue
-            if (other_since, other) < (int(since), pid) and start_time(other) == started:
+            if (now - last <= WAIT_FRESH and (other_since, other) < (since, pid)
+                    and start_time(other) == started):
                 return False
-        elif (name.startswith(("gate-", "offload-")) and text[3] == "overdue"
-              and os.path.isfile(text[2]) and leased_lock(text[2])):
-            return False
+        elif name.startswith(("gate-", "offload-")) and text[3] == "overdue":
+            try:
+                holder = int(text[0].split()[0])
+                started = int(text[1])
+            except (ValueError, IndexError):
+                continue
+            if (now - started < OVERDUE_RAMP
+                    and (holder == 0 or os.path.exists(f"/proc/{holder}"))
+                    and os.path.isfile(text[2]) and leased_lock(text[2])):
+                return False
     return True
 
 
@@ -855,7 +881,14 @@ def registered(base):
         # Opening anything but a regular file could fail or block.
         if not os.path.isfile(lock) or not leased_lock(lock):
             continue
-        found.append((kib * 1024, pid if pid > 0 and os.path.exists(f"/proc/{pid}") else None))
+        if pid == 0:
+            # An offloaded build whose command has not started: its cost.
+            found.append((kib * 1024, None))
+        elif os.path.exists(f"/proc/{pid}"):
+            found.append((kib * 1024, pid))
+        else:
+            # Its holder has exited: priced as unknown, the largest cost.
+            found.append((LARGEST, None))
     return found
 
 
@@ -875,8 +908,6 @@ if command == "lease":
     # The checkout and Cargo command this build is: another request for the
     # same one waits for its slot rather than build it again elsewhere.
     build = sys.argv[8] if len(sys.argv) > 8 else ""
-    # From when it asked for a slot, as the gate dates its own waits.
-    waited_since = int(time.time())
     os.makedirs(base, exist_ok=True)
     leases = []
     waiting_for = None
@@ -997,17 +1028,22 @@ if command == "lease":
     # At the head of the queue: the build starts once the memory it is
     # expected to need is free beside the builds already running here.
     waiting = None
+    refused_since = refused_last = None
     while True:
         # Recorded only once admitted, and in the same decision, so that the
         # host's other slot families neither miss it nor count it waiting.
         with deciding():
             why = room(base, slot, cost)
-            late = why is not None and overdue(slot, waited_since)
+            late = why is not None and refused_since is not None and overdue(slot, refused_since)
             if why is None or late:
                 register(slot, cost, None, overdue=late)
                 forget_wait(slot)
                 break
-            record_wait(slot, waited_since)
+            now = uptime()
+            if refused_since is None or now - refused_last > WAIT_FRESH:
+                refused_since = now
+            refused_last = now
+            record_refusal(slot, refused_since, now)
         if why.split()[0] != waiting:
             say("wait", why)
             announced = True

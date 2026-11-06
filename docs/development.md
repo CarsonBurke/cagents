@@ -385,12 +385,18 @@ under `/var/tmp` named like a shared lock), stays out of the registry unless
 the variable names one. A record whose lock is free is stale and ignored, and
 one whose holder has exited is priced at the largest cost. Families decide one
 at a time, under the registry's `.decision` lock. A slot held by a plain
-`flock`, or by a gate from before the registry, is priced only by its own
-family. So that no build waits forever behind smaller ones from other families
-that keep fitting, the build that has waited longest on the host, once it has
-waited 120 seconds (`CAGENTS_BUILD_WAIT_PRIORITY_SECS`; `0` disables it),
-starts beside the running builds whatever the memory or pressure, but only
-while no other build admitted that way still runs.
+`flock`, by a gate from before the registry or by an offload agent sent from
+such a checkout writes no record, so only its own family prices it.
+
+So that no build waits forever behind smaller ones from other families that
+keep fitting, a build refused room while it holds a free slot records itself
+as waiting. Once refused for 120 seconds (`CAGENTS_BUILD_WAIT_PRIORITY_SECS`,
+read on the host that admits the build; `0` disables it), the build refused
+longest on the host starts beside the running builds whatever the memory or
+pressure. Only one such build ramps up at a time: while one admitted that way
+started less than 10 minutes ago and its holder lives, the next waits. Time
+spent queued behind its own family, or waiting for one of its slots, does not
+count, and a build no longer refused for 10 seconds loses its place.
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock --close /var/tmp/cagents-cargo.lock` takes exactly

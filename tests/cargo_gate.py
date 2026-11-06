@@ -32,6 +32,10 @@ def records(registry):
 
 def start_time(pid):
     return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+
+
+def uptime():
+    return int(float(Path("/proc/uptime").read_text().split()[0]))
 # Admission must not follow the memory pressure of the host running these
 # tests, nor its registry of real builds; the tests about either set them.
 os.environ["CAGENTS_BUILD_MEMORY_PRESSURE"] = "0"
@@ -1908,14 +1912,10 @@ class HostRegistry(TwoSlots):
 
     def test_the_callers_descriptor_5_reaches_the_command(self):
         output = self.root / "via-5"
-        with output.open("w") as file:
-            os.dup2(file.fileno(), 5, inheritable=True)
-            try:
-                result = subprocess.run(
-                    [str(self.gate), "exec", "sh", "-c", "echo via5 >&5"], env=self.env,
-                    cwd=self.root, capture_output=True, text=True, timeout=10, pass_fds=(5,))
-            finally:
-                os.close(5)
+        result = subprocess.run(
+            ["sh", "-c", 'exec 5>"$1"; shift; exec "$@"', "sh", str(output),
+             str(self.gate), "exec", "sh", "-c", "echo via5 >&5"], env=self.env,
+            cwd=self.root, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(output.read_text(), "via5\n")
 
@@ -1983,22 +1983,58 @@ class HostRegistry(TwoSlots):
         self.assertEqual([path.name for path in self.registry.iterdir()
                           if path.name.startswith("wait-")], [])
 
-    def test_one_overdue_build_runs_at_a_time(self):
+    def test_a_build_that_comes_to_fit_is_not_admitted_as_overdue(self):
         env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
-        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\noverdue\n")
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        # Another build admitted as overdue keeps this one from being so.
+        ramping = self.root / "ramping.lock"
+        with ramping.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            record = self.registry / "offload-ramping"
+            record.write_text(f"{os.getpid()} {8 * 2**20}\n{uptime()}\n{ramping}\noverdue\n")
+            waiter = subprocess.Popen(
+                [str(self.gate), "exec", "true"], env=env | {"CAGENTS_BUILD_COST_GIB": "1"},
+                cwd=self.root, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(waiter.stderr.close)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                waiter.wait(timeout=3)
+            # Refused for longer than the priority time, it now fits.
+            self.held_elsewhere(f"{os.getpid()} 1\n0\n{{lock}}\n")
+            record.unlink()
+            self.assertEqual(waiter.wait(timeout=10), 0)
+        self.assertNotIn("waited longest", waiter.stderr.read())
+
+    def test_one_overdue_build_ramps_up_at_a_time(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n{uptime()}\n{{lock}}\noverdue\n")
         with self.assertRaises(subprocess.TimeoutExpired):
             self.build(1, timeout=3, env=env)
+        # Past its ramp-up, or with its holder gone, it no longer holds others back.
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        for record in (f"{os.getpid()} {8 * 2**20}\n{uptime() - 600}\n{{lock}}\noverdue\n",
+                       f"{dead.pid} {8 * 2**20}\n{uptime()}\n{{lock}}\noverdue\n"):
+            with self.subTest(record=record):
+                self.held_elsewhere(record)
+                result = self.build(1, timeout=10, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("waited longest", result.stderr)
 
-    def test_an_overdue_build_gives_way_to_one_waiting_longer(self):
+    def test_an_overdue_build_gives_way_to_one_refused_longer(self):
         env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
         self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
         older = self.registry / "wait-offload-older"
-        older.write_text(f"{os.getpid()} {start_time(os.getpid())} {int(time.time()) - 60}\n")
+        mine = f"{os.getpid()} {start_time(os.getpid())}"
+        older.write_text(f"{mine} {uptime() - 60} {uptime()}\n")
         with self.assertRaises(subprocess.TimeoutExpired):
             self.build(1, timeout=3, env=env)
-        # A record left by a process that has exited is not a waiting build.
-        older.write_text(f"{os.getpid()} {start_time(os.getpid()) + 1} {int(time.time()) - 60}\n")
-        self.assertEqual(self.build(1, timeout=10, env=env).returncode, 0)
+        # Neither a build refused no longer, nor a record left by a process
+        # that has exited, is still waiting for room.
+        for record in (f"{mine} {uptime() - 60} {uptime() - 11}\n",
+                       f"{os.getpid()} {start_time(os.getpid()) + 1} {uptime() - 60} {uptime()}\n"):
+            with self.subTest(record=record):
+                older.write_text(record)
+                self.assertEqual(self.build(1, timeout=10, env=env).returncode, 0)
 
 
 class MemoryPressureAdmission(TwoSlots):

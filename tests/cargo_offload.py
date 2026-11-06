@@ -1520,17 +1520,31 @@ class RemoteRun(unittest.TestCase):
                 write_figures(stand_in)
                 self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
 
-    def registered_elsewhere(self, registry, kib):
+    def registered_elsewhere(self, registry, kib, record="0 {kib}\n0\n{lock}\n", name="gate-1"):
         """A build in another slot family on this host, as scripts/cargo-gate
-        records one: its lock held, and its record naming that lock."""
+        records one: its lock held, and its record naming that lock. By
+        default its holder has not started, so all of its cost is to come."""
         registry.mkdir(exist_ok=True)
-        lock_path = registry.parent / "cagents-cargo.lock"
+        lock_path = registry.parent / f"{name}.lock"
         lock = open(lock_path, "a")
         self.addCleanup(lock.close)
         fcntl.flock(lock, fcntl.LOCK_EX)
-        # Its holder has exited, so all of its cost is still to come.
-        (registry / "gate-1").write_text(f"0 {kib}\n0\n{lock_path}\n")
+        (registry / name).write_text(record.format(kib=kib, lock=lock_path))
         return lock
+
+    def test_a_record_whose_holder_died_is_priced_at_the_largest_cost(self):
+        with self.slots() as base, tempfile.TemporaryDirectory() as host:
+            registry = Path(host, "registry")
+            stand_in = Path(base, "figures")
+            write_figures(stand_in, available_gib=12)
+            dead = subprocess.Popen(["true"])
+            dead.wait()
+            # 1 KiB recorded, but 9 GiB expected: too little left for 9 more.
+            self.registered_elsewhere(registry, 1, f"{dead.pid} {{kib}}\n0\n{{lock}}\n")
+            _, lines = self.lease(base, figures=stand_in, registry=registry)
+            self.assertEqual(lines.next(10).split()[:2], ["wait", "memory"])
+            with self.assertRaises(TimeoutError):
+                lines.next(1.5)
 
     def test_a_build_in_another_slot_family_counts_as_running_beside_it(self):
         with self.slots() as base, tempfile.TemporaryDirectory() as host:
@@ -1582,6 +1596,31 @@ class RemoteRun(unittest.TestCase):
             lease.stdin.close()
             lease.wait(timeout=10)
             self.assertEqual(records(registry), [])
+
+    def uptime(self):
+        return int(float(Path("/proc/uptime").read_text().split()[0]))
+
+    def test_an_overdue_build_gives_way_to_a_gate_refused_longer_or_ramping_up(self):
+        pid = os.getpid()
+        started = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        for name, record in (
+                ("wait-gate-older", f"{pid} {started} {self.uptime() - 60} {self.uptime()}\n"),
+                ("gate-ramping", f"{pid} {{kib}}\n{self.uptime()}\n{{lock}}\noverdue\n")):
+            with self.subTest(name=name), self.slots() as base, \
+                    tempfile.TemporaryDirectory() as host:
+                registry = Path(host, "registry")
+                stand_in = Path(base, "figures")
+                write_figures(stand_in, available_gib=12)
+                self.registered_elsewhere(registry, 4 * 2**20)
+                if name.startswith("wait-"):
+                    (registry / name).write_text(record)
+                else:
+                    self.registered_elsewhere(registry, 1, record, name=name)
+                _, lines = self.lease(base, figures=stand_in, registry=registry,
+                                      env={"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"})
+                self.assertEqual(lines.next(10).split()[:2], ["wait", "memory"])
+                with self.assertRaises(TimeoutError):
+                    lines.next(3)
 
     def test_the_build_waiting_longest_starts_whatever_the_memory(self):
         with self.slots() as base, tempfile.TemporaryDirectory() as host:
