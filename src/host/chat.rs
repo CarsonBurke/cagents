@@ -4059,65 +4059,19 @@ pub(super) fn restore_upgrade(
         }
         thread::sleep(Duration::from_millis(20));
     }
-    let mut sources = saved.previous_sources.clone();
-    sources.push(crate::upgrade::handoff::ChatSource {
-        source: saved.source.clone(),
-        launch: saved.launch.clone(),
-    });
-    let (registry, successor) = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(record) = state.chats.get(&saved.source.id) else {
-            return Err("Restored native chat disappeared before its confirmation".into());
-        };
-        (state.execution_registry.clone(), record.session.clone())
-    };
-    if let Some(registry) = registry {
-        adopt_relaunched_agent_session(&registry, &sources, successor);
-    }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let Some(record) = state.chats.get_mut(&saved.source.id) else {
         return Err("Restored native chat disappeared before its confirmation".into());
     };
     record.subscribers.remove(&0);
     record.observations.remove(&0);
+    let mut sources = saved.previous_sources.clone();
+    sources.push(crate::upgrade::handoff::ChatSource {
+        source: saved.source.clone(),
+        launch: saved.launch.clone(),
+    });
     state.upgrade_chats.insert(saved.source.id, sources);
     Ok(())
-}
-
-/// An agent row names the exact descriptor its provider was issued, and
-/// dispatch refuses any other. A relaunched provider has a new descriptor under
-/// the same ID, so move the agent, its pane and its delegated authority to it.
-/// Each checkpointed source is the previous daemon's own issued record, which
-/// the agent row recorded either as issued or after Codex confirmed its thread.
-///
-/// A refusal leaves the agent bound to its previous descriptor, so its next
-/// prompt is refused rather than delivered to an unproved process. It does not
-/// fail the restore: the conversation itself was relaunched and confirmed, and
-/// its window still resolves it through the upgrade aliases.
-fn adopt_relaunched_agent_session(
-    registry: &super::agent_execution::SharedRegistry,
-    sources: &[crate::upgrade::handoff::ChatSource],
-    successor: Session,
-) {
-    use crate::agent_execution::HostedSession;
-    let retained: Vec<_> = sources
-        .iter()
-        .flat_map(|saved| {
-            let mut confirmed = saved.source.clone();
-            confirmed.launch.session_id = saved.launch.session_id.clone();
-            [saved.source.clone(), confirmed]
-        })
-        .map(HostedSession::Chat)
-        .collect();
-    let id = successor.id;
-    if let Err(reason) = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .adopt_authenticated_agent_session(&retained, &HostedSession::Chat(successor))
-    {
-        tracing::warn!(session = %id, %reason,
-            "relaunched conversation was restored, but its agent could not be moved to the new provider; the agent keeps its previous descriptor and refuses new prompts");
-    }
 }
 
 pub(super) fn owns_codex_listener(session: &Session) -> bool {

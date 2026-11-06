@@ -3010,6 +3010,54 @@ fn restore_terminal_execution_authority(
     Ok(())
 }
 
+/// An agent row names the exact descriptor its provider was issued, and
+/// dispatch refuses any other. A relaunched provider has a new descriptor under
+/// the same ID, so move the agent, its console and its delegated authority to
+/// it. Only the previous daemons' checkpointed sources are lineage. The agent
+/// recorded one either as issued or after its provider confirmed the
+/// conversation, and before any console was paired with it: a console is
+/// recorded beside the agent's session, not in it.
+///
+/// A refusal leaves the agent on its previous descriptor, so its next prompt is
+/// refused rather than delivered to an unproved process. It does not fail the
+/// restore: the conversation itself was relaunched and confirmed, and windows
+/// still resolve it through the upgrade aliases.
+fn restore_relaunched_execution_authority(host: &SharedHost, id: TerminalId) {
+    use crate::agent_execution::HostedSession;
+    let (registry, successor, sources) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let (Some(registry), Some(record), Some(sources)) = (
+            state.execution_registry.clone(),
+            state.chats.get(&id),
+            state.upgrade_chats.get(&id),
+        ) else {
+            return;
+        };
+        (registry, record.session.clone(), sources.clone())
+    };
+    let mut retained = Vec::new();
+    for saved in &sources {
+        let mut confirmed = saved.source.clone();
+        confirmed.launch.session_id = saved.launch.session_id.clone();
+        for issued in [saved.source.clone(), confirmed] {
+            if issued.terminal.is_some() {
+                let mut unpaired = issued.clone();
+                unpaired.terminal = None;
+                retained.push(HostedSession::Chat(unpaired));
+            }
+            retained.push(HostedSession::Chat(issued));
+        }
+    }
+    if let Err(reason) = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .adopt_authenticated_agent_session(&retained, &HostedSession::Chat(successor))
+    {
+        tracing::warn!(session = %id, %reason,
+            "relaunched conversation was restored, but its agent could not be moved to the new provider; the agent keeps its previous descriptor and refuses new prompts");
+    }
+}
+
 pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> {
     let directory = crate::terminal::holder::directory()?;
     let proof = host
@@ -3454,6 +3502,14 @@ fn restore_upgrade_from(
             "Upgrade restore failed: {error}; checkpoint retained at {}",
             store.path.display()
         ));
+    }
+    // Only now is every relaunched provider kept. Moving an agent earlier
+    // would leave it on a descriptor that a failed restore then closes, which
+    // a replay of this checkpoint could no longer recognize.
+    for chat in &checkpoint.chats {
+        if ChatRestore::of(chat) != ChatRestore::Retained {
+            restore_relaunched_execution_authority(host, chat.source.id);
+        }
     }
     let finalized = if interrupted_setups {
         store.archive_interrupted_setup().map(|evidence| {

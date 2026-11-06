@@ -2521,7 +2521,7 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
 /// An unverified Codex (ReconnectOnly) agent is not carried through an update:
 /// the successor daemon relaunches its server and resumes the saved thread.
 /// The agent must then follow its relaunched conversation instead of refusing
-/// every prompt as an unavailable conversation.
+/// every prompt as an unavailable conversation, through successive updates.
 #[test]
 fn updated_codex_agent_answers_through_its_relaunched_server() {
     if isolated("updated_codex_agent_answers_through_its_relaunched_server").is_some() {
@@ -2546,7 +2546,7 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
     let server_root = root.clone();
     let server = std::thread::spawn(move || {
         let mut served = Vec::new();
-        for launch in 1..=2 {
+        for launch in 1..=3 {
             let deadline = Instant::now() + Duration::from_secs(20);
             let socket = loop {
                 let launches =
@@ -2648,76 +2648,82 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
     let Some(HostedSession::Chat(issued)) = agent.session else {
         panic!("Codex agent has no hosted conversation")
     };
-    let handle = host.lock().unwrap().chats[&issued.id].handle.clone();
     assert_eq!(
-        handle.native_continuity(),
+        host.lock().unwrap().chats[&issued.id]
+            .handle
+            .native_continuity(),
         chat::NativeContinuity::ReconnectOnly
     );
-
-    let control_gate = host.lock().unwrap().control_gate.clone();
-    let control = control_gate.write().unwrap();
-    let capability = host
-        .lock()
-        .unwrap()
-        .shutdown_preflight(Instant::now())
-        .unwrap()
-        .capability;
-    crate::host::state::prepare_upgrade(&host, capability, false).unwrap();
-    drop(control);
-    let (shutdown, _) = host.lock().unwrap().graceful_shutdown();
-    super::super::finish_chat_shutdown(&host).unwrap();
-    for terminal in shutdown {
-        let _ = terminal.shutdown();
-    }
-    drop(handle);
-    drop(host);
-
-    let successor_proof = HostSessionProof {
-        host_session_id: HostSessionId::new("updated-execution-fixture"),
-        boot_id: crate::daemon::read_boot_id().unwrap(),
-        host_incarnation: HostIncarnation::new("updated-incarnation"),
-    };
-    let mut state = HostState::new(successor_proof.clone());
-    state.install_model(Registry::at(&path).unwrap());
-    let successor = Arc::new(crate::host::state::HostLock::new(state));
-    assert!(
-        crate::host::state::restore_upgrade(&successor)
+    // The previous daemon prepares its checkpoint and stops; its successor
+    // restores the checkpoint from the same registry.
+    let update = |host: SharedHost, incarnation: &str| {
+        let control_gate = host.lock().unwrap().control_gate.clone();
+        let control = control_gate.write().unwrap();
+        let capability = host
+            .lock()
             .unwrap()
-            .is_empty()
-    );
-    let (agent, _) = status(&successor, &Authority::default(), accepted.agent.id).unwrap();
-    let Some(HostedSession::Chat(relaunched)) = agent.session else {
-        panic!("the updated agent lost its hosted conversation")
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        crate::host::state::prepare_upgrade(&host, capability, false).unwrap();
+        drop(control);
+        let (shutdown, _) = host.lock().unwrap().graceful_shutdown();
+        super::super::finish_chat_shutdown(&host).unwrap();
+        for terminal in shutdown {
+            let _ = terminal.shutdown();
+        }
+        drop(host);
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new(format!("{incarnation}-execution-fixture")),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: HostIncarnation::new(incarnation),
+        };
+        let mut state = HostState::new(proof.clone());
+        state.install_model(Registry::at(&path).unwrap());
+        let successor = Arc::new(crate::host::state::HostLock::new(state));
+        assert!(
+            crate::host::state::restore_upgrade(&successor)
+                .unwrap()
+                .is_empty()
+        );
+        (successor, proof)
     };
-    assert_eq!(relaunched.id, issued.id);
-    assert_eq!(relaunched.proof.as_ref(), Some(&successor_proof));
-    let followup = submit(
-        &successor,
-        &Authority::default(),
-        Submit {
-            name: None,
-            destination: Destination::Existing(accepted.agent.id),
-            prompt: "after the update".into(),
-            idempotency_key: "after-update".into(),
-        },
-    )
-    .unwrap();
-    let after = settled(&successor, followup.run.id);
-    assert_eq!(after.state, State::Succeeded, "{after:?}");
-    assert_eq!(after.result.text, "CODEX_SERVER_2_ANSWER");
-    close(&successor, &Authority::default(), accepted.agent.id).unwrap();
+    let mut host = host;
+    for (launch, incarnation) in [(2, "first-update"), (3, "second-update")] {
+        let (successor, proof) = update(host, incarnation);
+        host = successor;
+        let (agent, _) = status(&host, &Authority::default(), accepted.agent.id).unwrap();
+        let Some(HostedSession::Chat(relaunched)) = agent.session else {
+            panic!("the updated agent lost its hosted conversation")
+        };
+        assert_eq!(relaunched.id, issued.id);
+        assert_eq!(relaunched.proof.as_ref(), Some(&proof));
+        let followup = submit(
+            &host,
+            &Authority::default(),
+            Submit {
+                name: None,
+                destination: Destination::Existing(accepted.agent.id),
+                prompt: format!("after the {incarnation}"),
+                idempotency_key: incarnation.into(),
+            },
+        )
+        .unwrap();
+        let after = settled(&host, followup.run.id);
+        assert_eq!(after.state, State::Succeeded, "{incarnation}: {after:?}");
+        assert_eq!(after.result.text, format!("CODEX_SERVER_{launch}_ANSWER"));
+    }
+    close(&host, &Authority::default(), accepted.agent.id).unwrap();
     let served = server.join().unwrap();
     assert_eq!(served[0].1, 1);
-    assert!(
-        served[1].0.iter().any(|method| method == "thread/resume")
-            && !served[1].0.iter().any(|method| method == "thread/start"),
-        "the relaunched server must resume the saved thread: {:?}",
-        served[1].0
-    );
-    assert_eq!(
-        served[1].1, 1,
-        "the follow-up reached the relaunched server once"
-    );
+    for (methods, prompts) in &served[1..] {
+        assert!(
+            methods.iter().any(|method| method == "thread/resume")
+                && !methods.iter().any(|method| method == "thread/start"),
+            "each relaunched server must resume the saved thread: {methods:?}"
+        );
+        assert_eq!(*prompts, 1, "each follow-up reached its server once");
+    }
 }
 
 #[test]
