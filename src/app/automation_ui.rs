@@ -1,6 +1,8 @@
 use super::*;
 use crate::automation_ui::{Action, Effect, TargetChoice};
 
+pub(super) mod transport;
+
 impl Cagents {
     pub(super) fn automation_subscription(&self) -> Subscription<Message> {
         if self.refresh_ui.focused
@@ -121,23 +123,18 @@ impl Cagents {
                 }
                 Task::none()
             }
-            Some(Effect::Request { sequence, request }) => cosmic::task::future(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    let socket = crate::terminal::ensure_daemon_ready()
-                        .map_err(|error| error.to_string())?;
-                    let mut client = crate::control::ControlClient::connect(&socket)
-                        .map_err(|error| error.to_string())?;
-                    client
-                        .automation(crate::agent_execution::Authority::default(), request)
-                        .map_err(|error| error.to_string())
+            Some(Effect::Request { sequence, request }) => {
+                let context = transport::Context::capture();
+                cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || context.request(request))
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()));
+                    Message::AutomationUi(Action::Received {
+                        sequence,
+                        result: Arc::new(result),
+                    })
                 })
-                .await
-                .unwrap_or_else(|error| Err(error.to_string()));
-                Message::AutomationUi(Action::Received {
-                    sequence,
-                    result: Arc::new(result),
-                })
-            }),
+            }
             Some(Effect::OpenRun(detail)) => {
                 let Some(agent) = detail.agent else {
                     return Task::none();

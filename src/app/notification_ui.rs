@@ -1,4 +1,5 @@
 //! Windows mirror attention and report focus; only the daemon delivers alerts.
+use super::automation_ui::transport;
 use super::*;
 use crate::{
     control::ControlClient,
@@ -81,11 +82,12 @@ fn lifecycle_backend() -> Option<(String, String, String)> {
 
 fn read_lifecycle(
     activation: &LifecycleActivation,
+    context: transport::Context,
 ) -> Result<crate::automations::LifecyclePage, ()> {
     if lifecycle_backend() != activation.backend {
         return Err(());
     }
-    let mut client = connect().map_err(|_| ())?;
+    let mut client = context.connect_existing().map_err(|_| ())?;
     if client.proof() != &activation.host {
         return Err(());
     }
@@ -99,14 +101,11 @@ fn read_lifecycle(
         .checked_add(1)
         .filter(|value| *value <= i64::MAX as u64);
     let page = match client
-        .automation(
-            crate::agent_execution::Authority::default(),
-            crate::automations::Request::Audit {
-                id: activation.id,
-                before,
-                limit: 1,
-            },
-        )
+        .request(crate::automations::Request::Audit {
+            id: activation.id,
+            before,
+            limit: 1,
+        })
         .map_err(|_| ())?
     {
         crate::automations::Response::Audit(page) => page,
@@ -752,11 +751,13 @@ impl Cagents {
                 };
                 self.notification_ui.lifecycle_read = Some(activation.generation);
                 self.notification_ui.lifecycle_activation = Some(activation.clone());
+                let context = transport::Context::capture();
                 cosmic::task::future(async move {
                     let generation = activation.generation;
-                    let result = tokio::task::spawn_blocking(move || read_lifecycle(&activation))
-                        .await
-                        .unwrap_or(Err(()));
+                    let result =
+                        tokio::task::spawn_blocking(move || read_lifecycle(&activation, context))
+                            .await
+                            .unwrap_or(Err(()));
                     Message::NotificationUi(Action::LifecycleResolved { generation, result })
                 })
             }
@@ -1369,6 +1370,8 @@ pub(super) fn card_session(card: &CardState) -> Option<TerminalId> {
 
 #[cfg(test)]
 mod tests {
+    mod authority;
+
     use super::*;
     use crate::agent::Provider;
 
