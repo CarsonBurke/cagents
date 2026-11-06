@@ -782,6 +782,13 @@ touch. A `signal: 9` from a mutant is a result to read, and doesn't show that a
 test caught it. A test that allocates on purpose needs a ceiling of its own: a
 mutant may remove the very limit it was testing, and did.
 
+**Scratch files in agent sessions:** use a fresh `mktemp -d` directory per batch
+of work and remove old ones by exact name. Don't run a bare wildcard delete such as
+`cd DIR; rm -f *`, or reword one to get past a guard: most of the ones agents ran
+stalled with no process and no result, apparently held for an approval nobody could
+give, though that mechanism is inferred. Treat a tool call with no process and no
+result as a held approval rather than a slow command.
+
 Where no scope can be made, as without a user manager, the command runs without a
 limit and says so.
 
