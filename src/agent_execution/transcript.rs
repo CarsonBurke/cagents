@@ -364,7 +364,9 @@ impl Builder {
         }
         if let Some(cursor) = &self.before {
             if item.id == *cursor {
-                self.before = None;
+                // Until an older item joins the page, the cursor itself
+                // still marks where the next page begins.
+                self.oldest = self.before.take();
             }
             return true;
         }

@@ -31,7 +31,6 @@ pub struct TranscriptArgs {
 }
 
 pub(super) fn read(arguments: TranscriptArgs) -> Result<CommandOutput, AppError> {
-    let handle = arguments.session.clone();
     let query = Query {
         session: arguments.session,
         before: arguments.before,
@@ -43,7 +42,10 @@ pub(super) fn read(arguments: TranscriptArgs) -> Result<CommandOutput, AppError>
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
     let page = match client
-        .agent(Authority::from_environment(), Operation::Transcript(query))
+        .agent(
+            Authority::from_environment(),
+            Operation::Transcript(query.clone()),
+        )
         .map_err(protocol_error)?
     {
         Reply::Transcript(page) => page,
@@ -54,7 +56,7 @@ pub(super) fn read(arguments: TranscriptArgs) -> Result<CommandOutput, AppError>
             ));
         }
     };
-    let human = human(&page, &handle, sessions::now_ms());
+    let human = human(&page, &query, sessions::now_ms());
     Ok(CommandOutput {
         command: "transcript",
         data: json!(page),
@@ -63,16 +65,33 @@ pub(super) fn read(arguments: TranscriptArgs) -> Result<CommandOutput, AppError>
 }
 
 /// The page oldest first, as a conversation reads, under a line naming the
-/// session. `handle` is how the caller named it, reused in the paging hint.
-fn human(page: &Page, handle: &str, now: u64) -> String {
+/// session. The paging hint repeats how the caller asked, so the next page
+/// reads the same way.
+fn human(page: &Page, query: &Query, now: u64) -> String {
     let mut out = heading(&page.session, now);
     if let Some(cursor) = &page.earlier {
-        out.push_str(&format!(
-            "\nEarlier: cagents transcript {handle} --before {cursor}"
-        ));
+        let mut hint = format!(
+            "\nEarlier: cagents transcript {} --before {}",
+            format::plain(&query.session),
+            format::plain(cursor)
+        );
+        if query.limit != DEFAULT_LIMIT {
+            hint.push_str(&format!(" -n {}", query.limit));
+        }
+        if query.tools {
+            hint.push_str(" --tools");
+        }
+        if query.full {
+            hint.push_str(" --full");
+        }
+        out.push_str(&hint);
     }
     if page.entries.is_empty() {
-        out.push_str("\n\nNo conversation yet.");
+        out.push_str(if query.before.is_some() {
+            "\n\nNothing earlier."
+        } else {
+            "\n\nNo conversation yet."
+        });
     }
     for entry in &page.entries {
         out.push_str("\n\n");
@@ -244,6 +263,16 @@ mod tests {
         }
     }
 
+    fn query(session: &str) -> Query {
+        Query {
+            session: session.into(),
+            before: None,
+            limit: DEFAULT_LIMIT,
+            tools: false,
+            full: false,
+        }
+    }
+
     fn entry(id: &str, content: Content) -> Entry {
         Entry {
             id: id.into(),
@@ -312,7 +341,7 @@ mod tests {
             earlier: Some("u0".into()),
         };
         assert_eq!(
-            human(&page, "0000", 120_000),
+            human(&page, &query("0000"), 120_000),
             "Session 00000000-0000-4000-8000-000000000001 (codex, exited) \"fix [31m build\", active 1 min ago\n\
              Failed: You've hit your usage limit\n\
              Earlier: cagents transcript 0000 --before u0\n\
@@ -356,14 +385,25 @@ mod tests {
         session.failure = None;
         session.active_at = None;
         session.title = None;
-        let page = Page {
+        let mut page = Page {
             session,
             entries: vec![],
             earlier: None,
         };
         assert_eq!(
-            human(&page, "0000", 0),
+            human(&page, &query("0000"), 0),
             "Session 00000000-0000-4000-8000-000000000001 (codex, idle)\n\nNo conversation yet."
+        );
+        let mut earlier = query("0000");
+        earlier.before = Some("u1".into());
+        assert!(human(&page, &earlier, 0).ends_with("Nothing earlier."));
+        page.earlier = Some("u0".into());
+        earlier.limit = 3;
+        earlier.tools = true;
+        assert!(
+            human(&page, &earlier, 0)
+                .contains("\nEarlier: cagents transcript 0000 --before u0 -n 3 --tools\n"),
+            "the hint keeps the view"
         );
     }
 }

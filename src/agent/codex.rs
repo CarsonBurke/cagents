@@ -63,53 +63,117 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
 const ROLLOUT_SCAN: usize = 262_144;
 
 /// The one rollout recording thread `id` under a Codex home: Codex files each
-/// as `sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl`. Links are refused and
-/// the scan is bounded, so a damaged or hostile home cannot redirect or stall it.
+/// as `sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl`, dated locally. A
+/// time-ordered thread ID names its day, so the days around it are searched
+/// first; otherwise, or when they hold none, every day is. Links are refused
+/// and the scan is bounded, so a damaged or hostile home cannot redirect or
+/// stall it.
 #[cfg(feature = "host")]
 pub(crate) fn rollout(home: &std::path::Path, id: &str) -> Result<PathBuf, String> {
-    fn find(
-        root: &std::path::Path,
-        depth: usize,
-        suffix: &str,
-        budget: &mut usize,
-        found: &mut Vec<PathBuf>,
-    ) -> Result<(), String> {
-        if depth == 0 {
-            return Ok(());
-        }
-        crate::secure_file::reject_symlink_components(root).map_err(|error| error.to_string())?;
-        for entry in std::fs::read_dir(root).map_err(|error| error.to_string())? {
-            if *budget == 0 {
-                return Err("The Codex history is too large to search".into());
-            }
-            *budget -= 1;
-            let entry = entry.map_err(|error| error.to_string())?;
-            let kind = entry.file_type().map_err(|error| error.to_string())?;
-            if kind.is_dir() {
-                find(&entry.path(), depth - 1, suffix, budget, found)?;
-            } else if kind.is_file() && entry.file_name().to_string_lossy().ends_with(suffix) {
-                found.push(entry.path());
-            }
-        }
-        Ok(())
+    let suffix = rollout_suffix(id)?;
+    let sessions = home.join("sessions");
+    let mut budget = ROLLOUT_SCAN;
+    let mut found = Vec::new();
+    for day in creation_days(id) {
+        find_rollouts(&sessions.join(day), 1, &suffix, &mut budget, &mut found)?;
     }
-    if uuid::Uuid::parse_str(id).is_err() || id.len() != 36 {
-        return Err("Codex thread ID is not an exact UUID".into());
+    if !found.is_empty() {
+        return one_rollout(found);
     }
     let mut found = Vec::new();
+    find_rollouts(&sessions, 4, &suffix, &mut budget, &mut found)?;
+    one_rollout(found)
+}
+
+/// A rollout Codex archived, which it moves out of the dated tree into one
+/// flat directory.
+#[cfg(feature = "host")]
+pub(crate) fn archived_rollout(home: &std::path::Path, id: &str) -> Result<PathBuf, String> {
+    let suffix = rollout_suffix(id)?;
+    let mut found = Vec::new();
     let mut budget = ROLLOUT_SCAN;
-    find(
-        &home.join("sessions"),
-        4,
-        &format!("-{id}.jsonl"),
+    find_rollouts(
+        &home.join("archived_sessions"),
+        1,
+        &suffix,
         &mut budget,
         &mut found,
     )?;
+    one_rollout(found)
+}
+
+#[cfg(feature = "host")]
+fn rollout_suffix(id: &str) -> Result<String, String> {
+    if id.len() != 36 || uuid::Uuid::parse_str(id).is_err() {
+        return Err("Codex thread ID is not an exact UUID".into());
+    }
+    Ok(format!("-{id}.jsonl"))
+}
+
+#[cfg(feature = "host")]
+fn one_rollout(found: Vec<PathBuf>) -> Result<PathBuf, String> {
     match <[PathBuf; 1]>::try_from(found) {
         Ok([path]) => Ok(path),
         Err(found) if found.is_empty() => Err("The Codex thread's rollout is missing".into()),
         Err(_) => Err("The Codex thread has more than one rollout".into()),
     }
+}
+
+/// `YYYY/MM/DD` for the UTC day a version-7 thread ID was minted and the
+/// days either side, which cover every local time zone.
+#[cfg(feature = "host")]
+fn creation_days(id: &str) -> Vec<String> {
+    let Ok(uuid) = uuid::Uuid::parse_str(id) else {
+        return Vec::new();
+    };
+    let Some((seconds, _)) = uuid
+        .get_timestamp()
+        .filter(|_| uuid.get_version_num() == 7)
+        .map(|time| time.to_unix())
+    else {
+        return Vec::new();
+    };
+    let Ok(at) = jiff::Timestamp::from_second(seconds as i64) else {
+        return Vec::new();
+    };
+    let day = at.to_zoned(jiff::tz::TimeZone::UTC).date();
+    [day.yesterday(), Ok(day), day.tomorrow()]
+        .into_iter()
+        .flatten()
+        .map(|day| day.strftime("%Y/%m/%d").to_string())
+        .collect()
+}
+
+#[cfg(feature = "host")]
+fn find_rollouts(
+    root: &std::path::Path,
+    depth: usize,
+    suffix: &str,
+    budget: &mut usize,
+    found: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if depth == 0 {
+        return Ok(());
+    }
+    crate::secure_file::reject_symlink_components(root).map_err(|error| error.to_string())?;
+    let entries = match std::fs::read_dir(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        entries => entries.map_err(|error| error.to_string())?,
+    };
+    for entry in entries {
+        if *budget == 0 {
+            return Err("The Codex history is too large to search".into());
+        }
+        *budget -= 1;
+        let entry = entry.map_err(|error| error.to_string())?;
+        let kind = entry.file_type().map_err(|error| error.to_string())?;
+        if kind.is_dir() {
+            find_rollouts(&entry.path(), depth - 1, suffix, budget, found)?;
+        } else if kind.is_file() && entry.file_name().to_string_lossy().ends_with(suffix) {
+            found.push(entry.path());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(test, feature = "host"))]
@@ -148,6 +212,29 @@ mod tests {
             rollout(home.path(), id).unwrap(),
             path,
             "a link is not a rollout"
+        );
+
+        // A time-ordered ID is found on the days around its creation, even
+        // when the full tree would be too large to search.
+        let dated = "01a1b0ba-e200-7000-8000-000000000002";
+        assert_eq!(
+            creation_days(dated),
+            ["2026/11/05", "2026/11/06", "2026/11/07"]
+        );
+        let near = later.join(format!("rollout-2026-11-07T01-00-00-{dated}.jsonl"));
+        std::fs::write(&near, "").unwrap();
+        assert_eq!(rollout(home.path(), dated).unwrap(), near);
+        assert!(creation_days("00000000-0000-4000-8000-000000000001").is_empty());
+
+        let archived = home.path().join("archived_sessions");
+        std::fs::create_dir(&archived).unwrap();
+        let old = archived.join(format!("rollout-2026-11-01T10-00-00-{id}.jsonl"));
+        std::fs::write(&old, "").unwrap();
+        assert_eq!(archived_rollout(home.path(), id).unwrap(), old);
+        assert!(
+            archived_rollout(home.path(), dated)
+                .unwrap_err()
+                .contains("missing")
         );
 
         let elsewhere = tempfile::tempdir().unwrap();

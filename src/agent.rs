@@ -9,7 +9,7 @@ mod claude;
 pub(crate) use claude::transcript as claude_transcript;
 mod codex;
 #[cfg(feature = "host")]
-pub(crate) use codex::rollout as codex_rollout;
+pub(crate) use codex::{archived_rollout as codex_archived_rollout, rollout as codex_rollout};
 mod omp;
 
 #[cfg(feature = "host")]

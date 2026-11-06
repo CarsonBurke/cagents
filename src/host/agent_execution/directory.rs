@@ -48,6 +48,10 @@ pub(super) fn read(
                 .ok()
                 .and_then(|source| source.modified());
         }
+        // Whoever worked most recently is likeliest the one to pick up from.
+        directory
+            .sessions
+            .sort_by_key(|entry| std::cmp::Reverse(entry.active_at));
     }
     Ok(directory)
 }

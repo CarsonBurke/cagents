@@ -143,9 +143,9 @@ The caller's identity comes from its daemon-issued capability, never from an env
 
 ## Reading your channel
 
-`cagents ls --channel` lists the sessions in the caller's channel, or in `--channel CHANNEL`. It includes native chats whose provider has exited, for example after a usage limit, until their card is closed, and shows when each conversation was last saved. `whoami` marks the peers that share the caller's channel.
+`cagents ls --channel` lists the sessions in the caller's channel, or in `--channel CHANNEL`. It includes native chats whose provider has exited, for example after a usage limit, until their card is closed, and lists the most recently active first, with when each conversation was last saved. `whoami` marks the peers that share the caller's channel.
 
-`cagents transcript SESSION` (alias `history`) reads a page of another session's conversation from the provider's own saved history: Claude's project transcript or Codex's rollout. It names sessions as `cagents send` does. The daemon locates the file from that session's own launch: provider, conversation, working directory and account home. Callers never pass a path. Reading neither starts the provider nor requires it to be running, and it grants no control, like listing.
+`cagents transcript SESSION` (alias `history`) reads a page of another session's conversation from the provider's own saved history: Claude's project transcript or Codex's rollout, including an archived one. It names sessions as `cagents send` does. The daemon locates the file from that session's own launch: provider, conversation, working directory and account home. Callers never pass a path. Reading neither starts the provider nor requires it to be running, and it grants no control, like listing.
 
 ```sh
 cagents ls --channel
@@ -168,7 +168,7 @@ The login test fails one run in ten; find out why.
 The session cookie expires during the retry loop. I extended its lifetime in the fixture and ...
 ```
 
-A page holds the last `--limit` messages (10 by default, at most 200): user messages, assistant text and messages delivered by other sessions. Notices between them, including Claude's compaction summaries and Codex's compaction markers, come along. Each run of consecutive tool calls folds into one line with counts, failures and edited paths; `--tools` lists every call with clipped output instead. Messages are clipped to 2,000 bytes and notices to 600, with the omitted size shown; `--full` keeps them whole. The page lists oldest first, so the newest message is last. Its `Earlier:` line names the cursor for the previous page. `--json` returns the session's directory entry, the entries with their IDs and the `earlier` cursor. A provider CLI in a terminal is read from the conversation it is resuming or was last seen in. Omp conversations cannot be read yet.
+A page holds the last `--limit` messages (10 by default, at most 200): user messages, assistant text, messages delivered by other sessions and reports from subagents. Notices between them, including Claude's compaction summaries and Codex's compaction markers, come along. Each run of consecutive tool calls folds into one line with counts, failures and edited paths; `--tools` lists every call with clipped output instead. Messages are clipped to 2,000 bytes and notices to 600, with the omitted size shown; `--full` keeps them whole, except that a Codex command's output is kept to 64 KiB. The page lists oldest first, so the newest message is last. Its `Earlier:` line gives the command for the previous page, with the same options. `--json` returns the session's directory entry, the entries with their IDs and the `earlier` cursor. A forked Codex thread includes the history it replays from its parent; Codex's own instructions and environment context are left out. Reasoning never appears, and tool output appears only with `--tools`. A provider CLI in a terminal is read from the conversation it is resuming or was last seen in. Omp conversations cannot be read yet.
 
 ## Messages between sessions
 

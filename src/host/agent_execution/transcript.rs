@@ -28,8 +28,9 @@ pub(super) fn read(host: &SharedHost, authority: &Authority, query: Query) -> Re
         return Err(format!("A page holds between 1 and {MAX_LIMIT} messages"));
     }
     let listing = directory::read_including(host, authority, Scope::All, true)?;
-    let session = resolve(&listing, &query.session)?;
+    let mut session = resolve(&listing, &query.session)?;
     let source = source(host, session.id, true)?;
+    session.active_at = source.modified();
     let recognizer = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -68,7 +69,7 @@ pub(super) fn read(host: &SharedHost, authority: &Authority, query: Query) -> Re
             break;
         }
     }
-    if pages == MAX_PAGES && !builder.found_cursor() {
+    if !exhausted && !builder.found_cursor() {
         return Err("The cursor is too far back to reach in one read".into());
     }
     let (entries, earlier) = builder.finish(exhausted)?;
@@ -87,7 +88,18 @@ fn resolve(
 ) -> Result<Entry, String> {
     let entries = || listing.caller.iter().chain(&listing.sessions);
     if handle == "parent" {
-        let mut parents = entries().filter(|entry| entry.relation == Relation::Parent);
+        // A parent relaunched in its card leaves the exited original listed
+        // beside it; the live one is the parent now.
+        let parents: Vec<&Entry> = entries()
+            .filter(|entry| entry.relation == Relation::Parent)
+            .collect();
+        let live: Vec<&Entry> = parents
+            .iter()
+            .copied()
+            .filter(|entry| !entry.exited)
+            .collect();
+        let chosen = if live.is_empty() { parents } else { live };
+        let mut parents = chosen.into_iter();
         return match (parents.next(), parents.next()) {
             (Some(parent), None) => Ok(parent.clone()),
             (None, _) => Err("This caller has no live parent session".into()),
@@ -224,7 +236,10 @@ impl Source {
                     .unwrap_or_else(|_| self.launch.recipe.working_directory.clone());
                 crate::agent::claude_transcript(&root, &cwd, id)
             }
-            Provider::Codex => crate::agent::codex_rollout(&root, id),
+            // An archived thread keeps its rollout outside the dated tree.
+            Provider::Codex => crate::agent::codex_rollout(&root, id).or_else(|error| {
+                crate::agent::codex_archived_rollout(&root, id).map_err(|_| error)
+            }),
             Provider::Omp => Err("Reading an Omp conversation is not supported yet".into()),
         }
     }
@@ -309,5 +324,143 @@ impl History for Whole {
 
     fn earlier(&mut self) -> Result<(Vec<Item>, bool), String> {
         Ok((Vec::new(), false))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_execution::{
+        Lineage,
+        directory::{Directory, Surface},
+        transcript::Content,
+    };
+
+    fn entry(id: &str, lineage: &str, relation: Relation, exited: bool) -> Entry {
+        Entry {
+            id: id.parse().unwrap(),
+            surface: Surface::Chat,
+            provider: Some(Provider::Claude),
+            title: None,
+            channel: None,
+            view_scope: None,
+            channel_repository: None,
+            state: crate::agent::ActivityState::Idle,
+            directory: None,
+            worktree: None,
+            project: None,
+            project_name: None,
+            delegation: None,
+            relation,
+            lineage: Lineage(lineage.parse().unwrap()),
+            exited,
+            failure: None,
+            active_at: None,
+        }
+    }
+
+    const ORIGINAL: &str = "11111111-0000-4000-8000-000000000001";
+    const RELAUNCH: &str = "22222222-0000-4000-8000-000000000002";
+    const OTHER: &str = "33333333-0000-4000-8000-000000000003";
+
+    fn listing(sessions: Vec<Entry>) -> Directory {
+        Directory {
+            caller: None,
+            scope: Scope::All,
+            sessions,
+        }
+    }
+
+    #[test]
+    fn handles_name_one_session_and_a_relaunch_supersedes_its_exited_original() {
+        let relaunched = listing(vec![
+            entry(ORIGINAL, ORIGINAL, Relation::Parent, true),
+            entry(RELAUNCH, ORIGINAL, Relation::Parent, false),
+            entry(OTHER, OTHER, Relation::Peer, false),
+        ]);
+        let id = |handle| resolve(&relaunched, handle).map(|entry| entry.id.to_string());
+        assert_eq!(id("parent").unwrap(), RELAUNCH);
+        assert_eq!(id("2222").unwrap(), RELAUNCH);
+        assert_eq!(id("3333").unwrap(), OTHER);
+        // A session ID names that exact session, even an exited one.
+        assert_eq!(id("1111").unwrap(), ORIGINAL);
+        assert!(id("111").unwrap_err().contains("at least 4"));
+        assert!(id("4444").unwrap_err().contains("cagents ls --channel"));
+
+        let exited_only = listing(vec![entry(ORIGINAL, ORIGINAL, Relation::Parent, true)]);
+        assert_eq!(
+            resolve(&exited_only, "parent").unwrap().id.to_string(),
+            ORIGINAL,
+            "an exited parent is still readable"
+        );
+        let twins = listing(vec![
+            entry(ORIGINAL, OTHER, Relation::Peer, false),
+            entry(RELAUNCH, OTHER, Relation::Peer, false),
+        ]);
+        assert!(
+            resolve(&twins, "3333")
+                .unwrap_err()
+                .contains("2 sessions match")
+        );
+    }
+
+    #[test]
+    fn codex_history_is_read_from_the_sessions_own_rollout() {
+        let home = tempfile::tempdir().unwrap();
+        let id = "01a1b0ba-e200-7000-8000-000000000002";
+        let day = home.path().join("codex/sessions/2026/11/06");
+        std::fs::create_dir_all(&day).unwrap();
+        let records = [
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Ship it"}]}}"#,
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"c1","command":"git push","status":"completed","exit_code":0,"aggregated_output":""}}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","id":"m1","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Pushed."}]}}"#,
+        ];
+        std::fs::write(
+            day.join(format!("rollout-2026-11-06T12-00-00-{id}.jsonl")),
+            records.join("\n"),
+        )
+        .unwrap();
+        let source = Source {
+            launch: Launch {
+                provider: Provider::Codex,
+                session_id: Some(id.into()),
+                recipe: crate::model::LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: Vec::new(),
+                    working_directory: home.path().into(),
+                    environment: [
+                        ("HOME".to_owned(), home.path().display().to_string()),
+                        ("CODEX_HOME".to_owned(), "codex".to_owned()),
+                    ]
+                    .into(),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        assert!(source.modified().is_some());
+        let (items, earlier) = source.open().unwrap().newest().unwrap();
+        assert!(!earlier);
+        let query = Query {
+            session: id.into(),
+            before: None,
+            limit: 10,
+            tools: false,
+            full: false,
+        };
+        let mut builder = Builder::new(&query);
+        for item in items.iter().rev() {
+            assert!(builder.push(item));
+        }
+        let (entries, earlier) = builder.finish(true).unwrap();
+        assert_eq!(earlier, None);
+        assert!(matches!(&entries[0].content, Content::User(text) if text.text == "Ship it"));
+        assert!(matches!(&entries[1].content, Content::Tools(run) if run.calls[0].name == "Run"));
+        assert!(
+            matches!(&entries[2].content, Content::Assistant { text, .. } if text.text == "Pushed.")
+        );
+
+        let mut moved = source;
+        moved.launch.session_id = Some("01a1b0ba-e200-7000-8000-000000000009".into());
+        assert!(moved.open().err().unwrap().contains("missing"));
     }
 }
