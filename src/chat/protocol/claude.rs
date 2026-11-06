@@ -457,6 +457,7 @@ impl TaskOutcome {
             self.summary
                 .truncate(self.summary.floor_char_boundary(RECORDED_SUMMARY_BYTES));
             self.summary.push('…');
+            self.summary.shrink_to_fit();
         }
         self
     }
@@ -589,6 +590,13 @@ struct Claude {
     /// whole rather than bounded by count, since a replayed launch it does not
     /// name is shown as never having been settled.
     history_outcomes: HashMap<String, TaskOutcome>,
+    /// Background commands still waiting for their task's notification, by
+    /// the call that launched them, oldest first.
+    launches: VecDeque<ScopedId>,
+    /// The rows of those commands that the tool cache has since let go of.
+    /// A long command can outlast hundreds of later calls; its row is still
+    /// on screen as Running, and its notification must still settle it.
+    evicted_launches: HashMap<ScopedId, Item>,
     /// Exact successful child failure/result and task-notification receipts,
     /// not bodies or running work. Changed payloads remain observable.
     failure_receipts: VecDeque<[u8; 32]>,
@@ -785,8 +793,25 @@ impl Claude {
         self.tools.insert(key, item);
         while self.tool_order.len() > MAX_TOOLS {
             if let Some(key) = self.tool_order.pop_front() {
+                if self.launches.contains(&key)
+                    && let Some(item) = self.tools.get(&key)
+                {
+                    self.evicted_launches.insert(key.clone(), item.clone());
+                }
                 self.forget_tool(&key);
             }
+        }
+    }
+
+    /// Remember a background command that is running until its task's
+    /// notification arrives.
+    fn launched(&mut self, key: ScopedId) {
+        self.launches.retain(|known| known != &key);
+        self.launches.push_back(key);
+        if self.launches.len() > MAX_TOOLS
+            && let Some(oldest) = self.launches.pop_front()
+        {
+            self.evicted_launches.remove(&oldest);
         }
     }
     fn forget_tool(&mut self, key: &ScopedId) {
@@ -1729,6 +1754,9 @@ impl Claude {
                         if let Some(task) = structured["backgroundTaskId"].as_str() {
                             self.foreground_tasks.retain(|known| known != task);
                             self.background_launch(&tool_id, history, &mut item.content);
+                            if item.content.status() == Some(ToolStatus::Running) {
+                                self.launched(ScopedId::new(child, &tool_id));
+                            }
                         }
                         if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent")
                         {
@@ -1971,18 +1999,23 @@ impl Claude {
     /// is shown, and keep the outcome for a launch acknowledgement still to
     /// come.
     fn settle_task_call(&mut self, tool: &str, outcome: TaskOutcome, step: &mut Step) {
-        self.task_outcomes.retain(|(call, _)| call != tool);
-        self.task_outcomes
-            .push_back((tool.to_owned(), outcome.clone()));
-        if self.task_outcomes.len() > MAX_TOOLS {
-            self.task_outcomes.pop_front();
-        }
-        let Some(key) = self.task_call(tool) else {
+        self.remember_outcome(tool, outcome.clone());
+        let found = match self.task_call(tool) {
+            Some(key) => self.tools.get(&key).cloned().map(|item| (key, item)),
+            None => {
+                // A launch the tool cache let go of while it ran.
+                let mut evicted = self.evicted_launches.keys().filter(|key| key.id == tool);
+                match (evicted.next().cloned(), evicted.next()) {
+                    (Some(key), None) => self.evicted_launches.remove(&key).map(|item| (key, item)),
+                    _ => None,
+                }
+            }
+        };
+        let Some((key, mut item)) = found else {
             return;
         };
-        let Some(mut item) = self.tools.get(&key).cloned() else {
-            return;
-        };
+        self.launches.retain(|known| known != &key);
+        self.evicted_launches.remove(&key);
         let before = item.content.clone();
         outcome.settle(&mut item.content);
         if item.content == before {
@@ -1993,6 +2026,15 @@ impl Claude {
             Some(parent) => Event::SubagentItem { id: parent, item },
             None => Event::Item(item),
         });
+    }
+
+    /// Keep how a task ended for a launch acknowledgement still to come.
+    fn remember_outcome(&mut self, tool: &str, outcome: TaskOutcome) {
+        self.task_outcomes.retain(|(call, _)| call != tool);
+        self.task_outcomes.push_back((tool.to_owned(), outcome));
+        if self.task_outcomes.len() > MAX_TOOLS {
+            self.task_outcomes.pop_front();
+        }
     }
 
     fn agent_tool(&self, tool: &str) -> bool {
@@ -2470,19 +2512,18 @@ impl Adapter for Claude {
                     background: Some(false),
                 });
             }
-            let children = history.subagent_frames().unwrap_or_default();
+            let mut children = history.subagent_frames().unwrap_or_default();
             // An agent's own background commands are settled by the
             // notifications its sidecar recorded, which follow their launches.
-            for frame in children.iter().flat_map(|(.., frames)| frames) {
-                if let Some(content) = recorded_notification(frame) {
-                    for (tool, outcome) in notified_calls(&content) {
-                        if !history.agent_tools.contains_key(&tool) {
-                            self.history_outcomes.insert(tool, outcome.recorded());
-                        }
-                    }
+            for (tool, outcome) in children
+                .iter_mut()
+                .flat_map(|(.., outcomes)| std::mem::take(outcomes))
+            {
+                if !history.agent_tools.contains_key(&tool) {
+                    self.history_outcomes.insert(tool, outcome);
                 }
             }
-            for (parent, kind, description, frames) in children {
+            for (parent, kind, description, frames, _) in children {
                 history_step.events.push(Event::Subagent {
                     model: None,
                     waiting: None,
@@ -2862,6 +2903,8 @@ impl Adapter for Claude {
                 self.foreground_tasks.clear();
                 self.task_outcomes.clear();
                 self.history_outcomes.clear();
+                self.launches.clear();
+                self.evicted_launches.clear();
                 self.failure_receipts.clear();
                 self.agent_task_calls.clear();
                 self.ended_agents.clear();
@@ -5302,9 +5345,15 @@ impl Claude {
                         output,
                         status,
                         ..
-                    } => Some((input, output, status)),
+                    } => {
+                        if let Some(text) = patch["description"].as_str() {
+                            *input = text.into();
+                        }
+                        Some((output, status))
+                    }
                     ItemContent::Command {
                         label,
+                        command,
                         output,
                         status,
                         exit_code,
@@ -5313,14 +5362,24 @@ impl Claude {
                         if let Some(summary) = patch["summary"].as_str() {
                             *exit_code = summary_exit_code(summary).or(*exit_code);
                         }
-                        Some((label, output, status))
+                        // Claude Code names a command that has no description
+                        // by the command itself. A description of several
+                        // lines is that command, kept whole where the row's
+                        // detail and copy show it rather than cut to the
+                        // heading's one line.
+                        if let Some(text) = patch["description"].as_str() {
+                            if text.trim().contains('\n') {
+                                label.clear();
+                                *command = text.trim().into();
+                            } else {
+                                *label = text.into();
+                            }
+                        }
+                        Some((output, status))
                     }
                     _ => None,
                 };
-                if let Some((description, output, status)) = fields {
-                    if let Some(text) = patch["description"].as_str() {
-                        *description = text.into();
-                    }
+                if let Some((output, status)) = fields {
                     // A foreground command's summary repeats the command.
                     if let Some(summary) = patch["summary"].as_str()
                         && !foreground
@@ -5364,14 +5423,17 @@ impl Claude {
                 self.tool(None, item.clone());
                 if let (Some(tool), Some(ended)) = (frame["tool_use_id"].as_str(), ended)
                     && known_tool.is_none()
-                    && !foreground
                     && (notification || patch["status"].is_string())
                 {
-                    self.settle_task_call(
-                        tool,
-                        TaskOutcome::new(ended, string(patch, "summary")),
-                        step,
-                    );
+                    let outcome = TaskOutcome::new(ended, string(patch, "summary"));
+                    if foreground {
+                        // The call's own result settles it, unless that result
+                        // says a timeout moved the command to the background
+                        // after all: the acknowledgement then needs this.
+                        self.remember_outcome(tool, outcome.recorded());
+                    } else {
+                        self.settle_task_call(tool, outcome, step);
+                    }
                 }
                 if represented {
                     if self.visible_task_rows.remove(&item.id) {
@@ -5945,7 +6007,23 @@ impl History {
     }
     /// Load only children linked by a tool-use ID in this exact parent session.
     /// A bounded tail keeps reopening a long-running session cheap.
-    fn subagent_frames(&self) -> Result<Vec<(String, String, String, Vec<Value>)>, String> {
+    ///
+    /// Each child also carries how the background tasks it started ended, by
+    /// the call that launched them, from every notification its tail
+    /// recorded, in any of the forms Claude Code records one.
+    #[allow(clippy::type_complexity)]
+    fn subagent_frames(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            String,
+            String,
+            Vec<Value>,
+            Vec<(String, TaskOutcome)>,
+        )>,
+        String,
+    > {
         use std::io::BufRead as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let Some(dir) = &self.subagent_dir else {
@@ -6020,6 +6098,7 @@ impl History {
                 continue;
             }
             let mut frames = VecDeque::new();
+            let mut outcomes = Vec::new();
             let mut retained_bytes = 0;
             loop {
                 line.clear();
@@ -6036,13 +6115,30 @@ impl History {
                 if count > MAX_PAYLOAD {
                     break;
                 }
-                if count > 48 * 1024 {
+                let large = count > 48 * 1024;
+                if large
+                    && !line
+                        .windows(NOTIFICATION_OPEN.len())
+                        .any(|window| window == NOTIFICATION_OPEN.as_bytes())
+                {
                     continue;
                 }
                 let Ok(frame) = serde_json::from_slice::<Value>(&line) else {
                     continue;
                 };
                 if frame["sessionId"].as_str() != Some(&self.session_id)
+                    || frame["agentId"].as_str().is_some_and(|id| id != agent_id)
+                {
+                    continue;
+                }
+                if let Some(content) = recorded_notification(&frame) {
+                    outcomes.extend(
+                        notified_calls(&content)
+                            .into_iter()
+                            .map(|(tool, outcome)| (tool, outcome.recorded())),
+                    );
+                }
+                if large
                     || frame["agentId"].as_str() != Some(agent_id)
                     || frame["isSidechain"].as_bool() != Some(true)
                     || !matches!(string(&frame, "type"), "user" | "assistant")
@@ -6065,6 +6161,7 @@ impl History {
                     .into(),
                 string(&meta, "description").into(),
                 frames.into_iter().map(|(frame, _)| frame).collect(),
+                outcomes,
             ));
         }
         Ok(children)
@@ -12399,6 +12496,13 @@ mod tests {
                 child("child-call", json!({"type":"assistant","message":{"id":"child-message","content":[{"type":"tool_use","id":"child-bash","name":"Bash","input":{"command":"sleep 30","run_in_background":true}}]}})),
                 child("child-result", json!({"type":"user","toolUseResult":{"backgroundTaskId":"t-child-bash"},"message":{"content":[{"type":"tool_result","tool_use_id":"child-bash","content":"Command running in background with ID: t-child-bash."}]}})),
                 child("child-notified", json!({"type":"user","origin":{"kind":"task-notification"},"message":{"role":"user","content":notification("child-bash", "failed", "Background command \"sleep 30\" failed with exit code 1")}})),
+                // The other forms a notification is recorded in.
+                child("queued-call", json!({"type":"assistant","message":{"id":"queued-message","content":[{"type":"tool_use","id":"child-queued","name":"Bash","input":{"command":"make lint","run_in_background":true}}]}})),
+                child("queued-result", json!({"type":"user","toolUseResult":{"backgroundTaskId":"t-child-queued"},"message":{"content":[{"type":"tool_result","tool_use_id":"child-queued","content":"Command running in background with ID: t-child-queued."}]}})),
+                child("attached-call", json!({"type":"assistant","message":{"id":"attached-message","content":[{"type":"tool_use","id":"child-attached","name":"Bash","input":{"command":"make docs","run_in_background":true}}]}})),
+                child("attached-result", json!({"type":"user","toolUseResult":{"backgroundTaskId":"t-child-attached"},"message":{"content":[{"type":"tool_result","tool_use_id":"child-attached","content":"Command running in background with ID: t-child-attached."}]}})),
+                format!("{}\n", json!({"type":"queue-operation","operation":"enqueue","sessionId":session,"content":notification("child-queued", "failed", "Background command \"make lint\" failed with exit code 3")})),
+                child("attached-notified", json!({"type":"attachment","attachment":{"type":"queued_command","commandMode":"task-notification","origin":{"kind":"task-notification"},"prompt":notification("child-attached", "completed", "Background command \"make docs\" completed (exit code 0)")}})),
             ]
             .concat(),
         )
@@ -12432,6 +12536,92 @@ mod tests {
             "{:?}",
             shown_command(&replayed, "child-bash")
         );
+        for (tool, ended, code) in [
+            ("child-queued", ToolStatus::Failed, 3),
+            ("child-attached", ToolStatus::Succeeded, 0),
+        ] {
+            assert!(
+                matches!(
+                    shown_command(&replayed, tool),
+                    Some((Some(ref scope), ItemContent::Command { status, exit_code: Some(exit), .. }))
+                        if scope == "agent-call" && status == ended && exit == code
+                ),
+                "{tool}: {:?}",
+                shown_command(&replayed, tool)
+            );
+        }
+    }
+
+    /// A command can outlast hundreds of later calls, which the tool cache
+    /// lets go of first; its notification still settles its row.
+    #[test]
+    fn a_long_background_command_settles_after_many_later_calls() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"call","message":{"id":"m","content":[{"type":"tool_use","id":"bash","name":"Bash","input":{"command":"cargo test","description":"Run tests","run_in_background":true}}]}})).unwrap();
+        adapter.receive(json!({"type":"user","uuid":"launch","tool_use_result":{"backgroundTaskId":"b1"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"bash","content":"Command running in background with ID: b1."}]}})).unwrap();
+        for n in 0..MAX_TOOLS + 8 {
+            adapter.receive(json!({"type":"assistant","uuid":format!("read-{n}"),"message":{"id":format!("read-message-{n}"),"content":[{"type":"tool_use","id":format!("read-{n}"),"name":"Read","input":{"file_path":"/x"}}]}})).unwrap();
+        }
+        assert!(!adapter.tools.contains_key(&ScopedId::new(None, "bash")));
+        let notified = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"bash","status":"failed","summary":"Background command \"Run tests\" failed with exit code 101","uuid":"n"})).unwrap();
+        assert!(
+            matches!(
+                shown_command(&notified, "bash"),
+                Some((
+                    None,
+                    ItemContent::Command {
+                        status: ToolStatus::Failed,
+                        exit_code: Some(101),
+                        ..
+                    }
+                ))
+            ),
+            "{:?}",
+            shown_command(&notified, "bash")
+        );
+        assert!(adapter.launches.is_empty() && adapter.evicted_launches.is_empty());
+    }
+
+    /// A timeout can move a foreground command to the background, and the
+    /// task can end before the call's result says so; the result then settles
+    /// from the notification already received.
+    #[test]
+    fn a_command_moved_to_the_background_settles_from_an_earlier_notification() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"call","message":{"id":"m","content":[{"type":"tool_use","id":"bash","name":"Bash","input":{"command":"cargo build"}}]}})).unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"b2","tool_use_id":"bash","task_type":"local_bash","is_backgrounded":false,"description":"cargo build"})).unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"b2","tool_use_id":"bash","status":"completed","summary":"Background command \"cargo build\" completed (exit code 0)","uuid":"n"})).unwrap();
+        let result = adapter.receive(json!({"type":"user","uuid":"launch","tool_use_result":{"backgroundTaskId":"b2"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"bash","content":"Command running in background with ID: b2."}]}})).unwrap();
+        assert!(
+            matches!(
+                shown_command(&result, "bash"),
+                Some((
+                    None,
+                    ItemContent::Command {
+                        status: ToolStatus::Succeeded,
+                        exit_code: Some(0),
+                        ..
+                    }
+                ))
+            ),
+            "{:?}",
+            shown_command(&result, "bash")
+        );
+    }
+
+    /// Claude Code names a command with no description by the command. When
+    /// nothing else shows it, its row keeps the whole command, not only the
+    /// heading's first line.
+    #[test]
+    fn an_unforwarded_command_named_by_a_script_keeps_the_whole_script() {
+        let mut adapter = Claude::default();
+        let script =
+            "mkdir -p /var/tmp/audit && cat > /var/tmp/audit/run.py <<'EOF'\nprint('hi')\nEOF";
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"b3","tool_use_id":"unseen","owned_by_subagent":true,"task_type":"local_bash","description":script})).unwrap();
+        assert!(matches!(
+            &adapter.tools[&ScopedId::new(None, "claude-task:b3")].content,
+            ItemContent::Command { label, command, .. } if label.is_empty() && command == script
+        ));
     }
 
     /// Claude Code reports a refused or interrupted call as an error in fixed
