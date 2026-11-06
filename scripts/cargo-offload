@@ -1716,6 +1716,17 @@ class Offload:
         for name, value in launch["environment"].items():
             environment[name] = rewrite(value, mappings)
         environment["CARGO"] = shutil.which(real_cargo(self.environment)) or environment.get("CARGO", "")
+        if shims := environment.get("CAGENTS_BUILD_EXEC_SHIMS"):
+            # The named Cargo in an outer `cargo-gate exec` removed its
+            # shim and guard so this build could use real Cargo. The local
+            # program is back in that exec's scope: its named Cargo must
+            # enter the gate again, and Cargo reached by path (including
+            # $CARGO above) must not compile here. The saved caller wrapper
+            # still handles queries, and the persistent guard outlives the
+            # outer exec's temporary shim directory.
+            environment["PATH"] = shims + os.pathsep + environment.get("PATH", os.defpath)
+            environment["RUSTC_WRAPPER"] = str(Path(__file__).resolve().with_name(
+                "cargo-gate-rustc-guard"))
         sys.stdout.flush()
         sys.stderr.flush()
         # The program replaces this process, and with it the cleanup at the
