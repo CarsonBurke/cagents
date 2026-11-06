@@ -1716,6 +1716,12 @@ class Offload:
         for name, value in launch["environment"].items():
             environment[name] = rewrite(value, mappings)
         environment["CARGO"] = shutil.which(real_cargo(self.environment)) or environment.get("CARGO", "")
+        if shims := environment.get("CAGENTS_BUILD_EXEC_SHIMS"):
+            # Back in the outer exec's scope: restore the Cargo shim and
+            # compiler guard that the gate removed for this build.
+            environment["PATH"] = shims + os.pathsep + environment.get("PATH", os.defpath)
+            environment["RUSTC_WRAPPER"] = str(Path(__file__).resolve().with_name(
+                "cargo-gate-rustc-guard"))
         sys.stdout.flush()
         sys.stderr.flush()
         # The program replaces this process, and with it the cleanup at the

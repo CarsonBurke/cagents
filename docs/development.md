@@ -438,6 +438,9 @@ admission budget. A Cargo reached any other way inside COMMAND, by path,
 through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
 also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
 compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+Programs launched by `cargo run` inside that `exec` inherit the same Cargo
+shim and guard. Their named `cargo` reenters the gate after the program's
+build releases its slot; their absolute `$CARGO` cannot compile here.
 On the build host itself, or with
 `CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
 above. A gate without `scripts/cargo-offload` beside it refuses to build
