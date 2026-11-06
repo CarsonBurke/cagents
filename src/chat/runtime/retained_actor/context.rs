@@ -12,6 +12,8 @@ pub(super) struct ContextProjection {
     // Every subscriber at or behind this helper generation needs a full resync.
     // A consumed dirty bit would repair only the first subscriber to read.
     invalidated_through: Option<u64>,
+    #[cfg(test)]
+    worker_waiting: bool,
 }
 
 #[cfg(test)]
@@ -67,25 +69,16 @@ mod tests {
         last.generation = 9;
         let expected = last.clone();
         let serving = thread::spawn(move || {
+            let full_reply = |snapshot: Snapshot| {
+                serde_json::to_value(Some(ServerResponse::ChatSnapshot {
+                    chat_id: id,
+                    snapshot: Some(snapshot),
+                }))
+                .unwrap()
+            };
             let calls = [
-                (
-                    "presentation",
-                    json!([id, null]),
-                    serde_json::to_value(Some(ServerResponse::ChatSnapshot {
-                        chat_id: id,
-                        snapshot: Some(full.clone()),
-                    }))
-                    .unwrap(),
-                ),
-                (
-                    "presentation",
-                    json!([id, null]),
-                    serde_json::to_value(Some(ServerResponse::ChatSnapshot {
-                        chat_id: id,
-                        snapshot: Some(full),
-                    }))
-                    .unwrap(),
-                ),
+                ("presentation", json!([id, null]), full_reply(full.clone())),
+                ("presentation", json!([id, null]), full_reply(full)),
                 (
                     "presentation",
                     json!([id, 8]),
@@ -221,7 +214,16 @@ impl RemoteActor {
                             .unwrap_or_else(|p| p.into_inner())
                             .is_none()
                     {
-                        break;
+                        #[cfg(test)]
+                        {
+                            inner.context.lock().unwrap().worker_waiting = true;
+                        }
+                        // An unavailable proxy can later recover verified final
+                        // evidence. Wait without scanning, retaining only Weak
+                        // ownership so the final view can resume this worker.
+                        drop(inner);
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
                     }
                     let actor = Self(inner);
                     actor.scan_context(&mut scanner, &mut session);

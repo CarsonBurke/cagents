@@ -4106,10 +4106,19 @@ while IFS= read -r frame; do :; done
         let body = snapshot.items[0].logical_copy_body().unwrap().to_owned();
         let original = snapshot.clone();
         std::fs::remove_file(&path).unwrap();
+        remote.0.stop.store(true, Ordering::Release);
+        remote.start_context_worker().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !remote.0.context.lock().unwrap().worker_waiting {
+            assert!(
+                Instant::now() < deadline,
+                "unavailable scanner must wait for final evidence"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         Arc::make_mut(&mut remote.0.state.lock().unwrap()).confirmed_session =
             Some("00000000-0000-4000-8000-000000000099".into());
         remote.publish_closed(snapshot);
-        remote.start_context_worker().unwrap();
         assert_eq!(
             remote.snapshot(None).unwrap().items[0].role,
             chat::Role::User

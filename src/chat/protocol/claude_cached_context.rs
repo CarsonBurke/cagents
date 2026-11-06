@@ -11,7 +11,7 @@ use crate::{
 };
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
@@ -60,11 +60,6 @@ struct Entry {
     offset: u64,
     bytes: usize,
     block: Option<usize>,
-    base: usize,
-}
-struct Carrier {
-    base: usize,
-    items: Vec<String>,
 }
 struct Source {
     path: PathBuf,
@@ -77,8 +72,8 @@ struct Source {
     charged: usize,
     failed: bool,
     entries: HashMap<String, Entry>,
-    carriers: HashMap<String, Carrier>,
-    message_offsets: HashMap<String, usize>,
+    carriers: HashMap<String, Vec<String>>,
+    ambiguous_carriers: HashSet<String>,
     #[cfg(test)]
     reads: std::sync::atomic::AtomicUsize,
 }
@@ -156,7 +151,7 @@ impl CachedContext {
                 failed: false,
                 entries: HashMap::new(),
                 carriers: HashMap::new(),
-                message_offsets: HashMap::new(),
+                ambiguous_carriers: HashSet::new(),
                 #[cfg(test)]
                 reads: std::sync::atomic::AtomicUsize::new(0),
             });
@@ -185,7 +180,7 @@ impl CachedContext {
                 changed |= previously_proven;
                 source.entries.clear();
                 source.carriers.clear();
-                source.message_offsets.clear();
+                source.ambiguous_carriers.clear();
                 source.failed = true;
                 changed
             }
@@ -215,7 +210,7 @@ impl CachedContext {
                 failed: source.failed,
                 entries: source.entries.clone(),
                 carriers: HashMap::new(),
-                message_offsets: HashMap::new(),
+                ambiguous_carriers: source.ambiguous_carriers.clone(),
                 #[cfg(test)]
                 reads: std::sync::atomic::AtomicUsize::new(0),
             }),
@@ -277,19 +272,9 @@ impl CachedContext {
         let ItemChange::Append { item, .. } = change else {
             return false;
         };
-        item.role == Role::User
-            && matches!(
-                item.content,
-                ItemContent::Text {
-                    thinking: false,
-                    ..
-                }
-            )
-            && self.source.as_ref().is_some_and(|source| {
-                source.entries.contains_key(&item.id)
-                    || TranscriptPart::parse(&item.id)
-                        .is_some_and(|part| source.entries.contains_key(part.item))
-            })
+        self.source
+            .as_ref()
+            .is_some_and(|source| source.candidate(item).is_some())
     }
 }
 
@@ -315,14 +300,15 @@ impl Source {
             return None;
         }
         // Exact provider IDs win over a coincidental part-looking suffix.
-        self.entries
-            .get(&item.id)
-            .map(|entry| (*entry, false))
-            .or_else(|| {
-                self.entries
-                    .get(TranscriptPart::parse(&item.id)?.item)
-                    .map(|entry| (*entry, true))
-            })
+        let key = if self.entries.contains_key(&item.id) {
+            item.id.as_str()
+        } else {
+            TranscriptPart::parse(&item.id)?.item
+        };
+        let (carrier, _) = key.rsplit_once(':')?;
+        (!self.ambiguous_carriers.contains(carrier))
+            .then(|| self.entries.get(key).map(|entry| (*entry, key != item.id)))
+            .flatten()
     }
 
     fn scan(&mut self, file: &mut File, end: u64) -> Option<bool> {
@@ -368,35 +354,35 @@ impl Source {
         let Some(carrier) = frame["uuid"].as_str() else {
             return Some(false);
         };
-        let message = frame["message"]["id"].as_str().unwrap_or(carrier);
-        let base = self
-            .carriers
-            .get(carrier)
-            .map(|saved| saved.base)
-            .unwrap_or_else(|| self.message_offsets.get(message).copied().unwrap_or(0));
         let content = &frame["message"]["content"];
-        let length = content.as_array().map_or(1, Vec::len);
-        let next = base.checked_add(length)?;
         // Charge cumulative input, including replacements, before allocating
         // derived keys. This bounds adversarial UUIDs and huge block arrays.
-        self.charge(carrier.len().checked_add(message.len())?.checked_add(128)?)?;
+        self.charge(carrier.len().checked_add(128)?)?;
         if self.carriers.len() >= MAX_RECORDS && !self.carriers.contains_key(carrier) {
             return None;
         }
-        self.message_offsets.insert(message.to_owned(), next);
         let previous = self.carriers.remove(carrier);
+        // A repeated carrier no longer proves an immutable cached identity.
+        // Replaying ordinary assistant frames must not wake presentation.
         let mut changed = false;
         if let Some(previous) = previous {
-            for key in previous.items {
-                changed |= self.entries.remove(&key).is_some();
+            if self.ambiguous_carriers.insert(carrier.to_owned()) {
+                self.charge(carrier.len().checked_add(32)?)?;
+                changed = !previous.is_empty();
+            }
+            for key in previous {
+                self.entries.remove(&key);
             }
         }
-        let context = is_context(frame);
         let mut items = Vec::new();
+        if !is_context(frame) || self.ambiguous_carriers.contains(carrier) {
+            self.carriers.insert(carrier.to_owned(), items);
+            return Some(changed);
+        }
         let blocks: Box<dyn Iterator<Item = (Option<usize>, usize)> + '_> =
             if let Some(blocks) = content.as_array() {
                 Box::new(blocks.iter().enumerate().filter_map(|(index, block)| {
-                    (block["type"].as_str() == Some("text")).then_some((Some(index), base + index))
+                    (block["type"].as_str() == Some("text")).then_some((Some(index), index))
                 }))
             } else if content.is_string() {
                 Box::new(std::iter::once((None, 0)))
@@ -404,26 +390,20 @@ impl Source {
                 Box::new(std::iter::empty())
             };
         for (block, index) in blocks {
-            self.charge(message.len().checked_add(96)?)?;
+            self.charge(carrier.len().checked_add(96)?)?;
             if items.len() >= MAX_RECORDS || self.entries.len() >= MAX_RECORDS {
                 return None;
             }
-            let key = format!("{message}:{index}");
-            if context {
-                let entry = Entry {
-                    offset,
-                    bytes,
-                    block,
-                    base,
-                };
-                changed |= self.entries.insert(key.clone(), entry) != Some(entry);
-            } else {
-                changed |= self.entries.remove(&key).is_some();
-            }
+            let key = format!("{carrier}:{index}");
+            let entry = Entry {
+                offset,
+                bytes,
+                block,
+            };
+            changed |= self.entries.insert(key.clone(), entry) != Some(entry);
             items.push(key);
         }
-        self.carriers
-            .insert(carrier.to_owned(), Carrier { base, items });
+        self.carriers.insert(carrier.to_owned(), items);
         Some(changed)
     }
 
@@ -501,6 +481,10 @@ fn same_session(frame: &Value, session: &str) -> bool {
 }
 fn is_context(frame: &Value) -> bool {
     frame["type"].as_str() == Some("user")
+        // Only UUID-keyed user rows have the same identity in live and saved
+        // decoders. Explicit, differing message IDs have uncertain cumulative
+        // offsets and stay untouched, including when rereading a prior proof.
+        && frame["uuid"].as_str().is_some_and(|uuid| frame["message"]["id"].as_str().is_none_or(|id| id == uuid))
         && frame["origin"]["kind"].as_str() != Some("peer")
         && frame["parent_tool_use_id"]
             .as_str()
@@ -529,12 +513,10 @@ fn frame_text(frame: &Value, block: Option<usize>) -> Option<&str> {
     }
 }
 fn frame_item_id(frame: &Value, entry: Entry) -> Option<String> {
-    let id = frame["message"]["id"]
-        .as_str()
-        .or_else(|| frame["uuid"].as_str())?;
     Some(format!(
-        "{id}:{}",
-        entry.block.map_or(0, |index| entry.base + index)
+        "{}:{}",
+        frame["uuid"].as_str()?,
+        entry.block.unwrap_or(0)
     ))
 }
 
@@ -605,6 +587,9 @@ mod tests {
         }
         fn refresh(&mut self) -> bool {
             self.index.refresh(&self.launch, &self.scope, SESSION)
+        }
+        fn classifies(&mut self, id: &str, body: &str) -> bool {
+            self.index.classify(&mut text(id, body))
         }
     }
     fn frame(id: &str, body: &str) -> Value {
@@ -697,42 +682,129 @@ mod tests {
             }
         }
         for id in ["peer", "assistant", "child", "sidechain", "team", "mixed:1"] {
-            assert!(
-                !fixture.index.classify(&mut text(&format!("{id}:0"), body)),
-                "{id}"
-            );
+            assert!(!fixture.classifies(&format!("{id}:0"), body), "{id}");
         }
-        assert!(fixture.index.classify(&mut text("mixed:0", body)));
-        assert!(
-            !fixture
-                .index
-                .classify(&mut text("mixed:1", "Launching skill"))
-        );
-        assert!(
-            !fixture
-                .index
-                .classify(&mut text("0-true:0", "different cached bytes"))
-        );
+        assert!(fixture.classifies("mixed:0", body));
+        assert!(!fixture.classifies("mixed:1", "Launching skill"));
+        assert!(!fixture.classifies("0-true:0", "different cached bytes"));
     }
 
     #[test]
-    fn cumulative_carriers_and_rewritten_flags_do_not_reuse_stale_proofs() {
-        let mut fixture = Fixture::new();
-        for (id, body) in [("one", "first"), ("two", "second")] {
-            let mut row = frame(id, body);
-            row["message"] = json!({"id":"message","content":[{"type":"text","text":body}]});
-            fixture.append(row);
+    fn replayed_shared_ids_preserve_identical_genuine_live_and_history_cache_items() {
+        use crate::chat::Event;
+        fn history(launch: &Launch) -> Vec<Item> {
+            super::super::claude::create_history(launch)
+                .unwrap()
+                .1
+                .initialize()
+                .unwrap()
+                .events
+                .into_iter()
+                .find_map(|event| match event {
+                    Event::History { items, .. } => Some(items),
+                    _ => None,
+                })
+                .unwrap()
         }
+        let mut fixture = Fixture::new();
+        let row = |uuid, parent, synthetic| {
+            json!({"type":"user","uuid":uuid,"sessionId":SESSION,
+            "parentUuid":parent,"isSynthetic":synthetic,"message":{"id":"M","content":[{"type":"text","text":"identical"}]}})
+        };
+        let rows = [
+            row("A", Value::Null, false),
+            row("B", json!("A"), false),
+            row("A", Value::Null, false),
+            row("C", json!("B"), true),
+        ];
+        let mut live_launch = fixture.launch.clone();
+        live_launch.session_id = None;
+        let (_, mut live) = super::super::claude::create(&live_launch).unwrap();
+        let live: Vec<_> = rows
+            .iter()
+            .flat_map(|row| live.receive(row.clone()).unwrap().events)
+            .filter_map(|event| match event {
+                Event::Item(item) => Some(item),
+                _ => None,
+            })
+            .collect();
+        let live_genuine = live
+            .iter()
+            .find(|item| item.id == "M:1" && item.role == Role::User)
+            .unwrap()
+            .clone();
+        assert_eq!(live.last().unwrap().id, "M:2");
+        fixture.launch.recipe.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            fixture.scope.canonical_home.to_str().unwrap().into(),
+        );
+        for row in &rows[..3] {
+            fixture.append(row.clone());
+        }
+        let history_genuine = history(&fixture.launch)
+            .into_iter()
+            .find(|item| item.id == "M:1")
+            .unwrap();
+        assert_eq!(history_genuine.role, Role::User);
+        fixture.append(rows[3].clone());
+        assert_eq!(history(&fixture.launch).last().unwrap().id, "M:1");
+        fixture.refresh();
+        for mut genuine in [live_genuine, history_genuine] {
+            let before = genuine.clone();
+            assert!(!fixture.index.classify(&mut genuine));
+            assert_eq!(genuine, before);
+        }
+    }
+
+    #[test]
+    fn replayed_uuid_shapes_revoke_proofs_without_waking_for_assistant_offsets() {
+        for explicit_id in ["A", "different-message"] {
+            let mut fixture = Fixture::new();
+            let mut row = frame("A", "identical");
+            fixture.append(row.clone());
+            assert!(fixture.refresh());
+            assert!(fixture.classifies("A:0", "identical"));
+            row["message"]["id"] = json!(explicit_id);
+            row["message"]["content"] = json!([{"type":"text","text":"identical"}]);
+            fixture.append(row.clone());
+            assert!(
+                fixture.refresh(),
+                "quarantine invalidates earlier context proof"
+            );
+            assert!(!fixture.classifies("A:0", "identical"));
+            let mut projection = fixture.index.projection();
+            assert!(!projection.classify(&mut text("A:0", "identical")));
+            fixture.append(row);
+            assert!(
+                !fixture.refresh(),
+                "an already quarantined UUID adds no outward proof"
+            );
+            assert!(!fixture.classifies("different-message:0", "identical"));
+        }
+        let mut fixture = Fixture::new();
+        for uuid in ["A", "B", "A"] {
+            fixture.append(json!({"type":"assistant","uuid":uuid,"sessionId":SESSION,
+                "message":{"id":"assistant","content":[{"type":"text","text":"progress"}]}}));
+            assert!(
+                !fixture.refresh(),
+                "assistant bookkeeping adds no outward context proof"
+            );
+        }
+    }
+
+    #[test]
+    fn current_source_revalidation_rejects_a_changed_message_identity_before_rescan() {
+        let mut fixture = Fixture::new();
+        let mut row = frame("A", "identical");
+        row["message"]["id"] = json!("A");
+        fixture.append(row.clone());
         assert!(fixture.refresh());
-        assert!(fixture.index.classify(&mut text("message:0", "first")));
-        assert!(fixture.index.classify(&mut text("message:1", "second")));
-        let mut rewritten = frame("one", "first");
-        rewritten["isSynthetic"] = json!(false);
-        rewritten["message"] = json!({"id":"message","content":[{"type":"text","text":"first"}]});
-        fixture.append(rewritten);
-        assert!(fixture.refresh());
-        assert!(!fixture.index.classify(&mut text("message:0", "first")));
-        assert!(fixture.index.classify(&mut text("message:1", "second")));
+        assert!(fixture.classifies("A:0", "identical"));
+        row["message"]["id"] = json!("B");
+        // Same-sized first record followed by growth exercises reread guards,
+        // rather than the equal-length modification rejection.
+        std::fs::write(&fixture.path, format!("{row}\n{{}}\n")).unwrap();
+        assert!(!fixture.classifies("A:0", "identical"));
     }
 
     #[test]
@@ -742,7 +814,7 @@ mod tests {
         let body = "skill λ instructions\n".repeat(32 * 1024);
         fixture.append(frame("large", &body));
         assert!(fixture.refresh());
-        assert!(fixture.index.classify(&mut text("large:0", &body[..20])));
+        assert!(fixture.classifies("large:0", &body[..20]));
         let range = (21, 40);
         let id = TranscriptPart {
             item: "large:0",
@@ -773,7 +845,7 @@ mod tests {
                 fields,
             }
             .id();
-            assert!(!fixture.index.classify(&mut text(&id, bytes)));
+            assert!(!fixture.classifies(&id, bytes));
         }
     }
 
@@ -784,21 +856,13 @@ mod tests {
         let midpoint = line.len() / 2;
         std::fs::write(&fixture.path, &line[..midpoint]).unwrap();
         assert!(!fixture.refresh());
-        assert!(
-            !fixture
-                .index
-                .classify(&mut text("late:0", "provider wrote this later"))
-        );
+        assert!(!fixture.classifies("late:0", "provider wrote this later"));
         assert!(!fixture.refresh());
         let mut file = File::options().append(true).open(&fixture.path).unwrap();
         file.write_all(&line[midpoint..]).unwrap();
         file.write_all(b"\n").unwrap();
         assert!(fixture.refresh());
-        assert!(
-            fixture
-                .index
-                .classify(&mut text("late:0", "provider wrote this later"))
-        );
+        assert!(fixture.classifies("late:0", "provider wrote this later"));
         assert!(!fixture.refresh());
     }
 
@@ -811,26 +875,14 @@ mod tests {
         let replacement = fixture.path.with_extension("replacement");
         std::fs::write(&replacement, b"{}\n").unwrap();
         std::fs::rename(&replacement, &fixture.path).unwrap();
-        assert!(
-            !fixture
-                .index
-                .classify(&mut text("context:0", "instructions"))
-        );
+        assert!(!fixture.classifies("context:0", "instructions"));
         assert!(fixture.refresh());
-        assert!(
-            !fixture
-                .index
-                .classify(&mut text("context:0", "instructions"))
-        );
+        assert!(!fixture.classifies("context:0", "instructions"));
         fixture.append(frame("context", "instructions"));
         assert!(fixture.refresh());
         fixture.append(json!({"sessionId":"00000000-0000-4000-8000-000000000099"}));
         assert!(fixture.refresh());
-        assert!(
-            !fixture
-                .index
-                .classify(&mut text("context:0", "instructions"))
-        );
+        assert!(!fixture.classifies("context:0", "instructions"));
         assert!(!fixture.refresh(), "a static invalid file is not rescanned");
         std::fs::write(&fixture.path, b"not JSON\n").unwrap();
         assert!(!fixture.refresh());
@@ -847,17 +899,9 @@ mod tests {
         let removed = home.with_extension("old");
         std::fs::rename(&home, &removed).unwrap();
         std::fs::create_dir(&home).unwrap();
-        assert!(
-            !fixture
-                .index
-                .classify(&mut text("context:0", "instructions"))
-        );
+        assert!(!fixture.classifies("context:0", "instructions"));
         assert!(fixture.refresh());
-        assert!(
-            !fixture
-                .index
-                .classify(&mut text("context:0", "instructions"))
-        );
+        assert!(!fixture.classifies("context:0", "instructions"));
     }
 
     #[test]
@@ -874,7 +918,7 @@ mod tests {
             }
             fixture.append(frame("tail", "more instructions"));
             assert!(fixture.refresh());
-            assert!(!fixture.index.classify(&mut text("known:0", "instructions")));
+            assert!(!fixture.classifies("known:0", "instructions"));
             assert!(fixture.index.source.as_ref().unwrap().entries.is_empty());
         }
         let mut fixture = Fixture::new();
@@ -887,7 +931,7 @@ mod tests {
             .set_len(MAX_FILE + 1)
             .unwrap();
         assert!(fixture.refresh());
-        assert!(!fixture.index.classify(&mut text("known:0", "instructions")));
+        assert!(!fixture.classifies("known:0", "instructions"));
     }
 
     #[test]
@@ -895,7 +939,7 @@ mod tests {
         let mut fixture = Fixture::new();
         let mut bodies = vec!["instructions λ\n".repeat(32 * 1024)];
         bodies.extend((1..128).map(|index| format!("opaque instructions block {index}")));
-        fixture.append(json!({"type":"user","uuid":"carrier","sessionId":SESSION,"isSynthetic":true,
+        fixture.append(json!({"type":"user","uuid":"batch","sessionId":SESSION,"isSynthetic":true,
             "message":{"id":"batch","content":bodies.iter().map(|body|json!({"type":"text","text":body})).collect::<Vec<_>>()}}));
         fixture.append(frame("next-record", "next instructions"));
         assert!(fixture.refresh());
@@ -947,22 +991,6 @@ mod tests {
     }
 
     #[test]
-    fn immutable_projection_omits_scanner_state_and_keeps_exact_read_proofs() {
-        let mut fixture = Fixture::new();
-        fixture.append(frame("known", "instructions"));
-        assert!(fixture.refresh());
-        let mut projection = fixture.index.projection();
-        let source = projection.source.as_ref().unwrap();
-        assert!(source.carriers.is_empty() && source.message_offsets.is_empty());
-        assert_eq!((source.offset, source.records, source.charged), (0, 0, 0));
-        assert!(projection.classify(&mut text("known:0", "instructions")));
-        fixture.append(frame("later", "more instructions"));
-        assert!(fixture.refresh());
-        assert!(!projection.classify(&mut text("later:0", "more instructions")));
-        assert!(projection.classify(&mut text("known:0", "instructions")));
-    }
-
-    #[test]
     fn appending_during_a_bounded_scan_preserves_prefix_proofs_and_resumes_at_old_eof() {
         let mut fixture = Fixture::new();
         fixture.append(frame("prefix", "existing instructions"));
@@ -975,27 +1003,11 @@ mod tests {
                     writeln!(file, "{}", frame("tail", "concurrent instructions")).unwrap();
                 })
         );
-        assert!(
-            fixture
-                .index
-                .classify(&mut text("prefix:0", "existing instructions"))
-        );
-        assert!(
-            !fixture
-                .index
-                .classify(&mut text("tail:0", "concurrent instructions"))
-        );
+        assert!(fixture.classifies("prefix:0", "existing instructions"));
+        assert!(!fixture.classifies("tail:0", "concurrent instructions"));
         assert!(fixture.refresh());
-        assert!(
-            fixture
-                .index
-                .classify(&mut text("prefix:0", "existing instructions"))
-        );
-        assert!(
-            fixture
-                .index
-                .classify(&mut text("tail:0", "concurrent instructions"))
-        );
+        assert!(fixture.classifies("prefix:0", "existing instructions"));
+        assert!(fixture.classifies("tail:0", "concurrent instructions"));
         assert!(!fixture.refresh());
     }
 }
