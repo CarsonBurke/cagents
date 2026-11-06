@@ -3613,6 +3613,29 @@ fn file_changes(value: &Value) -> Result<Vec<FileChange>, String> {
     }
     Ok(changes)
 }
+/// The agents a collaboration call addressed, each with its state when Codex
+/// reported one. A call in progress, or one its turn cut short, names its
+/// receivers before it has their states, and the row still says whom it was
+/// for.
+fn agent_states(value: &Value) -> Value {
+    let mut states = value["agentsStates"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    for receiver in value["receiverThreadIds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(32)
+    {
+        states
+            .entry(receiver)
+            .or_insert_with(|| Value::Object(Default::default()));
+    }
+    Value::Object(states)
+}
+
 /// A tool call's arguments as its detail shows them: nothing when it was
 /// called with none.
 fn arguments(value: &Value) -> String {
@@ -3862,7 +3885,7 @@ fn parse_item_with_windows(
         "collabAgentToolCall" => tool_call(
             string(value, "tool")?.into(),
             value["prompt"].as_str().unwrap_or("").into(),
-            value["agentsStates"].to_string(),
+            agent_states(value).to_string(),
         ),
         "webSearch" => vec![Item {
             id: id.into(),
@@ -8757,9 +8780,19 @@ mod tests {
                 json!({"id":"f","type":"functionCallOutput","name":"lookup","output":output});
             assert_eq!(only_tool(item, true).2, "plain text");
         }
-        let interrupted = json!({"id":"c","type":"collabAgentToolCall","tool":"wait","status":"interrupted",
+        let interrupted = json!({"id":"c","type":"collabAgentToolCall","tool":"interruptAgent","status":"interrupted",
             "senderThreadId":"thread-exact","receiverThreadIds":["child"],"agentsStates":{}});
-        assert_eq!(only_tool(interrupted, true).3, ToolStatus::Stopped);
+        let (_, _, states, status) = only_tool(interrupted, true);
+        assert_eq!(status, ToolStatus::Stopped);
+        // The receiver is named even before Codex reports its state.
+        assert_eq!(states, r#"{"child":{}}"#);
+        let reported = json!({"id":"c","type":"collabAgentToolCall","tool":"sendMessage","status":"completed",
+            "senderThreadId":"thread-exact","receiverThreadIds":["child"],
+            "agentsStates":{"child":{"status":"running"}}});
+        assert_eq!(
+            only_tool(reported, true).2,
+            r#"{"child":{"status":"running"}}"#
+        );
     }
 
     /// Codex's own events read as events: an image being generated says
