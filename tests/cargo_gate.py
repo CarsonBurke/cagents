@@ -2036,8 +2036,9 @@ class FixtureCustody(unittest.TestCase):
         self.addCleanup(scope.close)
         root = Path(scope.name)
         with self.assertRaises(subprocess.TimeoutExpired):
+            # The command execs so nothing but the sweep can reap its children.
             scope.run(["sh", "-c", f"sleep 60 & echo $! >{root}/ordinary; "
-                       f"setsid sleep 60 & echo $! >{root}/detached; wait"], timeout=1)
+                       f"setsid sleep 60 & echo $! >{root}/detached; exec sleep 60"], timeout=1)
         pidfds = [os.pidfd_open(int((root / name).read_text())) for name in ("ordinary", "detached")]
         self.addCleanup(lambda: [os.close(pidfd) for pidfd in pidfds])
         # The command's group is gone; the child in its own session is not.
