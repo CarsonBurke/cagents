@@ -225,7 +225,11 @@ if __name__ == "__main__":
         if sys.argv[1:2] in (["--admission-deadline"], ["--admission-check"]):
             sys.exit(admission_clock(sys.argv[1:]))
         if sys.argv[1:2] == ["--wait-lock"]:
-            sys.exit(wait_lock(sys.argv[2:]))
+            try:
+                sys.exit(wait_lock(sys.argv[2:]))
+            except Exception as error:
+                print(f"cargo-gate: lock waiter failed: {error}", file=sys.stderr)
+                sys.exit(2)
         sys.exit(main())
     except Exception as error:
         print(f"cargo-gate: command supervision failed: {error}", file=sys.stderr)

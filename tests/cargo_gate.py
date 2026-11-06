@@ -959,7 +959,7 @@ exec sleep 60
         self.assertIsNone(child.poll(), "only a running flock's slot counts")
 
     def wait_for_gate_request(self, gate):
-        """Pin this private gate's waiting tree, accepting old and current gates."""
+        """Pin this private gate's waiting tree until its lock waiter blocks."""
         pinned = {pid for pid, _pidfd in self.descendants}
 
         def requesting():
@@ -989,9 +989,7 @@ exec sleep 60
                             pidfd = None
                         parents.append(pid)
                         arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-                        waiter = (arguments[:2] == [b"flock", b"6"]
-                                  or b"--wait-lock" in arguments)
-                        found |= waiter and "lock" in Path(f"/proc/{pid}/wchan").read_text()
+                        found |= b"--wait-lock" in arguments and "lock" in Path(f"/proc/{pid}/wchan").read_text()
                     except (FileNotFoundError, ProcessLookupError):
                         pass
                     finally:
@@ -1079,7 +1077,6 @@ exec sleep 60
         gate.kill()
         gate.wait(timeout=5)
         self.wait_for(lambda: not self.is_locked(queue), "the queue to free")
-        # An old gate's request may still wait, without the caller's streams.
         # Read to EOF without blocking: anything the gate wrote first also reads ready.
         for stream in (gate.stdout, gate.stderr):
             deadline = time.monotonic() + 5
@@ -1714,6 +1711,7 @@ class AdmissionTimeout(unittest.TestCase):
                     self.assertTrue(completed, "gate required its outside holder to release")
                     self.assertEqual(process.returncode, 124, stderr)
                     self.assertIn("admission", stderr.lower())
+                    self.assertEqual(stderr.count("build admission timed out"), 1, stderr)
                     self.assertFalse(caller_reaped)
                     if kind != "queue":
                         self.assertEqual(cost.read_text(), expected_cost)

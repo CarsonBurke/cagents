@@ -438,7 +438,8 @@ acquire() {
             exec 6>>"$lock"
             # A killed gate must leave neither an abandoned slot request nor
             # any helper holding its caller's pipes, locks or queue descriptor.
-            python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "${admission_deadline:-}" \
+            # This loop enforces the deadline itself, so the waiter needs none.
+            python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "" \
                 8>&- 9>&- </dev/null >/dev/null &
             waiter=$!
         fi
@@ -460,11 +461,16 @@ acquire() {
             sleep 0.5
             continue
         fi
-        # Queue again if the request itself was killed.
+        # Queue again if the request itself was killed; a waiter that failed
+        # on its own would fail again, so stop rather than respawn it forever.
         if waiter_gone; then
-            wait "$waiter" 2>/dev/null || :
+            status=0
+            wait "$waiter" 2>/dev/null || status=$?
             waiter=
             exec 6>&-
+            if [ "$status" -gt 0 ] && [ "$status" -lt 128 ]; then
+                exit "$status"
+            fi
             continue
         fi
         # Every free slot sees the same other builds, so price them once.
