@@ -241,7 +241,8 @@ class InstalledGateDeferral(unittest.TestCase):
 class InstalledGateSync(unittest.TestCase):
     """A gate change merged into main is installed by the next gate run."""
 
-    files = ("cargo-gate", "cargo-gate-command.py", "cargo-gate-sync.py", "cargo-offload",
+    files = ("cargo-gate", "cargo-gate-command.py", "cargo-gate-sync.py",
+             "cargo-gate-rustc-guard", "cargo-offload",
              "seed-build-dir", "build-disk-guard", "install-cargo-gate")
 
     def setUp(self):
@@ -803,6 +804,14 @@ exec sleep 60
         cargo.chmod(0o755)
         self.env["PATH"] = f"{binary}:{self.env['PATH']}"
 
+    def open_files(self, pid):
+        # A process still starting closes files as it loads, so one listed may be gone.
+        files = []
+        for entry in Path(f"/proc/{pid}/fd").iterdir():
+            with contextlib.suppress(FileNotFoundError):
+                files.append(os.readlink(entry))
+        return files
+
     def kill_gate_and_check_the_daemon(self, child):
         self.wait_for((self.root / "ready").exists, "the leftover daemon")
         daemon, stub = map(int, (self.root / "ready").read_text().split())
@@ -812,8 +821,7 @@ exec sleep 60
         child.kill()
         child.wait(timeout=5)
         os.kill(daemon, 0)
-        open_files = [os.readlink(entry) for entry in Path(f"/proc/{daemon}/fd").iterdir()]
-        self.assertNotIn(str(self.lock), open_files)
+        self.assertNotIn(str(self.lock), self.open_files(daemon))
         self.wait_for(self.slot_is_free, "the slot of a killed gate")
         os.kill(daemon, 0)
 
@@ -1320,6 +1328,8 @@ class MemoryAdmission(TwoSlots):
         result = self.build(1, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("waiting", result.stderr)
+        # It withdrew its request for the held slot; dash would report that.
+        self.assertNotIn("Terminated", result.stderr)
         cpus = os.cpu_count()
         self.assertEqual(int(result.stdout), max(4, min(8, cpus // 2)))
         # Released, the slot no longer prices its last holder.
@@ -1609,9 +1619,10 @@ class AdmissionTimeout(unittest.TestCase):
         self.assertEqual([event["phase"] for event in self.fixture.calls()], ["metadata", "guard"])
 
     def test_leading_zero_budget_does_not_limit_an_admitted_build(self):
-        self.reset(delays={"compiler":1.25}, compiler_exit=17)
-        process = self.fixture.start(environment=self.fixture.env | {self.setting:"0001"})
-        _stdout, stderr = process.communicate("", timeout=5)
+        # Admission must fit in the budget on a loaded host; the compiler then outlasts it.
+        self.reset(delays={"compiler":3.25}, compiler_exit=17)
+        process = self.fixture.start(environment=self.fixture.env | {self.setting:"0003"})
+        _stdout, stderr = process.communicate("", timeout=10)
         self.assertEqual(process.returncode, 17, stderr)
         self.assertNotIn("timed out", stderr.lower())
         compiler = next(event for event in self.fixture.calls() if event["phase"] == "compiler")

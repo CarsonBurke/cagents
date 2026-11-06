@@ -84,6 +84,22 @@ impl Picker {
 }
 
 impl Runtime {
+    /// While a subagent's transcript is open, the main conversation's own
+    /// work, a question for the reader or a failure is marked on its tab,
+    /// since its transcript is not there to say so. What its subagents do is
+    /// on their own tabs and counts, so it is not repeated here.
+    pub(super) fn parent_tab_state(&self) -> Option<(Icon, &str)> {
+        let (glyph, label) = self.conversation_status_base(false);
+        match glyph? {
+            Icon::AgentWorking if self.snapshot.busy => Some((Icon::AgentWorking, label)),
+            Icon::AgentWaiting if self.snapshot.waiting || !self.snapshot.requests.is_empty() => {
+                Some((Icon::AgentWaiting, label))
+            }
+            Icon::Warning => Some((Icon::Warning, label)),
+            _ => None,
+        }
+    }
+
     pub(super) fn child_navigation(&self, _width: f32) -> Element<'_, Message> {
         let target = self.target;
         let selected = self
@@ -134,18 +150,35 @@ impl Runtime {
             target,
             self.child_picker.is_none(),
         )));
+        let parent = selected
+            .and_then(|_| self.parent_tab_state())
+            .map(|(glyph, label)| {
+                let mark = if glyph == Icon::AgentWorking {
+                    crate::ui_controls::activity_spinner(
+                        f32::from(design::COMPACT_ICON_SIZE),
+                        design::accent_color,
+                    )
+                } else {
+                    crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
+                };
+                (mark, label)
+            });
+        let (mark, description) = match parent {
+            Some((mark, label)) => (Some(mark), format!("Main conversation: {label}").into()),
+            None => (None, "Main conversation".into()),
+        };
         let mut controls = vec![
             crate::ui_controls::view_tab(
                 crate::ui_controls::ViewTab {
                     label: "Conversation".into(),
-                    description: "Main conversation".into(),
+                    description,
                     count: None,
                     selected: selected.is_none(),
                     id: None,
                     on_press: Some(action(Action::SelectSubagent(target, None))),
                 },
                 true,
-                None,
+                mark,
             ),
             trigger.into(),
         ];

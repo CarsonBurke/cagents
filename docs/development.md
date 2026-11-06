@@ -402,11 +402,15 @@ locks and owned fixture processes only: `python3 tests/cargo_gate.py -v`.
 
 `scripts/lock-holders [LOCK...]` shows who holds each lock under
 `/var/tmp/cagents-*.lock*`, whether they or their descendants are using CPU, and who
-is waiting. It warns when no holder is a build or a session, which usually means a
-leftover process inherited the lock, and it notes a lock whose holders used no CPU
-during its one-second sample. A leftover that looks like a build, or a script that
-doesn't, can still fool the warning, so read the holders it lists. It only reads
-`/proc`, so ending a process stays your decision.
+is waiting. It notes a lock whose holders aren't a recognized build or session, and
+one whose holders used no CPU during its one-second sample. Neither makes a holder a
+leftover: a script can hold a lock and sleep between its own steps, and only its
+owner can say. Nor does a recognized name clear one: a leftover that looks like a
+build gets at most the idle note, so read the holders it lists. Process age isn't
+hold time: a process can start long before it takes a lock, or after the lock was
+taken if it inherited it. The kernel doesn't record when a lock was taken, but a
+holder that took the lock itself is marked, and took it at most its age ago. The tool
+only reads `/proc`, so ending a process stays your decision.
 
 The feature lanes coexist in one build directory: a no-op check of one lane
 stays a no-op after building the others. With a per-checkout build directory,
@@ -425,15 +429,30 @@ slot here. Commands that compile nothing, such as `metadata`, `tree` or
 first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
 script of builds, such as the development runner or
 `scripts/build-ceditor-product`, builds there too, each command with its own
-admission budget. On the build host itself, or with
+admission budget. A Cargo reached any other way inside COMMAND, by path,
+through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
+also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
+compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+On the build host itself, or with
 `CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
 above. A gate without `scripts/cargo-offload` beside it refuses to build
 unless `CAGENTS_BUILD_REMOTE=local` is set.
 
-The host has a few build slots under
-`~/.cache/cagents-offload/<repository>/slot-N` (`CAGENTS_BUILD_REMOTE_SLOTS`,
-default 3), each with its own checkout and target directory, and Cargo runs
-there with `CAGENTS_BUILD_REMOTE_JOBS` jobs (default 6). A build copies the
+The host has build slots under
+`~/.cache/cagents-offload/<repository>/slot-N`, each with its own checkout and
+target directory. A further slot is made when every slot is leased, up to
+`CAGENTS_BUILD_REMOTE_SLOTS` (default 8), and only while the host's free space
+holds another 50 GiB of build output above its floor, beyond the 50 GiB each
+slot made in the last 12 hours is taken to be filling to; how many build at
+once is then down to memory and CPU, below. Unless `CAGENTS_BUILD_REMOTE_JOBS`
+is set, each build gets the host's CPUs divided among the builds leased when
+it starts, as `CARGO_BUILD_JOBS`: at least 4, and at most 8 or half the CPUs
+where that is more than 4, as builds here get. A request from the same worktree
+and directory for the same build as one building now, a command that runs
+nothing there, waits for that slot rather than build it again in another,
+outside the queue meanwhile, and then gets back in line: once it ends, little
+is left to compile. A
+build copies the
 checkout's tracked and untracked, not ignored, files into a free slot and
 removes the slot's other files. It prefers the slot this worktree used last,
 then one another worktree has built in. A slot's checkout path never changes,
@@ -446,8 +465,11 @@ place. A slot last leased by a gate from before this rule rebuilds its sources
 once. A slot is admitted as the gate admits builds here: beside other
 running builds, only when the host's available memory, less what those builds
 are expected to take beyond what they already hold, covers this build's
-expected peak, and while the host's memory pressure (`some avg10` in
-`/proc/pressure/memory`) is below 10%; a lone build always starts. One build's
+expected peak (at least 2 GiB), while the host's memory pressure (`some
+avg10` in `/proc/pressure/memory`) is below 10%, and while its CPU pressure
+(`/proc/pressure/cpu`) is below 40%; a lone build always starts. A plain
+`cargo test` runs its tests there, in the slot, which stays leased until they
+end. One build's
 steps share one ssh connection, which ends with it. Output streams back and
 the exit status is Cargo's; cancelling the gate ends the command's processes
 on the host before the slot is free again. Commands there run without core
@@ -558,13 +580,20 @@ cold. Before its first gated build, `scripts/cargo-gate` runs
 `scripts/seed-build-dir`, which copies the main checkout's compiled
 dependencies into the new build directory with btrfs reflinks. The copy takes
 under a minute and shares file data with the main checkout's until either side
-rewrites a file, so it costs only file system metadata. Cargo then rebuilds
-what differs: this checkout's own and vendored crates, which depend on the
-checkout path, and the crates that depend on them. Incremental caches are not
-copied. Seeding does nothing on a file system without reflinks, when the main
-checkout has no build, for a directory that has been built in, or with
+rewrites a file, so it costs only file system metadata. Seeding leaves out the
+fingerprints of this checkout's own and vendored crates, the packages with no
+`source` in `Cargo.lock`, so Cargo always rebuilds them and the crates that
+depend on them. Cargo would otherwise judge them by source times alone, and a
+copied fingerprint can be newer than this checkout's different sources.
+Incremental caches are not copied. Seeding does nothing on a file system
+without reflinks, when the main checkout has no build or this checkout has no
+`Cargo.lock`, for a directory that has been built in, or with
 `CAGENTS_BUILD_SEED=0`; run `scripts/seed-build-dir` by hand to seed a
-directory a plain `cargo` would create. Seeded directories carry Cargo's
+directory a plain `cargo` would create. After copying a target by hand, run
+`scripts/seed-build-dir --forget-local TARGET` from the checkout that will build
+there, before its first build. It fails when it can't find this checkout's
+crates in `Cargo.lock`, or can't search or clean `TARGET`; a `TARGET` with no
+fingerprints has nothing to forget. Seeded directories carry Cargo's
 `CACHEDIR.TAG`, so `prune-cargo-build-dirs` reclaims them after their worktree
 is removed.
 
