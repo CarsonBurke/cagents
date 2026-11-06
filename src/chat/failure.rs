@@ -105,6 +105,13 @@ pub const COMMAND_OUT_OF_MEMORY: &str =
 /// Opens the runtime's report of a provider process that exited on its own.
 pub const PROVIDER_EXITED: &str = "Provider exited with ";
 
+/// Whether a reported error tells of something the agent carried on past,
+/// rather than a failure of the conversation. It still gets its notice in
+/// the transcript, but the conversation's state does not become an error.
+pub fn is_notice(message: &str) -> bool {
+    message.trim_start().starts_with(COMMAND_OUT_OF_MEMORY)
+}
+
 /// What a runtime exit report says happened to the provider, in words: the
 /// signal or status itself stays in the details.
 fn exit_summary(name: &str, message: &str) -> String {
