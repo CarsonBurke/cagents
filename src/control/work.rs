@@ -143,6 +143,42 @@ impl ControlClient {
         .map(drop)
     }
 
+    /// Inspects one project's card without fetching or removing anything.
+    /// The caller retains this connection's host proof with the returned plan.
+    pub fn plan_worktree_removal(
+        &mut self,
+        project: PathBuf,
+        item: String,
+    ) -> Result<RemovalPlan, ControlError> {
+        match self.work(
+            Request::RemovalPlan {
+                scope: Scope::Project(project),
+                item,
+                fetch: false,
+            },
+            PLAN_TIMEOUT,
+        )? {
+            Response::RemovalPlan(plan) => Ok(*plan),
+            response => Err(unexpected_response(
+                "a worktree removal plan",
+                &ServerResponse::Work(response),
+            )),
+        }
+    }
+
+    /// Submits the reviewed token and explicit preservation choices once.
+    /// An error does not establish whether removal took effect: reconcile the
+    /// current board and snapshots before deciding what to do next.
+    pub fn remove_worktree_from_plan(&mut self, removal: Removal) -> Result<Removed, ControlError> {
+        match self.work(Request::Remove(Box::new(removal)), REMOVE_TIMEOUT)? {
+            Response::Removed(removed) => Ok(*removed),
+            response => Err(unexpected_response(
+                "a worktree removal result",
+                &ServerResponse::Work(response),
+            )),
+        }
+    }
+
     /// Subscribes this connection to the Work board and returns it, with the
     /// revision later boards from [`Self::next_work_board`] supersede.
     pub fn watch_work(&mut self) -> Result<(u64, Board), ControlError> {
@@ -766,6 +802,261 @@ mod tests {
     };
 
     const NOW: u64 = 1_800_000_000_000;
+
+    fn removal_plan() -> RemovalPlan {
+        RemovalPlan {
+            project: "/device/project/.git".into(),
+            project_name: "project".into(),
+            item: "feature/reviewed".into(),
+            inspection: crate::worktree_content::Inspection {
+                path: "/device/project/.worktrees/reviewed".into(),
+                branch: Some("feature/reviewed".into()),
+                head: Some("reviewed-head".into()),
+                verdict: crate::worktree_content::Verdict::Landed,
+                landed_in: Some("origin/main".into()),
+                staged: 1,
+                modified: 2,
+                untracked: 3,
+                untracked_bytes: 40,
+                filtered: vec!["filtered.dat".into()],
+                nested: vec!["nested".into()],
+                ignored: vec![crate::worktree_content::IgnoredEntry {
+                    path: "target".into(),
+                    directory: true,
+                }],
+                ignored_total: 5,
+                token: Some("reviewed-content-token".into()),
+            },
+            merged_pull_request: Some(123),
+        }
+    }
+
+    fn removal(keep: Keep, delete_branch: bool) -> Removal {
+        Removal {
+            scope: Scope::Project("/device/project/.git".into()),
+            item: "/device/project/.worktrees/reviewed".into(),
+            token: "reviewed-content-token".into(),
+            keep,
+            delete_branch,
+        }
+    }
+
+    fn removed() -> Removed {
+        Removed {
+            project: "/device/project/.git".into(),
+            path: "/device/project/.worktrees/reviewed".into(),
+            snapshot: None,
+            deleted_branch: None,
+            branch_error: Some("Branch kept after worktree removal".into()),
+        }
+    }
+
+    fn work_handshake(stream: &mut UnixStream) -> HostSessionProof {
+        let connected: ClientEnvelope = read_frame(stream).unwrap().unwrap();
+        assert!(matches!(connected.request, ClientRequest::Connect { .. }));
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("work-removal-client"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+        };
+        work_reply(
+            stream,
+            &proof,
+            connected.request_id,
+            ServerResponse::Connected {
+                proof: proof.clone(),
+                resumed: Vec::new(),
+            },
+        );
+        proof
+    }
+
+    fn work_reply(
+        stream: &mut UnixStream,
+        proof: &HostSessionProof,
+        request_id: u64,
+        response: ServerResponse,
+    ) {
+        write_frame(
+            stream,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(request_id),
+                proof: proof.clone(),
+                message: ServerMessage::Response { response },
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn typed_removal_roundtrip_preserves_plan_token_scope_and_explicit_choices() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server = thread::spawn(move || {
+            let proof = work_handshake(&mut server_stream);
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(request.proof, Some(proof.clone()));
+            assert_eq!(
+                request.request,
+                ClientRequest::Work(Request::RemovalPlan {
+                    scope: Scope::Project("/device/project/.git".into()),
+                    item: "/device/project/.worktrees/reviewed".into(),
+                    fetch: false,
+                })
+            );
+            work_reply(
+                &mut server_stream,
+                &proof,
+                request.request_id,
+                ServerResponse::Work(Response::RemovalPlan(Box::new(removal_plan()))),
+            );
+            for keep in [Keep::Nothing, Keep::Snapshot, Keep::Discard] {
+                for delete_branch in [false, true] {
+                    let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    assert_eq!(request.proof, Some(proof.clone()));
+                    assert_eq!(
+                        request.request,
+                        ClientRequest::Work(Request::Remove(Box::new(removal(
+                            keep,
+                            delete_branch
+                        ))))
+                    );
+                    work_reply(
+                        &mut server_stream,
+                        &proof,
+                        request.request_id,
+                        ServerResponse::Work(Response::Removed(Box::new(removed()))),
+                    );
+                }
+            }
+            assert!(
+                read_frame::<ClientEnvelope>(&mut server_stream)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        assert_eq!(
+            client
+                .plan_worktree_removal(
+                    "/device/project/.git".into(),
+                    "/device/project/.worktrees/reviewed".into()
+                )
+                .unwrap(),
+            removal_plan()
+        );
+        for keep in [Keep::Nothing, Keep::Snapshot, Keep::Discard] {
+            for delete_branch in [false, true] {
+                assert_eq!(
+                    client
+                        .remove_worktree_from_plan(removal(keep, delete_branch))
+                        .unwrap(),
+                    removed()
+                );
+            }
+        }
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn typed_removal_rejects_wrong_outer_and_inner_replies_without_resending() {
+        for planning in [true, false] {
+            for outer in [true, false] {
+                let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+                server_stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let server = thread::spawn(move || {
+                    let proof = work_handshake(&mut server_stream);
+                    let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    assert!(matches!(
+                        (&request.request, planning),
+                        (ClientRequest::Work(Request::RemovalPlan { .. }), true)
+                            | (ClientRequest::Work(Request::Remove(_)), false)
+                    ));
+                    let response = if outer {
+                        ServerResponse::Accepted
+                    } else if planning {
+                        ServerResponse::Work(Response::Removed(Box::new(removed())))
+                    } else {
+                        ServerResponse::Work(Response::RemovalPlan(Box::new(removal_plan())))
+                    };
+                    work_reply(&mut server_stream, &proof, request.request_id, response);
+                    assert!(
+                        read_frame::<ClientEnvelope>(&mut server_stream)
+                            .unwrap()
+                            .is_none()
+                    );
+                });
+                let mut client = ControlClient::from_stream(client_stream).unwrap();
+                let result = if planning {
+                    client
+                        .plan_worktree_removal(
+                            "/device/project/.git".into(),
+                            "/device/project/.worktrees/reviewed".into(),
+                        )
+                        .map(drop)
+                } else {
+                    client
+                        .remove_worktree_from_plan(removal(Keep::Snapshot, false))
+                        .map(drop)
+                };
+                assert!(matches!(
+                    result,
+                    Err(ControlError::UnexpectedResponse { .. })
+                ));
+                drop(client);
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn typed_removal_disconnect_after_submission_is_not_retried() {
+        for planning in [true, false] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            server_stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let server = thread::spawn(move || {
+                work_handshake(&mut server_stream);
+                let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(
+                    (&request.request, planning),
+                    (ClientRequest::Work(Request::RemovalPlan { .. }), true)
+                        | (ClientRequest::Work(Request::Remove(_)), false)
+                ));
+                // The peer received the submission; no result establishes its effects.
+                // Close only its write half so a repeated request remains observable.
+                server_stream.shutdown(std::net::Shutdown::Write).unwrap();
+                assert!(
+                    read_frame::<ClientEnvelope>(&mut server_stream)
+                        .unwrap()
+                        .is_none()
+                );
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            let result = if planning {
+                client
+                    .plan_worktree_removal(
+                        "/device/project/.git".into(),
+                        "/device/project/.worktrees/reviewed".into(),
+                    )
+                    .map(drop)
+            } else {
+                client
+                    .remove_worktree_from_plan(removal(Keep::Discard, true))
+                    .map(drop)
+            };
+            assert!(matches!(result, Err(ControlError::ConnectionClosed)));
+            drop(client);
+            server.join().unwrap();
+        }
+    }
 
     fn item() -> Item {
         Item {

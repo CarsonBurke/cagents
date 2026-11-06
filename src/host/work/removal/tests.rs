@@ -171,13 +171,19 @@ fn isolated(name: &str) -> Option<PathBuf> {
     } else {
         Command::new(std::env::current_exe().unwrap())
     };
+    // Keep inherited delegation even though the fixture needs private XDG
+    // and HOME paths. Isolation must not turn a hosted caller into User.
+    let authority = std::env::var_os(crate::agent_execution::AUTHORITY_ENV);
+    command.env_clear();
+    if let Some(authority) = authority {
+        command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+    }
     let status = command
         .args([
             "--exact",
             &format!("host::work::removal::tests::{name}"),
             "--nocapture",
         ])
-        .env_clear()
         .env(CHILD, name)
         .env("CAGENTS_WORK_REMOVAL_ROOT", root)
         .env("HOME", root.join("home"))
