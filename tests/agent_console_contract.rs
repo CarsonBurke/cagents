@@ -479,6 +479,9 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
 /// line per step, each once, and none of what those steps carried.
 #[test]
 fn terminal_console_prints_each_line_once_without_tool_payloads() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let fixture = Fixture::with_provider(include_str!("fixtures/console-transcript-claude.sh"));
     let project = fixture.root.path().join("project");
     let project = project.to_str().unwrap();
