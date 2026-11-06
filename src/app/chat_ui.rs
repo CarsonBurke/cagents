@@ -9117,11 +9117,12 @@ impl Cagents {
                 match chat::failure::DeliveryOutcome::parse(&error) {
                     // Claude did not take the request; the model itself may
                     // be fine, so it stays on offer.
+                    // Whether the message itself is sent is reported apart.
                     Some(outcome) if outcome.unknown => runtime.note(format!(
-                        "Claude hasn't confirmed the switch to {name} yet, so the message may go to the default model."
+                        "Claude hasn't confirmed the switch to {name} yet, so this message may not use it."
                     )),
                     Some(_) => runtime.note(format!(
-                        "Claude didn't take the switch to {name}, so the message went to the default model."
+                        "Claude didn't take the switch to {name}, so this message won't use it."
                     )),
                     None => {
                         runtime.note(format!(
@@ -24325,11 +24326,11 @@ mod tests {
         for (outcome, said) in [
             (
                 chat::failure::delivery::UNACKNOWLEDGED_INPUT,
-                "hasn't confirmed the switch to gpt-b yet",
+                "hasn't confirmed the switch to gpt-b yet, so this message may not use it",
             ),
             (
                 chat::failure::delivery::UNCONFIRMED_INPUT,
-                "didn't take the switch to gpt-b",
+                "didn't take the switch to gpt-b, so this message won't use it",
             ),
         ] {
             let mut app = crate::app::tests::context_inspector_test_app(false);

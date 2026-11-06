@@ -54,6 +54,10 @@ const SETTLE_MARGIN: Duration = Duration::from_secs(1);
 /// about a minute: long enough for a busy journal to clear, and bounded for a
 /// helper that can never answer, such as one that already retired the input.
 const SETTLE_ATTEMPTS: u32 = 12;
+/// How long the helper is asked to settle an unconfirmed input at all. A
+/// helper that is alive but never answers in time, such as one wedged on its
+/// journal, is not counted by `SETTLE_ATTEMPTS`; this bounds it as well.
+const SETTLE_LIMIT: Duration = Duration::from_secs(120);
 // These reach the person through the chat pane, attached to a message, a
 // model choice or a stop. They say what happened to it and what to do; the
 // helper's own reasons stay in the logs.
@@ -63,6 +67,13 @@ use crate::chat::failure::delivery::{
     UNACKNOWLEDGED_INPUT, UNACKNOWLEDGED_STOP, UNAVAILABLE_INPUT, UNCONFIRMED_INPUT,
     UNSETTLEABLE_INPUT, UNSETTLED_INPUT, UNSUPPORTED_INPUT,
 };
+/// The outcome of an admitted input the actor's queue would not take.
+fn unrun_input_outcome(refusal: QueueRefusal) -> &'static str {
+    match refusal {
+        QueueRefusal::Closed => CLOSING_INPUT,
+        QueueRefusal::Full => CROWDED_INPUT,
+    }
+}
 /// A helper's answer to a request it does not implement, such as an older
 /// helper asked to settle an input.
 const UNKNOWN_METHOD: &str = "Unknown retained actor method/version";
@@ -235,8 +246,10 @@ struct UncertainInput {
     retransmit: Option<Retransmit>,
     /// The helper's latest refusal of the input, given without a receipt.
     refusal: Option<String>,
-    /// How many requests to settle the input have failed.
+    /// How many requests to settle the input the helper has refused.
     settle_failures: u32,
+    /// When the helper was first asked to settle the input.
+    settling_since: Option<Instant>,
     /// The helper cannot settle the input, so only a receipt it reports on
     /// its own lifts the fence.
     unsettleable: bool,
@@ -1571,6 +1584,7 @@ impl RemoteActor {
                 retransmit: None,
                 refusal: None,
                 settle_failures: 0,
+                settling_since: None,
                 unsettleable: false,
             });
             pending.push(Pending {
@@ -1677,12 +1691,12 @@ impl RemoteActor {
     /// and a caller still waiting hears it.
     fn resolve_uncertain_input(&self) {
         let (identity, settle_at, settle, last_refusal) = {
-            let uncertain = self
+            let mut uncertain = self
                 .0
                 .uncertain_input
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            let Some(uncertain) = uncertain.as_ref() else {
+            let Some(uncertain) = uncertain.as_mut() else {
                 return;
             };
             let now = Instant::now();
@@ -1692,6 +1706,9 @@ impl RemoteActor {
                 _ => return,
             }
             let settle = now >= settle_at;
+            if settle {
+                uncertain.settling_since.get_or_insert(now);
+            }
             (
                 uncertain.identity.clone(),
                 settle_at,
@@ -1704,6 +1721,7 @@ impl RemoteActor {
         } else {
             self.answer_input(&identity)
         };
+        let refused = matches!(answer, Ok(Err(_)));
         let refusal = match answer {
             Ok(Ok(receipt)) => {
                 if settle && matches!(&receipt.state, InputState::Acknowledged(Err(_))) {
@@ -1721,11 +1739,13 @@ impl RemoteActor {
                 self.stop_settling(&identity, "the retained actor cannot settle inputs");
                 return;
             }
-            Ok(Err(_)) if settle => {
+            Ok(Err(_)) | Err(_) if settle => {
                 // The helper refused to settle it for now, such as on a busy
-                // journal; it is asked again after the backoff, a bounded
-                // number of times. An unreachable helper is asked without
-                // limit, as it may yet return and settle it.
+                // journal, or did not answer; it is asked again after the
+                // backoff. Refusals are bounded in number. Missed answers are
+                // bounded only in time, as a helper that was unreachable may
+                // yet return and settle it, while one that is alive but never
+                // answers in time would otherwise fence input forever.
                 let exhausted = self
                     .0
                     .uncertain_input
@@ -1734,8 +1754,13 @@ impl RemoteActor {
                     .as_mut()
                     .filter(|uncertain| uncertain.identity == identity)
                     .is_some_and(|uncertain| {
-                        uncertain.settle_failures += 1;
+                        if refused {
+                            uncertain.settle_failures += 1;
+                        }
                         uncertain.settle_failures >= SETTLE_ATTEMPTS
+                            || uncertain
+                                .settling_since
+                                .is_some_and(|since| since.elapsed() >= SETTLE_LIMIT)
                     });
                 if exhausted {
                     self.stop_settling(&identity, "the retained actor kept failing to settle it");
@@ -2986,10 +3011,7 @@ impl Server {
                             ?refusal,
                             "the retained actor admitted an input it could not run"
                         );
-                        let reason = match refusal {
-                            QueueRefusal::Closed => CLOSING_INPUT,
-                            QueueRefusal::Full => CROWDED_INPUT,
-                        };
+                        let reason = unrun_input_outcome(refusal);
                         journal.finish(&identity, InputState::Acknowledged(Err(reason.into())))?;
                         if let Some(run) = run {
                             journal.refuse_unexecuted_run(run)?;
@@ -6147,6 +6169,54 @@ exec /bin/sleep 60
             actor.enqueue(None, Command::Refresh).unwrap_err(),
             UNSETTLEABLE_INPUT
         );
+    }
+    /// An admitted input the actor's queue will not take is refused as its
+    /// cause: a closing actor's for good, a full queue's as crowded.
+    #[test]
+    fn an_input_the_actor_queue_refuses_is_refused_as_its_cause() {
+        assert_eq!(unrun_input_outcome(QueueRefusal::Closed), CLOSING_INPUT);
+        assert_eq!(unrun_input_outcome(QueueRefusal::Full), CROWDED_INPUT);
+    }
+    #[test]
+    fn a_helper_that_never_answers_is_asked_to_settle_for_a_bounded_time() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let actor = RemoteActor::fixture_at(directory.path().join("actor.sock"));
+        let _response = actor.enqueue(None, Command::Refresh).unwrap();
+        let settle_now = |actor: &RemoteActor| {
+            let mut uncertain = actor.0.uncertain_input.lock().unwrap();
+            let uncertain = uncertain.as_mut().unwrap();
+            uncertain.acknowledgement_deadline = Instant::now();
+            uncertain.retransmit.as_mut().unwrap().next = Instant::now();
+        };
+        // Missed answers are not counted as refusals: the helper may return.
+        for attempt in 1..=SETTLE_ATTEMPTS * 2 {
+            settle_now(&actor);
+            actor.resolve_uncertain_input();
+            let uncertain = actor.0.uncertain_input.lock().unwrap();
+            let uncertain = uncertain.as_ref().unwrap();
+            assert!(!uncertain.unsettleable, "still settleable at {attempt}");
+            assert_eq!(uncertain.settle_failures, 0);
+        }
+        // A helper that never answers in time stops being asked after the
+        // limit, and new input is refused at once rather than fenced forever.
+        settle_now(&actor);
+        *actor
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .settling_since
+            .as_mut()
+            .unwrap() -= SETTLE_LIMIT;
+        actor.resolve_uncertain_input();
+        let started = Instant::now();
+        assert_eq!(
+            actor.enqueue(None, Command::Refresh).unwrap_err(),
+            UNSETTLEABLE_INPUT
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
     /// A proxy attached to the real helper request handling, served one
     /// request at a time as the helper's serve loop runs them.
