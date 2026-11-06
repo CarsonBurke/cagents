@@ -811,19 +811,55 @@ fn a_chat_that_finished_while_hidden_closes_without_asking() {
     assert!(!peer.app.chat_close_dialog_visible());
 }
 
-/// Closing while the first message is on its way would drop the prompt.
+/// Closing while the first message is on its way would drop the prompt, at
+/// every step of the send: saving it, starting the provider, and waiting for
+/// the provider to come up, which the provider reports as doing nothing.
 #[test]
-fn closing_during_this_windows_own_first_start_asks() {
+fn closing_at_any_step_of_this_windows_first_send_asks_and_keeps_the_message() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = super::tests::draft_chat_for_provider(&mut app, Provider::Claude);
+    write(&mut app, card, "hello");
+
+    super::tests::submit(&mut app, card);
+    assert!(app.chat_start_pending(card), "the provider is starting");
+    let asks_and_keeps = |app: &mut Cagents| {
+        drop(app.update(Message::CloseCard(card)));
+        assert!(app.chat_close_dialog_visible());
+        drop(app.update(Message::CancelChatClose));
+        assert!(!app.chat_close_dialog_visible());
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            panic!("the chat stays");
+        };
+        assert!(runtime.queued.is_some(), "and so does its first message");
+    };
+    asks_and_keeps(&mut app);
+
+    let target = super::tests::chat_runtime_attempt(&app, card);
+    let handle = super::tests::fixture_handle(&app, card, None);
+    handle.replace_snapshot_for_test(Snapshot {
+        ready: false,
+        ..Snapshot::default()
+    });
+    super::tests::answer_start(&mut app, target, Ok(handle));
+    assert!(!app.chat_start_pending(card), "attached, not yet up");
+    asks_and_keeps(&mut app);
+    let session = app.chat_working_session(card).unwrap();
+    assert!(session.1, "this window knows what it sent");
+}
+
+/// A window that came to the conversation from elsewhere has no message of its
+/// own to go by; a provider still coming up reports idle and has not been.
+#[test]
+fn closing_a_conversation_still_coming_up_elsewhere_asks_without_claiming_it_works() {
     let mut peer = peer();
-    let target = draft_runtime(&peer.app, peer.card).target;
-    peer.app
-        .chat_ui
-        .phases
-        .insert(peer.card, Phase::SavingDraft { target });
+    attached_with_update_pending(&mut peer);
+    publish_activity(&peer, |snapshot| snapshot.ready = false);
 
+    assert!(!peer.app.chat_working_session(peer.card).unwrap().1);
     drop(peer.app.update(Message::CloseCard(peer.card)));
-
     assert!(peer.app.chat_close_dialog_visible());
+
+    drop(peer.app.update(Message::CancelChatClose));
     assert!(card_open(&peer));
 }
 

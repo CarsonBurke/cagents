@@ -5155,6 +5155,16 @@ impl Runtime {
     fn connected(&self) -> bool {
         self.handle().is_some() && !self.disconnected
     }
+    /// Whether a message of this window's has yet to reach the provider, so
+    /// that ending the conversation now would lose it.
+    fn message_on_its_way(&self) -> bool {
+        self.queued.is_some()
+            || !self.followups.is_empty()
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.sent.is_some())
+    }
     pub(super) fn inspector_runtime_status(&self) -> InspectorRuntimeStatus {
         if self.disconnected {
             InspectorRuntimeStatus::Attention
@@ -8032,13 +8042,17 @@ impl Cagents {
             // refreshed while the pane is on screen, and a tab can be closed
             // without ever being shown.
             Some(CardRuntime::Chat(runtime)) if runtime.connected() && !pending => {
-                match runtime.handle()?.snapshot().activity() {
+                let snapshot = runtime.handle()?.snapshot();
+                match snapshot.activity() {
                     crate::agent::ActivityState::Working | crate::agent::ActivityState::Waiting => {
                         true
                     }
-                    crate::agent::ActivityState::Idle | crate::agent::ActivityState::Unknown => {
-                        return None;
-                    }
+                    crate::agent::ActivityState::Unknown => return None,
+                    // The provider says nothing of what it has not been handed.
+                    crate::agent::ActivityState::Idle if runtime.message_on_its_way() => true,
+                    // Nor can one that has not come up yet say it is idle.
+                    crate::agent::ActivityState::Idle if !snapshot.ready => false,
+                    crate::agent::ActivityState::Idle => return None,
                 }
             }
             // A pane that lost its connection or provider says so already, and
@@ -16917,7 +16931,7 @@ mod tests {
     fn draft_chat(app: &mut Cagents) -> CardId {
         draft_chat_for_provider(app, Provider::Codex)
     }
-    fn draft_chat_for_provider(app: &mut Cagents, provider: Provider) -> CardId {
+    pub(super) fn draft_chat_for_provider(app: &mut Cagents, provider: Provider) -> CardId {
         let _ = app.new_native_chat(provider, Some(PathBuf::from(FIXTURE_DIRECTORY)));
         let card = app.workspace.focused().unwrap();
         assert!(
@@ -19047,7 +19061,7 @@ mod tests {
     }
 
     /// Sends what the composer of `card` holds.
-    fn submit(app: &mut Cagents, card: CardId) {
+    pub(super) fn submit(app: &mut Cagents, card: CardId) {
         let target = chat_runtime(app, card).target;
         submit_target(app, target);
     }
@@ -20518,7 +20532,7 @@ mod tests {
         (card, target)
     }
 
-    fn answer_start(
+    pub(super) fn answer_start(
         app: &mut Cagents,
         target: Target,
         result: Result<Arc<ClientHandle>, chat::StartFailure>,
@@ -21049,7 +21063,7 @@ mod tests {
         card
     }
 
-    fn chat_runtime_attempt(app: &Cagents, card: CardId) -> Target {
+    pub(super) fn chat_runtime_attempt(app: &Cagents, card: CardId) -> Target {
         app.chat_ui
             .attempt(card)
             .expect("a start is in flight")
