@@ -875,7 +875,7 @@ fn finish_terminal_close(
         ));
     }
     if let Ok(Some(generation)) = &close.generation {
-        // This fsync runs outside the writer. The DELETE fences itself on the
+        // This commit runs outside the writer. The DELETE fences itself on the
         // generation, and the fresh read below refuses any newer publication.
         drop(admission);
         let result = super::agent_execution::registry(host).and_then(|registry| {
@@ -1292,7 +1292,7 @@ pub(super) fn process_request(
                 };
                 // The shared control reader spans selection and publication;
                 // automatic cleanup takes its writer before reserving an ID.
-                // Disconnect is not card closure, so these pins are durable.
+                // Disconnect is not card closure, so these pins outlive it.
                 if let Some(registry) = registry {
                     let internal =
                         |message| ProtocolError::new(ProtocolErrorCode::Internal, message, true);

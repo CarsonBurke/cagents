@@ -121,7 +121,8 @@ pub(super) fn pinned_terminals(
 impl Registry {
     /// A pin only defers retiring a worker alive on this boot. A process crash
     /// keeps a committed WAL frame in the OS, and power loss ends the worker
-    /// with its pin, so a window or Close need not wait for the disk here.
+    /// with its pin, so a window or Close need not wait for this commit's sync.
+    /// A checkpoint or a WAL restart that lands on one still syncs.
     fn commit_without_sync(
         &mut self,
         write: impl FnOnce(&Transaction<'_>) -> Result<(), String>,
