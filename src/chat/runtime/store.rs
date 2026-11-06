@@ -1207,6 +1207,48 @@ impl Store {
             None => self.boundary(id, len0, target),
         }
     }
+    /// Marks every cached step still running as stopped, once the provider
+    /// that ran it has exited and nothing will report its end. A step's
+    /// status is part of its metadata, so its cached output is kept as is.
+    pub(super) fn stop_running_steps(&mut self) -> Result<(), String> {
+        let mut statement = self
+            .db
+            .prepare("SELECT id,metadata FROM items")
+            .map_err(|e| e.to_string())?;
+        let mut stopped = Vec::new();
+        let mut rows = statement.query([]).map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let metadata: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
+            let mut item: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
+            if let Some(status) = item.content.status_mut()
+                && *status == crate::chat::ToolStatus::Running
+            {
+                *status = crate::chat::ToolStatus::Stopped;
+                let id: String = row.get(0).map_err(|e| e.to_string())?;
+                stopped.push((id, postcard::to_stdvec(&item).map_err(|e| e.to_string())?));
+            }
+        }
+        drop(rows);
+        drop(statement);
+        if stopped.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+        for (id, metadata) in &stopped {
+            transaction
+                .execute(
+                    "UPDATE items SET metadata=?2 WHERE id=?1",
+                    params![id, metadata],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
+        for (id, _) in &stopped {
+            self.changed(id);
+        }
+        self.dirty = true;
+        Ok(())
+    }
     fn changed(&mut self, id: &str) {
         if let Some(changed) = &mut self.changed {
             changed.insert(id.into());
@@ -3336,6 +3378,60 @@ mod tests {
         let completed = store.window().unwrap().items[0].clone();
         assert_eq!(completed.started_at, Some(started));
         assert!(completed.at.unwrap() >= streaming.at.unwrap());
+    }
+
+    #[test]
+    fn steps_left_running_at_exit_are_stopped_with_their_output_kept() {
+        use crate::chat::ToolStatus;
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let tool = |id: &str, status| Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Bash".into(),
+                input: "sleep 6001".into(),
+                output: String::new(),
+                status,
+            },
+            started_at: None,
+            at: None,
+        };
+        store
+            .apply(Event::Item(tool("running", ToolStatus::Running)))
+            .unwrap();
+        store
+            .apply(Event::OutputDelta {
+                id: "running".into(),
+                offset: 0,
+                delta: "epoch 1 of 40".into(),
+            })
+            .unwrap();
+        store
+            .apply(Event::Item(tool("done", ToolStatus::Succeeded)))
+            .unwrap();
+        // The actor reuses its last window, so the stop must reach it as a
+        // change, not only in a fresh read.
+        let mut presented = store.window().unwrap().items;
+        store.stop_running_steps().unwrap();
+        let items = store.window_reusing(&mut presented).unwrap().items;
+        let steps: Vec<_> = items
+            .iter()
+            .map(|item| match &item.content {
+                ItemContent::Tool { output, status, .. } => (output.as_str(), *status),
+                other => panic!("unexpected item {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("epoch 1 of 40", ToolStatus::Stopped),
+                ("", ToolStatus::Succeeded)
+            ]
+        );
+        // Nothing is left to stop the second time.
+        store.dirty = false;
+        store.stop_running_steps().unwrap();
+        assert!(!store.dirty);
     }
 
     /// The stamp is read as the moment an item finished, and a running daemon

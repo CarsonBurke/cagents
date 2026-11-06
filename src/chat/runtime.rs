@@ -658,6 +658,15 @@ impl LocalHandle {
                 } else {
                     true
                 };
+                // Nothing reports the end of a step the provider left running.
+                if let Err(error) = actor
+                    .store
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .stop_running_steps()
+                {
+                    tracing::warn!(%error, "steps left running could not be marked stopped");
+                }
                 actor.apply(Event::Exited { code });
                 let usage = actor
                     .state

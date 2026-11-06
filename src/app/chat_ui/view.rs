@@ -7369,7 +7369,10 @@ mod tests {
             "{} systemd-oomd ended it.",
             chat::failure::PROVIDER_OUT_OF_MEMORY
         ));
-        assert_eq!(runtime.conversation_status(false).1, "Error");
+        assert_eq!(
+            runtime.conversation_status(false),
+            (Some(Icon::Warning), "Stopped: out of memory".into())
+        );
     }
 
     #[test]
