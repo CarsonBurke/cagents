@@ -98,6 +98,12 @@ const PROMPT_MEASURE: f32 = 560.0;
 pub(super) const DELIVERY_FOLDED_HEIGHT: f32 = 180.0;
 /// The lines of a notice's event shown before it is opened.
 pub(super) const NOTICE_LINES: usize = 3;
+/// The characters of a notice's event shown before it is opened, so a single
+/// line too long to read at a glance cannot wrap down the transcript either.
+pub(super) const NOTICE_CHARS: usize = 480;
+/// The characters of a notice's heading. A heading is one line: what the
+/// notice is about, not the event itself.
+pub(super) const NOTICE_HEADING_CHARS: usize = 160;
 
 const MESSAGE_ACTION_HEIGHT: f32 = 24.0;
 /// The most characters a footer name shows before it is cut.

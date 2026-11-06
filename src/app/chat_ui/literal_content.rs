@@ -17,6 +17,38 @@ pub(super) enum Prepared {
         url: Option<markdown::Uri>,
     },
 }
+/// A notice's heading and body as they are shown.
+///
+/// A heading is one line saying what the notice is about. Claude Code names a
+/// command it was given no description for by the command itself, so a heredoc
+/// arrives as a heading thousands of lines long. Such a heading keeps the start
+/// of its first line, and the whole of it leads the body, which shows a few
+/// lines until the reader opens it.
+pub(super) fn notice_parts<'a>(
+    summary: &'a str,
+    body: &'a str,
+) -> (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>) {
+    let summary = summary.trim();
+    if !summary.contains(['\n', '\r']) && summary.chars().nth(view::NOTICE_HEADING_CHARS).is_none()
+    {
+        return (summary.into(), body.into());
+    }
+    let mut heading: String = summary
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_end()
+        .chars()
+        .take(view::NOTICE_HEADING_CHARS)
+        .collect();
+    heading.push('…');
+    let full = if body.is_empty() {
+        summary.to_owned()
+    } else {
+        format!("{summary}\n\n{body}")
+    };
+    (heading.into(), full.into())
+}
 pub(super) struct Notice(Option<Box<NoticeData>>);
 impl Notice {
     pub(super) fn data(&self) -> &NoticeData {
@@ -115,14 +147,17 @@ impl Prepared {
                 summary,
                 body,
                 ..
-            } => Self::Notice(Box::new(NoticeData {
-                summary: text(summary, None)?,
-                body: prompt::Prepared::with_policy(
-                    body,
-                    prompt::PreviewPolicy::Notice,
-                    cancelled,
-                )?,
-            })),
+            } => {
+                let (summary, body) = notice_parts(summary, body);
+                Self::Notice(Box::new(NoticeData {
+                    summary: text(&summary, None)?,
+                    body: prompt::Prepared::with_policy(
+                        &body,
+                        prompt::PreviewPolicy::Notice,
+                        cancelled,
+                    )?,
+                }))
+            }
             ItemContent::Image {
                 path,
                 description,

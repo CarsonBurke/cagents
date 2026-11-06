@@ -1962,6 +1962,76 @@ mod tests {
         assert!(slots.try_acquire_owned().is_ok());
     }
 
+    /// Claude Code names a command run without a description by the command
+    /// itself, and its task notification carries that name as the summary. A
+    /// subagent's 11 KB heredoc reached the parent conversation this way and
+    /// drew every line of it under a collapsed group.
+    #[test]
+    fn a_notice_named_by_a_whole_command_shows_one_line_and_a_bounded_body() {
+        let command = format!(
+            "mkdir -p /var/tmp/fw16-audit && cat > /var/tmp/fw16-audit/sampler.py <<'EOF'\n{}EOF\npython3 /var/tmp/fw16-audit/sampler.py 2 10",
+            "def sample(path):\n    with open(path) as f:\n        return f.read()\n\n".repeat(160)
+        );
+        let one_line = format!("cargo test {}", "--features host ".repeat(200));
+        for (summary, body, heading) in [
+            (
+                command.as_str(),
+                "",
+                "mkdir -p /var/tmp/fw16-audit && cat > /var/tmp/fw16-audit/sampler.py <<'EOF'…",
+            ),
+            (
+                one_line.as_str(),
+                "exit code 0",
+                &*format!(
+                    "{}…",
+                    one_line
+                        .chars()
+                        .take(view::NOTICE_HEADING_CHARS)
+                        .collect::<String>()
+                ),
+            ),
+        ] {
+            let (mut runtime, _handle) = literal_runtime(ItemContent::Delivery {
+                kind: chat::DeliveryKind::Notice,
+                from: String::new(),
+                sender: "b1".into(),
+                summary: summary.into(),
+                body: body.into(),
+            });
+            let (_run, shared) = job(&runtime.preparation);
+            let output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+                .join()
+                .unwrap();
+            let Some(literal_content::Prepared::Notice(notice)) = output.literal.as_ref() else {
+                panic!("notice payload")
+            };
+            assert_eq!(notice.summary.plain().as_ref(), heading);
+            let full = notice.body.full.plain();
+            assert!(
+                full.starts_with(summary.trim()),
+                "the whole name stays on demand"
+            );
+            assert!(full.ends_with(body));
+            assert!(notice.body.long, "a long name folds until it is opened");
+            let shown = notice.body.shown(false).plain();
+            assert!(shown.lines().count() <= view::NOTICE_LINES, "{shown}");
+            assert!(shown.chars().count() <= view::NOTICE_CHARS, "{shown}");
+            assert_eq!(notice.body.shown(true).plain(), full);
+            runtime.show(false);
+        }
+        for (summary, body) in [
+            (
+                "Background command \"Run tests\" completed (exit code 0)",
+                "",
+            ),
+            ("Monitor event: \"Build\"", "warning: unused import"),
+        ] {
+            let (heading, shown) = literal_content::notice_parts(summary, body);
+            assert_eq!((&*heading, &*shown), (summary, body));
+        }
+        retirement_barrier();
+    }
+
     #[test]
     fn managed_image_actual_worker_uses_receipt_label_and_preserves_diagnostics() {
         let reference = chat::ImageReference {
