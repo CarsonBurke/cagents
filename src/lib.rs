@@ -22,7 +22,11 @@ macro_rules! refuse_filtered_test_run {
         #[unsafe(link_section = ".init_array")]
         static REFUSE_FILTERED_TEST_RUN: extern "C" fn() = {
             extern "C" fn refuse() {
-                $crate::refuse_filtered_test_run(std::env::args().skip(1));
+                $crate::refuse_filtered_test_run(
+                    std::env::args_os()
+                        .skip(1)
+                        .map(|argument| argument.to_string_lossy().into_owned()),
+                );
             }
             refuse
         };
@@ -52,21 +56,24 @@ pub fn refuse_filtered_test_run(mut arguments: impl Iterator<Item = String>) {
     }
 }
 
-// A fixture re-runs this binary for one `--exact` test, and may check that child's
-// output and limits, so only the outer run reports or changes anything at startup.
-// `scripts/test-lib` also passes `--exact`, so its runs keep the limit they inherit.
-// The binary also re-executes as a holder or actor, whose own `.init_array` hook may
-// run after these in link order, and whose limit is the one under test.
+// The binary re-executes as a holder or actor, whose own `.init_array` hook may run
+// after these in link order, and whose limit is the one under test.
+#[cfg(all(test, target_os = "linux"))]
+fn is_reexecution() -> bool {
+    std::env::args_os().nth(1).is_some_and(|argument| {
+        let argument = argument.to_string_lossy();
+        argument.starts_with("--cagents-") || argument.starts_with("--internal-")
+    })
+}
+
+// A fixture re-runs this binary for one `--exact` test and may check that child's
+// output. `scripts/test-lib` also passes `--exact`, so its runs skip the report too.
 #[cfg(all(test, target_os = "linux"))]
 fn is_fixture_child() -> bool {
-    std::env::args()
-        .skip(1)
-        .enumerate()
-        .any(|(index, argument)| {
-            argument == "--exact"
-                || (index == 0
-                    && (argument.starts_with("--cagents-") || argument.starts_with("--internal-")))
-        })
+    is_reexecution()
+        || std::env::args_os()
+            .skip(1)
+            .any(|argument| argument == "--exact")
 }
 
 // Sandboxes such as Codex's can leave an empty .git in writable roots, which then
@@ -106,7 +113,7 @@ static REPORT_ENCLOSING_GIT: extern "C" fn() = {
 #[unsafe(link_section = ".init_array")]
 static RAISE_TEST_DESCRIPTOR_LIMIT: extern "C" fn() = {
     extern "C" fn raise() {
-        if is_fixture_child() {
+        if is_reexecution() {
             return;
         }
         let mut limit = libc::rlimit {
