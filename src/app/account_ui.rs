@@ -412,9 +412,15 @@ impl State {
 
     /// What another row's message calls `account`: [`Self::display_name`],
     /// but with the address it is listed as alone where its records name
-    /// two logins, which that row's own message explains.
+    /// two logins, which that row's own message explains, and the system
+    /// account named as such, since other rows can carry its address too.
     fn referred_name(&self, account: &AccountState) -> String {
-        self.name(account, false)
+        let name = self.name(account, false);
+        if account.account.is_system() && self.registry.label(&account.account).is_none() {
+            format!("System default ({name})")
+        } else {
+            name
+        }
     }
 
     /// [`Self::display_name`], naming both logins a disputed login's
@@ -844,7 +850,7 @@ impl LoginConflict {
                 with,
                 because: Contradiction::Disputed,
             } => format!(
-                "Reports the same login as {with}, but {with}'s records disagree about who it is, so neither is known to be a duplicate. Sign in again on {with} to settle it."
+                "Reports the same login as {with}, whose records disagree about who it is, so neither is known to be a duplicate. Sign in again on {with} to settle it."
             ),
             Self::Contradicted {
                 with,
@@ -8097,7 +8103,7 @@ mod app_tests {
                 .login_conflict(state(1))
                 .unwrap()
                 .detail()
-                .starts_with(&format!("Reports the same login as {with}, but {with}'s"))
+                .starts_with(&format!("Reports the same login as {with}, whose records"))
         );
         for index in [0, 1] {
             assert_eq!(
