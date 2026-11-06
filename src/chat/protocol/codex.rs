@@ -3967,23 +3967,16 @@ fn parse_item_with_windows(
             Role::System,
         )],
         // Codex starts the item when it begins compacting and completes it
-        // when the context has been replaced.
-        "contextCompaction" => vec![text(
-            id.into(),
-            if done {
-                "Context compacted"
-            } else {
-                "Compacting context…"
-            }
-            .into(),
-            false,
-            Role::System,
-        )],
+        // when the context has been replaced. The name stays the same either
+        // way and the status says how far it got, so an item a turn left
+        // unfinished, or one replayed from a turn still running, never reads
+        // as still compacting once it is not.
+        "contextCompaction" => tool_call("Compact context".into(), String::new(), String::new()),
         // What the hooks added, in their own words; the run IDs the fragments
         // are keyed by are Codex's bookkeeping.
-        "hookPrompt" => vec![text(
-            id.into(),
-            value["fragments"]
+        // Hooks that added nothing leave no row.
+        "hookPrompt" => {
+            let added = value["fragments"]
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -3991,22 +3984,22 @@ fn parse_item_with_windows(
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
                 .collect::<Vec<_>>()
-                .join("\n\n"),
-            false,
-            Role::System,
-        )],
-        // The agent pausing, named as a pause.
+                .join("\n\n");
+            if added.is_empty() {
+                Vec::new()
+            } else {
+                vec![text(id.into(), added, false, Role::System)]
+            }
+        }
+        // The agent pausing, named as a pause. As with compaction, the status
+        // and not the wording says whether the pause is over.
         "sleep" => {
             let seconds = value["durationMs"].as_u64().unwrap_or(0).div_ceil(1000);
             let duration = match seconds {
                 0..60 => format!("{seconds}s"),
                 _ => format!("{}m {}s", seconds / 60, seconds % 60),
             };
-            tool_call(
-                format!("{} {duration}", if done { "Waited" } else { "Waiting" }),
-                String::new(),
-                String::new(),
-            )
+            tool_call(format!("Wait {duration}"), String::new(), String::new())
         }
         // A subagent's lifecycle is reported on the subagent itself, as its
         // collaboration calls and thread status discover it; a row per
@@ -8814,9 +8807,22 @@ mod tests {
             ] => text.clone(),
             items => panic!("one notice, not {items:?}"),
         };
+        // A pause or a compaction keeps its name; its status says how far it
+        // got, so a replayed or abandoned one never reads as still going.
         let compaction = json!({"id":"k","type":"contextCompaction"});
-        assert_eq!(notice(compaction.clone(), false), "Compacting context…");
-        assert_eq!(notice(compaction, true), "Context compacted");
+        let running = only_tool(compaction.clone(), false);
+        assert_eq!(
+            (running.0.as_str(), running.3),
+            ("Compact context", ToolStatus::Running)
+        );
+        let done = only_tool(compaction, true);
+        assert_eq!(
+            (done.0.as_str(), done.3),
+            ("Compact context", ToolStatus::Succeeded)
+        );
+        let empty =
+            json!({"id":"h0","type":"hookPrompt","fragments":[{"hookRunId":"run-0","text":"  "}]});
+        assert!(parse_item(&empty, true, "turn").unwrap().is_empty());
         let hook = json!({"id":"h","type":"hookPrompt","fragments":[
             {"hookRunId":"run-1","text":"Remember the style guide."},{"hookRunId":"run-2","text":"Run the tests."}]});
         assert_eq!(
@@ -8824,8 +8830,16 @@ mod tests {
             "Remember the style guide.\n\nRun the tests."
         );
         let sleep = json!({"id":"s","type":"sleep","durationMs":90_000});
-        assert_eq!(only_tool(sleep.clone(), false).0, "Waiting 1m 30s");
-        assert_eq!(only_tool(sleep, true).0, "Waited 1m 30s");
+        let running = only_tool(sleep.clone(), false);
+        assert_eq!(
+            (running.0.as_str(), running.3),
+            ("Wait 1m 30s", ToolStatus::Running)
+        );
+        let done = only_tool(sleep, true);
+        assert_eq!(
+            (done.0.as_str(), done.3),
+            ("Wait 1m 30s", ToolStatus::Succeeded)
+        );
         let activity = json!({"id":"a","type":"subAgentActivity","kind":"started","agentThreadId":"child","agentPath":"/root/review"});
         assert!(parse_item(&activity, true, "turn").unwrap().is_empty());
         let mut adapter = adapter();
