@@ -2098,6 +2098,16 @@ enum LatestReader {
     Preserve,
 }
 
+/// When and how the last turn ended, as the transcript's closing stamp says.
+struct FinishedStamp {
+    at: u64,
+    clock: String,
+    full: String,
+    /// Settled when the turn finishes, so a later notice or an unrelated
+    /// local error does not rewrite how it ended.
+    outcome: &'static str,
+}
+
 struct PendingCommand {
     followup: bool,
     /// The provider's queued message this command asks back, which stops
@@ -2273,7 +2283,7 @@ pub(super) struct Runtime {
     snapshot: Arc<Snapshot>,
     provider_queue: std::cell::RefCell<prompt::ProviderQueue>,
     source_clock: Option<chat::client::SourceClock>,
-    finished_stamp: Option<(u64, String, String)>,
+    finished_stamp: Option<FinishedStamp>,
     cache: HashMap<String, CachedItem>,
     /// Only the selected child has presentation. Parent grouping continues to
     /// use its own cache, even when a child uses the same opaque item IDs.
@@ -4517,7 +4527,8 @@ impl Runtime {
         {
             return;
         }
-        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at {
+        if self.finished_stamp.as_ref().map(|stamp| stamp.at) != snapshot.finished_at {
+            let outcome = view::turn_outcome(&snapshot);
             self.finished_stamp = snapshot.finished_at.and_then(|at| {
                 let time = chat::local_time(i64::try_from(at / 1000).ok()?)?;
                 let full = format!(
@@ -4527,7 +4538,12 @@ impl Runtime {
                     time.day,
                     time.clock()
                 );
-                Some((at, format!("Finished at {}", time.clock()), full))
+                Some(FinishedStamp {
+                    at,
+                    clock: time.clock(),
+                    full,
+                    outcome,
+                })
             });
         }
         self.subagent_scroll

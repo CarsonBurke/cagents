@@ -722,6 +722,7 @@ class Evidence(unittest.TestCase):
             result = self.run_tool("start", "after", "--wait-lock", "0", check=False)
         self.assertEqual(result.returncode, 1)
         self.assertIn("native lock stayed busy", result.stderr)
+        self.assertIn(f"scripts/lock-holders {self.native_lock}", result.stderr)
         self.assertFalse((self.logs / "kwin").exists())
 
     def test_session_lifecycle_holds_the_lock_isolates_state_and_ends_its_processes(self) -> None:

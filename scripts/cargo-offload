@@ -569,13 +569,16 @@ CPU_PRESSURE_LIMIT = 40
 # floor the host keeps free, before one is made. The variable is for tests
 # standing in for the build host; ssh does not pass it on.
 SLOT_DISK = int(os.environ.get("CAGENTS_OFFLOAD_SLOT_DISK_BYTES") or 50 * GIB)
+# Where memory and CPU figures are read. This too is for tests, whose results
+# must not depend on how busy the host running them is.
+FIGURES = os.environ.get("CAGENTS_OFFLOAD_FIGURES") or "/proc"
 # How long a new slot is taken to be filling to that size.
 SLOT_FILLS = 12 * 3600
 
 
 def available_memory():
     try:
-        with open("/proc/meminfo") as file:
+        with open(f"{FIGURES}/meminfo") as file:
             for line in file:
                 if line.startswith("MemAvailable:"):
                     return int(line.split()[1]) * 1024
@@ -586,7 +589,7 @@ def available_memory():
 
 def memory_pressure(resource="memory"):
     try:
-        with open(f"/proc/pressure/{resource}") as file:
+        with open(f"{FIGURES}/pressure/{resource}") as file:
             for line in file:
                 if line.startswith("some "):
                     return float(line.split("avg10=")[1].split()[0])
