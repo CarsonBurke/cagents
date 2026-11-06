@@ -1146,6 +1146,18 @@ Published releases still come from `scripts/build-release-linux`; see
 | A UI problem needs logs | Add `--debug --log-file /tmp/cagents-ui.log` and read the file after reproducing. |
 | New links do not open in browserless mode | Install `xdg-utils`, or use a desktop with a working portal. |
 
+## Scripts and mise shims
+
+A mise shim on `PATH` under a moved `HOME` or `XDG_DATA_HOME`, as in a fixture, finds
+itself and re-executes without end: no error, and the process keeps its pid and
+restarts forever, outliving a `timeout` on its parent. In a terminal it can also
+stop at mise's trust prompt in a new worktree. So scripts here name `/usr/bin/python3`
+rather than finding `python3` on `PATH`, and a host running them needs it there.
+`scripts/cargo-gate` also sets `MISE_DATA_DIR` from the shims directory on `PATH`, so
+what it runs can move `HOME`. A harness of your own that moves `HOME` and runs tools
+through shims should set `MISE_DATA_DIR` first or drop the shims from `PATH`, and
+should run in a systemd scope with a time limit, which stops all of it.
+
 ## Standalone editor
 
 ```sh

@@ -52,7 +52,7 @@ if [ -z "$synced" ] && [ "${CAGENTS_BUILD_INSTALL_SYNC-1}" != 0 ] &&
     main=$(git rev-parse -q --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null) &&
     [ "$(cat -- "$installed.checked" 2>/dev/null)" != "$main" ]; then
     was=$(readlink -f -- "$installed" 2>/dev/null) || was=
-    if python3 "$here/cargo-gate-sync.py" "$installed" "$main"; then
+    if /usr/bin/python3 "$here/cargo-gate-sync.py" "$installed" "$main"; then
         # This gate was the installed one, so main's runs in its place.
         case $here/ in
             "$(readlink -f -- "$(dirname -- "$installed")")/cagents-cargo-gate.d/"*)
@@ -679,7 +679,7 @@ acquire() {
     exec 6>>"$lock.queue"
     if ! flock -n 6; then
         announce
-        python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "${admission_deadline:-}" \
+        /usr/bin/python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "${admission_deadline:-}" \
             8>&- 9>&- </dev/null >/dev/null &
         waiter=$!
         status=0
@@ -695,7 +695,7 @@ acquire() {
             # A killed gate must leave neither an abandoned slot request nor
             # any helper holding its caller's pipes, locks or queue descriptor.
             # This loop enforces the deadline itself, so the waiter needs none.
-            python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "" \
+            /usr/bin/python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "" \
                 8>&- 9>&- </dev/null >/dev/null &
             waiter=$!
         fi
@@ -764,7 +764,7 @@ acquire() {
 check_admission() {
     [ -n "$admission_deadline" ] || return 0
     admission_status=0
-    python3 "$here/cargo-gate-command.py" \
+    /usr/bin/python3 "$here/cargo-gate-command.py" \
         --admission-check "$admission_deadline" 6>&- 8>&- 9>&- || admission_status=$?
     if [ "$admission_status" -ne 0 ]; then
         withdraw
@@ -866,7 +866,7 @@ supervised() {
     if [ -z "$slot_marker" ] && [ -n "${admission_deadline:-}" ]; then
         set -- --admission-until "$admission_deadline" "$@"
     fi
-    CAGENTS_BUILD_SLOT_HELD=$slot_marker python3 "$here/cargo-gate-command.py" \
+    CAGENTS_BUILD_SLOT_HELD=$slot_marker /usr/bin/python3 "$here/cargo-gate-command.py" \
         "$@" 0<&8 8>&- 9>&- &
     child=$!
     exec 8<&-
@@ -1019,7 +1019,7 @@ esac
 if [ "$where" -eq 0 ]; then
     deadline=
     if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
-        deadline=$(python3 "$here/cargo-gate-command.py" \
+        deadline=$(/usr/bin/python3 "$here/cargo-gate-command.py" \
             --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
     fi
     admission_deadline=
@@ -1065,7 +1065,7 @@ fi
 
 admission_deadline=
 if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
-    admission_deadline=$(python3 "$here/cargo-gate-command.py" \
+    admission_deadline=$(/usr/bin/python3 "$here/cargo-gate-command.py" \
         --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
 fi
 
