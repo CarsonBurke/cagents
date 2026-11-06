@@ -678,6 +678,7 @@ class ScriptContractsApplicability(unittest.TestCase):
         ] + [
             "Not applicable: build directory seeding (source and fixture both absent at this head)",
             "Not applicable: build disk guard and gate install (source and fixture both absent at this head)",
+            "Not applicable: build directory pruning (source and fixture both absent at this head)",
             "Not applicable: build offload (source and fixture both absent at this head)",
             "Not applicable: focused lib tests (source and fixture both absent at this head)",
             "Not applicable: lock holders (source and fixture both absent at this head)",
@@ -696,6 +697,7 @@ class ScriptContractsApplicability(unittest.TestCase):
                          + [
                              "Not applicable: build directory seeding (source and fixture both absent at this head)",
                              "Not applicable: build disk guard and gate install (source and fixture both absent at this head)",
+                             "Not applicable: build directory pruning (source and fixture both absent at this head)",
                              "Not applicable: build offload (source and fixture both absent at this head)",
                              "Not applicable: focused lib tests (source and fixture both absent at this head)",
                              "Not applicable: lock holders (source and fixture both absent at this head)",

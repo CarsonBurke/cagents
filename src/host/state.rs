@@ -285,6 +285,8 @@ pub(crate) struct HostState {
     /// would invite every window to re-seed on every connection. A failure is
     /// reported instead, and terminals keep working meanwhile.
     model: Option<super::model::Registry>,
+    /// Layout persistence and hydration never borrow the global terminal lock.
+    pub(super) workspace_registry: Option<Arc<Mutex<super::model::Registry>>>,
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
@@ -445,6 +447,7 @@ impl HostState {
             clients: BTreeMap::new(),
             watchers: BTreeSet::new(),
             model: None,
+            workspace_registry: None,
             execution_registry: None,
             agent_clients: BTreeMap::new(),
             automations: None,
@@ -559,6 +562,13 @@ impl HostState {
             Ok(connection) => Some(Arc::new(Mutex::new(connection))),
             Err(error) => {
                 tracing::error!(%error, "cannot open the agent execution registry");
+                None
+            }
+        };
+        self.workspace_registry = match registry.execution_connection() {
+            Ok(connection) => Some(Arc::new(Mutex::new(connection))),
+            Err(error) => {
+                tracing::error!(%error, "cannot open the workspace model writer");
                 None
             }
         };
@@ -719,11 +729,16 @@ impl HostState {
         destination
     }
 
+    pub(super) fn subscribe_model(&mut self, client_id: ClientId) {
+        self.model_watchers.insert(client_id);
+    }
+
     /// Subscribes `client_id` to shared-model edges and returns the model.
     ///
     /// Both happen under one lock, so an edit applied between subscribing and
     /// reading cannot fall into a gap: a client either sees it in the model it
     /// is handed or receives it as an edge afterwards, never neither.
+    #[cfg(test)]
     pub(crate) fn watch_model(
         &mut self,
         client_id: ClientId,
@@ -733,6 +748,7 @@ impl HostState {
         Ok(model)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_model(&self) -> Result<WorkspaceModel, ProtocolError> {
         self.model
             .as_ref()
@@ -751,37 +767,6 @@ impl HostState {
         let edit = edit
             .canonicalized()
             .map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false))?;
-        if let ModelEdit::ChangeView {
-            scope,
-            expected_revision,
-            operation,
-            change,
-        } = &edit
-        {
-            let registry = self.registry()?;
-            let seen = registry
-                .view_operation_seen(*operation)
-                .map_err(model_unavailable)?;
-            if !seen {
-                if let Some(reason) = registry
-                    .view_change_refusal(scope, change)
-                    .map_err(model_unavailable)?
-                {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::InvalidRequest,
-                        reason,
-                        false,
-                    ));
-                }
-                if registry.view_revision(scope).map_err(model_unavailable)? != *expected_revision {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::ViewConflict,
-                        "The workspace view changed; rebase this pane mutation on the current revision",
-                        true,
-                    ));
-                }
-            }
-        }
         if let ModelEdit::SuggestConversationTitle {
             id,
             card,
@@ -808,9 +793,9 @@ impl HostState {
             {
                 return Err(invalid());
             }
-            // Model mutations serialize under this HostLock. Read only resident
-            // metadata, not Store, snapshot/history or files. A later B edit
-            // cannot overtake this A admission; a delayed A sees B's current name.
+            // The request holds workspace writer admission as well as this
+            // resident identity guard. Read only current metadata, not Store,
+            // history or files; later edits cannot overtake this admission.
             let (session, current_title) =
                 actual.handle.conversation_title().map_err(|reason| {
                     let busy = reason == crate::chat::runtime::TitleUnavailable::Busy;
@@ -841,31 +826,9 @@ impl HostState {
                 _ => return Err(invalid()),
             }
         }
-        let registry = self.registry()?;
-        let applied = registry.apply(&edit).map_err(|error| {
-            if error == super::model::Registry::VIEW_SOURCE_CONFLICT {
-                return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
-            }
-            // An execution writer can close a view after the preflight read.
-            // apply has rolled back; inspect authoritative membership again
-            // rather than making the client retry a permanently invalid edit.
-            if let ModelEdit::ChangeView { scope, change, .. } = &edit {
-                match registry.view_change_refusal(scope, change) {
-                    Ok(Some(reason)) => {
-                        return ProtocolError::new(
-                            ProtocolErrorCode::InvalidRequest,
-                            reason,
-                            false,
-                        );
-                    }
-                    Err(storage) => return model_unavailable(storage),
-                    Ok(None) => {}
-                }
-            }
-            model_unavailable(error)
-        })?;
+        let applied = super::workspace::apply(self.registry()?, &edit)?;
         if applied.changed {
-            self.announce_model_edit(origin, applied.model.sequence, &edit);
+            self.announce_model_edit(origin, applied.sequence, &edit);
         }
         Ok(applied.model)
     }
@@ -3899,83 +3862,6 @@ pub(crate) fn spawn_terminal(
     spawn_terminal_with_environment(shared, client_id, session, options, None)
 }
 
-fn finish_pending_terminal(state: &mut HostState, terminal_id: TerminalId) {
-    // Finish a durable automatic-terminal reservation only after its exact
-    // worker exists. A client lost before this point can resume the intent.
-    let session = state.terminals[&terminal_id].session.clone();
-    if let Some(registry) = state.model.as_mut() {
-        if let Ok(model) = registry.model() {
-            for view in model.views {
-                for before in view.panes {
-                    if before.pending_terminal_start
-                        && matches!(&before.kind,crate::model::CardKind::Terminal(terminal) if terminal.id==terminal_id)
-                    {
-                        let mut pane = before.clone();
-                        pane.pending_terminal_start = false;
-                        pane.kind = crate::model::CardKind::Terminal(session.clone());
-                        let edit = ModelEdit::ChangeView {
-                            scope: view.scope.clone(),
-                            expected_revision: view.revision,
-                            operation: uuid::Uuid::new_v4(),
-                            change: crate::workspace_model::views::Change::Update { before, pane },
-                        };
-                        match registry.apply(&edit) {
-                            Ok(applied) if applied.changed => {
-                                let sequence = applied.model.sequence;
-                                for watcher in &state.model_watchers {
-                                    if let Some(delivery) = state.clients.get(watcher) {
-                                        let _ = delivery.push(Outbound::broadcast(
-                                            &state.proof,
-                                            ServerMessage::WorkspaceModelEdited {
-                                                sequence,
-                                                edit: edit.clone(),
-                                            },
-                                        ));
-                                    }
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(error) => {
-                                tracing::warn!(%terminal_id,%error,"could not finish automatic terminal reservation")
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Reads only the daemon's accepted reservation, never a client's launch recipe.
-fn pending_terminal_session(
-    state: &HostState,
-    pane: crate::model::CardId,
-    terminal_id: TerminalId,
-    require_pending: bool,
-) -> Result<TerminalSession, ProtocolError> {
-    let model = state
-        .model
-        .as_ref()
-        .ok_or_else(|| model_unavailable("registry is unavailable".into()))?
-        .model()
-        .map_err(model_unavailable)?;
-    model
-        .views
-        .into_iter()
-        .flat_map(|view| view.panes)
-        .find_map(|candidate| {
-            if candidate.id == pane && (!require_pending || candidate.pending_terminal_start) {
-                if let crate::model::CardKind::Terminal(session) = candidate.kind {
-                    if session.id == terminal_id {
-                        return Some(session);
-                    }
-                }
-            }
-            None
-        })
-        .ok_or_else(|| not_found(terminal_id))
-}
-
 pub(super) fn spawn_pending_terminal(
     shared: &SharedHost,
     client_id: ClientId,
@@ -3984,8 +3870,9 @@ pub(super) fn spawn_pending_terminal(
     options: TerminalSpawnOptions,
 ) -> Result<TerminalDescriptor, ProtocolError> {
     let session = {
-        let state = shared.lock().unwrap_or_else(|p| p.into_inner());
-        pending_terminal_session(&state, pane, terminal_id, false)?
+        let writer = super::workspace::writer(shared)?;
+        let registry = writer.lock().unwrap_or_else(|p| p.into_inner());
+        super::workspace::pending_terminal(&registry, pane, terminal_id)?.session
     };
     start_terminal_view_owned(
         shared,
@@ -4247,21 +4134,32 @@ fn start_terminal_view_owned_reserved(
     let install_session = previous
         .as_ref()
         .map_or_else(|| session.clone(), |previous| previous.source.clone());
+    // Pane reservations are read on the workspace writer, which is always
+    // locked before HostState and never while holding it.
+    let pending_writer = pending_pane
+        .map(|_| super::workspace::writer(shared))
+        .transpose()?;
     let holder_recovery = {
+        let registry = pending_writer
+            .as_ref()
+            .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
+        let reservation = registry
+            .as_deref()
+            .zip(pending_pane)
+            .map(|(registry, pane)| super::workspace::pending_terminal(registry, pane, terminal_id))
+            .transpose()?;
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(pane) = pending_pane {
+        if let Some(reservation) = reservation {
             // Completion is idempotent across clients, but an actor alone is
             // insufficient: its authoritative pane must still name it.
             if state.terminals.contains_key(&terminal_id) {
-                pending_terminal_session(&state, pane, terminal_id, false)?;
                 let descriptor = state.attach(client_id, terminal_id)?;
                 let handle = state.terminals[&terminal_id].handle.clone();
                 return Ok((descriptor, handle));
             }
-            let accepted = pending_terminal_session(&state, pane, terminal_id, true)?;
-            if accepted.launch != session.launch {
+            if !reservation.accepts(&session) {
                 return Err(not_found(terminal_id));
             }
         }
@@ -4523,7 +4421,25 @@ fn start_terminal_view_owned_reserved(
         .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
 
     let redraw_handle = handle.clone();
-    let descriptor = {
+    // Hold writer admission from this check through the completion save.
+    let mut pending_registry = pending_writer
+        .as_ref()
+        .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
+    let reservation = pending_registry
+        .as_deref()
+        .zip(pending_pane)
+        .map(|(registry, pane)| {
+            super::workspace::pending_terminal(registry, pane, terminal_id).and_then(
+                |reservation| {
+                    if reservation.accepts(&session) {
+                        Ok(reservation)
+                    } else {
+                        Err(not_found(terminal_id))
+                    }
+                },
+            )
+        });
+    let (descriptor, completion) = {
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4537,16 +4453,9 @@ fn start_terminal_view_owned_reserved(
                 false,
             ));
         }
-        if let Some(pane) = pending_pane {
-            let validation =
-                pending_terminal_session(&state, pane, terminal_id, true).and_then(|accepted| {
-                    if accepted.launch == session.launch {
-                        Ok(())
-                    } else {
-                        Err(not_found(terminal_id))
-                    }
-                });
-            if let Err(error) = validation {
+        let reservation = match reservation.transpose() {
+            Ok(reservation) => reservation,
+            Err(error) => {
                 if adopting {
                     state.retain_startup_recovery(format!(
                         "Adopted terminal {terminal_id} lost its pane reservation after commit: {}",
@@ -4556,6 +4465,7 @@ fn start_terminal_view_owned_reserved(
                 }
                 state.cancel_spawn(terminal_id);
                 drop(state);
+                drop(pending_registry);
                 // The reservation was withdrawn while the worker was starting.
                 // Shut down only this unpublished worker, never an actor
                 // already attached by another client.
@@ -4563,7 +4473,7 @@ fn start_terminal_view_owned_reserved(
                 drop(handle);
                 return Err(error);
             }
-        }
+        };
         let issued_hint = execution_recipe
             .as_ref()
             .map(|_| session.resume_hint.clone());
@@ -4614,9 +4524,9 @@ fn start_terminal_view_owned_reserved(
                 .resume_hint = hint.clone();
             descriptor.session.resume_hint = hint;
         }
-        if descriptor.is_ok() && pending_pane.is_some() {
-            finish_pending_terminal(&mut state, terminal_id);
-        }
+        let completion = reservation
+            .filter(|_| descriptor.is_ok())
+            .map(|reservation| (reservation, state.terminals[&terminal_id].session.clone()));
         if descriptor.is_ok() {
             state
                 .terminals
@@ -4635,8 +4545,14 @@ fn start_terminal_view_owned_reserved(
             // terminal connection after checkpointing the returned live proof.
             state.subscriptions.detach(client_id, terminal_id);
         }
-        descriptor
+        (descriptor, completion)
     };
+    if let (Some(registry), Some((reservation, session))) =
+        (pending_registry.as_deref_mut(), completion)
+    {
+        super::workspace::complete_terminal(shared, registry, reservation, session);
+    }
+    drop(pending_registry);
     let descriptor = match descriptor {
         Ok(descriptor) => descriptor,
         Err(error) => {
