@@ -54,6 +54,25 @@ where
     hover(base, top, Placement::Beside(spacing))
 }
 
+/// Where the pointer reveals the actions: the whole wrapper, or for an open
+/// row, the band of its first row, so the open detail below keeps to its own
+/// controls.
+fn hover_bounds(placement: Placement, layout: core::Layout<'_>) -> iced::Rectangle {
+    let bounds = layout.bounds();
+    match placement {
+        Placement::BesideFirst(_) => layout
+            .children()
+            .next()
+            .and_then(|base| base.children().next())
+            .map(|row| row.with_virtual_offset(layout.virtual_offset()))
+            .map_or(bounds, |row| iced::Rectangle {
+                height: (row.bounds().y + row.bounds().height - bounds.y).max(0.0),
+                ..bounds
+            }),
+        _ => bounds,
+    }
+}
+
 /// Actions beside the first row of `base`, a column whose later rows keep
 /// to the width the first one has beside them.
 pub(super) fn beside_first<'a, Message, Theme, Renderer>(
@@ -250,7 +269,7 @@ where
                     viewport,
                 );
 
-                if cursor.is_over(layout.bounds())
+                if cursor.is_over(hover_bounds(self.placement, layout))
                     || tree.state.downcast_ref::<State>().is_top_focused
                     || tree.state.downcast_ref::<State>().is_top_overlay_active
                 {
@@ -376,7 +395,7 @@ where
             let (base_layout, base_tree) = children.next().unwrap();
             let (top_layout, top_tree) = children.next().unwrap();
 
-            let is_hovered = cursor.is_over(layout.bounds());
+            let is_hovered = cursor.is_over(hover_bounds(self.placement, layout));
 
             if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
                 let mut count_focused = operation::focusable::count();
@@ -558,5 +577,53 @@ mod tests {
             .expect("the message stays in the accessibility tree");
         // The probe reports window space, so it saw the scrollable's offset.
         assert_eq!(message.node().bounds().map(|bounds| bounds.y0), Some(63.0));
+    }
+    /// An open row's actions sit beside its header, centred on it, and its
+    /// detail ends where the header does rather than running under them.
+    #[test]
+    fn actions_beside_an_open_rows_header_keep_its_detail_to_the_header() {
+        let fixed = |width: f32, height: f32| {
+            iced::widget::Space::new()
+                .width(Length::Fixed(width))
+                .height(Length::Fixed(height))
+        };
+        let column = |header: f32| -> Element<'_, (), cosmic::Theme, cosmic::Renderer> {
+            iced::widget::column![
+                iced::widget::container(fixed(10.0, header)).width(Length::Fill),
+                iced::widget::container(fixed(10.0, 200.0)).width(Length::Fill),
+            ]
+            .spacing(4.0)
+            .width(Length::Fill)
+            .into()
+        };
+        for width in [320.0, 520.0, 900.0] {
+            let mut element = beside_first(column(32.0), fixed(24.0, 20.0), 4.0);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &headless_renderer(),
+                &Limits::new(Size::ZERO, Size::new(width, 1000.0)),
+            );
+            let layout = Layout::new(&node);
+            let mut children = layout.children();
+            let base = children.next().unwrap();
+            let actions = children.next().unwrap().bounds();
+            let mut rows = base.children();
+            let header = rows.next().unwrap().bounds();
+            let detail = rows.next().unwrap().bounds();
+            assert_eq!(node.size().width, width, "{width}");
+            assert_eq!(header.y, 0.0, "{width}");
+            assert_eq!(
+                actions.y + actions.height / 2.0,
+                header.y + header.height / 2.0,
+                "{width}"
+            );
+            assert_eq!(actions.x + actions.width, width, "{width}");
+            assert_eq!(header.x + header.width, actions.x - 4.0, "{width}");
+            assert_eq!(detail.x + detail.width, header.x + header.width, "{width}");
+            // Only the header's band reveals the actions.
+            let band = hover_bounds(Placement::BesideFirst(4.0), layout);
+            assert_eq!(band.height, header.height, "{width}");
+        }
     }
 }
