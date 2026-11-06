@@ -33,13 +33,13 @@ class PruneBuildDirs(unittest.TestCase):
         # Only private directories are ever searched.
         self.env |= {"HOME": str(self.home), "CAGENTS_BUILD_PRUNE_ROOTS": str(self.roots)}
 
-    def prune(self, *arguments, apply=True):
+    def prune(self, *arguments, apply=True, status=0):
         command = [str(PRUNER), "--lock", str(self.root / "lock"), "--log", str(self.log),
                    "--mirror", str(self.roots / "cargo-build"), "--verbose",
                    "--max-idle", str(IDLE / 86400), "--orphan-hours", str(IDLE / 3600)]
         result = subprocess.run(command + (["--apply"] if apply else []) + list(arguments),
                                 env=self.env, capture_output=True, text=True, timeout=60)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, status, result.stderr)
         return result.stdout
 
     def target(self, path, marker="rustc"):
@@ -74,10 +74,20 @@ class PruneBuildDirs(unittest.TestCase):
 
     def test_a_recent_write_anywhere_inside_keeps_it(self):
         path = self.target(self.roots / "lane/target")
-        time.sleep(4)
+        time.sleep(7)
         (path / "debug/deps/libcrate.rlib").touch()
-        # Older entries are idle at 3 seconds; the one just written is not.
-        self.prune("--max-idle", str(3 / 86400))
+        # Older entries are idle at 6 seconds; the one just written is not.
+        self.prune("--max-idle", str(6 / 86400))
+        self.assertTrue(path.exists())
+
+    def test_a_copy_that_kept_its_sources_times_is_recent(self):
+        path = self.target(self.roots / "lane/target")
+        self.settle()
+        # As `cp -p` leaves it: an old modification time, a new change time.
+        copied = path / "debug/deps/libcopied.rlib"
+        copied.write_bytes(b"x")
+        os.utime(copied, (time.time() - 30 * 86400,) * 2)
+        self.prune()
         self.assertTrue(path.exists())
 
     def test_idle_days_are_configurable(self):
@@ -169,7 +179,7 @@ class PruneBuildDirs(unittest.TestCase):
         self.assertTrue(in_tree.exists())
         self.assertTrue(mirrored.exists())
 
-    def test_any_main_checkouts_build_stays_and_a_worktrees_goes(self):
+    def test_another_main_checkouts_build_waits_longer_and_a_worktrees_goes(self):
         main = self.roots / "other-repo"
         (main / ".git").mkdir(parents=True)
         kept = self.target(main / "target")
@@ -183,24 +193,43 @@ class PruneBuildDirs(unittest.TestCase):
         self.assertTrue(kept.exists())
         self.assertTrue(mirrored.exists())
         self.assertFalse(removed.exists())
+        # Four times the idle limit later, it goes too.
+        output = self.prune("--max-idle", str(IDLE / 8 / 86400))
+        self.assertFalse(kept.exists())
+        self.assertFalse(mirrored.exists())
+        self.assertIn("main checkout's", output)
 
     def test_a_budget_bounds_the_run(self):
         path = self.target(self.roots / "lane/target")
         self.settle()
-        output = self.prune("--budget", "0")
+        output = self.prune("--budget", "0", status=75)
         self.assertTrue(path.exists())
+        self.assertIn("out of time", output)
         self.assertIn("removed 0 build directories", output)
+        # A run that searched everything says so.
+        self.prune("--budget", "60")
+        self.assertFalse(path.exists())
 
-    def test_it_waits_for_another_run_only_within_its_budget(self):
+    def test_it_leaves_the_search_to_another_run(self):
         path = self.target(self.roots / "lane/target")
         self.settle()
         with open(self.root / "lock", "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             started = time.monotonic()
-            output = self.prune("--budget", "1")
+            output = self.prune(status=75)
         self.assertLess(time.monotonic() - started, 10)
         self.assertIn("another run is pruning", output)
         self.assertTrue(path.exists())
+
+    def test_the_checkout_and_the_mirror_are_searched_first(self):
+        elsewhere = self.target(self.roots / "a/target")
+        mirrored = self.target(self.roots / "cargo-build/gone/repo/target")
+        checkout = self.root / "repo"
+        worktree = self.target(checkout / ".worktrees/w/target")
+        self.settle()
+        output = self.prune("--root", str(checkout), apply=False)
+        order = [line.split()[2] for line in output.splitlines() if line.startswith("would remove /")]
+        self.assertEqual(order, [str(worktree), str(mirrored), str(elsewhere)])
 
     def test_a_checkouts_committed_sources_are_not_searched(self):
         repository = self.root / "repository"

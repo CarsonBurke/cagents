@@ -650,14 +650,14 @@ roots under `~/.local/state` all stay until something removes them.
 `scripts/build-disk-guard`, which `scripts/cargo-gate` runs before every
 local build, removes them with `scripts/prune-build-dirs` in two ways:
 
-- **On a schedule.** While the file system has room, at most every `CAGENTS_BUILD_PRUNE_INTERVAL_HOURS` (default 6) per user and host, it starts the pruner in the background, in a session of its own at idle CPU and I/O priority. The build doesn't wait for it.
-- **Under pressure.** When the file system has less than twice a floor free (5% of its size, at most 64 GiB), it runs the pruner before the build, at most every ten minutes across the host. The build waits at most `CAGENTS_BUILD_PRUNE_BUDGET_SECONDS` (default 300) for it. This run also removes, at once, the build directories of removed workspaces in the mirrored `/var/tmp/cargo-build` layout; on the schedule they wait six hours. Below the floor the guard refuses the build and says why. With no pruner beside it and no `CAGENTS_BUILD_PRUNE`, it says it has nothing to reclaim with.
+- **On a schedule.** While the file system has room, at most every `CAGENTS_BUILD_PRUNE_INTERVAL_HOURS` (default 6) per user and host, it starts the pruner in the background, in a session of its own at idle CPU and I/O priority. The build doesn't wait for it. A run that is cut short is started again by the next build.
+- **Under pressure.** When the file system has less than twice a floor free (5% of its size, at most 64 GiB), it runs the pruner before the build, at most every ten minutes across the host. After `CAGENTS_BUILD_PRUNE_BUDGET_SECONDS` (default 300) it starts no new search or removal, so the build waits about that long at most. If another run is already pruning, it leaves the work to that run. A run cut short this way doesn't count as the scheduled one. This run also removes, at once, the build directories of removed workspaces in the mirrored `/var/tmp/cargo-build` layout; on the schedule they wait six hours. Below the floor the guard refuses the build and says why. With no pruner beside it and no `CAGENTS_BUILD_PRUNE`, it says it has nothing to reclaim with.
 
-The pruner searches `~/.cache`, `~/.local/state`, `/var/tmp` and the repository's main checkout, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the first three. It skips a checkout's committed directories, which hold only sources.
+The pruner searches the repository's main checkout first, then the mirrored `/var/tmp/cargo-build`, then `~/.cache`, `~/.local/state` and `/var/tmp`, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the first three. It skips a checkout's committed directories, which hold only sources.
 
 It recognizes build output by Cargo's own markers, not by name or place: a root `.rustc_info.json`, or a `CACHEDIR.TAG` beside a profile's `.fingerprint`. It removes a build directory only when all of these hold:
 
-- nothing inside it has been written or changed for `CAGENTS_BUILD_PRUNE_IDLE_DAYS` (default 7);
+- nothing inside it has been written or changed for `CAGENTS_BUILD_PRUNE_IDLE_DAYS` (default 7), or four times that for another main checkout's own build, which seeds that checkout's worktrees;
 - every Cargo lock in it is free;
 - no process has its working directory, an open file, its executable or a mapping inside it.
 
@@ -665,7 +665,7 @@ Under those locks it renames the directory aside, so a build that starts afterwa
 
 It never touches:
 - the build directory being guarded;
-- any main checkout's own build, in its `target/` or the mirror, which seeds new worktrees;
+- the build of this repository's main checkout, in its `target/` or the mirror;
 - `~/.local/share`;
 - the offload slots, which their leases manage;
 - other users' files;

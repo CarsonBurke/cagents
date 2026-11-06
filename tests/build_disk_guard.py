@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise scripts/build-disk-guard with private locks and a stand-in pruner."""
 
+import fcntl
 import os
 import shutil
 from pathlib import Path
@@ -112,12 +113,12 @@ class BuildDiskGuard(unittest.TestCase):
         result = self.guard(1, guard=self.alone())
         self.assertEqual((result.returncode, result.stderr), (0, ""))
 
-    def stand_in_pruner(self):
+    def stand_in_pruner(self, status=0):
         """The guard beside a pruner that records how it was run."""
         guard = self.alone()
         calls = self.root / "calls"
         pruner = guard.with_name("prune-build-dirs")
-        pruner.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {calls}\n')
+        pruner.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {calls}\nexit {status}\n')
         pruner.chmod(0o755)
         del self.env["CAGENTS_BUILD_PRUNE"]
         return guard, calls
@@ -162,6 +163,36 @@ class BuildDiskGuard(unittest.TestCase):
         time.sleep(0.5)
         self.assertEqual(len(self.calls(calls, 1)), 1)
 
+    def test_a_reclaim_cut_short_leaves_the_scheduled_run_to_come(self):
+        guard, calls = self.stand_in_pruner(status=75)
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        self.assertEqual(self.guard(10**9, guard=guard).returncode, 2)
+        self.assertEqual(self.guard(1, guard=guard).returncode, 0)
+        lines = self.calls(calls, 2)
+        self.assertEqual(len(lines), 2)
+        self.assertNotIn("--budget", lines[1])
+
+    def test_a_scheduled_run_cut_short_is_started_again(self):
+        guard, calls = self.stand_in_pruner(status=75)
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        self.assertEqual(self.guard(1, guard=guard).returncode, 0)
+        self.calls(calls, 1)
+        self.wait_unlocked(self.root / "pruner.scheduled")
+        self.assertEqual(self.guard(1, guard=guard).returncode, 0)
+        self.assertEqual(len(self.calls(calls, 2)), 2)
+
+    def wait_unlocked(self, path, timeout=10):
+        """Until the background run that holds path's lock has ended."""
+        deadline = time.monotonic() + timeout
+        with open(path, "a") as lock:
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.05)
+
     def test_the_build_directory_it_guards_is_kept(self):
         guard, calls = self.stand_in_pruner()
         self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
@@ -179,12 +210,13 @@ class BuildDiskGuard(unittest.TestCase):
         (call,) = self.calls(calls, 1)
         self.assertIn("--apply --max-idle 3", call)
         self.assertNotIn("--orphan-hours", call)
-        # Within the interval, no build starts another.
+        # Once it has finished, and within the interval, no build starts another.
+        stamp = self.root / "pruner.scheduled"
+        self.wait_unlocked(stamp)
         self.assertEqual(self.guard(1, guard=guard).returncode, 0)
         time.sleep(0.5)
         self.assertEqual(len(self.calls(calls, 1)), 1)
         # Once it has passed, the next build does.
-        stamp = self.root / "pruner.scheduled"
         long_ago = time.time() - 7 * 3600
         os.utime(stamp, (long_ago, long_ago))
         self.assertEqual(self.guard(1, guard=guard).returncode, 0)
@@ -215,7 +247,8 @@ class BuildDiskGuard(unittest.TestCase):
                             ("CAGENTS_BUILD_PRUNE_INTERVAL_HOURS", "999999"),
                             ("CAGENTS_BUILD_PRUNE_IDLE_DAYS", "week"),
                             ("CAGENTS_BUILD_PRUNE_IDLE_DAYS", "0"),
-                            ("CAGENTS_BUILD_PRUNE_BUDGET_SECONDS", "-1")):
+                            ("CAGENTS_BUILD_PRUNE_BUDGET_SECONDS", "-1"),
+                            ("CAGENTS_BUILD_PRUNE_BUDGET_SECONDS", "0")):
             with self.subTest(name=name, value=value):
                 self.env[name] = value
                 result = self.guard(1)

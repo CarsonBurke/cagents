@@ -21,11 +21,16 @@ Under those locks it is renamed aside, so a build that starts later finds no
 directory rather than a partly removed one. The renamed copy is checked
 again, and put back if anything wrote to or opened it meanwhile; an
 interrupted removal leaves only the renamed copy, which the next run
-removes. Never touched: a main checkout's own build (its workspace has a
-`.git` directory; it seeds new worktrees), the directories given with
---keep, ~/.local/share, the offload build slots (~/.cache/cagents-offload,
-whose leases manage them), other users' files and anything a symlink leads
-to. One run at a time per user.
+removes. A main checkout's own build, whose workspace has a `.git`
+directory, seeds new worktrees, so it waits four times as long. Never
+touched: the checkouts given with --keep-checkout, the directories given
+with --keep, ~/.local/share, the offload build slots
+(~/.cache/cagents-offload, whose leases manage them), other users' files
+and anything a symlink leads to.
+
+One run at a time per user. The checkouts given with --root, and the mirror,
+are searched first. A run that stops on its --budget, or finds another run
+pruning, exits 75 so its caller can tell it did not search everything.
 """
 from __future__ import annotations
 
@@ -104,17 +109,21 @@ def find(roots: list[Path], excluded: list[Path], depth: int, mirror: Path):
     file systems or through symlinks. Yields each as it is found, so a run
     with a budget removes what it can while it searches."""
     seen = set()
-    for root in roots:
+    for index, root in enumerate(roots):
         try:
             device = root.lstat().st_dev
         except OSError:
             continue
         if deadline_passed():
             break
-        pending = [(root, 0)]
+        # Searched already, as an earlier root or under one.
+        walked = roots[:index]
+        if within(root, walked):
+            continue
+        pending = [(root, -sys.maxsize if root == mirror else 0)]
         while pending and not deadline_passed():
             directory_, level = pending.pop()
-            if within(directory_, excluded):
+            if within(directory_, excluded) or (directory_ != root and directory_ in walked):
                 continue
             try:
                 with os.scandir(directory_) as entries:
@@ -146,10 +155,13 @@ def find(roots: list[Path], excluded: list[Path], depth: int, mirror: Path):
 
 def survey(root: Path, cutoff: float) -> tuple[int, list[Path]] | None:
     """Allocated bytes and profile locks, or None when anything inside was
-    written after cutoff or cannot be read: a partial survey proves nothing."""
+    written after cutoff or cannot be read, or the budget ran out: a partial
+    survey proves nothing."""
     total, locks, pending = 0, [], [root]
     try:
         while pending:
+            if deadline_passed():
+                return None
             directory = pending.pop()
             with os.scandir(directory) as entries:
                 for entry in entries:
@@ -253,6 +265,11 @@ def workspace(directory: Path, mirror: Path) -> Path:
     return Path("/", *relative.parts[:-1])
 
 
+# A main checkout's build seeds its worktrees', so it waits this many times
+# as long as other build output.
+MAIN_CHECKOUT_IDLE_FACTOR = 4
+
+
 def main_checkout(directory: Path, mirror: Path) -> bool:
     """Whether this is a main checkout's own build: its `.git` is a
     directory, where a worktree's is a file."""
@@ -260,6 +277,9 @@ def main_checkout(directory: Path, mirror: Path) -> bool:
 
 
 DEADLINE = [math.inf]
+# The exit status of a run that did not search everything: out of time, or
+# another run was pruning.
+INCOMPLETE = 75
 
 
 def deadline_passed() -> bool:
@@ -300,8 +320,8 @@ def main() -> int:
     parser.add_argument("--log", type=Path, metavar="FILE",
                         help="append a tab-separated line per removal to FILE")
     parser.add_argument("--budget", type=nonnegative, metavar="SECONDS",
-                        help="start no search or removal after this long, waiting for "
-                             "another run included (default: no limit)")
+                        help="start no search or removal after this long, finishing the "
+                             "removal under way (default: no limit)")
     parser.add_argument("--verbose", action="store_true",
                         help="also say why each build directory in use stays")
     parser.add_argument("--lock", type=Path, default=Path(f"/var/tmp/cagents-prune-build-dirs-{os.getuid()}.lock"),
@@ -314,8 +334,14 @@ def main() -> int:
     # Descriptors inherited from a build must not stay open for the run.
     os.closerange(3, 1024)
     real = lambda path: Path(os.path.realpath(path))
-    roots = [real(root) for root in roots + arguments.root]
+    roots = [real(root) for root in roots]
     arguments.mirror = real(arguments.mirror)
+    # Worktrees' build output, the most there usually is to reclaim, first:
+    # a run with a budget may not reach the rest.
+    first = [real(root) for root in arguments.root]
+    if within(arguments.mirror, roots):
+        first.append(arguments.mirror)
+    roots = first + roots
     excluded = [real(path) for path in never() + arguments.keep]
     for checkout in arguments.keep_checkout:
         checkout = real(checkout)
@@ -325,29 +351,25 @@ def main() -> int:
         DEADLINE[0] = time.monotonic() + arguments.budget
 
     runs = open(arguments.lock, "a")
-    while True:
-        try:
-            fcntl.flock(runs, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError:
-            if deadline_passed():
-                print("another run is pruning; not waiting longer for it", flush=True)
-                return 0
-            time.sleep(1)
+    try:
+        fcntl.flock(runs, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # It searches everything this run would; waiting frees nothing sooner.
+        print("another run is pruning; leaving the search to it", flush=True)
+        return INCOMPLETE
 
     now = time.time()
     idle_cutoff = now - arguments.max_idle * 86400
     orphan_cutoff = now - arguments.orphan_hours * 3600
     removed = kept = 0
     freed = 0
-    failed = False
+    failed = complete = False
     def note(message):
         if arguments.verbose:
             print(message, flush=True)
 
     for directory in find(roots, excluded, arguments.max_depth, arguments.mirror):
         if deadline_passed():
-            print("out of time; the rest waits for the next run", flush=True)
             break
         leftover = PRUNED.match(directory.name)
         if leftover:
@@ -356,7 +378,8 @@ def main() -> int:
                 continue
             reason, cutoff = "interrupted removal", now
         elif main_checkout(directory, arguments.mirror):
-            continue
+            days = arguments.max_idle * MAIN_CHECKOUT_IDLE_FACTOR
+            reason, cutoff = f"main checkout's, unwritten for {days:g} days", now - days * 86400
         elif orphaned(directory, arguments.mirror):
             reason, cutoff = "workspace removed", max(idle_cutoff, orphan_cutoff)
         else:
@@ -400,11 +423,17 @@ def main() -> int:
         # Anything that wrote to or opened it since the first look keeps it.
         user = in_use(aside)
         if user is not None or survey(aside, cutoff) is None:
-            if aside != directory:
-                with contextlib.suppress(OSError):
-                    os.rename(aside, directory)
-            note(f"keep {directory}: used while it was being removed")
             kept += 1
+            if aside != directory:
+                try:
+                    os.rename(aside, directory)
+                except OSError as error:
+                    # A build recreated it meanwhile; a later run removes this
+                    # copy once nothing uses it.
+                    print(f"kept {aside}, which was in use as it was removed, but cannot "
+                          f"put it back as {directory}: {error}", file=sys.stderr, flush=True)
+                    continue
+            note(f"keep {directory}: used while it was being removed")
             continue
         try:
             shutil.rmtree(aside)
@@ -419,10 +448,15 @@ def main() -> int:
             with contextlib.suppress(OSError), open(arguments.log, "a") as log:
                 log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\t{directory}\t"
                           f"{size}\t{reason}\n")
+    else:
+        complete = True
+    if not complete or deadline_passed():
+        complete = False
+        print("out of time; the rest waits for the next run", flush=True)
     verb = "removed" if arguments.apply else "would remove"
     print(f"{verb} {removed} build directories ({freed / 2**30:.1f} GiB); "
           f"kept {kept} in use or recently written", flush=True)
-    return int(failed)
+    return int(failed) if complete else INCOMPLETE
 
 
 if __name__ == "__main__":

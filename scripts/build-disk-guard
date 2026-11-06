@@ -35,8 +35,8 @@ Environment:
                                 Hours between background runs (default 6);
                                 0 runs the pruner only when space is low.
   CAGENTS_BUILD_PRUNE_BUDGET_SECONDS
-                                Longest the build waits for the pruner when
-                                space is low (default 300).
+                                Seconds after which the pruner run for low
+                                space starts nothing new (default 300).
   CAGENTS_BUILD_PRUNE_ROOTS     Directories the default pruner searches,
                                 colon-separated, besides the main checkout;
                                 default: ~/.cache, ~/.local/state, /var/tmp.
@@ -67,7 +67,7 @@ for number in "$interval" "$idle" "$budget"; do
         ''|0?*|*[!0-9]*|??????*) usage >&2; exit 2 ;;
     esac
 done
-[ "$idle" -gt 0 ] || { usage >&2; exit 2; }
+[ "$idle" -gt 0 ] && [ "$budget" -gt 0 ] || { usage >&2; exit 2; }
 
 # The build directory may not exist yet; its file system is its nearest
 # existing ancestor's.
@@ -127,18 +127,21 @@ if [ "$free" -ge $((floor * 2)) ]; then
     # Every few hours, in the background at idle priority and in a session of
     # its own: it reads every build directory, which a build should not wait
     # for, and outlives the build.
+    # The run holds the schedule's lock until it ends, and stamps it only
+    # once it has searched everything: one cut short, killed or out of time,
+    # is started again by the next build.
     if [ -n "$prune" ] && [ "$interval" -gt 0 ] && open7 "$pruner_state.scheduled"; then
         if flock -n 7 &&
-            [ -z "$(find "$pruner_state.scheduled" -mmin -$((interval * 60)) -size +0c 2>/dev/null)" ] &&
-            { date +%s >"$pruner_state.scheduled"; } 2>/dev/null; then
+            [ -z "$(find "$pruner_state.scheduled" -mmin -$((interval * 60)) -size +0c 2>/dev/null)" ]; then
             log=$pruner_state.log
             # Keep the last run's output and the one before.
             [ ! -f "$log" ] || mv -f -- "$log" "$log.1" 2>/dev/null || :
+            run="$prune; status=\$?; [ \$status -eq 75 ] || [ \$status -gt 128 ] || date +%s >$(quote "$pruner_state.scheduled")"
             (
-                exec 7>&- 8>&- 9>&- </dev/null >"$log" 2>&1
+                exec 8>&- 9>&- </dev/null >"$log" 2>&1
                 command -v ionice >/dev/null 2>&1 && ionice='ionice -c3' || ionice=
                 command -v setsid >/dev/null 2>&1 && setsid=setsid || setsid=
-                exec $setsid nice -n 19 $ionice sh -c "$prune"
+                exec $setsid nice -n 19 $ionice sh -c "$run"
             ) 2>/dev/null &
         fi
         exec 7>&-
@@ -158,10 +161,12 @@ if [ -n "$prune" ] && open7 "$state"; then
             printf '%s: %s GiB free on %s; reclaiming unused build directories\n' \
                 "$program" "$free" "$directory" >&2
             # A failed reclaim leaves the decision to the free space below.
-            sh -c "$pressed" >&2 || :
+            if sh -c "$pressed" >&2; then status=0; else status=$?; fi
             { date +%s >"$state"; } 2>/dev/null || :
-            # That was this period's run on the schedule too.
-            { date +%s >"$pruner_state.scheduled"; } 2>/dev/null || :
+            # One that searched everything was this period's scheduled run too.
+            if [ "$status" -ne 75 ]; then
+                { date +%s >"$pruner_state.scheduled"; } 2>/dev/null || :
+            fi
         fi
         exec 7>&-
     else
