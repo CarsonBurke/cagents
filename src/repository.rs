@@ -11525,7 +11525,7 @@ mod tests {
             .with_max_level(tracing::Level::WARN)
             .with_ansi(false)
             .finish();
-        tracing::subscriber::with_default(subscriber, body);
+        crate::test_tracing::with_thread_subscriber(subscriber, body);
         String::from_utf8(sink.lock().unwrap().clone()).expect("UTF-8 log output")
     }
 

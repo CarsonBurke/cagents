@@ -2435,7 +2435,7 @@ mod tests {
                 !sensitive_browser_diagnostic(metadata.target(), metadata.level())
             }))
             .with(Observe(seen.clone()));
-        tracing::subscriber::with_default(subscriber, || {
+        crate::test_tracing::with_thread_subscriber(subscriber, || {
             tracing::debug!(target: "net::cookie", "fixture bearer cookie must be filtered");
             // Pinned Servo emits the complete Cookie header at INFO, including
             // when a site reads document.cookie, not just during extraction.
