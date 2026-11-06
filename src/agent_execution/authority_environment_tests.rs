@@ -282,7 +282,8 @@ fn present_authority_never_downgrades_terminal_or_work_cli_to_user() {
             if let Some(terminal_id) = spawned {
                 synchronize(&mut stream, &proof, terminal_id);
             }
-            if let Some(expected) = attached {
+            // An accepted Close already retired the subscription; it sends no Detach.
+            if let Some(expected) = attached.filter(|_| operation != "close") {
                 let detach = receive(&mut stream, &proof, &mut next);
                 assert!(
                     matches!(detach.request, ClientRequest::Detach { terminal_id } if terminal_id == expected)

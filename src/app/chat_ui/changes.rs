@@ -231,7 +231,7 @@ impl Runtime {
                 .subagents
                 .iter()
                 .find(|agent| &agent.id == id)
-                .map(|agent| format!("Subagent: {}", Self::native_child_name(agent)))
+                .map(|agent| format!("Subagent: {}", self.child_label(agent, 80)))
                 .unwrap_or_else(|| format!("Subagent: {}", id.chars().take(8).collect::<String>())),
         }
     }

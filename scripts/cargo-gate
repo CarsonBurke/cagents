@@ -14,7 +14,7 @@ set -eu
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=6
+gate_version=7
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -795,8 +795,12 @@ if [ -x "$guard" ] || [ -x "$seed" ]; then
     supervised '' /bin/sh -c '
         guard=$1
         seed=$2
-        build_dir=$("${CAGENTS_BUILD_CARGO:-cargo}" metadata --format-version 1 --no-deps 2>/dev/null |
-            sed -n '\''s/.*"build_directory":"\([^"]*\)".*/\1/p'\'') || build_dir=
+        metadata=$("${CAGENTS_BUILD_CARGO:-cargo}" metadata --format-version 1 --no-deps 2>/dev/null) || metadata=
+        build_dir=$(printf "%s\n" "$metadata" |
+            sed -n '\''s/.*"build_directory":"\([^"]*\)".*/\1/p'\'')
+        # A Cargo that reports no build directory builds in the target.
+        [ -n "$build_dir" ] || build_dir=$(printf "%s\n" "$metadata" |
+            sed -n '\''s/.*"target_directory":"\([^"]*\)".*/\1/p'\'')
         if [ -n "$build_dir" ]; then
             [ ! -x "$guard" ] || "$guard" "$build_dir" || exit "$?"
             [ ! -x "$seed" ] || "$seed" --to "$build_dir" || :

@@ -653,6 +653,13 @@ impl LocalHandle {
                 }
                 actor.publish_activity();
                 completed.store(native_closed && direct_closed, Ordering::Release);
+                if native_closed && direct_closed {
+                    // Completion can leave a detached daemon with no other
+                    // event. Publish once after the ownership flag, even when
+                    // its hidden observation was already consumed. Reuse the
+                    // existing helper-compatible metadata notification.
+                    actor.observe_next.store(true, Ordering::Release);
+                }
                 actor.observe_update();
                 if actor.visible.load(Ordering::Acquire) {
                     (actor.notify)(Update::Presentation);
@@ -5797,6 +5804,111 @@ mod tests {
         assert_eq!(state.error.as_deref(), Some("History page failed"));
         apply(&mut state, Event::HistoryRecovered);
         assert_eq!(state.error, None);
+    }
+
+    fn codex_child_name_adapter(directory: &std::path::Path) -> Box<dyn Adapter> {
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: Some("parent-exact".into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: Vec::new(),
+                working_directory: directory.into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    directory.to_str().unwrap().into(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        // Build an owned-listener spec without creating a process or socket.
+        super::super::protocol::codex::create_with_listener(&launch, directory.join("unused.sock"))
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn codex_child_name_survives_sparse_metadata_and_takes_a_genuine_rename() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut adapter = codex_child_name_adapter(directory.path());
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let hello = adapter.initialize().unwrap();
+        let initialized = adapter
+            .receive(json!({"id":hello.writes[0]["id"],"result":{
+                "codexHome":directory.path().to_str().unwrap(),"userAgent":"codex-child-name-fixture"
+            }}))
+            .unwrap();
+        let attach = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/resume")
+            .unwrap();
+        let attached = adapter
+            .receive(json!({"id":attach["id"],"result":{
+                "thread":{"id":"parent-exact","status":{"type":"idle"}},
+                "initialTurnsPage":{"data":[],"nextCursor":null}
+            }}))
+            .unwrap();
+        let skills = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "skills/list")
+            .unwrap();
+        let ready = adapter
+            .receive(json!({"id":skills["id"],"result":{"data":[]}}))
+            .unwrap();
+        assert!(ready.events.contains(&Event::Ready(true)));
+        for event in attached.events.into_iter().chain(ready.events) {
+            apply_event(&mut state, &mut indices, event);
+        }
+        let mut publish = |thread: Value| {
+            let mut thread = thread;
+            thread["parentThreadId"] = json!("parent-exact");
+            let step = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":thread}}))
+                .unwrap();
+            for event in step.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            state
+                .subagents
+                .iter()
+                .map(|agent| (agent.id.clone(), agent.kind.clone()))
+                .collect::<Vec<_>>()
+        };
+        let names = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(id, name)| (id.to_string(), name.to_string()))
+                .collect::<Vec<_>>()
+        };
+        // A role is not a name: the unnamed child stays unnamed for the tabs
+        // to label, rather than showing "worker" or a provider default.
+        assert_eq!(
+            publish(json!({"id":"unnamed","agentRole":"worker"})),
+            names(&[("unnamed", "")])
+        );
+        assert_eq!(
+            publish(json!({"id":"child","agentNickname":" Scout ","agentRole":"worker"})),
+            names(&[("unnamed", ""), ("child", "Scout")])
+        );
+        for sparse in [
+            json!({"id":"child","agentRole":"explorer"}),
+            json!({"id":"child","agentNickname":null}),
+            json!({"id":"child","agentNickname":" \t\n"}),
+        ] {
+            assert_eq!(
+                publish(sparse),
+                names(&[("unnamed", ""), ("child", "Scout")]),
+                "sparse metadata keeps the known name"
+            );
+        }
+        assert_eq!(
+            publish(json!({"id":"child","agentNickname":"Pilot"})),
+            names(&[("unnamed", ""), ("child", "Pilot")]),
+            "a genuine new nickname replaces the old one"
+        );
     }
 
     #[test]
