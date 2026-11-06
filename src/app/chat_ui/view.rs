@@ -100,6 +100,8 @@ pub(super) const DELIVERY_FOLDED_HEIGHT: f32 = 180.0;
 pub(super) const NOTICE_LINES: usize = 3;
 
 const MESSAGE_ACTION_HEIGHT: f32 = 24.0;
+/// The most characters a footer name shows before it is cut.
+const FOOTER_LABEL: usize = 32;
 const MESSAGE_ACTION_FOOTER: f32 = MESSAGE_ACTION_HEIGHT + step::GAP_XS;
 
 /// Existing action footers provide separation. Count that space toward the
@@ -713,6 +715,16 @@ fn completion_kind(kind: completion::Kind) -> &'static str {
         completion::Kind::Command => "Command",
         completion::Kind::Skill => "Skill",
         completion::Kind::File => "File",
+    }
+}
+
+/// A footer name, said whole on hover where it was cut. Names have no
+/// bound, and a footer item does not wrap within itself.
+fn bounded<'a>(content: Element<'a, Message>, name: &str, kind: &str) -> Element<'a, Message> {
+    if name.chars().count() > FOOTER_LABEL {
+        crate::interaction::tooltip(content, format!("{kind}: {name}"))
+    } else {
+        content
     }
 }
 
@@ -3127,17 +3139,19 @@ impl Runtime {
             );
         }
         if !place.name.is_empty() {
-            status.push(
-                design::caption(place.name.clone())
+            status.push(bounded(
+                design::caption(Self::short_description(&place.name, FOOTER_LABEL))
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
-            );
+                &place.name,
+                "Project",
+            ));
         }
         if let Some(branch) = &place.branch {
-            status.push(
+            status.push(bounded(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
-                    design::caption(branch.clone())
+                    design::caption(Self::short_description(branch, FOOTER_LABEL))
                         .class(cosmic::theme::Text::Custom(design::muted_text))
                         .wrapping(iced::widget::text::Wrapping::None)
                         .into(),
@@ -3145,7 +3159,9 @@ impl Runtime {
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center)
                 .into(),
-            );
+                branch,
+                "Branch",
+            ));
         }
         let mut engine = Vec::new();
         if !self.closed_elsewhere {
@@ -3713,6 +3729,14 @@ impl Runtime {
                     .into(),
                     None => "Model".into(),
                 },
+            };
+            // An unlisted model is named by its id, which has no bound; the
+            // open picker shows it whole. Cut here, the trailing group stays
+            // narrow enough that the footer's leading group keeps a column.
+            let label = if label.chars().count() > FOOTER_LABEL {
+                Cow::Owned(Self::short_description(&label, FOOTER_LABEL))
+            } else {
+                label
             };
             if transitioning {
                 controls.push(design::caption(label).into());
@@ -7275,6 +7299,35 @@ mod tests {
             activity(&runtime),
             Some((Icon::AgentWorking, "Sending".into()))
         );
+    }
+
+    #[test]
+    fn conversation_tab_marks_only_the_main_conversations_own_state() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let state = |runtime: &Runtime| runtime.parent_tab_state().map(|(glyph, _)| glyph);
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.ready = true;
+        snapshot.subagents = vec![native_child_fixture()];
+        // A subagent working or waiting is said on its own tab, not here.
+        assert_eq!(state(&runtime), None);
+        Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
+        assert_eq!(state(&runtime), None);
+        // The main conversation's own work, question and failure are.
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        assert_eq!(state(&runtime), Some(Icon::AgentWorking));
+        Arc::make_mut(&mut runtime.snapshot).waiting = true;
+        assert_eq!(state(&runtime), Some(Icon::AgentWaiting));
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = false;
+        snapshot.waiting = false;
+        snapshot.subagents.clear();
+        snapshot.finished_at = Some(42);
+        // A turn that ended well needs no mark; one that failed does.
+        assert_eq!(state(&runtime), None);
+        Arc::make_mut(&mut runtime.snapshot).detail = "Turn interrupted".into();
+        assert_eq!(state(&runtime), None);
+        Arc::make_mut(&mut runtime.snapshot).detail = "Turn failed".into();
+        assert_eq!(runtime.parent_tab_state(), Some((Icon::Warning, "Failed")));
     }
 
     #[test]
