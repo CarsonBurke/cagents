@@ -305,9 +305,116 @@ fn reported_reset(message: &str) -> Option<String> {
     Some(line.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
+/// What became of a request Claude's retained conversation process could not
+/// confirm or take, as the daemon reports it, and what the person can do.
+/// Each text is one sentence of outcome and one of next step, so a notice can
+/// show the step as its guidance instead of a generic one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryOutcome {
+    pub summary: &'static str,
+    pub action: &'static str,
+}
+
+macro_rules! delivery_outcomes {
+    ($($(#[$doc:meta])* $name:ident: $summary:literal, $action:literal;)*) => {
+        /// The texts of every [`DeliveryOutcome`].
+        pub mod delivery {
+            $($(#[$doc])* pub const $name: &str = concat!($summary, " ", $action);)*
+            pub(super) const ALL: &[(&str, super::DeliveryOutcome)] = &[$((
+                $name,
+                super::DeliveryOutcome { summary: $summary, action: $action },
+            )),*];
+        }
+    };
+}
+
+delivery_outcomes! {
+    /// An input whose delivery was never confirmed, settled as not sent.
+    UNCONFIRMED_INPUT: "Claude couldn't accept this in time, so it was not sent.", "Try again.";
+    /// The caller stopped waiting while the outcome is still unknown.
+    UNACKNOWLEDGED_INPUT: "Claude hasn't confirmed this yet.",
+        "It may still go through, so check the conversation before trying again.";
+    /// An answer whose outcome is still unknown when its caller stops waiting.
+    UNACKNOWLEDGED_ANSWER: "Claude hasn't confirmed this answer yet.",
+        "It may still go through, so check the conversation before answering again.";
+    /// A stop whose outcome is still unknown when its caller stops waiting.
+    UNACKNOWLEDGED_STOP: "Claude hasn't confirmed the stop yet.",
+        "It may still take effect, so check the conversation before trying again.";
+    /// A new input while an earlier one is still unconfirmed.
+    UNSETTLED_INPUT: "Claude hasn't confirmed the previous request yet, so this was not sent.",
+        "Try again in a moment.";
+    /// Every new input once an unconfirmed one cannot be settled.
+    UNSETTLEABLE_INPUT: "Claude stopped confirming requests in this conversation, so this was not sent.",
+        "Close and reopen the conversation to continue.";
+    /// Pending inputs once the proxy stopped before their outcome was known.
+    STOPPED_INPUT: "Claude's conversation process stopped before confirming this, so it may or may not have gone through.",
+        "Check the conversation before trying again.";
+    /// A new input while the proxy reattaches to its helper.
+    RECONNECTING_INPUT: "Claude is still reconnecting to this conversation, so this was not sent.",
+        "Try again in a moment.";
+    /// A new input beyond the requests already waiting.
+    CROWDED_INPUT: "Too many requests are waiting for Claude, so this was not sent.",
+        "Try again in a moment.";
+    /// A new input while completed ones are still being retired.
+    RETIRING_INPUT: "Claude is still finishing earlier requests, so this was not sent.",
+        "Try again in a moment.";
+    /// An input too large for one protocol frame.
+    OVERSIZED_INPUT: "This is too large to send to Claude, so it was not sent.",
+        "Shorten it or split it into smaller messages.";
+    /// An input to a helper whose conversation is closing.
+    CLOSING_INPUT: "Claude's conversation is closing, so this was not sent.",
+        "Reopen the conversation to continue.";
+    /// An input to a helper handing its conversation to an updated daemon.
+    HANDOVER_INPUT: "Claude's conversation is moving to the updated cagents service, so this was not sent.",
+        "Try again in a moment.";
+    /// An input after the helper lost track of earlier outcomes.
+    DISCONTINUOUS_INPUT: "Claude can't confirm earlier work in this conversation, so this was not sent.",
+        "Start a new conversation to continue.";
+    /// An input that arrived altered or malformed.
+    DAMAGED_INPUT: "This request was damaged on its way to Claude, so it was not sent.",
+        "Try again.";
+}
+
+impl DeliveryOutcome {
+    /// The outcome whose exact text `message` is.
+    pub fn parse(message: &str) -> Option<Self> {
+        let message = message.trim();
+        delivery::ALL
+            .iter()
+            .find(|(text, _)| *text == message)
+            .map(|(_, outcome)| *outcome)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_outcomes_split_into_their_outcome_and_next_step() {
+        assert_eq!(
+            DeliveryOutcome::parse(delivery::UNACKNOWLEDGED_INPUT),
+            Some(DeliveryOutcome {
+                summary: "Claude hasn't confirmed this yet.",
+                action: "It may still go through, so check the conversation before trying again.",
+            })
+        );
+        for (index, (text, outcome)) in delivery::ALL.iter().enumerate() {
+            assert_eq!(DeliveryOutcome::parse(text), Some(*outcome), "{text}");
+            assert!(outcome.summary.ends_with('.') && outcome.action.ends_with('.'));
+            assert!(
+                delivery::ALL[..index]
+                    .iter()
+                    .all(|(other, _)| other != text),
+                "{text} is listed twice"
+            );
+        }
+        // Only the exact text is recognised, never a quotation of it.
+        assert_eq!(
+            DeliveryOutcome::parse(&format!("Claude said: {}", delivery::UNCONFIRMED_INPUT)),
+            None
+        );
+    }
 
     #[test]
     fn explicit_provenance_requires_full_provider_tuple_and_preserves_original_item_identity() {

@@ -433,8 +433,12 @@ impl Journal {
         }
         Ok(None)
     }
+    /// Whether `run` is new and no further run identity can be retained.
+    pub fn run_capacity_reached(&self, run: crate::model::RunId) -> bool {
+        self.run_ids.len() >= MAX_ENTRIES && !self.run_ids.contains(&run)
+    }
     fn check_run_capacity(&self, run: crate::model::RunId) -> Result<(), String> {
-        if self.run_ids.len() >= MAX_ENTRIES && !self.run_ids.contains(&run) {
+        if self.run_capacity_reached(run) {
             return Err(
                 "Retained actor run identity capacity reached; outcome continuity is unconfirmed"
                     .into(),
