@@ -73,20 +73,478 @@ async fn native_delete_recreate_and_replaced_nested_parent() {
     std::fs::write(&path, "before").unwrap();
     let (card, mut runtime) = opened(root.path(), "nested/deep/live.txt").await;
     std::fs::remove_file(&path).unwrap();
-    while !matches!(runtime.document, DocumentState::Failed { .. }) {
-        change(card, &mut runtime).await;
-    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime.has_save_conflict() {
+            change(card, &mut runtime).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(runtime.editor_text().as_deref(), Some("before"));
+    assert!(runtime.save_error().unwrap().contains("Reload to retry"));
     std::fs::write(&path, "recreated").unwrap();
     text(card, &mut runtime, "recreated").await;
     std::fs::rename(root.path().join("nested"), root.path().join("moved")).unwrap();
-    while !matches!(runtime.document, DocumentState::Failed { .. }) {
-        change(card, &mut runtime).await;
-    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime.has_save_conflict() {
+            change(card, &mut runtime).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(runtime.editor_text().as_deref(), Some("recreated"));
     std::fs::create_dir_all(root.path().join("nested/deep")).unwrap();
     std::fs::write(&path, "new parent").unwrap();
     text(card, &mut runtime, "new parent").await;
     std::fs::write(&path, "still live").unwrap();
     text(card, &mut runtime, "still live").await;
+}
+
+#[tokio::test]
+async fn unavailable_clean_buffer_retains_history_and_recovers_only_its_observation() {
+    unavailable_clean_buffer_retention_contract("live.txt").await;
+}
+
+#[tokio::test]
+async fn unavailable_symlink_target_retains_history_and_recovers_only_its_observation() {
+    for selected in ["link.txt", "outer.txt"] {
+        unavailable_clean_buffer_retention_contract(selected).await;
+    }
+}
+
+async fn unavailable_clean_buffer_retention_contract(selected: &str) {
+    for type_after_deletion in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let linked = selected != "live.txt";
+        let source = if linked {
+            "target/live.txt"
+        } else {
+            "live.txt"
+        };
+        if linked {
+            std::fs::create_dir(root.path().join("target")).unwrap();
+            std::os::unix::fs::symlink(source, root.path().join("link.txt")).unwrap();
+            if selected == "outer.txt" {
+                std::os::unix::fs::symlink("link.txt", root.path().join("outer.txt")).unwrap();
+            }
+        }
+        let path = root.path().join(source);
+        let baseline = "first line\nsecond line\nthird\n";
+        std::fs::write(&path, baseline).unwrap();
+        let (card, mut runtime) = opened(root.path(), selected).await;
+        assert!(runtime.configure_save_recovery(Default::default(), vec![root.path().to_owned()]));
+        runtime.set_auto_save(false);
+        for action in [
+            RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+            },
+            RepositoryAction::Undo { card },
+        ] {
+            let task = runtime.update(action);
+            settle(&mut runtime, task).await;
+        }
+        assert!(!runtime.is_dirty());
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            panic!("actual read opened an editable document")
+        };
+        assert!(document.history.can_redo());
+        document.content.set_cursor(text_editor::Cursor {
+            position: text_editor::Position { line: 1, column: 3 },
+            selection: Some(text_editor::Position { line: 0, column: 1 }),
+        });
+        let cursor = document.content.cursor();
+        let buffer = document.content.text_snapshot().text();
+        assert_eq!(document.source, Path::new(source));
+        let source = document.source.clone();
+        let saved_hash = document.disk_hash;
+        let revision = document.revision;
+        let lsp_version = document.lsp_version;
+        let identity = runtime.current_identity(card, selected.into());
+        let original = runtime.retained_editor_root().unwrap();
+        let watch = runtime.document_watch.as_ref().unwrap().id();
+        let descriptor = runtime.descriptor.clone();
+        runtime.viewports.editor = text_editor::ScrollPosition {
+            line: 1,
+            vertical: 0.25,
+            horizontal: 24.0,
+        };
+        let viewport = runtime.viewports.editor;
+        runtime.set_auto_save(true);
+        drop(runtime.take_restored_editor_focus(card));
+        drop(runtime.take_lsp_intents());
+
+        std::fs::remove_file(&path).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !runtime.has_save_conflict() {
+                change(card, &mut runtime).await;
+            }
+        })
+        .await
+        .unwrap();
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("a failed external read must retain the last readable buffer")
+        };
+        assert!(Arc::ptr_eq(
+            &buffer,
+            &document.content.text_snapshot().text()
+        ));
+        assert_eq!(document.content.cursor(), cursor);
+        assert_eq!(document.source, source);
+        assert_eq!(document.disk_hash, saved_hash);
+        assert_eq!(document.saved_text, baseline);
+        assert_eq!(document.revision, revision);
+        assert_eq!(document.lsp_version, lsp_version);
+        assert!(document.history.can_redo());
+        assert_eq!(runtime.current_identity(card, selected.into()), identity);
+        assert_eq!(runtime.document_watch.as_ref().unwrap().id(), watch);
+        assert_eq!(runtime.descriptor, descriptor);
+        assert_eq!(runtime.viewports.editor, viewport);
+        assert!(Arc::ptr_eq(
+            &original,
+            &runtime.retained_editor_root().unwrap()
+        ));
+        assert!(runtime.original_read_attested);
+        assert!(runtime.take_lsp_intents().is_empty());
+        assert!(runtime.take_restored_editor_focus(card).is_none());
+        assert!(
+            runtime
+                .save_error()
+                .unwrap()
+                .contains("Your text is preserved")
+        );
+        if linked {
+            assert!(
+                runtime.save_error().unwrap().contains(
+                    "link.txt is a symbolic link to target/live.txt, which does not exist."
+                )
+            );
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                native_watch_count(&root.path().join("target")),
+                1,
+                "the missing physical source must stay watched for recreation"
+            );
+        }
+
+        if type_after_deletion {
+            let task = runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('y')),
+            });
+            settle(&mut runtime, task).await;
+            assert!(runtime.is_dirty());
+        } else {
+            // A stale/no-op Save must not orphan the observer diagnostic.
+            assert!(!runtime.can_save());
+            drop(runtime.request_save(card, false));
+        }
+        drop(runtime.auto_save_task(card));
+        assert!(runtime.auto_save_pending.is_none());
+        assert!(!runtime.is_saving());
+        assert!(!path.exists());
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        let retained = document.content.text_snapshot().text();
+        let cursor = document.content.cursor();
+
+        std::fs::write(&path, baseline).unwrap();
+        // Text equality would pass before consuming the recovery event for
+        // the clean case. Wait for the actual reader to clear its warning.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.has_save_conflict() || runtime.save_error().is_some() {
+                change(card, &mut runtime).await;
+            }
+        })
+        .await
+        .unwrap();
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        assert!(Arc::ptr_eq(
+            &retained,
+            &document.content.text_snapshot().text()
+        ));
+        assert_eq!(document.content.cursor(), cursor);
+        assert_eq!(document.source, source);
+        assert_eq!(document.disk_hash, saved_hash);
+        assert_eq!(runtime.current_identity(card, selected.into()), identity);
+        assert_eq!(runtime.is_dirty(), type_after_deletion);
+        assert!(runtime.original_read_attested);
+        assert!(Arc::ptr_eq(
+            &original,
+            &runtime.retained_editor_root().unwrap()
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), baseline);
+        if type_after_deletion {
+            assert!(runtime.auto_save_revision().is_some());
+            let task = runtime.update(RepositoryAction::Undo { card });
+            settle(&mut runtime, task).await;
+            assert_eq!(runtime.editor_text().as_deref(), Some(baseline));
+        } else {
+            assert!(document.history.can_redo());
+        }
+    }
+}
+
+#[tokio::test]
+async fn unavailable_symlink_target_stays_watched_after_a_failed_explicit_reload() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("target")).unwrap();
+    let path = root.path().join("target/live.txt");
+    std::fs::write(&path, "saved text").unwrap();
+    std::os::unix::fs::symlink("target/live.txt", root.path().join("link.txt")).unwrap();
+    let (card, mut runtime) = opened(root.path(), "link.txt").await;
+    let original = runtime.retained_editor_root().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime.has_save_conflict() {
+            change(card, &mut runtime).await;
+        }
+    })
+    .await
+    .unwrap();
+    let DocumentState::Editable(document) = &mut runtime.document else {
+        panic!("the missing target must retain its readable buffer")
+    };
+    document.content.set_cursor(text_editor::Cursor {
+        position: text_editor::Position { line: 0, column: 5 },
+        selection: Some(text_editor::Position { line: 0, column: 1 }),
+    });
+    let cursor = document.content.cursor();
+    let buffer = document.content.text_snapshot().text();
+    let task = runtime.update(RepositoryAction::Reload { card });
+    assert!(runtime.retains_reload_buffer());
+    settle(&mut runtime, task).await;
+    let DocumentState::Editable(document) = &runtime.document else {
+        panic!("failed Reload must keep the same buffer")
+    };
+    assert!(Arc::ptr_eq(
+        &buffer,
+        &document.content.text_snapshot().text()
+    ));
+    assert_eq!(document.content.cursor(), cursor);
+    assert_eq!(document.source, Path::new("target/live.txt"));
+    assert!(!runtime.original_read_attested);
+    assert!(
+        runtime
+            .save_error()
+            .unwrap()
+            .contains("Reload did not replace the editor buffer")
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        native_watch_count(&root.path().join("target")),
+        1,
+        "failed Reload must not drop the retained physical source watch"
+    );
+
+    // Only a real nested target event can attest this recreated baseline;
+    // no explicit watch rearm or injected read supplies its recovery.
+    std::fs::write(&path, "saved text").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime.original_read_attested {
+            change(card, &mut runtime).await;
+        }
+    })
+    .await
+    .unwrap();
+    let DocumentState::Editable(document) = &runtime.document else {
+        panic!()
+    };
+    assert!(Arc::ptr_eq(
+        &buffer,
+        &document.content.text_snapshot().text()
+    ));
+    assert_eq!(document.content.cursor(), cursor);
+    assert!(Arc::ptr_eq(
+        &original,
+        &runtime.retained_editor_root().unwrap()
+    ));
+    // A watcher recovery clears only its own warning; the failed foreground
+    // Reload keeps its established explicit recovery semantics.
+    assert!(runtime.save_error().is_some());
+    let task = runtime.update(RepositoryAction::Reload { card });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("saved text"));
+    assert_eq!(runtime.linked_source(), Some(Path::new("target/live.txt")));
+    assert!(runtime.save_error().is_none());
+    assert!(!runtime.has_save_conflict());
+    assert!(runtime.original_read_attested);
+}
+
+#[tokio::test]
+async fn unavailable_read_and_same_baseline_recovery_keep_a_newer_save_failure() {
+    if retained_save_tests::isolated_test(
+        "repository_widget::live_tests::unavailable_read_and_same_baseline_recovery_keep_a_newer_save_failure",
+    ) {
+        return;
+    }
+    let root = retained_save_tests::Checkout::new();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "disk").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.txt").await;
+    assert!(runtime.configure_save_recovery(Default::default(), vec![root.path().to_owned()]));
+    std::fs::remove_file(&path).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime.has_save_conflict() {
+            change(card, &mut runtime).await;
+        }
+    })
+    .await
+    .unwrap();
+    for action in [
+        text_editor::Action::SelectAll,
+        text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("my edits".into()))),
+    ] {
+        let task = runtime.update(RepositoryAction::EditorAction { card, action });
+        settle(&mut runtime, task).await;
+    }
+    let save = runtime.request_save(card, false);
+    let DocumentState::Editable(document) = &runtime.document else {
+        panic!()
+    };
+    let ticket = document.active_save.clone().expect("actual Save ticket");
+    // Supply a failed completion for the actual queued ticket. The lazy
+    // filesystem writer is deliberately not executed by this result fixture.
+    drop(save);
+    let task = runtime.update(RepositoryAction::SaveFinished {
+        identity: ticket.identity,
+        ticket: ticket.id,
+        revision: ticket.revision,
+        saved_text: ticket.snapshot,
+        result: Err(FileIoError::Io(
+            "fixture Save failure before publication".into(),
+        )),
+    });
+    settle(&mut runtime, task).await;
+    assert!(!path.exists());
+    let failure = runtime.save_error().unwrap().to_owned();
+    assert!(failure.contains("fixture Save failure"));
+    assert!(runtime.has_save_conflict());
+
+    std::fs::write(&path, "disk").unwrap();
+    change(card, &mut runtime).await;
+    assert_eq!(runtime.save_error(), Some(failure.as_str()));
+    assert!(runtime.has_save_conflict());
+    assert_eq!(runtime.editor_text().as_deref(), Some("my edits"));
+    assert!(runtime.original_read_attested);
+    std::fs::remove_file(&path).unwrap();
+    change(card, &mut runtime).await;
+    assert_eq!(runtime.save_error(), Some(failure.as_str()));
+    assert!(runtime.has_save_conflict());
+    drop(runtime.auto_save_task(card));
+    assert!(runtime.auto_save_pending.is_none());
+    assert!(!runtime.is_saving());
+    assert_eq!(runtime.editor_text().as_deref(), Some("my edits"));
+}
+
+#[tokio::test]
+async fn retained_read_failure_requires_a_current_editable_original_root_to_reattest() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "disk").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.txt").await;
+    let departed = runtime.current_identity(card, "live.txt".into());
+    let original = runtime.retained_editor_root().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let task = runtime.update(RepositoryAction::Reload { card });
+    settle(&mut runtime, task).await;
+    // A foreground Reload retains a buffer only after an observed conflict.
+    // Establish that public path first, rather than injecting its predecessor.
+    assert!(matches!(runtime.document, DocumentState::Failed { .. }));
+    std::fs::write(&path, "disk").unwrap();
+    text(card, &mut runtime, "disk").await;
+    std::fs::remove_file(&path).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime.has_save_conflict() {
+            change(card, &mut runtime).await;
+        }
+    })
+    .await
+    .unwrap();
+    let task = runtime.update(RepositoryAction::Reload { card });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("disk"));
+    assert!(!runtime.original_read_attested);
+    let identity = runtime.current_identity(card, "live.txt".into());
+
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(other.path().join("live.txt"), "foreign").unwrap();
+    let read = crate::editor::read_file_at(
+        other.path(),
+        Path::new("live.txt"),
+        crate::editor::PdfTone::Original,
+        None,
+    );
+    let task = runtime.update(RepositoryAction::FileLoadedAt {
+        identity: identity.clone(),
+        result: read,
+    });
+    settle(&mut runtime, task).await;
+    assert!(!runtime.original_read_attested);
+    assert_eq!(runtime.editor_text().as_deref(), Some("disk"));
+    assert!(Arc::ptr_eq(
+        &original,
+        &runtime.retained_editor_root().unwrap()
+    ));
+
+    std::fs::write(&path, "disk").unwrap();
+    // Matching path and bytes do not replace the retained physical read root.
+    // This is a real read through a separately opened Root, not a forged result.
+    let fresh_root = crate::editor::read_file_at(
+        root.path(),
+        Path::new("live.txt"),
+        crate::editor::PdfTone::Original,
+        None,
+    );
+    assert_eq!(
+        fresh_root.as_ref().unwrap().source(),
+        Some(Path::new("live.txt"))
+    );
+    let task = runtime.update(RepositoryAction::FileLoadedAt {
+        identity: identity.clone(),
+        result: fresh_root,
+    });
+    settle(&mut runtime, task).await;
+    assert!(!runtime.original_read_attested);
+    assert_eq!(runtime.editor_text().as_deref(), Some("disk"));
+    assert!(Arc::ptr_eq(
+        &original,
+        &runtime.retained_editor_root().unwrap()
+    ));
+
+    let stale = crate::editor::read_file_at(
+        root.path(),
+        Path::new("live.txt"),
+        crate::editor::PdfTone::Original,
+        Some(original.clone()),
+    );
+    drop(runtime.update(RepositoryAction::FileLoadedAt {
+        identity: departed,
+        result: stale,
+    }));
+    assert!(!runtime.original_read_attested);
+    std::fs::write(&path, b"binary\0data").unwrap();
+    change(card, &mut runtime).await;
+    assert!(!runtime.original_read_attested);
+    assert_eq!(runtime.editor_text().as_deref(), Some("disk"));
+    std::fs::write(&path, "disk").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime.original_read_attested {
+            change(card, &mut runtime).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(runtime.current_identity(card, "live.txt".into()), identity);
+    assert_eq!(runtime.editor_text().as_deref(), Some("disk"));
+    assert!(runtime.has_save_conflict());
+    assert!(Arc::ptr_eq(
+        &original,
+        &runtime.retained_editor_root().unwrap()
+    ));
 }
 #[tokio::test]
 async fn native_background_tabs_symlink_target_and_close_reopen() {
