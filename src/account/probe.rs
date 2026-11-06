@@ -2461,10 +2461,17 @@ cat >/dev/null
         assert_eq!(second, home.join(".claude"));
         let chosen = |name: &str| match name {
             "HOME" => Some(home_text.clone()),
-            "CLAUDE_CONFIG_DIR" => Some(format!("{home_text}/.claude")),
+            "CLAUDE_CONFIG_DIR" => Some(format!("{home_text}/claude-config")),
             _ => None,
         };
         assert_eq!(second_home(&system, &chosen), None);
+        // The default spelled out is no home of the reader's choosing.
+        let spelled = |name: &str| match name {
+            "HOME" => Some(home_text.clone()),
+            "CLAUDE_CONFIG_DIR" => Some(format!("{home_text}/.claude")),
+            _ => None,
+        };
+        assert_eq!(second_home(&system, &spelled), Some(home.join(".claude")));
         assert_eq!(
             second_home(&Account::system(Provider::Codex), &environment),
             None

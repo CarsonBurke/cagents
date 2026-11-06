@@ -5078,6 +5078,62 @@ IFS= read -r finish < finish
         );
     }
 
+    /// A conversation on the system Claude login resolves the CLI's default
+    /// home, as the window's probe does, even under a daemon started with
+    /// its own `CLAUDE_CONFIG_DIR`, and after an upgrade.
+    #[test]
+    fn a_system_claude_launch_does_not_take_the_daemon_home() {
+        let mut recipe = LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: "/project".into(),
+            environment: BTreeMap::from([("HOME".into(), "/home/a".into())]),
+            unset_environment: Default::default(),
+        };
+        crate::account::Account::system(Provider::Claude)
+            .bind_home_in(&mut recipe, &|name| {
+                (name == "HOME").then(|| "/home/a".to_owned())
+            })
+            .unwrap();
+        let launch = chat::Launch {
+            provider: Provider::Claude,
+            recipe,
+            session_id: None,
+        };
+        let daemon = BTreeMap::from([
+            ("CLAUDE_CONFIG_DIR".into(), "/daemon/claude".into()),
+            ("HTTPS_PROXY".into(), "http://fixture".into()),
+        ]);
+        let prepared =
+            prepare_native_process_launch(&launch, Some(daemon.clone()), &BTreeMap::new(), None)
+                .unwrap();
+        assert!(
+            !prepared
+                .recipe
+                .environment
+                .contains_key("CLAUDE_CONFIG_DIR")
+        );
+        assert!(
+            prepared
+                .recipe
+                .unset_environment
+                .contains("CLAUDE_CONFIG_DIR")
+        );
+        assert_eq!(
+            prepared
+                .recipe
+                .environment
+                .get("HTTPS_PROXY")
+                .map(String::as_str),
+            Some("http://fixture")
+        );
+        assert!(
+            !upgrade_environment(&launch, false, daemon)
+                .unwrap()
+                .contains_key("CLAUDE_CONFIG_DIR")
+        );
+    }
+
     #[test]
     fn paired_codex_upgrade_preserves_confirmed_fresh_or_switched_thread() {
         use crate::model::agent_recovery::{AgentProcess, bind_session};

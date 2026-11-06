@@ -2983,6 +2983,52 @@ mod tests {
         assert!(project_session.launch.recipe.arguments.is_empty());
     }
 
+    /// Moving a conversation between the system Claude login, whose home
+    /// is left unset, and a linked one is an account recovery both ways.
+    #[test]
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn moving_between_an_unset_and_a_linked_home_is_an_account_recovery() {
+        let user = |name: &str| (name == "HOME").then(|| "/home/a".to_owned());
+        let system = crate::account::Account::system(Provider::Claude);
+        let linked = crate::account::Account::linked(
+            Provider::Claude,
+            uuid::Uuid::from_u128(7),
+            "/home/a/.claude-work".into(),
+        );
+        let mut source = fresh_session(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            "/".into(),
+            &system,
+        )
+        .unwrap();
+        source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        system
+            .bind_home_in(&mut source.launch.recipe, &user)
+            .unwrap();
+        assert!(
+            source
+                .launch
+                .recipe
+                .unset_environment
+                .contains("CLAUDE_CONFIG_DIR")
+        );
+        let moved = |from: &Session, to: &crate::account::Account| {
+            let mut replacement = from.clone();
+            replacement.id = crate::model::TerminalId::new();
+            replacement.proof = None;
+            replacement.terminal = None;
+            to.bind_home_in(&mut replacement.launch.recipe, &user)
+                .unwrap();
+            replacement
+        };
+        let on_linked = moved(&source, &linked);
+        assert!(is_account_recovery(&source, &on_linked));
+        assert!(is_account_recovery(&on_linked, &moved(&on_linked, &system)));
+        // Staying on the same home changes no account.
+        assert!(!is_account_recovery(&source, &moved(&source, &system)));
+    }
+
     /// A conversation on the system login exports the home its sign-in
     /// does, and its probe reads: none unless cagents was started with one,
     /// so the CLI keeps one record of who the login is, in `~/.claude.json`.
