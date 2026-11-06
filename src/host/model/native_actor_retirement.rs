@@ -491,6 +491,44 @@ impl Registry {
         .collect()
     }
 
+    /// The most recently registered ownership of allocation `terminal` by an
+    /// owner from a boot other than `boot`. Registration order is the table's
+    /// row order: refreshing an ownership updates its row in place.
+    pub(in crate::host) fn newest_native_actor_ownership(
+        &self,
+        terminal: crate::model::TerminalId,
+        boot: &crate::model::BootId,
+    ) -> Result<Option<NativeActorOwnership>, String> {
+        // Every ownership records its allocation's id as text; the prefilter
+        // only spares decoding other allocations' rows, and is rechecked below.
+        let mut statement = self
+            .db
+            .prepare(
+                "SELECT actor,ownership FROM native_actor_ownerships
+                 WHERE instr(ownership, ?1) > 0 ORDER BY rowid DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = statement
+            .query([terminal.to_string()])
+            .map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let actor: String = row.get(0).map_err(|e| e.to_string())?;
+            let encoded: String = row.get(1).map_err(|e| e.to_string())?;
+            if encoded.len() > MAX_RECEIPT_BYTES {
+                return Err("Stored actor census exceeds its metadata bound".into());
+            }
+            let ownership: NativeActorOwnership =
+                serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+            if ownership.actor.to_string() != actor || ownership.actor.is_nil() {
+                return Err("Stored actor census key changed its identity".into());
+            }
+            if ownership.source.id == terminal && ownership.owner.boot != *boot {
+                return Ok(Some(ownership));
+            }
+        }
+        Ok(None)
+    }
+
     /// Call only after the authenticated handle's finish_retained_close proves
     /// semantic/loss ACK, exact helper disappearance and discovery retirement.
     /// A completed provider, Stop ACK or an absent socket is never sufficient.
