@@ -556,6 +556,13 @@ struct Claude {
     /// either; its progress and notification frames do not repeat it.
     command_tasks: VecDeque<String>,
     subagent_tasks: VecDeque<String>,
+    /// Commands still running in the foreground of the call that started
+    /// them. Claude Code reports a long foreground command as a task too, and
+    /// names it by the command when it has no description; its notification
+    /// is that call's own progress, which its result settles, and never
+    /// reaches the model. Moving it to the background makes it a background
+    /// task like any other.
+    foreground_tasks: VecDeque<String>,
     /// How each background task a call started ended, by that call, oldest
     /// first: its status, the exit status its summary gave, and the summary.
     /// A replayed launch acknowledgement is settled from it.
@@ -1697,7 +1704,8 @@ impl Claude {
                                 .map(String::as_str),
                             structured,
                         );
-                        if structured["backgroundTaskId"].is_string() {
+                        if let Some(task) = structured["backgroundTaskId"].as_str() {
+                            self.foreground_tasks.retain(|known| known != task);
                             self.background_launch(&tool_id, history, &mut item.content);
                         }
                         if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent")
@@ -2812,6 +2820,7 @@ impl Adapter for Claude {
                 self.report_tasks.clear();
                 self.command_tasks.clear();
                 self.subagent_tasks.clear();
+                self.foreground_tasks.clear();
                 self.task_outcomes.clear();
                 self.failure_receipts.clear();
                 self.agent_task_calls.clear();
@@ -5161,6 +5170,11 @@ impl Claude {
                         &mut self.subagent_tasks,
                         frame["owned_by_subagent"].as_bool() == Some(true),
                     );
+                    remember(
+                        &mut self.foreground_tasks,
+                        string(frame, "task_type") == "local_bash"
+                            && frame["is_backgrounded"].as_bool() == Some(false),
+                    );
                 }
                 let command = self.command_tasks.iter().any(|known| known == task);
                 // A subagent's task is work in that subagent's transcript,
@@ -5211,6 +5225,10 @@ impl Claude {
                 } else {
                     frame
                 };
+                if patch["is_backgrounded"].as_bool() == Some(true) {
+                    self.foreground_tasks.retain(|known| known != task);
+                }
+                let foreground = self.foreground_tasks.iter().any(|known| known == task);
                 if string(frame, "subtype") == "task_started"
                     && matches!(string(frame, "task_type"), "local_agent" | "local_workflow")
                 {
@@ -5236,6 +5254,7 @@ impl Claude {
                 let ended = task_status(string(patch, "status"), notification);
                 if ended.is_some() {
                     self.tasks.retain(|running| running != task);
+                    self.foreground_tasks.retain(|known| known != task);
                 }
                 let fields = match &mut item.content {
                     ItemContent::Tool {
@@ -5300,6 +5319,7 @@ impl Claude {
                 self.tool(None, item.clone());
                 if let (Some(tool), Some(ended)) = (frame["tool_use_id"].as_str(), ended)
                     && known_tool.is_none()
+                    && !foreground
                     && (notification || patch["status"].is_string())
                 {
                     self.settle_task_call(
@@ -5340,7 +5360,7 @@ impl Claude {
                 // and history shows it the same way. A notification the harness
                 // keeps out of the transcript, or out of the model's way, is not
                 // one the model acts on, and history never shows it.
-                if notification && !subagent {
+                if notification && !subagent && !foreground {
                     let description = match &item.content {
                         ItemContent::Tool { input, .. } => input.clone(),
                         ItemContent::Command { label, .. } => label.clone(),
@@ -12099,6 +12119,96 @@ mod tests {
                 }
             ));
         }
+    }
+
+    /// The user's report: a background subagent ran an 11 KB heredoc in the
+    /// foreground with no description. Claude Code 2.1.296 reports a long
+    /// foreground command as a task named by the whole command, and ends it
+    /// with a notification whose summary is the command again, before the
+    /// call's own result. These frames are as captured from that version. The
+    /// command is its call's own progress: it adds no row and no notice to
+    /// either conversation, and the call's result says how it went.
+    #[test]
+    fn a_long_foreground_command_is_its_own_call_and_never_a_notice() {
+        let command = format!(
+            "mkdir -p /var/tmp/fw16-audit && cat > /var/tmp/fw16-audit/sampler.py <<'EOF'\n{}EOF\npython3 /var/tmp/fw16-audit/sampler.py 2 10",
+            "def sample(path):\n    with open(path) as f:\n        return f.read()\n\n".repeat(160)
+        );
+        for subagent in [false, true] {
+            let mut adapter = Claude {
+                cwd: PathBuf::from("/workspace"),
+                ..Claude::default()
+            };
+            let parent = subagent.then_some("agent-call");
+            if subagent {
+                notification_agent(&mut adapter, "agent-call", "agent-task", true);
+            }
+            let mut call = json!({"type":"assistant","uuid":"call","message":{"id":"m","content":[{"type":"tool_use","id":"bash","name":"Bash","input":{"command":command}}]}});
+            let mut started = json!({"type":"system","subtype":"task_started","uuid":"started","task_id":"blbzv107t","tool_use_id":"bash","description":command,"is_backgrounded":false,"task_type":"local_bash"});
+            let notified = json!({"type":"system","subtype":"task_notification","uuid":"notified","task_id":"blbzv107t","tool_use_id":"bash","status":"completed","output_file":"","summary":command});
+            let mut result = json!({"type":"user","uuid":"result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"bash","content":"/var/tmp/fw16-audit/smoke.json","is_error":false}]}});
+            if let Some(parent) = parent {
+                call["parent_tool_use_id"] = json!(parent);
+                result["parent_tool_use_id"] = json!(parent);
+                started["owned_by_subagent"] = json!(true);
+                started["parent_task_id"] = json!("agent-task");
+            }
+            let mut steps = Vec::new();
+            for frame in [call, started, notified] {
+                steps.push(adapter.receive(frame).unwrap());
+            }
+            for step in &steps {
+                assert!(task_rows(step).is_empty(), "subagent: {subagent}");
+                assert!(notice_summaries(step).is_empty(), "subagent: {subagent}");
+                assert!(
+                    !step.events.iter().any(|event| matches!(
+                        event,
+                        Event::Item(Item { content: ItemContent::Command { output, .. }, .. })
+                            | Event::SubagentItem { item: Item { content: ItemContent::Command { output, .. }, .. }, .. }
+                            if output.contains("sampler.py")
+                    )),
+                    "the command is not its own output: {step:?}"
+                );
+            }
+            assert!(adapter.visible_task_rows.is_empty());
+            assert!(adapter.foreground_tasks.is_empty());
+            let finished = adapter.receive(result).unwrap();
+            let (scope, content) = shown_command(&finished, "bash").unwrap();
+            assert_eq!(scope.as_deref(), parent);
+            assert!(
+                matches!(
+                    content,
+                    ItemContent::Command { status: ToolStatus::Succeeded, ref output, .. }
+                        if output == "/var/tmp/fw16-audit/smoke.json"
+                ),
+                "{content:?}"
+            );
+        }
+    }
+
+    /// A foreground command that outlives its timeout becomes a background
+    /// task the model is told about, so its notification is shown again.
+    #[test]
+    fn a_foreground_command_moved_to_the_background_is_notified_again() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"call","message":{"id":"m","content":[{"type":"tool_use","id":"bash","name":"Bash","input":{"command":"cargo build","description":"Build"}}]}})).unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"b2","tool_use_id":"bash","description":"Build","is_backgrounded":false,"task_type":"local_bash"})).unwrap();
+        adapter.receive(json!({"type":"user","uuid":"moved","tool_use_result":{"backgroundTaskId":"b2","timedOutAfterMs":120000},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"bash","content":"Command did not complete within its 120s timeout and was moved to the background (ID: b2)."}]}})).unwrap();
+        let notified = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"b2","tool_use_id":"bash","status":"completed","output_file":"/var/tmp/b2.output","summary":"Background command \"Build\" completed (exit code 0)"})).unwrap();
+        assert_eq!(
+            notice_summaries(&notified),
+            ["Background command \"Build\" completed (exit code 0)"]
+        );
+        assert!(matches!(
+            shown_command(&notified, "bash"),
+            Some((
+                None,
+                ItemContent::Command {
+                    status: ToolStatus::Succeeded,
+                    ..
+                }
+            ))
+        ));
     }
 
     /// A command Claude Code backgrounded only because it outlived its
