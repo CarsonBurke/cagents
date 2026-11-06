@@ -722,8 +722,17 @@ impl RemoteActor {
                 resident.ready = false;
                 resident.idle = false;
                 resident.busy = false;
+                let (changed, generation) = (resident.changed, resident.generation);
                 if !self.publish_resident_inner(resident, true) {
-                    return Err("Closed actor metadata was superseded during refresh".into());
+                    // Another refresh, such as the outcome broker's while a
+                    // close drains the outbox, can publish a newer closed
+                    // reply first. This older one is then only stale.
+                    let current = self.state();
+                    if !(current.completed
+                        && (current.changed > changed || current.generation > generation))
+                    {
+                        return Err("Closed actor metadata was superseded during refresh".into());
+                    }
                 }
             } else if !self.publish_resident(resident) && self.0.stop.load(Ordering::Acquire) {
                 return Err("Retained actor attachment closed during refresh".into());
@@ -5971,6 +5980,55 @@ exec /bin/sleep 60
         assert_eq!(actor.state().activity, crate::agent::ActivityState::Idle);
         actor.0.stop.store(true, Ordering::Release);
         stop.send(()).unwrap();
+        peer.join().unwrap();
+    }
+    /// #2339: while a close drains the outbox, the outcome broker refreshes
+    /// the same closed actor. When its newer reply is published first, the
+    /// close's older reply is stale, not a failed close.
+    #[test]
+    fn a_closed_refresh_overtaken_by_a_newer_one_is_stale_not_a_failure() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("closed-refresh.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let actor = RemoteActor::fixture_at(socket);
+        let mut older = actor.state().as_ref().clone();
+        older.completed = true;
+        older.close.completed = true;
+        let mut newer = older.clone();
+        newer.changed += 1;
+        newer.outbox_ack = 1;
+        newer.outbox_latest = 1;
+        actor.publish_closed_inner(
+            Snapshot {
+                exited: true,
+                ..Default::default()
+            },
+            Some(newer.clone()),
+        );
+        // Current, yet it contradicts the acknowledged installation.
+        let mut contradictory = newer.clone();
+        contradictory.installed = false;
+        let replies = [older, contradictory];
+        let peer = thread::spawn(move || {
+            for reply in replies {
+                let (stream, _) = listener.accept().unwrap();
+                let request: Invocation = receive(&stream, TIMEOUT).unwrap();
+                assert_eq!(request.method, "state");
+                send(
+                    &stream,
+                    &Ok::<Value, String>(serde_json::to_value(Some(reply)).unwrap()),
+                    TIMEOUT,
+                )
+                .unwrap();
+            }
+        });
+        actor.refresh_state().unwrap();
+        assert_eq!(actor.state().changed, newer.changed);
+        assert_eq!(actor.state().outbox_ack, 1);
+        assert_eq!(
+            actor.refresh_state().unwrap_err(),
+            "Closed actor metadata was superseded during refresh"
+        );
         peer.join().unwrap();
     }
     #[test]
