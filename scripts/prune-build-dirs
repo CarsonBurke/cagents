@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""Remove Cargo build output that nothing has used for a while.
+
+Agents build in many places: worktree `target/`s, `CARGO_TARGET_DIR`s under
+~/.cache and /var/tmp, test roots under ~/.local/state, and the mirrored
+`/var/tmp/cargo-build/<workspace>/target` layout. Cargo never removes any of
+them, and together they fill the disk that every build shares. This finds
+build output by what it holds rather than by where it is: Cargo writes
+`.rustc_info.json` at the root of every target directory and a `.fingerprint`
+directory in each profile, which nothing else does.
+
+A target directory is removed only when, at the time of removal:
+- no entry anywhere inside it was written within --max-idle days, or, for a
+  mirrored build directory whose workspace no longer exists, --orphan-hours;
+- every Cargo profile lock in it is free, and stays held by this program
+  until the directory is gone; and
+- no process has its working directory, root, executable, an open file or a
+  mapping inside it.
+
+It is first renamed aside, under those locks, so a build that starts later
+finds no directory rather than a partly removed one; an interrupted removal
+leaves only the renamed copy, which the next run removes. Never touched: the
+directories given with --keep, ~/.local/share, the offload build slots
+(~/.cache/cagents-offload, whose leases manage them) and anything a symlink
+leads to. One run at a time per host.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import math
+import os
+import re
+import shutil
+import stat
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+MIRROR = Path("/var/tmp/cargo-build")
+LOCK_NAMES = (".cargo-lock", ".cargo-artifact-lock", ".cargo-build-lock")
+PRUNED = re.compile(r"^\.(?P<name>.+)\.cagents-pruned-(?P<pid>\d+)$")
+
+
+def default_roots() -> list[Path]:
+    return [HOME / ".cache", HOME / ".local/state", Path("/var/tmp")]
+
+
+def never() -> list[Path]:
+    return [HOME / ".local/share", HOME / ".cache/cagents-offload"]
+
+
+def within(path: Path, parents: list[Path]) -> bool:
+    return any(path == parent or parent in path.parents for parent in parents)
+
+
+def is_build_output(path: Path, names: set[str]) -> bool:
+    """Cargo's own markers: `.rustc_info.json` at a target directory's root,
+    or, beside the CACHEDIR.TAG Cargo writes, a profile's `.fingerprint` in a
+    separate build directory."""
+    if ".rustc_info.json" in names:
+        return True
+    return "CACHEDIR.TAG" in names and any(
+        directory(path / name / ".fingerprint") for name in names if not name.startswith("."))
+
+
+def directory(path: Path) -> bool:
+    """Whether path is a directory, not through a symlink; unreadable is not."""
+    try:
+        return stat.S_ISDIR(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+# Never build output, and often large: not worth reading.
+SKIPPED = {".git", "node_modules", "__pycache__"}
+
+
+def find(roots: list[Path], excluded: list[Path], depth: int, mirror: Path) -> list[Path]:
+    """Build directories at most `depth` levels under the roots, or at any
+    depth in the mirror, which holds nothing else, without descending into
+    them, into Git repositories, across file systems or through symlinks."""
+    found = []
+    for root in roots:
+        try:
+            device = root.lstat().st_dev
+        except OSError:
+            continue
+        pending = [(root, 0)]
+        while pending:
+            directory_, level = pending.pop()
+            if within(directory_, excluded):
+                continue
+            try:
+                with os.scandir(directory_) as entries:
+                    entries = list(entries)
+            except OSError:
+                continue
+            names = {entry.name for entry in entries}
+            if directory_ != root and (PRUNED.match(directory_.name)
+                                       or is_build_output(directory_, names)):
+                found.append(directory_)
+                continue
+            # A bare Git repository holds no build output.
+            if level >= depth or {"HEAD", "objects", "refs"} <= names:
+                continue
+            for entry in entries:
+                if entry.name in SKIPPED:
+                    continue
+                with contextlib.suppress(OSError):
+                    info = entry.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(info.st_mode) and info.st_dev == device:
+                        child = Path(entry.path)
+                        pending.append((child, -sys.maxsize if child == mirror else level + 1))
+    return sorted(set(found))
+
+
+def survey(root: Path, cutoff: float) -> tuple[int, list[Path]] | None:
+    """Allocated bytes and profile locks, or None when anything inside was
+    written after cutoff or cannot be read: a partial survey proves nothing."""
+    total, locks, pending = 0, [], [root]
+    try:
+        while pending:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    info = entry.stat(follow_symlinks=False)
+                    if info.st_mtime > cutoff:
+                        return None
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append(Path(entry.path))
+                        continue
+                    total += info.st_blocks * 512
+                    if entry.name in LOCK_NAMES and len(Path(entry.path).relative_to(root).parts) <= 3:
+                        locks.append(Path(entry.path))
+    except OSError:
+        return None
+    return total, locks
+
+
+@contextlib.contextmanager
+def held(locks: list[Path]):
+    """Hold every lock, or yield False when any is busy or cannot be opened."""
+    descriptors = []
+    try:
+        for lock in locks:
+            try:
+                descriptor = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except OSError:
+                yield False
+                return
+            descriptors.append(descriptor)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                yield False
+                return
+        yield True
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+def in_use(directory: Path) -> int | None:
+    """A process with anything inside the directory, or None."""
+    prefix = f"{directory}/"
+    def inside(target: str) -> bool:
+        target = target.removesuffix(" (deleted)")
+        return target == str(directory) or target.startswith(prefix)
+    for process in os.listdir("/proc"):
+        if not process.isdigit() or int(process) == os.getpid():
+            continue
+        base = f"/proc/{process}"
+        links = ["cwd", "root", "exe"]
+        with contextlib.suppress(OSError):
+            links += [f"fd/{fd}" for fd in os.listdir(f"{base}/fd")]
+        for link in links:
+            with contextlib.suppress(OSError):
+                if inside(os.readlink(f"{base}/{link}")):
+                    return int(process)
+        with contextlib.suppress(OSError), open(f"{base}/maps") as maps:
+            for line in maps:
+                fields = line.split(None, 5)
+                if len(fields) == 6 and inside(fields[5].rstrip("\n")):
+                    return int(process)
+    return None
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def orphaned(directory: Path, mirror: Path) -> bool:
+    """A mirrored build directory whose workspace is definitely gone."""
+    try:
+        relative = directory.relative_to(mirror)
+    except ValueError:
+        return False
+    if directory.name != "target" or len(relative.parts) < 2:
+        return False
+    try:
+        Path("/", *relative.parts[:-1]).stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def nonnegative(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    return number
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        epilog="Roots default to ~/.cache, ~/.local/state and /var/tmp, or "
+               "CAGENTS_BUILD_PRUNE_ROOTS (colon-separated) when set.")
+    parser.add_argument("--apply", action="store_true", help="remove (default: only report)")
+    parser.add_argument("--max-idle", type=nonnegative, default=7.0, metavar="DAYS",
+                        help="remove build directories unwritten this long (default 7)")
+    parser.add_argument("--orphan-hours", type=nonnegative, default=6.0, metavar="HOURS",
+                        help="remove mirrored build directories of removed "
+                             "workspaces unwritten this long (default 6)")
+    parser.add_argument("--root", action="append", type=Path, default=[], metavar="DIR",
+                        help="also search DIR; repeatable")
+    parser.add_argument("--keep", action="append", type=Path, default=[], metavar="DIR",
+                        help="never remove DIR or anything in it; repeatable")
+    parser.add_argument("--max-depth", type=int, default=6, metavar="LEVELS",
+                        help="search at most this deep under each root (default 6)")
+    parser.add_argument("--mirror", type=Path, default=MIRROR, metavar="DIR",
+                        help="where build directories mirror their workspace's path, "
+                             "as `build-dir = \"DIR{workspace-root}/target\"` names them "
+                             "(default: %(default)s)")
+    parser.add_argument("--keep-checkout", action="append", type=Path, default=[], metavar="DIR",
+                        help="never remove the build of the checkout at DIR, in its "
+                             "target or the mirror; repeatable")
+    parser.add_argument("--log", type=Path, metavar="FILE",
+                        help="append a tab-separated line per removal to FILE")
+    parser.add_argument("--lock", type=Path, default=Path(f"/var/tmp/cagents-prune-build-dirs-{os.getuid()}.lock"),
+                        metavar="FILE", help="one run at a time holds FILE (default: %(default)s)")
+    arguments = parser.parse_args()
+
+    configured = os.environ.get("CAGENTS_BUILD_PRUNE_ROOTS")
+    roots = [Path(p) for p in configured.split(":") if p] if configured is not None \
+        else default_roots()
+    roots = [Path(os.path.abspath(root)) for root in roots + arguments.root]
+    arguments.mirror = Path(os.path.abspath(arguments.mirror))
+    excluded = never() + [Path(os.path.abspath(keep)) for keep in arguments.keep]
+    for checkout in arguments.keep_checkout:
+        checkout = Path(os.path.abspath(checkout))
+        excluded += [checkout / "target",
+                     arguments.mirror / checkout.relative_to("/") / "target"]
+
+    runs = open(arguments.lock, "a")
+    fcntl.flock(runs, fcntl.LOCK_EX)
+
+    now = time.time()
+    idle_cutoff = now - arguments.max_idle * 86400
+    orphan_cutoff = now - arguments.orphan_hours * 3600
+    removed = kept = 0
+    freed = 0
+    failed = False
+    for directory in find(roots, excluded, arguments.max_depth, arguments.mirror):
+        leftover = PRUNED.match(directory.name)
+        if leftover:
+            # Another run's renamed copy, which it did not finish removing.
+            if alive(int(leftover["pid"])):
+                continue
+            reason, cutoff = "interrupted removal", now
+        elif orphaned(directory, arguments.mirror):
+            reason, cutoff = "workspace removed", max(idle_cutoff, orphan_cutoff)
+        else:
+            reason, cutoff = f"unwritten for {arguments.max_idle:g} days", idle_cutoff
+        surveyed = survey(directory, cutoff)
+        if surveyed is None:
+            kept += 1
+            continue
+        size, locks = surveyed
+        with held(locks) as free:
+            if not free:
+                print(f"keep {directory}: a build holds its lock", flush=True)
+                kept += 1
+                continue
+            user = in_use(directory)
+            if user is not None:
+                print(f"keep {directory}: process {user} uses it", flush=True)
+                kept += 1
+                continue
+            if not arguments.apply:
+                print(f"would remove {directory} ({size / 2**30:.1f} GiB, {reason})", flush=True)
+                freed += size
+                removed += 1
+                continue
+            # Writes after the survey would show in a second one; then rename
+            # it aside while the locks still keep Cargo out.
+            if survey(directory, cutoff) is None:
+                kept += 1
+                continue
+            aside = directory if leftover else \
+                directory.with_name(f".{directory.name}.cagents-pruned-{os.getpid()}")
+            try:
+                if aside != directory:
+                    os.rename(directory, aside)
+            except OSError as error:
+                print(f"failed to remove {directory}: {error}", file=sys.stderr, flush=True)
+                failed = True
+                continue
+        try:
+            shutil.rmtree(aside)
+        except OSError as error:
+            print(f"failed to remove {aside}: {error}", file=sys.stderr, flush=True)
+            failed = True
+            continue
+        freed += size
+        removed += 1
+        print(f"removed {directory} ({size / 2**30:.1f} GiB, {reason})", flush=True)
+        if arguments.log:
+            with contextlib.suppress(OSError), open(arguments.log, "a") as log:
+                log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\t{directory}\t"
+                          f"{size}\t{reason}\n")
+    verb = "removed" if arguments.apply else "would remove"
+    print(f"{verb} {removed} build directories ({freed / 2**30:.1f} GiB); "
+          f"kept {kept} in use or recently written", flush=True)
+    return int(failed)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

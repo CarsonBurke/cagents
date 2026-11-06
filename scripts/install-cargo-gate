@@ -24,8 +24,8 @@ Usage: scripts/install-cargo-gate [DIRECTORY]
 
 Installs scripts/cargo-gate as DIRECTORY/cagents-cargo-gate, with
 cargo-gate-command.py, cargo-gate-sync.py, cargo-gate-rustc-guard,
-cargo-offload, seed-build-dir and
-build-disk-guard beside it (default DIRECTORY: /var/tmp). Exits 3, changing
+cargo-offload, seed-build-dir, build-disk-guard and
+prune-build-dirs beside it (default DIRECTORY: /var/tmp). Exits 3, changing
 nothing, when the installed gate's version is newer than this checkout's.
 EOF
 }
@@ -45,6 +45,7 @@ cargo-gate-rustc-guard:cargo-gate-rustc-guard
 cargo-offload:cargo-offload
 seed-build-dir:seed-build-dir
 build-disk-guard:build-disk-guard
+prune-build-dirs:prune-build-dirs
 cagents-cargo-gate:cargo-gate'
 
 # One installation at a time, by hand or by a gate installing main's: a gate
@@ -69,7 +70,7 @@ printf '%s\n' "$files" | while IFS=: read -r installed file; do
     cp -- "$source/$file" "$stage/$installed"
     chmod 755 -- "$stage/$installed"
     case $file in
-        *.py|cargo-offload) python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$stage/$installed" ;;
+        *.py|cargo-offload|prune-build-dirs) python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$stage/$installed" ;;
         *) sh -n "$stage/$installed" ;;
     esac
 done

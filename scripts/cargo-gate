@@ -91,9 +91,10 @@ when that is newer. Run inside a checkout whose origin/main has changed the
 gate since the installed one's commit, the gate first installs main's.
 
 A checkout whose Cargo build directory has never been built is first seeded
-from the main checkout's with scripts/seed-build-dir. When the file system
-holding build directories runs low, scripts/build-disk-guard first reclaims
-removed worktrees' build directories, and refuses the build below a floor.
+from the main checkout's with scripts/seed-build-dir. Every few hours, and
+at once when the file system holding build directories runs low,
+scripts/build-disk-guard runs scripts/prune-build-dirs, which removes Cargo
+build output nothing has used for a week; below a floor it refuses the build.
 
 Environment:
   CAGENTS_BUILD_REMOTE   Host that compiles (default fw16); `local` builds here

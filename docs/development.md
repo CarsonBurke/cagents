@@ -636,8 +636,8 @@ directory a plain `cargo` would create. After copying a target by hand, run
 there, before its first build. It fails when it can't find this checkout's
 crates in `Cargo.lock`, or can't search or clean `TARGET`; a `TARGET` with no
 fingerprints has nothing to forget. Seeded directories carry Cargo's
-`CACHEDIR.TAG`, so `prune-cargo-build-dirs` reclaims them after their worktree
-is removed.
+Cargo's markers, so `scripts/prune-build-dirs` reclaims them once they go
+unused.
 
 The gate's helpers run from the gate's own directory. Install a changed gate
 for every checkout with `scripts/install-cargo-gate`, never by copying
@@ -645,14 +645,24 @@ for every checkout with `scripts/install-cargo-gate`, never by copying
 the staged gate runs a command, renames them into `/var/tmp`, and checks the
 result.
 
-Build directories share one disk. When the file system holding them has less
-than twice a floor free (5% of its size, at most 64 GiB), `scripts/cargo-gate`
-runs `scripts/build-disk-guard`, which reclaims removed worktrees' build
-directories at once with `prune-cargo-build-dirs`, at most every ten minutes
-across the host; idle live worktrees' are left to the pruner's own schedule.
-Below the floor it refuses the build and says why. Remove worktrees you no
-longer need; their build directories follow. Set `CAGENTS_BUILD_FREE_FLOOR_GIB`
-to change the floor, or `0` to disable the guard.
+Build directories share one disk, and Cargo never removes one. Worktrees'
+`target/`s, `CARGO_TARGET_DIR`s under `~/.cache` and `/var/tmp`, and test
+roots under `~/.local/state` all stay until something removes them.
+`scripts/build-disk-guard`, which `scripts/cargo-gate` runs before every
+build, does so with `scripts/prune-build-dirs` in two ways:
+
+- **On a schedule.** At most every `CAGENTS_BUILD_PRUNE_INTERVAL_HOURS` (default 6) per user and host, whatever the free space, it starts the pruner in the background at idle CPU and I/O priority; the build does not wait for it.
+- **Under pressure.** When the file system has less than twice a floor free (5% of its size, at most 64 GiB), it runs the pruner before the build, at most every ten minutes across the host. This run also removes at once the build directories of workspaces that no longer exist in the mirrored `/var/tmp/cargo-build` layout. Below the floor it refuses the build and says why. With no pruner beside it and no `CAGENTS_BUILD_PRUNE`, it says it has nothing to reclaim with.
+
+The pruner searches `~/.cache`, `~/.local/state`, `/var/tmp` and the repository's main checkout (`CAGENTS_BUILD_PRUNE_ROOTS` replaces the first three). It recognizes build output by Cargo's own markers, a root `.rustc_info.json` or a profile's `.fingerprint`, not by name or place. It removes a build directory only when all of these hold:
+
+- nothing inside it has been written for `CAGENTS_BUILD_PRUNE_IDLE_DAYS` (default 7);
+- every Cargo lock in it is free;
+- no process has its working directory, an open file, its executable or a mapping inside it.
+
+It holds those locks while it renames the directory aside, so a build that starts afterwards begins with an empty directory rather than a partly removed one. It never touches the main checkout's own build, which seeds new worktrees, `~/.local/share`, the offload slots (their leases manage them) or anything reached through a symlink.
+
+What it removed goes to `/var/tmp/cagents-prune-build-dirs-UID.tsv` (`CAGENTS_BUILD_PRUNE_STATE` sets the prefix), and the last scheduled run's output to `.log` beside it. Run `scripts/prune-build-dirs` without `--apply` to see what it would remove. Remove worktrees you no longer need. Set `CAGENTS_BUILD_FREE_FLOOR_GIB` to change the floor, or `0` to disable the guard.
 
 The build script that stamps `--version` reruns only when the stamp could
 change, because each rerun recompiles `cagents`. It watches this checkout's

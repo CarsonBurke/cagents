@@ -267,7 +267,7 @@ class InstalledGateSync(unittest.TestCase):
 
     files = ("cargo-gate", "cargo-gate-command.py", "cargo-gate-sync.py",
              "cargo-gate-rustc-guard", "cargo-offload",
-             "seed-build-dir", "build-disk-guard", "install-cargo-gate")
+             "seed-build-dir", "build-disk-guard", "prune-build-dirs", "install-cargo-gate")
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-sync-")
