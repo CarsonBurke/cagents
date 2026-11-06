@@ -97,6 +97,18 @@ impl ManualRemoval {
         let admin_dir = service
             .git_dir(path, cancellation)
             .map_err(|error| error.to_string())?;
+        // core.worktree (including config.worktree) can redirect all file
+        // inventories while Git still removes the registered directory.
+        let top_level = read(
+            path,
+            ["rev-parse", "--path-format=absolute", "--show-toplevel"],
+            cancellation,
+        )?;
+        if top_level.strip_suffix(b"\n") != Some(path.as_os_str().as_bytes()) {
+            return Err(
+                "Git is inspecting a different worktree root; the directory was kept.".into(),
+            );
+        }
         let directory_identity = identity(path)?;
         let common_identity = identity(&common_dir)?;
         let admin_identity = identity(&admin_dir)?;
@@ -651,6 +663,47 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(fixture.linked.join("TRACKED")).unwrap(),
             "distinct local data\n"
+        );
+    }
+
+    #[test]
+    fn manual_deletion_refuses_redirected_worktree_inventory() {
+        if crate::repository::isolated_git_test(concat!(
+            module_path!(),
+            "::manual_deletion_refuses_redirected_worktree_inventory"
+        )) {
+            return;
+        }
+        let fixture = Fixture::new();
+        let outside = fixture.repository.parent().unwrap().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        for file in ["tracked", ".gitignore"] {
+            std::fs::copy(fixture.repository.join(file), outside.join(file)).unwrap();
+        }
+        std::fs::write(fixture.linked.join(".env"), "preserve\n").unwrap();
+        git(
+            &fixture.repository,
+            &["config", "extensions.worktreeConfig", "true"],
+        );
+        git(
+            &fixture.linked,
+            &[
+                "config",
+                "--worktree",
+                "core.worktree",
+                outside.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(git(&fixture.linked, &["status", "--porcelain"]), "");
+        assert!(
+            fixture
+                .capture()
+                .unwrap_err()
+                .contains("different worktree root")
+        );
+        assert_eq!(
+            std::fs::read(fixture.linked.join(".env")).unwrap(),
+            b"preserve\n"
         );
     }
 }
