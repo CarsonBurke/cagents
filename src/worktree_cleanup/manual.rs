@@ -266,18 +266,27 @@ impl ManualRemoval {
         if !ignored.is_empty() {
             return Err("The worktree has ignored files, which can include .env or local data; move them before deleting.".into());
         }
+        // Removing the administrative directory also deletes this worktree's
+        // HEAD reflog. A detached commit can survive only there after switching
+        // back to a branch or resetting HEAD, so judge those commits as well.
+        let reflog = read(
+            path,
+            ["reflog", "show", "--format=%H", "HEAD"],
+            cancellation,
+        )?;
         let detached_only = count(
             path,
             head,
             &["--branches", "--remotes", "--tags"],
+            reflog,
             cancellation,
         )?;
         if detached_only != 0 {
             return Err(format!(
-                "The detached worktree has {detached_only} commit(s) on no branch, remote or tag; create a branch before deleting."
+                "The worktree has {detached_only} commit(s) on no branch, remote or tag; create a branch before deleting."
             ));
         }
-        let unpushed = count(path, head, &["--remotes"], cancellation)?;
+        let unpushed = count(path, head, &["--remotes"], Vec::new(), cancellation)?;
         Ok(Self {
             repository: repository.to_owned(),
             path: path.to_owned(),
@@ -409,11 +418,13 @@ fn count(
     path: &Path,
     head: &str,
     excluded: &[&str],
+    reflog: Vec<u8>,
     cancellation: &CancellationToken,
 ) -> Result<u64, String> {
     let command = read_command(path)
-        .args(["rev-list", "--count", head, "--not"])
-        .args(excluded.iter().copied());
+        .args(["rev-list", "--count", head, "--stdin", "--not"])
+        .args(excluded.iter().copied())
+        .stdin(reflog);
     let output = output(&command, cancellation)?
         .require_success(&command.program)
         .map_err(|error| error.reported_detail())?;
@@ -565,6 +576,17 @@ mod tests {
         );
         assert!(fixture.capture().unwrap_err().contains("1 commit(s)"));
         assert!(fixture.linked.is_dir());
+
+        let detached_head = git(&fixture.linked, &["rev-parse", "HEAD"]);
+        git(&fixture.linked, &["switch", "feature"]);
+        assert!(fixture.capture().unwrap_err().contains("1 commit(s)"));
+        // A rescue ref preserves the reflog-only work and permits removal.
+        git(&fixture.linked, &["branch", "rescue", &detached_head]);
+        fixture.remove();
+        assert_eq!(
+            git(&fixture.repository, &["rev-parse", "rescue"]),
+            detached_head
+        );
     }
 
     #[test]
