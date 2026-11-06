@@ -125,46 +125,6 @@ pub(super) struct Preview {
     theme: crate::settings::EditorSyntaxTheme,
 }
 
-/// A tool's short target when the input supplies one; otherwise describe
-/// the disclosure without promoting arbitrary payload text into the transcript.
-fn tool_preview(input: &str) -> String {
-    // Bound all inspection, including trimming a whitespace-only JSON prefix
-    // that Claude can publish before the rest of its streamed input arrives.
-    if input.len() > CachedItem::HIGHLIGHT_LIMIT {
-        return "Input available".into();
-    }
-    if input.trim().is_empty() {
-        return String::new();
-    }
-    let object = serde_json::from_str::<serde_json::Value>(input).ok();
-    let Some(object) = object.as_ref().and_then(serde_json::Value::as_object) else {
-        return "Input available".into();
-    };
-    for key in [
-        "file_path",
-        "path",
-        "url",
-        "query",
-        "pattern",
-        "skill",
-        "subject",
-    ] {
-        if let Some(value) = object.get(key).and_then(serde_json::Value::as_str) {
-            let value = value.trim();
-            // Long prose and multiline documents are detail, even when a
-            // provider uses a familiar target field for them.
-            if !value.is_empty() && value.chars().count() <= 120 && !value.contains(['\n', '\r']) {
-                return value.to_owned();
-            }
-        }
-    }
-    match object.len() {
-        0 => String::new(),
-        1 => "1 input field".into(),
-        count => format!("{count} input fields"),
-    }
-}
-
 /// How far back from the end of a failed command's output its diagnostic is
 /// looked for. A compiler prints its first error well before the summary that
 /// ends the run, but a log that kept going for megabytes after the failure is
@@ -340,7 +300,7 @@ impl Preview {
                 output,
                 ..
             } => (
-                Cow::Borrowed(turn::step_label(content)),
+                turn::step_label(content),
                 if command.trim().is_empty() {
                     Language::Plain
                 } else {
@@ -350,21 +310,24 @@ impl Preview {
             ),
             // The last line of a file that was read, or of a search's
             // matches, says nothing about how the step went.
-            ItemContent::Command { .. } => (
-                Cow::Borrowed(turn::step_label(content)),
-                Language::Plain,
-                "",
-            ),
+            ItemContent::Command { .. } => (turn::step_label(content), Language::Plain, ""),
             // Unknown tools can carry prompts, entire documents, and protocol
             // framing. Their raw arguments and successful output belong to
             // the explicit Input/Output disclosure, not the closed row.
             ItemContent::Tool {
+                name,
                 input,
                 output,
                 status,
                 ..
             } => (
-                Cow::Owned(tool_preview(input)),
+                // A tool the row names by what it did already says what it
+                // acted on; any other keeps its input's short target here.
+                if super::tool_title::title(name, input, *status).names_target {
+                    Cow::Borrowed("")
+                } else {
+                    Cow::Owned(super::tool_title::target(input))
+                },
                 Language::Plain,
                 if matches!(
                     status,
@@ -375,11 +338,7 @@ impl Preview {
                     ""
                 },
             ),
-            _ => (
-                Cow::Borrowed(turn::step_label(content)),
-                Language::Plain,
-                "",
-            ),
+            _ => (turn::step_label(content), Language::Plain, ""),
         };
         // Bound preview work independently of the complete source kept for
         // expansion and copying. Layout also caps wrapped text at two rows.
@@ -1565,17 +1524,12 @@ mod tests {
         }
         // An incomplete JSON prefix never flashes its prompt onto the row.
         let prefix = tool(r#"{"prompt":"Internal framing"#);
-        assert_eq!(
-            Preview::update(None, &prefix, theme).text,
-            "Input available"
-        );
-        // Unknown fields and multiline values disclose their structure only.
+        assert_eq!(Preview::update(None, &prefix, theme).text, "");
+        // Unknown fields and multiline values stay in the disclosure, and the
+        // row says nothing in their place rather than describing them.
         for (input, expected) in [
-            (
-                r#"{"prompt":"Internal framing","body":"document"}"#,
-                "2 input fields",
-            ),
-            (r#"{"query":"first\nsecond"}"#, "1 input field"),
+            (r#"{"prompt":"Internal framing","body":"document"}"#, ""),
+            (r#"{"query":"first\nsecond"}"#, ""),
             (
                 r#"{"skill":"writing-copy","args":"Internal framing"}"#,
                 "writing-copy",
@@ -1583,6 +1537,56 @@ mod tests {
         ] {
             assert_eq!(Preview::update(None, &tool(input), theme).text, expected);
         }
+    }
+
+    /// A row's trailing word is for a step still running or one that did not
+    /// do what it was asked; a step that worked says nothing there, since its
+    /// group's mark already says so. A command that ended without an exit
+    /// code to show it failed still says how it ended beside its duration.
+    #[test]
+    fn only_an_unsettled_step_names_its_status() {
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        let detail = |content: &ItemContent| {
+            CachedItem::updated(content, theme, None, false, false, None)
+                .detail
+                .clone()
+        };
+        let mut done = tool("{}");
+        assert_eq!(detail(&done), None);
+        if let ItemContent::Tool { status, .. } = &mut done {
+            *status = chat::ToolStatus::Running;
+        }
+        assert_eq!(detail(&done).as_deref(), Some("Running"));
+        let ran = |status, exit_code, duration_ms| {
+            let mut content = command("", "cargo test", chat::CommandAction::Run, "");
+            if let ItemContent::Command {
+                status: current,
+                exit_code: code,
+                duration_ms: elapsed,
+                ..
+            } = &mut content
+            {
+                *current = status;
+                *code = exit_code;
+                *elapsed = duration_ms;
+            }
+            detail(&content)
+        };
+        use chat::ToolStatus::{Denied, Failed, Stopped, Succeeded};
+        assert_eq!(ran(Succeeded, Some(0), None), None);
+        assert_eq!(
+            ran(Succeeded, Some(0), Some(1_200)).as_deref(),
+            Some("1.2s")
+        );
+        assert_eq!(
+            ran(Failed, Some(2), Some(1_200)).as_deref(),
+            Some("exit 2 · 1.2s")
+        );
+        assert_eq!(
+            ran(Stopped, None, Some(1_200)).as_deref(),
+            Some("Stopped · 1.2s")
+        );
+        assert_eq!(ran(Denied, None, None).as_deref(), Some("Denied"));
     }
 
     #[test]
@@ -1705,7 +1709,7 @@ mod tests {
             &tool(&large),
             crate::settings::EditorSyntaxTheme::Auto,
         );
-        assert_eq!(preview.text, "Input available");
+        assert_eq!(preview.text, "");
         // A partial JSON stream can consist entirely of whitespace; it is
         // still bounded before inspecting any of those bytes.
         let whitespace = " ".repeat(CachedItem::HIGHLIGHT_LIMIT + 1);
@@ -1716,7 +1720,7 @@ mod tests {
                 crate::settings::EditorSyntaxTheme::Auto
             )
             .text,
-            "Input available"
+            ""
         );
         assert!(
             Preview::update(

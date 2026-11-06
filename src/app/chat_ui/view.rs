@@ -4993,16 +4993,16 @@ impl Runtime {
         }
         let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
-            ItemContent::Text { text, .. } => text.as_str(),
+            ItemContent::Text { text, .. } => Cow::Borrowed(text.as_str()),
             ItemContent::Image {
                 path, description, ..
-            } => Self::attachment_label(path, description),
+            } => Cow::Borrowed(Self::attachment_label(path, description)),
             content => turn::step_label(content),
         };
         if attachment {
-            (text.to_owned(), true, false)
+            (text.into_owned(), true, false)
         } else {
-            let (preview, long) = prompt::preview(text);
+            let (preview, long) = prompt::preview(&text);
             (preview, false, long)
         }
     }

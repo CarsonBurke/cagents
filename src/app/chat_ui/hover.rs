@@ -32,6 +32,10 @@ use iced::{Element, Length, window};
 enum Placement {
     /// Beside the content, in space reserved for them, as a tool row's header.
     Beside(f32),
+    /// Beside the content's first row, in space reserved for them down the
+    /// content's whole height, as an open tool row: its detail ends where its
+    /// header does rather than running under the actions.
+    BesideFirst(f32),
     /// Over the content, within its bounds, as iced's own `hover` places them.
     Over,
 }
@@ -48,6 +52,21 @@ where
     Renderer: core::Renderer + 'a,
 {
     hover(base, top, Placement::Beside(spacing))
+}
+
+/// Actions beside the first row of `base`, a column whose later rows keep
+/// to the width the first one has beside them.
+pub(super) fn beside_first<'a, Message, Theme, Renderer>(
+    base: impl Into<Element<'a, Message, Theme, Renderer>>,
+    top: impl Into<Element<'a, Message, Theme, Renderer>>,
+    spacing: f32,
+) -> Element<'a, Message, Theme, Renderer>
+where
+    Message: 'a,
+    Theme: 'a,
+    Renderer: core::Renderer + 'a,
+{
+    hover(base, top, Placement::BesideFirst(spacing))
 }
 
 /// iced's `hover`, laid out the same way, that keeps the scroll offset and
@@ -140,17 +159,21 @@ where
             renderer: &Renderer,
             limits: &layout::Limits,
         ) -> layout::Node {
-            let Placement::Beside(spacing) = self.placement else {
-                let base =
-                    self.base
-                        .as_widget_mut()
-                        .layout(&mut tree.children[0], renderer, limits);
-                let top = self.top.as_widget_mut().layout(
-                    &mut tree.children[1],
-                    renderer,
-                    &layout::Limits::new(Size::ZERO, base.size()),
-                );
-                return layout::Node::with_children(base.size(), vec![base, top]);
+            let (spacing, first_row) = match self.placement {
+                Placement::Beside(spacing) => (spacing, false),
+                Placement::BesideFirst(spacing) => (spacing, true),
+                Placement::Over => {
+                    let base =
+                        self.base
+                            .as_widget_mut()
+                            .layout(&mut tree.children[0], renderer, limits);
+                    let top = self.top.as_widget_mut().layout(
+                        &mut tree.children[1],
+                        renderer,
+                        &layout::Limits::new(Size::ZERO, base.size()),
+                    );
+                    return layout::Node::with_children(base.size(), vec![base, top]);
+                }
             };
             // The hidden actions reserve exactly the space they will paint.
             // A long date moves below the header in narrow panes, leaving at
@@ -186,8 +209,13 @@ where
                 let x = (size.width - top.size().width).max(0.0);
                 (base, top.move_to(iced::Point::new(x, y)))
             } else {
-                let base_y = (size.height - base.size().height) / 2.0;
-                let top_y = (size.height - top.size().height) / 2.0;
+                // Centred on the row they act on: the whole content, or its
+                // first row when it continues below.
+                let (base_y, row_height) = match base.children().first() {
+                    Some(row) if first_row => (0.0, row.bounds().y + row.size().height),
+                    _ => ((size.height - base.size().height) / 2.0, size.height),
+                };
+                let top_y = (row_height - top.size().height) / 2.0;
                 let x = (size.width - top.size().width).max(0.0);
                 (
                     base.move_to(iced::Point::new(0.0, base_y)),
