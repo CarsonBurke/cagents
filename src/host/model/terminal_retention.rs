@@ -478,7 +478,7 @@ mod tests {
                     .db
                     .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                     .unwrap(),
-                20
+                super::super::SCHEMA_VERSION
             );
             let placement_after: Vec<(String, i64)> = registry
                 .db
@@ -758,9 +758,13 @@ mod tests {
                     .db
                     .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                     .unwrap(),
-                20
+                super::super::SCHEMA_VERSION
             );
             let mut after = table_rows(&registry.db);
+            assert!(
+                after.remove("automation_run_attention").unwrap().is_empty(),
+                "the added run-attention table must not replay historical runs"
+            );
             assert!(after.remove("terminal_retention_pins").unwrap().is_empty());
             assert_eq!(
                 after.remove("shared_terminal_retention_pins").unwrap(),
