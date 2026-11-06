@@ -14140,15 +14140,21 @@ mod tests {
                         .is_some_and(|name| name.starts_with("Reported edits 1"))),
                 "file review must not add a permanent footer action"
             );
-            for label in ["Send message", "Close"] {
+            // The draft field stands for the composer: an empty draft
+            // offers no Send to look for.
+            for label in ["Message", "Close"] {
                 let bounds = accessible
                     .root()
                     .iter()
                     .chain(accessible.children())
                     .find(|node| {
-                        node.node()
-                            .label()
-                            .is_some_and(|name| name.starts_with(label))
+                        node.node().label().is_some_and(|name| {
+                            if label == "Message" {
+                                name == label
+                            } else {
+                                name.starts_with(label)
+                            }
+                        })
                     })
                     .and_then(|node| node.node().bounds())
                     .unwrap_or_else(|| panic!("{width}: {label} must remain mounted"));
@@ -14464,13 +14470,9 @@ mod tests {
                     .root()
                     .iter()
                     .chain(accessible.children())
-                    .find(|node| {
-                        node.node()
-                            .label()
-                            .is_some_and(|label| label.starts_with("Send message"))
-                    })
+                    .find(|node| node.node().label() == Some("Message"))
                     .and_then(|node| node.node().bounds())
-                    .expect("composer send control remains mounted");
+                    .expect("composer draft field remains mounted");
                 assert!(
                     bounds.y0 >= 0.0 && bounds.y1 <= 600.0 && bounds.y1 > bounds.y0,
                     "{width}: inline panels must not push the composer out of the window: {bounds:?}"
@@ -14479,9 +14481,9 @@ mod tests {
         }
     }
 
-    /// The composer is one row, `+ | draft | send/stop`, at every width, and
-    /// a busy conversation with nothing typed offers Stop rather than a Send
-    /// that could never be pressed.
+    /// The composer is one row, `+ | draft | send | stop`, at every width.
+    /// Send is offered only for a draft, and a busy conversation always
+    /// offers Stop after it.
     #[test]
     fn composer_is_one_row_and_offers_stop_while_busy_with_an_empty_draft() {
         use iced::advanced::{Layout, layout, widget::Tree};
@@ -14560,16 +14562,24 @@ mod tests {
                         .or_else(|| find("Queue for the next turn"));
                     let stop = find("Cancel active turn");
                     let trailing = match (busy, draft.is_empty()) {
-                        (false, _) => {
+                        (false, true) => {
                             assert!(stop.is_none(), "{state}: idle has nothing to stop");
-                            send.unwrap_or_else(|| panic!("{state}: Send: {controls:?}"))
+                            assert!(
+                                send.is_none(),
+                                "{state}: an empty draft offers no send: {controls:?}"
+                            );
+                            None
+                        }
+                        (false, false) => {
+                            assert!(stop.is_none(), "{state}: idle has nothing to stop");
+                            Some(send.unwrap_or_else(|| panic!("{state}: Send: {controls:?}")))
                         }
                         (true, true) => {
                             assert!(
                                 send.is_none(),
                                 "{state}: an empty draft offers no send: {controls:?}"
                             );
-                            stop.unwrap_or_else(|| panic!("{state}: Stop: {controls:?}"))
+                            Some(stop.unwrap_or_else(|| panic!("{state}: Stop: {controls:?}")))
                         }
                         (true, false) => {
                             let stop = stop.unwrap_or_else(|| {
@@ -14578,15 +14588,17 @@ mod tests {
                             let send = send.unwrap_or_else(|| {
                                 panic!("{state}: the follow-up can be sent: {controls:?}")
                             });
-                            assert!(stop.x1 <= send.x0, "{state}: Stop precedes send");
-                            send
+                            assert!(send.x1 <= stop.x0, "{state}: send precedes Stop");
+                            Some(send)
                         }
                     };
-                    // One row: `+` before the draft, the trailing control after
-                    // it, and both beside the draft's last line.
+                    // One row: `+` before the draft, the trailing controls
+                    // after it, and all beside the draft's last line.
                     assert!(plus.x1 <= editor.x0, "{state}: {plus:?} {editor:?}");
-                    assert!(editor.x1 <= trailing.x0, "{state}: {editor:?} {trailing:?}");
-                    for control in [plus, trailing] {
+                    if let Some(trailing) = trailing {
+                        assert!(editor.x1 <= trailing.x0, "{state}: {editor:?} {trailing:?}");
+                    }
+                    for control in std::iter::once(plus).chain(trailing) {
                         assert!(
                             control.y0 >= editor.y0 && control.y1 <= editor.y1,
                             "{state}: controls sit inside the draft's row: {control:?} {editor:?}"
@@ -14601,8 +14613,10 @@ mod tests {
                         );
                         let middle = (editor.y0 + editor.y1) / 2.0;
                         assert!(
-                            ((plus.y0 + plus.y1) / 2.0 - middle).abs() < 1.0
-                                && ((trailing.y0 + trailing.y1) / 2.0 - middle).abs() < 1.0,
+                            std::iter::once(plus)
+                                .chain(trailing)
+                                .all(|control| ((control.y0 + control.y1) / 2.0 - middle).abs()
+                                    < 1.0),
                             "{state}: controls center on a single line"
                         );
                     }
