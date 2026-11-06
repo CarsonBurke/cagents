@@ -82,7 +82,7 @@ local_packages() {
 # cleaned fails.
 forget_local() {
     fingerprints=$(find "$2/" -type d -name .fingerprint -prune -print) || return 1
-    [ -n "$fingerprints" ] || return 0
+    [ -n "$fingerprints" ] || { note "no fingerprints in $2, so nothing to forget"; return 0; }
     printf '%s\n' "$fingerprints" | while IFS= read -r directory; do
         # Each is named <package>-<hash>; a package can begin with another's name.
         find "$directory" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
@@ -97,7 +97,7 @@ while [ "$#" -gt 0 ]; do
         --from) [ "$#" -gt 1 ] || { usage >&2; exit 2; }; from=$2; shift ;;
         --to) [ "$#" -gt 1 ] || { usage >&2; exit 2; }; to=$2; shift ;;
         --forget-local)
-            [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+            [ "$#" -eq 2 ] && [ -n "$2" ] || { usage >&2; exit 2; }
             lock=$(lock_file) || { note "cargo metadata names no Cargo.lock at $(pwd -P)"; exit 1; }
             packages=$(local_packages "$lock") || { note "$lock names no crate of this checkout"; exit 1; }
             forget_local "$packages" "$2" || { note "could not forget this checkout's crates in $2"; exit 1; }

@@ -357,8 +357,31 @@ class CopiedFingerprints(unittest.TestCase):
         worktree = self.worktree("worktree")
         (worktree / "executables/debug").mkdir(parents=True)
         (worktree / "executables/debug/probe").write_text("program")
-        subprocess.run([SEED, "--forget-local", "executables"], cwd=worktree, env=self.env, check=True)
+        result = subprocess.run([SEED, "--forget-local", "executables"], cwd=worktree, env=self.env,
+                                check=True, capture_output=True, text=True)
+        # It says so, as this may be the wrong path.
+        self.assertIn("nothing to forget", result.stderr)
         self.assertTrue((worktree / "executables/debug/probe").is_file())
+
+    def test_forgetting_refuses_an_empty_path(self):
+        # `find "/"` would otherwise search the whole host for fingerprints to remove.
+        worktree = self.worktree("worktree")
+        result = subprocess.run([SEED, "--forget-local", ""], cwd=worktree, env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 2)
+
+    def test_a_lock_file_awk_could_not_finish_is_not_believed(self):
+        worktree = self.worktree("worktree")
+        subprocess.run(["cp", "-a", "--reflink=auto", self.main / "target", worktree / "target"], check=True)
+        tools = self.root / "tools"
+        tools.mkdir()
+        (tools / "awk").write_text("#!/bin/sh\necho vendored\nexit 1\n")
+        (tools / "awk").chmod(0o755)
+        result = subprocess.run([SEED, "--forget-local", "target"], cwd=worktree,
+                                env={**self.env, "PATH": f"{tools}:{self.env['PATH']}"},
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotEqual(list((worktree / "target/debug/.fingerprint").glob("vendored-*")), [])
 
     def test_forgetting_reaches_a_profile_of_any_name_at_any_depth(self):
         worktree = self.worktree("worktree")
