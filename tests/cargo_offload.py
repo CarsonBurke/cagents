@@ -1379,9 +1379,10 @@ class RemoteRun(unittest.TestCase):
             self.assertEqual(others.next(10), "wait")
             fcntl.flock(lock, fcntl.LOCK_UN)
             self.assertEqual(json.loads(others.next(10).removeprefix("slot "))["index"], 0)
-            self.assertEqual(waits.next(10), "wait")
+            # It says so only if it got back in line before that build left it.
             with self.assertRaises(TimeoutError):
-                waits.next(1.5)
+                while True:
+                    self.assertEqual(waits.next(1.5), "wait")
             other.stdin.close()
             self.assertEqual(json.loads(waits.next(10).removeprefix("slot "))["index"], 0)
 
@@ -1395,6 +1396,8 @@ class RemoteRun(unittest.TestCase):
                 self.hold(base, 0, {"cost": 1, "pid": None})
                 _, lines = self.lease(base, figures=stand_in)
                 self.assertEqual(lines.next(10), reason)
+                with self.assertRaises(TimeoutError):
+                    lines.next(1.5)
                 write_figures(stand_in)
                 self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
 

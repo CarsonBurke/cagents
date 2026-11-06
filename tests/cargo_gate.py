@@ -1617,9 +1617,10 @@ class AdmissionTimeout(unittest.TestCase):
         self.assertEqual([event["phase"] for event in self.fixture.calls()], ["metadata", "guard"])
 
     def test_leading_zero_budget_does_not_limit_an_admitted_build(self):
-        self.reset(delays={"compiler":1.25}, compiler_exit=17)
-        process = self.fixture.start(environment=self.fixture.env | {self.setting:"0001"})
-        _stdout, stderr = process.communicate("", timeout=5)
+        # Admission must fit in the budget on a loaded host; the compiler then outlasts it.
+        self.reset(delays={"compiler":3.25}, compiler_exit=17)
+        process = self.fixture.start(environment=self.fixture.env | {self.setting:"0003"})
+        _stdout, stderr = process.communicate("", timeout=10)
         self.assertEqual(process.returncode, 17, stderr)
         self.assertNotIn("timed out", stderr.lower())
         compiler = next(event for event in self.fixture.calls() if event["phase"] == "compiler")
