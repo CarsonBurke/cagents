@@ -5,6 +5,8 @@ mod hosted_agent_cleanup;
 
 #[path = "support/private_cli_capture.rs"]
 mod private_cli_capture;
+#[path = "support/retained_fixture.rs"]
+mod retained_fixture;
 
 use serde_json::{Value, json};
 use std::{
@@ -195,6 +197,9 @@ fn a_live_process_without_a_control_reply_is_not_ready() {
 
 #[test]
 fn enabled_automation_dispatches_without_a_window_and_restart_does_not_repeat_it() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let mut fixture = Fixture::new();
     let project = fixture.root.path().join("project");
     fixture.cli(&["project", "open", project.to_str().unwrap()]);
@@ -700,6 +705,9 @@ fn run_attention_rejected_by_the_journal_survives_a_killed_daemon() {
 
 #[test]
 fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_and_removal() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let mut fixture = Fixture::new();
     let project = fixture.root.path().join("project");
     fixture.cli(&["project", "open", project.to_str().unwrap()]);
