@@ -259,7 +259,7 @@ impl<'a> Failure<'a> {
             ),
             FailureKind::OutOfMemory => (
                 format!("{name} stopped because the system ran out of memory"),
-                "The system stopped the agent to keep the computer responsive. Free up memory, then resume: the conversation and your draft are kept.",
+                "The system stopped the agent to keep the computer responsive. Free up memory before you resume the conversation.",
             ),
             FailureKind::CommandOutOfMemory => (
                 "A command was stopped because the system ran out of memory".to_owned(),
