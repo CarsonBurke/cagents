@@ -2600,9 +2600,7 @@ impl Runtime {
         // A draft starting for its first message says so on the message
         // itself.
         // A resume says so on its own control, beside what it is resuming.
-        if transitioning
-            && self.queued.is_none()
-            && !matches!(transition, ViewTransition::Resuming)
+        if transitioning && self.queued.is_none() && !matches!(transition, ViewTransition::Resuming)
         {
             content.push(body(match transition {
                 ViewTransition::FirstStart => "Starting this conversation… Editing and session controls are disabled. You can still read and copy the conversation.",
@@ -2635,9 +2633,10 @@ impl Runtime {
                 .into(),
             );
         } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
-            content.push(
-                self.stopped_controls(transitioning, matches!(transition, ViewTransition::Resuming)),
-            );
+            content.push(self.stopped_controls(
+                transitioning,
+                matches!(transition, ViewTransition::Resuming),
+            ));
         }
         if let Some((url, instructions)) = &snapshot.open_url {
             content.push(

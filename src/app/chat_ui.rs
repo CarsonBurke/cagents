@@ -10320,6 +10320,11 @@ impl Cagents {
                             runtime.error = None;
                             runtime.capacity_refused = false;
                             runtime.show(visible);
+                            // Show the new connection's state at once, as a
+                            // new runtime does, rather than the ended one's
+                            // until the next publication: a resumed card must
+                            // not offer Resume again in between.
+                            runtime.refresh();
                         } else {
                             let mut runtime = Runtime::new(
                                 target,
@@ -22192,7 +22197,11 @@ mod tests {
         };
         let transcript = vec![
             text("prompt", chat::Role::User, "Run the full evaluation"),
-            text("partial", chat::Role::Assistant, "Starting the full evaluation run now"),
+            text(
+                "partial",
+                chat::Role::Assistant,
+                "Starting the full evaluation run now",
+            ),
         ];
         let stopped = Snapshot {
             ready: true,
@@ -22212,6 +22221,9 @@ mod tests {
             Some(CardRuntime::Chat(runtime)) => runtime,
             _ => panic!("the card holds a chat"),
         };
+        // The reader is looking at what the ended actor left on screen.
+        runtime.visible.store(true, Ordering::Relaxed);
+        Arc::make_mut(&mut runtime.snapshot).items = transcript.clone();
         runtime.replace_draft(text_editor::Content::with_text("keep this draft"));
         runtime
             .attachments
@@ -22273,9 +22285,11 @@ mod tests {
             "the same card now names the successor"
         );
         let runtime = chat_runtime(&app, card);
+        // The card shows the successor at once, not the ended actor's state,
+        // so it does not offer Resume again before the next publication.
         assert!(!runtime.snapshot.exited);
         assert!(!runtime.disconnected);
-        assert_eq!(runtime.snapshot.items, transcript);
+        assert!(!runtime.resumes_in_place());
         assert_eq!(runtime.composer.text(), "keep this draft");
         assert_eq!(runtime.attachments, attachments);
         assert!(runtime.pending.is_none(), "the draft was not sent");
