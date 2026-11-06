@@ -1030,13 +1030,14 @@ rows are the same directory or signed in to the same login.
 
 **Identity conflict** means a row's login is not known to be the one it names.
 On the System default Claude login, the two records described above name
-different logins: the row lists both, its figures may be either one's, and
-**Sign in again** settles it. Signing in again from your own terminal settles it
-as well when it changes the login `~/.claude.json` names. On another row, it
-reports the same login as a row whose records disagree, or as a row whose weekly
-limit resets at a different time, which one login's could not; **Sign in again**
-on a row whose limit differs settles which login it is. Neither row offers **Archive duplicate**, and
-neither prevents a new sign-in to that login.
+different logins: the row names one and lists the other beneath it, its figures
+may be either one's, and **Sign in again** settles it. Signing in again from
+your own terminal settles it as well when it changes the login `~/.claude.json`
+names. On another row, it reports the same login as a row whose records
+disagree, or as a row whose weekly limit resets at a different time, which one
+login's could not; **Sign in again** on a row whose limit differs settles which
+login it is. Neither row offers **Archive duplicate**, and neither prevents a
+new sign-in to that login.
 
 For an unchanged **Same login** row, its menu offers **Archive duplicate**.
 This hides the extra account from choices without signing out or deleting its
