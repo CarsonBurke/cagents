@@ -1,5 +1,5 @@
 //! Authenticated retained Claude helper and bounded attachment transport.
-use super::super::{LocalHandle, Rejection, Update};
+use super::super::{LocalHandle, QueueRefusal, Rejection, Update};
 pub(crate) use super::final_snapshot::{RetirementInspection, VerifiedRetirement};
 use super::journal::Journal;
 use super::journal::{ContinuityLoss, InputIdentity, InputReceipt, InputState};
@@ -60,15 +60,12 @@ const SETTLE_ATTEMPTS: u32 = 12;
 use crate::chat::failure::delivery::{
     CLOSING_INPUT, CROWDED_INPUT, DAMAGED_INPUT, DISCONTINUOUS_INPUT, HANDOVER_INPUT,
     OVERSIZED_INPUT, RECONNECTING_INPUT, RETIRING_INPUT, STOPPED_INPUT, UNACKNOWLEDGED_ANSWER,
-    UNACKNOWLEDGED_INPUT, UNACKNOWLEDGED_STOP, UNCONFIRMED_INPUT, UNSETTLEABLE_INPUT,
-    UNSETTLED_INPUT,
+    UNACKNOWLEDGED_INPUT, UNACKNOWLEDGED_STOP, UNAVAILABLE_INPUT, UNCONFIRMED_INPUT,
+    UNSETTLEABLE_INPUT, UNSETTLED_INPUT, UNSUPPORTED_INPUT,
 };
 /// A helper's answer to a request it does not implement, such as an older
 /// helper asked to settle an input.
 const UNKNOWN_METHOD: &str = "Unknown retained actor method/version";
-/// Why no input is admitted once the proxy has stopped.
-const UNAVAILABLE_INPUT: &str =
-    "Claude's conversation process is no longer reachable, so this was not sent.";
 fn payload_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).into()
@@ -1724,9 +1721,11 @@ impl RemoteActor {
                 self.stop_settling(&identity, "the retained actor cannot settle inputs");
                 return;
             }
-            Ok(Err(_)) | Err(_) if settle => {
-                // Settling failed for now, such as on a busy journal; it is
-                // asked again after the backoff, a bounded number of times.
+            Ok(Err(_)) if settle => {
+                // The helper refused to settle it for now, such as on a busy
+                // journal; it is asked again after the backoff, a bounded
+                // number of times. An unreachable helper is asked without
+                // limit, as it may yet return and settle it.
                 let exhausted = self
                     .0
                     .uncertain_input
@@ -2940,7 +2939,9 @@ impl Server {
                 }
                 let payload = match serde_json::from_value::<InputPayload>(payload) {
                     Ok(payload) => payload,
-                    Err(error) => refuse!(DAMAGED_INPUT, error),
+                    // The frame is intact, so its sender speaks a protocol
+                    // this helper does not.
+                    Err(error) => refuse!(UNSUPPORTED_INPUT, error),
                 };
                 let (command, run, effects) = match payload {
                     InputPayload::IdlePrompt { text } => {
@@ -2975,25 +2976,21 @@ impl Server {
                         None,
                     ),
                 };
-                if let Some(run) = run
-                    && journal.run_capacity_reached(run)
-                {
-                    refuse!(DISCONTINUOUS_INPUT, "the run identity capacity is reached");
-                }
                 let receipt = journal.admit_with_run(&identity, run)?;
                 self.changed.fetch_add(1, Ordering::Release);
                 match self.actor.enqueue_actor(command) {
                     Ok(reply) => self.pending.push((identity, reply, effects)),
-                    Err(error) => {
+                    Err(refusal) => {
                         tracing::warn!(
                             sequence = identity.sequence,
-                            %error,
+                            ?refusal,
                             "the retained actor admitted an input it could not run"
                         );
-                        journal.finish(
-                            &identity,
-                            InputState::Acknowledged(Err(CLOSING_INPUT.into())),
-                        )?;
+                        let reason = match refusal {
+                            QueueRefusal::Closed => CLOSING_INPUT,
+                            QueueRefusal::Full => CROWDED_INPUT,
+                        };
+                        journal.finish(&identity, InputState::Acknowledged(Err(reason.into())))?;
                         if let Some(run) = run {
                             journal.refuse_unexecuted_run(run)?;
                         }
@@ -6310,10 +6307,14 @@ exec /bin/sleep 60
             let started = Instant::now();
             let refused = actor.enqueue(None, Command::Refresh).unwrap();
             assert_eq!(
-                refused.recv_timeout(Duration::from_secs(1)),
+                refused.recv_timeout(ACKNOWLEDGEMENT_WAIT),
                 Ok(Err(Rejection::Refused(expected.into())))
             );
-            assert!(started.elapsed() < RETRANSMIT_DELAY * 5, "reported at once");
+            // Well before the caller's wait would end with retransmission.
+            assert!(
+                started.elapsed() < ACKNOWLEDGEMENT_WAIT / 2,
+                "reported at once"
+            );
             assert!(
                 actor.0.uncertain_input.lock().unwrap().is_none(),
                 "the refusal lifts the fence"
@@ -6332,9 +6333,11 @@ exec /bin/sleep 60
             assert!(served.fixture.lock().unwrap().server.pending.is_empty());
         }
     }
-    /// A damaged frame is refused for good, without running.
+    /// A damaged frame, a request this helper's protocol does not describe,
+    /// and input after a continuity loss are each refused for good, without
+    /// running, with their own outcome.
     #[test]
-    fn a_damaged_input_is_refused_as_its_outcome() {
+    fn inputs_that_can_never_run_are_refused_as_their_outcome() {
         let served = ServedHelper::new(|_| {});
         let actor = &served.actor;
         let delivered = actor.enqueue(None, Command::Refresh).unwrap();
@@ -6342,16 +6345,54 @@ exec /bin/sleep 60
             delivered.recv_timeout(ACKNOWLEDGEMENT_WAIT).unwrap(),
             Ok(())
         );
-        let mut args = served.input_request(1);
-        args[0]["sequence"] = json!(2);
-        args[0]["id"] = json!(uuid::Uuid::new_v4());
-        args[1] = json!({"IdlePrompt": {"text": "altered"}});
-        let refused = served.invoke_input(args).unwrap();
-        assert_eq!(
-            serde_json::from_value::<InputReceipt>(refused)
+        let refused = |sequence: u64, payload: Value, hash: Option<[u8; 32]>| {
+            let mut args = served.input_request(1);
+            let hash =
+                hash.unwrap_or_else(|| payload_digest(&serde_json::to_vec(&payload).unwrap()));
+            args[0]["sequence"] = json!(sequence);
+            args[0]["id"] = json!(uuid::Uuid::new_v4());
+            args[0]["hash"] = json!(hash);
+            args[1] = payload;
+            serde_json::from_value::<InputReceipt>(served.invoke_input(args).unwrap())
                 .unwrap()
-                .state,
+                .state
+        };
+        let original: InputIdentity =
+            serde_json::from_value(served.input_request(1)[0].clone()).unwrap();
+        assert_eq!(
+            refused(
+                2,
+                json!({"IdlePrompt": {"text": "altered"}}),
+                Some(original.hash)
+            ),
             InputState::Acknowledged(Err(DAMAGED_INPUT.into()))
+        );
+        assert_eq!(
+            refused(3, json!({"FromANewerProtocol": {}}), None),
+            InputState::Acknowledged(Err(UNSUPPORTED_INPUT.into()))
+        );
+        assert!(served.fixture.lock().unwrap().server.pending.is_empty());
+        // After a continuity loss the proxy's caller hears it at once.
+        served
+            .fixture
+            .lock()
+            .unwrap()
+            .server
+            .journal
+            .lock()
+            .unwrap()
+            .record_loss("fixture loss")
+            .unwrap();
+        *actor.0.input_sequence.lock().unwrap() = 4;
+        let started = Instant::now();
+        let lost = actor.enqueue(None, Command::Refresh).unwrap();
+        assert_eq!(
+            lost.recv_timeout(ACKNOWLEDGEMENT_WAIT),
+            Ok(Err(Rejection::Refused(DISCONTINUOUS_INPUT.into())))
+        );
+        assert!(
+            started.elapsed() < ACKNOWLEDGEMENT_WAIT / 2,
+            "reported at once"
         );
         assert!(served.fixture.lock().unwrap().server.pending.is_empty());
     }

@@ -313,16 +313,32 @@ fn reported_reset(message: &str) -> Option<String> {
 pub struct DeliveryOutcome {
     pub summary: &'static str,
     pub action: &'static str,
+    /// Whether the request may still have gone through, rather than
+    /// certainly not.
+    pub unknown: bool,
+}
+
+macro_rules! delivery_unknown {
+    (unknown) => {
+        true
+    };
+    (refused) => {
+        false
+    };
 }
 
 macro_rules! delivery_outcomes {
-    ($($(#[$doc:meta])* $name:ident: $summary:literal, $action:literal;)*) => {
+    ($($(#[$doc:meta])* $kind:ident $name:ident: $summary:literal, $action:literal;)*) => {
         /// The texts of every [`DeliveryOutcome`].
         pub mod delivery {
             $($(#[$doc])* pub const $name: &str = concat!($summary, " ", $action);)*
             pub(super) const ALL: &[(&str, super::DeliveryOutcome)] = &[$((
                 $name,
-                super::DeliveryOutcome { summary: $summary, action: $action },
+                super::DeliveryOutcome {
+                    summary: $summary,
+                    action: $action,
+                    unknown: delivery_unknown!($kind),
+                },
             )),*];
         }
     };
@@ -330,49 +346,55 @@ macro_rules! delivery_outcomes {
 
 delivery_outcomes! {
     /// An input whose delivery was never confirmed, settled as not sent.
-    UNCONFIRMED_INPUT: "Claude couldn't accept this in time, so it was not sent.", "Try again.";
+    refused UNCONFIRMED_INPUT: "Claude couldn't accept this in time, so it was not sent.", "Try again.";
     /// The caller stopped waiting while the outcome is still unknown.
-    UNACKNOWLEDGED_INPUT: "Claude hasn't confirmed this yet.",
+    unknown UNACKNOWLEDGED_INPUT: "Claude hasn't confirmed this yet.",
         "It may still go through, so check the conversation before trying again.";
     /// An answer whose outcome is still unknown when its caller stops waiting.
-    UNACKNOWLEDGED_ANSWER: "Claude hasn't confirmed this answer yet.",
+    unknown UNACKNOWLEDGED_ANSWER: "Claude hasn't confirmed this answer yet.",
         "It may still go through, so check the conversation before answering again.";
     /// A stop whose outcome is still unknown when its caller stops waiting.
-    UNACKNOWLEDGED_STOP: "Claude hasn't confirmed the stop yet.",
+    unknown UNACKNOWLEDGED_STOP: "Claude hasn't confirmed the stop yet.",
         "It may still take effect, so check the conversation before trying again.";
     /// A new input while an earlier one is still unconfirmed.
-    UNSETTLED_INPUT: "Claude hasn't confirmed the previous request yet, so this was not sent.",
+    refused UNSETTLED_INPUT: "Claude hasn't confirmed the previous request yet, so this was not sent.",
         "Try again in a moment.";
     /// Every new input once an unconfirmed one cannot be settled.
-    UNSETTLEABLE_INPUT: "Claude stopped confirming requests in this conversation, so this was not sent.",
+    refused UNSETTLEABLE_INPUT: "Claude stopped confirming requests in this conversation, so this was not sent.",
         "Close and reopen the conversation to continue.";
     /// Pending inputs once the proxy stopped before their outcome was known.
-    STOPPED_INPUT: "Claude's conversation process stopped before confirming this, so it may or may not have gone through.",
+    unknown STOPPED_INPUT: "Claude's conversation process stopped before confirming this, so it may or may not have gone through.",
         "Check the conversation before trying again.";
     /// A new input while the proxy reattaches to its helper.
-    RECONNECTING_INPUT: "Claude is still reconnecting to this conversation, so this was not sent.",
+    refused RECONNECTING_INPUT: "Claude is still reconnecting to this conversation, so this was not sent.",
         "Try again in a moment.";
     /// A new input beyond the requests already waiting.
-    CROWDED_INPUT: "Too many requests are waiting for Claude, so this was not sent.",
+    refused CROWDED_INPUT: "Too many requests are waiting for Claude, so this was not sent.",
         "Try again in a moment.";
     /// A new input while completed ones are still being retired.
-    RETIRING_INPUT: "Claude is still finishing earlier requests, so this was not sent.",
+    refused RETIRING_INPUT: "Claude is still finishing earlier requests, so this was not sent.",
         "Try again in a moment.";
     /// An input too large for one protocol frame.
-    OVERSIZED_INPUT: "This is too large to send to Claude, so it was not sent.",
+    refused OVERSIZED_INPUT: "This is too large to send to Claude, so it was not sent.",
         "Shorten it or split it into smaller messages.";
     /// An input to a helper whose conversation is closing.
-    CLOSING_INPUT: "Claude's conversation is closing, so this was not sent.",
+    refused CLOSING_INPUT: "Claude's conversation is closing, so this was not sent.",
         "Reopen the conversation to continue.";
     /// An input to a helper handing its conversation to an updated daemon.
-    HANDOVER_INPUT: "Claude's conversation is moving to the updated cagents service, so this was not sent.",
+    refused HANDOVER_INPUT: "Claude's conversation is moving to the updated cagents service, so this was not sent.",
         "Try again in a moment.";
     /// An input after the helper lost track of earlier outcomes.
-    DISCONTINUOUS_INPUT: "Claude can't confirm earlier work in this conversation, so this was not sent.",
+    refused DISCONTINUOUS_INPUT: "Claude can't confirm earlier work in this conversation, so this was not sent.",
         "Start a new conversation to continue.";
-    /// An input that arrived altered or malformed.
-    DAMAGED_INPUT: "This request was damaged on its way to Claude, so it was not sent.",
+    /// An input whose frame arrived altered.
+    refused DAMAGED_INPUT: "This request was damaged on its way to Claude, so it was not sent.",
         "Try again.";
+    /// An intact input that the helper's protocol does not describe.
+    refused UNSUPPORTED_INPUT: "Claude's conversation process doesn't support this request, so it was not sent.",
+        "Close and reopen the conversation to continue.";
+    /// Any input once the proxy has stopped.
+    refused UNAVAILABLE_INPUT: "Claude's conversation process is no longer reachable, so this was not sent.",
+        "Close and reopen the conversation to continue.";
 }
 
 impl DeliveryOutcome {
@@ -397,6 +419,7 @@ mod tests {
             Some(DeliveryOutcome {
                 summary: "Claude hasn't confirmed this yet.",
                 action: "It may still go through, so check the conversation before trying again.",
+                unknown: true,
             })
         );
         for (index, (text, outcome)) in delivery::ALL.iter().enumerate() {
@@ -408,6 +431,12 @@ mod tests {
                     .all(|(other, _)| other != text),
                 "{text} is listed twice"
             );
+        }
+        // A provider failure's keywords never claim an outcome's text.
+        for (text, _) in delivery::ALL {
+            for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+                assert!(Failure::parse(provider, text).is_none(), "{text}");
+            }
         }
         // Only the exact text is recognised, never a quotation of it.
         assert_eq!(
