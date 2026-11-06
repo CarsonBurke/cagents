@@ -7049,7 +7049,13 @@ mod tests {
             stored["message"]["content"][2]["source"] =
                 json!({"type":"url", "url":attachment.path.to_str().unwrap()});
             assert_eq!(restored_reference(&stored), (2, Some(reference.clone())));
-            stored["message"]["content"][2]["source"]["url"] = json!(hinted.path.to_str().unwrap());
+            stored["message"]["content"][2]["source"]["url"] = json!(
+                display
+                    .path()
+                    .join(attachment.path.file_name().unwrap())
+                    .to_str()
+                    .unwrap()
+            );
             assert_eq!(
                 restored_reference(&stored),
                 (3, None),
