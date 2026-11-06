@@ -1494,6 +1494,14 @@ exit 0
                     .any(|live| live.id == source.id && live.history_only),
                 "a reader stays addressable and says it has no provider process"
             );
+            let directory = crate::host::agent_execution::read_directory(
+                &host,
+                &crate::agent_execution::Authority::default(),
+                crate::agent_execution::directory::Scope::All,
+            )
+            .unwrap();
+            assert_eq!(directory.saved_transcripts, [source.id]);
+            assert!(directory.sessions.iter().any(|entry| entry.id == source.id));
             assert!(!marker.exists(), "automatic restore launched a provider");
             if index == 0 {
                 let mut older_alias = source.clone();

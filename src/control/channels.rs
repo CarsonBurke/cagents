@@ -274,7 +274,7 @@ pub(super) fn refuse_close_holding_live_sessions(
         .iter()
         .chain(&directory.sessions)
         .filter(|entry| {
-            !entry.history_only
+            !directory.is_saved_transcript(entry)
                 && matches!(entry.view_scope, Some(Placement::Channel(id)) if id == channel)
         })
         .map(|entry| entry.id.to_string())
@@ -342,7 +342,7 @@ fn attach_session(
                 format!("No shared pane or live session matches {id}"),
             )
         })?;
-    if entry.history_only {
+    if directory.is_saved_transcript(entry) {
         return Err(AppError::new(
             "invalid_target",
             "This is a saved transcript open for reading; nothing is running to attach. Reopen the conversation with Resume conversation in the app.",
@@ -940,7 +940,7 @@ mod tests {
                     assert!(matches!(directory.request, ClientRequest::Agent { .. }));
                     write_frame(
                         &mut server_stream,
-                        &directory_response(directory.request_id, vec![]),
+                        &directory_response(directory.request_id, vec![], vec![]),
                     )
                     .unwrap();
                 }
@@ -975,7 +975,11 @@ mod tests {
         }
     }
 
-    fn directory_response(request_id: u64, sessions: Vec<Entry>) -> ServerEnvelope {
+    fn directory_response(
+        request_id: u64,
+        sessions: Vec<Entry>,
+        saved_transcripts: Vec<TerminalId>,
+    ) -> ServerEnvelope {
         envelope(
             request_id,
             ServerMessage::Response {
@@ -984,6 +988,7 @@ mod tests {
                         caller: None,
                         scope: DirectoryScope::All,
                         sessions,
+                        saved_transcripts,
                     },
                 )),
             },
@@ -1013,7 +1018,6 @@ mod tests {
 
     fn unplaced_entry(id: TerminalId, surface: directory::Surface) -> Entry {
         Entry {
-            history_only: false,
             id,
             surface,
             provider: Some(Provider::Claude),
@@ -1038,6 +1042,7 @@ mod tests {
     struct FakeDaemon {
         models: Vec<WorkspaceModel>,
         sessions: Vec<Entry>,
+        saved_transcripts: Vec<TerminalId>,
         chats: Vec<crate::chat::Session>,
         terminals: Vec<crate::terminal::ipc::TerminalDescriptor>,
         /// What each successive edit answers; `None` is a revision conflict.
@@ -1049,6 +1054,7 @@ mod tests {
             let Self {
                 mut models,
                 sessions,
+                saved_transcripts,
                 chats,
                 terminals,
                 mut edits,
@@ -1077,7 +1083,7 @@ mod tests {
                         ClientRequest::Agent {
                             operation: Operation::Directory(DirectoryScope::All),
                             ..
-                        } => directory_response(id, sessions.clone()),
+                        } => directory_response(id, sessions.clone(), saved_transcripts.clone()),
                         ClientRequest::ChatList => response(ServerResponse::ChatListed {
                             sessions: chats.clone(),
                         }),
@@ -1160,7 +1166,7 @@ mod tests {
         inside.view_scope = Some(Placement::Channel(to));
         let mut reading = unplaced_entry(TerminalId::new(), directory::Surface::Chat);
         reading.view_scope = Some(Placement::Channel(to));
-        reading.history_only = true;
+        let saved_transcript = reading.id;
         let mut elsewhere = unplaced_entry(TerminalId::new(), directory::Surface::Chat);
         elsewhere.view_scope = Some(Placement::Channel(ChannelId::new()));
 
@@ -1168,6 +1174,7 @@ mod tests {
             let (client_stream, server_stream) = UnixStream::pair().unwrap();
             let server = FakeDaemon {
                 models: vec![model.clone()],
+                saved_transcripts: vec![saved_transcript],
                 sessions,
                 chats: vec![],
                 terminals: vec![],
@@ -1203,6 +1210,7 @@ mod tests {
             let (client_stream, server_stream) = UnixStream::pair().unwrap();
             let server = FakeDaemon {
                 models: vec![model.clone()],
+                saved_transcripts: vec![],
                 sessions,
                 chats: vec![],
                 terminals: vec![],
@@ -1242,6 +1250,7 @@ mod tests {
         let (client_stream, server_stream) = UnixStream::pair().unwrap();
         let server = FakeDaemon {
             models: vec![model.clone()],
+            saved_transcripts: vec![],
             sessions: vec![unplaced_entry(chat.id, directory::Surface::Chat)],
             chats: vec![chat.clone()],
             terminals: vec![],
@@ -1316,6 +1325,7 @@ mod tests {
         );
         let server = FakeDaemon {
             models: vec![model],
+            saved_transcripts: vec![],
             sessions: vec![entry],
             chats: vec![],
             terminals: vec![descriptor],
@@ -1388,6 +1398,7 @@ mod tests {
             let (client_stream, server_stream) = UnixStream::pair().unwrap();
             let server = FakeDaemon {
                 models,
+                saved_transcripts: vec![],
                 sessions,
                 chats,
                 terminals: vec![],
@@ -1420,6 +1431,7 @@ mod tests {
             let (client_stream, server_stream) = UnixStream::pair().unwrap();
             let server = FakeDaemon {
                 models: vec![model],
+                saved_transcripts: vec![],
                 sessions: vec![unplaced_entry(chat.id, directory::Surface::Chat)],
                 chats: vec![chat.clone()],
                 terminals: vec![],
@@ -1442,6 +1454,7 @@ mod tests {
         let (client_stream, server_stream) = UnixStream::pair().unwrap();
         let server = FakeDaemon {
             models: vec![model],
+            saved_transcripts: vec![],
             sessions: vec![],
             chats: vec![],
             terminals: vec![],
@@ -1465,6 +1478,7 @@ mod tests {
         let answer = with_pane(model.clone(), Scope::Channel(to), theirs.clone());
         let server = FakeDaemon {
             models: vec![model],
+            saved_transcripts: vec![],
             sessions: vec![unplaced_entry(chat.id, directory::Surface::Chat)],
             chats: vec![chat.clone()],
             terminals: vec![],
@@ -1487,10 +1501,10 @@ mod tests {
         let (model, _, to) = fixture();
         let chat = unplaced_chat();
         let (client_stream, server_stream) = UnixStream::pair().unwrap();
-        let mut reader = unplaced_entry(chat.id, directory::Surface::Chat);
-        reader.history_only = true;
+        let reader = unplaced_entry(chat.id, directory::Surface::Chat);
         let server = FakeDaemon {
             models: vec![model],
+            saved_transcripts: vec![chat.id],
             sessions: vec![reader],
             chats: vec![chat.clone()],
             terminals: vec![],
@@ -1518,6 +1532,7 @@ mod tests {
         let (client_stream, server_stream) = UnixStream::pair().unwrap();
         let server = FakeDaemon {
             models: vec![model],
+            saved_transcripts: vec![],
             sessions: vec![unplaced_entry(chat.id, directory::Surface::Chat)],
             chats: vec![chat.clone()],
             terminals: vec![],

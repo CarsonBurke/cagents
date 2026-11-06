@@ -19,6 +19,8 @@ use std::{
 
 mod account_info;
 mod directory;
+#[cfg(test)]
+pub(super) use directory::read as read_directory;
 pub(super) use directory::{live_sessions, named};
 pub(super) mod mailbox;
 mod ownership;

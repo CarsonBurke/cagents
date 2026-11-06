@@ -94,10 +94,6 @@ pub struct Entry {
     #[serde(default)]
     pub channel_repository: Option<PathBuf>,
     pub state: ActivityState,
-    /// Open only to read its saved transcript: a client attached to it, with no
-    /// provider process behind it.
-    #[serde(default)]
-    pub history_only: bool,
     pub directory: Option<PathBuf>,
     /// The checkout that contains `directory`: a repository or linked worktree.
     pub worktree: Option<PathBuf>,
@@ -119,6 +115,19 @@ pub struct Directory {
     pub scope: Scope,
     /// Every other matching session, the caller's relatives first.
     pub sessions: Vec<Entry>,
+    /// Listed sessions open only to read a saved transcript: a client attached,
+    /// with no provider process behind it.
+    ///
+    /// Keep this last. Nothing follows it in the reply's frame, so a CLI from an
+    /// earlier protocol, which carried chats keep on `PATH` after an update,
+    /// stops reading before it and still gets every session.
+    pub saved_transcripts: Vec<TerminalId>,
+}
+
+impl Directory {
+    pub fn is_saved_transcript(&self, entry: &Entry) -> bool {
+        self.saved_transcripts.contains(&entry.id)
+    }
 }
 
 impl Entry {
@@ -126,10 +135,7 @@ impl Entry {
     /// one. A window may still show it from a card it has not published, so this
     /// does not by itself mean the session is hidden.
     pub fn has_no_shared_pane(&self) -> bool {
-        self.provider.is_some()
-            && self.view_scope.is_none()
-            && self.delegation.is_none()
-            && !self.history_only
+        self.provider.is_some() && self.view_scope.is_none() && self.delegation.is_none()
     }
 
     /// One line for people and agents scanning a list. IDs are printed whole
@@ -162,9 +168,6 @@ impl Entry {
         }
         if let Some(title) = self.title.as_deref().filter(|title| !title.is_empty()) {
             line.push_str(&format!("  \"{title}\""));
-        }
-        if self.history_only {
-            line.push_str(" [saved transcript]");
         }
         if let Some(super::Placement::Worktree { path, .. }) = &self.view_scope {
             line.push_str(&format!(" [worktree view: {}]", path.display()));

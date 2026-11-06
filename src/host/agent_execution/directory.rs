@@ -116,6 +116,7 @@ pub(super) fn read(
     let scopes = session_scopes(&model);
     let mut me = None;
     let mut sessions = Vec::new();
+    let mut saved_transcripts = Vec::new();
     for live in live {
         let (worktree, project) = place_cached(&live.directory);
         let (delegation, delegated_scope) = delegations.get(&live.id).cloned().unzip();
@@ -140,6 +141,9 @@ pub(super) fn read(
         if !related && wanted.is_some() && project != wanted {
             continue;
         }
+        if live.history_only {
+            saved_transcripts.push(live.id);
+        }
         let entry = Entry {
             id: live.id,
             surface: live.surface,
@@ -156,7 +160,6 @@ pub(super) fn read(
                     .map(|channel| channel.title.clone())
             }),
             state: live.state,
-            history_only: live.history_only,
             directory: Some(live.directory),
             worktree,
             project_name: project
@@ -198,6 +201,7 @@ pub(super) fn read(
         caller: me,
         scope,
         sessions,
+        saved_transcripts,
     })
 }
 

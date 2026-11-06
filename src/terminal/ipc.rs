@@ -202,8 +202,9 @@ use crate::{
 /// candidate line (0.1.3+local.c68275e94) and is never reissued here: its
 /// daemons are update sources this release inspects and replaces, not peers.
 /// Version 129 is this release's matched set with the same extension.
-/// Version 130 appends `history_only` to directory entries, which moves every
-/// later positional field, so peers must be the matched set.
+/// Version 130 appends the saved-transcript list to the directory reply. A
+/// client of this version can't read that reply from an earlier daemon, while
+/// an earlier client stops reading before the list and is unaffected.
 pub const PROTOCOL_VERSION: u16 = 130;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
@@ -212,9 +213,9 @@ pub const PROTOCOL_VERSION: u16 = 130;
 /// client. Other parts differ, such as device account operations, so it is
 /// never an ordinary peer.
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
-/// The matched set before `history_only`. Directory entries are not among the
-/// messages an update exchanges, so an update speaks this source's protocol as
-/// it does the candidate line's.
+/// The matched set before the saved-transcript list. The directory reply is not
+/// among the messages an update exchanges, so an update speaks this source's
+/// protocol as it does the candidate line's.
 pub const STARTUP_STATE_PROTOCOL: u16 = 129;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
@@ -2512,6 +2513,71 @@ mod tests {
         assert_eq!(
             TerminalSnapshot::full(&next).apply(None).unwrap().scroll,
             next.scroll
+        );
+    }
+
+    #[test]
+    fn a_client_from_an_earlier_protocol_reads_the_directory_reply() {
+        use crate::{
+            agent::{ActivityState, Provider},
+            agent_execution::{
+                Lineage, Reply,
+                directory::{Directory, Entry, Relation, Scope, Surface},
+            },
+        };
+
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct EarlierDirectory {
+            caller: Option<Entry>,
+            scope: Scope,
+            sessions: Vec<Entry>,
+        }
+
+        let id = TerminalId::new();
+        let entry = Entry {
+            id,
+            surface: Surface::Chat,
+            provider: Some(Provider::Claude),
+            title: Some("title".to_owned()),
+            channel: None,
+            view_scope: None,
+            channel_repository: None,
+            state: ActivityState::Working,
+            directory: Some("/fixture".into()),
+            worktree: None,
+            project: None,
+            project_name: None,
+            delegation: None,
+            relation: Relation::Peer,
+            lineage: Lineage(id),
+        };
+        let directory = Directory {
+            caller: Some(entry.clone()),
+            scope: Scope::All,
+            sessions: vec![entry.clone(), entry.clone()],
+            saved_transcripts: vec![id],
+        };
+        let reply = postcard::to_stdvec(&directory).unwrap();
+        let frame = postcard::to_stdvec(&ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: Some(1),
+            proof: proof("session", "boot", "incarnation"),
+            message: ServerMessage::Response {
+                response: ServerResponse::Agent(Reply::Directory(directory)),
+            },
+        })
+        .unwrap();
+        assert!(
+            frame.ends_with(&reply),
+            "an earlier client can only skip what ends the frame"
+        );
+        assert_eq!(
+            postcard::from_bytes::<EarlierDirectory>(&reply).unwrap(),
+            EarlierDirectory {
+                caller: Some(entry.clone()),
+                scope: Scope::All,
+                sessions: vec![entry.clone(), entry],
+            }
         );
     }
 

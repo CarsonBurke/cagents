@@ -19,7 +19,7 @@ pub struct SessionsArgs {
 pub(super) fn whoami() -> Result<CommandOutput, AppError> {
     let directory = read(Scope::Containing(current_directory()?))?;
     let mut human = match &directory.caller {
-        Some(me) => list_human(std::iter::once(me)),
+        Some(me) => list_human(&directory.saved_transcripts, std::iter::once(me)),
         None => "Not running inside a cagents session".to_owned(),
     };
     let peers: Vec<_> = directory
@@ -33,11 +33,19 @@ pub(super) fn whoami() -> Result<CommandOutput, AppError> {
         .collect();
     if !peers.is_empty() {
         human.push_str("\n\nRelated sessions:\n");
-        human.push_str(&list_human(peers.iter().copied()));
+        human.push_str(&list_human(
+            &directory.saved_transcripts,
+            peers.iter().copied(),
+        ));
     }
     Ok(CommandOutput {
         command: "whoami",
-        data: json!({ "me": directory.caller, "scope": directory.scope, "sessions": peers }),
+        data: json!({
+            "me": directory.caller,
+            "scope": directory.scope,
+            "sessions": peers,
+            "saved_transcripts": directory.saved_transcripts,
+        }),
         human,
     })
 }
@@ -51,7 +59,10 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
         Scope::Containing(current_directory()?)
     };
     let directory = read(scope)?;
-    let mut human = list_human(directory.caller.iter().chain(directory.sessions.iter()));
+    let mut human = list_human(
+        &directory.saved_transcripts,
+        directory.caller.iter().chain(directory.sessions.iter()),
+    );
     human.push_str(&no_shared_pane_guidance(&directory));
     if let Scope::Project(project) = &directory.scope {
         human.push_str(&format!(
@@ -61,7 +72,12 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
     }
     Ok(CommandOutput {
         command: "sessions",
-        data: json!({ "me": directory.caller, "scope": directory.scope, "sessions": directory.sessions }),
+        data: json!({
+            "me": directory.caller,
+            "scope": directory.scope,
+            "sessions": directory.sessions,
+            "saved_transcripts": directory.saved_transcripts,
+        }),
         human,
     })
 }
@@ -73,7 +89,7 @@ fn no_shared_pane_guidance(directory: &Directory) -> String {
         .caller
         .iter()
         .chain(&directory.sessions)
-        .filter(|entry| entry.has_no_shared_pane())
+        .filter(|entry| entry.has_no_shared_pane() && !directory.is_saved_transcript(entry))
         .collect::<Vec<_>>();
     if unplaced.is_empty() {
         return String::new();
@@ -113,7 +129,10 @@ fn no_shared_pane_guidance(directory: &Directory) -> String {
     guidance
 }
 
-fn list_human<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> String {
+fn list_human<'a>(
+    saved_transcripts: &[crate::model::TerminalId],
+    entries: impl IntoIterator<Item = &'a Entry>,
+) -> String {
     use crate::agent::ActivityState;
     use crate::agent_execution::directory::Owner;
     super::format::table(
@@ -136,10 +155,9 @@ fn list_human<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> String {
                 {
                     context.push(format!("worktree view {}", path.display()));
                 }
-                if entry.history_only {
+                if saved_transcripts.contains(&entry.id) {
                     context.push("saved transcript".to_owned());
-                }
-                if entry.has_no_shared_pane() {
+                } else if entry.has_no_shared_pane() {
                     context.push("no shared pane".to_owned());
                 }
                 match (entry.relation, entry.delegation.as_ref().map(|d| &d.owner)) {
@@ -214,7 +232,6 @@ mod tests {
     fn entry() -> Entry {
         let id = "00000000-0000-4000-8000-000000000001".parse().unwrap();
         Entry {
-            history_only: false,
             id,
             surface: Surface::Chat,
             provider: Some(crate::agent::Provider::Claude),
@@ -245,7 +262,7 @@ mod tests {
     fn readable_session_rows_keep_original_identity_and_delegation_context() {
         let entry = entry();
         let before = serde_json::to_value(&entry).unwrap();
-        let human = list_human(std::iter::once(&entry));
+        let human = list_human(&[], std::iter::once(&entry));
         assert_eq!(human.lines().count(), 2);
         assert_eq!(
             human
@@ -283,19 +300,20 @@ mod tests {
             caller,
             scope: Scope::All,
             sessions,
+            saved_transcripts: vec![],
         };
         let mut entry = entry();
         let id = entry.id;
         // A delegated session is placed through its agent, whatever its view.
         entry.view_scope = None;
-        assert!(!list_human(std::iter::once(&entry)).contains("no shared pane"));
+        assert!(!list_human(&[], std::iter::once(&entry)).contains("no shared pane"));
         assert_eq!(
             no_shared_pane_guidance(&directory(None, vec![entry.clone()])),
             ""
         );
 
         entry.delegation = None;
-        assert!(list_human(std::iter::once(&entry)).contains("no shared pane"));
+        assert!(list_human(&[], std::iter::once(&entry)).contains("no shared pane"));
         let outside = no_shared_pane_guidance(&directory(None, vec![entry.clone()]));
         assert!(outside.contains(&format!("cagents channel move {id} --to CHANNEL_ID")));
         assert!(outside.contains("cagents channel list --repository /fixture/linked"));
@@ -321,12 +339,18 @@ mod tests {
         assert!(hosted.contains("can't open projects"));
 
         // A saved transcript open for reading has nothing running to place.
-        let mut reader = entry.clone();
-        reader.history_only = true;
-        let row = list_human(std::iter::once(&reader));
+        let reader = entry.clone();
+        let row = list_human(&[reader.id], std::iter::once(&reader));
         assert!(row.contains("saved transcript"));
         assert!(!row.contains("no shared pane"));
-        assert_eq!(no_shared_pane_guidance(&directory(None, vec![reader])), "");
+        let saved_transcripts = vec![reader.id];
+        assert_eq!(
+            no_shared_pane_guidance(&Directory {
+                saved_transcripts,
+                ..directory(None, vec![reader])
+            }),
+            ""
+        );
 
         // A channel only accepts sessions of its own project.
         entry.project = None;
@@ -337,7 +361,10 @@ mod tests {
 
     #[test]
     fn readable_sessions_empty_and_plain_shell_rows_are_explicit() {
-        assert_eq!(list_human(std::iter::empty::<&Entry>()), "No live sessions");
+        assert_eq!(
+            list_human(&[], std::iter::empty::<&Entry>()),
+            "No live sessions"
+        );
         let mut entry = entry();
         entry.provider = None;
         entry.surface = Surface::Terminal;
@@ -352,7 +379,7 @@ mod tests {
         entry.view_scope = None;
         entry.lineage = Lineage(entry.id);
         assert_eq!(
-            list_human(std::iter::once(&entry)),
+            list_human(&[], std::iter::once(&entry)),
             "SESSION                               PROVIDER  STATE    CONTEXT\n00000000-0000-4000-8000-000000000001  shell     unknown  me"
         );
     }
