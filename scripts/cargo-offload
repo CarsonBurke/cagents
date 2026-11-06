@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Run a gated Cargo command on the build host instead of this one.
 
 scripts/cargo-gate runs this before anything else. Rust compiles only on the
