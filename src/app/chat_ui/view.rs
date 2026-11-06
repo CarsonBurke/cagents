@@ -3733,16 +3733,12 @@ impl Runtime {
                     None => "Model".into(),
                 },
             };
-            // An unlisted model is named by its id, which has no bound; the
-            // open picker shows it whole. Cut here, the trailing group stays
-            // narrow enough that the footer's leading group keeps a column.
-            let label = if label.chars().count() > FOOTER_LABEL {
-                Cow::Owned(Self::short_description(&label, FOOTER_LABEL))
-            } else {
-                label
-            };
             if transitioning {
-                controls.push(design::caption(label).into());
+                controls.push(bounded(
+                    design::caption(Self::short_description(&label, FOOTER_LABEL)).into(),
+                    &label,
+                    "Model",
+                ));
             } else {
                 controls.push(self.model_picker(label, offers, shortcuts));
             }
@@ -4029,6 +4025,19 @@ impl Runtime {
         } else {
             label
         };
+        // An unlisted model is named by its id, which has no bound. Cut, the
+        // trailing group stays narrow enough that the footer's leading group
+        // keeps a column, and the tooltip says the whole name.
+        let shortcut = crate::workspace_widget::shortcut_tooltip(
+            crate::workspace_widget::GlobalShortcut::ChatModel,
+            shortcuts,
+        );
+        let tooltip = if label.chars().count() > FOOTER_LABEL {
+            format!("Model: {label} · {shortcut}")
+        } else {
+            shortcut
+        };
+        let label = Self::short_description(&label, FOOTER_LABEL);
         let anchor = widget::button::custom(
             widget::row::with_children(vec![
                 widget::icon(crate::ui_controls::provider_icon(
@@ -4051,13 +4060,7 @@ impl Runtime {
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
         .on_press(action(Action::ModelPicker(target, !open)));
-        let anchor = crate::interaction::tooltip_above(
-            anchor,
-            crate::workspace_widget::shortcut_tooltip(
-                crate::workspace_widget::GlobalShortcut::ChatModel,
-                shortcuts,
-            ),
-        );
+        let anchor = crate::interaction::tooltip_above(anchor, tooltip);
         crate::ui_controls::popover(
             anchor,
             self.model_search(offers),
