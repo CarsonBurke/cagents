@@ -15,6 +15,7 @@ import json
 import os
 import resource
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import socket
@@ -24,6 +25,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -551,6 +553,12 @@ class StandInHost(unittest.TestCase):
         self.root = Path(temporary.name)
         tools = self.root / "tools"
         tools.mkdir()
+        # HOME changes below, so caller Python shims (such as mise's) may
+        # no longer resolve their interpreter. Keep the test's own Python
+        # first without changing which Cargo or rustup each side finds.
+        python_tools = self.root / "python"
+        python_tools.mkdir()
+        (python_tools / "python3").symlink_to(Path(sys.executable).resolve())
         for name in ("cargo-gate", "cargo-gate-command.py", "cargo-gate-rustc-guard",
                      "cargo-offload"):
             shutil.copy2(ROOT / "scripts" / name, tools / name)
@@ -579,11 +587,12 @@ class StandInHost(unittest.TestCase):
             key: value for key, value in os.environ.items()
             if not key.startswith(("CAGENTS_BUILD_", "CARGO_BUILD_"))
         } | {
-            "PATH": f"{tools}:{os.environ['PATH']}",
+            "PATH": os.pathsep.join([str(python_tools), str(tools), os.environ["PATH"]]),
             # A build host's `cargo` is rustup's, as fw16's is, rather than
             # whatever wraps it first on this host's PATH: mise's shim, for
             # one, raises the open-file limit the build is meant to keep.
             "STAND_IN_HOST_PATH": os.pathsep.join([
+                str(python_tools),
                 os.path.join(os.environ.get("CARGO_HOME", str(home / ".cargo")), "bin"),
                 os.environ["PATH"]]),
             "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
@@ -1216,6 +1225,51 @@ class StandInHost(unittest.TestCase):
                 break
             self.assertLess(time.monotonic(), deadline, "the remote build script outlived the gate")
             time.sleep(0.1)
+
+
+class StandInHostPython(unittest.TestCase):
+    """Interpreter selection needs no Cargo build or real SSH connection."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-python-shim-")
+        self.addCleanup(temporary.cleanup)
+        caller_tools = Path(temporary.name)
+        self.shim_calls = caller_tools / "invocations"
+        shim = caller_tools / "python3"
+        # Fail promptly instead of reproducing a shim's recursive exec loop.
+        shim.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "${0%/*}/invocations"\nexit 86\n')
+        shim.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": f"{caller_tools}:{os.environ['PATH']}"}):
+            self.host = StandInHost()
+            self.addCleanup(self.host.doCleanups)
+            self.host.setUp()
+        self.environment = self.host.remote_env() | {"CAGENTS_FIXTURE_CALLER_ONLY": "present"}
+        self.probe = (
+            "import json, os, pathlib, sys; "
+            "print(json.dumps({'executable': str(pathlib.Path(sys.executable).resolve()), "
+            "'home': os.environ['HOME'], "
+            "'caller': os.environ.get('CAGENTS_FIXTURE_CALLER_ONLY')}))"
+        )
+
+    def assert_interpreter(self, result, *, caller):
+        self.assertFalse(self.shim_calls.exists(), "the caller's python3 shim ran")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            "executable": str(Path(sys.executable).resolve()),
+            "home": str(self.host.host_home),
+            "caller": caller,
+        })
+
+    def test_copied_gate_ignores_callers_python_shim(self):
+        result = self.host.gate_run("exec", "python3", "-c", self.probe,
+                                    env=self.environment, timeout=10)
+        self.assert_interpreter(result, caller="present")
+
+    def test_clean_stand_in_host_ignores_callers_python_shim(self):
+        result = subprocess.run(["ssh", "stand-in", "python3", "-c", shlex.quote(self.probe)],
+                                cwd=self.host.crate, env=self.environment,
+                                capture_output=True, text=True, timeout=10)
+        self.assert_interpreter(result, caller=None)
 
 
 class RemoteRun(unittest.TestCase):
