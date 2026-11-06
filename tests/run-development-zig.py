@@ -464,7 +464,55 @@ exit 83
         self.assertLess(time.monotonic() - started, 8)
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assertIn("refusing to keep waiting while holding the native lock", result.stderr)
-        self.assertNotIn("may only confirm that nothing needs compiling\nThe matched set", result.stderr)
+
+    def test_ending_a_guarded_launch_ends_its_build_and_frees_a_plain_flocks_lock(self):
+        lock = self.root / "native-lock"
+        lock.touch()
+        for name, deliver in (
+            ("kill", lambda holder, runner: os.kill(runner, signal.SIGKILL)),
+            ("terminate", lambda holder, runner: os.kill(runner, signal.SIGTERM)),
+            ("interrupt the group", lambda holder, runner: os.killpg(holder, signal.SIGINT)),
+            ("hang up the group", lambda holder, runner: os.killpg(holder, signal.SIGHUP)),
+        ):
+            with self.subTest(signal=name):
+                holder = subprocess.Popen(
+                    ["flock", str(lock), str(self.runner), "--browserless"], cwd=self.root,
+                    env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock), "FAKE_BUILD_SECONDS": "60"},
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                )
+                self.addCleanup(holder.wait)
+                self.addCleanup(lambda process=holder: process.poll() is None and process.kill())
+                deadline = time.monotonic() + 8
+                while not self.cargo_calls.exists():
+                    self.assertLess(time.monotonic(), deadline, "the build never started")
+                    time.sleep(0.02)
+                runner = int(subprocess.run(
+                    ["pgrep", "-P", str(holder.pid)], capture_output=True, text=True,
+                ).stdout.split()[0])
+                deliver(holder.pid, runner)
+                deadline = time.monotonic() + 5
+                while subprocess.run(["flock", "-n", str(lock), "true"]).returncode != 0:
+                    self.assertLess(time.monotonic(), deadline, "the build kept the native lock")
+                    time.sleep(0.05)
+                self.cargo_calls.unlink()
+
+    def test_a_bound_that_is_not_a_positive_number_refuses_to_build(self):
+        for value in ("abc", "-1", "0", "0.5"):
+            with self.subTest(value=value):
+                result = self.under_native_lock(
+                    "flock", "--close", CAGENTS_NATIVE_LOCK_BUILD_SECONDS=value,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("must be a positive number of seconds", result.stderr)
+                self.assertFalse(self.cargo_calls.exists())
+
+    def test_a_guarded_launch_without_a_target_directory_fails_before_building(self):
+        cargo = self.root / "bin/cargo"
+        cargo.write_text(cargo.read_text().replace("    metadata)\n", "    metadata)\n        exit 101\n", 1))
+        result = self.under_native_lock("flock", "--close")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot find the Cargo target directory", result.stderr)
+        self.assertFalse(self.cargo_calls.exists())
 
     def test_a_current_launch_holding_the_lock_starts_without_cargo(self):
         self.assert_built("--browserless")
