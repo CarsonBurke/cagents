@@ -2985,6 +2985,7 @@ mod tests {
     /// does, and its probe reads: none unless cagents was started with one,
     /// so the CLI keeps one record of who the login is, in `~/.claude.json`.
     #[test]
+    #[cfg(any(feature = "host", feature = "ui"))]
     fn a_system_conversation_exports_the_home_its_probe_reads() {
         let system = crate::account::Account::system(Provider::Claude);
         let session = fresh_session(

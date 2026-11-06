@@ -72,6 +72,7 @@ impl RecordedLogin {
 /// How long, in milliseconds, a sign-in that cagents ran settles the next
 /// disagreement a probe sees: the probe that follows it runs at once, so a
 /// sign-in older than this is not the one that wrote the CLI's record.
+#[cfg(any(feature = "ui", feature = "host"))]
 pub const SIGN_IN_SETTLES_FOR: u64 = 10 * 60 * 1000;
 
 /// What a probe reports of the system login's two records, and how the
@@ -89,6 +90,7 @@ pub const SIGN_IN_SETTLES_FOR: u64 = 10 * 60 * 1000;
 ///
 /// The second element is `None` to leave the settlement as it is, or the
 /// settlement to record in its place.
+#[cfg(any(feature = "ui", feature = "host"))]
 pub fn settle_dispute(
     reported: &Identity,
     other: RecordedLogin,
@@ -641,6 +643,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "ui", feature = "host"))]
     fn a_disagreement_is_reported_until_a_sign_in_is_known_to_have_settled_it() {
         use super::super::cache::Settled;
         const NOW: u64 = 1_000_000_000;
