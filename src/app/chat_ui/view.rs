@@ -722,7 +722,7 @@ fn completion_kind(kind: completion::Kind) -> &'static str {
 /// bound, and a footer item does not wrap within itself.
 fn bounded<'a>(content: Element<'a, Message>, name: &str, kind: &str) -> Element<'a, Message> {
     if name.chars().count() > FOOTER_LABEL {
-        crate::interaction::tooltip(content, format!("{kind}: {name}"))
+        crate::interaction::tooltip_above(content, format!("{kind}: {name}"))
     } else {
         content
     }
@@ -3130,7 +3130,7 @@ impl Runtime {
         let mut status: Vec<Element<'_, Message>> = Vec::new();
         if let Some(channel) = &place.channel {
             status.push(
-                crate::interaction::tooltip(
+                crate::interaction::tooltip_above(
                     design::caption(format!("# {}", Self::short_description(channel, 24)))
                         .wrapping(iced::widget::text::Wrapping::None),
                     format!("Channel: {channel}"),
@@ -3208,7 +3208,7 @@ impl Runtime {
             // beside it. The linear capsule this replaces spent the width of a
             // whole caption saying what the percentage already said.
             let used = (usage.context_tokens as f32 / usage.context_limit as f32).clamp(0.0, 1.0);
-            spend.push(crate::interaction::tooltip(
+            spend.push(crate::interaction::tooltip_above(
                 widget::row::with_children(vec![
                     crate::ui_controls::budget_radial(used),
                     design::caption(format!("{:.0}%", used * 100.0))
@@ -3246,7 +3246,10 @@ impl Runtime {
             spend.push(design::caption(format!("${:.2}", cost as f64 / 1_000_000.0)).into());
         } else if let Some(estimate) = usage.cost_estimate {
             let (label, tooltip) = cost_estimate_label(estimate);
-            spend.push(crate::interaction::tooltip(design::caption(label), tooltip));
+            spend.push(crate::interaction::tooltip_above(
+                design::caption(label),
+                tooltip,
+            ));
         }
         let spend = widget::row::with_children(spend)
             .spacing(step::GAP_S)
@@ -3843,7 +3846,7 @@ impl Runtime {
                     .class(crate::ui_controls::control_style(open, None))
                     .padding(CONTROL_PADDING)
                     .on_press(action(Action::PermissionPicker(target, !open)));
-                context.push(crate::interaction::tooltip(
+                context.push(crate::interaction::tooltip_above(
                     anchor,
                     crate::workspace_widget::shortcut_tooltip(
                         crate::workspace_widget::GlobalShortcut::ChatPermissions,
@@ -3874,7 +3877,7 @@ impl Runtime {
         if transitioning || !self.choosing() {
             // Manual choices are made before the first message. Automatic
             // routing can hand off later at a safe idle boundary.
-            return crate::interaction::tooltip(
+            return crate::interaction::tooltip_above(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE),
                     label.into(),
@@ -3914,7 +3917,7 @@ impl Runtime {
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
         .on_press(action(Action::AccountPicker(target, !open)));
-        let anchor = crate::interaction::tooltip(
+        let anchor = crate::interaction::tooltip_above(
             anchor,
             crate::workspace_widget::shortcut_tooltip(
                 crate::workspace_widget::GlobalShortcut::ChatAccount,
@@ -4048,7 +4051,7 @@ impl Runtime {
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
         .on_press(action(Action::ModelPicker(target, !open)));
-        let anchor = crate::interaction::tooltip(
+        let anchor = crate::interaction::tooltip_above(
             anchor,
             crate::workspace_widget::shortcut_tooltip(
                 crate::workspace_widget::GlobalShortcut::ChatModel,
