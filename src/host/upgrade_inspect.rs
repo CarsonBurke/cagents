@@ -488,7 +488,8 @@ impl ExecutionEvidence {
     /// and the server is the only writer of its conversation. It has ended
     /// when its holder, if one registered, is gone with everything in its
     /// process group and session, no process of this user still names the
-    /// pane's listener, and no socket is bound at that path. Tool work that
+    /// pane's listener, and no socket is bound at that path or at the socket
+    /// Codex publishes it as a symlink to. Tool work that
     /// left a dead server's process group writes no conversation. A paired
     /// console runs outside the server, so a paired pane stays unproved.
     fn classify_codex(&self, source: &Session) -> SavedExecution {
@@ -516,9 +517,23 @@ impl ExecutionEvidence {
                 Err(_) => return SavedExecution::Unproved,
             }
         }
+        // Recent Codex releases bind a socket in their own runtime directory
+        // and publish the listener path as a symlink to it.
+        let published = match std::fs::read_link(&listener.socket) {
+            Ok(target) => Some(listener.socket.with_file_name(target)),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::EINVAL) =>
+            {
+                None
+            }
+            Err(_) => return SavedExecution::Unproved,
+        };
         // A holder binds its control socket before it starts the server and
         // publishes its record, so a starting holder is seen by that socket.
-        match codex_listener_survives(&self.processes, source.id, &[&listener.socket, &control]) {
+        let mut sockets = vec![listener.socket.as_path(), control.as_path()];
+        sockets.extend(published.as_deref());
+        match codex_listener_survives(&self.processes, source.id, &sockets) {
             Ok(true) => SavedExecution::Running,
             Ok(false) => SavedExecution::Ended,
             Err(_) => SavedExecution::Unproved,
@@ -551,10 +566,10 @@ fn codex_listener_survives_with(
     sockets: &[&Path],
     settle: Duration,
 ) -> Result<bool, String> {
-    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    use std::os::unix::ffi::OsStrExt;
     let marker = format!("cagents-codex-{pane}");
     let marker = marker.as_bytes();
-    let uid = unsafe { libc::geteuid() };
+    let uid = crate::daemon::current_uid().to_string();
     let unavailable = |error: &std::io::Error| {
         error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
     };
@@ -608,11 +623,21 @@ fn codex_listener_survives_with(
             continue;
         }
         let path = entry.path();
-        match std::fs::metadata(&path) {
-            Ok(metadata) if metadata.uid() != uid => continue,
-            Ok(_) => {}
+        // The effective user, not the owner of `/proc/<pid>`, which becomes
+        // root for a process that made itself non-dumpable.
+        let status = match std::fs::read_to_string(path.join("status")) {
+            Ok(status) => status,
             Err(error) if unavailable(&error) => continue,
             Err(error) => return Err(format!("Cannot inspect a process: {error}")),
+        };
+        let effective = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|ids| ids.split_whitespace().nth(1));
+        match effective {
+            Some(effective) if effective != uid => continue,
+            Some(_) => {}
+            None => return Err("Cannot read a process's user".into()),
         }
         if arguments(&path)?
             .is_some_and(|argv| argv.windows(marker.len()).any(|window| window == marker))
@@ -1316,6 +1341,23 @@ mod tests {
                 SavedExecution::Ended,
                 "a socket file nobody listens on is no server"
             );
+            std::fs::remove_file(&socket).unwrap();
+            // Recent Codex binds in its own runtime directory and publishes
+            // the listener path as a symlink to that socket.
+            let runtime = tempfile::tempdir_in("/var/tmp").unwrap();
+            let target = runtime.path().join("served");
+            std::os::unix::fs::symlink(&target, &socket).unwrap();
+            let bound = std::os::unix::net::UnixListener::bind(&target).unwrap();
+            assert_eq!(
+                evidence(holders.path(), Vec::new()).classify(&card),
+                SavedExecution::Running,
+                "a server bound behind the published listener"
+            );
+            drop(bound);
+            assert_eq!(
+                evidence(holders.path(), Vec::new()).classify(&card),
+                SavedExecution::Ended
+            );
             std::fs::remove_dir_all(socket.parent().unwrap()).unwrap();
             for (holder, provider) in [
                 (running_process(), ended_process()),
@@ -1381,6 +1423,9 @@ mod tests {
         let process = processes.path().join("4242");
         std::fs::create_dir(&process).unwrap();
         std::fs::write(process.join("cmdline"), b"").unwrap();
+        let uid = crate::daemon::current_uid();
+        let user = |uid: u32| format!("Name:\tcodex\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n");
+        std::fs::write(process.join("status"), user(uid)).unwrap();
         let mut table = evidence(holders.path(), Vec::new());
         table.processes = processes.path().into();
         let stat = |state: char, flags: u64, threads: u32| {
@@ -1406,6 +1451,21 @@ mod tests {
         // A truncated status line proves nothing.
         std::fs::write(process.join("stat"), b"4242 (codex) Z 1 4242 4242").unwrap();
         assert_eq!(table.classify(&card), SavedExecution::Unproved);
+        // The effective user decides, not the owner of the process directory,
+        // which is root for a non-dumpable process of this user.
+        std::fs::write(process.join("stat"), stat('R', 0, 1)).unwrap();
+        std::fs::write(process.join("status"), user(uid.wrapping_add(1))).unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Ended);
+        std::fs::write(process.join("status"), b"Name:\tcodex\n").unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Unproved);
+        std::fs::write(process.join("status"), user(uid)).unwrap();
+        let named = card.owned_codex_listener.clone().unwrap().socket;
+        std::fs::write(
+            process.join("cmdline"),
+            format!("codex\0app-server\0--listen\0unix://{}\0", named.display()),
+        )
+        .unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Running);
         std::fs::remove_dir_all(&process).unwrap();
         assert_eq!(table.classify(&card), SavedExecution::Ended);
         // A socket bound at the listener, or at a starting holder's control
