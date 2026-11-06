@@ -1723,7 +1723,12 @@ fn signs_in(account: &Account, recipe: &LaunchRecipe) -> bool {
         .map(PathBuf::from);
     match named {
         Some(named) => account.resolved_home() == Some(named),
-        None => account.is_system(),
+        // An unset home is the CLI's default, which only a system account
+        // exporting no home of its own resolves (as `account_of_recipe`).
+        None => {
+            account.is_system()
+                && (!recipe.unset_environment.contains(variable) || account.launch_home().is_none())
+        }
     }
 }
 
