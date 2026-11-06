@@ -289,6 +289,24 @@ impl Coordination {
         matches!(self.kind, Kind::Message(_) | Kind::Spawn(_))
     }
 
+    /// Whether the step's output is the provider's record of the agents it
+    /// addressed, such as Codex's map of thread IDs to states, rather than
+    /// text for a reader. The step's line and the agents' own rows already
+    /// say what it did, and the record stays in the raw call.
+    pub fn output_is_agent_states(&self) -> bool {
+        !self.cli
+            && matches!(
+                self.kind,
+                Kind::Act(
+                    Act::Wait { .. }
+                        | Act::Close { .. }
+                        | Act::Resume { .. }
+                        | Act::Interrupt { .. }
+                        | Act::Agents
+                )
+            )
+    }
+
     /// How the step went, given how its item `reported` it went: a message
     /// or a launch whose exit status a pipeline hid still failed if the CLI
     /// said so and confirmed nothing.
@@ -872,6 +890,23 @@ mod tests {
                 .unwrap()
                 .kind,
             Kind::Act(Act::Agents)
+        );
+        // Their output is the agents' state map, which is not shown as text.
+        assert!(
+            native(Provider::Codex, "call", "interruptAgent", "", states)
+                .unwrap()
+                .output_is_agent_states()
+        );
+        assert!(
+            !native(
+                Provider::Codex,
+                "call",
+                "sendMessage",
+                "Check the docs",
+                states
+            )
+            .unwrap()
+            .output_is_agent_states()
         );
         // `task` is OMP's launcher, and only OMP's.
         let input = r#"{"i":"Split the work","context":"Shared notes","tasks":[{"name":"Docs","agent":"task","task":"Write docs"},{"name":"Tests","agent":"task","task":"Write tests"}]}"#;

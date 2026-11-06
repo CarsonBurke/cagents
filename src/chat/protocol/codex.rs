@@ -3995,8 +3995,9 @@ fn parse_item_with_windows(
         // unfinished, or one replayed from a turn still running, never reads
         // as still compacting once it is not.
         "contextCompaction" => tool_call("Compact context".into(), String::new(), String::new()),
-        // What the hooks added, in their own words; the run IDs the fragments
-        // are keyed by are Codex's bookkeeping.
+        // Context the hooks added for the model, in their own words, shown
+        // as a notice of where it came from rather than as the agent's prose;
+        // the run IDs the fragments are keyed by are Codex's bookkeeping.
         // Hooks that added nothing leave no row.
         "hookPrompt" => {
             let added = value["fragments"]
@@ -4011,7 +4012,19 @@ fn parse_item_with_windows(
             if added.is_empty() {
                 Vec::new()
             } else {
-                vec![text(id.into(), added, false, Role::System)]
+                vec![Item {
+                    id: id.into(),
+                    role: Role::System,
+                    content: ItemContent::Delivery {
+                        kind: chat::DeliveryKind::Notice,
+                        from: String::new(),
+                        sender: String::new(),
+                        summary: "Context from a hook".into(),
+                        body: added,
+                    },
+                    started_at: None,
+                    at: None,
+                }]
             }
         }
         // The agent pausing, named as a pause. As with compaction, the status
@@ -8834,10 +8847,16 @@ mod tests {
             [
                 Item {
                     role: Role::System,
-                    content: ItemContent::Text { text, .. },
+                    content:
+                        ItemContent::Delivery {
+                            kind: chat::DeliveryKind::Notice,
+                            summary,
+                            body,
+                            ..
+                        },
                     ..
                 },
-            ] => text.clone(),
+            ] => format!("{summary}: {body}"),
             items => panic!("one notice, not {items:?}"),
         };
         // A pause or a compaction keeps its name; its status says how far it
@@ -8860,7 +8879,7 @@ mod tests {
             {"hookRunId":"run-1","text":"Remember the style guide."},{"hookRunId":"run-2","text":"Run the tests."}]});
         assert_eq!(
             notice(hook, true),
-            "Remember the style guide.\n\nRun the tests."
+            "Context from a hook: Remember the style guide.\n\nRun the tests."
         );
         let sleep = json!({"id":"s","type":"sleep","durationMs":90_000});
         let running = only_tool(sleep.clone(), false);
