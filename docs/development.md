@@ -62,6 +62,12 @@ scripts/cargo-gate check --locked --features integrated-browser --bin cagents-ui
 scripts/cargo-gate check --locked --package ceditor --bin ceditor
 ```
 
+Each of these commands waits in the build host's queue on its own, and on a
+busy host the wait is most of its time: on fw16 under a full queue, the CLI
+check above took 26 s to compile and 19 minutes in all. A lane's tests
+(`scripts/cargo-gate test ... --all-targets`, [below](#testing)) type-check
+everything its check does, so when you are about to run them, skip the check.
+
 Changes to ceditor or shared UI, editor, or notification public contracts also
 require the standalone editor check above. The workspace's
 `default-members = ["."]` selects only cagents: root UI checks and root
