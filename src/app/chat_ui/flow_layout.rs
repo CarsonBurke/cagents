@@ -1370,7 +1370,7 @@ pub(super) fn paint(
         (matches, design::accent_wash(theme)),
         (
             std::slice::from_ref(&selection),
-            design::accent_color(theme),
+            design::selection_wash(theme),
         ),
     ] {
         visit_range_bounds(projection, ranges, |bounds| {
@@ -1939,7 +1939,7 @@ fn projected_selection_and_find_keep_native_ligature_caret_regions() {
             let color = if find {
                 design::accent_wash(&cosmic::theme::active())
             } else {
-                design::accent_color(&cosmic::theme::active())
+                design::selection_wash(&cosmic::theme::active())
             }
             .into_rgba8();
             for part in 0..count {

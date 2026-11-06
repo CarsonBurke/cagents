@@ -62,7 +62,6 @@ impl ActorJournalRetention {
             journal: (metadata.dev(), metadata.ino()),
         };
         write_new(&directory.join(IDENTITY), &identity)?;
-        File::open(directory)?.sync_all()?;
         Ok(Self {
             directory: directory.to_owned(),
             identity,
@@ -72,13 +71,20 @@ impl ActorJournalRetention {
     /// The Journal owner has permanently fenced future semantic appends and
     /// proved its exact ACK/loss state under the same mutex. The caller writes
     /// the authenticated native retirement receipt before this cache permit.
+    ///
+    /// Nothing here is fsynced. The cache lives in the runtime directory and
+    /// its journal is never reopened, so durability across an OS crash
+    /// protects no reader: a disposition lost with that crash only preserves
+    /// the cache. The retiring helper calls this from its single request
+    /// loop, where each fsync can take seconds on a disk-backed runtime
+    /// directory and expire its `retire` request (#2180).
     pub(crate) fn allow_removal(&self) -> io::Result<()> {
-        self.allow_removal_with_sync(|| File::open(&self.directory)?.sync_all())
+        self.allow_removal_with(|temporary, disposition| fs::rename(temporary, disposition))
     }
 
-    fn allow_removal_with_sync(
+    fn allow_removal_with(
         &self,
-        sync_directory: impl FnOnce() -> io::Result<()>,
+        publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
     ) -> io::Result<()> {
         let identity: Identity = read_private(&self.directory.join(IDENTITY))?;
         if identity != self.identity || directory_identity(&self.directory)? != identity.directory {
@@ -86,7 +92,6 @@ impl ActorJournalRetention {
         }
         let journal =
             crate::secure_file::open_existing_private_file_readonly(&self.directory.join(JOURNAL))?;
-        journal.sync_all()?;
         let metadata = journal.metadata()?;
         if (metadata.dev(), metadata.ino()) != identity.journal {
             return Err(io::Error::other("Retained journal file identity changed"));
@@ -99,15 +104,10 @@ impl ActorJournalRetention {
         let temporary = self
             .directory
             .join(format!(".actor-journal-drained-{}", uuid::Uuid::new_v4()));
-        let result = (|| {
-            write_new(&temporary, &disposition)?;
-            fs::rename(&temporary, self.directory.join(DISPOSITION))?;
-            sync_directory()
-        })();
+        let result = write_new(&temporary, &disposition)
+            .and_then(|()| publish(&temporary, &self.directory.join(DISPOSITION)));
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
-            let _ = fs::remove_file(self.directory.join(DISPOSITION));
-            let _ = File::open(&self.directory).and_then(|directory| directory.sync_all());
         }
         result
     }
@@ -130,8 +130,7 @@ fn write_new<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()
+    file.write_all(&bytes)
 }
 
 fn read_private<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
@@ -272,12 +271,19 @@ mod tests {
         let failed_retention = ActorJournalRetention::create(&failed, &failed_file).unwrap();
         assert!(
             failed_retention
-                .allow_removal_with_sync(|| Err(io::Error::other(
-                    "injected directory fsync failure"
+                .allow_removal_with(|_, _| Err(io::Error::other(
+                    "injected disposition publication failure"
                 )))
                 .is_err()
         );
         assert!(!reclaimable(&failed).unwrap());
-        assert!(!failed.join(DISPOSITION).exists());
+        assert!(
+            fs::read_dir(&failed).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".actor-journal-drained-")),
+            "an interrupted publication leaves no temporary disposition"
+        );
     }
 }

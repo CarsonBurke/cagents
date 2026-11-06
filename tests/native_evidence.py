@@ -182,6 +182,9 @@ class Evidence(unittest.TestCase):
             "CAGENTS_EVIDENCE_NATIVE_LOCK": str(self.native_lock),
             "CAGENTS_BUILD_LOCK": str(self.cargo_lock),
             "CAGENTS_BUILD_SLOTS": "1",
+            # These fixtures exercise this host's queue; Rust never compiles.
+            "CAGENTS_BUILD_REMOTE": "local",
+            "CAGENTS_BUILD_INSTALLED_GATE": "",
             "CAGENTS_EVIDENCE_TASK": str(self.task),
             "GIT_CONFIG_GLOBAL": "/dev/null",
         }
@@ -719,6 +722,7 @@ class Evidence(unittest.TestCase):
             result = self.run_tool("start", "after", "--wait-lock", "0", check=False)
         self.assertEqual(result.returncode, 1)
         self.assertIn("native lock stayed busy", result.stderr)
+        self.assertIn(f"scripts/lock-holders {self.native_lock}", result.stderr)
         self.assertFalse((self.logs / "kwin").exists())
 
     def test_session_lifecycle_holds_the_lock_isolates_state_and_ends_its_processes(self) -> None:

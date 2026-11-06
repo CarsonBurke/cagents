@@ -37,6 +37,11 @@ impl Handle {
             responder.settle_input_fixture(outcome)
         })
     }
+    /// A retained attachment whose proxy already recorded a terminal failure.
+    #[cfg(test)]
+    pub(crate) fn fixture_failed_remote() -> Self {
+        Self(Owner::Remote(RemoteActor::completed_failure_fixture()))
+    }
     /// Same retained actor identity, distinct proxy attachment allocations.
     /// Neither fixture has a live helper or permits real provider operations.
     #[cfg(test)]

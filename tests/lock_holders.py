@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 import unittest.mock
@@ -90,8 +91,10 @@ class LockHolders(unittest.TestCase):
         report = self.report()
         self.assertIn(f"holder {holder.pid} flock", report)
         self.assertIn("idle", report)
-        self.assertNotIn("WARNING", report)
-        self.assertIn("note: nothing holding this used CPU", report)
+        self.assertNotIn("no holder is a recognized", report)
+        self.assertIn("note: nothing holding this used CPU during the one-second sample", report)
+        self.assertIn("Run this again", report)
+        self.assertNotIn("leftover", self.notes(report))
 
     def test_a_leftover_that_inherited_the_lock_is_named_and_left_running(self):
         pid_file = self.root / "daemon"
@@ -104,9 +107,142 @@ class LockHolders(unittest.TestCase):
         self.assertTrue(self.holds(), "the fixture must reproduce the inherited lock")
         report = self.report()
         self.assertIn(f"holder {daemon} sleep", report)
-        self.assertIn("WARNING", report)
+        notes = self.notes(report)
+        self.assertIn("no holder is a recognized build or session", notes)
+        self.assertIn("idle during the sample", notes)
+        self.assertIn("could have inherited the lock", notes)
+        # It can't tell this from a script between its own steps, so never concludes.
+        self.assertIn("this can't tell which", notes)
+        self.assertIn("Everyone queued waits until every holder releases it", notes)
+        self.assertIn("commands and directories above", notes)
+        self.assertIn("ask the owner", notes)
+        self.assertNotIn("took this lock", notes)
+        self.assertNotRegex(notes, "(?i)kill|probably|leftover|WARNING")
         os.kill(daemon, 0)
         self.assertTrue(self.holds())
+
+    def test_the_help_does_not_present_process_age_as_hold_time(self):
+        output = subprocess.run([sys.executable, "-I", "-B", str(TOOL), "--help"],
+                                capture_output=True, text=True, check=True).stdout
+        self.assertIn("Process age isn't hold time", output)
+
+    @staticmethod
+    def notes(report):
+        """Only what the tool says: a holder's directory could contain any word."""
+        return "\n".join(line for line in report.splitlines() if line.startswith("  note:"))
+
+    def python_holder(self, body):
+        """An unrecognized holder that takes the lock itself, then runs BODY."""
+        return self.start(
+            sys.executable, "-c",
+            "import fcntl, os, sys, time\n"
+            "lock = open(sys.argv[1], 'a')\n"
+            "fcntl.flock(lock, fcntl.LOCK_EX)\n" + textwrap.dedent(body),
+            str(self.lock),
+        )
+
+    def test_a_holder_that_took_the_lock_itself_is_not_suspected_of_inheriting_it(self):
+        holder = self.python_holder("time.sleep(60)")
+        self.wait_for(self.holds, "holder")
+        report = self.report()
+        self.assertRegex(
+            report,
+            rf"holder {holder.pid} .*process age \d+:\d\d:\d\d, so it took this lock at most "
+            "that long ago",
+        )
+        notes = self.notes(report)
+        self.assertIn(f"idle during the sample. {holder.pid} took this lock; any process that inherited",
+                      notes)
+        self.assertIn("inherited it keeps it after the taker exits.", notes)
+        self.assertNotIn("can't tell which", notes)
+        self.assertNotRegex(notes, "(?i)kill|leftover")
+
+    def test_several_takers_of_a_shared_lock_are_all_named(self):
+        takers = []
+        for _ in range(2):
+            taker = self.start(
+                sys.executable, "-c",
+                "import fcntl, os, sys, time\n"
+                "lock = open(sys.argv[1], 'a')\n"
+                "fcntl.flock(lock, fcntl.LOCK_SH)\n"
+                "open(sys.argv[1] + '.' + str(os.getpid()), 'w').close()\n"
+                "time.sleep(60)\n",
+                str(self.lock),
+            )
+            takers.append(taker)
+            self.wait_for(Path(f"{self.lock}.{taker.pid}").exists, "a shared holder")
+        notes = self.notes(self.report())
+        first, second = sorted(taker.pid for taker in takers)
+        self.assertIn(f"{first} and {second} took this lock; any process that inherited it", notes)
+        self.assertNotIn("can't tell which", notes)
+
+    def test_a_taker_does_not_speak_for_a_holder_that_inherited_from_it(self):
+        pid_file = self.root / "child"
+        taker = self.python_holder(f"""
+            child = os.fork()
+            if child == 0:
+                open({str(pid_file)!r}, "w").write(str(os.getpid()))
+                time.sleep(60)
+                os._exit(0)
+            time.sleep(60)
+        """)
+        self.wait_for(lambda: pid_file.exists() and pid_file.read_text(), "child")
+        child = int(pid_file.read_text())
+        self.pids.append(child)
+        report = self.report()
+        self.assertRegex(report, rf"holder {taker.pid} .*at most that long ago")
+        self.assertNotRegex(report, rf"holder {child} .*at most that long ago")
+        notes = self.notes(report)
+        self.assertIn(f"{taker.pid} took this lock; any process that inherited it", notes)
+        # It may be a script between its steps, which holds a lock the same way.
+        self.assertIn("working through its own steps", notes)
+        self.assertIn("can't tell which", notes)
+
+    def test_a_busy_unrecognized_holder_is_said_to_be_busy(self):
+        self.python_holder("while True: pass")
+        self.wait_for(self.holds, "holder")
+        report = self.report()
+        self.assertIn("no holder is a recognized build or session, and they were busy during", report)
+
+    def test_a_running_locker_that_handed_the_lock_on_is_not_said_to_hold_it(self):
+        # The parent took the lock, gave its descriptor to a child and closed its own.
+        pid_file = self.root / "child"
+        self.python_holder(f"""
+            child = os.fork()
+            if child == 0:
+                open({str(pid_file)!r}, "w").write(str(os.getpid()))
+                time.sleep(60)
+                os._exit(0)
+            lock.close()
+            time.sleep(60)
+        """)
+        self.wait_for(lambda: pid_file.exists() and pid_file.read_text(), "child")
+        child = int(pid_file.read_text())
+        self.pids.append(child)
+        self.wait_for(lambda: self.report().count("  holder ") == 1, "the parent letting go")
+        report = self.report()
+        self.assertIn(f"holder {child} ", report)
+        self.assertNotIn("took this lock", self.notes(report))
+        self.assertIn("could have inherited the lock from another process", report)
+
+    def test_a_shell_holding_the_lock_of_a_flock_that_exited_is_only_undetermined(self):
+        # The usual `exec 9>LOCK; flock 9`: the process that took the lock has gone.
+        shell = self.start("bash", "-c", 'exec 9>"$0"; flock 9; exec -a holder-shell sleep 60',
+                           str(self.lock))
+        self.wait_for(self.holds, "holder")
+        report = self.report()
+        self.assertIn(f"holder {shell.pid} ", report)
+        notes = self.notes(report)
+        self.assertNotIn("took this lock", notes)
+        self.assertIn("this can't tell which", notes)
+        self.assertNotRegex(notes, "(?i)kill|leftover")
+
+    def test_a_holders_figure_is_labeled_as_its_process_age(self):
+        self.start("flock", str(self.lock), "sleep", "60")
+        self.wait_for(self.holds, "holder")
+        report = self.report()
+        self.assertRegex(report, r"process age \d+:\d\d:\d\d")
+        self.assertNotIn(", up ", report)
 
     def test_a_wrapper_script_running_a_build_raises_no_warning(self):
         # Named cargo, so it counts as a build though the script closes the lock for it.
@@ -119,7 +255,7 @@ class LockHolders(unittest.TestCase):
         self.start(str(wrapper_with_child))
         self.wait_for(self.holds, "holder")
         self.wait_for(lambda: "outer.sh" in self.report(), "the report")
-        self.assertNotIn("WARNING", self.report())
+        self.assertNotIn("no holder is a recognized", self.report())
 
     def test_a_holder_with_a_busy_child_gets_no_idle_note(self):
         self.start("flock", "--close", str(self.lock), "sh", "-c", "while :; do :; done")
@@ -151,7 +287,7 @@ class LockHolders(unittest.TestCase):
                 program.chmod(0o755)
                 self.start(str(program))
                 self.wait_for(self.holds, "holder")
-                self.assertNotIn("WARNING", self.report())
+                self.assertNotIn("no holder is a recognized", self.report())
                 self.end_processes()
                 self.pids.clear()
                 self.processes.clear()

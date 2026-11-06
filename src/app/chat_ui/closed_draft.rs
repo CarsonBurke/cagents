@@ -301,7 +301,9 @@ mod tests {
         app.chat_runtime_mut(target).unwrap().error =
             Some("Exact native chat is not hosted; explicit recovery is required".into());
         let text = visible_text(&app, target.card).join("\n");
-        assert!(text.contains("Closed · draft retained"), "{text}");
+        // The footer no longer repeats the state; the closed card says it.
+        assert!(text.contains("Closed in another window"), "{text}");
+        assert!(!text.contains("Closed · draft retained"), "{text}");
         assert!(
             text.contains("Copy draft") && text.contains("Discard draft text"),
             "{text}"
