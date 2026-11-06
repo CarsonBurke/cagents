@@ -527,12 +527,25 @@ impl ExecutionEvidence {
 
 /// Whether any process of this user names a Codex pane's listener directory
 /// in its arguments, or a socket is still bound at its listener path. A
-/// process whose arguments cannot be read yet, other than a zombie, is not
-/// evidence of absence.
+/// process between `execve` and publishing its new arguments briefly shows
+/// none; it is read again for a bounded moment, and one that still shows no
+/// arguments, other than a zombie, is not evidence of absence.
 fn codex_listener_survives(
     processes: &Path,
     pane: crate::model::TerminalId,
     socket: &Path,
+) -> Result<bool, String> {
+    codex_listener_survives_with(processes, pane, socket, EXEC_SETTLE)
+}
+
+/// How long one process may take to publish its arguments after `execve`.
+const EXEC_SETTLE: Duration = Duration::from_millis(100);
+
+fn codex_listener_survives_with(
+    processes: &Path,
+    pane: crate::model::TerminalId,
+    socket: &Path,
+    settle: Duration,
 ) -> Result<bool, String> {
     use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
     let marker = format!("cagents-codex-{pane}");
@@ -540,6 +553,36 @@ fn codex_listener_survives(
     let uid = unsafe { libc::geteuid() };
     let unavailable = |error: &std::io::Error| {
         error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+    };
+    // The arguments a process shows, or None once it has exited.
+    let arguments = |path: &Path| -> Result<Option<Vec<u8>>, String> {
+        let deadline = Instant::now() + settle;
+        loop {
+            let argv = match std::fs::read(path.join("cmdline")) {
+                Ok(argv) => argv,
+                Err(error) if unavailable(&error) => return Ok(None),
+                Err(error) => return Err(format!("Cannot inspect a process: {error}")),
+            };
+            if !argv.is_empty() {
+                return Ok(Some(argv));
+            }
+            let stat = match std::fs::read(path.join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if unavailable(&error) => return Ok(None),
+                Err(error) => return Err(format!("Cannot inspect a process: {error}")),
+            };
+            let state = stat
+                .iter()
+                .rposition(|byte| *byte == b')')
+                .and_then(|close| stat.get(close + 2));
+            if matches!(state, Some(b'Z' | b'X')) {
+                return Ok(None);
+            }
+            if Instant::now() >= deadline {
+                return Err("A process has not published its arguments yet".into());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     };
     let entries = std::fs::read_dir(processes)
         .map_err(|error| format!("Cannot enumerate processes: {error}"))?;
@@ -559,27 +602,9 @@ fn codex_listener_survives(
             Err(error) if unavailable(&error) => continue,
             Err(error) => return Err(format!("Cannot inspect a process: {error}")),
         }
-        let argv = match std::fs::read(path.join("cmdline")) {
-            Ok(argv) => argv,
-            Err(error) if unavailable(&error) => continue,
-            Err(error) => return Err(format!("Cannot inspect a process: {error}")),
-        };
-        if argv.is_empty() {
-            let stat = match std::fs::read(path.join("stat")) {
-                Ok(stat) => stat,
-                Err(error) if unavailable(&error) => continue,
-                Err(error) => return Err(format!("Cannot inspect a process: {error}")),
-            };
-            let state = stat
-                .iter()
-                .rposition(|byte| *byte == b')')
-                .and_then(|close| stat.get(close + 2));
-            if matches!(state, Some(b'Z' | b'X')) {
-                continue;
-            }
-            return Err("A process has not published its arguments yet".into());
-        }
-        if argv.windows(marker.len()).any(|window| window == marker) {
+        if arguments(&path)?
+            .is_some_and(|argv| argv.windows(marker.len()).any(|window| window == marker))
+        {
             return Ok(true);
         }
     }
@@ -1201,6 +1226,37 @@ mod tests {
                 SavedExecution::Unproved
             );
         }
+    }
+
+    /// A process between `execve` and publishing its new arguments shows
+    /// none for a moment. Any process of this user starting while the update
+    /// inspects must not turn an ended Codex pane into an unproved one.
+    #[test]
+    fn processes_starting_during_inspection_do_not_unprove_an_ended_codex_pane() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let [card, _] = codex_cards(root.path());
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                }
+            })
+        };
+        let unproved = (0..300)
+            .filter(|_| {
+                evidence(holders.path(), Vec::new()).classify(&card) != SavedExecution::Ended
+            })
+            .count();
+        stop.store(true, Ordering::Relaxed);
+        churn.join().unwrap();
+        assert_eq!(
+            unproved, 0,
+            "an exec in progress is read again, not absence"
+        );
     }
 
     #[test]
