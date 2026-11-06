@@ -1328,6 +1328,8 @@ class MemoryAdmission(TwoSlots):
         result = self.build(1, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("waiting", result.stderr)
+        # It withdrew its request for the held slot; dash would report that.
+        self.assertNotIn("Terminated", result.stderr)
         cpus = os.cpu_count()
         self.assertEqual(int(result.stdout), max(4, min(8, cpus // 2)))
         # Released, the slot no longer prices its last holder.

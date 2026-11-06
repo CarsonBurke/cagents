@@ -438,8 +438,9 @@ acquire() {
         # The shared descriptor locks only once the queued request is granted:
         # the kernel never leaves slot 0 free while a request waits for it.
         if flock -n 6; then
+            # `2>/dev/null`: dash reports "Terminated" for a job it kills and then waits for.
             kill "$waiter" 2>/dev/null || :
-            wait "$waiter" || :
+            wait "$waiter" 2>/dev/null || :
             waiter=
             exec 9>&6 6>&-
             if fits 0; then
@@ -454,7 +455,7 @@ acquire() {
         fi
         # Queue again if the request itself was killed.
         if waiter_gone; then
-            wait "$waiter" || :
+            wait "$waiter" 2>/dev/null || :
             waiter=
             exec 6>&-
             continue
@@ -503,7 +504,7 @@ check_admission() {
 withdraw() {
     if [ -n "$waiter" ]; then
         kill "$waiter" 2>/dev/null || :
-        wait "$waiter" || :
+        wait "$waiter" 2>/dev/null || :
     fi
     exec 6>&-
     waiter=
