@@ -2837,6 +2837,10 @@ impl Worker {
             command.env_remove(name);
         }
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
+        match crate::instance::development_instance() {
+            Some(instance) => command.env(crate::instance::DEVELOPMENT_INSTANCE_ENV, instance),
+            None => command.env_remove(crate::instance::DEVELOPMENT_INSTANCE_ENV),
+        };
         // A cagents process started in this terminal must not take the
         // account selected for it for the system account.
         match crate::account::registry::selection_marker(|name| {
