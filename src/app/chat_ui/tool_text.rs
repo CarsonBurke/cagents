@@ -283,9 +283,12 @@ impl Preview {
                 .sum::<usize>()
     }
 
+    /// `title` is what a plain tool call's row says it did, formed once with
+    /// the rest of its presentation; nothing here reads the call's input.
     pub(super) fn update(
         previous: Option<Self>,
         content: &ItemContent,
+        title: Option<&super::tool_title::Title>,
         theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
         let (source, language, output) = match content {
@@ -314,20 +317,10 @@ impl Preview {
             // Unknown tools can carry prompts, entire documents, and protocol
             // framing. Their raw arguments and successful output belong to
             // the explicit Input/Output disclosure, not the closed row.
-            ItemContent::Tool {
-                name,
-                input,
-                output,
-                status,
-                ..
-            } => (
+            ItemContent::Tool { output, status, .. } => (
                 // A tool the row names by what it did already says what it
                 // acted on; any other keeps its input's short target here.
-                if super::tool_title::title(name, input, *status).names_target {
-                    Cow::Borrowed("")
-                } else {
-                    Cow::Owned(super::tool_title::target(input))
-                },
+                Cow::Borrowed(title.map_or("", |title| title.target.as_str())),
                 Language::Plain,
                 if matches!(
                     status,
@@ -682,6 +675,24 @@ impl ToolText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A preview as a cached row forms it, its title read once beside it.
+    fn preview_of(
+        previous: Option<Preview>,
+        content: &ItemContent,
+        theme: crate::settings::EditorSyntaxTheme,
+    ) -> Preview {
+        let title = match content {
+            ItemContent::Tool {
+                name,
+                input,
+                status,
+                ..
+            } => Some(super::super::tool_title::Title::of(name, input, *status)),
+            _ => None,
+        };
+        Preview::update(previous, content, title.as_ref(), theme)
+    }
 
     // Geometry fixtures explicitly finish the same preparation stage before
     // inspecting glyphs. Timed frame/native workloads never use this helper.
@@ -1315,7 +1326,7 @@ mod tests {
             ),
             (tool("{\"query\":\"x\"}"), "x", Language::Plain, ""),
         ] {
-            let preview = Preview::update(None, &content, theme);
+            let preview = preview_of(None, &content, theme);
             assert_eq!(
                 (
                     preview.text.as_str(),
@@ -1332,7 +1343,7 @@ mod tests {
             *output = "first\nlast\n".into();
         }
         // Successful generic output stays in the explicit disclosure.
-        let preview = Preview::update(None, &finished, theme);
+        let preview = preview_of(None, &finished, theme);
         assert_eq!(
             (
                 preview.text.as_str(),
@@ -1342,9 +1353,9 @@ mod tests {
             ("x", Language::Plain, "")
         );
         // New output moves the tail and leaves the highlighted command alone.
-        let before = Preview::update(None, &command("", "cargo test", Run, "one\n"), theme);
+        let before = preview_of(None, &command("", "cargo test", Run, "one\n"), theme);
         let spans = before.spans[1].clone();
-        let after = Preview::update(
+        let after = preview_of(
             Some(before),
             &command("", "cargo test", Run, "one\ntwo\n"),
             theme,
@@ -1372,7 +1383,7 @@ mod tests {
             duration_ms: None,
             output: output.into(),
         };
-        let tail = |content: &ItemContent| Preview::update(None, content, theme).tail;
+        let tail = |content: &ItemContent| preview_of(None, content, theme).tail;
         use chat::ToolStatus::{Failed, Running, Succeeded};
         assert_eq!(
             tail(&ran(Failed, Some(101), cargo)),
@@ -1505,7 +1516,7 @@ mod tests {
                 *current = status;
                 *body = output.into();
             }
-            let preview = Preview::update(None, &content, theme);
+            let preview = preview_of(None, &content, theme);
             assert_eq!(preview.text, "src/app.rs");
             assert!(preview.tail.is_empty());
             let closed = CachedItem::updated(&content, theme, None, false, false, None);
@@ -1524,7 +1535,7 @@ mod tests {
         }
         // An incomplete JSON prefix never flashes its prompt onto the row.
         let prefix = tool(r#"{"prompt":"Internal framing"#);
-        assert_eq!(Preview::update(None, &prefix, theme).text, "");
+        assert_eq!(preview_of(None, &prefix, theme).text, "");
         // Unknown fields and multiline values stay in the disclosure, and the
         // row says nothing in their place rather than describing them.
         for (input, expected) in [
@@ -1535,14 +1546,15 @@ mod tests {
                 "writing-copy",
             ),
         ] {
-            assert_eq!(Preview::update(None, &tool(input), theme).text, expected);
+            assert_eq!(preview_of(None, &tool(input), theme).text, expected);
         }
     }
 
-    /// A row's trailing word is for a step still running or one that did not
-    /// do what it was asked; a step that worked says nothing there, since its
-    /// group's mark already says so. A command that ended without an exit
-    /// code to show it failed still says how it ended beside its duration.
+    /// A row's trailing word is for a step that did not do what it was asked;
+    /// a step that worked says nothing there, since its group's mark already
+    /// says so, and one still running says so in its verb. A command that
+    /// ended without an exit code to show it failed still says how it ended
+    /// beside its duration.
     #[test]
     fn only_an_unsettled_step_names_its_status() {
         let theme = crate::settings::EditorSyntaxTheme::Auto;
@@ -1556,7 +1568,7 @@ mod tests {
         if let ItemContent::Tool { status, .. } = &mut done {
             *status = chat::ToolStatus::Running;
         }
-        assert_eq!(detail(&done).as_deref(), Some("Running"));
+        assert_eq!(detail(&done), None);
         let ran = |status, exit_code, duration_ms| {
             let mut content = command("", "cargo test", chat::CommandAction::Run, "");
             if let ItemContent::Command {
@@ -1572,7 +1584,9 @@ mod tests {
             }
             detail(&content)
         };
-        use chat::ToolStatus::{Denied, Failed, Stopped, Succeeded};
+        use chat::ToolStatus::{Denied, Failed, Running, Stopped, Succeeded};
+        // A running command shows how long it has run, beside "Running".
+        assert_eq!(ran(Running, None, Some(3_000)).as_deref(), Some("3.0s"));
         assert_eq!(ran(Succeeded, Some(0), None), None);
         assert_eq!(
             ran(Succeeded, Some(0), Some(1_200)).as_deref(),
@@ -1602,7 +1616,7 @@ mod tests {
                 output: "Attempted read\nPermission denied\n".into(),
                 status,
             };
-            let preview = Preview::update(None, &content, crate::settings::EditorSyntaxTheme::Auto);
+            let preview = preview_of(None, &content, crate::settings::EditorSyntaxTheme::Auto);
             assert_eq!(preview.text, "src/app.rs");
             assert_eq!(preview.tail, "Permission denied");
         }
@@ -1671,7 +1685,7 @@ mod tests {
             duration_ms: None,
             output: String::new(),
         };
-        let preview = Preview::update(None, &content, crate::settings::EditorSyntaxTheme::Auto);
+        let preview = preview_of(None, &content, crate::settings::EditorSyntaxTheme::Auto);
         assert_eq!(preview.text.as_str(), "cat > tests.rs <<'EOF'");
         assert_eq!(
             copy_text(CopyPart::Input, &content).as_deref(),
@@ -1704,7 +1718,7 @@ mod tests {
         let block = ToolText::update(None, &large, Language::Json);
         assert_eq!(block.language, Language::Plain);
         assert_eq!(block.text.as_ref(), large);
-        let preview = Preview::update(
+        let preview = preview_of(
             None,
             &tool(&large),
             crate::settings::EditorSyntaxTheme::Auto,
@@ -1714,7 +1728,7 @@ mod tests {
         // still bounded before inspecting any of those bytes.
         let whitespace = " ".repeat(CachedItem::HIGHLIGHT_LIMIT + 1);
         assert_eq!(
-            Preview::update(
+            preview_of(
                 None,
                 &tool(&whitespace),
                 crate::settings::EditorSyntaxTheme::Auto
@@ -1723,7 +1737,7 @@ mod tests {
             ""
         );
         assert!(
-            Preview::update(
+            preview_of(
                 None,
                 &tool(" \n\t"),
                 crate::settings::EditorSyntaxTheme::Auto
@@ -1735,7 +1749,7 @@ mod tests {
 
     #[test]
     fn shell_preview_has_syntax_in_both_palettes_and_rethemes() {
-        let mut preview = Preview::update(
+        let mut preview = preview_of(
             None,
             &command("", "cargo test --locked", chat::CommandAction::Run, ""),
             crate::settings::EditorSyntaxTheme::InspiredGitHub,
@@ -1766,7 +1780,7 @@ mod tests {
             "longword".repeat(100),
             "one two three four five six seven eight nine ten".into(),
         ] {
-            let preview = Preview::update(
+            let preview = preview_of(
                 None,
                 &command("", &text, chat::CommandAction::Run, ""),
                 crate::settings::EditorSyntaxTheme::Auto,
@@ -1785,7 +1799,7 @@ mod tests {
                 node.size()
             );
         }
-        let preview = Preview::update(
+        let preview = preview_of(
             None,
             &command("", "short", chat::CommandAction::Run, ""),
             crate::settings::EditorSyntaxTheme::Auto,

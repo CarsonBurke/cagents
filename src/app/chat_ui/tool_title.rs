@@ -14,22 +14,50 @@ use std::borrow::Cow;
 use crate::chat::ToolStatus;
 
 /// Inputs above this are not read to title a row. The fields a title reads
-/// are named members of the input, read once per change to the call and
-/// without keeping the rest, so the limit only stops a pathological input:
-/// a file being written is well within it and keeps its path.
+/// are named members of the input, read once per change to the call (the
+/// title is kept with the row's presentation, never formed while drawing)
+/// and without keeping the rest, so the limit only stops a pathological
+/// input: a file being written is well within it and keeps its path.
 const TITLE_INPUT_LIMIT: usize = 8 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has read a call's input for its title.
+    pub(super) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The longest value a row shows as what a call acted on.
 const TARGET_LIMIT: usize = 120;
 
-/// A row's verb and what follows it.
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct Title<'a> {
+/// A row's verb and what follows it, formed once each time the call changes
+/// and kept with the row, so drawing and regrouping never read the input.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct Title {
     pub(super) verb: &'static str,
-    pub(super) label: Cow<'a, str>,
-    /// Whether the label already says what the call acted on, so a preview
-    /// of the input's target would repeat it.
-    pub(super) names_target: bool,
+    pub(super) label: String,
+    /// The short target an unfamiliar tool's input names, shown under its
+    /// name. Empty when the label already says what the call acted on.
+    pub(super) target: String,
+}
+
+impl Title {
+    /// A call's row as its name alone, for a call whose input has not been
+    /// read: nothing here parses it.
+    pub(super) fn unread(name: &str) -> Self {
+        Self {
+            label: readable(name),
+            ..Self::default()
+        }
+    }
+
+    /// The verb and label as one line, as a group's summary says it.
+    pub(super) fn line(&self) -> String {
+        match (self.verb.is_empty(), self.label.is_empty()) {
+            (true, _) => self.label.clone(),
+            (false, true) => self.verb.to_owned(),
+            (false, false) => format!("{} {}", self.verb, self.label),
+        }
+    }
 }
 
 /// The members of a tool's input that a row can be titled from. Anything
@@ -76,9 +104,12 @@ struct Question<'a> {
     question: Option<Cow<'a, str>>,
 }
 
-/// The input's named members, when it is an object of a size worth reading.
+/// The input's named members, when it is a whole object of a size worth
+/// reading. An input still streaming is an unclosed prefix, which is not
+/// scanned only to fail at its end.
 fn fields(input: &str) -> Option<Fields<'_>> {
-    if input.len() > TITLE_INPUT_LIMIT || !input.trim_start().starts_with('{') {
+    let input = input.trim();
+    if input.len() > TITLE_INPUT_LIMIT || !input.starts_with('{') || !input.ends_with('}') {
         return None;
     }
     serde_json::from_str(input).ok()
@@ -103,18 +134,23 @@ fn headline(value: &str) -> String {
     shown
 }
 
-/// Integrations whose names are not written the way their identifiers are.
-const INTEGRATION_NAMES: &[(&str, &str)] = &[
+/// Words in integration names that are not written the way their
+/// identifiers are.
+const INTEGRATION_WORDS: &[(&str, &str)] = &[
     ("github", "GitHub"),
     ("gitlab", "GitLab"),
     ("openai", "OpenAI"),
     ("hubspot", "HubSpot"),
     ("youtube", "YouTube"),
     ("posthog", "PostHog"),
+    ("devtools", "DevTools"),
+    ("api", "API"),
 ];
 
 /// `mcp__linear__get_issue` and Codex's `linear / get_issue` as a reader
-/// would say them: "Linear: get issue".
+/// would say them: "Linear: get issue". An integration's name is a proper
+/// name, so each of its words is capitalised; the action keeps its words
+/// as they are.
 fn integration(name: &str) -> Option<String> {
     let (server, tool) = name
         .strip_prefix("mcp__")
@@ -122,22 +158,57 @@ fn integration(name: &str) -> Option<String> {
         .or_else(|| name.split_once(" / "))?;
     // Claude names a claude.ai connector by its account scope first.
     let server = server.strip_prefix("claude_ai_").unwrap_or(server);
-    let words = |text: &str| text.replace(['_', '-'], " ").trim().to_owned();
-    let mut server = words(server);
-    if let Some((_, written)) = INTEGRATION_NAMES
-        .iter()
-        .find(|(id, _)| server.eq_ignore_ascii_case(id))
-    {
-        server = (*written).to_owned();
-    } else if let Some(first) = server.get(..1) {
-        let upper = first.to_uppercase();
-        server.replace_range(..1, &upper);
-    }
-    let tool = words(tool);
-    Some(match (server.is_empty(), tool.is_empty()) {
-        (false, false) => format!("{server}: {tool}"),
-        (true, _) => tool,
+    let words = |text: &str| -> Vec<String> {
+        text.split(['_', '-', ' '])
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let server = words(server)
+        .into_iter()
+        .map(|word| {
+            if let Some((_, written)) = INTEGRATION_WORDS
+                .iter()
+                .find(|(id, _)| word.eq_ignore_ascii_case(id))
+            {
+                (*written).to_owned()
+            } else if word.chars().all(|c| !c.is_uppercase()) {
+                let mut chars = word.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().chain(chars).collect())
+                    .unwrap_or_default()
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let tool = words(tool).join(" ");
+    Some(match (server.as_str(), tool.is_empty()) {
+        // Codex's app connectors without an app named: the namespace is
+        // an implementation name, and the action already says the app.
+        ("Codex Apps" | "", _) => {
+            let mut chars = tool.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        }
         (_, true) => server,
+        (_, false) => format!("{server}: {tool}"),
+    })
+}
+
+/// A tool's name as a reader would say it: an integration's as "Linear:
+/// get issue", an identifier's (`apply_patch`) with its words spaced.
+fn readable(name: &str) -> String {
+    integration(name).unwrap_or_else(|| {
+        if name.contains(char::is_whitespace) {
+            name.to_owned()
+        } else {
+            name.replace('_', " ")
+        }
     })
 }
 
@@ -155,15 +226,15 @@ fn plan_progress(todos: &[Todo]) -> String {
 
 /// What a call does, said as it stands: under way, done, or tried and not
 /// done. A call that failed, was refused or was stopped says what it tried,
-/// and its status glyph says what became of it.
-struct Verb {
+/// and its status says what became of it.
+pub(super) struct Verb {
     doing: &'static str,
     done: &'static str,
     tried: &'static str,
 }
 
 impl Verb {
-    fn said(&self, status: ToolStatus) -> &'static str {
+    pub(super) fn said(&self, status: ToolStatus) -> &'static str {
         match status {
             ToolStatus::Running => self.doing,
             ToolStatus::Succeeded => self.done,
@@ -172,209 +243,245 @@ impl Verb {
     }
 }
 
-const fn verb(doing: &'static str, done: &'static str, tried: &'static str) -> Verb {
+pub(super) const fn verb(doing: &'static str, done: &'static str, tried: &'static str) -> Verb {
     Verb { doing, done, tried }
 }
 
-/// The row a plain tool call is shown as.
-pub(super) fn title<'a>(name: &'a str, input: &'a str, status: ToolStatus) -> Title<'a> {
-    let fields = fields(input).unwrap_or_default();
-    let owned = |value: &Option<Cow<'_, str>>| {
-        value
-            .as_deref()
-            .and_then(short)
-            .map(|value| Cow::Owned(value.to_owned()))
-    };
-    let named = |verb: Verb, label: Option<Cow<'a, str>>| Title {
-        verb: verb.said(status),
-        label: label.unwrap_or_default(),
-        names_target: true,
-    };
-    match name {
-        "Skill" => named(
-            verb("Using skill", "Used skill", "Tried to use skill"),
-            owned(&fields.skill),
-        ),
-        "WebFetch" => named(
-            verb("Fetching", "Fetched", "Tried to fetch"),
-            owned(&fields.url),
-        ),
-        "WebSearch" | "web_search" => named(
-            verb(
-                "Searching the web for",
-                "Searched the web for",
-                "Tried to search the web for",
+/// What a monitor watches. Its description usually names it ("PR 12 CI
+/// checks"); one written as an instruction ("Watch the log") loses the
+/// verb the row already says.
+fn watched(description: &str) -> &str {
+    for lead in ["watching ", "watch ", "monitoring ", "monitor "] {
+        if description
+            .get(..lead.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(lead))
+        {
+            return description[lead.len()..].trim_start();
+        }
+    }
+    description
+}
+
+/// A tool search's query without its operators: `+slack send` requires
+/// "slack" in a tool's name, which a reader reads as "slack send".
+fn search_words(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|word| word.trim_start_matches('+'))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+impl Title {
+    /// The row a plain tool call is shown as, read from its input. This
+    /// parses the input, so it is formed once when the call changes.
+    pub(super) fn of(name: &str, input: &str, status: ToolStatus) -> Self {
+        #[cfg(test)]
+        READS.with(|reads| reads.set(reads.get() + 1));
+        let fields = fields(input).unwrap_or_default();
+        let owned =
+            |value: &Option<Cow<'_, str>>| value.as_deref().and_then(short).map(str::to_owned);
+        let named = |verb: Verb, label: Option<String>| Title {
+            verb: verb.said(status),
+            label: label.unwrap_or_default(),
+            target: String::new(),
+        };
+        match name {
+            "Skill" => named(
+                verb("Using skill", "Used skill", "Tried to use skill"),
+                owned(&fields.skill),
             ),
-            owned(&fields.query),
-        ),
-        // `select:Read,Edit` loads the tools it names rather than searching.
-        "ToolSearch" => match fields.query.as_deref().map(str::trim) {
-            Some(query) if query.starts_with("select:") => named(
-                verb("Loading tools", "Loaded tools", "Tried to load tools"),
-                short(&query["select:".len()..].replace(',', ", "))
-                    .map(|names| Cow::Owned(names.to_owned())),
+            "WebFetch" => named(
+                verb("Fetching", "Fetched", "Tried to fetch"),
+                owned(&fields.url),
             ),
-            _ => match owned(&fields.query) {
-                Some(query) => named(
-                    verb(
-                        "Looking up tools for",
-                        "Looked up tools for",
-                        "Tried to look up tools for",
-                    ),
-                    Some(query),
+            "WebSearch" | "web_search" => named(
+                verb(
+                    "Searching the web for",
+                    "Searched the web for",
+                    "Tried to search the web for",
                 ),
-                None => named(
-                    verb(
-                        "Looking up tools",
-                        "Looked up tools",
-                        "Tried to look up tools",
+                owned(&fields.query),
+            ),
+            // `select:Read,Edit` loads the tools it names rather than
+            // searching, and names them as the tools' own identifiers.
+            "ToolSearch" => match fields.query.as_deref().map(str::trim) {
+                Some(query) if query.starts_with("select:") => {
+                    let names: Vec<String> = query["select:".len()..]
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(|name| integration(name).unwrap_or_else(|| name.to_owned()))
+                        .collect();
+                    named(
+                        if names.len() == 1 {
+                            verb("Loading tool", "Loaded tool", "Tried to load tool")
+                        } else {
+                            verb("Loading tools", "Loaded tools", "Tried to load tools")
+                        },
+                        short(&names.join(", ")).map(str::to_owned),
+                    )
+                }
+                query => match query.map(search_words).as_deref().and_then(short) {
+                    Some(words) => named(
+                        verb(
+                            "Looking up tools for",
+                            "Looked up tools for",
+                            "Tried to look up tools for",
+                        ),
+                        Some(words.to_owned()),
                     ),
-                    None,
+                    None => named(
+                        verb(
+                            "Looking up tools",
+                            "Looked up tools",
+                            "Tried to look up tools",
+                        ),
+                        None,
+                    ),
+                },
+            },
+            "TodoWrite" => named(
+                verb(
+                    "Updating the plan",
+                    "Updated the plan",
+                    "Tried to update the plan",
                 ),
-            },
-        },
-        "TodoWrite" => named(
-            verb(
-                "Updating the plan",
-                "Updated the plan",
-                "Tried to update the plan",
+                fields.todos.as_deref().map(plan_progress),
             ),
-            fields.todos.as_deref().map(plan_progress).map(Cow::Owned),
-        ),
-        "TaskCreate" => named(
-            verb("Adding a task", "Added a task", "Tried to add a task"),
-            owned(&fields.subject),
-        ),
-        "TaskUpdate" => named(
-            verb(
-                "Updating a task",
-                "Updated a task",
-                "Tried to update a task",
+            "TaskCreate" => named(
+                verb("Adding a task", "Added a task", "Tried to add a task"),
+                owned(&fields.subject),
             ),
-            owned(&fields.subject),
-        ),
-        "TaskList" => named(
-            verb("Listing tasks", "Listed tasks", "Tried to list tasks"),
-            None,
-        ),
-        "TaskGet" => named(
-            verb("Reading a task", "Read a task", "Tried to read a task"),
-            None,
-        ),
-        "NotebookEdit" => named(
-            verb("Editing", "Edited", "Tried to edit"),
-            owned(&fields.notebook_path),
-        ),
-        "Edit" | "MultiEdit" => named(
-            verb("Editing", "Edited", "Tried to edit"),
-            owned(&fields.file_path),
-        ),
-        "Write" => named(
-            verb("Writing", "Wrote", "Tried to write"),
-            owned(&fields.file_path),
-        ),
-        "Read" => named(
-            verb("Reading", "Read", "Tried to read"),
-            owned(&fields.file_path),
-        ),
-        "BashOutput" | "TaskOutput" => named(
-            verb(
-                "Checking a background task",
-                "Checked a background task",
-                "Tried to check a background task",
+            "TaskUpdate" => named(
+                verb(
+                    "Updating a task",
+                    "Updated a task",
+                    "Tried to update a task",
+                ),
+                owned(&fields.subject),
             ),
-            None,
-        ),
-        "KillShell" | "KillBash" | "TaskStop" => named(
-            verb(
-                "Stopping a background task",
-                "Stopped a background task",
-                "Tried to stop a background task",
+            "TaskList" => named(
+                verb("Listing tasks", "Listed tasks", "Tried to list tasks"),
+                None,
             ),
-            None,
-        ),
-        // A monitor's description already says what it watches, in the
-        // imperative ("Watch the build log"), so it stands alone; a bare
-        // command is introduced by the verb.
-        "Monitor" => match owned(&fields.description) {
-            Some(description) => Title {
-                verb: "",
-                label: description,
-                names_target: true,
-            },
-            None => named(
+            "TaskGet" => named(
+                verb("Reading a task", "Read a task", "Tried to read a task"),
+                None,
+            ),
+            "NotebookEdit" => named(
+                verb("Editing", "Edited", "Tried to edit"),
+                owned(&fields.notebook_path),
+            ),
+            "Edit" | "MultiEdit" => named(
+                verb("Editing", "Edited", "Tried to edit"),
+                owned(&fields.file_path),
+            ),
+            "Write" => named(
+                verb("Writing", "Wrote", "Tried to write"),
+                owned(&fields.file_path),
+            ),
+            "Read" => named(
+                verb("Reading", "Read", "Tried to read"),
+                owned(&fields.file_path),
+            ),
+            "Grep" => named(
+                verb("Searching for", "Searched for", "Tried to search for"),
+                owned(&fields.pattern),
+            ),
+            "Glob" => named(
+                verb("Listing", "Listed", "Tried to list"),
+                owned(&fields.pattern),
+            ),
+            "Bash" => named(
+                verb("Running", "Ran", "Tried to run"),
+                fields.command.as_deref().map(headline),
+            ),
+            "BashOutput" | "TaskOutput" => named(
+                verb(
+                    "Checking a background task",
+                    "Checked a background task",
+                    "Tried to check a background task",
+                ),
+                None,
+            ),
+            "KillShell" | "KillBash" | "TaskStop" => named(
+                verb(
+                    "Stopping a background task",
+                    "Stopped a background task",
+                    "Tried to stop a background task",
+                ),
+                None,
+            ),
+            "Monitor" => named(
                 verb("Watching", "Watched", "Tried to watch"),
                 fields
-                    .command
+                    .description
                     .as_deref()
-                    .map(|command| Cow::Owned(headline(command))),
+                    .and_then(short)
+                    .map(|description| watched(description).to_owned())
+                    .or_else(|| fields.command.as_deref().map(headline)),
             ),
-        },
-        "AskUserQuestion" => named(
-            verb("Asking", "Asked", "Tried to ask"),
-            fields
-                .questions
-                .as_ref()
-                .and_then(|questions| questions.first()?.question.as_deref())
-                .map(|question| Cow::Owned(headline(question))),
-        ),
-        "ExitPlanMode" => named(
-            verb(
-                "Proposing a plan",
-                "Proposed a plan",
-                "Tried to propose a plan",
+            "AskUserQuestion" => named(
+                verb("Asking", "Asked", "Tried to ask"),
+                fields
+                    .questions
+                    .as_ref()
+                    .and_then(|questions| questions.first()?.question.as_deref())
+                    .map(headline),
             ),
-            None,
-        ),
-        "EnterPlanMode" => named(
-            verb(
-                "Entering plan mode",
-                "Entered plan mode",
-                "Tried to enter plan mode",
+            "ExitPlanMode" => named(
+                verb(
+                    "Proposing a plan",
+                    "Proposed a plan",
+                    "Tried to propose a plan",
+                ),
+                None,
             ),
-            None,
-        ),
-        "SendMessage" => named(
-            verb("Messaging", "Messaged", "Tried to message"),
-            owned(&fields.to),
-        ),
-        "Agent" | "Task" => named(
-            verb(
-                "Starting a subagent",
-                "Started a subagent",
-                "Tried to start a subagent",
+            "EnterPlanMode" => named(
+                verb(
+                    "Entering plan mode",
+                    "Entered plan mode",
+                    "Tried to enter plan mode",
+                ),
+                None,
             ),
-            owned(&fields.description),
-        ),
-        // Claude's lifecycle row for a task it reported before its call: its
-        // input is the task's own description, in plain words. A subagent
-        // that failed or was stopped still ran; its glyph says how it ended.
-        "Subagent task" => named(
-            verb("Running a subagent", "Ran a subagent", "Ran a subagent"),
-            (!input.trim().is_empty()).then(|| Cow::Owned(headline(input))),
-        ),
-        _ => match integration(name) {
-            Some(label) => Title {
+            "SendMessage" => named(
+                verb("Messaging", "Messaged", "Tried to message"),
+                owned(&fields.to),
+            ),
+            "Agent" | "Task" => named(
+                verb(
+                    "Starting a subagent",
+                    "Started a subagent",
+                    "Tried to start a subagent",
+                ),
+                owned(&fields.description),
+            ),
+            // Claude's lifecycle row for a task it reported before its call:
+            // its input is the task's own description, in plain words. A
+            // subagent that failed or was stopped still ran; the row's status
+            // says how it ended.
+            "Subagent task" => named(
+                verb("Running a subagent", "Ran a subagent", "Ran a subagent"),
+                (!input.trim().is_empty()).then(|| headline(input)),
+            ),
+            // Any other tool is named, made readable, and its preview offers
+            // the one short target its input names.
+            _ => Title {
                 verb: verb("Using", "Used", "Tried to use").said(status),
-                label: Cow::Owned(label),
-                names_target: false,
+                label: readable(name),
+                target: target(&fields),
             },
-            None => Title {
-                verb: "",
-                label: Cow::Borrowed(name),
-                names_target: false,
-            },
-        },
+        }
     }
 }
 
 /// The short target an unfamiliar tool's input names, shown under its name.
 /// A tool's arguments are not evidence of what it does, so only a field that
 /// names a target is shown; anything else stays in the call's detail.
-pub(super) fn target(input: &str) -> String {
-    let Some(fields) = fields(input) else {
-        return String::new();
-    };
+fn target(fields: &Fields<'_>) -> String {
     [
         &fields.file_path,
         &fields.path,
@@ -396,13 +503,7 @@ mod tests {
     use serde_json::json;
 
     fn row(name: &str, input: serde_json::Value, status: ToolStatus) -> String {
-        let input = input.to_string();
-        let title = title(name, &input, status);
-        [title.verb, title.label.as_ref()]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ")
+        Title::of(name, &input.to_string(), status).line()
     }
 
     /// Each documented tool's row says what was done, never "Called" and
@@ -464,7 +565,42 @@ mod tests {
             (
                 "Monitor",
                 json!({"command":"tail -f log\n| grep x","description":"Watch the log"}),
-                "Watch the log",
+                "Watched the log",
+            ),
+            (
+                "Monitor",
+                json!({"command":"gh pr checks 12","description":"PR 12 CI checks"}),
+                "Watched PR 12 CI checks",
+            ),
+            (
+                "ToolSearch",
+                json!({"query":"select:NotebookEdit"}),
+                "Loaded tool NotebookEdit",
+            ),
+            (
+                "ToolSearch",
+                json!({"query":"select:mcp__claude_ai_Linear__save_issue"}),
+                "Loaded tool Linear: save issue",
+            ),
+            (
+                "ToolSearch",
+                json!({"query":"+slack send"}),
+                "Looked up tools for slack send",
+            ),
+            (
+                "mcp__chrome-devtools__take_screenshot",
+                json!({}),
+                "Used Chrome DevTools: take screenshot",
+            ),
+            (
+                "mcp__sequential_thinking__think",
+                json!({}),
+                "Used Sequential Thinking: think",
+            ),
+            (
+                "codex_apps / linear_get_issue",
+                json!({}),
+                "Used Linear get issue",
             ),
             (
                 "Monitor",
@@ -506,7 +642,8 @@ mod tests {
                 json!(null),
                 "Used Linear: list issues",
             ),
-            ("fixture", json!({}), "fixture"),
+            ("fixture", json!({}), "Used fixture"),
+            ("apply_patch", json!({}), "Used apply patch"),
         ] {
             let shown = row(name, input, done);
             assert_eq!(shown, expected, "{name}");
@@ -539,18 +676,21 @@ mod tests {
     /// text, which is what the row names.
     #[test]
     fn a_reported_subagent_task_is_named_by_its_description() {
-        let titled = |status| {
-            let title = title("Subagent task", "Survey the tool rows\nand report", status);
-            format!("{} {}", title.verb, title.label)
-        };
+        let titled =
+            |status| Title::of("Subagent task", "Survey the tool rows\nand report", status).line();
         assert_eq!(
             titled(ToolStatus::Running),
             "Running a subagent Survey the tool rows"
         );
-        assert_eq!(
-            titled(ToolStatus::Succeeded),
-            "Ran a subagent Survey the tool rows"
-        );
+        // A subagent that failed or was stopped did run; the row's status
+        // word says how it ended, so the verb does not claim it only tried.
+        for status in [
+            ToolStatus::Succeeded,
+            ToolStatus::Failed,
+            ToolStatus::Stopped,
+        ] {
+            assert_eq!(titled(status), "Ran a subagent Survey the tool rows");
+        }
     }
 
     /// A call still under way says so; it does not claim to be done.
@@ -632,7 +772,27 @@ mod tests {
             (r#"{"prompt":"Internal framing"#.to_owned(), ""),
             ("plain prose".to_owned(), ""),
         ] {
-            assert_eq!(target(&input), expected, "{input}");
+            let title = Title::of("fixture", &input, ToolStatus::Succeeded);
+            assert_eq!(title.target, expected, "{input}");
         }
+        // A tool the row names by what it did previews nothing more.
+        let skill = Title::of(
+            "Skill",
+            r#"{"skill":"writing-copy"}"#,
+            ToolStatus::Succeeded,
+        );
+        assert_eq!(skill.target, "");
+    }
+
+    /// A call whose input is still streaming is not scanned to its end
+    /// only to fail there: an unclosed prefix is not read at all.
+    #[test]
+    fn an_unclosed_input_is_not_read() {
+        let partial = format!(r#"{{"file_path":"a.md","content":"{}"#, "x".repeat(64));
+        assert!(fields(&partial).is_none());
+        assert_eq!(
+            Title::of("Write", &partial, ToolStatus::Running).line(),
+            "Writing"
+        );
     }
 }

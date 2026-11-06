@@ -10684,6 +10684,173 @@ mod tests {
         }
     }
 
+    /// A tool call's title is read from its input once, when the call
+    /// changes. Drawing its row, open or closed, and regrouping the
+    /// transcript read the kept title, so a large refused write costs
+    /// nothing per frame and still names its file.
+    #[test]
+    fn drawing_and_regrouping_a_tool_row_do_not_read_its_input_again() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+        let item = chat::Item {
+            id: "write".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Write".into(),
+                input: serde_json::json!({
+                    "content": "x".repeat(2 * 1024 * 1024),
+                    "file_path": "docs/large-report.md",
+                })
+                .to_string(),
+                output: "The user doesn't want to proceed with this tool use.".into(),
+                status: chat::ToolStatus::Denied,
+            },
+            started_at: None,
+            at: None,
+        };
+        let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        assert_eq!(
+            runtime.turns[0].summary,
+            "Tried to write docs/large-report.md · denied"
+        );
+        let reads = || crate::app::chat_ui::tool_title::READS.with(std::cell::Cell::get);
+        let before = reads();
+        let name = "Tried to write docs/large-report.md · Denied";
+        for open in [false, true, false] {
+            if open {
+                runtime.expanded.insert(item.id.clone());
+            } else {
+                runtime.expanded.remove(&item.id);
+            }
+            let mut element = runtime.step_header(&item, &runtime.cache[&item.id], open);
+            let renderer = crate::app::tests::headless_renderer();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 1000.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            assert!(
+                accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node.node().role() == Role::Button
+                        && node.node().label() == Some("Tried to write docs/large-report.md")),
+                "the row names the file it tried to write ({name})"
+            );
+        }
+        let turns = turn::group(
+            &runtime.snapshot.items,
+            &runtime.asked_after,
+            crate::app::chat_ui::Presentations(&runtime.cache),
+        );
+        assert_eq!(turns[0].summary, runtime.turns[0].summary);
+        // Opening the row forms its presentation again, from the same call.
+        let shown = runtime.snapshot.items[0].clone();
+        let previous = runtime.cache.remove(&item.id);
+        let reopened = CachedItem::updated(
+            &shown.content,
+            runtime.syntax_theme,
+            previous,
+            true,
+            false,
+            None,
+        );
+        assert_eq!(
+            reopened
+                .title_of(&shown)
+                .map(|title| title.line())
+                .as_deref(),
+            Some("Tried to write docs/large-report.md")
+        );
+        assert_eq!(
+            reads(),
+            before,
+            "the input was read again after it was titled"
+        );
+    }
+
+    /// A group of one long shell script keeps its strip on one line in a
+    /// narrow pane, and its duration stays in view rather than being pushed
+    /// past the edge by the wrapped command.
+    #[test]
+    fn a_one_command_strip_stays_on_one_line_with_its_duration_in_view() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let script = format!(
+            "cd ~/.local/share/cagents/accounts/claude/{}/projects/; f=transcript.jsonl; \
+             echo \"### USER PROMPTS\"; jq -r 'select(.type==\"user\") | .message' $f | head",
+            "0123456789abcdef".repeat(4)
+        );
+        let item = chat::Item {
+            id: "script".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: String::new(),
+                command: script,
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: Some(1_200),
+                output: String::new(),
+            },
+            started_at: Some(1_000),
+            at: Some(2_200),
+        };
+        let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        let turn = &runtime.turns[0];
+        assert!(turn.summary.starts_with("Ran cd ~/.local/share/cagents"));
+        let renderer = crate::app::tests::headless_renderer();
+        let one_line = {
+            let mut short = turn.clone();
+            short.summary = "Ran ls".into();
+            let mut element = runtime.step_strip(&short, Vec::new);
+            let mut tree = Tree::new(element.as_widget());
+            element
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 1000.0)),
+                )
+                .size()
+                .height
+        };
+        let mut element = runtime.step_strip(turn, Vec::new);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 1000.0)),
+        );
+        assert_eq!(
+            node.size().height,
+            one_line,
+            "the strip stays one line tall"
+        );
+        // The strip is a button around the row of its parts; the last of
+        // them is the duration.
+        let layout = Layout::new(&node);
+        let line = layout
+            .children()
+            .next()
+            .and_then(|button| button.children().next())
+            .expect("the strip's row");
+        let duration = line.children().last().unwrap().bounds();
+        assert!(duration.width > 0.0);
+        assert!(
+            duration.x + duration.width <= 320.0,
+            "the duration ends at {} in a 320 pane",
+            duration.x + duration.width
+        );
+    }
+
     #[test]
     fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
         use iced::advanced::{Layout, layout, widget::Tree};
