@@ -451,13 +451,19 @@ class ProcessCustodyExitTests(unittest.TestCase):
         with OwnedFamily(self, self.module) as family:
             owner, pid = family.owner, family.child_pid
             released = {**self.module.process_state(pid), "ppid": 0, "state": "X"}
-            owner.nodes.pop(pid)
+            os.close(owner.nodes.pop(pid)["pidfd"])
             with mock.patch.object(self.module, "process_state", return_value=released):
                 with self.assertRaisesRegex(RuntimeError, "Child provenance"):
                     owner.pin(pid, family.worker.pid)
                 with mock.patch.object(owner, "exited", return_value=True), \
                         self.assertRaises(ProcessLookupError):
                     owner.pin(pid, family.worker.pid)
+            # Or it has no entry left by the time the check has failed.
+            with mock.patch.object(self.module, "process_state",
+                                   side_effect=[released, FileNotFoundError(errno.ENOENT, "Released")]), \
+                    mock.patch.object(owner, "exited", return_value=True), \
+                    self.assertRaises(ProcessLookupError):
+                owner.pin(pid, family.worker.pid)
             # A zombie stays readable: its failed check still counts.
             zombie = {**released, "ppid": owner.pid, "state": "Z", "uid": owner.uid + 1}
             with mock.patch.object(self.module, "process_state", return_value=zombie), \
@@ -477,7 +483,7 @@ class ProcessCustodyExitTests(unittest.TestCase):
             self.addCleanup(child.kill)
             comm = Path("/proc") / str(child.pid) / "comm"
             deadline = time.monotonic() + HANDSHAKE_SECONDS
-            while comm.read_bytes() == b"" or not comm.read_bytes().startswith(b"\xc3"):
+            while not comm.read_bytes().startswith(b"\xc3"):
                 self.assertLess(time.monotonic(), deadline, "The child did not exec")
                 time.sleep(0.01)
             self.assertEqual(self.module.process_state(child.pid)["ppid"], os.getpid())
