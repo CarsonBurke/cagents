@@ -227,6 +227,20 @@ impl Launch {
         }
         Some(recipe)
     }
+
+    /// Whether `recipe` is a terminal this conversation may hand off to: its
+    /// exact resume, either as launched or under one valid permission mode. The
+    /// mode comes from the live session, which storage does not hold, so this
+    /// cannot prove which mode was confirmed; it proves the recipe differs from
+    /// the resume by nothing else.
+    pub(crate) fn resumes_in_terminal(&self, recipe: &LaunchRecipe) -> bool {
+        let mode = match recipe.arguments.as_slice() {
+            [.., flag, mode] if flag == "--permission-mode" => Some(mode.as_str()),
+            _ => None,
+        };
+        self.terminal_recipe_with_permission_mode(mode).as_ref() == Some(recipe)
+    }
+
     /// Return to the CLI using the current provider-confirmed identity, not a
     /// stale ID from the original argv before a native /clear or session switch.
     pub fn terminal_recipe(&self) -> Option<LaunchRecipe> {
