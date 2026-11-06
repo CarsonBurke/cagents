@@ -7,19 +7,25 @@ use crate::agent_execution::{
 #[derive(Debug, clap::Args)]
 pub struct SessionsArgs {
     /// List sessions in every project, not just the current one.
-    #[arg(long, conflicts_with = "project")]
+    #[arg(long, conflicts_with_all = ["project", "channel"])]
     all: bool,
     /// List sessions in the open project with this name, or containing
     /// this path.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "channel")]
     project: Option<PathBuf>,
+    /// List the sessions in this channel, or in yours when no UUID is given,
+    /// with how recently each was active. Includes chats whose provider exited.
+    #[arg(long, value_name = "CHANNEL", num_args = 0..=1, default_missing_value = "")]
+    channel: Option<String>,
 }
 
-/// Who is calling, and which other sessions share its project.
+/// Who is calling, and which other sessions share its channel or checkout.
 pub(super) fn whoami() -> Result<CommandOutput, AppError> {
     let directory = read(Scope::Containing(current_directory()?))?;
+    let channel = directory.caller.as_ref().and_then(|me| me.channel);
+    let now = now_ms();
     let mut human = match &directory.caller {
-        Some(me) => list_human(std::iter::once(me)),
+        Some(me) => list_human(std::iter::once(me), channel, now),
         None => "Not running inside a cagents session".to_owned(),
     };
     let peers: Vec<_> = directory
@@ -28,12 +34,18 @@ pub(super) fn whoami() -> Result<CommandOutput, AppError> {
         .filter(|entry| {
             directory.caller.is_none()
                 || entry.relation != Relation::Peer
+                || channel.is_some() && entry.channel == channel
                 || shares_checkout(&directory, entry)
         })
         .collect();
     if !peers.is_empty() {
         human.push_str("\n\nRelated sessions:\n");
-        human.push_str(&list_human(peers.iter().copied()));
+        human.push_str(&list_human(peers.iter().copied(), channel, now));
+    }
+    if channel.is_some() {
+        human.push_str(
+            "\n\n`cagents ls --channel` lists your channel, including ended sessions; `cagents transcript SESSION` reads one.",
+        );
     }
     Ok(CommandOutput {
         command: "whoami",
@@ -43,20 +55,38 @@ pub(super) fn whoami() -> Result<CommandOutput, AppError> {
 }
 
 pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
-    let scope = if arguments.all {
-        Scope::All
-    } else if let Some(project) = arguments.project {
-        Scope::Project(super::project_argument(project)?)
-    } else {
-        Scope::Containing(current_directory()?)
-    };
+    let scope =
+        if arguments.all {
+            Scope::All
+        } else if let Some(channel) = arguments.channel {
+            Scope::Channel(if channel.is_empty() {
+                None
+            } else {
+                Some(channel.parse().map_err(|_| {
+                    AppError::new("target", format!("{channel} is not a channel UUID"))
+                })?)
+            })
+        } else if let Some(project) = arguments.project {
+            Scope::Project(super::project_argument(project)?)
+        } else {
+            Scope::Containing(current_directory()?)
+        };
     let directory = read(scope)?;
-    let mut human = list_human(directory.caller.iter().chain(directory.sessions.iter()));
-    if let Scope::Project(project) = &directory.scope {
-        human.push_str(&format!(
-            "\n(project {}; --all for every project)",
+    let channel = directory.caller.as_ref().and_then(|me| me.channel);
+    let mut human = list_human(
+        directory.caller.iter().chain(directory.sessions.iter()),
+        channel,
+        now_ms(),
+    );
+    match &directory.scope {
+        Scope::Project(project) => human.push_str(&format!(
+            "\n(project {}; --all for every project, --channel for yours)",
             super::format::plain(&project.display().to_string())
-        ));
+        )),
+        Scope::Channel(Some(channel)) => human.push_str(&format!(
+            "\n(channel {channel}; read a conversation with `cagents transcript SESSION`)"
+        )),
+        _ => {}
     }
     Ok(CommandOutput {
         command: "sessions",
@@ -65,7 +95,18 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
     })
 }
 
-fn list_human<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> String {
+pub(super) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// `channel` is the caller's, so a session sharing it is marked.
+pub(super) fn list_human<'a>(
+    entries: impl IntoIterator<Item = &'a Entry>,
+    channel: Option<crate::model::ChannelId>,
+    now: u64,
+) -> String {
     use crate::agent::ActivityState;
     use crate::agent_execution::directory::Owner;
     super::format::table(
@@ -88,6 +129,12 @@ fn list_human<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> String {
                 {
                     context.push(format!("worktree view {}", path.display()));
                 }
+                if entry.relation != Relation::Myself
+                    && channel.is_some()
+                    && entry.channel == channel
+                {
+                    context.push("my channel".into());
+                }
                 match (entry.relation, entry.delegation.as_ref().map(|d| &d.owner)) {
                     (Relation::Myself, _) => context.push("me".into()),
                     (Relation::Parent, _) => context.push("my parent".into()),
@@ -104,10 +151,17 @@ fn list_human<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> String {
                         context.push(format!("latest run {}", super::agents::state_label(state)));
                     }
                 }
+                if let Some(at) = entry.active_at {
+                    context.push(format!("active {}", super::format::relative_time(at, now)));
+                }
+                if let Some(failure) = &entry.failure {
+                    context.push(format!("failed: {failure}"));
+                }
                 [
                     entry.id.to_string(),
                     entry.provider.map_or("shell", |p| p.executable()).into(),
                     match entry.state {
+                        _ if entry.exited => "exited",
                         ActivityState::Unknown => "unknown",
                         ActivityState::Idle => "idle",
                         ActivityState::Working => "working",
@@ -183,6 +237,9 @@ mod tests {
             }),
             relation: Relation::Child,
             lineage: Lineage("00000000-0000-4000-8000-000000000003".parse().unwrap()),
+            exited: false,
+            failure: None,
+            active_at: None,
         }
     }
 
@@ -190,7 +247,7 @@ mod tests {
     fn readable_session_rows_keep_original_identity_and_delegation_context() {
         let entry = entry();
         let before = serde_json::to_value(&entry).unwrap();
-        let human = list_human(std::iter::once(&entry));
+        let human = list_human(std::iter::once(&entry), None, 0);
         assert_eq!(human.lines().count(), 2);
         assert_eq!(
             human
@@ -224,7 +281,10 @@ mod tests {
 
     #[test]
     fn readable_sessions_empty_and_plain_shell_rows_are_explicit() {
-        assert_eq!(list_human(std::iter::empty::<&Entry>()), "No live sessions");
+        assert_eq!(
+            list_human(std::iter::empty::<&Entry>(), None, 0),
+            "No live sessions"
+        );
         let mut entry = entry();
         entry.provider = None;
         entry.surface = Surface::Terminal;
@@ -239,7 +299,7 @@ mod tests {
         entry.view_scope = None;
         entry.lineage = Lineage(entry.id);
         assert_eq!(
-            list_human(std::iter::once(&entry)),
+            list_human(std::iter::once(&entry), None, 0),
             "SESSION                               PROVIDER  STATE    CONTEXT\n00000000-0000-4000-8000-000000000001  shell     unknown  me"
         );
     }

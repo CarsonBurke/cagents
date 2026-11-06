@@ -11,6 +11,7 @@ use std::path::PathBuf;
 pub(crate) mod bundled;
 pub mod directory;
 pub mod mailbox;
+pub mod transcript;
 
 use serde::{Deserialize, Serialize};
 
@@ -511,6 +512,8 @@ pub enum Operation {
     PeekInbox(mailbox::Inbox),
     /// Settle exact received IDs in the authenticated recipient's mailbox.
     AcknowledgeInbox(mailbox::Receipt),
+    /// Read a page of a session's conversation. Grants no control.
+    Transcript(transcript::Query),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -575,6 +578,7 @@ pub enum Reply {
     Sent(mailbox::Sent),
     Inbox(Vec<mailbox::Message>),
     InboxAcknowledged,
+    Transcript(transcript::Page),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

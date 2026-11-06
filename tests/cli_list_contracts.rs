@@ -80,6 +80,9 @@ impl Listing {
                         delegation: None,
                         relation: agent_execution::directory::Relation::Peer,
                         lineage: agent_execution::Lineage(id),
+                        exited: false,
+                        failure: None,
+                        active_at: None,
                     }]
                 } else {
                     vec![]

@@ -23,6 +23,7 @@ pub(super) use directory::{live_sessions, named};
 pub(super) mod mailbox;
 mod ownership;
 pub(super) mod terminals;
+mod transcript;
 pub(super) use ownership::{
     Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,
     reconcile_agent_run, reconcile_agent_run_under_control,
@@ -1166,6 +1167,9 @@ pub(super) fn process(
         Operation::PeekInbox(query) => mailbox::peek(host, &authority, query).map(Reply::Inbox),
         Operation::AcknowledgeInbox(receipt) => {
             mailbox::acknowledge(host, &authority, receipt).map(|()| Reply::InboxAcknowledged)
+        }
+        Operation::Transcript(query) => {
+            transcript::read(host, &authority, query).map(Reply::Transcript)
         }
     }
 }

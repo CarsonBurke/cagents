@@ -8,6 +8,8 @@ mod claude;
 #[cfg(feature = "host")]
 pub(crate) use claude::transcript as claude_transcript;
 mod codex;
+#[cfg(feature = "host")]
+pub(crate) use codex::rollout as codex_rollout;
 mod omp;
 
 #[cfg(feature = "host")]

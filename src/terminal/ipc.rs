@@ -202,7 +202,10 @@ use crate::{
 /// candidate line (0.1.3+local.c68275e94) and is never reissued here: its
 /// daemons are update sources this release inspects and replaces, not peers.
 /// Version 129 is this release's matched set with the same extension.
-pub const PROTOCOL_VERSION: u16 = 129;
+/// Version 152 appends the transcript read and its reply, a channel directory
+/// scope, and a directory entry's exited state, failure and last activity.
+/// Versions 145 to 151 are claimed by parallel branches and are not adopted.
+pub const PROTOCOL_VERSION: u16 = 152;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
