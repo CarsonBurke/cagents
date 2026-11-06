@@ -1220,3 +1220,19 @@ fn a_reachable_daemon_for_other_owners_supersedes_an_unreachable_one() {
     assert!(!app.startup_gate.saving);
     assert_eq!(reported(&app), None);
 }
+
+#[test]
+fn a_single_waiting_pane_is_named_in_the_singular() {
+    let (app, cards) = waiting(1);
+    let pending = Pending {
+        admission: false,
+        panes: cards,
+    };
+    for reason in [
+        app.stalled_reason(&pending),
+        app.reconnecting_reason(&pending),
+    ] {
+        assert!(reason.contains("1 saved pane "), "{reason}");
+        assert!(reason.contains(". It stays in this window"), "{reason}");
+    }
+}

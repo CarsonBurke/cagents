@@ -411,9 +411,10 @@ impl Cagents {
             return "recovery-incomplete: this window's shared workspace did not finish loading in time. The window and its saved panes remain available. The update has not been verified.".to_owned();
         }
         format!(
-            "recovery-incomplete: {} did not reconnect in time: {}. They stay in this window, which remains available. The update has not been verified.",
+            "recovery-incomplete: {} did not reconnect in time: {}. {} in this window, which remains available. The update has not been verified.",
             saved_panes(pending.panes.len()),
             self.startup_pane_names(&pending.panes),
+            they_stay(pending.panes.len()),
         )
     }
 
@@ -425,10 +426,11 @@ impl Cagents {
             );
         }
         format!(
-            "recovery-incomplete: {} made no progress reconnecting for {} seconds: {}. They stay in this window, which remains available. The update has not been verified.",
+            "recovery-incomplete: {} made no progress reconnecting for {} seconds: {}. {} in this window, which remains available. The update has not been verified.",
             saved_panes(pending.panes.len()),
             NO_PROGRESS.as_secs(),
             self.startup_pane_names(&pending.panes),
+            they_stay(pending.panes.len()),
         )
     }
 
@@ -762,6 +764,13 @@ fn restoring_reason(awaiting: u64) -> String {
 /// for exactly these owners that its restore had finished.
 fn unconfirmed_reason() -> String {
     "recovery-incomplete: this window's saved panes reconnected, but the terminal service did not confirm that it had finished restoring saved sessions. The window remains available. The update has not been verified.".to_owned()
+}
+
+fn they_stay(count: usize) -> &'static str {
+    match count {
+        1 => "It stays",
+        _ => "They stay",
+    }
 }
 
 fn saved_panes(count: usize) -> String {
