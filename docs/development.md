@@ -544,8 +544,9 @@ there; its build settings, such as `jobs` and `build-dir`, describe this host
 and are not. Each slot's commands get a private `TMPDIR`,
 `$XDG_RUNTIME_DIR/cof/<repository>-<N>` (mode 0700) on the host, short enough
 for the Unix sockets tests bind under it and emptied before the next command
-there; a HOST test lane leaves about 12 MB. It follows the HOST recipe below
-rather than `/tmp`, `/var/tmp`, `~/.cache` or the home directory: agent
+there; a HOST test lane leaves about 12 MB. It follows the ancestry, home and
+socket constraints in the HOST recipe below rather than selecting `/tmp`,
+`/var/tmp`, `~/.cache` or the home directory: agent
 sandboxes create `.git` placeholders in the first three, recovery placement
 deliberately refuses any enclosing `.git`, and fixtures refuse roots inside
 the home directory. The runtime directory exists while the host has a login
@@ -554,8 +555,8 @@ temporary files fall back to the slot, and `test` stops with status 78 if a
 marker is above it. While a
 `.git` sits in any of its ancestors on the host, `test` stops with status 78
 and names it, since fixtures that check Git ancestry fail under one and
-building here instead would hide the leak; remove the marker, or set
-`CAGENTS_BUILD_REMOTE=local`. Other commands still run there. Cargo's registry and Git caches and the toolchain on the
+building here instead would hide the leak. Stop and investigate its ownership;
+do not remove a shared marker to make tests pass. Other commands still run there. Cargo's registry and Git caches and the toolchain on the
 host are shared with anything else built there; Cargo locks its caches itself.
 
 ### Compilation jobs and shared build directories
@@ -765,18 +766,28 @@ The existing artifact helper reads Cargo's exact executable path, including
 configured target directories/triples. A matching version alone does not prove
 that two dirty source trees match.
 
-Use a fresh private temporary directory with a short, physical absolute path
-outside Git ancestry: neither it nor any ancestor may contain a `.git` file,
-directory or symlink. For this Linux example, verify that `XDG_RUNTIME_DIR`
-meets those conditions before creating the root. The **final** nested Unix
+For a local HOST run, select an existing private **disk-backed** base with a
+short, physical absolute path. Verify its filesystem with `findmnt -T PATH`;
+`/tmp`, `/dev/shm` and `XDG_RUNTIME_DIR` can be RAM-backed. Neither the base nor
+any ancestor may contain a `.git` file, directory or symlink. The base must also
+be outside the account home reported by `getent passwd "$(id -u)"`, even when
+`HOME` points elsewhere: bundled-skill tests deliberately refuse installation
+beneath the passwd home. A private `~/.cot` therefore does not qualify.
+
+On fw16, `/opt/resolve/.cot` is the existing user-owned private disk-backed base
+used for this preparation. On another host, select and verify a suitable base;
+do not create directories in an unrelated application's tree or change shared
+directories or Git markers. The **final** nested Unix
 socket path must be shorter than 108 bytes, including fixture suffixes. For
 example, `/.tmpXXXXXX/tmp/cagents-codex-<36-byte UUID>/control.sock` adds 79
 bytes, so that layout requires a temporary base of at most 28 bytes. Longer
 fixture layouts need more room; a short base alone is not proof.
 
 ```sh
+# Set this only after verifying the base above; this value is specific to fw16.
+export CAGENTS_TEST_TMP_BASE=/opt/resolve/.cot
 (
-    TMPDIR=$(mktemp -d "${XDG_RUNTIME_DIR:?}/tXXXXXX") || exit
+    TMPDIR=$(mktemp -d "${CAGENTS_TEST_TMP_BASE:?}/tXXXXXX") || exit
     export TMPDIR
     printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
     CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
@@ -792,7 +803,7 @@ A helper build failure prevents the test command. Use the same preparation for
 narrow HOST targets that need retained actors. Keep the temporary root and any
 separately retained fixture evidence until their original children have settled;
 this recipe deliberately installs no automatic deletion trap. Do not change
-socket limits, remove enclosing Git markers or silently select another runtime
+socket limits, remove enclosing Git markers or silently select another fixture
 root to make a failed preparation pass.
 
 Prefer the narrow target that covers the changed contract, for example:
