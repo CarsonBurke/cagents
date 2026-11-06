@@ -14,7 +14,7 @@ set -eu
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=7
+gate_version=8
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -406,7 +406,7 @@ others_idle() {
 # queue lock, and the one at its head takes the first slot that frees. Plain
 # `flock` callers take only slot 0 and wait for it in the kernel, which
 # admits waiters in arrival order; the head waiter queues there too, through
-# a background `flock` on a descriptor it shares, so it keeps its place
+# a background lock waiter on a descriptor it shares, so it keeps its place
 # instead of losing every release of slot 0. Meanwhile it polls the slots
 # that only gated builds use.
 acquire() {
@@ -414,25 +414,33 @@ acquire() {
     pressure_announced=false
     waited_since=$(date +%s)
     waiter=
-    # The supervisor closes 8/9, so keep this shared open description on 6
-    # until the queue wait has completed, then move it to 8 after the owned
-    # waiter has exited.
-    exec 6>>"$lock.queue"
-    flock -n 6 || { announce; supervised '' flock 6 || exit "$?"; }
-    exec 8>&6 6>&-
-    # A queued request outliving this gate would take slot 0 for a moment.
+    # Both queue and slot requests are private lock waiters, bound to this
+    # gate's lifetime. The admitted command alone inherits caller descriptors.
     trap 'withdraw; exit 130' INT
     trap 'withdraw; exit 143' TERM
     trap 'withdraw; exit 129' HUP
     trap 'withdraw; exit 131' QUIT
+    exec 6>>"$lock.queue"
+    if ! flock -n 6; then
+        announce
+        python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "${admission_deadline:-}" \
+            8>&- 9>&- </dev/null >/dev/null &
+        waiter=$!
+        status=0
+        wait "$waiter" || status=$?
+        waiter=
+        [ "$status" -eq 0 ] || exit "$status"
+    fi
+    exec 8>&6 6>&-
     while :; do
         check_admission
         if [ -z "$waiter" ]; then
             exec 6>>"$lock"
-            # Neither the queue nor the caller's streams: if this gate is killed,
-            # the request must not keep everyone queued behind a slot another
-            # gated build could skip, or a caller reading its output waiting.
-            flock 6 8>&- </dev/null >/dev/null 2>&1 &
+            # A killed gate must leave neither an abandoned slot request nor
+            # any helper holding its caller's pipes, locks or queue descriptor.
+            # This loop enforces the deadline itself, so the waiter needs none.
+            python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "" \
+                8>&- 9>&- </dev/null >/dev/null &
             waiter=$!
         fi
         # The shared descriptor locks only once the queued request is granted:
@@ -453,11 +461,16 @@ acquire() {
             sleep 0.5
             continue
         fi
-        # Queue again if the request itself was killed.
+        # Queue again if the request itself was killed; a waiter that failed
+        # on its own would fail again, so stop rather than respawn it forever.
         if waiter_gone; then
-            wait "$waiter" 2>/dev/null || :
+            status=0
+            wait "$waiter" 2>/dev/null || status=$?
             waiter=
             exec 6>&-
+            if [ "$status" -gt 0 ] && [ "$status" -lt 128 ]; then
+                exit "$status"
+            fi
             continue
         fi
         # Every free slot sees the same other builds, so price them once.
