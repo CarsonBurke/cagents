@@ -699,7 +699,7 @@ fn inspect_existing_daemon(
 
 /// What the window says when the daemon kept its original owners after a
 /// failed restore; the daemon's own reason goes beneath it as details.
-const RETAINED_NOTICE: &str = "Saved sessions could not be fully restored after the update. Their original processes are still running and nothing was closed or deleted, but new terminals and chats cannot start while they are kept. Close each affected pane once its work is done. The update has not been verified.";
+const RETAINED_NOTICE: &str = "Saved sessions could not be fully restored after the update. Their original processes are still running and nothing was closed or deleted. Until the terminal service restarts, it cannot start new terminals or chats or accept input in existing ones. The update has not been verified.";
 
 /// The handshake's prefix tells the launcher to keep the window open; the
 /// person reading the notice needs only the sentence after it.
