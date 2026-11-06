@@ -976,10 +976,12 @@ fn lost_holder_case(name: &str, managed: bool, mail: bool) {
     restored.set_visible(true).unwrap();
     wait("saved transcript", &mut || {
         let snapshot = restored.snapshot();
-        !snapshot.history_loading && users(&snapshot.items) == 1
+        !snapshot.history_loading
+            && users(&snapshot.items) == 1
+            && snapshot.read_only_reason.is_some()
+            && snapshot.exited
     });
     let snapshot = restored.snapshot();
-    assert!(snapshot.read_only_reason.is_some() && snapshot.exited);
     assert!(snapshot.items.iter().any(
         |item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == "FRAME_000|")
     ));

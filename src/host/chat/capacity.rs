@@ -1133,7 +1133,7 @@ exit 0
                 assert!(restored.session().is_saved_claude_history());
                 let reason = restored.snapshot().read_only_reason.clone().unwrap();
                 assert!(reason.contains("no confirmed outcome"), "{reason}");
-                assert!(reason.contains("without resending"), "{reason}");
+                assert!(reason.contains("doesn't resend"), "{reason}");
                 server = Some((restored, worker));
             }
             let (agent, run) = {
@@ -1917,7 +1917,11 @@ exit 0
             Err(failure) => failure,
             Ok(_) => panic!("a same-boot missing holder opened a reader"),
         };
-        assert!(failure.message.contains("could not be reattached"));
+        assert!(
+            failure.message.contains("nothing was"),
+            "{}",
+            failure.message
+        );
         server.join().unwrap();
         assert!(!host.lock().unwrap().chats.contains_key(&source.id));
         assert!(!marker.exists());
