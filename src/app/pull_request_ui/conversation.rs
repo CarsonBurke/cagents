@@ -336,11 +336,20 @@ fn name(list: &ConversationPullRequests, row: &ConversationPullRequest) -> Strin
     let number = if list.repository.as_ref() == Some(&row.repository) {
         format!("#{}", row.number)
     } else {
-        format!("{}#{}", row.repository.gh_selector(), row.number)
+        format!("{}#{}", repository_label(&row.repository), row.number)
     };
     match &row.pull_request {
         Some(pull_request) => format!("{number} {}", pull_request.title),
         None => number,
+    }
+}
+
+/// `owner/repo` on github.com, with the host only when it is another one.
+pub(super) fn repository_label(repository: &GitHubRepoKey) -> String {
+    if repository.host == "github.com" && repository.port.is_none() {
+        format!("{}/{}", repository.owner, repository.name)
+    } else {
+        repository.gh_selector()
     }
 }
 
@@ -601,6 +610,9 @@ mod tests {
         delegated.repository = repo("upstream");
         delegated.pull_request = None;
         assert_eq!(name(&list, &delegated), "upstream/repo#2");
+        delegated.repository = GitHubRepoKey::new("ghe.example", None, "me", "repo").unwrap();
+        assert_eq!(name(&list, &delegated), "ghe.example/me/repo#2");
+        delegated.repository = repo("upstream");
         assert!(matches!(choose(&delegated), Some(Action::Choose(Some(key)))
             if key.number == 2 && key.repository == repo("upstream")));
     }

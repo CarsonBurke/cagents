@@ -732,7 +732,11 @@ pub fn view(state: &State) -> Element<'_, Action> {
                         format!("{} · {}", target.repository.gh_selector(), target.branch)
                     }
                     Target::PullRequest(key) => {
-                        format!("{}#{}", key.repository.gh_selector(), key.number)
+                        format!(
+                            "{}#{}",
+                            conversation::repository_label(&key.repository),
+                            key.number
+                        )
                     }
                 })
                 .into(),
@@ -2104,7 +2108,7 @@ mod tests {
                 })
             }
         }
-        for (branch, unborn, expected) in [
+        for (symbolic, unborn, expected) in [
             (Some("refs/heads/feature"), false, true),
             (Some("refs/heads/other"), false, false),
             (None, false, false),
@@ -2113,7 +2117,7 @@ mod tests {
         ] {
             let executor = Arc::new(CountingGit {
                 calls: Default::default(),
-                branch,
+                branch: symbolic,
                 unborn,
             });
             let git = RepositoryService::new("git", executor.clone());
