@@ -1458,8 +1458,8 @@ impl Cagents {
             if current.kind != seeded.kind
                 && current.scope == shared.scope
                 && current.pending_terminal_start == shared.pending_terminal_start
-                && matches!(self.cards.get(&seeded.id), Some(CardRuntime::Terminal(_)))
                 && attached_to_same_terminal(&current.kind, &shared.kind)
+                && surface_attached_under(self.cards.get(&seeded.id), &current.kind)
             {
                 seeded.kind = shared.kind.clone();
                 seeded.pending_terminal_start = shared.pending_terminal_start;
@@ -1526,10 +1526,9 @@ impl Cagents {
                 continue;
             }
             let current = owner.panes.iter().find(|pane| pane.id == card).unwrap();
-            let source_changed = before.kind != pane.kind
-                || before.pending_terminal_start != pane.pending_terminal_start
-                || before.scope != pane.scope;
-            if source_changed && !can_retry_source_fields(before, current) {
+            if crate::workspace_model::views::updates_source(before, pane)
+                && !can_retry_source_fields(before, current)
+            {
                 before.kind = current.kind.clone();
                 pane.kind = current.kind.clone();
                 before.pending_terminal_start = current.pending_terminal_start;
@@ -2550,6 +2549,21 @@ fn attached_to_same_terminal(attached: &CardKind, shared: &CardKind) -> bool {
                     .live_proof()
                     .is_some_and(|proof| proof.is_complete())
     )
+}
+
+/// Whether a card's surface stands behind the proof its record claims. A
+/// hibernated surface has no connection yet to disagree with the proof its
+/// start returned; one whose connection failed no longer stands behind it.
+fn surface_attached_under(runtime: Option<&CardRuntime>, kind: &CardKind) -> bool {
+    let (Some(CardRuntime::Terminal(surface)), CardKind::Terminal(session)) = (runtime, kind)
+    else {
+        return false;
+    };
+    match surface.current_attachment() {
+        Ok(Some(attached)) => session.continuity.live_proof().as_ref() == Some(&attached),
+        Ok(None) => true,
+        Err(_) => false,
+    }
 }
 
 fn preserve_observed_terminal_exit(card: &CardState, incoming: &mut CardKind) {

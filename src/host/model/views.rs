@@ -599,30 +599,10 @@ pub(super) fn apply(
                     view.apply(change)?
                 }
                 Change::Update { before, pane } => {
-                    // Revision-only retries must not replay an old source over
-                    // a successor or undo host-owned start/location changes.
                     // Reject the whole edit before recording its operation ID;
                     // the client can refuse source intent and retry presentation
-                    // separately against the authoritative pane. A source that
-                    // already holds replays nothing: windows reopening together
-                    // all report the same attachment.
-                    let source_changed = before.kind != pane.kind
-                        || before.pending_terminal_start != pane.pending_terminal_start
-                        || before.scope != pane.scope;
-                    let holds =
-                        |current: &crate::workspace_model::views::Pane,
-                         source: &crate::workspace_model::views::Pane| {
-                            current.id == source.id
-                                && current.kind == source.kind
-                                && current.pending_terminal_start == source.pending_terminal_start
-                                && current.scope == source.scope
-                        };
-                    if source_changed
-                        && !view
-                            .panes
-                            .iter()
-                            .any(|current| holds(current, before) || holds(current, pane))
-                    {
+                    // separately against the authoritative pane.
+                    if view.source_update_conflicts(before, pane) {
                         return Err(Registry::VIEW_SOURCE_CONFLICT.into());
                     }
                     if resource_owner(transaction, pane)?.is_some() {
@@ -1576,6 +1556,34 @@ mod tests {
     }
 
     #[test]
+    fn a_source_update_conflicts_unless_all_of_its_source_or_result_holds() {
+        let before = live_source_pane();
+        let result = attached_under(&before, "result");
+        let view = |current: Pane| crate::workspace_model::views::View {
+            panes: vec![current],
+            ..crate::workspace_model::views::View::empty(Scope::Channel(ChannelId::new()))
+        };
+        let conflicts = |current: Pane| view(current).source_update_conflicts(&before, &result);
+        assert!(!conflicts(before.clone()));
+        assert!(!conflicts(result.clone()));
+        assert!(conflicts(attached_under(&before, "another")));
+        for held in [&before, &result] {
+            let mut started = held.clone();
+            started.pending_terminal_start = !started.pending_terminal_start;
+            assert!(conflicts(started));
+            let mut moved = held.clone();
+            moved.scope = Some("/elsewhere".into());
+            assert!(conflicts(moved));
+        }
+        // Presentation alone never conflicts, whatever the record says now.
+        let mut titled = before.clone();
+        titled.title = "independent title".into();
+        assert!(
+            !view(attached_under(&before, "another")).source_update_conflicts(&before, &titled)
+        );
+    }
+
+    #[test]
     fn a_stale_client_cannot_overwrite_a_newer_attachment() {
         let original = live_source_pane();
         let requested = attached_under(&original, "older");
@@ -1606,9 +1614,12 @@ mod tests {
         let attached = requested.clone();
         let mut ended = requested.clone();
         if let CardKind::Terminal(terminal) = &mut ended.kind {
-            terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
-                recipe: terminal.launch.clone(),
-                last_exit: None,
+            terminal.continuity = crate::model::TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
             };
         }
         let committed = ended.clone();

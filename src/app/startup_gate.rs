@@ -104,6 +104,7 @@ impl Cagents {
         let views_pending = views_hold.is_some();
         let mut pending = views_pending && views_stalled.is_none();
         let mut failures = Vec::new();
+        let mut out_of_step = Vec::new();
         let mut reasons = Vec::new();
         for card in self
             .durable
@@ -135,7 +136,7 @@ impl Cagents {
                             Err(Unready::Mismatch { .. }) => {
                                 match self.startup_attach_exhausted(card.id) {
                                     Some(reason) => {
-                                        failures.push(card.id);
+                                        out_of_step.push(card.id);
                                         reasons.push(reason.to_owned());
                                     }
                                     None => pending = true,
@@ -211,6 +212,9 @@ impl Cagents {
         if pending {
             return Ok(false);
         }
+        if !out_of_step.is_empty() {
+            return Err(self.startup_out_of_step(&failures, &out_of_step, reasons.first()));
+        }
         if !failures.is_empty() {
             return Err(self.startup_incomplete(&failures, reasons.first()));
         }
@@ -229,8 +233,47 @@ impl Cagents {
     /// The report for `failures`, named as their tabs are, with the first
     /// reason any of them gave.
     fn startup_incomplete(&self, failures: &[CardId], reason: Option<&String>) -> String {
+        let names = self.startup_names(failures);
+        let (count, verb) = match failures.len() {
+            1 => ("1 pane".to_owned(), "it"),
+            count => (format!("{count} panes"), "them"),
+        };
+        let detail = startup_details(reason);
+        format!(
+            "recovery-incomplete: {count} did not reconnect: {names}. Open {verb} to reconnect or recover {verb}; drafts and recovery evidence are kept, and this window stays available.{detail}"
+        )
+    }
+
+    /// The report when `out_of_step` panes are attached and working, so
+    /// opening them would change nothing, but the shared workspace's record
+    /// of them names something else.
+    fn startup_out_of_step(
+        &self,
+        failures: &[CardId],
+        out_of_step: &[CardId],
+        reason: Option<&String>,
+    ) -> String {
+        let names = self.startup_names(out_of_step);
+        let (count, verb) = match out_of_step.len() {
+            1 => ("1 pane".to_owned(), "it"),
+            count => (format!("{count} panes"), "them"),
+        };
+        let sentence = format!(
+            "{count} reconnected and can be used in this window, but the shared workspace lists {verb} under a different terminal service: {names}."
+        );
+        let detail = startup_details(reason);
+        if failures.is_empty() {
+            format!("recovery-incomplete: {sentence} This window stays available.{detail}")
+        } else {
+            let failed = self.startup_incomplete(failures, None);
+            format!("{failed} {sentence}{detail}")
+        }
+    }
+
+    /// `cards` as their tabs name them, short enough for the launcher's line.
+    fn startup_names(&self, cards: &[CardId]) -> String {
         const NAMED: usize = 8;
-        let mut names = failures
+        let mut names = cards
             .iter()
             .take(NAMED)
             .map(|card| {
@@ -241,19 +284,10 @@ impl Cagents {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        if failures.len() > NAMED {
-            names.push_str(&format!(" and {} more", failures.len() - NAMED));
+        if cards.len() > NAMED {
+            names.push_str(&format!(" and {} more", cards.len() - NAMED));
         }
-        let (count, verb) = match failures.len() {
-            1 => ("1 pane".to_owned(), "it"),
-            count => (format!("{count} panes"), "them"),
-        };
-        let detail = reason
-            .map(|reason| format!("{DETAILS_LABEL}{}.", startup_detail(reason)))
-            .unwrap_or_default();
-        format!(
-            "recovery-incomplete: {count} did not reconnect: {names}. Open {verb} to reconnect or recover {verb}; drafts and recovery evidence are kept, and this window stays available.{detail}"
-        )
+        names
     }
 
     /// What the gate reports once its budget runs out: each pane it was
@@ -578,6 +612,13 @@ fn views_incomplete(hold: &str) -> String {
     format!(
         "recovery-incomplete: this window's shared workspace did not finish restoring: {hold}. This window stays available."
     )
+}
+
+/// The first reason known, as it ends a report.
+fn startup_details(reason: Option<&String>) -> String {
+    reason
+        .map(|reason| format!("{DETAILS_LABEL}{}.", startup_detail(reason)))
+        .unwrap_or_default()
 }
 
 /// A tab title short enough to name in the launcher's 4 KiB line.

@@ -421,29 +421,19 @@ fn send(
     Ok(())
 }
 
-fn source_update_conflicts(
+pub(in crate::app) fn source_update_conflicts(
     model: &WorkspaceModel,
     scope: &crate::workspace_model::views::Scope,
     change: &crate::workspace_model::views::Change,
 ) -> bool {
-    use crate::workspace_model::views::Change;
+    use crate::workspace_model::views::{Change, updates_source};
     let Change::Update { before, pane } = change else {
         return false;
     };
-    let sensitive = before.kind != pane.kind
-        || before.pending_terminal_start != pane.pending_terminal_start
-        || before.scope != pane.scope;
-    sensitive
-        && !model
-            .views
-            .iter()
-            .find(|view| &view.scope == scope)
-            .and_then(|view| view.panes.iter().find(|current| current.id == before.id))
-            .is_some_and(|current| {
-                current.kind == before.kind
-                    && current.pending_terminal_start == before.pending_terminal_start
-                    && current.scope == before.scope
-            })
+    match model.views.iter().find(|view| &view.scope == scope) {
+        Some(view) => view.source_update_conflicts(before, pane),
+        None => updates_source(before, pane),
+    }
 }
 
 /// What adopting one shared row asked of the window.

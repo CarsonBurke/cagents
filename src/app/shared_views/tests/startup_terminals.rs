@@ -1380,6 +1380,9 @@ fn a_refused_attachment_edit_settles_on_the_record_that_won() {
             ),
             "{report}"
         );
+        // It is attached and working, so opening it would change nothing.
+        assert!(report.contains("can be used in this window"), "{report}");
+        assert!(!report.contains("Open it"), "{report}");
     }
 }
 
@@ -1617,9 +1620,12 @@ fn an_attachment_is_not_rebased_over_an_ended_registry_record() {
         .cards
         .insert(card, CardRuntime::Terminal(started.handle));
     let mut ended = saved.clone();
-    ended.continuity = TerminalContinuity::RelaunchAvailable {
-        recipe: ended.launch.clone(),
-        last_exit: None,
+    ended.continuity = TerminalContinuity::Exited {
+        last_exit: crate::model::TerminalExit {
+            code: Some(0),
+            signal: None,
+            occurred_at_unix_ms: 1,
+        },
     };
     model.sequence += 1;
     model.views[1].panes[0].kind = CardKind::Terminal(ended);
@@ -1630,4 +1636,65 @@ fn an_attachment_is_not_rebased_over_an_ended_registry_record() {
         panic!("expected one update, got {updates:?}");
     };
     assert_eq!(before.kind, CardKind::Terminal(saved));
+}
+
+/// A surface attached under another proof doesn't stand behind what its record
+/// claims, so the update stays on its saved base, which the daemon refuses.
+#[test]
+fn an_attachment_its_surface_disagrees_with_is_not_rebased() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut window, model, rx) = window_seeding_a_saved_terminal();
+    let card = window.cached.id;
+    let saved = session(&window.cached);
+    let started = attached(directory.path(), &saved);
+    let mut claimed = started.session.clone();
+    claimed.continuity = TerminalContinuity::Live {
+        host_session_id: HostSessionId::new("another-host"),
+        boot_id: BootId::new("boot"),
+        host_incarnation: HostIncarnation::new("another-host"),
+    };
+    window.app.card_state_mut(card).unwrap().kind = CardKind::Terminal(claimed);
+    window
+        .app
+        .cards
+        .insert(card, CardRuntime::Terminal(started.handle));
+
+    let updates = acknowledge_seed(&mut window, &model, &rx);
+
+    let [(before, _)] = updates.as_slice() else {
+        panic!("expected one update, got {updates:?}");
+    };
+    assert_eq!(before.kind, CardKind::Terminal(saved));
+}
+
+/// A window that loses the revision race reads the registry again before
+/// retrying. Finding its own result there isn't a refusal worth a notice;
+/// finding some other record is.
+#[test]
+fn a_stale_update_is_refused_only_when_neither_its_source_nor_result_holds() {
+    use crate::app::workspace_model_sync::source_update_conflicts;
+    use crate::workspace_model::views::Change;
+    let (_window, mut model, _rx) = window_seeding_a_saved_terminal();
+    let scope = model.views[1].scope.clone();
+    let before = model.views[1].panes[0].clone();
+    let live = |host: &str| {
+        let mut pane = before.clone();
+        if let CardKind::Terminal(terminal) = &mut pane.kind {
+            terminal.continuity = TerminalContinuity::Live {
+                host_session_id: HostSessionId::new(host),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new(host),
+            };
+        }
+        pane
+    };
+    let change = Change::Update {
+        before: before.clone(),
+        pane: live("result"),
+    };
+    assert!(!source_update_conflicts(&model, &scope, &change));
+    model.views[1].panes[0] = live("result");
+    assert!(!source_update_conflicts(&model, &scope, &change));
+    model.views[1].panes[0] = live("another-host");
+    assert!(source_update_conflicts(&model, &scope, &change));
 }

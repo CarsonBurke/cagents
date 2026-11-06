@@ -477,6 +477,20 @@ impl View {
         }
     }
 
+    /// Whether an update from `before` to `pane` has to be refused because the
+    /// source it changes moved on. Revision-only retries must not replay an old
+    /// source over a successor or undo host-owned start/location changes. A
+    /// result that already holds replays nothing: windows reopening together
+    /// all report the same attachment.
+    pub fn source_update_conflicts(&self, before: &Pane, pane: &Pane) -> bool {
+        let holds = |source: &Pane| {
+            self.panes
+                .iter()
+                .any(|current| current.id == source.id && !updates_source(current, source))
+        };
+        updates_source(before, pane) && !holds(before) && !holds(pane)
+    }
+
     /// Typed changes preserve unrelated edits; the daemon fences them with the
     /// view revision and records operation IDs before acknowledging them.
     pub fn apply(&mut self, change: &Change) -> Result<bool, String> {
@@ -555,6 +569,13 @@ impl View {
 
 /// Compare two local projections. This is invoked only for local changes;
 /// adopting a host snapshot resets the projection baseline first.
+/// Whether going from `before` to `pane` changes more than presentation.
+pub fn updates_source(before: &Pane, pane: &Pane) -> bool {
+    before.kind != pane.kind
+        || before.pending_terminal_start != pane.pending_terminal_start
+        || before.scope != pane.scope
+}
+
 pub fn changes(previous: &[Pane], desired: &[Pane]) -> Vec<Change> {
     let mut changes = Vec::new();
     let mut working = previous.to_vec();
