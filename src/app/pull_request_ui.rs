@@ -54,7 +54,8 @@ pub enum Action {
     /// Show this pull request rather than the active branch's, or with
     /// `None` return to the branch's.
     Choose(Option<PullRequestKey>),
-    ShowAllMentions,
+    /// Show every mentioned pull request, or again only the first few.
+    ToggleAllMentions,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +100,9 @@ pub struct State {
     /// The pull request chosen from the conversation's list, shown instead
     /// of the active branch's.
     chosen: Option<PullRequestKey>,
+    /// The worktree that was active when it was chosen: selecting another
+    /// returns the detail to that worktree's branch.
+    chosen_in: Option<ActiveWorktreeKey>,
     conversation: conversation::State,
 }
 
@@ -376,7 +380,9 @@ impl State {
             Action::Filter(filter) => self.filter = filter,
             Action::ToggleResolved => self.hide_resolved = !self.hide_resolved,
             Action::Conversation(watch) => self.conversation.update(watch),
-            Action::ShowAllMentions => self.conversation.all_mentions = true,
+            Action::ToggleAllMentions => {
+                self.conversation.all_mentions = !self.conversation.all_mentions;
+            }
             // Link routing belongs to the application, which owns browser
             // preferences; choosing rebinds through the application too.
             Action::OpenUrl(_) | Action::OpenMarkdownLink(_) | Action::Choose(_) => {}
@@ -1227,13 +1233,25 @@ impl Cagents {
         }
         match action {
             Action::Choose(key) => {
-                // The active branch's own pull request is shown as the
-                // branch's, which also compares it with the local head.
-                self.pull_request_inspector.chosen = key.filter(|key| {
-                    !self
-                        .active_branch_pull_request()
-                        .is_some_and(|active| conversation::same_pull_request(&active, key))
+                // Choosing the chosen row again returns to the default. The
+                // active branch's own pull request is shown as the branch's,
+                // which also compares it with the local head.
+                let again = |key: &PullRequestKey| {
+                    self.pull_request_inspector
+                        .chosen
+                        .as_ref()
+                        .is_some_and(|chosen| conversation::same_pull_request(chosen, key))
+                };
+                let key = key.filter(|key| {
+                    !again(key)
+                        && !self
+                            .active_branch_pull_request()
+                            .is_some_and(|active| conversation::same_pull_request(&active, key))
                 });
+                self.pull_request_inspector.chosen_in = key
+                    .as_ref()
+                    .and_then(|_| self.sidebar_state.active_worktree().cloned());
+                self.pull_request_inspector.chosen = key;
                 return self.sync_pull_request_inspector();
             }
             Action::Conversation(watch) => {
@@ -1390,6 +1408,19 @@ impl Cagents {
         PullRequestKey::new(repository.clone(), number).ok()
     }
 
+    /// The pull request the detail shows instead of the active branch's:
+    /// the one chosen from the list or, while the branch has none of its
+    /// own, the one the conversation worked on most.
+    fn shown_pull_request(&self) -> Option<PullRequestKey> {
+        let state = &self.pull_request_inspector;
+        state.chosen.clone().or_else(|| {
+            if self.active_branch_pull_request().is_some() {
+                return None;
+            }
+            state.conversation.leading()
+        })
+    }
+
     /// Whether the inspected conversation names any pull request, which
     /// opens the pull request tab even where no worktree branch would.
     pub(super) fn conversation_lists_pull_requests(&self) -> bool {
@@ -1410,8 +1441,11 @@ impl Cagents {
 
     pub(super) fn sync_pull_request_inspector(&mut self) -> Task<Message> {
         let inspected = self.inspected_conversation();
-        if self.pull_request_inspector.conversation.retarget(inspected) {
-            self.pull_request_inspector.chosen = None;
+        let active = self.sidebar_state.active_worktree();
+        let inspector = &mut self.pull_request_inspector;
+        if inspector.conversation.retarget(inspected) || inspector.chosen_in.as_ref() != active {
+            inspector.chosen = None;
+            inspector.chosen_in = None;
         }
         if !self.context_inspector_open || self.context_tab != ContextTab::PullRequest {
             self.pull_request_inspector.source_key = None;
@@ -1421,7 +1455,7 @@ impl Cagents {
                 .map(Message::PullRequestUi)
                 .map(cosmic::Action::App);
         }
-        if let Some(key) = self.pull_request_inspector.chosen.clone() {
+        if let Some(key) = self.shown_pull_request() {
             self.pull_request_inspector.source_key = None;
             let target = Target::PullRequest(key);
             if self.pull_request_inspector.source_target.as_ref() == Some(&target) {
@@ -1536,7 +1570,7 @@ impl Cagents {
 
     fn pull_request_binding_is_current(&self) -> bool {
         let state = &self.pull_request_inspector;
-        if let Some(key) = &state.chosen {
+        if let Some(key) = &self.shown_pull_request() {
             return self.context_inspector_open
                 && self.context_tab == ContextTab::PullRequest
                 && matches!(&state.source_target, Some(Target::PullRequest(bound)) if bound == key);
@@ -2440,15 +2474,43 @@ mod tests {
         );
         assert_eq!(
             app.pull_request_inspector.target,
-            Some(Target::PullRequest(key))
+            Some(Target::PullRequest(key.clone()))
         );
 
-        // A list that no longer names it returns the detail to the branch,
-        // which this window has none of.
+        // A list that no longer names it drops the choice. This window has
+        // no branch, so the pull request the conversation worked on most is
+        // shown without being chosen.
         drop(app.handle_pull_request_ui(listed(conversation, 2, &[5], false)));
         assert!(app.pull_request_inspector.chosen.is_none());
-        assert!(app.pull_request_inspector.target.is_none());
+        let five = PullRequestKey::new(key.repository.clone(), 5).unwrap();
+        assert_eq!(
+            app.pull_request_inspector.target,
+            Some(Target::PullRequest(five.clone()))
+        );
+        assert!(app.pull_request_binding_is_current());
         assert!(app.conversation_lists_pull_requests());
+
+        // Choosing the chosen row again returns to that default.
+        drop(app.handle_pull_request_ui(Action::Choose(Some(five.clone()))));
+        assert_eq!(app.pull_request_inspector.chosen, Some(five.clone()));
+        drop(app.handle_pull_request_ui(Action::Choose(Some(five.clone()))));
+        assert!(app.pull_request_inspector.chosen.is_none());
+        assert_eq!(
+            app.pull_request_inspector.target,
+            Some(Target::PullRequest(five.clone()))
+        );
+
+        // A choice belongs to the worktree it was made in: once another is
+        // active, the detail follows that worktree again.
+        drop(app.handle_pull_request_ui(Action::Choose(Some(five.clone()))));
+        app.pull_request_inspector.chosen_in = Some(crate::sidebar::ActiveWorktreeKey {
+            project_id: ProjectId::new(),
+            worktree_id: crate::model::WorktreeId::new(),
+            canonical_path: PathBuf::from("/elsewhere"),
+        });
+        drop(app.sync_pull_request_inspector());
+        assert!(app.pull_request_inspector.chosen.is_none());
+        assert!(app.pull_request_inspector.chosen_in.is_none());
 
         // An older revision does not bring it back.
         drop(app.handle_pull_request_ui(listed(conversation, 1, &[4, 5], false)));

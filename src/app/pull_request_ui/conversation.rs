@@ -100,6 +100,15 @@ impl State {
         self.rows().iter().any(|row| names(row, key))
     }
 
+    /// The pull request the conversation worked on most: the daemon ranks
+    /// what it created first, then what it pushed, then the rest.
+    pub(super) fn leading(&self) -> Option<PullRequestKey> {
+        self.rows()
+            .iter()
+            .find(|row| row.relation.worked_on())
+            .and_then(row_key)
+    }
+
     /// Whether the conversation lists pull requests, or listed some before
     /// it changed and its new list has not arrived yet.
     pub(super) fn lists_any(&self) -> bool {
@@ -289,15 +298,23 @@ pub(super) fn view<'a>(
         for row in mentioned.iter().take(shown) {
             children.push(mentioned_row(list, row, selected));
         }
-        if mentioned.len() > shown {
+        if mentioned.len() > MENTIONS_SHOWN {
+            let (label, name) = if state.all_mentions {
+                (
+                    "Show fewer".to_owned(),
+                    "Show only the first mentioned pull requests",
+                )
+            } else {
+                (
+                    format!("Show {} more", mentioned.len() - shown),
+                    "Show every mentioned pull request",
+                )
+            };
             children.push(
-                crate::ui_controls::button::secondary(format!(
-                    "Show {} more",
-                    mentioned.len() - shown
-                ))
-                .name("Show every mentioned pull request")
-                .on_press(Action::ShowAllMentions)
-                .into(),
+                crate::ui_controls::button::secondary(label)
+                    .name(name)
+                    .on_press(Action::ToggleAllMentions)
+                    .into(),
             );
         }
     }
