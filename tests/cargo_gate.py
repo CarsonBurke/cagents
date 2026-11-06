@@ -22,6 +22,10 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Admission must not follow the memory pressure of the host running these
+# tests, nor its registry of real builds; the tests about either set them.
+os.environ["CAGENTS_BUILD_MEMORY_PRESSURE"] = "0"
+os.environ["CAGENTS_BUILD_REGISTRY"] = ""
 
 
 class CargoGateApplicability(unittest.TestCase):
@@ -1424,14 +1428,14 @@ class TwoSlots(unittest.TestCase):
             key: value for key, value in os.environ.items()
             if not key.startswith("CAGENTS_BUILD_") and key != "CARGO_BUILD_JOBS"
         } | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_SLOTS": "2",
-              "CAGENTS_BUILD_CPU_PRESSURE": "0", "CAGENTS_BUILD_REMOTE": "local",
-              "CAGENTS_BUILD_INSTALLED_GATE": ""}
+              "CAGENTS_BUILD_CPU_PRESSURE": "0", "CAGENTS_BUILD_MEMORY_PRESSURE": "0",
+              "CAGENTS_BUILD_REMOTE": "local", "CAGENTS_BUILD_INSTALLED_GATE": ""}
 
-    def hold(self, cost):
+    def hold(self, cost, env=None):
         holder = subprocess.Popen(
             [str(self.gate), "exec", "sh", "-c", f"touch {self.root}/held; "
              f"while [ ! -e {self.root}/release ]; do sleep 0.05; done"],
-            env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
+            env=(env or self.env) | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
             stderr=subprocess.DEVNULL,
         )
         self.addCleanup(holder.wait, 10)
@@ -1811,6 +1815,113 @@ class AdmissionTimeout(unittest.TestCase):
         self.assertEqual(process.returncode, 0, stderr)
         self.assertNotIn("timed out", stderr.lower())
 
+class HostRegistry(TwoSlots):
+    """Two slot families on one host, which a shared registry joins."""
+
+    def setUp(self):
+        super().setUp()
+        self.registry = self.root / "registry"
+        self.env["CAGENTS_BUILD_REGISTRY"] = str(self.registry)
+        self.other = self.env | {"CAGENTS_BUILD_LOCK": str(self.root / "other.lock"),
+                                 "CAGENTS_BUILD_SLOTS": "1"}
+
+    def test_a_build_in_another_family_is_priced_beside_this_one(self):
+        self.hold(1, env=self.other)
+        [entry] = self.registry.iterdir()
+        self.assertEqual(entry.read_text().splitlines()[2], str(self.root / "other.lock"))
+        # Alone in its own family, it would start whatever its cost.
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(10**6, timeout=2)
+        (self.root / "release").touch()
+        self.holder.wait(timeout=10)
+        self.assertEqual(list(self.registry.iterdir()), [])
+        result = self.build(10**6, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_build_that_fits_beside_another_familys_shares_the_cpus(self):
+        self.hold(1, env=self.other)
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cpus = os.cpu_count()
+        self.assertEqual(int(result.stdout), max(4, min(8, cpus // 2)))
+
+    def test_an_offloaded_build_on_this_host_is_priced_too(self):
+        self.registry.mkdir()
+        lock_path = self.root / "slot-0-lock"
+        lock = lock_path.open("a")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # As scripts/cargo-offload records a leased slot before its command runs.
+        (self.registry / "offload-0").write_text(f"0 {10**6 * 2**20}\n0\n{lock_path}\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=2)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_record_whose_lock_is_free_or_gone_is_stale(self):
+        self.registry.mkdir()
+        (self.root / "free.lock").touch()
+        (self.registry / "gate-1").write_text(f"1 {10**6 * 2**20}\n0\n{self.root}/free.lock\n")
+        (self.registry / "gate-2").write_text(f"1 {10**6 * 2**20}\n0\n{self.root}/gone.lock\n")
+        result = self.build(10**6, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "gone.lock").exists())
+
+    def test_a_private_family_has_no_registry_unless_named(self):
+        del self.env["CAGENTS_BUILD_REGISTRY"]
+        self.hold(1)
+        (self.root / "release").touch()
+        self.holder.wait(timeout=10)
+        self.assertFalse(self.registry.exists())
+
+
+class MemoryPressureAdmission(TwoSlots):
+    """Two slots and memory to spare; the memory pressure comes from a fixture."""
+
+    def setUp(self):
+        super().setUp()
+        self.pressure = self.root / "memory-pressure"
+        self.env |= {"CAGENTS_BUILD_MEMORY_PRESSURE": "10",
+                     "CAGENTS_BUILD_MEMORY_PRESSURE_FILE": str(self.pressure)}
+
+    def report(self, some):
+        self.pressure.write_text(
+            f"some avg10={some} avg60=4.00 avg300=2.00 total=1\n"
+            "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+
+    def test_a_build_waits_while_tasks_stall_on_memory(self):
+        self.report("10.00")
+        self.hold(1)
+        waiter = subprocess.Popen(
+            [str(self.gate), "exec", "true"], env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"},
+            cwd=self.root, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(waiter.stderr.close)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            waiter.wait(timeout=2)
+        self.report("9.99")
+        self.assertEqual(waiter.wait(timeout=10), 0)
+        self.assertIn("memory under pressure (10%, limit 10%)", waiter.stderr.read())
+
+    def test_a_lone_build_starts_whatever_the_memory_pressure(self):
+        self.report("100.00")
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_zero_disables_and_invalid_limits_are_refused(self):
+        self.report("100.00")
+        self.env["CAGENTS_BUILD_MEMORY_PRESSURE"] = "0"
+        self.hold(1)
+        self.assertEqual(self.build(1, timeout=10).returncode, 0)
+        for value in ("010", "101", "high"):
+            result = subprocess.run(
+                [str(self.gate), "exec", "true"],
+                env=self.env | {"CAGENTS_BUILD_MEMORY_PRESSURE": value},
+                cwd=self.root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 2, value)
+            self.assertIn("CAGENTS_BUILD_MEMORY_PRESSURE", result.stderr)
+
+
 class CpuPressureAdmission(TwoSlots):
     """Two slots and memory to spare; the CPU pressure comes from a fixture."""
 
@@ -1945,6 +2056,7 @@ class CpuPressureAdmission(TwoSlots):
             "FIXTURE_MEMINFO": str(memory), "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
             "CAGENTS_BUILD_SLOTS": "3", "CARGO_BUILD_JOBS": "1",
             "CAGENTS_BUILD_CPU_PRESSURE": "0" if disabled else "60",
+            "CAGENTS_BUILD_MEMORY_PRESSURE": "0",
             "CAGENTS_BUILD_CPU_SETTLE_SECS": "60",
             "CAGENTS_BUILD_CPU_PRESSURE_FILE": str(self.pressure),
             "CAGENTS_BUILD_COST_GIB": "7", "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1",

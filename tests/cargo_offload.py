@@ -40,6 +40,9 @@ def load_offload():
 
 
 offload = load_offload()
+# What these tests start must not price, or record itself among, the real
+# builds on the host running them; a test about the registry names its own.
+os.environ["CAGENTS_BUILD_REGISTRY"] = ""
 
 
 def write_figures(directory, *, available_gib=1024, cpu=0, memory=0):
@@ -524,7 +527,7 @@ if [ "$1" = marked ]; then
     # A host with a stray Git marker above its temporary directory.
     shift
     cd "$HOME"
-    exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
+    exec env -i CAGENTS_BUILD_REGISTRY= HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
         CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/stray/cof" \
         sh -c "mkdir -p '$HOME/stray/.git'; $*"
 fi
@@ -537,7 +540,7 @@ ulimit -Sn 256
 # Its Cargo keeps intermediates outside the slot, as a build-dir setting in
 # its configuration would, and inside the stand-in's home, which the test
 # removes.
-exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" \
+exec env -i CAGENTS_BUILD_REGISTRY= HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" \
     RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_BUILD_DIR="$HOME/build{workspace-root}/target" \
     CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
 """
@@ -1402,7 +1405,7 @@ class RemoteRun(unittest.TestCase):
                     lease.kill()
                     lease.wait()
 
-    def lease(self, base, *, slots=2, build="", slot_disk=0, figures=None):
+    def lease(self, base, *, slots=2, build="", slot_disk=0, figures=None, registry=""):
         if figures is None:
             figures = Path(base, "figures")
             write_figures(figures)
@@ -1411,6 +1414,7 @@ class RemoteRun(unittest.TestCase):
              "", build],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
             env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof")),
+                              "CAGENTS_BUILD_REGISTRY": str(registry),
                               "CAGENTS_OFFLOAD_SLOT_DISK_BYTES": str(slot_disk),
                               "CAGENTS_OFFLOAD_FIGURES": str(figures)})
         self.leases.append(lease)
@@ -1509,6 +1513,47 @@ class RemoteRun(unittest.TestCase):
                     lines.next(1.5)
                 write_figures(stand_in)
                 self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
+
+    def registered_elsewhere(self, registry, kib):
+        """A build in another slot family on this host, as scripts/cargo-gate
+        records one: its lock held, and its record naming that lock."""
+        registry.mkdir(exist_ok=True)
+        lock_path = registry.parent / "cagents-cargo.lock"
+        lock = open(lock_path, "a")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # Its holder has exited, so all of its cost is still to come.
+        (registry / "gate-1").write_text(f"0 {kib}\n0\n{lock_path}\n")
+        return lock
+
+    def test_a_build_in_another_slot_family_counts_as_running_beside_it(self):
+        with self.slots() as base, tempfile.TemporaryDirectory() as host:
+            registry = Path(host, "registry")
+            stand_in = Path(base, "figures")
+            write_figures(stand_in, available_gib=12)
+            # Alone in these slots, but not on the host: the other family's
+            # build is expected to need 4 GiB more, leaving too little for 9.
+            lock = self.registered_elsewhere(registry, 4 * 2**20)
+            _, lines = self.lease(base, figures=stand_in, registry=registry)
+            self.assertEqual(lines.next(10).split()[:2], ["wait", "memory"])
+            with self.assertRaises(TimeoutError):
+                lines.next(1.5)
+            # Once it ends, its record is stale and this one is alone.
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
+
+    def test_a_leased_slot_is_recorded_for_other_families_until_released(self):
+        with self.slots() as base, tempfile.TemporaryDirectory() as host:
+            registry = Path(host, "registry")
+            lease, lines = self.lease(base, registry=registry)
+            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
+            [entry] = registry.iterdir()
+            first, _since, lock = entry.read_text().splitlines()
+            self.assertEqual(lock, os.path.join(base, "slot-0", "lock"))
+            self.assertEqual(first, f"0 {9 * 2**20}")
+            lease.stdin.close()
+            lease.wait(timeout=10)
+            self.assertEqual(list(registry.iterdir()), [])
 
     def test_a_lone_build_starts_however_busy_the_host_is(self):
         with self.slots() as base:

@@ -653,8 +653,13 @@ def slot_indices(base):
 
 def leased(slot):
     """Whether a build holds `slot`."""
+    return leased_lock(os.path.join(slot, "lock"))
+
+
+def leased_lock(path):
+    """Whether something holds the lock file at `path`."""
     try:
-        with open(os.path.join(slot, "lock"), "a") as lock:
+        with open(path, "a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -677,6 +682,7 @@ def room(base, mine, cost):
         slot = os.path.join(base, f"slot-{index}")
         if slot != mine and leased(slot):
             others.append(claim(slot))
+    others += registered(base)
     if not others:
         return None
     pressure = memory_pressure()
@@ -693,6 +699,57 @@ def room(base, mine, cost):
     if available - outstanding >= cost:
         return None
     return f"memory {max(0, available - outstanding) / GIB:.1f} {cost / GIB:.1f} {len(others)}"
+
+
+# Where this host's builds record themselves, whichever slot family runs
+# them: scripts/cargo-gate's shared families here and these offloaded slots
+# each price the others' running builds beside their own. Empty disables it;
+# tests standing in for the build host name a private one.
+REGISTRY = os.environ.get("CAGENTS_BUILD_REGISTRY", f"/var/tmp/cagents-builds-{os.getuid()}")
+
+
+def registry_entry(slot):
+    return os.path.join(REGISTRY, "offload-" + hashlib.sha256(os.fsencode(slot)).hexdigest()[:16])
+
+
+def register(slot, cost, pid):
+    """Records the build in `slot` as the gate records its own: its holder,
+    expected cost in KiB, start in seconds since boot, and the lock it holds."""
+    if not REGISTRY:
+        return
+    try:
+        os.makedirs(REGISTRY, mode=0o700, exist_ok=True)
+        with open("/proc/uptime") as file:
+            since = int(float(file.read().split()[0]))
+        entry = registry_entry(slot)
+        with open(entry + ".new", "w") as file:
+            file.write(f"{pid or 0} {cost // 1024}\n{since}\n{os.path.join(slot, 'lock')}\n")
+        os.replace(entry + ".new", entry)
+    except OSError:
+        pass
+
+
+def registered(base):
+    """The expected cost and holder of each running build that another slot
+    family on this host recorded: one whose record's lock is held."""
+    found = []
+    try:
+        names = os.listdir(REGISTRY) if REGISTRY else []
+    except OSError:
+        return found
+    for name in names:
+        try:
+            with open(os.path.join(REGISTRY, name)) as file:
+                first, _since, lock = (file.read().splitlines() + ["", "", ""])[:3]
+            pid, kib = (int(field) for field in first.split())
+        except (OSError, ValueError):
+            continue
+        if not lock or os.path.commonpath([base, os.path.abspath(lock)]) == base:
+            continue
+        if not os.path.exists(lock) or not leased_lock(lock):
+            continue
+        found.append((kib * 1024, pid if pid > 0 and os.path.exists(f"/proc/{pid}") else None))
+    return found
 
 
 def enclosing_checkout(path):
@@ -720,6 +777,10 @@ if command == "lease":
         if leases:
             with open(os.path.join(leases[0], "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
+            try:
+                os.unlink(registry_entry(leases[0]))
+            except OSError:
+                pass
         os._exit(0)
     until_closed(release)
     # Waiters line up on a queue lock, and the one at its head takes the
@@ -823,6 +884,7 @@ if command == "lease":
     with open(os.path.join(slot, "claim.new"), "w") as file:
         json.dump({"cost": cost, "pid": None, "build": build, "key": key}, file)
     os.replace(os.path.join(slot, "claim.new"), os.path.join(slot, "claim"))
+    register(slot, cost, None)
     # At the head of the queue: the build starts once the memory it is
     # expected to need is free beside the builds already running here.
     waiting = None
@@ -967,6 +1029,7 @@ elif command == "run":
         json.dump({"cost": cost, "pid": os.getpid(), "build": claimed.get("build", ""),
                    "key": claimed.get("key", "")}, file)
     os.replace(os.path.join(base, "claim.new"), os.path.join(base, "claim"))
+    register(base, cost, os.getpid())
     os.chdir(os.path.join(base, "src", directory))
     environment = dict(os.environ, **environment)
     if "CARGO_BUILD_JOBS" not in environment:
