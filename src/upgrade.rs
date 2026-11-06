@@ -204,8 +204,8 @@ pub(crate) fn surviving_process(
 
 /// A process shows no arguments for a moment while it execs or exits, which on a
 /// machine that's building happens often enough that one scan alone would turn
-/// people away. Measured under build load, none lasted to a check 100ms later.
-/// A scan that never finishes still fails: unknown is not absent.
+/// people away. Each attempt scans everything again, so a process that keeps
+/// re-execing or stays unreadable can still fail the scan: unknown is not absent.
 #[cfg(any(feature = "host", feature = "ui"))]
 fn finish_process_scan<T>(mut scan: impl FnMut() -> Result<T, String>) -> Result<T, String> {
     const ATTEMPTS: usize = 4;
@@ -2454,6 +2454,31 @@ mod tests {
         fs::write(process.join("cmdline"), format!("browser-helper\0{id}\0")).unwrap();
         let error = ensure_no_surviving_process(&source, u32::MAX, directory.path()).unwrap_err();
         assert!(error.contains("agent session still has a live process"));
+    }
+
+    /// A zombie shows no arguments for as long as its parent leaves it, and it
+    /// has stopped running, so it mustn't block every Close and Retry.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn a_zombie_does_not_fail_a_process_scan_but_a_lasting_blank_process_does() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let process = directory.path().join("42");
+        fs::create_dir(&process).unwrap();
+        fs::write(process.join("cmdline"), b"").unwrap();
+
+        fs::write(process.join("stat"), "42 (sleep) Z 1 41 41 0").unwrap();
+        assert_eq!(
+            ensure_no_surviving_process(&source, u32::MAX, directory.path()),
+            Ok(())
+        );
+
+        fs::write(process.join("stat"), "42 (sleep) R 1 41 41 0").unwrap();
+        let error = ensure_no_surviving_process(&source, u32::MAX, directory.path()).unwrap_err();
+        assert!(
+            error.contains("cannot inspect process invocation (42)"),
+            "{error}"
+        );
     }
 
     #[cfg(any(feature = "host", feature = "ui"))]

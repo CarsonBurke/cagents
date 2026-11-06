@@ -672,6 +672,29 @@ mod tests {
         file
     }
 
+    /// A recovery that returns before the connection a test expected must fail
+    /// that test, not leave it waiting on the listener.
+    fn accept_within(listener: &UnixListener) -> std::os::unix::net::UnixStream {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        listener.set_nonblocking(true).unwrap();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "recovery never made the connection this test expected"
+                    );
+                    thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+
     fn discovery(
         socket: &Path,
         proof: HostSessionProof,
@@ -680,7 +703,7 @@ mod tests {
     ) -> thread::JoinHandle<()> {
         let listener = UnixListener::bind(socket).unwrap();
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = accept_within(&listener);
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
@@ -722,7 +745,7 @@ mod tests {
             // this connection. A newly returned plan must use a fresh handle.
             assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None);
             for _ in 0..probes {
-                listener.accept().unwrap();
+                accept_within(&listener);
             }
         })
     }
@@ -1213,10 +1236,10 @@ mod tests {
     fn retry_says_plainly_when_it_cannot_read_a_holder_record() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
-        let owner = proof("live");
-        let original = session(directory.path(), &owner);
-        let _lease = lease(directory.path(), &owner);
-        let server = discovery(&socket, owner, Vec::new(), 1);
+        let original = session(directory.path(), &proof("old"));
+        let replacement_proof = proof("replacement");
+        let _lease = lease(directory.path(), &replacement_proof);
+        let server = discovery(&socket, replacement_proof, Vec::new(), 1);
         let recovered = reconcile_with(original, true, &socket, directory.path(), |_, _| {
             Err("Permission denied (os error 13)".to_owned())
         });
@@ -1562,7 +1585,7 @@ mod tests {
     ) -> thread::JoinHandle<()> {
         let listener = UnixListener::bind(socket).unwrap();
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = accept_within(&listener);
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
@@ -1612,7 +1635,7 @@ mod tests {
                 .unwrap();
             }
             for _ in 0..inventory.owner_probes {
-                listener.accept().unwrap();
+                accept_within(&listener);
             }
         })
     }
