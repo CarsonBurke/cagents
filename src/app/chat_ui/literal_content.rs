@@ -21,31 +21,35 @@ pub(super) enum Prepared {
 ///
 /// A heading is one line saying what the notice is about. Claude Code names a
 /// command it was given no description for by the command itself, so a heredoc
-/// arrives as a heading thousands of lines long. Such a heading keeps the start
-/// of its first line, and the whole of it leads the body, which shows a few
-/// lines until the reader opens it.
+/// arrives as a heading thousands of lines long. Such a heading keeps only its
+/// first line and the rest leads the body, which shows a few lines until the
+/// reader opens it. A first line too long for a heading is cut, and then the
+/// body leads with the whole of it, so nothing is shown only in part.
 pub(super) fn notice_parts<'a>(
     summary: &'a str,
     body: &'a str,
 ) -> (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>) {
     let summary = summary.trim();
-    if !summary.contains(['\n', '\r']) && summary.chars().nth(view::NOTICE_HEADING_CHARS).is_none()
-    {
+    let (first, rest) = summary
+        .split_once(['\r', '\n'])
+        .map_or((summary, ""), |(first, rest)| {
+            (first.trim_end(), rest.trim_start_matches(['\r', '\n']))
+        });
+    let fits = first.chars().nth(view::NOTICE_HEADING_CHARS).is_none();
+    if fits && rest.is_empty() {
         return (summary.into(), body.into());
     }
-    let mut heading: String = summary
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim_end()
-        .chars()
-        .take(view::NOTICE_HEADING_CHARS)
-        .collect();
-    heading.push('…');
-    let full = if body.is_empty() {
-        summary.to_owned()
+    let (heading, lead) = if fits {
+        (first.to_owned(), rest)
     } else {
-        format!("{summary}\n\n{body}")
+        let mut heading: String = first.chars().take(view::NOTICE_HEADING_CHARS).collect();
+        heading.push('…');
+        (heading, summary)
+    };
+    let full = if body.is_empty() {
+        lead.to_owned()
+    } else {
+        format!("{lead}\n\n{body}")
     };
     (heading.into(), full.into())
 }

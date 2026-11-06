@@ -494,11 +494,14 @@ fn queue_key(press: &text_editor::KeyPress, empty: bool) -> bool {
 /// way a system notice is and read in sequence with what it interrupted.
 #[cfg(test)]
 fn visible_notice_body(body: &str, expanded: bool) -> String {
-    if !expanded && body.lines().count() > NOTICE_LINES {
+    if !expanded && (body.lines().count() > NOTICE_LINES || body.chars().count() > NOTICE_CHARS) {
         body.lines()
             .take(NOTICE_LINES)
             .collect::<Vec<_>>()
             .join("\n")
+            .chars()
+            .take(NOTICE_CHARS)
+            .collect()
     } else {
         body.to_owned()
     }

@@ -1903,17 +1903,22 @@ mod tests {
             "one\r\ntwo\r\nthree\r\n",
             "one\r\ntwo\r\nthree\r\nfour",
             "single huge line",
+            &*"a single line too long to read at a glance ".repeat(20),
         ] {
             let cancelled = AtomicBool::new(false);
             let prepared =
                 prompt::Prepared::with_policy(body, prompt::PreviewPolicy::Notice, &cancelled)
                     .unwrap();
-            let long = body.lines().count() > view::NOTICE_LINES;
+            let long = body.lines().count() > view::NOTICE_LINES
+                || body.chars().count() > view::NOTICE_CHARS;
             let expected = if long {
                 body.lines()
                     .take(view::NOTICE_LINES)
                     .collect::<Vec<_>>()
                     .join("\n")
+                    .chars()
+                    .take(view::NOTICE_CHARS)
+                    .collect()
             } else {
                 body.to_owned()
             };
@@ -1973,11 +1978,12 @@ mod tests {
             "def sample(path):\n    with open(path) as f:\n        return f.read()\n\n".repeat(160)
         );
         let one_line = format!("cargo test {}", "--features host ".repeat(200));
-        for (summary, body, heading) in [
+        for (summary, body, heading, lead) in [
             (
                 command.as_str(),
                 "",
-                "mkdir -p /var/tmp/fw16-audit && cat > /var/tmp/fw16-audit/sampler.py <<'EOF'…",
+                "mkdir -p /var/tmp/fw16-audit && cat > /var/tmp/fw16-audit/sampler.py <<'EOF'",
+                command.split_once('\n').unwrap().1,
             ),
             (
                 one_line.as_str(),
@@ -1989,6 +1995,7 @@ mod tests {
                         .take(view::NOTICE_HEADING_CHARS)
                         .collect::<String>()
                 ),
+                one_line.trim(),
             ),
         ] {
             let (mut runtime, _handle) = literal_runtime(ItemContent::Delivery {
@@ -2007,10 +2014,7 @@ mod tests {
             };
             assert_eq!(notice.summary.plain().as_ref(), heading);
             let full = notice.body.full.plain();
-            assert!(
-                full.starts_with(summary.trim()),
-                "the whole name stays on demand"
-            );
+            assert!(full.starts_with(lead), "the whole name stays on demand");
             assert!(full.ends_with(body));
             assert!(notice.body.long, "a long name folds until it is opened");
             let shown = notice.body.shown(false).plain();
@@ -2029,6 +2033,8 @@ mod tests {
             let (heading, shown) = literal_content::notice_parts(summary, body);
             assert_eq!((&*heading, &*shown), (summary, body));
         }
+        let (heading, shown) = literal_content::notice_parts("Done\r\n\r\nexit 0\r\n", "log");
+        assert_eq!((&*heading, &*shown), ("Done", "exit 0\n\nlog"));
         retirement_barrier();
     }
 
