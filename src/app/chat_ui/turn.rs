@@ -473,10 +473,10 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
                 target(*action, label)
             }
         }
-        ItemContent::Changes { changes, .. } => match changes.as_slice() {
+        ItemContent::Changes { changes, status } => match changes.as_slice() {
             // An edit whose input is still arriving: what it changes, and so
             // whether it adds or edits a file, is not known yet.
-            [] => "Preparing an edit",
+            [] if *status == ToolStatus::Running => "Preparing an edit",
             [single] => single.path.as_str(),
             _ => "File changes",
         },
@@ -561,8 +561,8 @@ pub(super) fn step_verb(content: &ItemContent) -> &'static str {
             chat::CommandAction::List => "Listed",
             chat::CommandAction::Run => "Ran",
         },
-        ItemContent::Changes { changes, .. } => match changes.as_slice() {
-            [] => "",
+        ItemContent::Changes { changes, status } => match changes.as_slice() {
+            [] if *status == ToolStatus::Running => "",
             [single] => match single.kind {
                 chat::ChangeKind::Added => "Added",
                 chat::ChangeKind::Deleted => "Deleted",
@@ -603,7 +603,11 @@ fn summarize_steps<'c, T: Borrow<Item>>(
             continue;
         }
         match &item.content {
-            ItemContent::Changes { changes, .. } if changes.is_empty() => preparing += 1,
+            ItemContent::Changes { changes, status }
+                if changes.is_empty() && *status == ToolStatus::Running =>
+            {
+                preparing += 1
+            }
             ItemContent::Changes { changes, .. } => {
                 edited.extend(changes.iter().map(|change| change.path.as_str()));
             }
@@ -1495,6 +1499,14 @@ mod tests {
         };
         assert_eq!(step_verb(&content), "");
         assert_eq!(step_label(&content), "Preparing an edit");
+        // One that ended without describing a change was never being prepared.
+        for status in [ToolStatus::Succeeded, ToolStatus::Failed] {
+            let content = ItemContent::Changes {
+                changes: Vec::new(),
+                status,
+            };
+            assert_ne!(step_label(&content), "Preparing an edit");
+        }
     }
 
     /// A group still preparing an edit says so, rather than summarizing only
