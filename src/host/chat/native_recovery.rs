@@ -568,6 +568,14 @@ pub(in crate::host) fn restore_orphaned_native(
             continue;
         }
         let result = if Handle::is_remote_record(&record) {
+            match super::retained_actor::finish_interrupted_exit(host, &record) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(session = %record.terminal, %error, "an interrupted exit could not be finished; holder evidence preserved");
+                    continue;
+                }
+            }
             Handle::inspect_remote(&record, proof.clone())
                 .and_then(|inspection| restore(host, 0, &inspection.source))
         } else {

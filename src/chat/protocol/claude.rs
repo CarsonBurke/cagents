@@ -2614,10 +2614,16 @@ impl Adapter for Claude {
             if self.session_id.is_none() {
                 self.session_id = Some(id.into());
             }
-            step.events.push(Event::Session {
-                id: id.into(),
-                title: None,
-            });
+            // SessionStart hooks and other system frames name the session
+            // before the CLI answers initialize. Only frames after it announce
+            // the session: a resume is confirmed by that answer, and a fresh
+            // conversation, as without hooks, by its first turn.
+            if self.ready {
+                step.events.push(Event::Session {
+                    id: id.into(),
+                    title: None,
+                });
+            }
         }
         match required(&frame, "type")? {
             "control_request" => return self.permission(frame),
@@ -10304,7 +10310,13 @@ mod tests {
             if let Some(replay) = replay {
                 frame["isReplay"] = json!(replay);
             }
-            let live = Claude::default().receive(frame.clone()).unwrap();
+            // A live summary arrives after initialize, so it names the session.
+            let live = Claude {
+                ready: true,
+                ..Default::default()
+            }
+            .receive(frame.clone())
+            .unwrap();
             let expected = context_item("summary:0".into(), body.into());
             assert!(
                 matches!(&live.events[..], [Event::Session { .. }, Event::Item(item)] if item == &expected),
@@ -13143,6 +13155,54 @@ mod tests {
         // `--session-id` names a conversation that does not exist on disk
         // until its first prompt, so nothing could resume it yet.
         assert!(!confirmed(false));
+    }
+
+    /// A SessionStart hook makes the CLI report its session on system hook
+    /// frames before it answers initialize. Those frames must not confirm the
+    /// resume, or the daemon would treat a still-opening provider as ready.
+    #[test]
+    fn hook_frames_before_initialize_do_not_confirm_a_resume() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let announces = |step: Step| {
+            step.events
+                .iter()
+                .any(|event| matches!(event, Event::Session { id: session, .. } if session == id))
+        };
+        for resumed in [true, false] {
+            let mut adapter = Claude {
+                session_id: Some(id.into()),
+                resumed,
+                ..Default::default()
+            };
+            let initialize = adapter.initialize().unwrap();
+            let request = initialize.writes[0]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            for subtype in ["hook_started", "hook_response"] {
+                let step = adapter
+                    .receive(json!({"type":"system","subtype":subtype,"uuid":subtype,"hook_name":"SessionStart","session_id":id}))
+                    .unwrap();
+                assert!(
+                    !announces(step),
+                    "{subtype} confirmed the session before initialize"
+                );
+            }
+            // A hook naming another conversation is still refused outright.
+            assert!(adapter
+                .receive(json!({"type":"system","subtype":"hook_started","uuid":"other","hook_name":"SessionStart","session_id":"00000000-0000-4000-8000-000000000002"}))
+                .is_err());
+            assert_eq!(
+                announces(adapter.receive(reply(&request, json!({}))).unwrap()),
+                resumed
+            );
+            // After initialize, frames name the session as before.
+            assert!(announces(
+                adapter
+                    .receive(json!({"type":"system","subtype":"hook_response","uuid":"late","hook_name":"SessionStart","session_id":id}))
+                    .unwrap()
+            ));
+        }
     }
 
     #[test]
