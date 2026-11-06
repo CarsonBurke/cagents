@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <focus><focusNew>yes</focusNew><followMouse>no</followMouse></focus>
+  <desktops><number>1</number></desktops>
+  <keyboard><keybind key="A-F4"><action name="Close"/></keybind></keyboard>
+  <applications><application class="*"><decor>no</decor><position force="yes"><x>0</x><y>0</y></position></application></applications>
+</openbox_config>
