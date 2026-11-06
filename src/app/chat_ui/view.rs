@@ -5,6 +5,8 @@ use super::*;
 enum ViewTransition {
     Idle,
     FirstStart,
+    /// A new provider is starting on the conversation of one that stopped.
+    Resuming,
     SessionChange,
 }
 
@@ -13,6 +15,9 @@ impl From<Option<&Phase>> for ViewTransition {
         match phase {
             None => Self::Idle,
             Some(Phase::SavingDraft { .. }) => Self::FirstStart,
+            Some(Phase::Starting(attempt)) if attempt.intent == chat::Intent::Resume => {
+                Self::Resuming
+            }
             Some(_) => Self::SessionChange,
         }
     }
@@ -2594,7 +2599,11 @@ impl Runtime {
         }
         // A draft starting for its first message says so on the message
         // itself.
-        if transitioning && self.queued.is_none() {
+        // A resume says so on its own control, beside what it is resuming.
+        if transitioning
+            && self.queued.is_none()
+            && !matches!(transition, ViewTransition::Resuming)
+        {
             content.push(body(match transition {
                 ViewTransition::FirstStart => "Starting this conversation… Editing and session controls are disabled. You can still read and copy the conversation.",
                 _ => "Switching or closing this session… Editing and session controls are disabled. You can still read and copy the conversation.",
@@ -2612,8 +2621,7 @@ impl Runtime {
             content.push(
                 widget::column::with_children(vec![
                     design::caption(CAPACITY_GUIDANCE).into(),
-                    widget::button::custom(design::caption("Retry"))
-                        .class(crate::ui_controls::control_style(false, None))
+                    crate::ui_controls::button::primary("Retry")
                         .on_press_maybe(enabled.then(|| {
                             action(if self.is_draft() {
                                 Action::Submit(target, PromptMode::Send)
@@ -2627,61 +2635,8 @@ impl Runtime {
                 .into(),
             );
         } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
-            let unresumable = self.offers_fresh_conversation();
-            let saved_history = self.has_connected_saved_history(snapshot);
-            let enabled = !transitioning
-                && self.pending.is_none()
-                && self.attachment_chooser_pending.is_none()
-                && self.pastes_pending == 0
-                && (!saved_history || !snapshot.history_loading);
-            let mut controls = vec![
-                crate::design::caption(if unresumable {
-                    // The provider's own sentence is already above this line,
-                    // so this says what it means for the card, and what the
-                    // second control does and does not do: the old
-                    // conversation is left alone, but this card stops being
-                    // the way back to it.
-                    "The saved conversation did not load. Retry resumes it, or start a new one beside it - the old conversation stays on disk, but this card stops pointing at it."
-                } else if snapshot.exited && self.session.owns_codex_listener() {
-                    "Chat attachment ended. The retained provider may still be running; your draft is retained."
-                } else if snapshot.exited {
-                    snapshot.read_only_reason.as_deref().unwrap_or(
-                        "Agent process exited. The transcript and draft are retained.",
-                    )
-                } else {
-                    "Disconnected. The daemon may still be working; your draft is retained."
-                })
-                .width(Length::Fill)
-                .into(),
-                if saved_history {
-                    widget::button::custom(design::caption("Resume conversation"))
-                        .class(crate::ui_controls::control_style(false, None))
-                        .on_press_maybe(enabled.then(|| action(Action::ResumeSaved(target))))
-                        .into()
-                } else { icon(
-                    Icon::Refresh,
-                    if unresumable {
-                        "Resume this conversation again"
-                    } else {
-                        "Reconnect to this session"
-                    },
-                    enabled,
-                    Action::Reconnect(target),
-                ) },
-            ];
-            if unresumable {
-                controls.push(icon(
-                    Icon::Plus,
-                    "Start a new conversation beside it",
-                    enabled,
-                    Action::StartFresh(target.card),
-                ));
-            }
             content.push(
-                widget::row::with_children(controls)
-                    .spacing(space::S)
-                    .align_y(Alignment::Center)
-                    .into(),
+                self.stopped_controls(transitioning, matches!(transition, ViewTransition::Resuming)),
             );
         }
         if let Some((url, instructions)) = &snapshot.open_url {
