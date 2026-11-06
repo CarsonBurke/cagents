@@ -54,9 +54,12 @@ const SETTLE_MARGIN: Duration = Duration::from_secs(1);
 /// about a minute: long enough for a busy journal to clear, and bounded for a
 /// helper that can never answer, such as one that already retired the input.
 const SETTLE_ATTEMPTS: u32 = 12;
-/// How long the helper is asked to settle an unconfirmed input at all. A
-/// helper that is alive but never answers in time, such as one wedged on its
-/// journal, is not counted by `SETTLE_ATTEMPTS`; this bounds it as well.
+/// How long new input waits on a helper that does not answer requests to
+/// settle an unconfirmed input. Missed answers are not counted toward
+/// `SETTLE_ATTEMPTS`, as the helper may return and settle it, but a helper
+/// that is alive and never answers in time, such as one wedged on its
+/// journal, would otherwise fence input for good. After this, new input is
+/// refused at once while the helper is still asked.
 const SETTLE_LIMIT: Duration = Duration::from_secs(120);
 // These reach the person through the chat pane, attached to a message, a
 // model choice or a stop. They say what happened to it and what to do; the
@@ -250,8 +253,9 @@ struct UncertainInput {
     settle_failures: u32,
     /// When the helper was first asked to settle the input.
     settling_since: Option<Instant>,
-    /// The helper cannot settle the input, so only a receipt it reports on
-    /// its own lifts the fence.
+    /// New input is refused at once rather than waiting for this one: the
+    /// helper cannot settle it, or has not answered for `SETTLE_LIMIT`. A
+    /// receipt for it still lifts the fence.
     unsettleable: bool,
 }
 impl UncertainInput {
@@ -1742,29 +1746,38 @@ impl RemoteActor {
             Ok(Err(_)) | Err(_) if settle => {
                 // The helper refused to settle it for now, such as on a busy
                 // journal, or did not answer; it is asked again after the
-                // backoff. Refusals are bounded in number. Missed answers are
-                // bounded only in time, as a helper that was unreachable may
-                // yet return and settle it, while one that is alive but never
-                // answers in time would otherwise fence input forever.
-                let exhausted = self
+                // backoff. After a bounded number of refusals it is no longer
+                // asked. A helper that does not answer is asked without
+                // limit, as it may return and settle the input, but new input
+                // stops waiting on it after `SETTLE_LIMIT`.
+                let (exhausted, overdue) = self
                     .0
                     .uncertain_input
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .as_mut()
                     .filter(|uncertain| uncertain.identity == identity)
-                    .is_some_and(|uncertain| {
+                    .map_or((false, false), |uncertain| {
                         if refused {
                             uncertain.settle_failures += 1;
                         }
-                        uncertain.settle_failures >= SETTLE_ATTEMPTS
-                            || uncertain
+                        let overdue = !uncertain.unsettleable
+                            && uncertain
                                 .settling_since
-                                .is_some_and(|since| since.elapsed() >= SETTLE_LIMIT)
+                                .is_some_and(|since| since.elapsed() >= SETTLE_LIMIT);
+                        uncertain.unsettleable |= overdue;
+                        (uncertain.settle_failures >= SETTLE_ATTEMPTS, overdue)
                     });
                 if exhausted {
                     self.stop_settling(&identity, "the retained actor kept failing to settle it");
                     return;
+                }
+                if overdue {
+                    tracing::warn!(
+                        sequence = identity.sequence,
+                        "the retained actor has not answered requests to settle an unconfirmed input; new input is refused"
+                    );
+                    self.0.input_settled.notify_all();
                 }
                 None
             }
@@ -6177,29 +6190,65 @@ exec /bin/sleep 60
         assert_eq!(unrun_input_outcome(QueueRefusal::Closed), CLOSING_INPUT);
         assert_eq!(unrun_input_outcome(QueueRefusal::Full), CROWDED_INPUT);
     }
+    /// A helper that does not answer requests to settle an input, whether
+    /// unreachable or wedged so each request times out, is not counted as
+    /// refusing them. After `SETTLE_LIMIT` new input stops waiting on it, but
+    /// it is still asked, so a helper that returns can still settle it.
     #[test]
-    fn a_helper_that_never_answers_is_asked_to_settle_for_a_bounded_time() {
+    fn new_input_stops_waiting_on_a_helper_that_never_answers() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-        let actor = RemoteActor::fixture_at(directory.path().join("actor.sock"));
-        let _response = actor.enqueue(None, Command::Refresh).unwrap();
+        let socket = directory.path().join("actor.sock");
+        let actor = RemoteActor::fixture_at(socket.clone());
+        let unknown = actor.enqueue(None, Command::Refresh).unwrap();
+        let expected = actor.pending_inputs().pop().unwrap();
         let settle_now = |actor: &RemoteActor| {
             let mut uncertain = actor.0.uncertain_input.lock().unwrap();
             let uncertain = uncertain.as_mut().unwrap();
             uncertain.acknowledgement_deadline = Instant::now();
             uncertain.retransmit.as_mut().unwrap().next = Instant::now();
         };
-        // Missed answers are not counted as refusals: the helper may return.
+        let state = |actor: &RemoteActor| {
+            let uncertain = actor.0.uncertain_input.lock().unwrap();
+            let uncertain = uncertain.as_ref().unwrap();
+            (
+                uncertain.settling_since.is_some(),
+                uncertain.settle_failures,
+                uncertain.unsettleable,
+                uncertain.retransmit.is_some(),
+            )
+        };
+        // An unreachable helper.
         for attempt in 1..=SETTLE_ATTEMPTS * 2 {
             settle_now(&actor);
             actor.resolve_uncertain_input();
-            let uncertain = actor.0.uncertain_input.lock().unwrap();
-            let uncertain = uncertain.as_ref().unwrap();
-            assert!(!uncertain.unsettleable, "still settleable at {attempt}");
-            assert_eq!(uncertain.settle_failures, 0);
+            assert_eq!(
+                state(&actor),
+                (true, 0, false, true),
+                "asked to settle, uncounted, at {attempt}"
+            );
         }
-        // A helper that never answers in time stops being asked after the
-        // limit, and new input is refused at once rather than fenced forever.
+        // A wedged helper takes the request and never answers it.
+        let listener = UnixListener::bind(&socket).unwrap();
+        let wedged = |listener: &UnixListener| {
+            let (stream, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&stream, TIMEOUT).unwrap();
+            assert_eq!(request.method, "abandon_input");
+            // Hold the connection until the proxy gives up on the answer.
+            let _ = stream.set_read_timeout(Some(TIMEOUT * 2));
+            let _ = std::io::Read::read(&mut &stream, &mut [0; 1]);
+        };
         settle_now(&actor);
+        thread::scope(|scope| {
+            let helper = scope.spawn(|| wedged(&listener));
+            actor.resolve_uncertain_input();
+            helper.join().unwrap();
+        });
+        assert_eq!(
+            state(&actor),
+            (true, 0, false, true),
+            "a timeout is uncounted"
+        );
+        // Past the limit, new input is refused at once.
         *actor
             .0
             .uncertain_input
@@ -6210,13 +6259,48 @@ exec /bin/sleep 60
             .settling_since
             .as_mut()
             .unwrap() -= SETTLE_LIMIT;
-        actor.resolve_uncertain_input();
+        settle_now(&actor);
+        thread::scope(|scope| {
+            let helper = scope.spawn(|| wedged(&listener));
+            actor.resolve_uncertain_input();
+            helper.join().unwrap();
+        });
+        assert_eq!(state(&actor), (true, 0, true, true), "refused, still asked");
         let started = Instant::now();
         assert_eq!(
             actor.enqueue(None, Command::Refresh).unwrap_err(),
             UNSETTLEABLE_INPUT
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refused at once"
+        );
+        // A helper that returns still settles it, which lifts the fence.
+        settle_now(&actor);
+        let settled = InputReceipt {
+            identity: expected.clone(),
+            state: InputState::Acknowledged(Err(UNCONFIRMED_INPUT.into())),
+        };
+        thread::scope(|scope| {
+            let helper = scope.spawn(|| {
+                let (stream, _) = listener.accept().unwrap();
+                let request: Invocation = receive(&stream, TIMEOUT).unwrap();
+                assert_eq!(request.method, "abandon_input");
+                send(
+                    &stream,
+                    &Ok::<Value, String>(serde_json::to_value(&settled).unwrap()),
+                    TIMEOUT,
+                )
+                .unwrap();
+            });
+            actor.resolve_uncertain_input();
+            helper.join().unwrap();
+        });
+        assert!(actor.0.uncertain_input.lock().unwrap().is_none());
+        assert_eq!(
+            unknown.try_recv(),
+            Ok(Err(Rejection::Refused(UNCONFIRMED_INPUT.into())))
+        );
     }
     /// A proxy attached to the real helper request handling, served one
     /// request at a time as the helper's serve loop runs them.

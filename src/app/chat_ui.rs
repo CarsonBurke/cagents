@@ -9052,7 +9052,7 @@ impl Cagents {
             } else if !snapshot.models.is_empty() || waited >= MODEL_PATIENCE {
                 queued.model = None;
                 runtime.note(format!(
-                    "This conversation does not offer {model}, so the message went to its default model."
+                    "This conversation does not offer {model}, so this message will use its default model."
                 ));
                 self.forget_chat_model(provider, &model);
             } else {
@@ -9119,14 +9119,15 @@ impl Cagents {
                     // be fine, so it stays on offer.
                     // Whether the message itself is sent is reported apart.
                     Some(outcome) if outcome.unknown => runtime.note(format!(
-                        "Claude hasn't confirmed the switch to {name} yet, so this message may not use it."
+                        "Claude hasn't confirmed the switch to {name} yet, so this message might not use it."
                     )),
                     Some(_) => runtime.note(format!(
                         "Claude didn't take the switch to {name}, so this message won't use it."
                     )),
                     None => {
+                        tracing::warn!(%error, "a queued model choice was refused");
                         runtime.note(format!(
-                            "{} could not be chosen ({error}), so the message went to the default model.",
+                            "{} couldn't be chosen, so this message won't use it.",
                             model.as_deref().unwrap_or("The model")
                         ));
                         if let Some(model) = model {
@@ -24326,7 +24327,7 @@ mod tests {
         for (outcome, said) in [
             (
                 chat::failure::delivery::UNACKNOWLEDGED_INPUT,
-                "hasn't confirmed the switch to gpt-b yet, so this message may not use it",
+                "hasn't confirmed the switch to gpt-b yet, so this message might not use it",
             ),
             (
                 chat::failure::delivery::UNCONFIRMED_INPUT,
