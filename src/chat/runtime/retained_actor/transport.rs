@@ -4555,7 +4555,9 @@ while IFS= read -r frame; do :; done
                 close.0.finish_close().unwrap();
             }
             assert!(!identity.record.root.is_current());
-            assert!(!identity.record.holder.is_current());
+            // The retirement proof sees the helper exit before its reaper
+            // collects it.
+            assert!(identity.record.holder.reaped());
             let retired = RemoteActor::retired_actor_receipt(&identity.record, &proof)
                 .unwrap()
                 .unwrap();

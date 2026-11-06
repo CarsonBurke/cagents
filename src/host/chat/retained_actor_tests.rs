@@ -2258,8 +2258,7 @@ fn sigkill_host_fixture(semantic_held: bool) {
             "successor cannot pass without exact original-parent collection"
         );
         assert!(
-            !receipt.identity.record.holder.is_current()
-                && !receipt.identity.record.root.is_current()
+            receipt.identity.record.holder.reaped() && !receipt.identity.record.root.is_current()
         );
         coordinator.successful = true;
         return;
@@ -2893,7 +2892,7 @@ fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provi
     );
     handle.close().unwrap();
     retained_actor::finish_close(&successor, &handle, &replacement).unwrap();
-    assert!(!identity.record.root.is_current() && !identity.record.holder.is_current());
+    assert!(!identity.record.root.is_current() && identity.record.holder.reaped());
     let registry = super::super::agent_execution::registry(&successor).unwrap();
     let retirement = registry
         .lock()
@@ -3108,7 +3107,7 @@ fn retired_helper_receipt_completes_after_host_sigkill_before_registry_commit() 
         // semantic ACKs and completes discovery teardown. Deliberately stop at
         // the next instruction boundary before the host's SQL receipt commit.
         handle.finish_retained_close().unwrap();
-        assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+        assert!(identity.record.holder.reaped() && !identity.record.root.is_current());
         assert!(
             registry
                 .lock()
@@ -3144,9 +3143,7 @@ fn retired_helper_receipt_completes_after_host_sigkill_before_registry_commit() 
     assert_eq!(role, "successor");
     let receipt: Receipt =
         serde_json::from_slice(&fs::read(root.join("retired-before-sql.json")).unwrap()).unwrap();
-    assert!(
-        !receipt.identity.record.holder.is_current() && !receipt.identity.record.root.is_current()
-    );
+    assert!(receipt.identity.record.holder.reaped() && !receipt.identity.record.root.is_current());
     let registry = super::super::agent_execution::registry(&host).unwrap();
     assert!(
         registry
@@ -3647,7 +3644,7 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
             super::native_cleanup::close_retained(&successor, &requested)
                 .is_err_and(|error| error.contains("fixture unattached retirement commit failure"))
         );
-        assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+        assert!(identity.record.holder.reaped() && !identity.record.root.is_current());
         let state = successor.lock().unwrap();
         assert!(
             state.chats.contains_key(&id),
@@ -3675,9 +3672,9 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
         drop(fault);
     }
     super::native_cleanup::close_retained(&successor, &requested).unwrap();
-    assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+    assert!(identity.record.holder.reaped() && !identity.record.root.is_current());
     if let Some(pair) = pair {
-        assert!(!pair.holder.is_current() && !pair.root.is_current());
+        assert!(pair.holder.reaped() && !pair.root.is_current());
     }
     let state = successor.lock().unwrap();
     assert!(!state.chats.contains_key(&id));
@@ -3792,7 +3789,7 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
         successor.lock().unwrap().chats.is_empty(),
         "resume preparation must not launch a provider"
     );
-    assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+    assert!(identity.record.holder.reaped() && !identity.record.root.is_current());
     assert_eq!(
         fs::read_to_string(root.join("prompts"))
             .unwrap()
@@ -4021,7 +4018,7 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
             assert!(error.is_none(), "{error:?}");
         }
         assert!(
-            !pair.holder.is_current() && !pair.root.is_current(),
+            pair.holder.reaped() && !pair.root.is_current(),
             "ordinary exit must stop the paired console"
         );
         assert!(

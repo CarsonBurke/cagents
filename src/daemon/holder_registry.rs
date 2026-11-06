@@ -38,6 +38,23 @@ impl Process {
     pub fn is_current(&self) -> bool {
         Self::read(self.pid).is_ok_and(|actual| actual == *self)
     }
+
+    /// Whether this exact process is gone within 15 seconds. Exit proofs, such
+    /// as a readable pidfd or a zombie state, come before the parent reaps the
+    /// process, and until then its `/proc` entry still names this identity.
+    /// How soon the reaper runs depends on scheduling, so a test asserting
+    /// absence after such a proof waits for it here.
+    #[cfg(test)]
+    pub fn reaped(&self) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while self.is_current() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        true
+    }
 }
 
 /// A process reaped between opening and reading its stat file fails the read
