@@ -3,7 +3,7 @@
 
 scripts/cargo-gate runs this before anything else. Rust compiles only on the
 host in CAGENTS_BUILD_REMOTE, unless that is `local` or names this host. A
-command that compiles leases one of a few fixed build slots there, copies the
+command that compiles leases a build slot there, copies the
 checkout's sources into it, and runs Cargo there with its output streamed
 back and its exit status kept. What a caller here expects from it comes back:
 executables, documentation, timing reports, artifact directories, fixes to
@@ -20,6 +20,7 @@ faithfully is refused with the reason.
 """
 
 import base64
+import hashlib
 import ipaddress
 import json
 import os
@@ -557,6 +558,19 @@ LARGEST = 9 * GIB
 # which a build waits rather than start beside others: tasks are already
 # stalling on reclaim.
 MEMORY_PRESSURE_LIMIT = 10
+# The least any build is priced at: even a check of one crate runs rustc and
+# Cargo beside the build's other processes.
+LEAST = 2 * GIB
+# CPU pressure (`some avg10` in /proc/pressure/cpu) at which a build waits
+# rather than start beside others: runnable tasks already wait this share of
+# the time, so another build would only slow the running ones.
+CPU_PRESSURE_LIMIT = 40
+# What a further slot's build output is expected to take on disk, beyond the
+# floor the host keeps free, before one is made. The variable is for tests
+# standing in for the build host; ssh does not pass it on.
+SLOT_DISK = int(os.environ.get("CAGENTS_OFFLOAD_SLOT_DISK_BYTES") or 50 * GIB)
+# How long a new slot is taken to be filling to that size.
+SLOT_FILLS = 12 * 3600
 
 
 def available_memory():
@@ -570,9 +584,9 @@ def available_memory():
     return None
 
 
-def memory_pressure():
+def memory_pressure(resource="memory"):
     try:
-        with open("/proc/pressure/memory") as file:
+        with open(f"/proc/pressure/{resource}") as file:
             for line in file:
                 if line.startswith("some "):
                     return float(line.split("avg10=")[1].split()[0])
@@ -605,40 +619,69 @@ def resident(roots):
     return held
 
 
-def claim(slot):
-    """What a leased slot's build is expected to need and the process its
-    command runs as, once it has started."""
+def read_claim(slot):
     try:
         with open(os.path.join(slot, "claim")) as file:
             claimed = json.load(file)
+        return claimed if isinstance(claimed, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def claim(slot):
+    """What a leased slot's build is expected to need and the process its
+    command runs as, once it has started."""
+    claimed = read_claim(slot)
+    try:
         return int(claimed.get("cost") or LARGEST), claimed.get("pid")
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError):
         return LARGEST, None
 
 
-def room(base, slots, mine, cost):
-    """None when a build expected to need `cost` bytes fits beside the builds
-    in the other leased slots, as scripts/cargo-gate admits builds on its
-    host: the memory available now, less what those builds are expected to
-    take beyond what they already hold, covers it, and the memory is not
-    under pressure. A lone build always fits. Otherwise why it waits."""
-    others = []
-    for index in range(slots):
-        slot = os.path.join(base, f"slot-{index}")
-        if slot == mine or not os.path.isdir(slot):
-            continue
+def slot_indices(base):
+    """The slots made so far, in order."""
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return []
+    return sorted(int(name[5:]) for name in names
+                  if name.startswith("slot-") and name[5:].isdigit())
+
+
+def leased(slot):
+    """Whether a build holds `slot`."""
+    try:
         with open(os.path.join(slot, "lock"), "a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                others.append(claim(slot))
-                continue
+                return True
             fcntl.flock(lock, fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return False
+
+
+def room(base, mine, cost):
+    """None when a build expected to need `cost` bytes fits beside the builds
+    in the other leased slots, as scripts/cargo-gate admits builds on its
+    host: the memory available now, less what those builds are expected to
+    take beyond what they already hold, covers it, and neither the memory nor
+    the CPUs are under pressure. A lone build always fits. Otherwise why it
+    waits."""
+    others = []
+    for index in slot_indices(base):
+        slot = os.path.join(base, f"slot-{index}")
+        if slot != mine and leased(slot):
+            others.append(claim(slot))
     if not others:
         return None
     pressure = memory_pressure()
     if pressure is not None and pressure >= MEMORY_PRESSURE_LIMIT:
         return f"pressure {pressure:.0f} {MEMORY_PRESSURE_LIMIT}"
+    pressure = memory_pressure("cpu")
+    if pressure is not None and pressure >= CPU_PRESSURE_LIMIT:
+        return f"cpu {pressure:.0f} {CPU_PRESSURE_LIMIT}"
     available = available_memory()
     if available is None:
         return None
@@ -661,14 +704,18 @@ def enclosing_checkout(path):
 if command == "lease":
     slots, key, floor = int(sys.argv[3]), sys.argv[4], int(sys.argv[5]) * 2**30
     profiles = sys.argv[6]
-    cost = int(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else LARGEST
+    cost = max(LEAST, int(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else LARGEST)
+    # The checkout and Cargo command this build is: another request for the
+    # same one waits for its slot rather than build it again elsewhere.
+    build = sys.argv[8] if len(sys.argv) > 8 else ""
     os.makedirs(base, exist_ok=True)
-    leased = []
+    leases = []
+    waiting_for = None
     def release():
         # The next build in this slot starts only once this one's command
         # has ended, however this host's side of it was stopped.
-        if leased:
-            with open(os.path.join(leased[0], "running"), "a") as running:
+        if leases:
+            with open(os.path.join(leases[0], "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
         os._exit(0)
     until_closed(release)
@@ -679,14 +726,18 @@ if command == "lease":
     marker = enclosing_checkout(temporary_directory(os.path.join(base, "slot-0")))
     if marker:
         say("marker", json.dumps(marker))
-    queue = open(os.path.join(base, "queue"), "a")
     announced = False
-    try:
-        fcntl.flock(queue, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        say("wait")
-        announced = True
-        fcntl.flock(queue, fcntl.LOCK_EX)
+    def join_queue():
+        global announced
+        queue = open(os.path.join(base, "queue"), "a")
+        try:
+            fcntl.flock(queue, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            say("wait")
+            announced = True
+            fcntl.flock(queue, fcntl.LOCK_EX)
+        return queue
+    queue = join_queue()
     def owner(index):
         try:
             with open(os.path.join(base, f"slot-{index}", "owner")) as file:
@@ -694,13 +745,53 @@ if command == "lease":
         except OSError:
             return ""
     # This checkout's last slot, then one another checkout built in, whose
-    # compiled dependencies it shares, then an empty one.
+    # compiled dependencies it shares, then an empty one. Up to `slots` are
+    # made, each only while the disk holds another build's output beside the
+    # floor; how many build at once is then down to memory and CPU, below.
     def built(index):
         return os.path.isdir(os.path.join(base, f"slot-{index}", "src", "target"))
-    order = sorted(range(slots), key=lambda index: (owner(index) != key, not built(index), index))
+    def free():
+        stat = os.statvfs(base)
+        return stat.f_bavail * stat.f_frsize
+    def candidates():
+        existing = slot_indices(base)
+        # The same build, running: once it ends, this one has nothing left
+        # to compile in its slot.
+        def claimed(index):
+            return read_claim(os.path.join(base, f"slot-{index}"))
+        same = [index for index in existing
+                if build and claimed(index).get("build") == build
+                and claimed(index).get("key") == key and leased(os.path.join(base, f"slot-{index}"))]
+        if same:
+            return same, "same"
+        indices = existing[:]
+        # The first slot is always made; the disk floor below governs it. A
+        # further one needs room for its build output beyond what the slots
+        # made lately have yet to take as they fill.
+        def growing(index):
+            try:
+                made = os.stat(os.path.join(base, f"slot-{index}", "made")).st_mtime
+            except OSError:
+                return False
+            return time.time() - made < SLOT_FILLS
+        pending = SLOT_DISK * sum(1 for index in existing if growing(index))
+        if not existing or len(existing) < slots and free() - floor - pending >= SLOT_DISK:
+            indices.append(max(existing, default=-1) + 1)
+        return sorted(indices, key=lambda index: (owner(index) != key, not built(index), index)), None
     while True:
-        for index in order:
+        order, why = candidates()
+        if why != "same" and queue.closed:
+            # The build it waited for has ended: back in line, behind the
+            # builds that went on meanwhile.
+            queue = join_queue()
+            order, why = candidates()
+        # A slot is taken only from the head of the queue: one that waited
+        # for the same build, once it ends, gets back in line first.
+        for index in order if why != "same" else ():
             slot = os.path.join(base, f"slot-{index}")
+            if not os.path.isdir(slot):
+                os.makedirs(os.path.join(slot, "src"), exist_ok=True)
+                open(os.path.join(slot, "made"), "a").close()
             os.makedirs(os.path.join(slot, "src"), exist_ok=True)
             lock = open(os.path.join(slot, "lock"), "a")
             try:
@@ -710,18 +801,30 @@ if command == "lease":
                 continue
             break
         else:
-            if not announced:
+            if why == "same":
+                # Out of the queue meanwhile, which other builds go on through.
+                queue.close()
+                if waiting_for != why:
+                    say("wait same")
+                    announced = True
+                    waiting_for = why
+            elif not announced:
                 say("wait")
                 announced = True
             time.sleep(0.5)
             continue
         break
-    leased.append(slot)
-    # Still at the head of the queue: the build starts once the memory it is
+    leases.append(slot)
+    # What this build is, at once, so that builds deciding meanwhile price it
+    # and do not take it for a build it is not.
+    with open(os.path.join(slot, "claim.new"), "w") as file:
+        json.dump({"cost": cost, "pid": None, "build": build, "key": key}, file)
+    os.replace(os.path.join(slot, "claim.new"), os.path.join(slot, "claim"))
+    # At the head of the queue: the build starts once the memory it is
     # expected to need is free beside the builds already running here.
     waiting = None
     while True:
-        why = room(base, slots, slot, cost)
+        why = room(base, slot, cost)
         if why is None:
             break
         if why.split()[0] != waiting:
@@ -729,9 +832,6 @@ if command == "lease":
             announced = True
             waiting = why.split()[0]
         time.sleep(1)
-    with open(os.path.join(slot, "claim.new"), "w") as file:
-        json.dump({"cost": cost, "pid": None}, file)
-    os.replace(os.path.join(slot, "claim.new"), os.path.join(slot, "claim"))
     queue.close()
     # A previous build's command or prune may outlive its lease's
     # connection; nothing in the slot changes until it has ended.
@@ -743,9 +843,6 @@ if command == "lease":
                 say("wait")
                 announced = True
             fcntl.flock(running, fcntl.LOCK_EX)
-    def free():
-        stat = os.statvfs(base)
-        return stat.f_bavail * stat.f_frsize
     if free() < floor:
         # This slot's build output is the one this build may discard.
         say("wait")
@@ -863,10 +960,22 @@ elif command == "run":
     # Builds admitted later price this one by what its processes hold.
     cost, _ = claim(base)
     with open(os.path.join(base, "claim.new"), "w") as file:
-        json.dump({"cost": cost, "pid": os.getpid()}, file)
+        claimed = read_claim(base)
+        json.dump({"cost": cost, "pid": os.getpid(), "build": claimed.get("build", ""),
+                   "key": claimed.get("key", "")}, file)
     os.replace(os.path.join(base, "claim.new"), os.path.join(base, "claim"))
     os.chdir(os.path.join(base, "src", directory))
     environment = dict(os.environ, **environment)
+    if "CARGO_BUILD_JOBS" not in environment:
+        # The CPUs shared by the builds running now, this one included, but
+        # never so few that one build's slow crates stall it.
+        builds = sum(leased(os.path.join(os.path.dirname(base), f"slot-{index}"))
+                     for index in slot_indices(os.path.dirname(base)))
+        # At most 8 and half the CPUs, as scripts/cargo-gate gives builds on
+        # its host: the memory builds are expected to need was measured so.
+        cpus = len(os.sched_getaffinity(0))
+        environment["CARGO_BUILD_JOBS"] = str(
+            min(max(4, cpus // max(1, builds)), max(4, min(8, cpus // 2))))
     # Temporary files go on disk in a directory of this slot's own, rather
     # than in the host's /tmp, which may be memory and which others use. The
     # path stays short: tests bind Unix sockets under it, whose paths are
@@ -1009,8 +1118,9 @@ class Offload:
         self.host = host
         self.plan = plan
         self.environment = environment
-        self.slots = positive(environment, "CAGENTS_BUILD_REMOTE_SLOTS", 3)
-        self.jobs = positive(environment, "CAGENTS_BUILD_REMOTE_JOBS", 6)
+        self.slots = positive(environment, "CAGENTS_BUILD_REMOTE_SLOTS", 8)
+        # Unset: the host shares its CPUs among the builds running there.
+        self.jobs = positive(environment, "CAGENTS_BUILD_REMOTE_JOBS", 0) or None
         self.floor = positive(environment, "CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB", 40)
         self.answer = positive(environment, "CAGENTS_BUILD_REMOTE_ANSWER_SECONDS", 30)
         self.retry = positive(environment, "CAGENTS_BUILD_REMOTE_RETRY_SECONDS", 15)
@@ -1197,13 +1307,31 @@ class Offload:
                     return 128 + self.cancelled, None
                 time.sleep(0.1)
 
+    def build_identity(self, directory):
+        """The Cargo command this is, run from `directory` of the checkout, for
+        a command that only builds there, without what only its tests take or
+        what only changes how Cargo reports; empty for one that also runs
+        tests there, which a request for the same build should not wait out."""
+        if self.plan.subcommand in ("test", "bench") and not self.plan.no_run:
+            return ""
+        options = [option for option in self.plan.options
+                   if option[0] is not None or self.plan.subcommand not in ("test", "bench")]
+        identity = json.dumps([self.plan.toolchain, self.plan.subcommand, directory, options,
+                               sorted((name, value) for name, value
+                                      in forwarded_environment(self.environment).items()
+                                      if not name.startswith(("CAGENTS_", "CARGO_TERM_"))
+                                      and name not in ("RUST_BACKTRACE", "RUST_LIB_BACKTRACE",
+                                                       "RUST_LOG"))])
+        return hashlib.sha256(identity.encode()).hexdigest()[:24]
+
     def try_lease(self, base, top, deadline):
         """("slot", path); ("waiting", why) when the host cannot take the build
         now; ("expired", None) when the admission budget ran out; or
         ("status"/"cancelled", exit status) when the command ends."""
         lease = self.lease = self.spawn(
             self.remote("lease", base, self.slots, f"{os.uname().nodename}:{top}", self.floor,
-                        profile_config(os.path.expanduser("~/.cargo/config.toml")), self.cost),
+                        profile_config(os.path.expanduser("~/.cargo/config.toml")), self.cost,
+                        self.build_identity(os.path.relpath(os.path.realpath(os.getcwd()), top))),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
         lines = Lines(lease.stdout)
@@ -1242,8 +1370,14 @@ class Offload:
                     elif reason == "pressure":
                         say(f"waiting for memory on {self.host}: its memory pressure is "
                             f"{words[2]}%, at or above the {words[3]}% limit")
+                    elif reason == "cpu":
+                        say(f"waiting for CPU on {self.host}: its CPU pressure is "
+                            f"{words[2]}%, at or above the {words[3]}% limit")
+                    elif reason == "same":
+                        say(f"waiting for the same build of this checkout on {self.host} to "
+                            f"finish, which leaves this one little to compile")
                     else:
-                        say(f"waiting for one of {self.slots} build slots on {self.host}")
+                        say(f"waiting for a build slot on {self.host}")
                 line = next_line(None)
         except AdmissionExpired:
             lease.kill()
@@ -1360,7 +1494,8 @@ class Offload:
         root = next((package for package in metadata.get("packages", [])
                      if os.path.dirname(os.path.realpath(package["manifest_path"])) == workspace),
                     None)
-        environment["CARGO_BUILD_JOBS"] = str(self.jobs)
+        if self.jobs:
+            environment["CARGO_BUILD_JOBS"] = str(self.jobs)
         environment.setdefault("CARGO_TERM_PROGRESS_WHEN", "never")
         if sys.stderr.isatty():
             environment.setdefault("CARGO_TERM_COLOR", "always")

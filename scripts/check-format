@@ -15,6 +15,7 @@ cargo fmt --check || cargo_status=$?
 included_status=0
 set -- --edition 2024 --check \
     src/modules.rs \
+    src/app/repository_clone_lsp_ownership_tests.rs \
     src/control/handshake_deadline_tests.rs \
     src/terminal/worker/bounded_input_tests.rs \
     src/host/model/views/placement_tests.rs \
