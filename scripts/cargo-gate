@@ -14,7 +14,7 @@ set -eu
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=10
+gate_version=11
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -91,9 +91,10 @@ when that is newer. Run inside a checkout whose origin/main has changed the
 gate since the installed one's commit, the gate first installs main's.
 
 A checkout whose Cargo build directory has never been built is first seeded
-from the main checkout's with scripts/seed-build-dir. When the file system
-holding build directories runs low, scripts/build-disk-guard first reclaims
-removed worktrees' build directories, and refuses the build below a floor.
+from the main checkout's with scripts/seed-build-dir. Every few hours, and
+at once when the file system holding build directories runs low,
+scripts/build-disk-guard runs scripts/prune-build-dirs, which removes Cargo
+build output nothing has used for a week; below a floor it refuses the build.
 
 Environment:
   CAGENTS_BUILD_REMOTE   Host that compiles (default fw16); `local` builds here
@@ -1052,8 +1053,9 @@ fi
 # A new worktree's build directory starts from the main checkout's compiled
 # dependencies instead of empty, so it neither builds them all again nor
 # shares a build directory with another worktree. Copying needs no slot.
-# Before either, a file system running out of room for build directories
-# reclaims removed worktrees' or refuses the build.
+# Before either, the disk guard prunes unused build output on its schedule,
+# and a file system running out of room for build directories prunes at once
+# or refuses the build.
 guard=$here/build-disk-guard
 seed=$here/seed-build-dir
 if [ -x "$guard" ] || [ -x "$seed" ]; then
