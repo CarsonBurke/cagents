@@ -454,9 +454,25 @@ where
                                 let position =
                                     window_attributes.position.take();
 
-                                let window = event_loop
-                                    .create_window(window_attributes)
-                                    .expect("Create window");
+                                let window =
+                                    event_loop.create_window(window_attributes);
+                                let window = if on_open.is_configured() {
+                                    match window {
+                                        Ok(window) => window,
+                                        Err(error) => {
+                                            self.process_event(
+                                                event_loop,
+                                                Some(Event::WindowOpenFailed {
+                                                    on_open,
+                                                    error: runtime::window::OpenError::NativeCreation(error.to_string()),
+                                                }),
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    window.expect("Create window")
+                                };
 
                                 #[cfg(target_os = "macos")]
                                 if let Some(position) = position {
@@ -516,25 +532,40 @@ where
                                     window.clone(),
                                 );
 
-                                self.process_event(
-                                    event_loop,
-                                    Some(Event::WindowCreated {
-                                        id,
-                                        window,
-                                        exit_on_close_request,
-                                        make_visible: visible,
-                                        on_open,
-                                        resize_border,
-                                    }),
-                                );
+                                let created = Event::WindowCreated {
+                                    id,
+                                    window,
+                                    exit_on_close_request,
+                                    make_visible: visible,
+                                    on_open,
+                                    resize_border,
+                                };
                                 #[cfg(feature = "a11y")]
-                                self.process_event(
-                                    event_loop,
-                                    Some(Event::A11yAdapter(
-                                        id,
-                                        self.adapters[&id].0,
-                                    )),
-                                );
+                                {
+                                    let node = dispatch_then_registered(
+                                        self,
+                                        |runner| {
+                                            runner.process_event(
+                                                event_loop,
+                                                Some(created),
+                                            )
+                                        },
+                                        |runner| {
+                                            runner
+                                                .adapters
+                                                .get(&id)
+                                                .map(|adapter| adapter.0)
+                                        },
+                                    );
+                                    if let Some(node) = node {
+                                        self.process_event(
+                                            event_loop,
+                                            Some(Event::A11yAdapter(id, node)),
+                                        );
+                                    }
+                                }
+                                #[cfg(not(feature = "a11y"))]
+                                self.process_event(event_loop, Some(created));
                             }
                             Control::Exit => {
                                 self.process_event(
@@ -727,12 +758,16 @@ where
 }
 
 enum Event<Message: 'static> {
+    WindowOpenFailed {
+        on_open: OpenCompletion,
+        error: runtime::window::OpenError,
+    },
     WindowCreated {
         id: window::Id,
         window: Arc<dyn winit::window::Window>,
         exit_on_close_request: bool,
         make_visible: bool,
-        on_open: oneshot::Sender<window::Id>,
+        on_open: OpenCompletion,
         resize_border: u32,
     },
     Exit,
@@ -764,7 +799,7 @@ enum Control {
         settings: window::Settings,
         title: String,
         monitor: Option<winit::monitor::MonitorHandle>,
-        on_open: oneshot::Sender<window::Id>,
+        on_open: OpenCompletion,
         scale_factor: f64,
     },
     SetAutomaticWindowTabbing(bool),
@@ -781,6 +816,76 @@ enum Control {
     AboutToWait,
     Winit(winit::window::WindowId, winit::event::WindowEvent),
     StartDnd,
+}
+
+// Recursive dispatch may remove the original adapter. Query only its current
+// registration after dispatch, never a pre-dispatch snapshot.
+#[cfg(any(feature = "a11y", test))]
+fn dispatch_then_registered<S, R>(
+    state: &mut S,
+    dispatch: impl FnOnce(&mut S),
+    registered: impl FnOnce(&S) -> Option<R>,
+) -> Option<R> {
+    dispatch(state);
+    registered(state)
+}
+
+enum OpenCompletion {
+    Legacy(oneshot::Sender<window::Id>),
+    Configured(oneshot::Sender<Result<window::Id, runtime::window::OpenError>>),
+}
+
+impl OpenCompletion {
+    fn is_configured(&self) -> bool {
+        matches!(self, Self::Configured(_))
+    }
+
+    fn opened(self, id: window::Id) {
+        match self {
+            Self::Legacy(sender) => {
+                let _ = sender.send(id);
+            }
+            Self::Configured(sender) => {
+                let _ = sender.send(Ok(id));
+            }
+        }
+    }
+
+    fn failed(
+        self,
+        error: runtime::window::OpenError,
+        keep_alive_for_failed_open: &mut bool,
+        no_windows: bool,
+    ) {
+        if let Self::Configured(sender) = self {
+            // Retain the loop before waking the result task. Otherwise the
+            // failed native window's Destroyed event can exit a non-daemon
+            // program before it consumes this result.
+            *keep_alive_for_failed_open |= no_windows;
+            let _ = sender.send(Err(error));
+        }
+    }
+}
+
+fn configured_surface_error(
+    error: compositor::SurfaceInitError,
+) -> runtime::window::OpenError {
+    match error {
+        compositor::SurfaceInitError::Unsupported => {
+            runtime::window::OpenError::Unsupported
+        }
+        compositor::SurfaceInitError::ZeroSize => {
+            runtime::window::OpenError::ZeroSize
+        }
+        compositor::SurfaceInitError::Graphics(
+            graphics::Error::BackendError(detail),
+        ) => runtime::window::OpenError::GraphicsInitialization(detail),
+        compositor::SurfaceInitError::Graphics(error) => {
+            runtime::window::OpenError::GraphicsInitialization(
+                error.to_string(),
+            )
+        }
+    }
 }
 
 // Parameters drop in reverse order. Drop the program and its cancellation
@@ -823,6 +928,9 @@ async fn run_instance<P>(
         <<P as Program>::Renderer as compositor::Default>::Compositor,
     > = WindowManager::new();
     let mut is_window_opening = !is_daemon;
+    // A checked failure with no window must reach the program. Its consumer
+    // chooses an explicit exit or another open; legacy opens never set this.
+    let mut keep_alive_for_failed_open = false;
 
     let mut compositor = None;
     let mut events = Vec::new();
@@ -916,6 +1024,14 @@ async fn run_instance<P>(
         };
 
         match event {
+            Event::WindowOpenFailed { on_open, error } => {
+                is_window_opening = false;
+                on_open.failed(
+                    error,
+                    &mut keep_alive_for_failed_open,
+                    window_manager.is_empty(),
+                );
+            }
             Event::WindowCreated {
                 id,
                 window,
@@ -924,6 +1040,20 @@ async fn run_instance<P>(
                 on_open,
                 resize_border,
             } => {
+                if on_open.is_configured() {
+                    let size = window.surface_size();
+                    if size.width == 0 || size.height == 0 {
+                        #[cfg(feature = "a11y")]
+                        let _ = control_sender.start_send(Control::Cleanup(id));
+                        is_window_opening = false;
+                        on_open.failed(
+                            runtime::window::OpenError::ZeroSize,
+                            &mut keep_alive_for_failed_open,
+                            window_manager.is_empty(),
+                        );
+                        continue;
+                    }
+                }
                 #[cfg(wayland_platform)]
                 platform_specific_handler.send_wayland(
                     platform_specific::Action::TrackWindow(window.clone(), id),
@@ -945,6 +1075,26 @@ async fn run_instance<P>(
                             compositor = Some(comp);
                         }
                         Err(error) => {
+                            if on_open.is_configured() {
+                                #[cfg(wayland_platform)]
+                                platform_specific_handler.send_wayland(
+                                    platform_specific::Action::RemoveWindow(id),
+                                );
+                                #[cfg(feature = "a11y")]
+                                let _ = control_sender
+                                    .start_send(Control::Cleanup(id));
+                                is_window_opening = false;
+                                on_open.failed(
+                                    configured_surface_error(
+                                        compositor::SurfaceInitError::Graphics(
+                                            error,
+                                        ),
+                                    ),
+                                    &mut keep_alive_for_failed_open,
+                                    window_manager.is_empty(),
+                                );
+                                continue;
+                            }
                             control_sender
                                 .start_send(Control::Crash(
                                     Error::GraphicsCreationFailed(error),
@@ -971,15 +1121,45 @@ async fn run_instance<P>(
                 let is_first = window_manager.is_empty();
                 let compositor: &mut <<P as Program>::Renderer as compositor::Default>::Compositor =
                     compositor.as_mut().expect("Compositor must be initialized");
-                let window = window_manager.insert(
-                    id,
-                    window,
-                    &program,
-                    compositor,
-                    exit_on_close_request,
-                    system_theme,
-                    resize_border,
-                );
+                let window = if on_open.is_configured() {
+                    match window_manager.try_insert_configured(
+                        id,
+                        window,
+                        &program,
+                        compositor,
+                        exit_on_close_request,
+                        system_theme,
+                        resize_border,
+                    ) {
+                        Ok(window) => window,
+                        Err(error) => {
+                            #[cfg(wayland_platform)]
+                            platform_specific_handler.send_wayland(
+                                platform_specific::Action::RemoveWindow(id),
+                            );
+                            #[cfg(feature = "a11y")]
+                            let _ =
+                                control_sender.start_send(Control::Cleanup(id));
+                            is_window_opening = false;
+                            on_open.failed(
+                                error,
+                                &mut keep_alive_for_failed_open,
+                                is_first,
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    window_manager.insert(
+                        id,
+                        window,
+                        &program,
+                        compositor,
+                        exit_on_close_request,
+                        system_theme,
+                        resize_border,
+                    )
+                };
 
                 window.raw.set_theme(conversion::window_theme(
                     window.state.theme_mode(),
@@ -1032,7 +1212,8 @@ async fn run_instance<P>(
                     );
                 }
 
-                let _ = on_open.send(id);
+                keep_alive_for_failed_open = false;
+                on_open.opened(id);
                 is_window_opening = false;
             }
             Event::NewEvents(event::StartCause::Init) => {
@@ -1362,6 +1543,7 @@ async fn run_instance<P>(
                 if !is_daemon
                     && matches!(event, winit::event::WindowEvent::Destroyed)
                     && !is_window_opening
+                    && !keep_alive_for_failed_open
                     && window_manager.is_empty()
                 {
                     runtime.track(None.into_iter());
@@ -2188,11 +2370,26 @@ where
                         title: program.title(id),
                         scale_factor: program.scale_factor(id),
                         monitor,
-                        on_open: channel,
+                        on_open: OpenCompletion::Legacy(channel),
                     })
                     .expect("Send control action");
 
                 *is_window_opening = true;
+            }
+            window::Action::OpenConfigured(id, settings, channel) => {
+                let monitor = window_manager.last_monitor();
+                let completion = OpenCompletion::Configured(channel);
+                let control = Control::CreateWindow {
+                    id,
+                    settings,
+                    title: program.title(id),
+                    scale_factor: program.scale_factor(id),
+                    monitor,
+                    on_open: completion,
+                };
+                // A closed control channel drops the sender. open_configured
+                // reports Canceled, never an inferred graphics failure.
+                *is_window_opening = control_sender.start_send(control).is_ok();
             }
             window::Action::Close(id) => {
                 let _ = ui_caches.remove(&id);
@@ -2875,3 +3072,100 @@ mod control_flow_tests {
 pub use program::Program;
 
 pub use platform_specific::*;
+
+#[cfg(test)]
+mod configured_open_tests {
+    use super::*;
+
+    #[test]
+    fn adapter_registration_is_checked_after_recursive_dispatch() {
+        let mut adapters = std::collections::BTreeMap::from([(7_u64, 11_u64)]);
+        assert_eq!(
+            dispatch_then_registered(
+                &mut adapters,
+                |adapters| {
+                    adapters.remove(&7);
+                },
+                |adapters| adapters.get(&7).copied()
+            ),
+            None
+        );
+        adapters.insert(7, 11);
+        assert_eq!(
+            dispatch_then_registered(
+                &mut adapters,
+                |adapters| {
+                    adapters.insert(7, 13);
+                },
+                |adapters| adapters.get(&7).copied()
+            ),
+            Some(13)
+        );
+    }
+
+    #[test]
+    fn checked_surface_categories_and_completions_stay_distinct() {
+        assert_eq!(
+            configured_surface_error(compositor::SurfaceInitError::ZeroSize),
+            runtime::window::OpenError::ZeroSize
+        );
+        assert_eq!(
+            configured_surface_error(compositor::SurfaceInitError::Unsupported),
+            runtime::window::OpenError::Unsupported
+        );
+        assert!(matches!(
+            configured_surface_error(compositor::SurfaceInitError::Graphics(
+                graphics::Error::NoAvailablePixelFormat
+            )),
+            runtime::window::OpenError::GraphicsInitialization(_),
+        ));
+        for error in [
+            runtime::window::OpenError::NativeCreation("fixture".into()),
+            runtime::window::OpenError::GraphicsInitialization(
+                "fixture".into(),
+            ),
+            runtime::window::OpenError::ZeroSize,
+            runtime::window::OpenError::Unsupported,
+            runtime::window::OpenError::Canceled,
+        ] {
+            let (sender, mut receiver) = oneshot::channel();
+            let mut keep_alive = false;
+            OpenCompletion::Configured(sender).failed(
+                error.clone(),
+                &mut keep_alive,
+                true,
+            );
+            assert!(
+                keep_alive,
+                "the empty-window loop must survive result delivery"
+            );
+            assert_eq!(receiver.try_recv().unwrap(), Some(Err(error)));
+        }
+    }
+
+    #[test]
+    fn legacy_and_checked_completions_keep_their_original_window_id() {
+        let mut keep_alive = false;
+        let (sender, mut receiver) = oneshot::channel();
+        OpenCompletion::Configured(sender).failed(
+            runtime::window::OpenError::ZeroSize,
+            &mut keep_alive,
+            false,
+        );
+        assert!(
+            !keep_alive,
+            "an existing window already keeps the loop alive"
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            Some(Err(runtime::window::OpenError::ZeroSize))
+        );
+        let id = window::Id::unique();
+        let (sender, mut receiver) = oneshot::channel();
+        OpenCompletion::Legacy(sender).opened(id);
+        assert_eq!(receiver.try_recv().unwrap(), Some(id));
+        let (sender, mut receiver) = oneshot::channel();
+        OpenCompletion::Configured(sender).opened(id);
+        assert_eq!(receiver.try_recv().unwrap(), Some(Ok(id)));
+    }
+}

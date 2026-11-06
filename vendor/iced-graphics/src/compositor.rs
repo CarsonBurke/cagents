@@ -52,6 +52,19 @@ pub trait Compositor: Sized {
         height: u32,
     ) -> Self::Surface;
 
+    /// Creates and configures the initial, nonzero window surface.
+    ///
+    /// Unlike [`Self::create_surface`], success explicitly means initial
+    /// configuration has completed. Backends must opt into this contract.
+    fn try_create_configured_surface<W: Window + Clone>(
+        &mut self,
+        _window: W,
+        _width: u32,
+        _height: u32,
+    ) -> Result<Self::Surface, SurfaceInitError> {
+        Err(SurfaceInitError::Unsupported)
+    }
+
     /// Configures a new [`Surface`] with the given dimensions.
     ///
     /// [`Surface`]: Self::Surface
@@ -160,6 +173,20 @@ pub enum SurfaceError {
     NoDamage,
 }
 
+/// A failure before an initial window surface has been configured.
+#[derive(Clone, PartialEq, Eq, Debug, Error)]
+pub enum SurfaceInitError {
+    /// The backend has not implemented checked initial configuration.
+    #[error("checked initial surface configuration is unsupported")]
+    Unsupported,
+    /// A zero-sized surface cannot be configured.
+    #[error("the initial surface has zero physical size")]
+    ZeroSize,
+    /// The backend could not create or configure the surface.
+    #[error("initial surface configuration failed: {0}")]
+    Graphics(#[from] Error),
+}
+
 /// Contains information about the graphics (e.g. graphics adapter, graphics backend).
 #[derive(Debug)]
 pub struct Information {
@@ -235,4 +262,32 @@ impl Compositor for () {
 #[cfg(debug_assertions)]
 impl Default for () {
     type Compositor = ();
+}
+
+#[cfg(all(test, debug_assertions))]
+mod configured_surface_tests {
+    use super::*;
+    use raw_window_handle::{DisplayHandle, HandleError, WindowHandle};
+
+    #[derive(Clone)]
+    struct NoWindow;
+
+    impl HasWindowHandle for NoWindow {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            Err(HandleError::Unavailable)
+        }
+    }
+    impl HasDisplayHandle for NoWindow {
+        fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+            Err(HandleError::Unavailable)
+        }
+    }
+
+    #[test]
+    fn unchecked_compositors_cannot_claim_initial_configuration() {
+        assert_eq!(
+            ().try_create_configured_surface(NoWindow, 640, 480),
+            Err(SurfaceInitError::Unsupported),
+        );
+    }
 }
