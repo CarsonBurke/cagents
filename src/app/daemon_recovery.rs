@@ -289,7 +289,14 @@ fn reconcile_with(
             }
         }
     }
-    if let Some(survivor) = crate::upgrade::surviving_process(&session, owner, proc_root)? {
+    if let Some(survivor) = crate::upgrade::surviving_process(&session, owner, proc_root)
+        .map_err(|error| {
+            tracing::warn!(%error, terminal = %session.id, "could not finish the process check for Retry");
+            format!(
+                "Cagents couldn't check every running process, {NOTHING_STARTED}: this terminal may still be running. Try Retry again in a moment. If this keeps happening, leave the pane in place."
+            )
+        })?
+    {
         return Err(survivor_refusal(
             &survivor,
             NOTHING_STARTED,
@@ -1256,6 +1263,29 @@ mod tests {
         assert!(!error.contains(&id.to_string()), "{error}");
     }
 
+    /// A process that stays unreadable is unknown, and the reader gets words about
+    /// what to do, not the scan's own error.
+    #[test]
+    fn retry_says_plainly_when_it_cannot_check_every_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let original = session(directory.path(), &proof("old"));
+        let process = directory.path().join("42");
+        fs::create_dir(&process).unwrap();
+        fs::write(process.join("stat"), b"42 (sleep) R 1 42 42").unwrap();
+        fs::write(process.join("cmdline"), b"").unwrap();
+        let replacement_proof = proof("replacement");
+        let _lease = lease(directory.path(), &replacement_proof);
+        let server = discovery(&socket, replacement_proof, Vec::new(), 1);
+        let error = reconcile_at(original, true, &socket, directory.path())
+            .err()
+            .unwrap();
+        server.join().unwrap();
+        assert!(is_retry_refusal(&error), "{error}");
+        assert!(!error.contains("cannot inspect"), "{error}");
+        assert!(!error.contains("42"), "{error}");
+    }
+
     #[test]
     fn explicit_retry_does_not_override_missing_daemon_ownership() {
         let directory = tempfile::tempdir().unwrap();
@@ -1291,7 +1321,7 @@ mod tests {
             result
                 .err()
                 .unwrap()
-                .contains("cannot inspect process ancestry")
+                .contains("couldn't check every running process")
         );
     }
 

@@ -199,6 +199,36 @@ pub(crate) fn surviving_process(
     owner: u32,
     proc_root: &Path,
 ) -> Result<Option<SurvivingProcess>, String> {
+    finish_process_scan(|| scan_for_survivor(session, owner, proc_root))
+}
+
+/// A process shows no arguments for a moment while it execs or exits, which on a
+/// machine that's building happens often enough that one scan alone would turn
+/// people away. Measured under build load, none lasted to a check 100ms later.
+/// A scan that never finishes still fails: unknown is not absent.
+#[cfg(any(feature = "host", feature = "ui"))]
+fn finish_process_scan<T>(mut scan: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    const ATTEMPTS: usize = 4;
+    const WAIT: std::time::Duration = if cfg!(test) {
+        std::time::Duration::from_millis(1)
+    } else {
+        std::time::Duration::from_millis(100)
+    };
+    for _ in 1..ATTEMPTS {
+        match scan() {
+            Err(_) => std::thread::sleep(WAIT),
+            finished => return finished,
+        }
+    }
+    scan()
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn scan_for_survivor(
+    session: &TerminalSession,
+    owner: u32,
+    proc_root: &Path,
+) -> Result<Option<SurvivingProcess>, String> {
     use std::collections::HashMap;
     let mut processes = HashMap::new();
     let mut starts = HashMap::new();
@@ -2424,6 +2454,38 @@ mod tests {
         fs::write(process.join("cmdline"), format!("browser-helper\0{id}\0")).unwrap();
         let error = ensure_no_surviving_process(&source, u32::MAX, directory.path()).unwrap_err();
         assert!(error.contains("agent session still has a live process"));
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn a_process_scan_gets_past_a_moment_of_exec_but_not_a_lasting_unknown() {
+        let mut scans = 0;
+        let finished = finish_process_scan(|| {
+            scans += 1;
+            if scans < 3 {
+                Err("cannot inspect process invocation (42)".to_owned())
+            } else {
+                Ok(None::<u32>)
+            }
+        });
+        assert_eq!(finished, Ok(None));
+        assert_eq!(scans, 3);
+
+        let mut scans = 0;
+        let unknown = finish_process_scan::<()>(|| {
+            scans += 1;
+            Err("cannot inspect process invocation (42)".to_owned())
+        });
+        assert!(unknown.is_err(), "unknown is not absent");
+        assert_eq!(scans, 4);
+
+        let mut scans = 0;
+        let found = finish_process_scan(|| {
+            scans += 1;
+            Ok::<_, String>(Some(42))
+        });
+        assert_eq!(found, Ok(Some(42)));
+        assert_eq!(scans, 1, "a finished scan isn't repeated");
     }
 
     #[cfg(any(feature = "host", feature = "ui"))]
