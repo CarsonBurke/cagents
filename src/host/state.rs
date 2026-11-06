@@ -1337,7 +1337,7 @@ impl HostState {
             .any(|id| *id != predecessor && self.is_live(id))
     }
 
-    fn is_live(&self, id: &TerminalId) -> bool {
+    pub(super) fn is_live(&self, id: &TerminalId) -> bool {
         self.terminals
             .get(id)
             .is_some_and(|record| record.running || !record.handle.is_completed())
