@@ -55,6 +55,11 @@ case ${1:-} in
 esac
 directory=$1
 build_dir=$1
+# This build may wait for a slot before it writes here; meanwhile another
+# build's pruner must not find its build directory idle.
+if [ -f "$build_dir/.rustc_info.json" ] || [ -f "$build_dir/CACHEDIR.TAG" ]; then
+    touch -- "$build_dir/.cagents-gate-used" 2>/dev/null || :
+fi
 floor=${CAGENTS_BUILD_FREE_FLOOR_GIB:-}
 case $floor in
     0) exit 0 ;;
@@ -124,12 +129,6 @@ if [ -z "$prune" ] && [ -x "$here/prune-build-dirs" ]; then
     prune="$pruner --orphan-hours 0 --budget $budget --wait"
 fi
 
-# This build may wait for a slot before it writes here; meanwhile another
-# build's pruner must not find its build directory idle.
-if [ -f "$build_dir/.rustc_info.json" ] || [ -f "$build_dir/CACHEDIR.TAG" ]; then
-    touch -- "$build_dir/.cagents-gate-used" 2>/dev/null || :
-fi
-
 # Starts the pruner, with the arguments after the first three, detached and
 # at a lower priority, unless a run is under way or one searched everything
 # within $1 minutes. $2 is its nice value and $3 its ionice options. Fails
@@ -184,6 +183,11 @@ if [ -z "$prune" ]; then
     printf '%s: %s GiB free on %s, and nothing to reclaim build directories with: %s is missing and CAGENTS_BUILD_PRUNE is unset\n' \
         "$program" "$free" "$directory" "$here/prune-build-dirs" >&2
 fi
+# Below the floor, a complete run starts too, unless one did within the hour:
+# the build waits for it only within its budget, and it searches on after.
+if [ -n "$pruner" ]; then
+    detach 60 10 '-c2 -n7' --orphan-hours 0 || :
+fi
 # One reclaim at a time across the host, and at most every ten minutes: a
 # queue of builds would otherwise each scan every build directory. The stamp
 # is a separate file, whose time a full disk can still update.
@@ -206,7 +210,9 @@ if [ -n "$prune" ] && open7 "$state"; then
     fi
     # Some file systems, such as btrfs, count freed space only once they
     # commit.
-    sync -f -- "$directory" 2>/dev/null || :
+    # Every build writing meanwhile makes that slower; it need not finish.
+    command -v timeout >/dev/null 2>&1 && bounded='timeout 30' || bounded=
+    $bounded sync -f -- "$directory" 2>/dev/null || :
     read_space
 fi
 [ "$free" -lt "$floor" ] || exit 0

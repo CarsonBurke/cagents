@@ -261,6 +261,9 @@ class TestLib(unittest.TestCase):
         environment.pop("CAGENTS_BUILD_FREE_FLOOR_GIB")
         environment["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "0"
         environment["CAGENTS_BUILD_PRUNE_STATE"] = str(self.root / "pruner")
+        # A complete run just now: below the floor the guard starts no
+        # background one, whose events would interleave with these.
+        (self.root / "pruner.scheduled").touch()
         return environment
 
     def assert_one_build_then_direct_harness(self):

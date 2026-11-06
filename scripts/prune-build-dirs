@@ -394,12 +394,15 @@ def main() -> int:
             break
         return INCOMPLETE
     if arguments.output:
+        # Without it, the run still prunes; its output goes where it was.
         with contextlib.suppress(OSError):
             os.replace(arguments.output, f"{arguments.output}.1")
-        output = os.open(arguments.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o644)
-        os.dup2(output, 1)
-        os.dup2(output, 2)
-        os.close(output)
+        with contextlib.suppress(OSError):
+            output = os.open(arguments.output,
+                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o644)
+            os.dup2(output, 1)
+            os.dup2(output, 2)
+            os.close(output)
 
     now = time.time()
     idle_cutoff = now - arguments.max_idle * 86400

@@ -153,7 +153,13 @@ class BuildDiskGuard(unittest.TestCase):
             capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 2)
         self.assertIn("reclaiming unused build directories", result.stderr)
-        (call,) = self.calls(calls, 1)
+        # A complete run in the background, and the one the build waits for.
+        lines = self.calls(calls, 2)
+        self.assertEqual(len(lines), 2)
+        (background,) = [line for line in lines if "--output" in line]
+        self.assertNotIn("--budget", background)
+        self.assertIn("--orphan-hours 0", background)
+        (call,) = [line for line in lines if "--output" not in line]
         self.assertIn("--apply --max-idle 7", call)
         self.assertIn("--orphan-hours 0 --budget 300 --wait", call)
         self.assertIn(f"--stamp {self.root}/pruner.scheduled", call)
@@ -166,22 +172,22 @@ class BuildDiskGuard(unittest.TestCase):
         self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
         result = self.guard(10**9, guard=guard)
         self.assertEqual(result.returncode, 2)
-        time.sleep(0.5)
-        (call,) = self.calls(calls, 1)
-        self.assertIn("--budget", call)
-        # That run was this period's: a build with room starts none.
+        self.assertEqual(len(self.calls(calls, 2)), 2)
+        # That complete run was this period's: a build with room starts none.
         self.assertEqual(self.guard(1, guard=guard).returncode, 0)
         time.sleep(0.5)
-        self.assertEqual(len(self.calls(calls, 1)), 1)
+        self.assertEqual(len(self.calls(calls, 2)), 2)
 
     def test_a_reclaim_cut_short_leaves_the_scheduled_run_to_come(self):
         guard, calls = self.stand_in_pruner(status=75)
         self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
         self.assertEqual(self.guard(10**9, guard=guard).returncode, 2)
+        self.assertEqual(len(self.calls(calls, 2)), 2)
         self.assertEqual(self.guard(1, guard=guard).returncode, 0)
-        lines = self.calls(calls, 2)
-        self.assertEqual(len(lines), 2)
-        self.assertNotIn("--budget", lines[1])
+        lines = self.calls(calls, 3)
+        self.assertEqual(len(lines), 3)
+        # The background runs, below the floor and on the schedule.
+        self.assertEqual(len([line for line in lines if "--budget" not in line]), 2)
 
     def test_a_scheduled_run_cut_short_is_started_again(self):
         guard, calls = self.stand_in_pruner(status=75)
