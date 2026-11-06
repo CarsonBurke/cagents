@@ -1236,3 +1236,59 @@ fn a_single_waiting_pane_is_named_in_the_singular() {
         assert!(reason.contains(". It stays in this window"), "{reason}");
     }
 }
+
+#[test]
+fn a_saved_chat_that_never_gets_a_runtime_is_named_once_the_daemon_is_ready() {
+    // A provider the daemon relaunched can leave its saved chat without a
+    // runtime; the gate names it rather than waiting out the inventory cap.
+    let (mut app, cards) = waiting(2);
+    connected_chat(&mut app);
+    let mut card = crate::app::tests::terminal_card_state();
+    let CardKind::Terminal(terminal) = &card.kind else {
+        unreachable!()
+    };
+    let session = crate::chat::Session {
+        id: terminal.id,
+        launch: crate::chat::Launch {
+            provider: crate::agent::Provider::Codex,
+            recipe: terminal.launch.clone(),
+            session_id: Some("22345678-1234-4234-8234-123456789abc".into()),
+        },
+        proof: Some(fixture_proof()),
+        terminal: None,
+        owned_codex_listener: None,
+        native_continuity: Default::default(),
+    };
+    let stuck = card.id;
+    card.kind = CardKind::Chat(session);
+    card.title = "Relaunched Codex".into();
+    Arc::make_mut(&mut app.durable).cards.push(card);
+    end_terminals(&mut app, &cards);
+    drop(app.verify_startup_gate());
+    assert_eq!(
+        app.startup_gate
+            .pending
+            .as_ref()
+            .map(|pending| pending.panes.clone()),
+        Some(vec![stuck])
+    );
+    drop(deliver(&mut app, Ok(StartupState::Ready)));
+    assert!(app.startup_gate.daemon.is_some(), "Ready for these owners");
+    // Ninety seconds without progress, inside a larger window's inventory
+    // budget (two counted chats here give only 90 s).
+    let progressed = app.startup_gate.progressed.unwrap();
+    app.startup_gate.progressed = Some(
+        progressed
+            .checked_sub(NO_PROGRESS + Duration::from_secs(1))
+            .unwrap(),
+    );
+    drop(app.verify_startup_gate());
+    let reason = reported(&app).expect("a stalled chat answers the launcher");
+    assert_readable(reason);
+    assert!(
+        reason.starts_with(
+            "1 saved pane made no progress reconnecting for 90 seconds: \u{201c}Relaunched Codex\u{201d}. It stays"
+        ),
+        "{reason}"
+    );
+}
