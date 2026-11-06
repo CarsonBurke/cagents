@@ -248,6 +248,10 @@ pub fn may_recognize(item: &Item, provider: Provider) -> bool {
                     | "close_agent"
                     | "resumeAgent"
                     | "resume_agent"
+                    | "sendMessage"
+                    | "followupTask"
+                    | "interruptAgent"
+                    | "listAgents"
             ),
             Provider::Omp => name == "task",
         },
@@ -570,6 +574,26 @@ fn codex(name: &str, input: &str, output: &str) -> Option<Coordination> {
         "resumeAgent" | "resume_agent" => Kind::Act(Act::Resume {
             agents: receivers.clone(),
         }),
+        // A message for an agent to read, where `sendInput` hands it its next
+        // turn's prompt.
+        "sendMessage" => Kind::Message(Outbound {
+            kind: OutboundKind::Send,
+            to: receivers.join(", "),
+            body: Text::Inline(input.into()),
+            summary: String::new(),
+            waits: false,
+        }),
+        "followupTask" => Kind::Message(Outbound {
+            kind: OutboundKind::Prompt,
+            to: receivers.join(", "),
+            body: Text::Inline(input.into()),
+            summary: String::new(),
+            waits: false,
+        }),
+        "interruptAgent" => Kind::Act(Act::Interrupt {
+            agent: receivers.join(", "),
+        }),
+        "listAgents" => Kind::Act(Act::Agents),
         _ => return None,
     };
     Some(Coordination {
@@ -814,6 +838,40 @@ mod tests {
             Kind::Act(Act::Wait {
                 agents: vec!["a".into(), "b".into()]
             })
+        );
+        // The collaboration tools Codex added later read as what they do,
+        // not as raw tool calls.
+        let states = r#"{"thread-a":{"status":"running"}}"#;
+        for (name, kind) in [
+            ("sendMessage", OutboundKind::Send),
+            ("followupTask", OutboundKind::Prompt),
+        ] {
+            let Some(Coordination {
+                kind: Kind::Message(message),
+                ..
+            }) = native(Provider::Codex, "call", name, "Check the docs", states)
+            else {
+                panic!("{name} is a message");
+            };
+            assert_eq!(
+                (message.kind, message.to.as_str()),
+                (kind, "thread-a"),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            native(Provider::Codex, "call", "interruptAgent", "", states)
+                .unwrap()
+                .kind,
+            Kind::Act(Act::Interrupt {
+                agent: "thread-a".into()
+            })
+        );
+        assert_eq!(
+            native(Provider::Codex, "call", "listAgents", "", "{}")
+                .unwrap()
+                .kind,
+            Kind::Act(Act::Agents)
         );
         // `task` is OMP's launcher, and only OMP's.
         let input = r#"{"i":"Split the work","context":"Shared notes","tasks":[{"name":"Docs","agent":"task","task":"Write docs"},{"name":"Tests","agent":"task","task":"Write tests"}]}"#;

@@ -3243,18 +3243,10 @@ impl Adapter for Codex {
                 }
                 step.events.push(session_notice(message));
             }
-            "turn/diff/updated" => step.events.push(Event::Item(Item {
-                id: format!("{}/diff", string(params, "turnId")?),
-                role: Role::Assistant,
-                content: ItemContent::Tool {
-                    name: "Turn diff".into(),
-                    input: String::new(),
-                    output: string(params, "diff")?.into(),
-                    status: ToolStatus::Succeeded,
-                },
-                started_at: None,
-                at: None,
-            })),
+            // The turn's cumulative diff restates the file changes its own
+            // items already show, and the worktree's changes are the Changes
+            // panel's; a row for it repeated both under a tool's name.
+            "turn/diff/updated" => {}
             "turn/plan/updated" => step.events.push(Event::Plan {
                 steps: plan_steps(&params["plan"]),
             }),
@@ -3621,6 +3613,16 @@ fn file_changes(value: &Value) -> Result<Vec<FileChange>, String> {
     }
     Ok(changes)
 }
+/// A tool call's arguments as its detail shows them: nothing when it was
+/// called with none.
+fn arguments(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Object(object) if object.is_empty() => String::new(),
+        Value::String(text) => text.clone(),
+        value => value.to_string(),
+    }
+}
 fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String> {
     parse_item_with_windows(value, done, turn, |_, _| {})
 }
@@ -3657,12 +3659,14 @@ fn parse_item_with_windows(
         _ if value["success"] == false || value["error"].is_object() => ToolStatus::Failed,
         Some("failed") => ToolStatus::Failed,
         Some("declined") => ToolStatus::Denied,
+        // A collaboration call cut short with its turn.
+        Some("interrupted") => ToolStatus::Stopped,
         Some("inProgress") => ToolStatus::Running,
         Some("completed") => ToolStatus::Succeeded,
         _ if done => ToolStatus::Succeeded,
         _ => ToolStatus::Running,
     };
-    let tool = |name: String, input: String, output: String| {
+    let tool_call = |name: String, input: String, output: String| {
         vec![Item {
             id: id.into(),
             role: Role::Assistant,
@@ -3814,27 +3818,48 @@ fn parse_item_with_windows(
             started_at: None,
             at: None,
         }],
-        "mcpToolCall" => images::tool_result(
-            id,
-            status,
-            format!("{} / {}", string(value, "server")?, string(value, "tool")?),
-            value["arguments"].to_string(),
-            if !value["error"].is_null() {
-                &value["error"]
-            } else if !value["result"].is_null() {
-                &value["result"]
-            } else {
-                &Value::Null
-            },
-        ),
+        // Named by the app the call went through when Codex knows it, as the
+        // person connected it, and otherwise by its server; the reader's
+        // `server / tool` form is the one the transcript titles.
+        "mcpToolCall" => {
+            let app = &value["appContext"];
+            let server = app["appName"]
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .map_or_else(|| string(value, "server"), Ok)?;
+            let tool = app["actionName"]
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .map_or_else(|| string(value, "tool"), Ok)?;
+            match value["error"]["message"].as_str() {
+                // What went wrong, as the server said it, rather than the
+                // error object it was carried in.
+                Some(message) => tool_call(
+                    format!("{server} / {tool}"),
+                    arguments(&value["arguments"]),
+                    message.into(),
+                ),
+                None => images::tool_result(
+                    id,
+                    status,
+                    format!("{server} / {tool}"),
+                    arguments(&value["arguments"]),
+                    if !value["error"].is_null() {
+                        &value["error"]
+                    } else {
+                        &value["result"]
+                    },
+                ),
+            }
+        }
         "dynamicToolCall" => images::tool_result(
             id,
             status,
             string(value, "tool")?.into(),
-            value["arguments"].to_string(),
+            arguments(&value["arguments"]),
             &value["contentItems"],
         ),
-        "collabAgentToolCall" => tool(
+        "collabAgentToolCall" => tool_call(
             string(value, "tool")?.into(),
             value["prompt"].as_str().unwrap_or("").into(),
             value["agentsStates"].to_string(),
@@ -3864,10 +3889,10 @@ fn parse_item_with_windows(
             started_at: None,
             at: None,
         }],
-        "functionCallOutput" => tool(
+        "functionCallOutput" => tool_call(
             string(value, "name")?.into(),
             String::new(),
-            value["output"].to_string(),
+            images::readable(&value["output"]),
         ),
         "imageView" => vec![Item {
             id: id.into(),
@@ -3875,7 +3900,13 @@ fn parse_item_with_windows(
             content: ItemContent::Image {
                 reference: None,
                 path: string(value, "path")?.into(),
-                description: "Codex image".into(),
+                // The file it looked at, which is what a reader would call it.
+                description: std::path::Path::new(string(value, "path")?)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("Image")
+                    .into(),
             },
             started_at: None,
             at: None,
@@ -3914,10 +3945,18 @@ fn parse_item_with_windows(
                         },
                     }]
                 }
-                _ => tool(
+                _ => tool_call(
                     "Image generation".into(),
                     value["revisedPrompt"].as_str().unwrap_or("").into(),
-                    "No displayable image was returned.".into(),
+                    match value["failure"]["type"].as_str() {
+                        Some("usageLimitExceeded") => {
+                            "Image generation has reached its usage limit.".into()
+                        }
+                        Some(other) => format!("Image generation failed ({other})."),
+                        // Still generating: there is nothing to say yet.
+                        None if status == ToolStatus::Running => String::new(),
+                        None => "No displayable image was returned.".into(),
+                    },
                 ),
             }
         }
@@ -3927,23 +3966,57 @@ fn parse_item_with_windows(
             false,
             Role::System,
         )],
+        // Codex starts the item when it begins compacting and completes it
+        // when the context has been replaced.
         "contextCompaction" => vec![text(
             id.into(),
-            "Context compacted".into(),
+            if done {
+                "Context compacted"
+            } else {
+                "Compacting context…"
+            }
+            .into(),
             false,
             Role::System,
         )],
+        // What the hooks added, in their own words; the run IDs the fragments
+        // are keyed by are Codex's bookkeeping.
         "hookPrompt" => vec![text(
             id.into(),
-            value["fragments"].to_string(),
+            value["fragments"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|fragment| fragment["text"].as_str())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
             false,
             Role::System,
         )],
-        // Codex's own auxiliary items, `sleep` and `subAgentActivity` among
-        // them, and any item type a later Codex introduces, still belong to the
+        // The agent pausing, named as a pause.
+        "sleep" => {
+            let seconds = value["durationMs"].as_u64().unwrap_or(0).div_ceil(1000);
+            let duration = match seconds {
+                0..60 => format!("{seconds}s"),
+                _ => format!("{}m {}s", seconds / 60, seconds % 60),
+            };
+            tool_call(
+                format!("{} {duration}", if done { "Waited" } else { "Waiting" }),
+                String::new(),
+                String::new(),
+            )
+        }
+        // A subagent's lifecycle is reported on the subagent itself, as its
+        // collaboration calls and thread status discover it; a row per
+        // transition would repeat that for every agent a turn coordinates.
+        "subAgentActivity" => Vec::new(),
+        // Any other auxiliary item, and any item type a later Codex
+        // introduces, still belongs to the
         // turn. The tool disclosure exists to keep an unrecognized item
         // renderable rather than ending the session over it.
-        other => tool(other.into(), String::new(), value.to_string()),
+        other => tool_call(other.into(), String::new(), value.to_string()),
     };
     for item in &mut items {
         let mut window = OutputWindow::default();
@@ -8626,6 +8699,140 @@ mod tests {
             panic!("A file change kind this build does not know is still a file change");
         };
         assert_eq!(changes[0].kind, ChangeKind::Updated);
+    }
+
+    fn only_tool(value: Value, done: bool) -> (String, String, String, ToolStatus) {
+        match &parse_item(&value, done, "turn").unwrap()[..] {
+            [
+                Item {
+                    content:
+                        ItemContent::Tool {
+                            name,
+                            input,
+                            output,
+                            status,
+                        },
+                    ..
+                },
+            ] => (name.clone(), input.clone(), output.clone(), *status),
+            items => panic!("one tool row, not {items:?}"),
+        }
+    }
+
+    /// A tool row carries what a reader can use: the app's name for an MCP
+    /// call, no arguments when there were none, the text a tool returned
+    /// rather than the content parts carrying it, and the error's message.
+    #[test]
+    fn tool_rows_carry_readable_names_arguments_results_and_errors() {
+        let called = json!({"id":"m","type":"mcpToolCall","server":"codex_apps","tool":"linear_get_issue",
+            "appContext":{"connectorId":"c","appName":"Linear","actionName":"get_issue"},
+            "status":"completed","arguments":null,
+            "result":{"content":[{"type":"text","text":"ENG-42: Tool rows"},{"type":"text","text":"Status: open"}],"structuredContent":null}});
+        assert_eq!(
+            only_tool(called, true),
+            (
+                "Linear / get_issue".into(),
+                String::new(),
+                "ENG-42: Tool rows\n\nStatus: open".into(),
+                ToolStatus::Succeeded
+            )
+        );
+        let structured = json!({"id":"m","type":"mcpToolCall","server":"docs","tool":"search","status":"completed",
+            "arguments":{"query":"hover"},"result":{"content":[],"structuredContent":{"hits":1}}});
+        let (name, input, output, _) = only_tool(structured, true);
+        assert_eq!(
+            (name.as_str(), input.as_str()),
+            ("docs / search", r#"{"query":"hover"}"#)
+        );
+        assert_eq!(output, "{\n  \"hits\": 1\n}");
+        let failed = json!({"id":"m","type":"mcpToolCall","server":"docs","tool":"search","status":"failed",
+            "arguments":{},"error":{"message":"Connector is not authorized"}});
+        assert_eq!(
+            only_tool(failed, true),
+            (
+                "docs / search".into(),
+                String::new(),
+                "Connector is not authorized".into(),
+                ToolStatus::Failed
+            )
+        );
+        for output in [
+            json!("plain text"),
+            json!([{"type":"input_text","text":"plain text"}]),
+        ] {
+            let item =
+                json!({"id":"f","type":"functionCallOutput","name":"lookup","output":output});
+            assert_eq!(only_tool(item, true).2, "plain text");
+        }
+        let interrupted = json!({"id":"c","type":"collabAgentToolCall","tool":"wait","status":"interrupted",
+            "senderThreadId":"thread-exact","receiverThreadIds":["child"],"agentsStates":{}});
+        assert_eq!(only_tool(interrupted, true).3, ToolStatus::Stopped);
+    }
+
+    /// Codex's own events read as events: an image being generated says
+    /// nothing until it has a result, compaction says it is under way until
+    /// it is done, a hook's prompt is its text, a pause is a pause, and a
+    /// subagent's lifecycle adds no rows of its own.
+    #[test]
+    fn codex_events_read_as_what_happened() {
+        let generating = json!({"id":"g","type":"imageGeneration","status":"inProgress","inputImages":[],"revisedPrompt":"A fox"});
+        assert_eq!(
+            only_tool(generating, false),
+            (
+                "Image generation".into(),
+                "A fox".into(),
+                String::new(),
+                ToolStatus::Running
+            )
+        );
+        let limited = json!({"id":"g","type":"imageGeneration","status":"failed","inputImages":[],
+            "failure":{"type":"usageLimitExceeded","limitId":"images"}});
+        let (_, _, output, status) = only_tool(limited, true);
+        assert_eq!(
+            (output.as_str(), status),
+            (
+                "Image generation has reached its usage limit.",
+                ToolStatus::Failed
+            )
+        );
+        let viewed = parse_item(
+            &json!({"id":"v","type":"imageView","path":"/repo/shots/after.png"}),
+            true,
+            "turn",
+        )
+        .unwrap();
+        assert!(matches!(&viewed[0].content,
+            ItemContent::Image { description, .. } if description == "after.png"));
+        let notice = |value: Value, done: bool| match &parse_item(&value, done, "turn").unwrap()[..]
+        {
+            [
+                Item {
+                    role: Role::System,
+                    content: ItemContent::Text { text, .. },
+                    ..
+                },
+            ] => text.clone(),
+            items => panic!("one notice, not {items:?}"),
+        };
+        let compaction = json!({"id":"k","type":"contextCompaction"});
+        assert_eq!(notice(compaction.clone(), false), "Compacting context…");
+        assert_eq!(notice(compaction, true), "Context compacted");
+        let hook = json!({"id":"h","type":"hookPrompt","fragments":[
+            {"hookRunId":"run-1","text":"Remember the style guide."},{"hookRunId":"run-2","text":"Run the tests."}]});
+        assert_eq!(
+            notice(hook, true),
+            "Remember the style guide.\n\nRun the tests."
+        );
+        let sleep = json!({"id":"s","type":"sleep","durationMs":90_000});
+        assert_eq!(only_tool(sleep.clone(), false).0, "Waiting 1m 30s");
+        assert_eq!(only_tool(sleep, true).0, "Waited 1m 30s");
+        let activity = json!({"id":"a","type":"subAgentActivity","kind":"started","agentThreadId":"child","agentPath":"/root/review"});
+        assert!(parse_item(&activity, true, "turn").unwrap().is_empty());
+        let mut adapter = adapter();
+        let diff = adapter
+            .receive(json!({"method":"turn/diff/updated","params":{"threadId":"thread-exact","turnId":"turn","diff":"@@ -1 +1 @@\n-a\n+b\n"}}))
+            .unwrap();
+        assert!(diff.events.is_empty());
     }
 
     #[test]
