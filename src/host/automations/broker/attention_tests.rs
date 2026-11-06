@@ -81,6 +81,27 @@ fn retry_due(transfer: &mut AttentionTransfer) {
 }
 
 #[test]
+fn an_idle_tick_reads_past_another_connections_write_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("registry.sqlite3");
+    let registry: agent_execution::SharedRegistry =
+        Arc::new(Mutex::new(Registry::at(&path).unwrap()));
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let started = Instant::now();
+    let delay = AttentionTransfer::default().pump(&registry, None).unwrap();
+
+    assert_eq!(delay, None);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "idle tick waited {:?} on the write lock",
+        started.elapsed()
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
 fn stopped_and_full_journals_keep_source_pending_and_retry_without_hot_enqueue() {
     for full in [false, true] {
         let (directory, registry, _) = fixture();
