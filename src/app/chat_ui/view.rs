@@ -1318,9 +1318,15 @@ impl Runtime {
             Self::native_child_status(agent),
             Self::short_description(model, 80),
         );
-        if !agent.detail.trim().is_empty() {
+        // A provider failure keeps its raw diagnostic for copying; the tab
+        // says what it means.
+        let detail = agent.detail.trim();
+        if !detail.is_empty() {
             identity.push_str(" · ");
-            identity.push_str(&Self::short_description(agent.detail.trim(), 120));
+            match chat::failure::Failure::parse(self.session.launch.provider, detail) {
+                Some(failure) => identity.push_str(&failure.summary),
+                None => identity.push_str(&Self::short_description(detail, 120)),
+            }
         }
         if let Some(task) = Self::native_child_task(agent) {
             identity.push_str(" · Task: ");
@@ -7384,6 +7390,13 @@ mod tests {
         assert!(known.contains("child-model"));
         assert!(known.contains("Waiting for you"));
         assert!(known.contains("Waiting for your approval"));
+        // A provider's raw error payload is summarized, not quoted.
+        child.detail =
+            r#"{"message":"You've hit your limit · resets 1:30pm","type":"rate_limit_error"}"#
+                .into();
+        let limited = runtime.native_child_identity(&child);
+        assert!(limited.contains("Claude usage limit reached · resets 1:30pm"));
+        assert!(!limited.contains("rate_limit_error"));
         child.status = chat::ToolStatus::Succeeded;
         assert_eq!(Runtime::native_child_status(&child), "Finished");
     }
