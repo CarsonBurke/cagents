@@ -59,11 +59,11 @@ fi
 # Keep the three implementation feature graphs isolated, as in run-development.
 # Use Cargo's executable paths: build.target can come from config as well as
 # the environment, and a guessed target/release path can select an older build.
-cli=$(python3 "$root/scripts/build-ceditor-product" cagents \
+cli=$(/usr/bin/python3 "$root/scripts/build-ceditor-product" cagents \
     --locked --release --no-default-features --features development --bin cagents)
-python3 "$root/scripts/build-ceditor-product" cagentsd \
+/usr/bin/python3 "$root/scripts/build-ceditor-product" cagentsd \
     --locked --release --no-default-features --features development,host --bin cagentsd >/dev/null
-ui=$(python3 "$root/scripts/build-ceditor-product" cagents-ui \
+ui=$(/usr/bin/python3 "$root/scripts/build-ceditor-product" cagents-ui \
     --locked --release --no-default-features --features development,latency-harness --bin cagents-ui)
 sandbox=$(mktemp -d /tmp/cagents-latency-runtime.XXXXXXXX)
 cleanup() {

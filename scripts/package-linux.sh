@@ -137,7 +137,7 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     build_target() {
         product=$1
         shift
-        python3 "$SCRIPT_DIR/build-ceditor-product" "$product" \
+        /usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" "$product" \
             --manifest-path "$ROOT_DIR/Cargo.toml" \
             --locked \
             --profile "$PROFILE" \

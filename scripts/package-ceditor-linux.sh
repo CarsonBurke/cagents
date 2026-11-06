@@ -61,13 +61,13 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     # The package is native-only. Override config build.target with the validated
     # release target, and consume each exact Cargo executable instead of guessing
     # whether it lives below a target-triple directory.
-    CLI_BINARY=$(python3 "$SCRIPT_DIR/build-ceditor-product" cagents \
+    CLI_BINARY=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" cagents \
         --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
         --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --no-default-features --bin cagents)
-    HOST_BINARY=$(python3 "$SCRIPT_DIR/build-ceditor-product" cagentsd \
+    HOST_BINARY=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" cagentsd \
         --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
         --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --no-default-features --features host --bin cagentsd)
-    EDITOR_BINARY=$(python3 "$SCRIPT_DIR/build-ceditor-product" ceditor \
+    EDITOR_BINARY=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" ceditor \
         --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
         --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --package ceditor)
 else
