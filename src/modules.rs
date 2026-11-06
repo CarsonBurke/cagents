@@ -101,6 +101,8 @@ pub mod process;
 pub mod project_location;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub mod pull_request_signals;
 pub mod recovery_authority;
 #[cfg(feature = "ui")]
 pub mod reorder;

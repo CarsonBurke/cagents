@@ -2,7 +2,8 @@
 //! progress, newest activity first.
 use super::*;
 use crate::work::{
-    ActivitySource, Board, CheckOutcome, Column, Forge, Item, Keep, PullRequestState, Removal,
+    ActivitySource, Board, CheckOutcome, Column, ConversationPullRequests, Forge, Item, Keep,
+    PullRequestState, Removal,
     RemovalPlan, Removed, Request, Response, Review, SavedSnapshot, Scope,
 };
 
@@ -179,6 +180,66 @@ impl ControlClient {
                 // The daemon is about to close this connection. Reporting it as
                 // a closed connection is what makes a watcher reconnect and
                 // resubscribe to the successor's board.
+                ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
+                ServerMessage::Error(error) => {
+                    return Err(ControlError::Remote {
+                        code: error.code,
+                        message: error.message,
+                        retryable: error.retryable,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl ControlClient {
+    /// Subscribes this connection to the pull requests `conversation`
+    /// worked on or mentioned, and returns them with the revision later
+    /// lists from [`Self::next_conversation_pull_requests`] supersede.
+    pub fn watch_conversation_pull_requests(
+        &mut self,
+        conversation: TerminalId,
+    ) -> Result<(u64, ConversationPullRequests), ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::WatchConversationPullRequests { conversation },
+            Instant::now() + BOARD_TIMEOUT,
+        )? {
+            ServerResponse::Work(Response::WatchingConversation {
+                revision,
+                pull_requests,
+            }) => Ok((revision, *pull_requests)),
+            response => Err(unexpected_response(
+                "a conversation's pull requests",
+                &response,
+            )),
+        }
+    }
+
+    /// Blocks until the daemon sends a list newer than `revision`, as
+    /// [`Self::next_work_board`] does for boards.
+    pub fn next_conversation_pull_requests(
+        &mut self,
+        revision: u64,
+    ) -> Result<(u64, ConversationPullRequests), ControlError> {
+        if let Some((observed, pull_requests)) = self.observed_conversation.take()
+            && observed > revision
+        {
+            return Ok((observed, *pull_requests));
+        }
+        self.stream
+            .set_read_timeout(None)
+            .map_err(ControlError::Configure)?;
+        loop {
+            let envelope = self.read_envelope()?;
+            self.validate_pinned_envelope(&envelope)?;
+            match envelope.message {
+                ServerMessage::ConversationPullRequests {
+                    revision: observed,
+                    pull_requests,
+                    ..
+                } if observed > revision => return Ok((observed, *pull_requests)),
                 ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
                 ServerMessage::Error(error) => {
                     return Err(ControlError::Remote {

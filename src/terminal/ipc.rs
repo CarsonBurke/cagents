@@ -195,7 +195,11 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 151 appends a conversation's inferred pull requests: the
+/// `WatchConversationPullRequests` request, its `work::Response` and the
+/// `ConversationPullRequests` push. 128 and 147-148 are taken by unmerged
+/// branches and are not adopted here.
+pub const PROTOCOL_VERSION: u16 = 151;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -549,6 +553,11 @@ pub enum ClientRequest {
         authority: crate::agent_execution::Authority,
         request: crate::channel_work_api::Request,
     },
+    /// Subscribes this connection to the pull requests one conversation
+    /// worked on or mentioned and returns them, as
+    /// [`crate::work::Response::WatchingConversation`]. Each later change
+    /// arrives as [`ServerMessage::ConversationPullRequests`].
+    WatchConversationPullRequests { conversation: TerminalId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -763,6 +772,14 @@ pub enum ServerMessage {
     WorkBoard {
         revision: u64,
         board: Box<crate::work::Board>,
+    },
+    /// A conversation's pull requests after a change, delivered only to a
+    /// connection that subscribed with
+    /// [`ClientRequest::WatchConversationPullRequests`].
+    ConversationPullRequests {
+        conversation: TerminalId,
+        revision: u64,
+        pull_requests: Box<crate::work::ConversationPullRequests>,
     },
 }
 

@@ -1,19 +1,31 @@
 use super::*;
+use crate::github_identity::PullRequestKey;
 use crate::github::{
     PullRequest, PullRequestComment, PullRequestConversation, PullRequestInspection,
     PullRequestReviewThread,
 };
 use cosmic::widget::markdown;
 
+mod conversation;
+
 type ActionTask = iced::Task<Action>;
 
-/// Stable inspector identity, with a separate local HEAD revision for refresh fencing.
+/// The active worktree branch, with a separate local HEAD revision for
+/// refresh fencing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Target {
+pub struct BranchTarget {
     pub worktree: PathBuf,
     pub branch: String,
     pub head_oid: Option<String>,
     pub repository: GitHubRepoKey,
+}
+
+/// What the inspector shows: the active branch's pull request, or one chosen
+/// from those the focused conversation worked on or mentioned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Branch(BranchTarget),
+    PullRequest(PullRequestKey),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +49,12 @@ pub enum Action {
     ToggleSection(Section),
     OpenUrl(Url),
     OpenMarkdownLink(String),
+    /// The focused conversation's pull requests changed.
+    Conversation(conversation::Watch),
+    /// Show this pull request rather than the active branch's, or with
+    /// `None` return to the branch's.
+    Choose(Option<PullRequestKey>),
+    ShowAllMentions,
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +65,10 @@ pub struct Resolution {
 
 impl Action {
     pub(super) fn allowed_while_modal(&self) -> bool {
-        matches!(self, Self::Resolved(..) | Self::Loaded(..))
+        matches!(
+            self,
+            Self::Resolved(..) | Self::Loaded(..) | Self::Conversation(..)
+        )
     }
 }
 
@@ -75,13 +96,41 @@ pub struct State {
     comment_markdown: HashMap<String, Vec<markdown::Item>>,
     checks_collapsed: bool,
     discussion_collapsed: bool,
+    /// The pull request chosen from the conversation's list, shown instead
+    /// of the active branch's.
+    chosen: Option<PullRequestKey>,
+    conversation: conversation::State,
+}
+
+impl From<BranchTarget> for Target {
+    fn from(target: BranchTarget) -> Self {
+        Self::Branch(target)
+    }
 }
 
 impl Target {
     fn same_identity(&self, other: &Self) -> bool {
-        self.worktree == other.worktree
-            && self.branch == other.branch
-            && self.repository == other.repository
+        match (self, other) {
+            (Self::Branch(a), Self::Branch(b)) => {
+                a.worktree == b.worktree && a.branch == b.branch && a.repository == b.repository
+            }
+            (Self::PullRequest(a), Self::PullRequest(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    pub fn repository(&self) -> &GitHubRepoKey {
+        match self {
+            Self::Branch(target) => &target.repository,
+            Self::PullRequest(key) => &key.repository,
+        }
+    }
+
+    pub fn branch(&self) -> Option<&BranchTarget> {
+        match self {
+            Self::Branch(target) => Some(target),
+            Self::PullRequest(_) => None,
+        }
     }
 }
 
@@ -110,7 +159,7 @@ impl State {
         if same_identity {
             self.loading = false;
             if self.target.as_ref().is_some_and(|target| {
-                !crate::github::polling::ready(&target.repository.host, false)
+                !crate::github::polling::ready(&target.repository().host, false)
             }) {
                 return ActionTask::none();
             }
@@ -147,8 +196,8 @@ impl State {
         let Some(target) = self.target.clone() else {
             return ActionTask::none();
         };
-        if !crate::github::polling::ready(&target.repository.host, true) {
-            self.error = crate::github::polling::rate_limit(&target.repository.host)
+        if !crate::github::polling::ready(&target.repository().host, true) {
+            self.error = crate::github::polling::rate_limit(&target.repository().host)
                 .map(|limit| limit.to_string());
             return ActionTask::none();
         }
@@ -165,8 +214,17 @@ impl State {
         ActionTask::perform(
             async move {
                 let work = target.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    resolve_current_pull_request(&git, &github, &work, &cancellation)
+                let result = tokio::task::spawn_blocking(move || match &work {
+                    Target::Branch(branch) => {
+                        resolve_current_pull_request(&git, &github, branch, &cancellation)
+                    }
+                    Target::PullRequest(key) => github
+                        .view(key, &cancellation)
+                        .map(|pull_request| Resolution {
+                            target: work.clone(),
+                            pull_request: Some(Arc::new(pull_request)),
+                        })
+                        .map_err(|error| error.to_string()),
                 })
                 .await
                 .map_err(|error| format!("Pull request loader failed: {error}"))
@@ -182,9 +240,9 @@ impl State {
             Action::Refresh => {
                 if let Some(target) = &self.target {
                     if let Some(pr) = self.pull_request.as_ref() {
-                        GitHubService::<crate::repository::SystemProcessExecutor>::invalidate_checks(&target.repository, pr.number);
+                        GitHubService::<crate::repository::SystemProcessExecutor>::invalidate_checks(target.repository(), pr.number);
                     } else if let Some(pr) = &self.preview {
-                        GitHubService::<crate::repository::SystemProcessExecutor>::invalidate_checks(&target.repository, pr.number);
+                        GitHubService::<crate::repository::SystemProcessExecutor>::invalidate_checks(target.repository(), pr.number);
                     }
                 }
                 return self.refresh();
@@ -245,7 +303,7 @@ impl State {
                         let result = tokio::task::spawn_blocking(move || {
                             let inspection = GitHubService::system("gh")
                                 .inspect_pull_request(
-                                    &work.repository,
+                                    work.repository(),
                                     (*pull_request).clone(),
                                     &cancellation,
                                 )
@@ -271,7 +329,7 @@ impl State {
                         if inspection.as_ref().is_none_or(|inspection| {
                             inspection.checks.is_ok() && inspection.conversation.is_ok()
                         }) {
-                            crate::github::polling::succeeded(&target.repository.host);
+                            crate::github::polling::succeeded(&target.repository().host);
                         }
                         self.comment_markdown.clear();
                         if let Some(inspection) = &inspection
@@ -317,8 +375,11 @@ impl State {
             },
             Action::Filter(filter) => self.filter = filter,
             Action::ToggleResolved => self.hide_resolved = !self.hide_resolved,
-            // Link routing belongs to the application, which owns browser preferences.
-            Action::OpenUrl(_) | Action::OpenMarkdownLink(_) => {}
+            Action::Conversation(watch) => self.conversation.update(watch),
+            Action::ShowAllMentions => self.conversation.all_mentions = true,
+            // Link routing belongs to the application, which owns browser
+            // preferences; choosing rebinds through the application too.
+            Action::OpenUrl(_) | Action::OpenMarkdownLink(_) | Action::Choose(_) => {}
         }
         ActionTask::none()
     }
@@ -336,9 +397,9 @@ impl Drop for State {
 
 fn verify_local_head_with<E: crate::repository::ProcessExecutor>(
     git: &RepositoryService<E>,
-    target: &Target,
+    target: &BranchTarget,
     cancellation: &CancellationToken,
-) -> Result<Target, String> {
+) -> Result<BranchTarget, String> {
     // Resolve only the ref: scanning tracked files cannot establish a stronger
     // revision fence and becomes very expensive with active agent worktrees.
     let head = git
@@ -369,7 +430,7 @@ fn resolve_current_pull_request<
 >(
     git: &RepositoryService<E>,
     github: &GitHubService<G>,
-    target: &Target,
+    target: &BranchTarget,
     cancellation: &CancellationToken,
 ) -> Result<Resolution, String> {
     let current = verify_local_head_with(git, target, cancellation)?;
@@ -402,7 +463,7 @@ fn resolve_current_pull_request<
         None => None,
     };
     Ok(Resolution {
-        target: current,
+        target: Target::Branch(current),
         pull_request,
     })
 }
@@ -666,11 +727,14 @@ pub fn view(state: &State) -> Element<'_, Action> {
     if let Some(target) = &state.target {
         if state.pull_request.is_none() {
             children.push(
-                crate::design::caption(format!(
-                    "{} · {}",
-                    target.repository.gh_selector(),
-                    target.branch
-                ))
+                crate::design::caption(match target {
+                    Target::Branch(target) => {
+                        format!("{} · {}", target.repository.gh_selector(), target.branch)
+                    }
+                    Target::PullRequest(key) => {
+                        format!("{}#{}", key.repository.gh_selector(), key.number)
+                    }
+                })
                 .into(),
             );
         }
@@ -749,6 +813,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
         let local_head = state
             .target
             .as_ref()
+            .and_then(Target::branch)
             .and_then(|target| target.head_oid.as_deref())
             .filter(|oid| !oid.is_empty());
         if let Some(local_head) = local_head
@@ -779,7 +844,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                 // The panel can outlive its target for a frame; the pull
                 // request's own URL still names where it lives.
                 || repository_from_url(&pr.url),
-                |target| target.repository.gh_selector(),
+                |target| target.repository().gh_selector(),
             ))
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
             .width(Length::Fill)
@@ -787,7 +852,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
         ));
         // The identity block names the remote head. Where the checked-out
         // branch is not that branch, saying so is the whole point of the row.
-        if let Some(target) = &state.target
+        if let Some(target) = state.target.as_ref().and_then(Target::branch)
             && target.branch != pr.head_ref_name
         {
             metadata.push(meta_row(
@@ -1156,6 +1221,33 @@ impl Cagents {
         {
             return Task::none();
         }
+        match action {
+            Action::Choose(key) => {
+                // The active branch's own pull request is shown as the
+                // branch's, which also compares it with the local head.
+                self.pull_request_inspector.chosen =
+                    key.filter(|key| self.active_branch_pull_request().as_ref() != Some(key));
+                return self.sync_pull_request_inspector();
+            }
+            Action::Conversation(watch) => {
+                drop(self.pull_request_inspector.update(Action::Conversation(watch)));
+                // A pull request the conversation no longer lists is no
+                // longer one to show for it.
+                let inspector = &mut self.pull_request_inspector;
+                if inspector
+                    .chosen
+                    .as_ref()
+                    .is_some_and(|key| !inspector.conversation.lists(key))
+                {
+                    inspector.chosen = None;
+                }
+                return self.sync_pull_request_inspector();
+            }
+            action => self.apply_pull_request_ui(action),
+        }
+    }
+
+    fn apply_pull_request_ui(&mut self, action: Action) -> Task<Message> {
         let url = match &action {
             Action::OpenUrl(url) => Some(Ok(url.clone())),
             Action::OpenMarkdownLink(uri) => Some(Url::parse(uri)),
@@ -1186,7 +1278,11 @@ impl Cagents {
             _ => false,
         };
         let task = self.pull_request_inspector.update(action);
-        if accepted && let Some(target) = self.pull_request_inspector.target.as_ref() {
+        // A chosen pull request is no worktree's: only the branch's updates
+        // the sidebar's rows.
+        if accepted
+            && let Some(Target::Branch(target)) = self.pull_request_inspector.target.as_ref()
+        {
             for project in &mut self.sidebar_model.projects {
                 if self
                     .github_availability
@@ -1237,12 +1333,91 @@ impl Cagents {
         task.map(Message::PullRequestUi).map(cosmic::Action::App)
     }
 
+    /// The chat card whose conversation the inspector lists pull requests
+    /// for: the focused one, else the last one focused while it remains in
+    /// the workspace.
+    fn inspected_conversation(&self) -> Option<(CardId, TerminalId)> {
+        let chat = |card: CardId| match &self.card_state(card)?.kind {
+            CardKind::Chat(session) => Some((card, session.id)),
+            _ => None,
+        };
+        self.workspace.focused().and_then(chat).or_else(|| {
+            self.pull_request_inspector
+                .conversation
+                .card
+                .filter(|card| self.workspace.card(*card).is_some())
+                .and_then(chat)
+        })
+    }
+
+    /// The pull request the sidebar knows for the active worktree's branch.
+    fn active_branch_pull_request(&self) -> Option<PullRequestKey> {
+        if self.active_folder_scope() {
+            return None;
+        }
+        let source = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .filter(|source| self.sidebar_state.active_worktree() == Some(&source.key))?;
+        let branch = source.branch.as_ref()?.as_str();
+        let repository = self
+            .github_availability
+            .get(&source.key.project_id)?
+            .repository_key()?;
+        let number = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.id == source.key.project_id)?
+            .worktrees
+            .iter()
+            .find(|row| row.path == source.key.canonical_path && row.branch.as_deref() == Some(branch))?
+            .pull_request()?
+            .number;
+        PullRequestKey::new(repository.clone(), number).ok()
+    }
+
+    /// Whether the inspected conversation names any pull request, which
+    /// opens the pull request tab even where no worktree branch would.
+    pub(super) fn conversation_lists_pull_requests(&self) -> bool {
+        !self.pull_request_inspector.conversation.rows().is_empty()
+    }
+
+    /// The inspected conversation's pull requests, watched while the
+    /// inspector is shown.
+    pub(super) fn conversation_pull_request_subscription(&self) -> Subscription<Message> {
+        match self.pull_request_inspector.conversation.conversation {
+            Some(conversation) if self.context_inspector_visible() => {
+                conversation::subscription(conversation)
+                    .map(|watch| Message::PullRequestUi(Action::Conversation(watch)))
+            }
+            _ => Subscription::none(),
+        }
+    }
+
     pub(super) fn sync_pull_request_inspector(&mut self) -> Task<Message> {
+        let inspected = self.inspected_conversation();
+        if self.pull_request_inspector.conversation.retarget(inspected) {
+            self.pull_request_inspector.chosen = None;
+        }
         if !self.context_inspector_open || self.context_tab != ContextTab::PullRequest {
             self.pull_request_inspector.source_key = None;
             return self
                 .pull_request_inspector
                 .synchronize(None, None)
+                .map(Message::PullRequestUi)
+                .map(cosmic::Action::App);
+        }
+        if let Some(key) = self.pull_request_inspector.chosen.clone() {
+            self.pull_request_inspector.source_key = None;
+            let target = Target::PullRequest(key);
+            if self.pull_request_inspector.source_target.as_ref() == Some(&target) {
+                return Task::none();
+            }
+            return self
+                .pull_request_inspector
+                .synchronize(Some(target), None)
                 .map(Message::PullRequestUi)
                 .map(cosmic::Action::App);
         }
@@ -1300,25 +1475,20 @@ impl Cagents {
                 .map(Message::PullRequestUi)
                 .map(cosmic::Action::App);
         };
-        if self
-            .pull_request_inspector
-            .source_target
-            .as_ref()
-            .is_some_and(|target| {
-                target.worktree == *worktree
-                    && target.branch == branch
-                    && target.head_oid.as_deref() == head_oid
-                    && target.repository == *repository
-            })
+        if let Some(Target::Branch(target)) = self.pull_request_inspector.source_target.as_ref()
+            && target.worktree == *worktree
+            && target.branch == branch
+            && target.head_oid.as_deref() == head_oid
+            && target.repository == *repository
         {
             return Task::none();
         }
-        let target = Target {
+        let target = Target::Branch(BranchTarget {
             worktree: worktree.clone(),
             branch: branch.to_owned(),
             head_oid: head_oid.map(str::to_owned),
             repository: repository.clone(),
-        };
+        });
         let preview = self
             .sidebar_model
             .projects
@@ -1354,6 +1524,11 @@ impl Cagents {
 
     fn pull_request_binding_is_current(&self) -> bool {
         let state = &self.pull_request_inspector;
+        if let Some(key) = &state.chosen {
+            return self.context_inspector_open
+                && self.context_tab == ContextTab::PullRequest
+                && matches!(&state.source_target, Some(Target::PullRequest(bound)) if bound == key);
+        }
         self.context_inspector_open
             && self.context_tab == ContextTab::PullRequest
             && state.source_key.as_ref() == self.sidebar_state.active_worktree()
@@ -1364,7 +1539,7 @@ impl Cagents {
                 .is_some_and(|source| {
                     state.source_key.as_ref() == Some(&source.key)
                         && source.data_state == SidebarDataState::Ready
-                        && state.source_target.as_ref().is_some_and(|target| {
+                        && state.source_target.as_ref().and_then(Target::branch).is_some_and(|target| {
                             target.worktree == source.key.canonical_path
                                 && source.branch.as_ref().map(|branch| branch.as_str())
                                     == Some(target.branch.as_str())
@@ -1394,7 +1569,7 @@ impl Cagents {
                 .pull_request_inspector
                 .target
                 .as_ref()
-                .is_none_or(|target| !crate::github::polling::ready(&target.repository.host, false))
+                .is_none_or(|target| !crate::github::polling::ready(&target.repository().host, false))
         {
             return Task::none();
         }
@@ -1405,7 +1580,59 @@ impl Cagents {
     }
 
     pub(super) fn pull_request_panel(&self, width: f32) -> Element<'_, Message> {
-        widget::container(view(&self.pull_request_inspector).map(Message::PullRequestUi))
+        let state = &self.pull_request_inspector;
+        let selected = match &state.target {
+            Some(Target::PullRequest(key)) => Some(key.clone()),
+            Some(Target::Branch(target)) => state
+                .pull_request
+                .as_ref()
+                .and_then(|pr| PullRequestKey::new(target.repository.clone(), pr.number).ok()),
+            None => None,
+        };
+        let title = state
+            .conversation
+            .card
+            .and_then(|card| self.card_state(card))
+            .map(|card| card.title.as_str())
+            .filter(|title| !title.is_empty());
+        let list = conversation::view(&state.conversation, title, selected.as_ref());
+        let detail: Element<'_, Action> = match list {
+            // Without a branch or a choice, the list is the panel's content.
+            Some(_) if state.target.is_none() => widget::container(
+                design::caption("Choose a pull request to see its checks and discussion.")
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .width(Length::Fill),
+            )
+            .padding([space::S, space::S])
+            .width(Length::Fill)
+            .into(),
+            _ => view(state),
+        };
+        let content: Element<'_, Action> = match list {
+            Some(list) => widget::column::with_children(vec![
+                widget::container(
+                    widget::scrollable(
+                        widget::container(list)
+                            .padding(design::with_vertical_rail(Padding::from([space::S, space::S]))),
+                    )
+                    .direction(iced::widget::scrollable::Direction::Vertical(
+                        design::scrollbar(),
+                    ))
+                    .width(Length::Fill),
+                )
+                // The list keeps room for the detail below it.
+                .max_height((self.window_height * 0.4).max(160.0))
+                .width(Length::Fill)
+                .into(),
+                design::horizontal_rule().into(),
+                detail,
+            ])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+            None => detail,
+        };
+        widget::container(content.map(Message::PullRequestUi))
             .width(Length::Fixed(width))
             .height(Length::Fill)
             .into()
@@ -1566,7 +1793,10 @@ mod tests {
                 assert_eq!(outputs, 1);
             });
         let observed = app.pull_request_inspector.target.clone().unwrap();
-        assert_eq!(observed.head_oid.as_deref(), Some("b".repeat(40).as_str()));
+        assert_eq!(
+            observed.branch().unwrap().head_oid.as_deref(),
+            Some("b".repeat(40).as_str())
+        );
         // A local commit need not be pushed: the unique, proven source branch
         // still owns the same PR at its previous hosted tip.
         let resolved = app.pull_request_inspector.pull_request.as_ref().unwrap();
@@ -1622,7 +1852,7 @@ mod tests {
         assert!(!app.pull_request_inspector.loading);
         // A later full snapshot catching up to the ref-only result starts no duplicate work.
         app.sidebar_model.source_control.as_mut().unwrap().head_oid =
-            observed.head_oid.clone().map(String::into_boxed_str);
+            observed.branch().unwrap().head_oid.clone().map(String::into_boxed_str);
         drop(app.sync_pull_request_inspector());
         assert_eq!(app.pull_request_inspector.generation, generation);
         assert_eq!(app.pull_request_inspector.target.as_ref(), Some(&observed));
@@ -1661,7 +1891,7 @@ mod tests {
         app.sidebar_state.sync_active_worktree(
             &app.sidebar_model,
             &SidebarFocus::Repository {
-                worktree: old.worktree.clone(),
+                worktree: old.branch().unwrap().worktree.clone(),
             },
         );
         app.sidebar_model
@@ -1693,13 +1923,17 @@ mod tests {
         assert!(app.pull_request_inspector.error.is_none());
     }
 
-    fn target() -> Target {
-        Target {
+    fn branch() -> BranchTarget {
+        BranchTarget {
             worktree: "/tmp/worktree".into(),
             branch: "feature".into(),
             head_oid: Some("aaa".into()),
             repository: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
         }
+    }
+
+    fn target() -> Target {
+        branch().into()
     }
 
     fn discussion_comment(body: &str) -> crate::github::PullRequestComment {
@@ -1749,9 +1983,9 @@ mod tests {
         });
         state.pull_request = Some(Arc::new(pr));
         state.inspection = Some(Arc::clone(&inspection));
-        let mut next = target();
+        let mut next = branch();
         next.head_oid = Some("bbb".into());
-        drop(state.synchronize(Some(next), None));
+        drop(state.synchronize(Some(next.into()), None));
         assert!(state.loaded);
         assert!(state.loading);
         assert_eq!(state.filter, "keep this filter");
@@ -1763,10 +1997,10 @@ mod tests {
     #[test]
     fn local_head_changes_observe_automatic_host_backoff_without_blank_content() {
         let host = "inspector-commit-backoff.invalid";
-        let mut original = target();
+        let mut original = branch();
         original.repository = GitHubRepoKey::new(host, None, "owner", "repo").unwrap();
         let mut state = State::default();
-        state.target = Some(original.clone());
+        state.target = Some(original.clone().into());
         state.loaded = true;
         state.filter = "keep".into();
         state.description = markdown::parse("Loaded content").collect();
@@ -1775,7 +2009,7 @@ mod tests {
             &crate::github::GitHubError::Inspection("offline".into()),
         );
         original.head_oid = Some("b".repeat(40));
-        drop(state.synchronize(Some(original), None));
+        drop(state.synchronize(Some(original.into()), None));
         assert!(!state.loading);
         assert!(state.loaded);
         assert_eq!(state.filter, "keep");
@@ -1786,7 +2020,7 @@ mod tests {
     #[test]
     fn a_server_limited_inspector_explains_its_wait_without_discarding_content() {
         let host = "inspector-server-limit.invalid";
-        let mut selected = target();
+        let mut selected = branch();
         selected.repository = GitHubRepoKey::new(host, None, "owner", "repo").unwrap();
         crate::github::polling::failed(
             host,
@@ -1797,7 +2031,7 @@ mod tests {
             },
         );
         let mut state = State::default();
-        drop(state.synchronize(Some(selected), None));
+        drop(state.synchronize(Some(selected.into()), None));
         assert!(!state.loading);
         assert!(state.error.as_deref().unwrap().contains("Retrying at"));
         state.loaded = true;
@@ -1869,7 +2103,7 @@ mod tests {
                 unborn,
             });
             let git = RepositoryService::new("git", executor.clone());
-            let mut target = target();
+            let mut target = branch();
             target.head_oid = (!unborn).then(|| "a".repeat(40));
             assert_eq!(
                 verify_local_head_with(&git, &target, &CancellationToken::new()).is_ok(),
@@ -1961,9 +2195,9 @@ mod tests {
         let _ = state.update(Action::Loaded(target.clone(), 1, Err("old request".into())));
         assert!(state.loading);
         assert!(state.error.is_none());
-        let mut previous = target.clone();
+        let mut previous = branch();
         previous.head_oid = Some("previous".into());
-        let _ = state.update(Action::Loaded(previous, 2, Err("old head".into())));
+        let _ = state.update(Action::Loaded(previous.into(), 2, Err("old head".into())));
         assert!(state.loading);
         assert!(state.error.is_none());
         let _ = state.update(Action::Loaded(target, 2, Err("current error".into())));
@@ -1973,11 +2207,12 @@ mod tests {
 
     #[test]
     fn review_inspector_manual_refresh_preserves_content_during_server_pause() {
-        let mut target = target();
-        target.repository =
+        let mut branch = branch();
+        branch.repository =
             GitHubRepoKey::new("review-inspector-pause.invalid", None, "o", "r").unwrap();
+        let target = Target::from(branch);
         crate::github::polling::failed(
-            &target.repository.host,
+            &target.repository().host,
             &crate::github::GitHubError::RateLimited {
                 limit: crate::github::polling::RateLimit {
                     retry_at: crate::github::polling::now() + 120,
@@ -2005,11 +2240,12 @@ mod tests {
     #[test]
     fn review_inspector_automatic_refresh_honors_backoff_and_manual_refresh_bypasses_it() {
         let mut app = super::super::tests::context_inspector_test_app(false);
-        let mut target = target();
-        target.repository =
+        let mut branch = branch();
+        branch.repository =
             GitHubRepoKey::new("review-inspector-backoff.invalid", None, "o", "r").unwrap();
+        let target = Target::from(branch);
         crate::github::polling::failed(
-            &target.repository.host,
+            &target.repository().host,
             &crate::github::GitHubError::Inspection("offline".into()),
         );
         app.context_inspector_open = true;
@@ -2058,5 +2294,132 @@ mod tests {
         assert!(!state.loading);
         assert!(state.inspection.is_none());
         assert!(state.preview.is_none());
+    }
+
+    /// A window with a chat card, focused, and a terminal card beside it.
+    fn conversation_app() -> (Cagents, TerminalId, CardId) {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let conversation = TerminalId::new();
+        let chat = CardState {
+            id: CardId::new(),
+            generation: 0,
+            title: "Fix the parser".into(),
+            width_fraction: 0.5,
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Hot,
+            kind: CardKind::Chat(crate::chat::Session {
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                id: conversation,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    recipe: crate::model::LaunchRecipe {
+                        unset_environment: Default::default(),
+                        program: "/bin/sh".into(),
+                        arguments: Vec::new(),
+                        working_directory: PathBuf::from("/tmp"),
+                        environment: Default::default(),
+                    },
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+            }),
+        };
+        let terminal = super::super::tests::terminal_card_state();
+        let terminal_id = terminal.id;
+        let chat_id = chat.id;
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![chat, terminal],
+            focused: Some(chat_id),
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.index_cards();
+        app.context_inspector_open = true;
+        app.context_tab = ContextTab::PullRequest;
+        (app, conversation, terminal_id)
+    }
+
+    fn listed(
+        conversation: TerminalId,
+        revision: u64,
+        numbers: &[u64],
+        first: bool,
+    ) -> Action {
+        let repository = GitHubRepoKey::new("chosen-inspector.invalid", None, "o", "r").unwrap();
+        Action::Conversation(conversation::Watch::Listed {
+            conversation,
+            revision,
+            list: Arc::new(crate::work::ConversationPullRequests {
+                generated_at_unix_ms: 0,
+                repository: Some(repository.clone()),
+                pull_requests: numbers
+                    .iter()
+                    .map(|number| crate::work::ConversationPullRequest {
+                        repository: repository.clone(),
+                        number: *number,
+                        relation: crate::work::Relation::Created,
+                        by_subagent: false,
+                        current_branch: false,
+                        pull_request: None,
+                        observed_at_unix_ms: None,
+                    })
+                    .collect(),
+                transcript: crate::work::TranscriptCoverage::Complete,
+                forge_error: None,
+            }),
+            first,
+        })
+    }
+
+    #[test]
+    fn a_chosen_pull_request_is_shown_until_its_conversation_no_longer_lists_it() {
+        let (mut app, conversation, terminal) = conversation_app();
+        drop(app.sync_pull_request_inspector());
+        assert_eq!(
+            app.pull_request_inspector.conversation.conversation,
+            Some(conversation)
+        );
+        assert!(!app.conversation_lists_pull_requests());
+        drop(app.handle_pull_request_ui(listed(conversation, 1, &[4, 5], true)));
+        assert!(app.conversation_lists_pull_requests());
+        let key = PullRequestKey::new(
+            GitHubRepoKey::new("chosen-inspector.invalid", None, "o", "r").unwrap(),
+            4,
+        )
+        .unwrap();
+        drop(app.handle_pull_request_ui(Action::Choose(Some(key.clone()))));
+        assert_eq!(
+            app.pull_request_inspector.target,
+            Some(Target::PullRequest(key.clone()))
+        );
+        assert!(app.pull_request_binding_is_current());
+        assert!(app.pull_request_inspector.loading);
+
+        // Focusing another card in the workspace keeps the conversation and
+        // the choice.
+        drop(app.workspace.focus(terminal));
+        drop(app.sync_pull_request_inspector());
+        assert_eq!(
+            app.pull_request_inspector.conversation.conversation,
+            Some(conversation)
+        );
+        assert_eq!(
+            app.pull_request_inspector.target,
+            Some(Target::PullRequest(key))
+        );
+
+        // A list that no longer names it returns the detail to the branch,
+        // which this window has none of.
+        drop(app.handle_pull_request_ui(listed(conversation, 2, &[5], false)));
+        assert!(app.pull_request_inspector.chosen.is_none());
+        assert!(app.pull_request_inspector.target.is_none());
+        assert!(app.conversation_lists_pull_requests());
+
+        // An older revision does not bring it back.
+        drop(app.handle_pull_request_ui(listed(conversation, 1, &[4, 5], false)));
+        assert_eq!(app.pull_request_inspector.conversation.rows().len(), 1);
     }
 }

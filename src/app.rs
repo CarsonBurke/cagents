@@ -11110,10 +11110,9 @@ impl Cagents {
             return Task::none();
         };
         if self.folder_scope(&key)
-            && matches!(
-                self.context_tab,
-                ContextTab::Changes | ContextTab::PullRequest
-            )
+            && (self.context_tab == ContextTab::Changes
+                || (self.context_tab == ContextTab::PullRequest
+                    && !self.conversation_lists_pull_requests()))
         {
             self.context_tab = ContextTab::Files;
         }
@@ -17820,7 +17819,9 @@ impl Application for Cagents {
             }
             Message::SelectContextTab(tab) => {
                 if self.active_folder_scope()
-                    && matches!(tab, ContextTab::Changes | ContextTab::PullRequest)
+                    && (tab == ContextTab::Changes
+                        || (tab == ContextTab::PullRequest
+                            && !self.conversation_lists_pull_requests()))
                 {
                     return Task::none();
                 }
@@ -18362,6 +18363,7 @@ impl Application for Cagents {
             self.account_subscription(),
             self.automation_subscription(),
             self.work_subscription(),
+            self.conversation_pull_request_subscription(),
             self.channel_work_subscription(),
             self.automation_approval_subscription(),
             self.document_tone_subscription(),
