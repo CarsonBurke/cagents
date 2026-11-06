@@ -271,15 +271,34 @@ fn order(state: &State, sort: Sort, left: &AccountState, right: &AccountState) -
     }
 }
 
+/// Pane visibility is separate from a successful account or quota reading:
+/// a system account whose check failed stays listed for its retry control,
+/// unless its CLI is missing, which the group explains with its remedy.
+pub(super) fn listed(state: &State, account: &AccountState) -> bool {
+    account.present
+        || !account.account.is_system()
+        || (account.failure.is_some()
+            && state.installed.get(&account.account.provider) != Some(&false))
+}
+
 /// The accounts the pane lists for `provider`, in `sort` order: every
-/// account cagents added, and the system account where its CLI is set up.
+/// account cagents added, and the system account where its CLI is set up or
+/// its last check failed and the reader needs its retry control.
 fn rows<'a>(state: &'a State, provider: Provider, sort: Sort) -> Vec<&'a AccountState> {
     let mut rows: Vec<&AccountState> = state
         .of(provider)
-        .filter(|account| account.present || !account.account.is_system())
+        .filter(|account| listed(state, account))
         .collect();
     rows.sort_by(|left, right| order(state, sort, left, right));
     rows
+}
+
+#[cfg(test)]
+pub(super) fn row_ids_for_test(state: &State, provider: Provider) -> Vec<AccountId> {
+    rows(state, provider, state.table.sort)
+        .into_iter()
+        .map(|account| account.id.clone())
+        .collect()
 }
 
 pub(super) fn view(app: &Cagents) -> Element<'_, Message> {
@@ -777,7 +796,7 @@ fn row<'a>(
     // row, including when the Status column has been dropped for space.
     let mut lines = vec![content];
     // The group explains a missing CLI once, with the way to install it.
-    if let Some(reason) = failure_caption(account)
+    if let Some(reason) = failure_caption(account, now)
         .filter(|_| state.installed.get(&account.account.provider) != Some(&false))
     {
         lines.push(
@@ -863,7 +882,8 @@ fn account_cell<'a>(
     let mut title: Vec<Element<'a, Message>> = vec![name];
     let several = state
         .of(account.account.provider)
-        .filter(|other| other.present || !other.account.is_system())
+        .filter(|other| listed(state, other))
+        .take(2)
         .count()
         > 1;
     if several && state.registry.is_default(&account.account) && renaming.is_none() {
@@ -1007,7 +1027,7 @@ fn status(account: &AccountState) -> (&'static str, fn(&cosmic::Theme) -> iced::
 
 /// A failed read does not invalidate the last figures, but they no longer
 /// describe the outcome of the most recent check.
-fn failure_caption(account: &AccountState) -> Option<String> {
+fn failure_caption(account: &AccountState, now: Millis) -> Option<String> {
     let failure = account.failure.as_ref()?;
     // Remote transport diagnostics can be longer than the probe's own fixed
     // summaries. Bound the always-visible text without copying the full
@@ -1036,9 +1056,15 @@ fn failure_caption(account: &AccountState) -> Option<String> {
     } else {
         ""
     };
-    Some(format!(
-        "Last check failed: {detail}{figures} Refresh to try again."
-    ))
+    // Name the row's own control, in the state it is in right now.
+    let next = if account.schedule.in_flight(now) || account.queued.is_some() {
+        "Checking again…"
+    } else if account.schedule.manual_ready(now) {
+        "Use Check now to try again."
+    } else {
+        "You can check again shortly."
+    };
+    Some(format!("Last check failed: {detail}{figures} {next}"))
 }
 
 fn status_badge<'a>(account: &AccountState) -> Element<'a, Message> {
@@ -1467,6 +1493,167 @@ mod tests {
     }
 
     #[test]
+    fn failure_caption_names_what_check_now_can_do_right_now() {
+        let now = 10 * schedule::MANUAL_DEBOUNCE;
+        let mut account = AccountState::new(Account::system(Provider::Codex));
+        account.failure = Some("Codex could not read usage just now".into());
+        let caption = |account: &AccountState, at| failure_caption(account, at).unwrap();
+        assert_eq!(
+            caption(&account, now),
+            "Last check failed: Codex could not read usage just now. Use Check now to try again."
+        );
+        account.schedule.start(Trigger::Manual, now);
+        assert!(caption(&account, now).ends_with(" Checking again…"));
+        account.schedule.fail(now + 1);
+        // The control stays disabled through the manual debounce.
+        assert!(caption(&account, now + 1).ends_with(" You can check again shortly."));
+        assert!(
+            caption(&account, now + schedule::MANUAL_DEBOUNCE)
+                .ends_with(" Use Check now to try again.")
+        );
+    }
+
+    #[test]
+    fn failed_system_rows_keep_error_and_refresh_when_status_columns_drop() {
+        use iced::advanced::{clipboard, mouse};
+        use iced::runtime::{UserInterface, user_interface::Cache};
+
+        let mut renderer = crate::app::tests::headless_renderer();
+        for provider in [Provider::Claude, Provider::Codex] {
+            for (width, stacked, status_visible) in [
+                (420.0, true, false),
+                (500.0, false, false),
+                (1_200.0, false, true),
+            ] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                app.account_ui.now_ms = 1_790_000_000_000;
+                let now = app.account_ui.now_ms;
+                let managed = app.account_ui.add_managed_fixture(provider, 1938006);
+                app.account_ui
+                    .set_fixture_label(&managed, Some("Other account"));
+                app.account_ui
+                    .registry
+                    .set_default(&Account::system(provider));
+                let completed = app.account_ui.account_mut(&managed).unwrap();
+                // Synthetic completed-check timing keeps only the System row's
+                // Refresh enabled; no provider future runs in this widget test.
+                completed.schedule.start(Trigger::Manual, now);
+                completed.schedule.succeed(now);
+                assert!(!completed.schedule.in_flight(now));
+                assert!(!completed.schedule.manual_ready(now));
+                let id = Account::system(provider).id();
+                let account = app.account_ui.account_mut(&id).unwrap();
+                // A first failed check has no quota or reported identity. This
+                // fixture exercises only the actual table's labels and input.
+                account.present = false;
+                account.snapshot = None;
+                account.identity = None;
+                account.failure = Some("The provider returned no usable quota".into());
+
+                let columns = layout(width);
+                assert_eq!(columns.stacked, stacked, "{provider:?} {width}");
+                assert_eq!(
+                    columns.columns.contains(&Column::Status),
+                    status_visible,
+                    "{provider:?} {width}"
+                );
+                let mut ui = UserInterface::build(
+                    table(&app, width),
+                    iced::Size::new(width, 600.0),
+                    Cache::new(),
+                    &mut renderer,
+                );
+                ui.draw(
+                    &mut renderer,
+                    &cosmic::theme::active(),
+                    &iced::advanced::renderer::Style::default(),
+                    mouse::Cursor::Unavailable,
+                );
+                let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+                let nodes = tree
+                    .root()
+                    .iter()
+                    .chain(tree.children())
+                    .collect::<Vec<_>>();
+                let labels = nodes
+                    .iter()
+                    .filter_map(|node| node.node().label())
+                    .collect::<Vec<_>>();
+                assert!(labels.contains(&"System default"), "{provider:?} {width}");
+                assert!(labels.contains(&"Other account"), "{provider:?} {width}");
+                assert_eq!(
+                    labels
+                        .iter()
+                        .copied()
+                        .filter(|label| *label == "Default")
+                        .count(),
+                    1,
+                    "{provider:?} {width}: both listed rows preserve the selected default"
+                );
+                let login = format!("{}'s own login", probe::cli_name(provider));
+                // Every width explains the failure beneath the row and keeps
+                // the account's original login context.
+                assert!(
+                    labels.contains(
+                        &"Last check failed: The provider returned no usable quota. Use Check now to try again."
+                    ),
+                    "{provider:?} {width}: {labels:?}"
+                );
+                assert!(
+                    labels.iter().any(|label| label.contains(login.as_str())),
+                    "{provider:?} {width}: {labels:?}"
+                );
+                assert_eq!(
+                    labels.contains(&"Check failed"),
+                    status_visible,
+                    "{provider:?} {width}: the status column names the failed check"
+                );
+                let refresh = nodes
+                    .iter()
+                    .filter(|node| node.node().label() == Some("Check now"))
+                    .collect::<Vec<_>>();
+                assert_eq!(refresh.len(), 1, "{provider:?} {width}");
+                assert!(!refresh[0].node().is_disabled());
+                let bounds = refresh[0].node().bounds().expect("refresh geometry");
+                let refresh = iced::Rectangle {
+                    x: bounds.x0 as f32,
+                    y: bounds.y0 as f32,
+                    width: (bounds.x1 - bounds.x0) as f32,
+                    height: (bounds.y1 - bounds.y0) as f32,
+                };
+                assert_eq!(refresh.width, design::COMPACT_CONTROL_SIZE);
+                assert_eq!(refresh.height, design::COMPACT_CONTROL_SIZE);
+                assert!(
+                    refresh.x.is_finite()
+                        && refresh.y.is_finite()
+                        && refresh.x >= 0.0
+                        && refresh.x + refresh.width <= width
+                        && refresh.y >= 0.0
+                        && refresh.y + refresh.height <= 600.0,
+                    "{provider:?} {width}: full retry target stays inside the pane"
+                );
+                let point = refresh.center();
+                let mut messages = Vec::new();
+                let _ = ui.update(
+                    &[
+                        iced::Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                        iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    ],
+                    mouse::Cursor::Available(point),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert!(
+                    matches!(messages.as_slice(), [Message::AccountUi(Action::Refresh(actual))] if actual == &id),
+                    "{provider:?} {width}: actual retry click keeps the original account"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn escape_closes_a_menu_before_a_rename() {
         let id = Account::system(Provider::Claude).id();
         let mut table = Table {
@@ -1536,17 +1723,26 @@ mod tests {
             span_secs: None,
             binding: false,
         }];
-        let owner = app.account_ui.account(&id).unwrap().owner;
         // Exercise accepted probe completions; no returned background Task is polled.
-        let _ = app.update(Message::AccountUi(Action::Probed {
-            owner,
-            id: id.clone(),
-            outcome: Outcome::Answered {
+        let probe = |app: &mut crate::app::Cagents, id: &AccountId, outcome| {
+            let now = app.account_ui.now_ms;
+            let (owner, ticket) = app.account_ui.begin_probe_for_test(id, Trigger::Focus, now);
+            drop(app.update(Message::AccountUi(Action::Probed {
+                owner,
+                id: id.clone(),
+                ticket,
+                outcome,
+            })));
+        };
+        probe(
+            &mut app,
+            &id,
+            Outcome::Answered {
                 identity: None,
                 catalog: None,
                 snapshot: snapshot.clone(),
             },
-        }));
+        );
         let widths = [1_400.0, 1_100.0, 520.0, 360.0];
         let healthy = widths.map(|width| measure(&app, &id, width));
         assert!(healthy[0].0.iter().any(|(text, _)| text == "Available"));
@@ -1557,16 +1753,12 @@ mod tests {
                     .any(|(text, _)| text.starts_with("Last check failed:"))
         }));
         let failure = "Codex did not answer within 30 seconds";
-        let _ = app.update(Message::AccountUi(Action::Probed {
-            owner,
-            id: id.clone(),
-            outcome: Outcome::Failed(failure.into()),
-        }));
+        probe(&mut app, &id, Outcome::Failed(failure.into()));
         assert_eq!(
             app.account_ui.account(&id).unwrap().snapshot.as_ref(),
             Some(&snapshot)
         );
-        let caption = "Last check failed: Codex did not answer within 30 seconds. Showing last known usage. Refresh to try again.";
+        let caption = "Last check failed: Codex did not answer within 30 seconds. Showing last known usage. Use Check now to try again.";
         let mut wide_caption_height = None;
         for (index, width) in widths.into_iter().enumerate() {
             let (texts, size, controls) = measure(&app, &id, width);
@@ -1607,15 +1799,15 @@ mod tests {
                 assert!(!layout(width).columns.contains(&Column::Status));
             }
         }
-        let _ = app.update(Message::AccountUi(Action::Probed {
-            owner,
-            id: id.clone(),
-            outcome: Outcome::Answered {
+        probe(
+            &mut app,
+            &id,
+            Outcome::Answered {
                 identity: None,
                 catalog: None,
                 snapshot: snapshot.clone(),
             },
-        }));
+        );
         assert_eq!(
             app.account_ui.account(&id).unwrap().snapshot.as_ref(),
             Some(&snapshot)
@@ -1637,17 +1829,13 @@ mod tests {
         // Long transport diagnostics cannot turn the visible row into an
         // unbounded body. Unicode stays intact and guidance is outside the cap.
         let long_failure = "界🙂é ".repeat(4_000);
-        let _ = app.update(Message::AccountUi(Action::Probed {
-            owner,
-            id: id.clone(),
-            outcome: Outcome::Failed(long_failure.clone()),
-        }));
+        probe(&mut app, &id, Outcome::Failed(long_failure.clone()));
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(state.failure.as_ref(), Some(&long_failure));
         assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
         // status_badge's existing tooltip still formats this whole state.failure.
         let expected = format!(
-            "Last check failed: {}… Showing last known usage. Refresh to try again.",
+            "Last check failed: {}… Showing last known usage. Use Check now to try again.",
             "界🙂é ".repeat(60),
         );
         let (texts, size, controls) = measure(&app, &id, 360.0);
@@ -1663,24 +1851,20 @@ mod tests {
         assert!(captions[0].1.y + captions[0].1.height <= size.height + 0.1);
         assert_eq!(controls, healthy[3].2);
         // Existing sentence punctuation is not duplicated by the caption.
-        let _ = app.update(Message::AccountUi(Action::Probed {
-            owner,
-            id: id.clone(),
-            outcome: Outcome::Failed("Codex could not read usage just now.".into()),
-        }));
+        probe(
+            &mut app,
+            &id,
+            Outcome::Failed("Codex could not read usage just now.".into()),
+        );
         let (texts, _, _) = measure(&app, &id, 520.0);
         assert!(texts.iter().any(|(text, _)| text ==
-            "Last check failed: Codex could not read usage just now. Showing last known usage. Refresh to try again."));
+            "Last check failed: Codex could not read usage just now. Showing last known usage. Use Check now to try again."));
         // A first failed check explains the failure without claiming cached figures.
         let unchecked = app.account_ui.add_managed_fixture(Provider::Codex, 1168);
-        let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&unchecked).unwrap().owner,
-            id: unchecked.clone(),
-            outcome: Outcome::Failed(failure.into()),
-        }));
+        probe(&mut app, &unchecked, Outcome::Failed(failure.into()));
         let (texts, _, _) = measure(&app, &unchecked, 360.0);
         assert!(texts.iter().any(|(text, _)| text
-            == "Last check failed: Codex did not answer within 30 seconds. Refresh to try again."));
+            == "Last check failed: Codex did not answer within 30 seconds. Use Check now to try again."));
         assert!(
             !texts
                 .iter()

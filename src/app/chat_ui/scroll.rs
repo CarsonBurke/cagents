@@ -1566,6 +1566,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     &mut SetBottom(offset),
                 );
                 top.0 = Some((next.travel() - offset).max(0.0));
+            } else if top.0.is_some() {
+                // The native offset kept its distance from the end, which is
+                // where this pass decided the reader is. A later pass in this
+                // layout must start there, not at the top read before growth:
+                // otherwise a measurement that corrects this pass's estimate
+                // makes a reader following the end look scrolled away.
+                top.0 = anchor.active.and_then(|index| anchor.contexts[index].top);
             }
             restore = false;
             let mut virtual_viewport = virtualized::UpdateViewport::default();
@@ -2149,6 +2156,68 @@ mod tests {
             draws: draws.clone(),
             clicks: clicks.clone(),
         })
+    }
+
+    #[test]
+    fn a_reader_at_the_end_follows_growth_whose_estimate_is_corrected_by_measurement() {
+        // Rows are estimated taller than they measure, so each growth changes
+        // the content height again within the same layout.
+        fn transcript(rows: u64) -> Element<'static, Message> {
+            let draws = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let clicks = Rc::new(Cell::new(0));
+            let column = virtualized::column(
+                (0..rows)
+                    .map(|key| {
+                        let draws = draws.clone();
+                        let clicks = clicks.clone();
+                        virtualized::Row::new(key, 0, 100.0, None, move || {
+                            presentation_probe("line", 60.0, &draws, &clicks)
+                        })
+                    })
+                    .collect(),
+                Default::default(),
+            );
+            transcript_observed(
+                column,
+                Target {
+                    card: CardId::new(),
+                    generation: 0,
+                },
+                None,
+                vec![],
+                true,
+                vec![],
+                Observations::default(),
+                Memory::default(),
+                false,
+                HashSet::new(),
+                None,
+            )
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
+        let mut element = transcript(40);
+        let mut tree = Tree::new(&element);
+        let mut end_distance = |element: &mut Element<'static, Message>, tree: &mut Tree| {
+            let node = element.as_widget_mut().layout(tree, &renderer, &limits);
+            let mut top = ReadTop::default();
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(&node), &renderer, &mut top);
+            let travel = node.children()[0].size().height - node.size().height;
+            travel - top.0.expect("a transcript scrollable")
+        };
+        assert!(end_distance(&mut element, &mut tree).abs() <= 0.5);
+        for rows in [80, 120, 200] {
+            let mut grown = transcript(rows);
+            tree.diff(&mut grown);
+            assert!(
+                end_distance(&mut grown, &mut tree).abs() <= 0.5,
+                "growing to {rows} rows left the reader above the end"
+            );
+            element = grown;
+        }
+        drop(element);
     }
 
     #[test]
@@ -3712,7 +3781,7 @@ mod tests {
         let horizontal_id = block_id(neighbor, None, identity);
         let wanted_body = prose::code_text(
             Arc::from("wanted line\n".repeat(5000)),
-            Arc::from([]),
+            None,
             iced::Pixels(14.0),
             iced::Font::MONOSPACE,
             wanted,
@@ -4331,7 +4400,7 @@ mod tests {
         let byte = line.len() * 1500;
         let text = prose::code_text(
             source,
-            Arc::from([]),
+            None,
             design::TEXT_BODY.into(),
             iced::Font::MONOSPACE,
             target,

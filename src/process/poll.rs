@@ -157,26 +157,29 @@ fn write_ready(
     stdin: &mut Option<ChildStdin>,
     bytes: &[u8],
     written: &mut usize,
-) -> Option<String> {
+) -> Option<io::Error> {
     let pipe = stdin.as_mut()?;
     let end = bytes.len().min(written.saturating_add(IO_TURN_BYTES));
     while *written < end {
         match pipe.write(&bytes[*written..end]) {
             Ok(0) => {
                 stdin.take();
-                return Some("stdin: failed to write whole input".into());
+                return Some(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole input",
+                ));
             }
             Ok(count) => *written += count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return None,
             Err(error) => {
                 stdin.take();
-                return Some(format!("stdin: {error}"));
+                return Some(error);
             }
         }
     }
     if *written == bytes.len() {
-        let error = pipe.flush().err().map(|error| format!("stdin: {error}"));
+        let error = pipe.flush().err();
         stdin.take();
         return error;
     }
@@ -435,6 +438,11 @@ pub(super) fn execute(
             true,
         )
     })?;
+    // A command that exits closes its stdin before its exit can be observed, so
+    // its failure explains a broken pipe. A clean exit still lost input it never read.
+    let stdin_error = stdin_error
+        .filter(|error| error.kind() != io::ErrorKind::BrokenPipe || status.success())
+        .map(|error| format!("stdin: {error}"));
     if let Some(message) = stdin_error.or(pipe_error) {
         return Err(ProcessFailure {
             kind: ProcessFailureKind::Io,
@@ -755,6 +763,19 @@ mod tests {
             assert!(failure.stdout.iter().all(|byte| *byte == 0));
             assert!(failure.stderr.iter().all(|byte| *byte == 0));
         }
+    }
+
+    #[test]
+    fn a_command_that_fails_without_reading_its_input_reports_its_own_failure() {
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "exec 0<&-; echo refused >&2; exit 3"])
+            .stdin(vec![b'x'; 2 * 1024 * 1024])
+            .timeout(Duration::from_secs(5));
+        let output = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(output.exit_code, Some(3));
+        assert_eq!(output.stderr, b"refused\n");
     }
 
     #[test]

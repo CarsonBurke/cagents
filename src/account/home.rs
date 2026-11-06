@@ -136,6 +136,75 @@ impl Homes {
             .join(key.hyphenated().to_string())
     }
 
+    /// Whether `key` names a home of `provider` that exists as this user's
+    /// own real directory, reached through no link. A removed home is parked
+    /// and then deleted, so it never is.
+    pub(crate) fn is_kept(&self, provider: Provider, key: Uuid) -> bool {
+        let path = self.path(provider, key);
+        crate::secure_file::reject_symlink_components(&path).is_ok()
+            && crate::secure_file::validate_owned_directory(&path).is_ok()
+    }
+
+    /// Whether `key` names a kept home of `provider` that `registry` does not
+    /// name. Only such a home can be restored to the registry.
+    pub(crate) fn is_unregistered(
+        &self,
+        registry: &super::registry::Registry,
+        provider: Provider,
+        key: Uuid,
+    ) -> bool {
+        !registry.contains_managed_home(self, provider, key) && self.is_kept(provider, key)
+    }
+
+    /// The managed homes `registry` does not name, oldest first, with when
+    /// each directory was created where the filesystem records it.
+    ///
+    /// A registry that was lost or reset leaves its homes here with their
+    /// logins and histories. Only directories named exactly by a key are
+    /// candidates: a parked removal (`.removing-<key>`) is on its way out,
+    /// and anything else in the directory is not a home cagents made.
+    #[cfg(any(feature = "host", test))]
+    pub(crate) fn unregistered(
+        &self,
+        registry: &super::registry::Registry,
+    ) -> Vec<(Provider, Uuid, Option<std::time::SystemTime>)> {
+        let mut found = Vec::new();
+        for provider in super::Account::PROVIDERS {
+            let directory = self.provider_directory(provider);
+            if crate::secure_file::reject_symlink_components(&directory).is_err()
+                || crate::secure_file::validate_owned_directory(&directory).is_err()
+            {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Some(key) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| Uuid::parse_str(name).ok())
+                else {
+                    continue;
+                };
+                // `parse_str` also accepts braced, simple and URN spellings,
+                // which are not the name cagents gives a home.
+                if entry.path() != self.path(provider, key)
+                    || !self.is_unregistered(registry, provider, key)
+                {
+                    continue;
+                }
+                let created = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.created())
+                    .ok();
+                found.push((provider, key, created));
+            }
+        }
+        found.sort_by_key(|(provider, key, created)| (*created, *provider, *key));
+        found
+    }
+
     /// Creates a new, empty home for `provider`, private to this user, and
     /// links the reader's shared entries from `system_home` into it.
     ///

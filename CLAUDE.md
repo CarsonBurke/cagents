@@ -29,7 +29,7 @@ You are a senior app developer tasked with creating a great Agent Development En
 
 ## Choose the cheapest correct build lane
 
-- Run Cargo through `scripts/cargo-gate`, which admits as many builds as the host's memory allows and runs tests after their build releases its slot. Use `scripts/cargo-gate exec COMMAND` where you would have used `flock /var/tmp/cagents-cargo.lock COMMAND`. Do not hold a build lock while tests or the app run.
+- Run Cargo through `scripts/cargo-gate`. Rust compiles only on the build host (`fw16`): the gate sends every compiling command there, brings back the executables, docs and messages callers use, and waits while the host is unavailable rather than building here. Set `CAGENTS_BUILD_REMOTE=local` only when a build must run on this host. Use `scripts/cargo-gate exec COMMAND` for a script of Cargo commands, such as anything you would have run under `flock /var/tmp/cagents-cargo.lock`; its `cargo` leads back to the gate. Do not hold a build lock while tests or the app run.
 - Start with the isolated boundary that owns the change:
   - CLI: `scripts/cargo-gate check --locked --no-default-features --bin cagents`
   - daemon/terminal host: `scripts/cargo-gate check --locked --no-default-features --features host --bin cagentsd`
