@@ -548,14 +548,19 @@ impl Cagents {
             .spacing(space::S),
         );
         let surface = widget::column::with_children(vec![
-            widget::scrollable(content)
-                .height(Length::Fixed(440.0))
-                .into(),
+            widget::scrollable(content).height(Length::Fill).into(),
             controls,
         ])
-        .spacing(space::M);
+        .spacing(space::M)
+        .height(Length::Fill);
+        // Reserve the decision row before assigning the remaining height to
+        // the request. Cap the surface before flex allocation to retain the
+        // ordinary 440-pixel body without squeezing controls on scaled views.
         let overlay = dialog_ui::overlay(
-            dialog_ui::surface(surface, 680.0),
+            widget::container(dialog_ui::surface(surface, 680.0))
+                .max_width(680.0)
+                .max_height(440.0 + space::M + design::DENSE_ROW_HEIGHT + 2.0 * space::L)
+                .into(),
             (!state.deciding).then_some(dismiss),
             1.0,
         );
@@ -1030,6 +1035,176 @@ mod tests {
             assert!(!app.automation_approval_open());
             assert!(!app.automation_approval.deciding);
             assert_eq!(app.automation_approval.available, Some(proposal));
+        }
+
+        use cosmic::iced::{
+            Event, Rectangle, Size, Vector,
+            advanced::{
+                Layout, Shell, clipboard, layout,
+                widget::{
+                    Operation, Tree,
+                    operation::{Focusable, Scrollable},
+                },
+            },
+            mouse,
+        };
+
+        #[derive(Default)]
+        struct Geometry {
+            controls: HashMap<String, Rectangle>,
+            scrollables: Vec<(Rectangle, Rectangle, Vector)>,
+        }
+        impl Operation for Geometry {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.controls.insert(id.to_string(), bounds);
+                }
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                content: Rectangle,
+                translation: Vector,
+                _: &mut dyn Scrollable,
+            ) {
+                self.scrollables.push((bounds, content, translation));
+            }
+        }
+
+        // The supported 900x600 native minimum at InterfaceScale 1.5 supplies a
+        // 600x400 widget viewport. Keep the ordinary dialog size as a positive.
+        for viewport in [Size::new(600.0, 400.0), Size::new(1000.0, 900.0)] {
+            let (mut app, proposal) = reviewing();
+            app.automation_approval
+                .proposal
+                .as_mut()
+                .unwrap()
+                .definition
+                .prompt = "Read all of the saved request before deciding.\n".repeat(80);
+            let generation = app.automation_approval.generation;
+            let renderer = super::super::tests::headless_renderer();
+            let mut element = app.automation_approval_dialog().unwrap();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport),
+            );
+            let mut geometry = Geometry::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut geometry,
+            );
+            for role in ["dismiss", "decline", "approve"] {
+                let bounds = geometry.controls[&approval_control_id(generation, role).to_string()];
+                assert!(
+                    bounds.width > 0.0
+                        && bounds.height > 0.0
+                        && bounds.x >= 0.0
+                        && bounds.y >= 0.0
+                        && bounds.x + bounds.width <= viewport.width + 0.01
+                        && bounds.y + bounds.height <= viewport.height + 0.01,
+                    "{role} must remain reachable at {viewport:?}: {bounds:?}"
+                );
+            }
+            assert_eq!(geometry.scrollables.len(), 1);
+            let (scroll, content, translation) = geometry.scrollables[0];
+            assert!(scroll.width > 0.0 && scroll.height > 0.0 && scroll.height <= 440.01);
+            assert!(scroll.x >= 0.0 && scroll.y >= 0.0);
+            assert!(scroll.x + scroll.width <= viewport.width + 0.01);
+            assert!(scroll.y + scroll.height <= viewport.height + 0.01);
+            assert!(
+                content.height > scroll.height,
+                "the long request must overflow"
+            );
+
+            {
+                let mut pointer = |point, event| {
+                    let mut messages = Vec::new();
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &Event::Mouse(event),
+                        Layout::new(&node),
+                        mouse::Cursor::Available(point),
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &Rectangle::with_size(viewport),
+                    );
+                    messages
+                };
+                assert!(
+                    pointer(
+                        scroll.center(),
+                        mouse::Event::WheelScrolled {
+                            delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -120.0 },
+                        },
+                    )
+                    .is_empty()
+                );
+                for role in ["dismiss", "decline", "approve"] {
+                    let point = geometry.controls
+                        [&approval_control_id(generation, role).to_string()]
+                        .center();
+                    assert!(
+                        pointer(point, mouse::Event::ButtonPressed(mouse::Button::Left)).is_empty()
+                    );
+                    let messages =
+                        pointer(point, mouse::Event::ButtonReleased(mouse::Button::Left));
+                    assert_eq!(messages.len(), 1, "{role} at {viewport:?}");
+                    assert!(match &messages[0] {
+                        Message::AutomationApproval(Action::Dismiss {
+                            id,
+                            revision,
+                            generation: shown,
+                        }) if role == "dismiss" => {
+                            *id == proposal.id
+                                && *revision == proposal.revision
+                                && *shown == generation
+                        }
+                        Message::AutomationApproval(Action::Decide {
+                            id,
+                            revision,
+                            generation: shown,
+                            approved,
+                        }) if role != "dismiss" => {
+                            *id == proposal.id
+                                && *revision == proposal.revision
+                                && *shown == generation
+                                && *approved == (role == "approve")
+                        }
+                        _ => false,
+                    });
+                    // Inspect widget output only: do not dispatch a decision or
+                    // start any daemon/provider task from this geometry regression.
+                }
+            }
+            let mut after_scroll = Geometry::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut after_scroll,
+            );
+            assert_eq!(after_scroll.controls, geometry.controls);
+            assert_eq!(after_scroll.scrollables[0].0, scroll);
+            assert!(
+                after_scroll.scrollables[0].2.y > translation.y,
+                "wheel input must scroll the request while controls remain reachable"
+            );
+            assert!(app.automation_approval_open());
+            assert!(!app.automation_approval.deciding);
         }
     }
 
