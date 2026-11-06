@@ -12,8 +12,9 @@ const NO_PROGRESS: Duration = Duration::from_secs(90);
 const INSPECT_EVERY: Duration = Duration::from_secs(1);
 /// How long a window whose panes have all settled waits for the answer to its
 /// first settled-phase inspection before saving without one. A local worker
-/// gives up within two 5 s control IO bounds: the handshake and the request.
-const SETTLED_ANSWER_BOUND: Duration = Duration::from_secs(12);
+/// gives up within two 5 s control IO bounds, the handshake and the request;
+/// the rest allows for a blocking pool that is busy just after an update.
+const SETTLED_ANSWER_BOUND: Duration = Duration::from_secs(15);
 /// Most panes a notice names; the rest are counted.
 const NAMED_PANES: usize = 8;
 /// Longest pane title a notice repeats, in characters.
@@ -36,6 +37,12 @@ pub(super) struct State {
     asked: Option<Instant>,
     /// The latest inspection in this phase could not reach the daemon.
     unavailable: bool,
+    /// This phase accepted an answer, even one since dropped because its
+    /// owners changed; the daemon has not been silent.
+    answered: bool,
+    /// An answer in this phase came from a reachable daemon, but not for
+    /// exactly this window's connected owners; only a current answer clears it.
+    mismatched: bool,
     /// An unreachable daemon is logged once per opening.
     warned: bool,
     /// A successful answer remains bound to its waiting phase and exact owner.
@@ -92,6 +99,8 @@ impl State {
         self.settled = None;
         self.asked = None;
         self.unavailable = false;
+        self.answered = false;
+        self.mismatched = false;
     }
 
     pub(super) fn window_opened(&self) -> bool {
@@ -199,12 +208,12 @@ impl Cagents {
             return Ok(Some(Pending { admission, panes }));
         }
         if !failures.is_empty() {
-            let (them, their) = match failures.len() {
-                1 => ("it", "its"),
-                _ => ("them", "their"),
+            let them = match failures.len() {
+                1 => "it",
+                _ => "them",
             };
             return Err(format!(
-                "recovery-incomplete: {} could not reconnect: {}. Open {them} to see why and retry; {their} drafts and recovery evidence are kept, and this window remains available.",
+                "recovery-incomplete: {} could not reconnect: {}. Open {them} to see why and retry. Nothing was closed, and this window remains available.",
                 saved_panes(failures.len()),
                 self.startup_pane_names(&failures),
             ));
@@ -312,8 +321,9 @@ impl Cagents {
 
     /// A terminal can attach while the daemon keeps its original owners, so
     /// panes that all settled do not prove the update recovered them: the
-    /// gate saves once the daemon reports Ready for exactly these owners or
-    /// cannot be reached. A Retained answer was reported when it arrived.
+    /// gate saves once the daemon reports Ready for exactly these owners, or
+    /// cannot be reached before it has answered at all. A Retained answer was
+    /// reported when it arrived.
     fn settled_verdict(&mut self, now: Instant) -> Settled {
         self.retire_stale_observation(None);
         let gate = &mut self.startup_gate;
@@ -322,6 +332,8 @@ impl Cagents {
             gate.settled = Some(now);
             gate.asked = None;
             gate.unavailable = false;
+            gate.answered = false;
+            gate.mismatched = false;
             gate.inspecting = None;
             gate.pending = None;
             gate.progressed = Some(now);
@@ -337,17 +349,30 @@ impl Cagents {
                     Settled::Wait
                 }
             }
+            // Retained is reported, and the gate retired, when it arrives.
             Some(StartupState::Retained { .. }) => Settled::Wait,
+            // An answer this phase gave was dropped when its owners changed,
+            // or the daemon that answered is not these owners'. Neither is
+            // silence, and a later failed inspection does not undo it, so
+            // the gate waits for a current answer.
+            None if gate.answered || gate.mismatched => {
+                if self.startup_budget_spent(now) {
+                    Settled::Report(unconfirmed_reason())
+                } else {
+                    Settled::Wait
+                }
+            }
+            None if gate.unavailable => Settled::Save,
             None => {
-                let answered_late = gate
+                let answer_overdue = gate
                     .asked
                     .is_some_and(|asked| now.duration_since(asked) >= SETTLED_ANSWER_BOUND);
                 // An earlier phase's worker can hold the one slot for its own
                 // bound before this phase may ask.
-                let never_asked = gate
+                let past_backstop = gate
                     .settled
                     .is_some_and(|settled| now.duration_since(settled) >= SETTLED_ANSWER_BOUND * 2);
-                if gate.unavailable || answered_late || never_asked {
+                if answer_overdue || past_backstop {
                     Settled::Save
                 } else {
                     Settled::Wait
@@ -383,10 +408,10 @@ impl Cagents {
 
     fn reconnecting_reason(&self, pending: &Pending) -> String {
         if pending.panes.is_empty() {
-            return "recovery-incomplete: this window's shared workspace did not finish loading in time. The window remains available; its saved panes are kept. The update has not been verified.".to_owned();
+            return "recovery-incomplete: this window's shared workspace did not finish loading in time. The window and its saved panes remain available. The update has not been verified.".to_owned();
         }
         format!(
-            "recovery-incomplete: {} did not reconnect in time: {}. The window remains available and keeps reconnecting them. The update has not been verified.",
+            "recovery-incomplete: {} did not reconnect in time: {}. They stay in this window, which remains available. The update has not been verified.",
             saved_panes(pending.panes.len()),
             self.startup_pane_names(&pending.panes),
         )
@@ -395,12 +420,12 @@ impl Cagents {
     fn stalled_reason(&self, pending: &Pending) -> String {
         if pending.panes.is_empty() {
             return format!(
-                "recovery-incomplete: this window's shared workspace made no progress loading for {} seconds. The window remains available; its saved panes are kept. The update has not been verified.",
+                "recovery-incomplete: this window's shared workspace made no progress loading for {} seconds. The window and its saved panes remain available. The update has not been verified.",
                 NO_PROGRESS.as_secs()
             );
         }
         format!(
-            "recovery-incomplete: {} made no progress reconnecting for {} seconds: {}. The window remains available with its saved panes. The update has not been verified.",
+            "recovery-incomplete: {} made no progress reconnecting for {} seconds: {}. They stay in this window, which remains available. The update has not been verified.",
             saved_panes(pending.panes.len()),
             NO_PROGRESS.as_secs(),
             self.startup_pane_names(&pending.panes),
@@ -508,10 +533,14 @@ impl Cagents {
                     context: inspection.context,
                     daemon,
                 };
+                // Whatever it answered, the daemon was reachable.
+                self.startup_gate.unavailable = false;
                 if !self.startup_observation_current(&observed, observed.context.pending.as_ref()) {
+                    self.startup_gate.mismatched = true;
                     return Task::none();
                 }
-                self.startup_gate.unavailable = false;
+                self.startup_gate.mismatched = false;
+                self.startup_gate.answered = true;
                 Some(observed)
             }
             Err(error) => {
@@ -624,7 +653,7 @@ impl Cagents {
     ) -> Task<Message> {
         self.startup_gate.saving = false;
         let settings = settings.map(|settings| self.acknowledge_settings_save(settings));
-        let mut result = settings.and(saved).map_err(|error| format!("recovery-incomplete: conversations reconnected, but the recovered workspace could not be saved: {error}. This window remains available; retry saving before updating again."));
+        let mut result = settings.and(saved).map_err(|error| format!("recovery-incomplete: saved panes reconnected, but the recovered workspace could not be saved: {error}. This window remains available; retry saving before updating again."));
         if result.is_ok() {
             match self.startup_pane_check() {
                 Ok(true) => {}
@@ -670,7 +699,7 @@ fn inspect_existing_daemon(
 
 /// What the window says when the daemon kept its original owners after a
 /// failed restore; the daemon's own reason goes beneath it as details.
-const RETAINED_NOTICE: &str = "Saved sessions could not be reconnected after the update. Their original processes were kept and nothing was closed or deleted, but this window cannot reach them. The update has not been verified.";
+const RETAINED_NOTICE: &str = "Saved sessions could not be fully restored after the update. Their original processes are still running and nothing was closed or deleted, but new terminals and chats cannot start while they are kept. Close each affected pane once its work is done. The update has not been verified.";
 
 /// The handshake's prefix tells the launcher to keep the window open; the
 /// person reading the notice needs only the sentence after it.
@@ -727,6 +756,12 @@ fn restoring_reason(awaiting: u64) -> String {
             count => format!("{count} saved sessions"),
         }
     )
+}
+
+/// Every pane this window shows reconnected, but the daemon did not confirm
+/// for exactly these owners that its restore had finished.
+fn unconfirmed_reason() -> String {
+    "recovery-incomplete: this window's saved panes reconnected, but the terminal service did not confirm that it had finished restoring saved sessions. The window remains available. The update has not been verified.".to_owned()
 }
 
 fn saved_panes(count: usize) -> String {

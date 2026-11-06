@@ -845,7 +845,7 @@ fn a_stale_inspection_does_not_hide_a_real_save_error() {
     drop(app.startup_panes_saved(settings, workspace));
     let reason = reported(&app).unwrap();
     assert_readable(reason);
-    assert!(reason.starts_with("Conversations reconnected"), "{reason}");
+    assert!(reason.starts_with("Saved panes reconnected"), "{reason}");
     assert!(reason.contains("workspace storage unavailable"));
     assert!(!reason.contains(DETAIL));
 }
@@ -970,8 +970,9 @@ fn settled_panes_wait_out_a_restore_until_the_inventory_cap() {
         &mut app,
         Ok(StartupState::Restoring { awaiting: 1 }),
     ));
-    // A restore still under way can end Retained; it is not a verdict.
-    elapse(&mut app, SETTLED_ANSWER_BOUND * 2);
+    // A restore still under way can end Retained; it is not a verdict,
+    // even past the bound a silent daemon gets and within the 30 s cap.
+    elapse(&mut app, SETTLED_ANSWER_BOUND + Duration::from_secs(1));
     drop(app.verify_startup_gate());
     assert!(!app.startup_gate.saving);
     assert_eq!(reported(&app), None);
@@ -1077,4 +1078,145 @@ fn a_waiting_phase_failure_does_not_excuse_the_settled_answer() {
         }),
     ));
     assert_eq!(reported_details(&app), Some(DETAIL));
+}
+
+#[test]
+fn a_settled_answer_dropped_with_its_owner_is_not_silence() {
+    let (mut app, cards) = waiting(2);
+    let chat = connected_chat(&mut app);
+    app.startup_gate.inspected = None;
+    settle(&mut app, &cards);
+    drop(answer_reserved(
+        &mut app,
+        Ok(StartupState::Restoring { awaiting: 1 }),
+    ));
+    // Past the bound a silent daemon gets, within the 30 s cap this window
+    // has once the chat closes.
+    elapse(&mut app, SETTLED_ANSWER_BOUND + Duration::from_secs(1));
+    drop(app.verify_startup_gate());
+    assert!(!app.startup_gate.saving);
+    // Closing the connected chat changes the owners the answer was for.
+    for card in &mut Arc::make_mut(&mut app.durable).cards {
+        if card.id == chat {
+            card.existence = crate::model::Existence::Closing {
+                operation_id: crate::model::OperationId::new(),
+            };
+        }
+    }
+    app.startup_gate.inspected = Some(Instant::now());
+    drop(app.verify_startup_gate());
+    assert!(app.startup_gate.daemon.is_none(), "the owners changed");
+    assert!(!app.startup_gate.saving, "a dropped Restoring is not Ready");
+    assert_eq!(reported(&app), None);
+    // The cap still bounds the wait for a current answer.
+    elapse(&mut app, Duration::from_secs(60));
+    drop(app.verify_startup_gate());
+    let reason = reported(&app).expect("the cap bounds the wait");
+    assert_readable(reason);
+    assert!(reason.contains("did not confirm"), "{reason}");
+}
+
+#[test]
+fn a_reachable_daemon_for_other_owners_is_not_silence() {
+    let (mut app, cards) = waiting(2);
+    connected_chat(&mut app);
+    app.startup_gate.inspected = None;
+    settle(&mut app, &cards);
+    let context = app.startup_gate.inspecting.clone().unwrap();
+    drop(app.startup_state_inspected(Inspection {
+        context,
+        outcome: Ok(Observation {
+            socket: app.startup_gate.fixture_endpoint.clone().unwrap(),
+            proof: old_proof(),
+            state: StartupState::Ready,
+        }),
+    }));
+    assert!(app.startup_gate.mismatched && app.startup_gate.daemon.is_none());
+    elapse(&mut app, SETTLED_ANSWER_BOUND * 2 + Duration::from_secs(1));
+    drop(app.verify_startup_gate());
+    assert!(!app.startup_gate.saving);
+    assert_eq!(reported(&app), None);
+    // The cap still bounds the wait for an answer about these owners.
+    elapse(&mut app, Duration::from_secs(120));
+    drop(app.verify_startup_gate());
+    assert!(!app.startup_gate.saving);
+    let reason = reported(&app).expect("the cap bounds the wait");
+    assert_readable(reason);
+    assert!(reason.contains("did not confirm"), "{reason}");
+}
+
+#[test]
+fn pane_notices_fit_one_launcher_handshake_line_at_their_longest() {
+    let (mut app, cards) = waiting(NAMED_PANES + 3);
+    for card in &mut Arc::make_mut(&mut app.durable).cards {
+        card.title = "\u{1d11e}".repeat(MAX_PANE_TITLE_CHARS * 2);
+    }
+    let pending = Pending {
+        admission: false,
+        panes: cards.clone(),
+    };
+    let stalled = app.stalled_reason(&pending);
+    let reconnecting = app.reconnecting_reason(&pending);
+    for card in &cards {
+        app.cards
+            .insert(*card, CardRuntime::Failed("Fixture attach failed".into()));
+    }
+    let failed = app.startup_pending().unwrap_err();
+    for reason in [stalled, reconnecting, failed] {
+        let line = format!("{}{reason}", instance::UI_LAUNCH_ERROR_PREFIX);
+        assert!(line.len() < 4096, "{}", line.len());
+        assert!(!line.contains('\n'));
+        assert!(line.contains("and 3 more"), "{line}");
+    }
+}
+
+#[test]
+fn a_failed_inspection_after_an_answer_is_not_silence() {
+    let (mut app, cards) = waiting(2);
+    connected_chat(&mut app);
+    app.startup_gate.inspected = None;
+    settle(&mut app, &cards);
+    drop(answer_reserved(
+        &mut app,
+        Ok(StartupState::Restoring { awaiting: 1 }),
+    ));
+    app.startup_gate.inspected = None;
+    drop(app.verify_startup_gate());
+    // A daemon busy restoring can miss one control IO bound.
+    drop(answer_reserved(
+        &mut app,
+        Err("fixture control timeout".into()),
+    ));
+    assert!(app.startup_gate.unavailable && app.startup_gate.daemon.is_none());
+    drop(app.verify_startup_gate());
+    assert!(!app.startup_gate.saving, "its last word was Restoring");
+    assert_eq!(reported(&app), None);
+}
+
+#[test]
+fn a_reachable_daemon_for_other_owners_supersedes_an_unreachable_one() {
+    let (mut app, cards) = waiting(2);
+    connected_chat(&mut app);
+    app.startup_gate.inspected = None;
+    settle(&mut app, &cards);
+    drop(answer_reserved(
+        &mut app,
+        Err("fixture daemon starting".into()),
+    ));
+    assert!(app.startup_gate.unavailable);
+    // The next answer arrives before the gate's own check runs.
+    app.startup_gate.inspected = None;
+    let context = app.reserve_startup_inspection().unwrap();
+    drop(app.startup_state_inspected(Inspection {
+        context,
+        outcome: Ok(Observation {
+            socket: app.startup_gate.fixture_endpoint.clone().unwrap(),
+            proof: old_proof(),
+            state: StartupState::Ready,
+        }),
+    }));
+    assert!(!app.startup_gate.unavailable, "the daemon was reachable");
+    drop(app.verify_startup_gate());
+    assert!(!app.startup_gate.saving);
+    assert_eq!(reported(&app), None);
 }
