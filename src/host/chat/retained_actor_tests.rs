@@ -1510,7 +1510,8 @@ session=next((arg.split('=',1)[1] for arg in sys.argv[1:] if arg.startswith('--s
 def send(value): print(json.dumps(value),flush=True)
 for line in sys.stdin:
     frame=json.loads(line)
-    trace({'event':'input','type':str(frame.get('type'))[:96],'uuid':str(frame.get('uuid'))[:96]})
+    request=frame.get('request')
+    trace({'event':'input','type':str(frame.get('type'))[:96],'subtype':str(request.get('subtype') if isinstance(request,dict) else None)[:96],'uuid':str(frame.get('uuid'))[:96]})
     if frame.get('type')=='control_request':
         send({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':{}}})
     elif frame.get('type')=='user':
@@ -3982,6 +3983,12 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
         fault.execute_batch("CREATE TRIGGER reject_exit_commit BEFORE INSERT ON native_actor_cursors BEGIN SELECT RAISE(ABORT, 'fixture exit commit failure'); END;").unwrap();
     }
     fs::remove_file(root.join("provider-done")).unwrap();
+    let outcome_clock = || {
+        handle
+            .retained_outcome_clock_until(Instant::now() + Duration::from_secs(2))
+            .map(|(_, latest)| latest)
+    };
+    let journaled_before = outcome_clock().unwrap();
     handle
         .command(chat::Command::Prompt {
             text: "A second turn before the exit".into(),
@@ -3989,9 +3996,14 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
             mode: chat::PromptMode::Send,
         })
         .unwrap();
+    // The provider's marker follows its result frame, which the actor may not
+    // have read yet. Exit only once the actor has journaled the turn's outcome.
     wait_until(
-        || root.join("provider-done").exists(),
-        "fixture provider never finished its second turn",
+        || {
+            root.join("provider-done").exists()
+                && outcome_clock().is_ok_and(|latest| latest > journaled_before)
+        },
+        "the actor never journaled its second turn's outcome",
     );
     if console_survives {
         // Killed right after closing the provider, before its CLI view or
@@ -4009,7 +4021,12 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
             &host, &mut error, false
         ));
         if interrupted {
-            let error = error.expect("the unfinished retirement must be reported");
+            let error = error.unwrap_or_else(|| {
+                panic!(
+                    "the unfinished retirement must be reported; provider trace:\n{}",
+                    fs::read_to_string(root.join("provider-trace.jsonl")).unwrap_or_default()
+                )
+            });
             assert!(
                 error.to_string().contains("fixture exit commit failure"),
                 "{error}"
