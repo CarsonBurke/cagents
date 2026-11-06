@@ -9,6 +9,7 @@ in a temporary directory. Cargo builds only a tiny private crate.
 import importlib.machinery
 import importlib.util
 import ast
+import base64
 import contextlib
 import fcntl
 import json
@@ -532,6 +533,8 @@ while [ "$#" -gt 0 ]; do
         *) break ;;
     esac
 done
+# What the build host was asked to do, one line each, for tests that count.
+[ -z "${STAND_IN_LOG-}" ] || printf '%s\n' "$*" >>"$STAND_IN_LOG"
 [ "$1" != unreachable ] || exit 255
 [ "$1" != silent ] || exec sleep 600
 [ "$1" != broken ] || exit 1
@@ -876,6 +879,73 @@ class StandInHost(unittest.TestCase):
         self.assertFalse((self.root / "local-build").exists())
         # Its shim is gone afterwards.
         self.assertFalse(Path(result.stdout.strip()).exists())
+
+    def leases(self, log):
+        """How many slots the build host was asked to lease."""
+        if not log.exists():
+            return 0
+        requests = [json.loads(base64.b64decode(shlex.split(line)[-1]))[1]
+                    for line in log.read_text().splitlines() if "cargo-offload" in line]
+        return sum(1 for request in requests if request[:1] == ["lease"])
+
+    def test_a_held_exec_builds_all_its_cargo_commands_in_one_lease(self):
+        log = self.root / "requests"
+        env = self.remote_env() | {"STAND_IN_LOG": str(log)}
+        result = self.gate_run(
+            "exec", "--hold", "sh", "-ec",
+            "cargo build --bin probe; cargo build --release --bin probe; "
+            "cargo metadata --format-version 1 >/dev/null; exit 7",
+            env=env)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(self.leases(log), 1, log.read_text())
+        self.assertNotIn("waiting", result.stderr)
+        self.assertTrue((self.crate / "target/debug/probe").is_file())
+        self.assertTrue((self.crate / "target/release/probe").is_file())
+        slots = self.host_home / ".cache/cagents-offload/crate"
+        self.assertTrue((slots / "slot-0/src/target/release/probe").is_file())
+        self.assertFalse((slots / "slot-1").exists())
+        self.assertFalse((self.root / "local-build").exists())
+        # The slot is free again, and nothing of the hold is left here.
+        self.assertFalse(list((self.root / "runtime").glob("cagents-hold-*")))
+        log.unlink()
+        result = self.gate_run("build", "--bin", "probe", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.leases(log), 1)
+        self.assertFalse((slots / "slot-1").exists())
+
+    def test_a_build_leases_its_own_slot_once_a_hold_has_ended_or_is_not_its_checkouts(self):
+        log = self.root / "requests"
+        lock = self.root / "runtime" / "cagents-hold-ended" / "lock"
+        lock.parent.mkdir(parents=True)
+        lock.touch()
+        base = "~/.cache/cagents-offload/crate"
+        for top in (str(self.crate.resolve()), str(self.root / "elsewhere")):
+            with self.subTest(top=top):
+                holder = open(lock)
+                if top != str(self.crate.resolve()):
+                    # Held, but for another checkout.
+                    fcntl.flock(holder, fcntl.LOCK_EX)
+                held = json.dumps({"host": "stand-in", "base": base, "top": top,
+                                   "slot": f"{base}/slot-1", "marker": None, "lock": str(lock)})
+                env = self.remote_env() | {"STAND_IN_LOG": str(log),
+                                           "CAGENTS_BUILD_OFFLOAD_HELD": held}
+                result = self.gate_run("build", "--bin", "probe", env=env)
+                holder.close()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.leases(log), 1)
+                self.assertFalse((self.host_home / ".cache/cagents-offload/crate/slot-1").exists())
+                log.unlink()
+
+    def test_tests_in_a_hold_stop_under_a_stray_git_marker_and_builds_do_not(self):
+        env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "marked"}
+        result = self.gate_run("exec", "--hold", "sh", "-c",
+                               "cargo build --bin probe || exit 1; cargo test; echo \"tests $?\"",
+                               env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tests 78", result.stdout)
+        self.assertIn(f"cargo-gate: {self.host_home}/stray/.git on marked puts the tests inside a Git checkout;",
+                      result.stderr)
+        self.assertTrue((self.crate / "target/debug/probe").is_file())
 
     def test_cargo_in_an_exec_command_reaches_cargo_through_a_wrapper(self):
         # Like mise's shim, the wrapper runs the next `cargo` on PATH after its

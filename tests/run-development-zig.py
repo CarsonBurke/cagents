@@ -577,11 +577,16 @@ exit 83
         # Cargo's dependency lists stay there, so nothing here can say the
         # products are current.
         offload = self.runner.with_name("cargo-offload")
+        # One slot there serves all three builds: the hold runs the script.
         offload.write_text('#!/bin/sh\n[ "$1" != --host ] || { echo build-host; exit 0; }\n'
+                           '[ "$1" != --hold ] || { shift; printf "hold\\n" >>"$CARGO_CALLS"; exec "$@"; }\n'
                            'exec cargo "$@"\n')
         offload.chmod(0o755)
-        self.assert_built("--browserless")
-        self.assert_built("--browserless")
+        for _ in range(2):
+            result, calls = self.launch("--browserless")
+            self.assertEqual(calls[0], "hold", result.stderr)
+            self.assertEqual(len(calls), 4, calls)
+            self.assertNotIn("skipping the build", result.stderr)
 
     def test_identity_records_hide_environment_values_and_stay_private(self):
         # Build tools are inert; these are synthetic values, including an

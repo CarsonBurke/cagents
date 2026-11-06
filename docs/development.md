@@ -423,7 +423,8 @@ To gate a script that runs several Cargo commands, replace
 `flock /var/tmp/cagents-cargo.lock COMMAND` with
 `scripts/cargo-gate exec COMMAND`. Where Rust compiles on [another
 host](#building-on-another-host), each Cargo command in it goes there on its
-own. Building here, it holds one slot until the command exits, and gated
+own, unless `exec --hold` holds one slot there for all of them. Building here,
+it holds one slot until the command exits, with or without `--hold`, and gated
 commands inside it run in that slot; gating each Cargo command instead keeps
 test runs out of the slot.
 
@@ -466,9 +467,16 @@ command that compiles there through `scripts/cargo-offload`, without taking a
 slot here. Commands that compile nothing, such as `metadata`, `tree` or
 `clean`, run here at once. Under `scripts/cargo-gate exec COMMAND`, a `cargo`
 first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
-script of builds, such as the development runner or
-`scripts/build-ceditor-product`, builds there too, each command with its own
-admission budget. A Cargo reached any other way inside COMMAND, by path,
+script of builds, such as `scripts/build-ceditor-product`, builds there too,
+each command with its own admission. `scripts/cargo-gate exec --hold COMMAND`
+leases one slot there first, at the `exec` cost, and holds it until COMMAND
+exits: each gated Cargo command in it builds in that slot, one at a time, with
+no admission of its own. It is for a script that only builds, such as the
+development runner's three: a launch waits in the host's queue once rather
+than three times. A command that runs tests or anything slow between its builds
+would keep the slot leased and its memory reserved while it did, so leave
+`--hold` off for those. A Cargo command run from another checkout, or after the
+hold's lease has ended, leases a slot of its own. A Cargo reached any other way inside COMMAND, by path,
 through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
 also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
 compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.

@@ -341,19 +341,18 @@ products=
 build_dir=
 under_lock=false
 
-# Builds the matched set, each product through the gate: on the build host
-# each takes its own slot there and its executable comes back; with
-# CAGENTS_BUILD_REMOTE=local, or on the build host itself, each takes a slot
-# here. Each product is a separate Cargo invocation: features are
-# package-wide, so a single --bins invocation would reunify the UI and host
-# graphs and make the UI compile Ghostty while making the daemon compile
-# libcosmic.
+# Builds the matched set in one slot the gate holds for the three: on the
+# build host, a single admission there, and each executable comes back; with
+# CAGENTS_BUILD_REMOTE=local, or on the build host itself, a slot here. Each
+# product is a separate Cargo invocation: features are package-wide, so a
+# single --bins invocation would reunify the UI and host graphs and make the
+# UI compile Ghostty while making the daemon compile libcosmic.
 build_products() {
     if [ "$under_lock" = true ]; then
         set -- without_compiling "$@"
     fi
     # shellcheck disable=SC2016 # expanded by the inner shell
-    "$@" sh -ec '
+    "$@" "$root/scripts/cargo-gate" exec --hold sh -ec '
         gate=$1
         shift
         "$gate" build --locked --profile dev-runtime --no-default-features --features development --bin cagents
