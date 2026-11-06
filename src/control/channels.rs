@@ -425,7 +425,7 @@ fn attach_session(
                     title => title,
                 };
                 let human = format!(
-                    "Attached session {id} to channel \"{title}\" in {}. Open that channel to see it. A window with something still queued in this conversation moves it there once that finishes.",
+                    "Attached session {id} to channel \"{title}\" in {}. Open that channel to see it. If a window still has work waiting in this conversation, such as a chosen answer, its card moves there once that's done.",
                     entry.project_name.as_deref().unwrap_or("its project"),
                 );
                 placed_output(&result, placed, to, true, human)
@@ -1195,6 +1195,37 @@ mod tests {
     }
 
     #[test]
+    fn channel_close_asks_before_it_deletes() {
+        let (model, _, to) = fixture();
+        let mut inside = unplaced_entry(TerminalId::new(), directory::Surface::Chat);
+        inside.view_scope = Some(Placement::Channel(to));
+        let close = |sessions: Vec<Entry>| {
+            let (client_stream, server_stream) = UnixStream::pair().unwrap();
+            let server = FakeDaemon {
+                models: vec![model.clone()],
+                sessions,
+                chats: vec![],
+                terminals: vec![],
+                edits: vec![],
+            }
+            .serve(server_stream);
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            let result = super::super::channel_output(
+                &mut client,
+                ResolvedChannel::Close { channel_id: to },
+            );
+            drop(client);
+            (result.is_ok(), server.join().unwrap())
+        };
+
+        assert_eq!(close(vec![inside]), (false, vec![]));
+        assert_eq!(
+            close(vec![]),
+            (true, vec![ModelEdit::DeleteChannel { id: to }])
+        );
+    }
+
+    #[test]
     fn channel_move_attaches_a_live_session_without_a_pane_using_the_daemons_descriptor() {
         let (model, _, to) = fixture();
         let chat = unplaced_chat();
@@ -1237,7 +1268,7 @@ mod tests {
         assert_eq!(
             output.human,
             format!(
-                "Attached session {} to channel \"channel\" in repo. Open that channel to see it. A window with something still queued in this conversation moves it there once that finishes.",
+                "Attached session {} to channel \"channel\" in repo. Open that channel to see it. If a window still has work waiting in this conversation, such as a chosen answer, its card moves there once that's done.",
                 match &expected.kind {
                     CardKind::Chat(session) => session.id,
                     _ => unreachable!(),

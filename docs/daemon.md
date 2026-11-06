@@ -73,7 +73,7 @@ cagents daemon stop --confirm
 | `daemon protocol-version` | Print this executable's wire protocol version without contacting a daemon |
 | `terminal list`, `spawn`, `write`, `close`, `snapshot`, `wait` | Inspect and drive daemon-hosted terminals |
 | `project open`, `list`, `close` | Manage the projects every window shares, with or without a window running |
-| `channel spawn`, `list`, `close` | Manage the channels every window shares |
+| `channel spawn`, `list`, `close` | Manage the channels every window shares. `close` is refused while a live session is in the channel: move it, or delete the channel in the app, which closes its sessions |
 | `channel move PANE_OR_SESSION_OR_AGENT --to CHANNEL_ID` | Move a live pane within its project without restarting its session; accepts full pane/session IDs or an agent's full ID, unique ID prefix or unique name, and reports the resulting placement. A live session marked `no shared pane` in `cagents sessions` gets a pane in the channel instead. Refused inside a hosted session, including an in-app shell |
 | `sessions [--project PATH \| --all]` (alias `ls`), `whoami` | List live agent sessions in this project, or identify the calling session and its peers; see [Hosted agent execution](agent-execution.md#finding-other-sessions) |
 | `work ls [--project PATH] [--column COLUMN] [--fresh]`, `work pin ITEM COLUMN`, `work unpin ITEM` | Show every worktree and branch in progress across open projects, newest activity first, or override a card's column; see [Work board](user-guide.md#work-board). Hosted sessions may read the board but not pin |
