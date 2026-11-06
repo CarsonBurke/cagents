@@ -105,6 +105,15 @@ To check where a failure is drawn after delivered work, write a diagnostic to
 command's completion notice, a follow-up, and that error. The notice must
 appear once, after the follow-up.
 
+To check recovery after the provider dies mid-turn, as when the system runs
+out of memory, create `fixture-stop-on-prompt`. The next prompt gets the start
+of an answer, then the provider kills itself with SIGKILL; the file is removed
+first, so a resumed provider answers normally. Create an empty
+`fixture-launches` as well to record each provider start: a line holds the
+conversation ID it resumed, or `new`. After pressing **Resume conversation**
+on the stopped card, the file ends with exactly one line naming the
+conversation that stopped, and no prompt is sent until you send one.
+
 For tool disclosure checks, create `fixture-verbosity`. Each turn emits a
 streamed MCP call with a large prompt, a Skill call, a failed MCP call, and a
 multiline Bash command. It records complete tool inputs and results in the
