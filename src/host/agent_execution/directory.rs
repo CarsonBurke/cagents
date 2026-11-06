@@ -38,7 +38,7 @@ pub(super) fn read(
     scope: Scope,
 ) -> Result<Directory, String> {
     let channel = matches!(scope, Scope::Channel(_));
-    let mut directory = read_including(host, authority, scope, channel)?;
+    let mut directory = read_members(host, authority, scope, channel)?;
     if channel {
         // How recently each session worked is what a reader picking up a
         // channel's work needs first; it costs a file lookup per session, so
@@ -56,18 +56,21 @@ pub(super) fn read(
     Ok(directory)
 }
 
-/// The directory, with chats whose provider exited when `exited` is set.
-pub(super) fn read_including(
+/// The directory. A view of individual members, as of one channel or one
+/// session's history, also includes chats whose provider exited, and names
+/// each session only by its own title: the channel's title, a fallback
+/// elsewhere, would label every member alike.
+pub(super) fn read_members(
     host: &SharedHost,
     authority: &Authority,
     scope: Scope,
-    exited: bool,
+    members: bool,
 ) -> Result<Directory, String> {
     // Reading confers nothing, so a capability whose session has ended reads
     // as a caller outside cagents rather than failing the whole listing.
     let (caller_origin, caller) = caller(host, authority).unwrap_or((Origin::User, None));
     let mut live = live_sessions(host);
-    if exited {
+    if members {
         live.extend(exited_chats(host));
     }
     let (model, delegations, lineages) = {
@@ -192,6 +195,7 @@ pub(super) fn read_including(
             // Channel metadata supplies a fallback when the provider has no title.
             title: live.title.or_else(|| {
                 channel
+                    .filter(|_| !members)
                     .and_then(|channel| model.channel(channel))
                     .map(|channel| channel.title.clone())
             }),
@@ -207,7 +211,13 @@ pub(super) fn read_including(
             relation,
             lineage: lineage(live.id),
             exited: live.exited,
-            failure: live.failure.map(|mut failure| {
+            failure: live.failure.map(|failure| {
+                let mut failure = match live.provider {
+                    Some(provider) => {
+                        crate::chat::failure::summary(provider, &failure).into_owned()
+                    }
+                    None => failure,
+                };
                 if crate::agent_execution::truncate(&mut failure, FAILURE_BYTES) {
                     failure.push('…');
                 }

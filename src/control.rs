@@ -147,7 +147,7 @@ pub enum TopCommand {
         #[command(subcommand)]
         command: AccountCommand,
     },
-    /// List live agent sessions in this project, whoever started them.
+    /// List live agent sessions in this project, whoever started them, or everyone in your channel with --channel.
     #[command(visible_alias = "ls")]
     Sessions(SessionsArgs),
     /// Read a session's conversation, newest last: messages, tool calls and compactions.

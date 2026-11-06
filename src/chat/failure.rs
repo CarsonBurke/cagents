@@ -215,6 +215,30 @@ impl<'a> Failure<'a> {
     }
 }
 
+/// A failure's message in one line: its first line of prose, or "Request
+/// failed" for a raw provider payload, which reads as nothing.
+pub fn headline(message: &str) -> &str {
+    let first = message
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    if first.starts_with(['{', '[']) || first.starts_with("API Error:") {
+        "Request failed"
+    } else {
+        first
+    }
+}
+
+/// A failure as one line for a listing: what it means when it is a known
+/// kind, such as a usage limit and its reset, and otherwise its headline.
+pub fn summary(provider: Provider, message: &str) -> Cow<'_, str> {
+    match Failure::parse(provider, message) {
+        Some(failure) => Cow::Owned(failure.summary),
+        None => Cow::Borrowed(headline(message)),
+    }
+}
+
 /// Inspect only the provider error fields, never a quoted request, prompt, or
 /// model payload. Known error types take precedence over incidental wording in
 /// their message. Plain diagnostics keep the existing phrase-based behavior.
@@ -593,5 +617,25 @@ mod tests {
         })
         .to_string();
         assert!(Failure::parse(Provider::Claude, &raw).is_none());
+    }
+
+    #[test]
+    fn a_listed_failure_reads_as_one_line_never_a_raw_payload() {
+        let limit = summary(Provider::Codex, "Usage limit reached for this plan");
+        assert!(limit.starts_with("Codex usage limit reached"), "{limit}");
+        // An unclassified message keeps its own words, such as a reset time.
+        let own = "You\u{2019}ve hit your usage limit. Try again at Nov 8th, 2026 11:11 AM.";
+        assert_eq!(summary(Provider::Codex, own), own);
+        assert_eq!(
+            summary(
+                Provider::Claude,
+                "[ede_diagnostic] result_type=user stop_reason=tool_use"
+            ),
+            "Request failed"
+        );
+        assert_eq!(
+            summary(Provider::Claude, "\nThe process exited\nwith details"),
+            "The process exited"
+        );
     }
 }

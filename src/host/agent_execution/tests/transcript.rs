@@ -266,6 +266,11 @@ fn channel_directory_lists_members_with_activity_including_an_exited_chat() {
             .collect::<Vec<_>>(),
         vec![session]
     );
+    assert_ne!(
+        named.sessions[0].title.as_deref(),
+        Some("Login"),
+        "a member is not named after its channel"
+    );
 
     // A provider that exits, as at a usage limit, stays listed and readable
     // until its card is closed.

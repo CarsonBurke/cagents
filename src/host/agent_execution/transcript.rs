@@ -27,7 +27,7 @@ pub(super) fn read(host: &SharedHost, authority: &Authority, query: Query) -> Re
     if query.limit == 0 || query.limit > MAX_LIMIT {
         return Err(format!("A page holds between 1 and {MAX_LIMIT} messages"));
     }
-    let listing = directory::read_including(host, authority, Scope::All, true)?;
+    let listing = directory::read_members(host, authority, Scope::All, true)?;
     let mut session = resolve(&listing, &query.session)?;
     let source = source(host, session.id, true)?;
     session.active_at = source.modified();
