@@ -1,0 +1,38 @@
+{
+  "kind": "AUTHOR_ASSEMBLED_ISSUE2015_CORRECTED_SOURCE_DATA_BINDING_NOT_INDEPENDENT_REVIEW",
+  "verdict": "BOUND_CORRECTED_SOURCE_DATA_ONLY",
+  "head": "6dc09b9a1b5d205650e244401da0938b653d16da",
+  "tree": "aaab67a21378958066103707baf3abe8850577d6",
+  "owning_parent_count": 5,
+  "command_data": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/command-data-6dc.json",
+    "sha256": "e4dc07796afbbdbb40095128fdfcbdf24f7b3a1cfcbb60087060a9c1ec4f3938"
+  },
+  "independent_source_review": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/dependencies/command-data-independent-review.md",
+    "sha256": "b8298607a7932d0da9f2175e6a4feeb4b4f867ac65cddb8dd3cedaf1f961f928",
+    "scope": "Historical5a4 selector/gate/count review and bounded cause/guard correction source review. This authored repin verifies corrected leaf identity; not a new independent product review."
+  },
+  "correction_freeze": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/dependencies/cause-guard-correction-freeze.json",
+    "sha256": "9b3bb550982922098cb15695a60a30251374eadbf52ec22c421c70901f59ab33",
+    "scope": "Historical precommit correction leaves; exact same leaf hashes matched to actual committed6dc."
+  },
+  "historical_data": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/dependencies/historical-command-data-5a4.json",
+    "sha256": "feb23120adabb815ba07c657d0eade56499a78fa38fcd5f264b6c5fdb80e80db",
+    "scope": "Historical negative retained unchanged, not executing source pins."
+  },
+  "donor": {
+    "commit": "9714214306b5952b41008f157e02bcd912e64bb5",
+    "tree": "edc642c4029b4d57bdc8a2db2fe57f05abf697c9",
+    "runner_sha256": "ce724709493e94e5514fec52c4c02f596fad40be2846d96172f2502b48a703a8",
+    "plan_sha256": "18c66b50a740e4c71999d03bec40954cba04d91b079cfd1a3b78230f32183e7c",
+    "source_review_sha256": "276aa51159c327c96fb5f978211e18f3186eeb3a639638d432d115201f2d32dc",
+    "scope": "Supervision/guard source donor only; no old runtime pass, authority, grant, release or product review transfers."
+  },
+  "runtime": "ALL_UNRUN",
+  "actual_grant": null,
+  "actual_execution": null,
+  "actual_release": null
+}

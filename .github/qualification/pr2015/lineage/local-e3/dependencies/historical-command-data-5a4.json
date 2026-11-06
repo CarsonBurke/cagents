@@ -1,0 +1,734 @@
+{
+  "schema": "issue2015-source-only-validation-command-data/v1",
+  "created_utc": "2026-10-30T19:43:18.441267+00:00",
+  "author_role": "/root/1945_cache_io_oracles; source-only command DATA author and prior bounded test author, not an independent product reviewer or execution controller",
+  "status": "SOURCE_DATA_ONLY_ALL_EXECUTION_UNRUN_NO_GRANT",
+  "issue": 2015,
+  "product": {
+    "head": "5a4d6e6278714f673d0ce6f9c8453007a417f3b2",
+    "tree": "274283405bb0bf92fa8fa621cc5393048af4ef4e",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+    "identity_scope": "HEAD/tree verified; every listed relevant source pin matches exact Git blob bytes. No complete dependency closure or broad source review is claimed."
+  },
+  "prior_author_receipt": {
+    "path": "/tmp/issue2015-owning-tests-author-3xk46pdj/author-receipt.json",
+    "sha256": "c6563e5bc90acf723b554b61e4d00db618ac29b5c67604d603bd8c6fdd320253",
+    "scope": "Preserved historical author handoff only; current product hashes below are independently pinned and no runtime result transfers."
+  },
+  "source_pins": [
+    {
+      "path": "Cargo.toml",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/Cargo.toml",
+      "git_blob": "3c67491c83a0077d18b41a73ff5850488ebdf0f5",
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "bytes": 13087,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "Cargo.lock",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/Cargo.lock",
+      "git_blob": "9ff31301cf43f2219a56415069c4d3026765f9bb",
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+      "bytes": 341188,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": ".cargo/config.toml",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/.cargo/config.toml",
+      "git_blob": "0e2d20b442d9256e22ecbe4852d77e2a07c45409",
+      "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+      "bytes": 412,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "build.rs",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/build.rs",
+      "git_blob": "cc0447aee8720c7e850030ca36b5385665e6a275",
+      "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+      "bytes": 4593,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "src/main.rs",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/src/main.rs",
+      "git_blob": "429db35e164a3306f4e91c2576f4fc352606ebce",
+      "sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+      "bytes": 656,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "src/lib.rs",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/src/lib.rs",
+      "git_blob": "f2ff4fc03dff4a45810eee2cc7af2393bc9c6c5e",
+      "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+      "bytes": 350,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "src/modules.rs",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/src/modules.rs",
+      "git_blob": "9e04bd958166835de80fc06502dd6cbe547111d6",
+      "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "bytes": 4143,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "src/companion.rs",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/src/companion.rs",
+      "git_blob": "76a9424afbb0b85b6e9792ecf2ea5245204fa639",
+      "sha256": "76d991bd5ff1cd73a4252d6f5961bc1b19e50b0936dc4d00b699fbf56d93af00",
+      "bytes": 4113,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "src/install_guard.rs",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/src/install_guard.rs",
+      "git_blob": "dfe3a4a9685d6a044602fe2666987dfd4c44dea0",
+      "sha256": "b735f0b9564a0e7f4b90e496af57fe06319e07ee64477073a377f9517849356a",
+      "bytes": 39315,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "src/instance.rs",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/src/instance.rs",
+      "git_blob": "6c8de5ba70c47708aace09408c928837c67be89b",
+      "sha256": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+      "bytes": 119199,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "src/update.rs",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/src/update.rs",
+      "git_blob": "6d9c9be4061883d175e2277a3b56da1e3905f764",
+      "sha256": "6e6ac1456826e2dc2fb041d30efce55376549eabe277d5cc2786e80302ba02d7",
+      "bytes": 129496,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "src/app.rs",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/src/app.rs",
+      "git_blob": "fb4de01435e61d174ed960a1fc3a50559fd96119",
+      "sha256": "c405ea52503acc5076a5e77d3bc81d5e9ab341b1a78e313147e9ca70dfc67e77",
+      "bytes": 1376636,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "src/app/update_ui.rs",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/src/app/update_ui.rs",
+      "git_blob": "2db3842ee8438a2e44e3014cc6c3ef4f4c110020",
+      "sha256": "5bae66ddb5fd6ef6bb50de4add827f5212e390aa8d0d495a1678b225e8748e2f",
+      "bytes": 65494,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "install.sh",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/install.sh",
+      "git_blob": "c584a862ada8edb4ac87b5a3ca657c11f0e6ca5d",
+      "sha256": "7b49493d90d0aeeb627b488c8c4fd372b005a038af83098860780b19c0134d07",
+      "bytes": 41938,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "tests/installer_lifecycle_contract.rs",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/tests/installer_lifecycle_contract.rs",
+      "git_blob": "a4091f52fcca21f7cf2312d22fcf4bfdba596a2e",
+      "sha256": "ca9bb7034feddd8f21f303dea1ebcab2125315d8bf66a52964fe66df4fe05dec",
+      "bytes": 51789,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "tests/installer_guard_contract.rs",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/tests/installer_guard_contract.rs",
+      "git_blob": "8269ab33a7d2f031b41cdb4956dc2297f2944831",
+      "sha256": "51cba8117acc62f40e9c26f45ebac5d5a0cbb381d076cfd9fd38f1e28515c912",
+      "bytes": 70172,
+      "live_equals_frozen_git": true
+    },
+    {
+      "path": "tests/support/user_fixture.rs",
+      "absolute_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install/tests/support/user_fixture.rs",
+      "git_blob": "8ef7656d137f2f46f619b3ee1a886e9d85f81a61",
+      "sha256": "a016d99771e4ffdd6d413fcb89a0671462c56dda32956e0b89c09bd50b848079",
+      "bytes": 3948,
+      "live_equals_frozen_git": true
+    }
+  ],
+  "owning_integration_parents": [
+    {
+      "target": "installer_lifecycle_contract",
+      "name": "fresh_install_uses_the_verified_archive_cli_and_matched_inspector",
+      "source": "tests/installer_lifecycle_contract.rs",
+      "line": 1125,
+      "new_parent": true
+    },
+    {
+      "target": "installer_lifecycle_contract",
+      "name": "unsupported_installed_cli_uses_the_verified_archive_pair_without_external_forwarding",
+      "source": "tests/installer_lifecycle_contract.rs",
+      "line": 1132,
+      "new_parent": true
+    },
+    {
+      "target": "installer_lifecycle_contract",
+      "name": "unsupported_coordinators_refuse_before_mutating_the_installation",
+      "source": "tests/installer_lifecycle_contract.rs",
+      "line": 1144,
+      "new_parent": false
+    },
+    {
+      "target": "installer_guard_contract",
+      "name": "external_installer_saves_closes_and_reopens_windows_even_on_failure",
+      "source": "tests/installer_guard_contract.rs",
+      "line": 742,
+      "new_parent": false
+    },
+    {
+      "target": "installer_guard_contract",
+      "name": "inherited_fence_requires_exact_locked_description_and_closed_windows",
+      "source": "tests/installer_guard_contract.rs",
+      "line": 1007,
+      "new_parent": false
+    }
+  ],
+  "core_cli_command_data": [
+    {
+      "id": "cli-check",
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+      "argv": [
+        "cargo",
+        "+1.93.0",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "purpose": "Check only the shared CLI implementation graph.",
+      "execution_status": "UNRUN",
+      "required_future_oracle": "Original exit 0; no successful command is currently claimed."
+    },
+    {
+      "id": "cli-integration-compile",
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+      "argv": [
+        "cargo",
+        "+1.93.0",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_lifecycle_contract",
+        "--test",
+        "installer_guard_contract",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "purpose": "Compile exactly the two owning integration harnesses and their actual CARGO_BIN_EXE_cagents prerequisite.",
+      "execution_status": "UNRUN",
+      "required_future_oracle": "Original exit 0; retain compiler-artifact JSON executable paths for both named integration targets and the CLI. No HOST feature or daemon prerequisite."
+    },
+    {
+      "id": "installer_lifecycle_contract-inventory",
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+      "argv": [
+        "cargo",
+        "+1.93.0",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_lifecycle_contract",
+        "--",
+        "--list",
+        "--format=terse"
+      ],
+      "purpose": "Retain complete inventory for this exact harness before selecting parents.",
+      "execution_status": "UNRUN",
+      "required_future_oracle": {
+        "full_inventory": {
+          "derivation": "Source-only lexical #[test] declarations; Linux-only files. Runtime --list is still mandatory and UNRUN.",
+          "expected_full_test_rows": 36,
+          "expected_names": [
+            "uninstall_accepts_current_and_legacy_cli_status_envelopes",
+            "uninstall_preserves_installation_when_daemon_status_is_untrusted",
+            "installer_entrypoints_refuse_inherited_callers_before_tools_or_purge",
+            "candidate_coordinator_supports_upgrading_an_older_installed_cli",
+            "fresh_install_uses_the_verified_archive_cli_and_matched_inspector",
+            "unsupported_installed_cli_uses_the_verified_archive_pair_without_external_forwarding",
+            "candidate_startup_lock_without_handshake_defers_to_the_verified_owner",
+            "unsupported_coordinators_refuse_before_mutating_the_installation",
+            "interrupting_the_outer_installer_waits_for_inner_rollback",
+            "rejected_outer_signal_injection_cannot_count_as_delivered",
+            "an_unconfirmed_update_cannot_interrupt_sessions_created_after_preflight",
+            "compatible_switch_preserves_terminals_without_any_shutdown_request",
+            "incompatible_install_defers_daemon_replacement_without_stopping_sessions",
+            "failed_compatible_switch_rolls_back_without_stopping_live_sessions",
+            "interrupted_switch_preserves_sessions_and_rolls_back_version",
+            "incompatible_empty_switch_failure_restarts_previous_version_once",
+            "explicit_restart_checkpoints_before_replacing_even_a_compatible_daemon",
+            "failed_checkpoint_preparation_preserves_old_installation_and_sessions",
+            "legacy_restart_refuses_without_checkpoint_or_shutdown",
+            "installer_passes_relaunch_acceptance_only_to_a_supporting_installed_cli",
+            "installer_passes_a_declined_relaunch_only_to_a_cli_that_would_otherwise_accept",
+            "checkpointed_publication_failure_restarts_previous_version_from_handoff",
+            "checkpointed_publication_interruption_restarts_previous_version_from_handoff",
+            "checkpointed_start_failure_restarts_previous_version_from_handoff",
+            "ambiguous_candidate_start_preserves_replacement_and_never_restarts_old_writer",
+            "interrupted_candidate_start_preserves_replacement_writer",
+            "restart_option_rejects_uninstall_and_extra_values_without_creating_installation",
+            "authenticated_private_release_resolves_and_downloads_with_existing_gh_account",
+            "authenticated_pinned_release_downloads_only_requested_tag",
+            "authenticated_download_failure_preserves_installation_without_public_fallback",
+            "public_release_download_works_without_an_authenticated_gh_account",
+            "private_authentication_failure_preserves_installation_without_anonymous_downloads",
+            "staging_preserves_daemons_and_rolls_back_publication_without_control_calls",
+            "staging_rejects_destructive_options_before_touching_installation",
+            "staging_keeps_both_trees_when_current_cannot_be_safely_rolled_back",
+            "staging_cannot_borrow_candidate_support_from_an_installed_coordinator"
+          ],
+          "ignored_names": [],
+          "ordinary_active_source_rows": 36,
+          "nonadditive_passive_helpers": []
+        },
+        "must_match_exact_name_set": true,
+        "nonzero_required": true,
+        "no_test_execution_claim": "--list is inventory, not parent execution."
+      }
+    },
+    {
+      "id": "installer_guard_contract-inventory",
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+      "argv": [
+        "cargo",
+        "+1.93.0",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_guard_contract",
+        "--",
+        "--list",
+        "--format=terse"
+      ],
+      "purpose": "Retain complete inventory for this exact harness before selecting parents.",
+      "execution_status": "UNRUN",
+      "required_future_oracle": {
+        "full_inventory": {
+          "derivation": "Source-only lexical #[test] declarations; Linux-only files. Runtime --list is still mandatory and UNRUN.",
+          "expected_full_test_rows": 11,
+          "expected_names": [
+            "coordinator_fixture::guardian",
+            "coordinator_fixture::failed_readiness_deadline_and_leaked_installers_cannot_escape_custody_or_pass",
+            "coordinator_fixture::rejected_receipt_or_parent_retirement_retains_namespace_without_unwinding",
+            "staged_window_lease_fixture",
+            "external_installer_saves_closes_and_reopens_windows_even_on_failure",
+            "inherited_fence_requires_exact_locked_description_and_closed_windows",
+            "staging_never_contacts_or_reopens_live_windows_even_on_failure_or_cancel",
+            "staged_candidate_startup_authenticates_the_inherited_coordinator_fence",
+            "staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner",
+            "staged_native_ui_owner_fixture",
+            "sealed_anonymous_update_probe_does_not_require_installed_routing"
+          ],
+          "ignored_names": [
+            "coordinator_fixture::guardian"
+          ],
+          "ordinary_active_source_rows": 10,
+          "nonadditive_passive_helpers": [
+            "staged_window_lease_fixture",
+            "staged_native_ui_owner_fixture",
+            "coordinator_fixture::guardian"
+          ]
+        },
+        "must_match_exact_name_set": true,
+        "nonzero_required": true,
+        "no_test_execution_claim": "--list is inventory, not parent execution."
+      }
+    },
+    {
+      "id": "fresh_install_uses_the_verified_archive_cli_and_matched_inspector",
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+      "argv": [
+        "cargo",
+        "+1.93.0",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_lifecycle_contract",
+        "fresh_install_uses_the_verified_archive_cli_and_matched_inspector",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "purpose": "Execute one named owning parent only, if independently admitted in a future granted lane.",
+      "execution_status": "UNRUN",
+      "required_future_oracle": {
+        "running_tests": 1,
+        "named_owning_row": "fresh_install_uses_the_verified_archive_cli_and_matched_inspector",
+        "summary": {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 35
+        },
+        "full_inventory_N": 36,
+        "original_exit": 0,
+        "reject_zero_test_success": true,
+        "nested_helpers_are_nonadditive": true
+      }
+    },
+    {
+      "id": "unsupported_installed_cli_uses_the_verified_archive_pair_without_external_forwarding",
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+      "argv": [
+        "cargo",
+        "+1.93.0",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_lifecycle_contract",
+        "unsupported_installed_cli_uses_the_verified_archive_pair_without_external_forwarding",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "purpose": "Execute one named owning parent only, if independently admitted in a future granted lane.",
+      "execution_status": "UNRUN",
+      "required_future_oracle": {
+        "running_tests": 1,
+        "named_owning_row": "unsupported_installed_cli_uses_the_verified_archive_pair_without_external_forwarding",
+        "summary": {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 35
+        },
+        "full_inventory_N": 36,
+        "original_exit": 0,
+        "reject_zero_test_success": true,
+        "nested_helpers_are_nonadditive": true
+      }
+    },
+    {
+      "id": "unsupported_coordinators_refuse_before_mutating_the_installation",
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+      "argv": [
+        "cargo",
+        "+1.93.0",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_lifecycle_contract",
+        "unsupported_coordinators_refuse_before_mutating_the_installation",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "purpose": "Execute one named owning parent only, if independently admitted in a future granted lane.",
+      "execution_status": "UNRUN",
+      "required_future_oracle": {
+        "running_tests": 1,
+        "named_owning_row": "unsupported_coordinators_refuse_before_mutating_the_installation",
+        "summary": {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 35
+        },
+        "full_inventory_N": 36,
+        "original_exit": 0,
+        "reject_zero_test_success": true,
+        "nested_helpers_are_nonadditive": true
+      }
+    },
+    {
+      "id": "external_installer_saves_closes_and_reopens_windows_even_on_failure",
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+      "argv": [
+        "cargo",
+        "+1.93.0",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_guard_contract",
+        "external_installer_saves_closes_and_reopens_windows_even_on_failure",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "purpose": "Execute one named owning parent only, if independently admitted in a future granted lane.",
+      "execution_status": "UNRUN",
+      "required_future_oracle": {
+        "running_tests": 1,
+        "named_owning_row": "external_installer_saves_closes_and_reopens_windows_even_on_failure",
+        "summary": {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 10
+        },
+        "full_inventory_N": 11,
+        "original_exit": 0,
+        "reject_zero_test_success": true,
+        "nested_helpers_are_nonadditive": true
+      }
+    },
+    {
+      "id": "inherited_fence_requires_exact_locked_description_and_closed_windows",
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+      "argv": [
+        "cargo",
+        "+1.93.0",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_guard_contract",
+        "inherited_fence_requires_exact_locked_description_and_closed_windows",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "purpose": "Execute one named owning parent only, if independently admitted in a future granted lane.",
+      "execution_status": "UNRUN",
+      "required_future_oracle": {
+        "running_tests": 1,
+        "named_owning_row": "inherited_fence_requires_exact_locked_description_and_closed_windows",
+        "summary": {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 10
+        },
+        "full_inventory_N": 11,
+        "original_exit": 0,
+        "reject_zero_test_success": true,
+        "nested_helpers_are_nonadditive": true
+      }
+    }
+  ],
+  "exact_existing_library_ui_target": {
+    "target_kind": "library unit-test harness: --lib",
+    "ui_parent": {
+      "name": "app::update_ui::tests::a_superseded_window_reopens_only_when_nothing_holds_it_open",
+      "source": "src/app/update_ui.rs",
+      "line": 1519,
+      "features": [
+        "ui"
+      ],
+      "module_gates": [
+        "src/modules.rs:18 app requires ui",
+        "src/app.rs:52 mod update_ui",
+        "src/app/update_ui.rs:1022 cfg(test) mod tests"
+      ],
+      "oracle": "Actual update UI handler refuses restart while a confirmation blocks closure, permits only one restart attempt, and clears restarting after helper failure. No helper task/native app pass is claimed."
+    },
+    "shared_guard": {
+      "name": "instance::tests::source_inspection_veto_cancels_all_prepared_windows_before_commit",
+      "source": "src/instance.rs",
+      "line": 2541,
+      "minimum_features": [],
+      "source_gate": "src/instance.rs:2070 cfg(test) mod tests; instance is unconditional in modules.rs. It is also available in the UI library harness.",
+      "oracle": "Two prepared private socket-window fixtures receive update-prepare then update-cancel; injected source preflight refusal leaves guard.closed empty before any commit."
+    },
+    "reason_for_target": "The UI binary is test=false in Cargo.toml. UI app unit parents live under the library module tree and require --lib --features ui.",
+    "additional_ui_guard_command_data": [
+      {
+        "id": "ui-isolated-check",
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+        "argv": [
+          "cargo",
+          "+1.93.0",
+          "check",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "ui",
+          "--bin",
+          "cagents-ui"
+        ],
+        "purpose": "Separate browserless UI boundary if root elects UI guard qualification.",
+        "execution_status": "UNRUN",
+        "required_future_oracle": "Original exit 0; HOST must remain absent."
+      },
+      {
+        "id": "ui-lib-compile",
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+        "argv": [
+          "cargo",
+          "+1.93.0",
+          "test",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "ui",
+          "--lib",
+          "--no-run",
+          "--message-format=json"
+        ],
+        "purpose": "Compile the actual library test target that owns both shared instance and UI app guards.",
+        "execution_status": "UNRUN",
+        "required_future_oracle": "Original exit 0; retain the cagents library compiler-artifact executable path."
+      },
+      {
+        "id": "ui-lib-inventory",
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+        "argv": [
+          "cargo",
+          "+1.93.0",
+          "test",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "ui",
+          "--lib",
+          "--",
+          "--list",
+          "--format=terse"
+        ],
+        "purpose": "Capture full UI-feature library inventory; derive N_ui from actual unique test rows.",
+        "execution_status": "UNRUN",
+        "required_future_oracle": "N_ui is UNKNOWN/UNRUN. Require N_ui > 0 and exactly one inventory row for each selected fully-qualified parent. Preserve the entire inventory and its hash; do not substitute a filtered listing."
+      },
+      {
+        "id": "instance::tests::source_inspection_veto_cancels_all_prepared_windows_before_commit",
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+        "argv": [
+          "cargo",
+          "+1.93.0",
+          "test",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "ui",
+          "--lib",
+          "instance::tests::source_inspection_veto_cancels_all_prepared_windows_before_commit",
+          "--",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ],
+        "purpose": "Select the exact existing source guard through its owning library target.",
+        "execution_status": "UNRUN",
+        "required_future_oracle": {
+          "running_tests": 1,
+          "named_owning_row": "instance::tests::source_inspection_veto_cancels_all_prepared_windows_before_commit",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": "N_ui - 1, using that same harness full inventory",
+          "original_exit": 0,
+          "reject_zero_test_success": true
+        }
+      },
+      {
+        "id": "app::update_ui::tests::a_superseded_window_reopens_only_when_nothing_holds_it_open",
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+        "argv": [
+          "cargo",
+          "+1.93.0",
+          "test",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "ui",
+          "--lib",
+          "app::update_ui::tests::a_superseded_window_reopens_only_when_nothing_holds_it_open",
+          "--",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ],
+        "purpose": "Select the exact existing source guard through its owning library target.",
+        "execution_status": "UNRUN",
+        "required_future_oracle": {
+          "running_tests": 1,
+          "named_owning_row": "app::update_ui::tests::a_superseded_window_reopens_only_when_nothing_holds_it_open",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": "N_ui - 1, using that same harness full inventory",
+          "original_exit": 0,
+          "reject_zero_test_success": true
+        }
+      }
+    ],
+    "selection_scope": "Listed separately from the minimal CLI fixture plan. No UI compile, inventory, parent execution or allocation is implied. Root chooses separately admitted UI qualification; it cannot be inferred from CLI tests."
+  },
+  "inline_case_accounting": {
+    "new_parents": "Each new parent executes success and managed-pane-refusal inline subcases. These remain one libtest parent each, not two independent passes.",
+    "existing_external_guard": {
+      "owning_parent": "external_installer_saves_closes_and_reopens_windows_even_on_failure",
+      "inline_cases": [
+        "0",
+        "7",
+        "cancel",
+        "deferred",
+        "complete",
+        "inspector-refused",
+        "inspector-missing"
+      ],
+      "missing_refusal_oracles": [
+        "Refusal case emits original fixture source-pane error and prepare/source-inspect/cancel order.",
+        "Missing-helper case retains actual not-found cause and prepare/cancel order.",
+        "Neither source-inspection negative is a separate selectable parent or a missing-daemon-as-safety proof."
+      ],
+      "pass_accounting": "Exactly one owning parent if all inline assertions pass. Nested guardian/lease helper receipts are nonadditive."
+    },
+    "planned_selected_owning_counts": {
+      "core_cli_integration_parents": 5,
+      "additional_ui_library_parents_if_selected": 2,
+      "actual_completed": 0
+    },
+    "full_inventory_rule": "Retain the exact complete target inventory first. For each singleton exact parent, require running 1 test, its named ok row, 1P/0F/0I/0M and filtered N-1 for that same target. Never use zero selected tests, inline cases, passive helpers or Cargo exit alone as a pass."
+  },
+  "future_execution_constraints": {
+    "not_an_executor_or_controller": true,
+    "current_grant": "NONE",
+    "current_execution": "UNRUN",
+    "scheduler_context": "Root reports Main15 holds global C 7a237; A/B occupancy is unknown. No allocation, transfer or execution is authorized by this DATA.",
+    "serial_only": true,
+    "cargo_build_jobs": 2,
+    "declared_toolchain": "Rust 1.93.0 via cargo +1.93.0; installation/availability not probed",
+    "target_directory": "Use only a separately admitted existing target/context; this DATA specifies no new CARGO_TARGET_DIR and creates no target/build directory.",
+    "environment": "Preserve natural inherited authority/HOME/XDG at the outer command boundary. No authority-value reads, stripping, replacement, user-role fallback, feature union or manual export workaround is proposed. Source-owned fixtures use their declared private test directories.",
+    "command_identity": "Retain original argv/cwd/toolchain/features/target and source-pin pre/post observations. Inventory and selected runs must resolve to the same current compiled harness for their feature graph; source/data mismatches stop.",
+    "future_file_evidence": "Retain Cargo compiler-artifact executable paths and actual Running harness header; inspect/hash the resulting CLI and harness files with file identity before/after as separately admitted source/RAW gates specify. A header or file hash alone does not prove a historical test-ELF PID binding.",
+    "custody": "Any future execution needs its own independently reviewed custody/controller and fresh root grant, with original errors retained and positive whole-owned-family settlement plus all pidfd closure before that same C closes. This JSON implements and proves none of those operations."
+  },
+  "prerequisites_and_limits": {
+    "platform": "Linux. Both integration files are Linux cfg targets.",
+    "fixture_dependencies": "Actual Cargo-built CLI from CARGO_BIN_EXE_cagents; controlled Python3 inspector in the verified archive; ordinary sh/tar/gzip and fixture utilities. Tool presence was not probed.",
+    "host_compile_required_for_python_fixture": false,
+    "no_network_fixture": "The two new parents supply local archive/checksum hooks and a controlled archive; authenticated GitHub/release integration is not exercised.",
+    "source_qualification_only": "Commands, selectors, predicted integration inventory and result assertions are source DATA. No check, compile, inventory, test, installed helper, provider or native app has run as part of this task.",
+    "runtime_gaps": [
+      "Actual HOST source-inspection implementation and durable DB/source recovery remain unqualified.",
+      "Native save/close/refusal/reopen and fresh-install UX remain unqualified.",
+      "No actual process/ELF PID binding, direct inventory, capability, cleanup receipt, target cache availability or installation result is claimed.",
+      "Neither historical author receipt nor future command success alone establishes whole-product readiness."
+    ]
+  }
+}

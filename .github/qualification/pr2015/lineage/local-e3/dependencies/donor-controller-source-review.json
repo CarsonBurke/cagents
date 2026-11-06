@@ -1,0 +1,178 @@
+{
+  "verdict": "CONTROLLER_SOURCE_CLEAR",
+  "head": "4fa3370532d78d8e19099639f2bc40c711dc725a",
+  "tree": "ea6671347bb1c2aa84f240f9b4727c00346403bc",
+  "runner_sha256": "ce724709493e94e5514fec52c4c02f596fad40be2846d96172f2502b48a703a8",
+  "plan_sha256": "18c66b50a740e4c71999d03bec40954cba04d91b079cfd1a3b78230f32183e7c",
+  "kind": "INDEPENDENT_PR1287_CONTROLLER_SOURCE_SUCCESSOR_REVIEW_ONLY",
+  "scope": "Exact frozen qualification controller and data binding; successor of the retained CONTROLLER_SOURCE_HOLD. This is source acceptance only, not a new production review, runtime result, execution permission, C grant, queue admission, lease, release or merge readiness.",
+  "packet": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287",
+  "control_freeze": {
+    "path": "/tmp/fw16-backend-ec204421/pr1287-git-guard-successor-freeze-v2.json",
+    "sha256": "aceb81fac7359d5d68c32999c7414261664a4672c8bc9d81906307659b361f51",
+    "committed_base": "4fa3370532d78d8e19099639f2bc40c711dc725a",
+    "declared_staged_tree": "edc642c4029b4d57bdc8a2db2fe57f05abf697c9",
+    "source_correction_sha256": "b788148bd059facf9532064d553271c0438789cb4ed0bdcb75c69b2d0034731d",
+    "git_object_revalidation": "Not performed; supplied staged-tree identifier is retained as freeze metadata. Every one of its 42 file hashes was independently matched against the supplied packet and checksum file.",
+    "no_new_commit_or_publication": "As declared by the freeze; no Git or GitHub operation was performed in this review."
+  },
+  "method": "Static supplied-source reading, plain JSON data comparisons, SHA256 file verification and lexical byte comparisons only. No candidate Python import, AST evaluation, parser/helper/controller/oracle invocation, py_compile, Git fixture, Rust, build, test, formatter, native/provider workload, process-state probe, target/lock/cache/registry access, resource inquiry, inbox or meter action.",
+  "source_result": {
+    "actionable_blockers": [],
+    "predecessor_finding": "PRELOCK_GIT_CHECKS_PRECEDE_GUARDED_CONTEXT is corrected in this exact successor. No unsafe live configuration or historical unsafe execution is asserted.",
+    "routing_before_spawn": {
+      "lines": "run-packet.py:115-134,149-150",
+      "result": "Every Git invocation passes through git(), which checks presence of the same ten GIT_ROUTING names as the maintained policy source before bounded_capture/Popen. Empty values still refuse. No variable value is logged, removed or replaced.",
+      "command_overlays": [
+        "--no-replace-objects",
+        "--no-optional-locks",
+        "core.hooksPath=/dev/null",
+        "core.fsmonitor=false",
+        "core.untrackedCache=false",
+        "submodule.recurse=false"
+      ]
+    },
+    "configuration_before_object_or_status": {
+      "lines": "run-packet.py:150-156",
+      "result": "The first Git command is names-only NUL-delimited config enumeration with protective overlays already supplied. Conditional includes and partial/promisor config names refuse before index/object/status work. Sparse settings, when present, must parse false. Dormant filter driver definitions alone remain admitted."
+    },
+    "index_and_attributes_before_status": {
+      "lines": "run-packet.py:157-199,650-659",
+      "result": "Ordinary H index entries, nonempty unique paths, stage0, permitted regular/executable/symlink modes, exact 40-hex OIDs and exact HEAD mode/OID/path map are required; gitlinks/unresolved/hidden/staged divergence refuse. Both working and cached effective attributes are inspected before status, and every emitted filter attribute refuses regardless of textual value.",
+      "filename_argv_nul": "NUL boundaries preserve embedded tabs/newlines; metadata headers partition only at the first tab. Path argv are separate Popen arguments after --, with at most 32768 encoded path bytes per batch and a per-path bound. Attribute triples must be complete, refer to a requested path and be unique by path/attribute. No shell, stdin pipe or new workload API was added.",
+      "fail_closed_limits": "The inherited bounded_capture uses strict UTF-8 decoding and strip(). Non-UTF-8 metadata or leading-whitespace filename attribution can refuse an otherwise ordinary checkout; no filter gate bypass or false qualification follows. This is not arbitrary-filename support.",
+      "observation_limit": "Configuration, index, attributes, status and source pins are discrete cooperative observations. They do not atomically exclude an outside mutator."
+    }
+  },
+  "mechanical_conservation": {
+    "predecessor_runner_sha256": "4288fcae65f7afa46ce54979a9aa69a9ae0e9231235adf675423959fcbe579e4",
+    "existing_functions_byte_exact": [
+      "digest",
+      "now",
+      "observed_wait",
+      "supervision_failure",
+      "signal_pidfd",
+      "children",
+      "settle_children",
+      "cargo_test_artifact",
+      "inventory_names",
+      "parent_pass",
+      "validate_controller_review",
+      "evidence_copy",
+      "execute_contracts",
+      "custody_clean",
+      "safe_lane_handoff",
+      "parent_accounting",
+      "final_observations",
+      "note_lane_cancellation",
+      "require_workload_allowed",
+      "retain_uncertain_lane",
+      "bounded_capture"
+    ],
+    "existing_function_count_byte_exact": 21,
+    "changed_existing_functions": [
+      "git",
+      "main"
+    ],
+    "main_delta": "Exactly one guard_git_metadata(absolute_deadline) insertion at the start of nested source(); all other main bytes are exact.",
+    "added_functions": [
+      "refuse_git_routing",
+      "git_nul_fields",
+      "guard_git_metadata"
+    ],
+    "other_delta": "GIT_ROUTING constant, relocated PLAN path and corresponding PLAN_SHA only.",
+    "budget_custody": "bounded_capture, immutable spawn tuples, separate original wait/evidence states, pidfd timeout handling, sticky supervision failures/cancellation, owned-descendant custody, phase invoke body, final double custody observation, C acquisition and original-Cfd-close/uncertain-retention bodies remain byte-exact. No LOCK_UN, unknown provider-descendant kill, new cold fallback, target creation or new cleanup policy was introduced.",
+    "deadline": "Each new Git operation uses the existing 10-second capture deadline and original wait/TERM3/KILL3 supervision. After acquisition it shares the existing phase and absolute remaining 2400-second cap. Pre-C metadata checks still precede that cap; they do not acquire C or run Cargo/tests."
+  },
+  "binding_verification": {
+    "checksum_file_sha256": "f1f76639c24dc98fe392001941642765cfbfed49f956bf202390c0219ad4fb4e",
+    "checksum_entries_verified": 41,
+    "freeze_file_hashes_matched": 42,
+    "current_archive_bindings": 30,
+    "archive_names_unique": 30,
+    "archive_paths_unique": 30,
+    "every_current_archive_binding_local_and_checksum_pinned": true,
+    "source_review_binding_sha256": "4efe030529d467eea1664bd1ee9dfc3882dfa4f273530d414d2f8b6c9f3ea4d6",
+    "source_binding_delta": "Only packet path relocation from the predecessor binding; content claims otherwise byte-equivalent after path normalization. The current source-review archive entry intentionally has this new hash.",
+    "historical_archive_conservation": "The other 27 predecessor archive leaves retain their hashes. Two new current archives are retained HOLD72b0 and maintained policy helperd0c. Author predecessor readiness/conservation/diff/README/checksum bytes remain separately named archival metadata; their old paths/hashes confer no current admission.",
+    "predecessor_hold_sha256": "72b0db3ab2695e81d3acba9d14b216403a4971d482ab91013b8ed98c4863a83d",
+    "policy_source_sha256": "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74",
+    "direct_donor_runner_sha256": "9cee2286ec27df79c065d0534757404e4cf0aa53eb21b6f8a28d3acb9b9d961e",
+    "direct_donor_plan_sha256": "a6fe776656595c01b9f75777532226fd8f30bbf1cfc2511abb126ee131418774",
+    "source_manifest_sha256": "8cfbf1962340a5bc6bee485c45145e5e9586b7ab47c25cfaa7b7c2e22829c0bb",
+    "product_source_freeze_sha256": "0a11677566724b58721a42e5d6a96636bc0d346876d21daa93667be2c7bf6f58",
+    "source_pin_count": 20,
+    "all_source_pin_values_equal_manifest": true,
+    "source_pin_values_equal_predecessor": true,
+    "packet_mode": "0755, not the historical author's original0700 claim; dependencies0700, checked payloads0444 regular files. Current packet is not group/other writable.",
+    "plan_delta_after_path_normalization": [
+      "status",
+      "source_review_sha256",
+      "archive_bindings (rebased current source binding plus two additions)",
+      "limits (explicit guard and cooperative-observation limits)"
+    ]
+  },
+  "preserved_future_plan": {
+    "phases": 22,
+    "order": [
+      "host-binary-check",
+      "compile-host-lib",
+      "inventory-host-lib",
+      "parent-host-lib-1",
+      "parent-host-lib-2",
+      "parent-host-lib-3",
+      "parent-host-lib-4",
+      "ui-binary-check",
+      "compile-ui-lib",
+      "inventory-ui-lib",
+      "parent-ui-lib-1",
+      "parent-ui-lib-2",
+      "parent-ui-lib-3",
+      "parent-ui-lib-4",
+      "parent-ui-lib-5",
+      "parent-ui-lib-6",
+      "parent-ui-lib-7",
+      "parent-ui-lib-8",
+      "parent-ui-lib-9",
+      "parent-ui-lib-10",
+      "parent-ui-lib-11",
+      "parent-ui-lib-12"
+    ],
+    "assigned_distinct_owning_parents": 16,
+    "assigned": {
+      "host": 4,
+      "ui": 12,
+      "cli": 0
+    },
+    "source_predicted_compiled_selected": {
+      "host": 16,
+      "ui": 12,
+      "cli": 0
+    },
+    "source_predicted_counts_are_not_full_ELF_totals_or_passes": true,
+    "expected_child_reexecutions": 0,
+    "graphs": "Separate --no-default-features host and ui invocations; no default/full/integrated or host+ui unification.",
+    "sequence": "HOST binary check -> HOST lib Cargo JSON compile -> actual ELF full inventory -> four assigned exact parents; then UI binary check -> UI lib Cargo JSON compile -> actual ELF full inventory -> twelve assigned exact parents.",
+    "lane": "Existing C target and lock unchanged, jobs2, physical Rust1.93 tool paths and SHA pins conserved; neither existence nor availability probed.",
+    "packet_deadline_seconds": 2400,
+    "no_retry_or_cold_fallback": true
+  },
+  "retained_limits": {
+    "guard_oracles": "Inert source-derived future oracle data only. No real Git fixture or new guard runtime result exists.",
+    "current_rust_runtime": "HOST/UI check, compilation, actual ELF discovery and all sixteen assigned owning parents remain UNRUN. This source verdict records zero passes.",
+    "filtered_N_minus_1": "parent_pass is byte-exact. It enforces exact run1/named-ok/1P0F0I event shape but only syntax-checks the filtered-out integer. A sole original raw owning-parent summary must be independently checked against that lane's fresh complete inventory N-1; no source count or runner qualified flag substitutes for this.",
+    "negative_path_ELF_hash": "Digest is checked before inventory/each owning parent and after invoke returns successfully. A failed/timeout/uncertain invoke skips the post-use digest. No post-failed-use ELF hash or full archived ELF bytes are guaranteed. Preserve the original negative and make no failed-use immutability claim.",
+    "grant": "The validator checks only verdict/head/tree/runner_sha256/plan_sha256. This actual review supplies those fields; it invents no independent authority mechanism. Grant text is correlation syntax, not freshness, once-only authorization or an actual grant. Root must separately coordinate any fresh real grant and scheduling.",
+    "custody": "Positive handback still requires exact successful-spawn/original-wait/evidence correspondence and clean unforced phase plus both final custody observations. Timeout, unknown wait, forced cleanup, sticky supervision failure or ambiguous close cannot become qualification or safe-return evidence. Retained external-kill limitation remains.",
+    "source_context": "No assertion of current ambient Git configuration, current target/tool state or live process custody was made.",
+    "historical_negatives": "Old015e Script infrastructure failure,6327 FK source-oracle defect,clean-textual-merge duplicate source finding and predecessor4288 Git-guard HOLD remain separate from corrections; none becomes an executed runtime/compiler failure or retroactive pass.",
+    "script_success": "Copied exact4fa Script contracts41084001631/job124160232059 SUCCESS receipt remains separate from the manifest's original RUNNING observation and historical failures. It establishes zero Cargo/test/native passes.",
+    "whitespace": "Freeze reports six source-owned files diff-check PASS and whole staged diff-check EXIT2 on preserved historical/raw bytes. This review did not run diff-check and makes no whole staged whitespace PASS claim.",
+    "excluded_qualification": "No native/provider/development-runner/daemon/desktop, broad all-targets, whole-inventory/WHOLE/SeedView/admission, installed-product, release or merge qualification."
+  },
+  "actual_grant": null,
+  "actual_execution": null,
+  "actual_release": null,
+  "qualified": false,
+  "next_C": "1775 retains the next fair-queue turn. No reservation, allocation or job was requested or created by this review."
+}

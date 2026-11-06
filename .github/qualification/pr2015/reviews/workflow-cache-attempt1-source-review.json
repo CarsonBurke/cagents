@@ -1,0 +1,100 @@
+{
+  "schema": "fw16.issue2015.hosted-attempt1.scoped-independent-source-review.v1",
+  "verdict": "SOURCE_CLEAR_SCOPED_WORKFLOW_CACHE_ADMISSION_AND_SYNTHETIC_FIXTURE",
+  "head": "6dc09b9a1b5d205650e244401da0938b653d16da",
+  "tree": "aaab67a21378958066103707baf3abe8850577d6",
+  "controller_head": "143555931ca118d023b6ddeb8b7071f8bde5d98c",
+  "controller_tree": "730a4787d4f3d9c18dffd602212dd7b87d8cce7b",
+  "controller_parent": "182075edc8014ecf30767a9d376ec133fa8548ec",
+  "runner_sha256": "1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20",
+  "plan_sha256": "b617f0a06e4548b5157acc28fba52bec7d10a76484554b27d1187a491a97dbdb",
+  "source_freeze": {
+    "path": "/tmp/issue2015-hosted-attempt1-source-freeze-v2.json",
+    "sha256": "2bd0c301526fd9b9190518f1f4c1a3afc800bcffc25c87e7739ba4809928109a"
+  },
+  "commit_receipt": {
+    "path": "/tmp/issue2015-hosted-attempt1-commit-receipt-14355593.json",
+    "sha256": "ea371131552f031547798242c7b840b8d59d281ba971caee47f374836066d07b"
+  },
+  "active_source_and_fixture_sha256": {
+    ".github/workflows/research-pr1853-bd88.yml": "97bef99d9c141bbed508a3d9ea4b5b04904f6a92346994279ff16f4da338a181",
+    ".github/qualification/pr2015/run-packet.py": "1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20",
+    ".github/qualification/pr2015/plan.json": "b617f0a06e4548b5157acc28fba52bec7d10a76484554b27d1187a491a97dbdb",
+    ".github/qualification/pr2015/cache-restore-gate.py": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
+    ".github/qualification/pr2015/case-select.py": "360fd8c0c1b7dbed1ed80c6aca01fe2fdd23e382b0d0d07ad914045fb0675c85",
+    ".github/qualification/pr2015/case.json": "9af20ec84ffb12ac682df8cf8767d670cf25a9b9f2970bc248ab8f8833ec103f",
+    ".github/qualification/pr2015/manifest.json": "ce9a12cb0dd3c41e5f254851aa79d779c0bfc238c67d83ff6ea88e2953d25a22",
+    ".github/qualification/pr2015/source-review-binding.json": "137abfaddf843a76597c03d7f9b0f10405ce732393d91d2f6d8958f5d21b3e87",
+    ".github/qualification/pr2015/test-original-attempt-context.py": "0906fb636fae6e0b5b7cf3795b7174e0f5540c19dcf37b24cd0cf9b1ff467cac"
+  },
+  "prior_HOLD": {
+    "path": "/tmp/fw16-issue2015-hosted-workflow-cache-admission-HOLD-813653b3.json",
+    "sha256": "d6b4b3e403ca0641aae1f1d1cd285bb9463d6a447fb281dd1ee55b4190feaf08",
+    "status": "Original source HOLD remains unchanged historical evidence. Its concrete missing-attempt-fence finding is corrected only in this exact successor."
+  },
+  "scope": "Same independent nonauthor workflow/case/cache/hosted-User admission reviewer; finite successor placement/binding correction and isolated unit-fixture source assessment. Other peer retains full runner command/count/custody review. This scoped verdict is not the runtime-required full CONTROLLER_SOURCE_CLEAR receipt or an execution grant.",
+  "verified_correction": [
+    {
+      "path": ".github/qualification/pr2015/case-select.py:55",
+      "finding": "Exactly one literal attempt1 assertion is added inside only the installer2015 branch after immutable case hash/JSON/type selection checks. hosted_context returns only after this assertion. Its caller invokes it before writing source_selected/GITHUB_OUTPUT, and the actual installer workflow invokes the same selector before rustup/cache/gate/cargo--version. Attempt2+/nonliteral01 therefore have no accepted installer workflow path."
+    },
+    {
+      "path": ".github/qualification/pr2015/run-packet.py:619",
+      "finding": "Exactly one literal attempt1 assertion follows mandatory installer case selection in dedicated runner hosted_context. main calls hosted_context first, before plan/cache/tool materialization, custody lock or Cargo. Direct runner entry retains the same original-attempt requirement."
+    },
+    {
+      "path": ".github/workflows/research-pr1853-bd88.yml",
+      "finding": "The entire new workflow normalizes byte-exactly to the prior frozen workflow after replacing only new case/selector/runner hashes with their old values: two case hashes, two selector hashes and one runner hash. Mutually exclusive case guards and literal legacy1726 job remain unchanged. No new dispatch/retry event or heavy parallel route is added."
+    },
+    {
+      "path": ".github/qualification/pr2015/case.json",
+      "finding": "Six source leaf pins, top-level runner/selector/plan/cache references and both workflow preflight checks bind the corrected bytes. All42 freeze file hashes,30 runtime archive leaves and28 immutable lineage files match. plan/cache/manifest/source-binding remain byte-exact to predecessor; reviewed cache-before-all-Cargo and hosted-context policies therefore remain applicable."
+    }
+  ],
+  "legacy_semantics": "Removing the one installer-only selector assertion recovers the entire old selector byte-for-byte. Legacy positive run_attempt1/2/999/01 semantics and zero refusal remain untouched; dedicated runner still admits only installer case. No old packet is retroactively qualified.",
+  "fixture_source_judgment": {
+    "path": ".github/qualification/pr2015/test-original-attempt-context.py",
+    "sha256": "0906fb636fae6e0b5b7cf3795b7174e0f5540c19dcf37b24cd0cf9b1ff467cac",
+    "verdict": "SOURCE_CLEAR_FOR_BOUNDED_SYNTHETIC_CONTEXT_UNIT_EXECUTION_ONLY; NOT EXECUTED BY REVIEWER",
+    "actual_function_boundary": "AST selection requires exactly one top-level hosted_context FunctionDef from each actual source file. Only that definition is compiled/evaluated in a new namespace; controller module/global initializers/imports/main are not executed.",
+    "fake_environment": "The fixture imports no os. os in the extracted function namespace is SimpleNamespace(environ=the fixture-created engine dict). Every environment get/iteration reaches that dict; no real os.environ read, patch, copy, removal or replacement occurs.",
+    "fake_filesystem": "Path, CONTROL, control_path and digest inside extracted function resolve only MemoryPath/dictionary bytes. Real Path is used only to locate/read the two explicit source files. No actual event/control checkout/cache/target/lock/account/capability is inspected or created.",
+    "effects": "Within the exact pinned fixture and extracted current functions, effects are bounded source reads and normal unittest output. No process/helper/controller/Cargo/native/provider/account/resource action, environment mutation, filesystem writes, network, grant or real User provenance is created. This is not a sandbox guarantee for arbitrary future changed function bodies or an unseen execution wrapper.",
+    "method_parents": [
+      "test_installer_attempt1_allowed_by_both_contexts",
+      "test_installer_reruns_and_nonliteral_one_refused_by_both_contexts",
+      "test_zero_remains_invalid_for_all_supported_cases",
+      "test_legacy_positive_attempt_semantics_preserved"
+    ],
+    "accounting": "Four unittest methods; seventeen context evaluations are nonadditive subcases:2 attempt1,8 rerun/nonliteral,3 zero,4 legacy. Synthetic pass is never a hosted/product or owning CLI parent pass.",
+    "regression_value": "Tests exercise actual extracted body, accept installer literal1 in both contexts, reject2/3/999/01 with exact new refusal marker, retain zero refusal and preserve legacy1/2/999/01. The old-v1 expected-negative arm is a source prediction until actually run and recorded.",
+    "execution_plan_limit": "This test file defaults HERE to its own current source directory. Any proposed old-v1 comparison wrapper must explicitly and immutably bind the original source bytes and preserve original expected-negative output; this source review does not inspect or authorize an unseen wrapper, import or runner."
+  },
+  "evidence_checks": {
+    "freeze_payload_hashes": 42,
+    "case_leaf_hashes": 6,
+    "runtime_archive_hashes": 30,
+    "lineage_byte_exact_to_old": 28,
+    "old_frozen_active8_unchanged": true,
+    "plan_cache_manifest_binding_byte_exact": true,
+    "committed_identity_limit": "Commit/tree identities supplied by root and companion receipt; supplied source bytes independently hash-matched. No Git object/state command or mutable configuration probe performed."
+  },
+  "blockers_in_assigned_source_scope": [],
+  "remaining_runtime_requirements": [
+    "No unit test or extracted function was executed by this reviewer. Root proposed one bounded unit packet, but source judgment itself creates no run/job permission or actual result.",
+    "Actual genuine reserved nonauthor full hosted controller review file remains absent. Current scoped report is not a substitute; source preflight still fails before Cargo until the correct genuine full receipt is copied unchanged.",
+    "Actual authenticated GitHub-hosted User provenance, PR1921 cache visibility and existing native CLI features[] rmeta+rlib/fingerprint payload remain UNKNOWN/unprobed. UI warmth remains insufficient; a miss/incomplete payload must stop before any Cargo.",
+    "Root-library presence establishes neither integration-harness warmth nor full dependency freshness/no-rebuild guarantee. Actual check/compile/inventory/five owning-parent/hosted/native/provider/installed outcomes remain UNRUN.",
+    "External original-attempt grant, full hosted workflow/post-action custody and authenticated original RAW/cleanup/return/acceptance remain root-owned. Job-owned lock closure and literal attempt1 guard are not global C authority or handback.",
+    "Research remains NEVERMERGE. Original e3/813/HOLD/legacy negatives remain archival; no runtime pass or broader qualification transfers."
+  ],
+  "authority": {
+    "actual_grant": null,
+    "actual_execution": null,
+    "actual_release": null,
+    "new_job": false,
+    "new_reservation": false,
+    "qualified": false
+  },
+  "actions": "Only supplied source/hash/static AST/JSON/text-conservation reads and exclusive sealed /tmp report. No candidate/test/controller/helper body executed or imported, no compile/eval of candidate code, build/Cargo/SQL/native/provider/cache/account/env/process/target/lock/resource/registry probe, source edit, cagents/GitHub operation, Git command, worker/model retry or scheduling action. Root receives this original result directly through native collaboration.send_message."
+}

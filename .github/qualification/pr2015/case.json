@@ -1,0 +1,66 @@
+{
+  "schema": "immutable-research-case/v1",
+  "case": "installer2015",
+  "never_merge": true,
+  "product_head": "375c37ff01aab0b226c58f547012af74e93a8643",
+  "product_tree": "acb2cc6e049562469643e49a1ee5f7abc179c28b",
+  "runner_sha256": "c02b8bfa407d709c696a87ca2ec65c91a2d9f86808dafd70a41c228382baacb8",
+  "plan_sha256": "8e10fe09043d7ad8dbfa69744d49f9ecda2ce5d367a84e14ab320a7851e91a80",
+  "selector_path": ".github/qualification/pr2015/case-select.py",
+  "selector_sha256": "a8f84fe3efb6b4113cded99e142108e64aef8986b7dc24b97fda69a3981ad014",
+  "independent_review_path": ".github/qualification/pr2015/installer-custody-review.json",
+  "independent_review_input": "Genuine d32 installer process/tool/custody receipt copied byte-exact; exact product375/runnerc02/plan8e ABI only. It does not review this activation wrapper or grant publication/C/runtime. Fresh assembled-wrapper and conservation review remain mandatory.",
+  "source_sha256": {
+    ".github/qualification/pr2015/case-select.py": "a8f84fe3efb6b4113cded99e142108e64aef8986b7dc24b97fda69a3981ad014",
+    ".github/qualification/pr2015/installer-custody-runner.py": "c02b8bfa407d709c696a87ca2ec65c91a2d9f86808dafd70a41c228382baacb8",
+    ".github/qualification/pr2015/installer-custody-plan.json": "8e10fe09043d7ad8dbfa69744d49f9ecda2ce5d367a84e14ab320a7851e91a80",
+    ".github/qualification/pr2015/installer-custody-manifest.json": "e7eb0192eb3c347cc2905588dff93f3ee96e8f5e316cc785055ab8f67e07e33b",
+    ".github/qualification/pr2015/installer-custody-source-binding.json": "02fee817c9cf8cd5abf92279fcd0989e7a1084ee585c921f47b854cd22265c7c",
+    ".github/qualification/pr2015/installer-custody-review.json": "c79429e1c0e48216296b29118730070cf002ed8ea9532cb8aa3d59a81b70efa8",
+    ".github/qualification/pr2015/cache-restore-gate.py": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4"
+  },
+  "legacy_published_source": {
+    "case": "legacy-final-save-1726",
+    "head": "7dcf367268c51236ccd0b5e12cdb0bc5c64d273c",
+    "tree": "b9c3c5ecfc53c43775217134b7f27f6690c15db3",
+    "workflow_sha256": "91b11334d5c40b0b5f7c7707873f525ac8b741c4aee7f965022fc615db70800d",
+    "archive_path": ".github/qualification/pr2015/lineage/published-workflow-7dc.yml",
+    "this_case_status": "UNRUN_DESELECTED"
+  },
+  "original_installer_case": {
+    "control_head": "ac4bbf446957317d022a987e20887af4b3f70481",
+    "path": ".github/qualification/pr2015/lineage/installer2015-case-ac4.json",
+    "sha256": "9af20ec84ffb12ac682df8cf8767d670cf25a9b9f2970bc248ab8f8833ec103f",
+    "original_run": 41136465523,
+    "attempt": 1,
+    "outcome": "CACHE_MISS_BEFORE_CARGO_PRESERVED",
+    "parent_invocations": 0
+  },
+  "current_runtime": "ALL_UNRUN",
+  "current_allocation": null,
+  "current_execution": null,
+  "cache_constraints": [
+    "Installer restore only: preserve existing trusted Main15 namespace, ordered paths, key/prefix and unchanged feature-empty gate. No target creation, cache save, alternate cache or cold fallback.",
+    "A separately qualified producer/save does not qualify the installer. Require the later actual independent restore and unchanged payload gate before ANY Cargo command.",
+    "Library presence does not establish Cargo freshness or integration-harness warmth. All ten installer phases and five owning parents remain UNRUN until the separately granted actual original installer run."
+  ],
+  "publication_scope": "Prospective existing research PR1921 original nonforce synchronize attempt1 only/NeverMerge. Qualified producer/cache publication, fresh assembled wrapper reviews and separate external Root C required before triggering publication. Source original-attempt guards do not themselves consume or grant global C. No rerun/dispatch/rejected metadata route.",
+  "prior_source_negative": {
+    "head": "05f2f9ea33a45fdaed9b6b77e72eacc73117f877",
+    "scope": "Original source-only findings, no execution: payload enumeration missed nonmatching entries; partial tool evidence and initialization failure-write exits needed strengthening. Original05f2 and reviews remain immutable.",
+    "runtime_result": null
+  },
+  "prior_cbce_source_negative": {
+    "head": "cbce2c8af82b09008c566dd32e7a2ab545f28dcf",
+    "scope": "Source-only lock-acquisition refusal could return while handoff stayed unconfirmed because HOLD was conditioned on acquired. This successor removes that condition; no runtime result.",
+    "runtime_result": null
+  },
+  "independent_review_sha256": "c79429e1c0e48216296b29118730070cf002ed8ea9532cb8aa3d59a81b70efa8",
+  "cache_gate_sha256": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
+  "prior_selected_producer_source": {
+    "control_head": "26603cdeb870a571a95f0516bde52b2b2717be33",
+    "control_tree": "66cfade901bd232f81b90f58a83656b7d48fe8a1",
+    "case_sha256": "018edd110599229fe0bca8b44de1de3eb4f09f089db72cbecf7b8dfbe76efac0",
+    "role": "Immutable separate compile-only producer source. Actual producer/save and external accepted-return evidence are separate; no installer pass, warm restore or new grant is implied."
+  }
+}

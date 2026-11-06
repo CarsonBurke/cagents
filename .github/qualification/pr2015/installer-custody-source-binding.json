@@ -1,0 +1,25 @@
+{
+  "kind": "AUTHOR_ASSEMBLED_ISSUE2015_HOSTED_SOURCE_BINDING_NOT_INDEPENDENT_REVIEW",
+  "verdict": "BOUND_CORRECTED_SOURCE_DATA_ONLY",
+  "head": "375c37ff01aab0b226c58f547012af74e93a8643",
+  "tree": "acb2cc6e049562469643e49a1ee5f7abc179c28b",
+  "owning_parent_count": 5,
+  "command_data": {
+    "path": ".github/qualification/pr2015/installer-custody-manifest.json",
+    "sha256": "e7eb0192eb3c347cc2905588dff93f3ee96e8f5e316cc785055ab8f67e07e33b"
+  },
+  "independent_source_review": {
+    "path": ".github/qualification/pr2015/installer-custody-source/command-data-independent-review.json",
+    "sha256": "2b4279b70e68371b93e818569e87306ec1e9892f3872379d54ec4870c2a74e15"
+  },
+  "correction_freeze": {
+    "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/cause-guard-correction-freeze.json",
+    "sha256": "9b3bb550982922098cb15695a60a30251374eadbf52ec22c421c70901f59ab33"
+  },
+  "historical_data": {
+    "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/historical-command-data-5a4.json",
+    "sha256": "feb23120adabb815ba07c657d0eade56499a78fa38fcd5f264b6c5fdb80e80db"
+  },
+  "scope": "Authored current375 installer source-data binding. Genuine command-DATA delta review is copied unchanged. Historical cause correction and original6dc/ac4 receipts retain their original scope. New installer runner/custody/activation wrapper still require independent reviews. No cache save/restore, runtime, caller or C qualification.",
+  "runtime": "ALL_UNRUN"
+}

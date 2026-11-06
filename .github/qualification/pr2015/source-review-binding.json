@@ -1,0 +1,25 @@
+{
+  "kind": "AUTHOR_ASSEMBLED_ISSUE2015_HOSTED_SOURCE_BINDING_NOT_INDEPENDENT_REVIEW",
+  "verdict": "BOUND_CORRECTED_SOURCE_DATA_ONLY",
+  "head": "6dc09b9a1b5d205650e244401da0938b653d16da",
+  "tree": "aaab67a21378958066103707baf3abe8850577d6",
+  "owning_parent_count": 5,
+  "command_data": {
+    "path": ".github/qualification/pr2015/manifest.json",
+    "sha256": "ce9a12cb0dd3c41e5f254851aa79d779c0bfc238c67d83ff6ea88e2953d25a22"
+  },
+  "independent_source_review": {
+    "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/command-data-independent-review.md",
+    "sha256": "b8298607a7932d0da9f2175e6a4feeb4b4f867ac65cddb8dd3cedaf1f961f928"
+  },
+  "correction_freeze": {
+    "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/cause-guard-correction-freeze.json",
+    "sha256": "9b3bb550982922098cb15695a60a30251374eadbf52ec22c421c70901f59ab33"
+  },
+  "historical_data": {
+    "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/historical-command-data-5a4.json",
+    "sha256": "feb23120adabb815ba07c657d0eade56499a78fa38fcd5f264b6c5fdb80e80db"
+  },
+  "scope": "Authored hosted-path repin and preserved source lineage only. No new independent review, hosted provenance, warmth, job/grant or test pass.",
+  "runtime": "ALL_UNRUN"
+}

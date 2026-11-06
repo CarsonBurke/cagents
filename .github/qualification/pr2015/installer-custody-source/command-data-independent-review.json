@@ -1,0 +1,477 @@
+{
+  "schema": "independent-command-data-source-review/v1",
+  "verdict": "SOURCE_CLEAR",
+  "scope": "Current375 installer command-DATA declaration and unchanged selected five CLI fixture contracts only",
+  "reviewer": "/root/1281_holder_reconcile_review",
+  "review_kind": "Genuine independent actual source/metadata delta review; reviewer authored no candidate manifest or product source",
+  "head": "375c37ff01aab0b226c58f547012af74e93a8643",
+  "tree": "acb2cc6e049562469643e49a1ee5f7abc179c28b",
+  "controller_head": "d719e9d89ad28f727fc332f0f8cc051eca100b0a",
+  "controller_tree": "7f0c90df22bf49553aed4d46fc965dda907644b1",
+  "controller_parent": "26603cdeb870a571a95f0516bde52b2b2717be33",
+  "command_data": {
+    "path": ".github/qualification/pr2015/installer-custody-manifest.json",
+    "sha256": "e7eb0192eb3c347cc2905588dff93f3ee96e8f5e316cc785055ab8f67e07e33b"
+  },
+  "freeze": {
+    "path": "/tmp/fw16-backend-ec204421/pr1921-installer-current-command-data-source-freeze-v1.json",
+    "sha256": "14ba86e19cc4cb4ea27200b7de672d73febe474aae862152d588179ac7839768"
+  },
+  "source_plan": {
+    "path": "/tmp/pr1921-installer-canonical-custody-successor-source-plan-v1.json",
+    "sha256": "7f464865f22931ca280ad33473d8ddf6da768b3b781e211463d8e490992428b1"
+  },
+  "findings": [],
+  "metadata_delta": {
+    "actual": "Only new installer-custody-manifest.json is tracked relative to26603. The existing original6dc manifest is untouched. Relative to that original JSON, only kind/status/product change; historical_product_reference and installer_custody_successor are added; all other original keys/values are exact.",
+    "current_product": "Explicit375c37ff/acb2cc6e declaration matches immutable Git, and every one of17 source pins matches actual SHA256/bytes/blob/mode at375. All17 relevant leaves also remain byte-exact6dc, allowing reuse of only the prior unchanged selector/gate/count/cause-correction source conclusions.",
+    "history": "historical_product_reference reproduces the complete original6dc product object. Original b829 command-data review and old manifest/correction/history are preserved without retargeting.",
+    "honest_status": "Authored kind/status, current_independent_review:null, runtime/cache/activation nulls and explicit limits identify preparation rather than a fabricated independent review or execution. This external receipt may be copied unchanged into a later authored current-source binding; any later changed data requires its own delta check."
+  },
+  "selected_contracts": [
+    {
+      "path": "tests/installer_lifecycle_contract.rs",
+      "anchors": [
+        223,
+        354,
+        1125,
+        1132
+      ],
+      "parents": [
+        "fresh_install_uses_the_verified_archive_cli_and_matched_inspector",
+        "unsupported_installed_cli_uses_the_verified_archive_pair_without_external_forwarding"
+      ],
+      "source_observation": "Both ordinary parent bodies invoke the same verified_archive_coordinator_fixture with [false,true] refusal controls. The fixture uses the actual CARGO_BIN_EXE_cagents in a private same-archive installation/controlled Python inspector with declared HOME/XDG overrides. Success/refusal subcases remain nonadditive. Existing environment FD override is not outer caller authority removal; these selected paths do not invoke synthetic User entry."
+    },
+    {
+      "path": "tests/installer_lifecycle_contract.rs",
+      "anchors": [
+        813,
+        1144
+      ],
+      "parents": [
+        "unsupported_coordinators_refuse_before_mutating_the_installation"
+      ],
+      "source_observation": "Unchanged ordinary parent calls coordinated_release_fixture(true,2,None,None,None,\"none\"); original refusal/control and fixture state boundaries are unchanged. It is a CLI fixture case, not production daemon/native/provider admission."
+    },
+    {
+      "path": "tests/installer_guard_contract.rs",
+      "anchors": [
+        251,
+        277,
+        742,
+        857,
+        1011
+      ],
+      "parents": [
+        "external_installer_saves_closes_and_reopens_windows_even_on_failure",
+        "inherited_fence_requires_exact_locked_description_and_closed_windows"
+      ],
+      "source_observation": "Existing external parent retains all seven inline statuses, source-inspector refusal/missing-helper cause and prepare/cancel controls. The inherited-fence parent retains kernel-locked-description/windows controls. Guardian copies only explicit command env overrides/removals and otherwise inherits the caller; original authority is not serialized into its specification. Guardian/lease/helper activity is nonadditive."
+    },
+    {
+      "path": "tests/installer_guard_contract.rs",
+      "anchors": [
+        1375,
+        1377
+      ],
+      "parents": [],
+      "source_observation": "The sole user_fixture::enter call in this file belongs to unselected staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner. Compilation of tests/support/user_fixture.rs is not invocation. No selected parent or this DATA file may admit a delegated outer caller through that synthetic User helper."
+    }
+  ],
+  "command_and_count_conservation": {
+    "commands": 10,
+    "selected_ordinary_parents": 5,
+    "source_predicted_inventory_rows": {
+      "installer_lifecycle_contract": 36,
+      "installer_guard_contract": 11
+    },
+    "actual_completed": 0,
+    "result": "All exact CLI check/two no-run compile/two full inventory/five singleton parent argv, selectors, feature-empty lane and oracles are unchanged original DATA. Future inventories remain mandatory; require same actual N, exactly one named parent and1P0F0I0M/N-1 with original exit0. Inline success/refusal pairs, seven guard subcases, ignored guardian, passive helpers, inventories and compilation do not add passes.",
+    "limits": "Predicted36/11 are unchanged source declarations supported by the genuine b829 review, not observed harness inventories. Optional UI controls remain separate and unselected; no HOST/UI/native/provider or full installed-product qualification follows."
+  },
+  "prior_genuine_review_reuse": {
+    "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/command-data-independent-review.md",
+    "sha256": "b8298607a7932d0da9f2175e6a4feeb4b4f867ac65cddb8dd3cedaf1f961f928",
+    "scope": "Read the original b829 receipt. Reused only its unchanged CLI target/selector/source-count and bounded friendly-plus-underlying-cause correction conclusions, now directly pinned to current375 leaves. Its historical5a4 stale-assertion blocker and corrected-freeze scope remain intact; no runtime pass or complete dependency-closure review transfers."
+  },
+  "caller_preconditions": [
+    "Future owning caller must be genuine GitHub-hosted LinuxX64 User with absence by name of inherited CAGENTS_ inputs; presence-only refusal, no authority-value read/copy/scrub, synthetic User admission or controller HOME/account change",
+    "Actual authenticated hosted run/job/log/source/artifact provenance must independently corroborate caller context; engine environment flags alone are not evidence",
+    "Declared private fixture HOME/XDG and existing controlled archive/Python inspector are source fixtures, not permission changes or real daemon/provider proof"
+  ],
+  "static_verification": {
+    "tuple": [
+      "d719e9d89ad28f727fc332f0f8cc051eca100b0a",
+      "7f0c90df22bf49553aed4d46fc965dda907644b1",
+      "26603cdeb870a571a95f0516bde52b2b2717be33"
+    ],
+    "working_head": "d719e9d89ad28f727fc332f0f8cc051eca100b0a",
+    "status": "",
+    "freeze_sha256": "14ba86e19cc4cb4ea27200b7de672d73febe474aae862152d588179ac7839768",
+    "source_plan_sha256": "7f464865f22931ca280ad33473d8ddf6da768b3b781e211463d8e490992428b1",
+    "changed_paths": [
+      "A\t.github/qualification/pr2015/installer-custody-manifest.json"
+    ],
+    "manifest_sha256": "e7eb0192eb3c347cc2905588dff93f3ee96e8f5e316cc785055ab8f67e07e33b",
+    "working_manifest_exact": true,
+    "metadata_delta": {
+      "added_keys": [
+        "historical_product_reference",
+        "installer_custody_successor"
+      ],
+      "removed_keys": [],
+      "changed_existing_keys": [
+        "kind",
+        "status",
+        "product"
+      ],
+      "historical_product_reference_exact_original": true,
+      "all_other_original_keys_exact": true
+    },
+    "original_manifest_unchanged": true,
+    "original_manifest_sha256": "ce9a12cb0dd3c41e5f254851aa79d779c0bfc238c67d83ff6ea88e2953d25a22",
+    "original_review": {
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/command-data-independent-review.md",
+      "sha256": "b8298607a7932d0da9f2175e6a4feeb4b4f867ac65cddb8dd3cedaf1f961f928",
+      "exact_parent": true
+    },
+    "product_tuple": [
+      "375c37ff01aab0b226c58f547012af74e93a8643",
+      "acb2cc6e049562469643e49a1ee5f7abc179c28b",
+      "6dc09b9a1b5d205650e244401da0938b653d16da 4429728a1f179ea7f7eaca9667156553209a46ac"
+    ],
+    "source_pins": [
+      {
+        "path": "Cargo.toml",
+        "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "Cargo.lock",
+        "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": ".cargo/config.toml",
+        "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "build.rs",
+        "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "src/main.rs",
+        "sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "src/lib.rs",
+        "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "src/modules.rs",
+        "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "src/companion.rs",
+        "sha256": "76d991bd5ff1cd73a4252d6f5961bc1b19e50b0936dc4d00b699fbf56d93af00",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "src/install_guard.rs",
+        "sha256": "b735f0b9564a0e7f4b90e496af57fe06319e07ee64477073a377f9517849356a",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "src/instance.rs",
+        "sha256": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "src/update.rs",
+        "sha256": "48a9c75b73a3948063f4fca76e0ecf3159e0065a3a9ab19d6d8749a8446eec55",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "src/app.rs",
+        "sha256": "c405ea52503acc5076a5e77d3bc81d5e9ab341b1a78e313147e9ca70dfc67e77",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "src/app/update_ui.rs",
+        "sha256": "5bae66ddb5fd6ef6bb50de4add827f5212e390aa8d0d495a1678b225e8748e2f",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "install.sh",
+        "sha256": "7b49493d90d0aeeb627b488c8c4fd372b005a038af83098860780b19c0134d07",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "tests/installer_lifecycle_contract.rs",
+        "sha256": "ca9bb7034feddd8f21f303dea1ebcab2125315d8bf66a52964fe66df4fe05dec",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "tests/installer_guard_contract.rs",
+        "sha256": "a4413f4a235ef796438d32fa538f0e1d46fa5221283a588e1f36aaac01d92a00",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      },
+      {
+        "path": "tests/support/user_fixture.rs",
+        "sha256": "a016d99771e4ffdd6d413fcb89a0671462c56dda32956e0b89c09bd50b848079",
+        "sha256_match": true,
+        "bytes_match": true,
+        "git_blob_match": true,
+        "mode_match": true,
+        "historical_6dc_bytes_same": true
+      }
+    ],
+    "selected_parents": [
+      {
+        "target": "installer_lifecycle_contract",
+        "name": "fresh_install_uses_the_verified_archive_cli_and_matched_inspector",
+        "source": "tests/installer_lifecycle_contract.rs",
+        "line": 1125,
+        "new_parent": true
+      },
+      {
+        "target": "installer_lifecycle_contract",
+        "name": "unsupported_installed_cli_uses_the_verified_archive_pair_without_external_forwarding",
+        "source": "tests/installer_lifecycle_contract.rs",
+        "line": 1132,
+        "new_parent": true
+      },
+      {
+        "target": "installer_lifecycle_contract",
+        "name": "unsupported_coordinators_refuse_before_mutating_the_installation",
+        "source": "tests/installer_lifecycle_contract.rs",
+        "line": 1144,
+        "new_parent": false
+      },
+      {
+        "target": "installer_guard_contract",
+        "name": "external_installer_saves_closes_and_reopens_windows_even_on_failure",
+        "source": "tests/installer_guard_contract.rs",
+        "line": 742,
+        "new_parent": false
+      },
+      {
+        "target": "installer_guard_contract",
+        "name": "inherited_fence_requires_exact_locked_description_and_closed_windows",
+        "source": "tests/installer_guard_contract.rs",
+        "line": 1011,
+        "new_parent": false
+      }
+    ],
+    "commands": [
+      [
+        "cli-binary-check",
+        [
+          "cargo",
+          "check",
+          "--locked",
+          "--no-default-features",
+          "--bin",
+          "cagents"
+        ]
+      ],
+      [
+        "compile-installer_lifecycle_contract",
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--no-default-features",
+          "--test",
+          "installer_lifecycle_contract",
+          "--no-run",
+          "--message-format=json"
+        ]
+      ],
+      [
+        "inventory-installer_lifecycle_contract",
+        [
+          "<CURRENT_CARGO_REPORTED_HARNESS>",
+          "--list",
+          "--color=never"
+        ]
+      ],
+      [
+        "fresh_install_uses_the_verified_archive_cli_and_matched_inspector",
+        [
+          "<CURRENT_CARGO_REPORTED_HARNESS>",
+          "fresh_install_uses_the_verified_archive_cli_and_matched_inspector",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ]
+      ],
+      [
+        "unsupported_installed_cli_uses_the_verified_archive_pair_without_external_forwarding",
+        [
+          "<CURRENT_CARGO_REPORTED_HARNESS>",
+          "unsupported_installed_cli_uses_the_verified_archive_pair_without_external_forwarding",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ]
+      ],
+      [
+        "unsupported_coordinators_refuse_before_mutating_the_installation",
+        [
+          "<CURRENT_CARGO_REPORTED_HARNESS>",
+          "unsupported_coordinators_refuse_before_mutating_the_installation",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ]
+      ],
+      [
+        "compile-installer_guard_contract",
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--no-default-features",
+          "--test",
+          "installer_guard_contract",
+          "--no-run",
+          "--message-format=json"
+        ]
+      ],
+      [
+        "inventory-installer_guard_contract",
+        [
+          "<CURRENT_CARGO_REPORTED_HARNESS>",
+          "--list",
+          "--color=never"
+        ]
+      ],
+      [
+        "external_installer_saves_closes_and_reopens_windows_even_on_failure",
+        [
+          "<CURRENT_CARGO_REPORTED_HARNESS>",
+          "external_installer_saves_closes_and_reopens_windows_even_on_failure",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ]
+      ],
+      [
+        "inherited_fence_requires_exact_locked_description_and_closed_windows",
+        [
+          "<CURRENT_CARGO_REPORTED_HARNESS>",
+          "inherited_fence_requires_exact_locked_description_and_closed_windows",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ]
+      ]
+    ],
+    "unmodified_controls": {
+      "case-select.py": true,
+      "case.json": true,
+      "cli-cache-producer.py": true,
+      "cli-cache-producer-plan.json": true,
+      "cli-cache-producer-review.json": true,
+      "cache-restore-gate.py": true,
+      "run-packet.py": true,
+      "plan.json": true,
+      "source-review-binding.json": true
+    },
+    "workflow_exact_parent": true,
+    "selected_case": "cli-cache-producer-2015",
+    "end_manifest_sha256": "e7eb0192eb3c347cc2905588dff93f3ee96e8f5e316cc785055ab8f67e07e33b"
+  },
+  "activation": "Shared case/selector/workflow are byte-exact26603; cli-cache-producer-2015 remains selected. This new manifest is not currently activated. Producer review is not reassessed or extended.",
+  "remaining_gates": [
+    "New actual installer runner/plan and authored source binding, canonical unsignaled custody correction, independent code/custody/conservation review and final assembled wrapper review",
+    "Actual warm restore accepted by unchanged gate before any Cargo; no new target/cold fallback/save or producer auto-chain",
+    "Fresh external Root publication/C admission before trigger, original ten-phase/five-parent execution, complete job/post/RAW and accepted external return"
+  ],
+  "historical_negative": "Original ac4/run41136465523 attempt1 cache miss before Cargo remains a failure with five parents UNRUN. No original RAW rerun/read or result reclassification occurred.",
+  "runtime": "ALL_UNRUN_UNGRANTED_UNPUBLISHED",
+  "actual_grant": null,
+  "actual_execution": null,
+  "limits": [
+    "This genuine receipt clears exact command DATA only. It is not CONTROLLER_SOURCE_CLEAR, new installer implementation review, custody/whole-tree conservation certification, permission or publication authority",
+    "No candidate import/call, helper/controller/Cargo/test/inventory/install/native/provider execution, source edit, Git/ref/GitHub write, environment/account/DB/process/target/cache/resource probe, child/session or grant",
+    "Only task-owned tmp evidence written; no full dependency-closure, live runtime context, cache save/visibility/restore, installed outcome, C availability/return, readiness or merge claim",
+    "Any later source/manifest/product/selector/oracle change must retain this receipt at its exact scope and refresh affected review"
+  ]
+}

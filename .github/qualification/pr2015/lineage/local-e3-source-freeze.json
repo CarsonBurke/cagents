@@ -1,0 +1,211 @@
+{
+  "kind": "ISSUE2015_AUTHOR_CONTROLLER_SOURCE_FREEZE_PENDING_NEW_INDEPENDENT_REVIEW",
+  "status": "LOCALLY_COMMITTED_SOURCE_ONLY_UNREVIEWED_UNGRANTED_ALL_RUNTIME_UNRUN",
+  "control_worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control",
+  "branch": "research/fw16-issue2015-cli-qualification",
+  "control_commit": "e3c531d6669fc38dd718e7fc59eddb4f08a9fdf9",
+  "control_tree": "e6e460d7a84d33bd1e3651e60db2bef70868b963",
+  "control_parent": "e8842819519dff74c0726d1fdd94f435b495a153",
+  "local_commit_only": true,
+  "published": false,
+  "worktree_status_clean": true,
+  "packet": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015",
+  "product_head": "6dc09b9a1b5d205650e244401da0938b653d16da",
+  "product_tree": "aaab67a21378958066103707baf3abe8850577d6",
+  "product_worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+  "runner_sha256": "6fb2456472135952a7855dd1fb7f2089d9d9b8679ed23476a2626d0d063c351e",
+  "plan_sha256": "43b2b230e45a1f1e8fe4b3b4736788bfa9f5b046e5b39353c82001c67a336314",
+  "source_binding_sha256": "2fb1b8529ee45233741c49939564ebf6259eacb29e422eb4f1c0d3a01c6e380e",
+  "corrected_command_data_sha256": "e4dc07796afbbdbb40095128fdfcbdf24f7b3a1cfcbb60087060a9c1ec4f3938",
+  "files": {
+    "donor-diff.patch": "46b5fd9a132edba3684959574175dc7679d00498e0b0373c69ad1bbe9b78cb50",
+    "source-ready.json": "b4995b513f58997714c9d8fd215861241a32d43a6cb01359fa718568a04ec881",
+    "source-conservation.json": "f3c876c9e9121366739893822fceaeb65918b9412382fccb48f3e1079c7ba924",
+    "README.md": "25934c0e4cd79ea1a96f7603c0e372164838f1fe92ea795b68d7c04d7ad6077e",
+    "run-packet.py": "6fb2456472135952a7855dd1fb7f2089d9d9b8679ed23476a2626d0d063c351e",
+    "plan.json": "43b2b230e45a1f1e8fe4b3b4736788bfa9f5b046e5b39353c82001c67a336314",
+    "source-review-binding.json": "2fb1b8529ee45233741c49939564ebf6259eacb29e422eb4f1c0d3a01c6e380e",
+    "command-data-6dc.json": "e4dc07796afbbdbb40095128fdfcbdf24f7b3a1cfcbb60087060a9c1ec4f3938",
+    "dependencies/product-user_fixture.rs": "a016d99771e4ffdd6d413fcb89a0671462c56dda32956e0b89c09bd50b848079",
+    "dependencies/product-installer_guard_contract.rs": "a4413f4a235ef796438d32fa538f0e1d46fa5221283a588e1f36aaac01d92a00",
+    "dependencies/product-installer_lifecycle_contract.rs": "ca9bb7034feddd8f21f303dea1ebcab2125315d8bf66a52964fe66df4fe05dec",
+    "dependencies/product-install_guard.rs": "b735f0b9564a0e7f4b90e496af57fe06319e07ee64477073a377f9517849356a",
+    "dependencies/product-update.rs": "48a9c75b73a3948063f4fca76e0ecf3159e0065a3a9ab19d6d8749a8446eec55",
+    "dependencies/product-install.sh": "7b49493d90d0aeeb627b488c8c4fd372b005a038af83098860780b19c0134d07",
+    "dependencies/historical-git-guard-HOLD.json": "72b0db3ab2695e81d3acba9d14b216403a4971d482ab91013b8ed98c4863a83d",
+    "dependencies/git-policy-source.py": "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74",
+    "dependencies/donor-controller-source-review.json": "276aa51159c327c96fb5f978211e18f3186eeb3a639638d432d115201f2d32dc",
+    "dependencies/donor-plan.json": "18c66b50a740e4c71999d03bec40954cba04d91b079cfd1a3b78230f32183e7c",
+    "dependencies/donor-run-packet.py": "ce724709493e94e5514fec52c4c02f596fad40be2846d96172f2502b48a703a8",
+    "dependencies/cause-guard-correction-freeze.json": "9b3bb550982922098cb15695a60a30251374eadbf52ec22c421c70901f59ab33",
+    "dependencies/command-data-independent-review.md": "b8298607a7932d0da9f2175e6a4feeb4b4f867ac65cddb8dd3cedaf1f961f928",
+    "dependencies/historical-command-data-5a4.json": "feb23120adabb815ba07c657d0eade56499a78fa38fcd5f264b6c5fdb80e80db",
+    "SHA256SUMS": "dca4b1a412382d09103606d274132d5ea1d15054687d2df1c37e3a65b68ab417"
+  },
+  "source_ready": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/source-ready.json",
+    "sha256": "b4995b513f58997714c9d8fd215861241a32d43a6cb01359fa718568a04ec881"
+  },
+  "source_conservation": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/source-conservation.json",
+    "sha256": "f3c876c9e9121366739893822fceaeb65918b9412382fccb48f3e1079c7ba924"
+  },
+  "original_historical_inputs_preserved": {
+    "data5a4_sha256": "feb23120adabb815ba07c657d0eade56499a78fa38fcd5f264b6c5fdb80e80db",
+    "independent_data_and_correction_source_review_sha256": "b8298607a7932d0da9f2175e6a4feeb4b4f867ac65cddb8dd3cedaf1f961f928",
+    "cause_guard_correction_freeze_sha256": "9b3bb550982922098cb15695a60a30251374eadbf52ec22c421c70901f59ab33",
+    "donor_runner_sha256": "ce724709493e94e5514fec52c4c02f596fad40be2846d96172f2502b48a703a8",
+    "donor_controller_source_review_sha256": "276aa51159c327c96fb5f978211e18f3186eeb3a639638d432d115201f2d32dc",
+    "historical_github_git_guard_hold_sha256": "72b0db3ab2695e81d3acba9d14b216403a4971d482ab91013b8ed98c4863a83d",
+    "scope": "Historical source inputs only; no donor runtime pass, allocation, release, native or product qualification transfer."
+  },
+  "actual_source_checks": {
+    "product_immutable_tree_verified": true,
+    "relevant_pin_count": 17,
+    "all17_current_Git_blob_SHA256_equal_live_source_SHA256": true,
+    "changed_pins_from_historical5a4": [
+      "src/update.rs",
+      "tests/installer_guard_contract.rs"
+    ],
+    "source_lexical_test_declarations_equal_predicted_inventory_sets": {
+      "installer_lifecycle_contract": 36,
+      "installer_guard_contract": 11
+    },
+    "AST_syntax": "PASS via ast.parse only; candidate not imported, compiled, evaluated or executed",
+    "JSON_data_syntax": "PASS for plan/source binding/current data/conservation/source-ready",
+    "static_binding_and_cardinality_facts": {
+      "runtimeArchiveRefsDistinct": true,
+      "runtimeArchiveRefsPinned": true,
+      "actual17PinsGitAndLive": true,
+      "currentDataHeadTreeBound": true,
+      "sourceBindingHeadTreeBound": true,
+      "sourceBindingDataBound": true,
+      "runnerPlanHashBound": true,
+      "exactly5UniqueParents": true,
+      "sourcePredicts36and11": true,
+      "phaseOrder10": true,
+      "cliOnly": true,
+      "noPlaceholdersInRuntimePlanPaths": true,
+      "noCurrentGrantOrPass": true,
+      "noTerminalLedgerDump": true,
+      "originalSpawnAPIs2": true
+    },
+    "low_level_conservation": {
+      "existing_functions_exact": [
+        "digest",
+        "now",
+        "observed_wait",
+        "supervision_failure",
+        "bounded_capture",
+        "refuse_git_routing",
+        "git",
+        "git_nul_fields",
+        "guard_git_metadata",
+        "signal_pidfd",
+        "children",
+        "settle_children",
+        "validate_controller_review",
+        "evidence_copy",
+        "custody_clean",
+        "safe_lane_handoff",
+        "final_observations",
+        "note_lane_cancellation",
+        "require_workload_allowed",
+        "retain_uncertain_lane"
+      ],
+      "existing_functions_changed": [
+        "inventory_names",
+        "parent_pass",
+        "execute_contracts",
+        "parent_accounting",
+        "main"
+      ],
+      "existing_functions_replaced": [
+        "cargo_test_artifact"
+      ],
+      "new_functions": [
+        "cargo_test_artifacts",
+        "elf_record",
+        "verify_elf"
+      ],
+      "C_acquisition_through_confirmed_close_exact": true,
+      "run_supervision_body_exact": true,
+      "no_original_lowlevel_API_added": true,
+      "no_ledger_terminal_dump": true,
+      "no_environment_strip_added": true,
+      "source_data_pins": 17,
+      "distinct_parents": 5,
+      "phases": 10,
+      "actual_runtime": "ALL_UNRUN",
+      "source_inner_exact": true,
+      "context_inner_exact": true
+    },
+    "source_owned_whitespace": "PASS",
+    "complete_staged_whitespace": "PASS before local normal commit",
+    "generated_diff_note": "Newly authored donor-diff.patch uses zero context. The initial context-form patch alone triggered whitespace findings on literal unified-diff blank context lines; zero-context generation corrected the new artifact. No immutable historical source/review byte was rewritten.",
+    "checksum_payload_count": 22,
+    "all22_payload_checksums": "PASS after local commit",
+    "source_checked_then_committed": "Only23 qualification packet files added against e884. No product worktree/source or existing worktree was modified.",
+    "executable_payload_file_modes": "Sealed source payloads0444, tracked100644; dependencies directory0700. No packet controller was launched."
+  },
+  "concrete_future_packet": {
+    "phases": [
+      "cli-binary-check",
+      "compile-installer_lifecycle_contract",
+      "inventory-installer_lifecycle_contract",
+      "parent-installer_lifecycle_contract-1",
+      "parent-installer_lifecycle_contract-2",
+      "parent-installer_lifecycle_contract-3",
+      "compile-installer_guard_contract",
+      "inventory-installer_guard_contract",
+      "parent-installer_guard_contract-1",
+      "parent-installer_guard_contract-2"
+    ],
+    "total_phases": 10,
+    "owning_parents": 5,
+    "graphs": {
+      "cli": 5,
+      "host": 0,
+      "ui": 0
+    },
+    "expected_full_inventory_names": {
+      "installer_lifecycle_contract": 36,
+      "installer_guard_contract": 11
+    },
+    "actual_full_inventory_N": null,
+    "actual_passes": 0,
+    "architecture": "CLI check then lifecycle compile/full inventory/3 parents, then guard compile/full inventory/2 parents. Each compile binds exact current integration harness and Cargo-built regular CLI from one JSON stream, with isolated features[], canonical ELF/file identity and hash guards.",
+    "raw_contract": "Exactly one original owning summary1P0F0I/0M and actual same-harness fullN-1. Full current36/11 name sets mandatory. Source-pinned external refusal diagnostics are parsed without awarding child/inline passes. No provider/native/HOST/UI prerequisite.",
+    "target_and_custody": "Same existing donor C target/lock/jobs2/physical Rust1.93 hashes/2400-second cap and bounded original wait/pidfd/owned-family/cancellation/unknown/error/double-custody/Cfdclose behavior. No LOCK_UN, retry or cold fallback.",
+    "natural_context": "Retain natural inherited account/auth/environment/policy. No value reads/stripping/replacement/User fallback to force qualification. Actual unsupported installer caller guard remains a truthful original negative.",
+    "terminal": "Full original ledger and summary on disk; compact terminal receipt and receipt/evidence/hash output, bounded phase progress."
+  },
+  "future_argv": [
+    "python3",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/run-packet.py",
+    "--grant",
+    "<ACTUAL_AUTHENTICATED_GRANT>",
+    "--runner-sha256",
+    "6fb2456472135952a7855dd1fb7f2089d9d9b8679ed23476a2626d0d063c351e",
+    "--controller-review",
+    "<NEW_INDEPENDENT_REVIEW_RECEIPT>",
+    "--controller-review-sha256",
+    "<RECEIPT_SHA256>"
+  ],
+  "future_cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+  "review_required_fields": {
+    "verdict": "CONTROLLER_SOURCE_CLEAR",
+    "head": "6dc09b9a1b5d205650e244401da0938b653d16da",
+    "tree": "aaab67a21378958066103707baf3abe8850577d6",
+    "runner_sha256": "<actual frozen runner SHA256>",
+    "plan_sha256": "<actual frozen plan SHA256>"
+  },
+  "actual_new_independent_review": null,
+  "actual_grant": null,
+  "actual_execution": null,
+  "actual_release": null,
+  "qualified": false,
+  "prohibited_work_not_performed": "No Cargo/build/test/inventory/fixture/controller/helper/oracle/native/provider/job dispatch or new workers; no live process/account/state/inbox/meter query; no target/lock/toolchain/cache/registry/capacity probe; no fetch/push/PR/GitHub write.",
+  "remaining_limits": "Only10 serial phases and5 distinct CLI integration parents. Stop first negative/timeout/unknown/missing evidence. Full current --list sets must equal source-predicted36/11 names; runtime actualN is derived from each full inventory and every raw singleton summary must enforce1P0F0I/0M and N-1. Passive helpers/guardians/inline cases and compilation/inventory are not passes. Keep supported Git configuration/index/attribute refusal guards and cooperative source/context observations. No HOST/UI/default/full/integrated/broad/native/provider/live-install/release/WHOLE/SeedView/merge qualification. Natural unsupported authority context remains a real negative. Historical5a4 stale diagnostic/source-oracle finding and donor Git HOLD remain intact.",
+  "next_step": "Reserved independent reviewer inspects this exact locally committed source/freeze. Root coordinates any later actual grant/execution. Main15 C7a237 remains exclusive as reported; A/B unknown occupied. This source author makes no allocation/availability/return claim."
+}

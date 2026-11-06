@@ -1,0 +1,327 @@
+{
+  "verdict": "CONTROLLER_SOURCE_HOLD",
+  "head": "4fa3370532d78d8e19099639f2bc40c711dc725a",
+  "tree": "ea6671347bb1c2aa84f240f9b4727c00346403bc",
+  "runner_sha256": "4288fcae65f7afa46ce54979a9aa69a9ae0e9231235adf675423959fcbe579e4",
+  "plan_sha256": "0bf9f587e3f9f020d68603cac147c5de1765a1ef99e1d04796c5f9b3a2df4c7f",
+  "review_scope": "Independent whole-controller and supplied immutable binding/source review. No candidate execution/import/AST evaluation/py_compile, source helper/fixture/build/test/format/native/provider action, Git/GitHub query, live environment/process/state/target/lock/tool probe, registry/inbox/meter/session action, grant or admission. Only this new sealed /tmp report is written.",
+  "packet": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll",
+  "source_ready_sha256": "6e8ca300b2f8b8dd58220ada97edf1ce785e210669714daa6c91517ec4f3633a",
+  "source_manifest_sha256": "8cfbf1962340a5bc6bee485c45145e5e9586b7ab47c25cfaa7b7c2e22829c0bb",
+  "source_binding_sha256": "6b508f2825f105052b979203ba92ac6c575d80474229a7e1e32ae9e135574304",
+  "main_finding": {
+    "id": "PRELOCK_GIT_CHECKS_PRECEDE_GUARDED_CONTEXT",
+    "disposition": "BLOCKS_CONTROLLER_SOURCE_CLEAR",
+    "kind": "Actual inherited donor behavior; not metadata drift and not a claim about the current live environment.",
+    "anchors": [
+      "run-packet.py:115-116 git() adds only --no-optional-locks and -C WT.",
+      "run-packet.py:567-573 source() invokes Git rev-parse twice and Git status.",
+      "run-packet.py:583-604 context() snapshots Cargo/build input context; it neither rejects nor records GIT_* routing/config variables.",
+      "run-packet.py:608 evaluates source() before context().",
+      "run-packet.py:710-715 opens/flocks C later."
+    ],
+    "causal_scenario": "A core.fsmonitor command selected by permitted inherited Git configuration, including an injected GIT_CONFIG_COUNT/PARAMETERS setting, can execute when prelease git status runs. There is no earlier refusal of unsupported Git routing/config inputs and no explicit core.fsmonitor=false in that Git argv. Consequently the stated read-only source admission can start an unreviewed child before C acquisition, before context capture/refusal, and outside the 2400-second post-acquisition budget. This is a source-reachable conditional effect; no configuration, environment, process or reproduction was inspected.",
+    "conservation_does_not_waive": "The vulnerable git/source/context bodies are byte-exact donor bodies. Their prior review or conservation does not establish this packet's prelease effect boundary.",
+    "minimum_repair": "Before the first Git subprocess, apply an explicit reviewed refusal of unsupported Git routing/injected-config inputs rather than clearing inherited provider/account authority. Pin every source Git invocation's nonexecuting policy, including core.fsmonitor=false; retain appropriate hooks/submodule/no-lazy-fetch/replacement protections and exact-source routing. Establish the guarded context before the first Git call. Do not weaken the lock, source pins, fresh-grant requirement, custody or phase sequence. Freeze the successor runner/plan and refresh independent review; no current packet invocation is cleared."
+  },
+  "verified_bindings": {
+    "packet_hash_checks": "All 34 entries in SHA256SUMS were independently read/hash-checked OK. Relative archive names contain no absolute or '..' components.",
+    "seals": "Packet and dependencies directories are0700; every supplied file read is a regular0444 file. No mutable product worktree, physical tool or target was queried.",
+    "source_pin_mapping": "20 plan source-path SHA256 values match exactly the20 current-leaf entries in sealed manifest8cfbf196. Composition freeze head/tree and three feature-leaf hashes agree with the plan/manifest; this is immutable binding validation, not a new mutable-source or live-context observation.",
+    "exact_product_binding": "4fa3370532d78d8e19099639f2bc40c711dc725a / ea6671347bb1c2aa84f240f9b4727c00346403bc throughout current plan, manifest, source binding and freeze.",
+    "direct_donor_runner_sha256": "9cee2286ec27df79c065d0534757404e4cf0aa53eb21b6f8a28d3acb9b9d961e",
+    "direct_donor_plan_sha256": "a6fe776656595c01b9f75777532226fd8f30bbf1cfc2511abb126ee131418774",
+    "donor_runtime_inputs": "Existing C target/lock strings, jobs2, physical Rust1.93 paths, three tool byte pins and2400 cap equal the copied donor plan. This does not attest present capacity, lock ownership, tool bytes or warmth.",
+    "archives": "28 uniquely named archive bindings resolve inside the private packet and match their declared SHA256 entries, including the direct B9 donor and its supplied review/source archives. Historical nested original_path strings are provenance data; runner admission dereferences current sealed copies."
+  },
+  "mechanically_verified_conservation": {
+    "method": "Plain source-text/JSON/string comparison and file hashes; no Python AST, candidate imports, evaluation or execution.",
+    "whole_runner_after_inverse": true,
+    "replacement_sites": "Every one of15 enumerated inverse replacements matched exactly once; reversing them reproduces the complete9cee donor runner byte-for-byte.",
+    "top_level_helpers_exact": 20,
+    "changed_top_level_functions": [
+      "execute_contracts",
+      "parent_accounting",
+      "main"
+    ],
+    "nested_main_source_exact": true,
+    "nested_main_context_exact": true,
+    "nested_main_run_exact": true,
+    "C_acquisition_through_close_block_exact": true,
+    "detail": {
+      "inverse_exact": true,
+      "ops": [
+        {
+          "label": "task docstring",
+          "count": 1
+        },
+        {
+          "label": "sole product locator",
+          "count": 1
+        },
+        {
+          "label": "private plan locator",
+          "count": 1
+        },
+        {
+          "label": "exact plan hash",
+          "count": 1
+        },
+        {
+          "label": "per-group check before same-group library sequence",
+          "count": 1
+        },
+        {
+          "label": "fresh compiled selected-name bindings separate from assigned executions",
+          "count": 1
+        },
+        {
+          "label": "parent accounting upper bound",
+          "count": 1
+        },
+        {
+          "label": "phase accounting cardinality",
+          "count": 1
+        },
+        {
+          "label": "requested parent cardinality",
+          "count": 1
+        },
+        {
+          "label": "unrun parent cardinality",
+          "count": 1
+        },
+        {
+          "label": "PR1287 source manifest/freeze/status admission binding only",
+          "count": 1
+        },
+        {
+          "label": "phase admission count",
+          "count": 1
+        },
+        {
+          "label": "parent admission count",
+          "count": 1
+        },
+        {
+          "label": "evidence namespace",
+          "count": 1
+        },
+        {
+          "label": "qualification cardinality",
+          "count": 1
+        }
+      ],
+      "functions": [
+        {
+          "name": "digest",
+          "exact": true
+        },
+        {
+          "name": "now",
+          "exact": true
+        },
+        {
+          "name": "observed_wait",
+          "exact": true
+        },
+        {
+          "name": "supervision_failure",
+          "exact": true
+        },
+        {
+          "name": "bounded_capture",
+          "exact": true
+        },
+        {
+          "name": "git",
+          "exact": true
+        },
+        {
+          "name": "signal_pidfd",
+          "exact": true
+        },
+        {
+          "name": "children",
+          "exact": true
+        },
+        {
+          "name": "settle_children",
+          "exact": true
+        },
+        {
+          "name": "cargo_test_artifact",
+          "exact": true
+        },
+        {
+          "name": "inventory_names",
+          "exact": true
+        },
+        {
+          "name": "parent_pass",
+          "exact": true
+        },
+        {
+          "name": "validate_controller_review",
+          "exact": true
+        },
+        {
+          "name": "evidence_copy",
+          "exact": true
+        },
+        {
+          "name": "execute_contracts",
+          "exact": false
+        },
+        {
+          "name": "custody_clean",
+          "exact": true
+        },
+        {
+          "name": "safe_lane_handoff",
+          "exact": true
+        },
+        {
+          "name": "parent_accounting",
+          "exact": false
+        },
+        {
+          "name": "final_observations",
+          "exact": true
+        },
+        {
+          "name": "note_lane_cancellation",
+          "exact": true
+        },
+        {
+          "name": "require_workload_allowed",
+          "exact": true
+        },
+        {
+          "name": "retain_uncertain_lane",
+          "exact": true
+        },
+        {
+          "name": "main",
+          "exact": false
+        }
+      ]
+    },
+    "plan_comparisons": {
+      "pinmatches": true,
+      "assigned_count": 16,
+      "assigned_distinct": 16,
+      "checks_order": [
+        "host-lib",
+        "ui-lib"
+      ],
+      "phases_match": true,
+      "phases": 22,
+      "manifest_lane_matches": true,
+      "no_child_reexec": true,
+      "source_inner_equal": true,
+      "context_inner_equal": true,
+      "run_inner_equal": true,
+      "lease_block_equal": true,
+      "archive_unique_names": true,
+      "archive_paths_in_packet": true,
+      "argv_isolated": true,
+      "declared_nulls": {
+        "binding": [
+          null,
+          null,
+          null
+        ],
+        "plan": [
+          null,
+          null,
+          null
+        ]
+      }
+    }
+  },
+  "finite_execution_plan": {
+    "assigned_outer_parents": 16,
+    "distinct_assigned_outer_parents": 16,
+    "assigned_by_lane": {
+      "host": 4,
+      "ui": 12,
+      "cli": 0
+    },
+    "source_predicted_compiled_selected": {
+      "host": 16,
+      "ui": 12,
+      "cli": 0
+    },
+    "predicted_counts_are_not_full_inventory_or_passes": true,
+    "child_reexecution_exceptions": 0,
+    "phases": [
+      "host-binary-check",
+      "compile-host-lib",
+      "inventory-host-lib",
+      "parent-host-lib-1",
+      "parent-host-lib-2",
+      "parent-host-lib-3",
+      "parent-host-lib-4",
+      "ui-binary-check",
+      "compile-ui-lib",
+      "inventory-ui-lib",
+      "parent-ui-lib-1",
+      "parent-ui-lib-2",
+      "parent-ui-lib-3",
+      "parent-ui-lib-4",
+      "parent-ui-lib-5",
+      "parent-ui-lib-6",
+      "parent-ui-lib-7",
+      "parent-ui-lib-8",
+      "parent-ui-lib-9",
+      "parent-ui-lib-10",
+      "parent-ui-lib-11",
+      "parent-ui-lib-12"
+    ],
+    "total_phases": 22,
+    "graphs": "HOST-only cagentsd check then HOST --no-default-features lib Cargo JSON compile, fresh actual ELF full inventory and4 exact parents; only afterward UI-only cagents-ui check, UI --no-default-features lib compile, inventory and12 exact parents. No integrated/default/unified graph or broader all-target run.",
+    "actual_artifact_contract": "Exactly one root cagents lib test artifact, successful build-finished, exact manifest, exact features, absolute regular canonical ELF inside existing target; raw full --list determines actual N, predicted selected names must each occur once and excluded names must be absent.",
+    "phase_limits": {
+      "check_seconds": 600,
+      "compile_seconds": 1200,
+      "inventory_seconds": 30,
+      "parent_seconds": 30,
+      "absolute_packet_seconds": 2400,
+      "jobs": 2
+    },
+    "actual_argv_cwd_not_authorized": "Plan/README invocation is preparation data only; this HOLD receipt cannot satisfy the runner's CONTROLLER_SOURCE_CLEAR equality."
+  },
+  "custody_and_failure_review": {
+    "original_process_evidence": "Append-only successful-spawn tuples and separate state objects retain original Popen wait result. Null wait status stays unknown; descendant waitpid cannot be used to infer the original result.",
+    "bounded_cleanup": "Original pidfd TERM3s/KILL3s paths, natural adopted settlement3s and forced window10s remain donor-exact. Forced/control/evidence/unknown history is sticky; stop first negative and do not execute dependent phases.",
+    "release": "Two final custody observations surround final source/context checks. Safe handback requires exact attempt/state/phase matching, all original waits and evidence complete, no direct forced cleanup or supervision errors, and clean unforced final/phase custody. Original Cfd close is the only release; no LOCK_UN, close retry or safe-return inference after ambiguous close.",
+    "unknown_provider_scope": "No selected source parent requires an external provider/native/helper. This source review authorizes no signals or provider descendant cleanup; prelease Git configurability is precisely why this packet cannot yet be cleared."
+  },
+  "retained_limits": [
+    "Negative-path post-use ELF digest is not guaranteed: invoke raising on nonzero, timeout, custody/source/evidence error bypasses the caller's post-use digest. Full ELF bytes are not archived. Last pre-use hash is not proof of post-failed-use bytes.",
+    "Donor parent parser remains exact1P0F0I/name/event-shape but only syntax-checks filtered count. Root's independent original RAW receipt review must compare the sole original summary with fresh inventory N-1. No synthetic or future pass is inferred.",
+    "Grant text is correlation only. Runner syntax acceptance does not query cagents, prove freshness or enforce once-only authorization; separate actual coordinator grant for exact successor packet/argv/cwd remains required.",
+    "All packet/parser/custody behavior was inspected statically. No runtime, failure-injection, cancellation, release, warmth, capacity or live tool/source context is established.",
+    "Original015e Script infrastructure negative,6327 source-oracle FK defect and stale afa manifest retain their original scopes. Sealed r2's then-RUNNING Script record is not overwritten.",
+    "Separate companion/raw readback binds later Script41084001631/job124160232059 SUCCESS to the same4fa head and manifest8cfbf196. It contributes zero Cargo/test/native passes.",
+    "Broader isolated all-target, archive/replacement integration, loader/schema/WHOLE-before-SeedView, provider lifecycle, native UI/performance/WebPs, installed/release and merge gates remain unqualified."
+  ],
+  "script_companion_binding": {
+    "same_head": "4fa3370532d78d8e19099639f2bc40c711dc725a",
+    "companion_sha256": "c1b8bea2923ea15ea49142ed3fb6747235d26bf5c4a2435861e4186fbf0a4626",
+    "raw_readback_sha256": "1160a864c9f94eb65d549eddb1e01da97f02301661b928037a1528bc4e66f8b8",
+    "supplied_readback_status": "COMPLETED SUCCESS, Script contracts only"
+  },
+  "authority_and_state": {
+    "actual_grant": null,
+    "actual_execution": null,
+    "actual_release": null,
+    "qualified": false,
+    "new_job": false,
+    "new_reservation": false,
+    "queue_admission": false,
+    "scheduling": "Root's instruction that1775 remains next C is unchanged; this review neither grants nor reserves anything.",
+    "no_clear_fields_invented": "The first five machine fields use validate_controller_review's actual field names with this review's HOLD verdict. No CONTROLLER_SOURCE_CLEAR receipt or substitute authority is issued."
+  }
+}

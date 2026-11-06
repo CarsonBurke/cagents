@@ -1,0 +1,1770 @@
+{
+  "kind": "Immutable SOURCE plan for strict two-origin 56 fresh UI plus 5 retained functional CLI/HOST contracts v12r2",
+  "version": 12,
+  "future_actual": {
+    "state": "UNPOPULATED",
+    "run": null,
+    "attempt": null,
+    "job": null,
+    "artifact_id": null,
+    "download_receipt": null,
+    "whole_terminal_receipt": null,
+    "terminal_evidence": null
+  },
+  "fresh_pins": {
+    "product_sha": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
+    "product_tree": "fe98f00eb1d0d90a800c1e5808a0bbc756258ab5",
+    "control_sha": "14c7e18663ccae5a9309a83e35b1c96972a9fd12",
+    "control_tree": "8663de09669a744fa2dec63fc9e6f9da1f16fbd8",
+    "workflow_sha256": "c44afb360a5306da40b317bfdff9b39fded4b32018522d2165a2443b6944d8c7",
+    "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052"
+  },
+  "controller_source_references": {
+    ".github/workflows/qualify-held-scope.yml": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/held-scope-tooltip-probe-qualification-fw16/.github/workflows/qualify-held-scope.yml",
+      "sha256": "c44afb360a5306da40b317bfdff9b39fded4b32018522d2165a2443b6944d8c7",
+      "bytes": 7442
+    },
+    ".github/qualification/held-scope.py": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/held-scope-tooltip-probe-qualification-fw16/.github/qualification/held-scope.py",
+      "sha256": "07184df4fc708810cab766758954714c9e1aa5cfb54d5aeaf917c7acb140b982",
+      "bytes": 20910
+    },
+    ".github/qualification/native-driver.py": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/held-scope-tooltip-probe-qualification-fw16/.github/qualification/native-driver.py",
+      "sha256": "ec583809016514fc8d36684cfe5919f814b96b016446155b40048502d1becee9",
+      "bytes": 156865
+    },
+    ".github/qualification/native-fixture.rs": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/held-scope-tooltip-probe-qualification-fw16/.github/qualification/native-fixture.rs",
+      "sha256": "39f4a348bcf8232ce4ed422675ed8da45815281cb33a91f83c7f16879d9b40b8",
+      "bytes": 92284
+    },
+    ".github/qualification/review-native.py": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/held-scope-tooltip-probe-qualification-fw16/.github/qualification/review-native.py",
+      "sha256": "437537fdb17bbf843099df1390e1c487c3393c3109f6618439c3f01f5392f5b8",
+      "bytes": 23145
+    },
+    ".github/qualification/review-data.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/held-scope-tooltip-probe-qualification-fw16/.github/qualification/review-data.json",
+      "sha256": "1726a4f1863951cc1231b09d31abc7f23eb59403e50120cecda6a9bbb5192576",
+      "bytes": 17920
+    },
+    ".github/qualification/private-review-gh.py": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/held-scope-tooltip-probe-qualification-fw16/.github/qualification/private-review-gh.py",
+      "sha256": "f96231250e51acac1e95731d72d688e5d46f41c4da48762df9f92263832aa881",
+      "bytes": 4816
+    },
+    ".github/qualification/cache-restore-gate.py": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/held-scope-tooltip-probe-qualification-fw16/.github/qualification/cache-restore-gate.py",
+      "sha256": "3e06d35461148ca7fd32d9240dffbc4d9e1ba304e9feda7ba8990248acbcd281",
+      "bytes": 12665
+    },
+    ".github/actions/setup-linux/action.yml": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/held-scope-tooltip-probe-qualification-fw16/.github/actions/setup-linux/action.yml",
+      "sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+      "bytes": 2486
+    }
+  },
+  "source_applicability": {
+    "reference": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/b3e036c7-two-origin-map-source-design-v11.json",
+      "sha256": "b177b499d1bdafea7f528e0eafc73c566acf5704dcb0b3c0447469c10e68ba6d",
+      "bytes": 64732
+    },
+    "reviewed_delta": {
+      "all_other_tracked_entries_equal_mode_kind_blob": true,
+      "changed_file_pins": [
+        {
+          "blob": "0db969fcb9f5efe0e22b8c116cbb63d2f6497b01",
+          "bytes": 103194,
+          "path": "src/pull_request_review/discussion_ui.rs",
+          "revision": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
+          "sha256": "d41c4f3b6538538916dbc86c81bd3f24f4d7bdc194b77ec468586672ca33af17"
+        },
+        {
+          "blob": "6ef153a51fbb428a2b6eea0e9b65aa061f2c9298",
+          "bytes": 35140,
+          "path": "vendor/libcosmic/src/widget/button/widget.rs",
+          "revision": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
+          "sha256": "6e1910890ddaf21ecba6171f3906cf8b7969c1f07186d7b37458675b051cba67"
+        }
+      ],
+      "diff_binary_sha256": "1a6aed58866df187f048cbb00fc5b18e3981af07606a294ad954113597da99c0",
+      "exact_only_changed_entries": {
+        "src/pull_request_review/discussion_ui.rs": {
+          "new": "100644 blob 0db969fcb9f5efe0e22b8c116cbb63d2f6497b01",
+          "old": "100644 blob c25a70167997023543c36153b1d9054972c268e6"
+        },
+        "vendor/libcosmic/src/widget/button/widget.rs": {
+          "new": "100644 blob 6ef153a51fbb428a2b6eea0e9b65aa061f2c9298",
+          "old": "100644 blob 1aedf0bf8983f9fd86c2634c7572408d732c7ee2"
+        }
+      },
+      "identity_exception": {
+        "guard": "Do not normalize away these differences or assert a final-head CLI/HOST check/test pass. Any claimed new-head build/version/runtime behavior must come from actual fresh evidence.",
+        "reason": "build.rs:22-41 watches checkout-root and build metadata, and :71-109 derives Git HEAD/dirty version. src/modules.rs:1-9 tracks root and exposes generated version. New HEAD/root differ.",
+        "scope": "Functional applicability only. Not all compiler inputs, binaries, version identity, checkout path or executed test processes are identical."
+      },
+      "isolated_graph_fences": [
+        "Cargo.toml:2-4 default-members selects only root and retained commands have no --workspace.",
+        "Cargo.toml:24-48: full=[]; retained CLI --no-default-features and host feature omit ui/libcosmic.",
+        "Cargo.toml:49-85 UI alone selects libcosmic; src/modules.rs:102-103 gates pull_request_review on ui.",
+        "Unchanged root manifests/lock/config/build/test/shared/backend sources and no changed CLI/HOST include path into these two UI files are required for retention."
+      ],
+      "recursive_tracked_entries_per_tree": {
+        "112e": 2221,
+        "b3e": 2221
+      },
+      "unchanged_input_pins": [
+        {
+          "blob": "3c67491c83a0077d18b41a73ff5850488ebdf0f5",
+          "bytes": 13087,
+          "path": "Cargo.toml",
+          "revision": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
+          "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+        },
+        {
+          "blob": "9ff31301cf43f2219a56415069c4d3026765f9bb",
+          "bytes": 341188,
+          "path": "Cargo.lock",
+          "revision": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
+          "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+        },
+        {
+          "blob": "cc0447aee8720c7e850030ca36b5385665e6a275",
+          "bytes": 4593,
+          "path": "build.rs",
+          "revision": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
+          "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9"
+        },
+        {
+          "blob": "0e2d20b442d9256e22ecbe4852d77e2a07c45409",
+          "bytes": 412,
+          "path": ".cargo/config.toml",
+          "revision": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
+          "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+        },
+        {
+          "blob": "4c98ba1df7ee301c7698893059de3adfda37f411",
+          "bytes": 23,
+          "path": "mise.toml",
+          "revision": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
+          "sha256": "8d33cd18aeade46b6ef719241951bafff4655e011ed4d0c5d1cd9706acdfcdfe"
+        },
+        {
+          "blob": "3044665920d638c081ec1efada45f27b3553cbc3",
+          "bytes": 8296,
+          "path": "scripts/run-development",
+          "revision": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
+          "sha256": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016"
+        },
+        {
+          "blob": "f2ff4fc03dff4a45810eee2cc7af2393bc9c6c5e",
+          "bytes": 350,
+          "path": "src/lib.rs",
+          "revision": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
+          "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e"
+        },
+        {
+          "blob": "9e04bd958166835de80fc06502dd6cbe547111d6",
+          "bytes": 4143,
+          "path": "src/modules.rs",
+          "revision": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
+          "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374"
+        }
+      ]
+    },
+    "scope": "Functional CLI/HOST applicability only. New HEAD/root and generated version identity differ; no final-head CLI/HOST test or binary equality claim."
+  },
+  "focused_test_design": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/b8ce16ec-two-origin-checker-focused-data-test-design-v1.json",
+    "sha256": "fabf77ff80da00fd3af463a0cf8c2f1ad2d6cb5498f1fe8280e75d3f0d4855ff",
+    "bytes": 13989
+  },
+  "old": {
+    "allocation": "6e4acf9b-5f2a-4ed5-8556-0377e4fc70a2",
+    "artifact_id": 12991307374,
+    "artifact_name": "held-scope-112e671cfe7df93fb1bfd9404f4cc960ad3dec15-1",
+    "artifact_root": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final",
+    "artifact_zip_bytes": 19598495,
+    "artifact_zip_path": "/tmp/held-saved-scope-fw16-evidence/41071089029-original-final-artifact.zip",
+    "artifact_zip_sha256": "85cbec1f2a05c372f299c6b56315b5e8f51c64e5754c784baf886ee9d9097f48",
+    "attempt": 1,
+    "commands": {
+      "bytes": 26681,
+      "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/commands.json",
+      "sha256": "ef4ada358284c783e01482ed0e726e0cace67d845404b99d650eef0a27c9c11e"
+    },
+    "controller_sha": "8259b7b0bdb227e1140fd60c34c5e457bfe5d708",
+    "job_id": 124115086503,
+    "manifest": {
+      "bytes": 143650,
+      "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/sha256.txt",
+      "sha256": "e26b99526493d7966fca63e7721e3a19e23ae8b68a67606f3416a4e511a7341a"
+    },
+    "original_native_qualified": false,
+    "original_qualification_complete": false,
+    "product_sha": "112e671cfe7df93fb1bfd9404f4cc960ad3dec15",
+    "product_tree": "cc043b5c32501ec73164d506739256296908fb60",
+    "run_id": 41071089029,
+    "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+    "source": {
+      "bytes": 574,
+      "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/source.json",
+      "sha256": "466808189eabbe2a59d5fe60a7dc481ccea2d82e1fe9610424346589249e2035"
+    },
+    "terminal_job_api_record": {
+      "bytes": 5641,
+      "path": "/tmp/held-saved-scope-fw16-evidence/41071089029-original-terminal-job-api.json",
+      "sha256": "c198ee95c453f5fcb41d2ac952959b88e09a93467f8656cd1be0a648d9be0420"
+    },
+    "terminal_run_api_record": {
+      "bytes": 12780,
+      "path": "/tmp/held-saved-scope-fw16-evidence/41071089029-original-terminal-run-api.json",
+      "sha256": "025f7a734df0a58138289bcb61a2847001f9a96523d6a4f2dcbad7341cbe5934"
+    },
+    "terminal_state": "completed FAILURE, preserved",
+    "toolchain": {
+      "cargo": "cargo 1.93.0 (083ac5135 2025-12-15)",
+      "rustc": "rustc 1.93.0 (254b59607 2026-01-19)",
+      "zig": "0.15.2"
+    },
+    "workflow_sha256": "753ce84cff94f02af50ad7582dc5bd476fb70f3fe19f0909d12a7495f24fe92f",
+    "controller_tree": "51006b330440e79ec64585ead0211e4cba00e718",
+    "manifest_entries": 1127,
+    "terminal_run": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/41071089029-original-terminal-run-api.json",
+      "sha256": "025f7a734df0a58138289bcb61a2847001f9a96523d6a4f2dcbad7341cbe5934",
+      "bytes": 12780
+    },
+    "terminal_job": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/41071089029-original-terminal-job-api.json",
+      "sha256": "c198ee95c453f5fcb41d2ac952959b88e09a93467f8656cd1be0a648d9be0420",
+      "bytes": 5641
+    },
+    "whole_terminal": {
+      "bytes": 7945,
+      "path": "/tmp/held-saved-scope-fw16-evidence/41071089029-whole-terminal-barrier.json",
+      "sha256": "40ea4b09a1b1d061626ce94659a9576502cf0d9d717ff7c4ac55d67535d5f249"
+    },
+    "download": {
+      "bytes": 1614,
+      "path": "/tmp/held-saved-scope-fw16-evidence/41071089029-original-final-artifact-download-receipt.json",
+      "sha256": "f3d337711b31c6ba51a6c30ce82151a9855c67a46bbb5d98591103c09a76ac89"
+    },
+    "raw": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/41071089029-terminal-independent-audit-v1.json",
+      "sha256": "8608dff52e5f7df7cb12d52f12b85aa258e9d1ddddf44914bbeaff2df1f4ba39",
+      "bytes": 89147
+    },
+    "executor_return": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/41071089029-original-holder-return-send-receipt.json",
+      "sha256": "36a89b9b7df600379e9f4f6afe5c73603788840f942c2cffbc72d7c2284bfc8f",
+      "bytes": 2536
+    },
+    "accepted_return": {
+      "path": "/tmp/fw16-backend-ec204421/held-112e-8259-actual-C-return-accepted.json",
+      "sha256": "2b16d330cdad60b2e14ad4ec0f0e1d5ae67acab4c2d18b57120c6f4eec170499",
+      "bytes": 1488
+    },
+    "accepted_envelope": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/coord-inbox-20261030T161621.json",
+      "sha256": "347a9072695857a3b2cf15125d778aa659223e18f70a4ab1b828c6a6ef9dfcd6",
+      "bytes": 1203
+    },
+    "inspection_reference": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final-suites-inspection.json",
+      "sha256": "24da043ef40ee6068d2df04a2a14d683099d8c3e9e23ac5556468af74b743fbe",
+      "bytes": 59771
+    },
+    "helper": {
+      "after_receipt": {
+        "bytes": 444,
+        "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/host-helper-after.json",
+        "sha256": "e90f105daa841ed2efa0596d8343138f89c0ba39252720f2db14a6aa03df93a4"
+      },
+      "before_receipt": {
+        "bytes": 1882,
+        "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/host-helper.json",
+        "sha256": "1833fed2386756714ba0b1c275eda04ceb9e13c2b5576883710f3f300b8345c3"
+      },
+      "frozen_binary_sha256_from_original_receipt": "d080623ec50b087fffc4194a8ea2eeed3634405728c00450d9918bc0f67ea524",
+      "frozen_path_from_original_receipt": "/tmp/h1922.lozjxdfs/frozen-host-helper/cagentsd",
+      "scope": "Historical original HOST suite evidence only; no new helper/native claim."
+    },
+    "retained_records": [
+      {
+        "argv": [
+          "cargo",
+          "check",
+          "--locked",
+          "--no-default-features",
+          "--bin",
+          "cagents"
+        ],
+        "name": "cli-check",
+        "origin": "retained_cli_host",
+        "original_commands_json_index": 55,
+        "recorded_exit_code": 0,
+        "stderr": {
+          "bytes": 51675,
+          "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/cli-check.stderr.log",
+          "sha256": "1522fca89bde34244380b6b3f72724c09eca849f2db020cd72fdf4442d3908f1"
+        },
+        "stdout": {
+          "bytes": 0,
+          "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/cli-check.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      {
+        "argv": [
+          "cargo",
+          "check",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "host",
+          "--bin",
+          "cagentsd"
+        ],
+        "name": "host-check",
+        "origin": "retained_cli_host",
+        "original_commands_json_index": 56,
+        "recorded_exit_code": 0,
+        "stderr": {
+          "bytes": 48575,
+          "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/host-check.stderr.log",
+          "sha256": "990662424c0ab2d91760bdb98741d1e771bd0931c08c4be85a877de613d411ed"
+        },
+        "stdout": {
+          "bytes": 0,
+          "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/host-check.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--no-default-features",
+          "--all-targets",
+          "--",
+          "--test-threads=1"
+        ],
+        "name": "cli-all-targets-suite",
+        "origin": "retained_cli_host",
+        "original_commands_json_index": 57,
+        "recorded_exit_code": 0,
+        "stderr": {
+          "bytes": 60269,
+          "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/cli-all-targets-suite.stderr.log",
+          "sha256": "49a033e4c10157c545c93822bb255a2a1f708cccc27a7aa4bef4dfda4d50460d"
+        },
+        "stdout": {
+          "bytes": 98031,
+          "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/cli-all-targets-suite.log",
+          "sha256": "752e03ba212e776ba24c8dc915d3538a6d75cb61397e8a1e2f51dc006e6e1405"
+        }
+      },
+      {
+        "argv": [
+          "cargo",
+          "build",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "host",
+          "--bin",
+          "cagentsd",
+          "--message-format=json"
+        ],
+        "name": "host-helper-build",
+        "origin": "retained_cli_host",
+        "original_commands_json_index": 58,
+        "recorded_exit_code": 0,
+        "stderr": {
+          "bytes": 2455,
+          "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/host-helper-build.stderr.log",
+          "sha256": "4869c82f5c66460c3854d788e3711d10808b71992a96bb72a5d967d9978d0f54"
+        },
+        "stdout": {
+          "bytes": 496934,
+          "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/host-helper-build.jsonl",
+          "sha256": "faa8dc3aed2e2bd64fb827b81e46dd0543a16554f1a548acc5a39fd66beb06e6"
+        }
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "host",
+          "--all-targets",
+          "--",
+          "--test-threads=1"
+        ],
+        "name": "host-all-targets-suite",
+        "origin": "retained_cli_host",
+        "original_commands_json_index": 59,
+        "recorded_exit_code": 0,
+        "stderr": {
+          "bytes": 64377,
+          "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/host-all-targets-suite.stderr.log",
+          "sha256": "528e0b856ff652481c654cbf07990d32c7fe6413dfd9632ddb27380d74ab46a7"
+        },
+        "stdout": {
+          "bytes": 348186,
+          "path": "/tmp/held-saved-scope-fw16-evidence/hosted-41071089029-final/host-all-targets-suite.log",
+          "sha256": "7b553fef6cf8f16404d60a9d9cd27188b415bd04c7189603b52b838a84cf3af1"
+        }
+      }
+    ]
+  },
+  "canonical_names": [
+    "atspi-disabled-state-tests",
+    "ui-check",
+    "ui-all-targets-compile",
+    "active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+    "hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+    "quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+    "ordinary_closed_retained_chat_history_and_same_process_reopen_dispatch_only_the_explicit_resume",
+    "keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click",
+    "saved_pane_check_results_survive_transport_recovery_and_follow_the_current_source",
+    "quarantined_pane_removal_restores_the_surviving_native_control",
+    "notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot",
+    "model_read_publishes_new_managed_chat_before_initialized_view_projection",
+    "verified_retirement_survives_repeated_refresh_without_borrowing_metadata_sequence",
+    "verified_retirement_never_borrows_rejected_ambiguous_or_changed_sources",
+    "closed_retirement_history_still_requires_exact_proof_and_scope",
+    "verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+    "retirement_witness_binds_canonical_metadata_and_issuer_separately",
+    "verified_terminal_retirement_preserves_exact_ended_and_archived_sources",
+    "migration_session_inventory_budget_spans_windows_and_precedes_json_decode",
+    "systemd_scope_preserves_environment_arguments_and_isolates_cgroup",
+    "cli-check",
+    "host-check",
+    "cli-all-targets-suite",
+    "host-helper-build",
+    "host-all-targets-suite",
+    "ui-all-targets-suite",
+    "ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+    "ranked_snapshot_retires_verified_pane_behind_newer_metadata",
+    "ranked_snapshot_and_late_create_echo_preserve_closed_durable_denial",
+    "create_publisher_keeps_the_complete_canonical_rank_response",
+    "delayed_rank_receipts_preserve_newer_metadata_and_do_not_revive_deleted_channels",
+    "provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure",
+    "provider_context_closed_widget_and_catalog_preserve_literal_body",
+    "provider_context_find_reveals_selected_scope_and_restores_disclosure",
+    "mixed_scope_verified_retirement_preserves_runtime_only_managed_images",
+    "peer_remove_retains_ready_image_only_mounted_and_parked_drafts_after_writer_reopen",
+    "ready_image_only_alias_blocks_canonical_adoption",
+    "ready_image_only_canonical_destination_refuses_draft_rekey",
+    "history_browsing_preserves_unsent_image_stash_without_treating_sent_images_as_local_work",
+    "explicit_image_removal_and_local_close_keep_their_discard_semantics",
+    "pending_images_and_text_remain_local_work_while_an_empty_draft_does_not",
+    "composer_attachment_tooltip_preserves_native_image_and_remove_ownership",
+    "recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers",
+    "file_row_discussion_tooltip_preserves_native_count_and_actions",
+    "rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+    "coherent_quarantine_still_isolates_refused_content_and_closed_tombstones",
+    "restored_terminal_quarantine_still_isolates_content_and_tombstone_refusals",
+    "a_rebased_quarantine_retains_its_exact_snapshot_across_writer_retries",
+    "runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+    "an_unstarted_chat_saves_new_launch_options_with_the_window",
+    "a_refused_pane_keeps_its_stored_content_while_the_window_saves",
+    "a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown",
+    "closing_a_card_drops_its_refused_relaunch",
+    "a_refused_card_is_named_with_its_remedy",
+    "a_draft_account_choice_survives_the_next_shared_projection",
+    "a_chat_handed_to_its_terminal_stays_a_terminal_after_the_next_shared_projection",
+    "a_chat_card_takes_a_new_conversation_only_through_its_replacement",
+    "ownership_recovery_rolls_back_the_transfer_when_the_full_snapshot_is_refused",
+    "history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+    "quarantined_terminal_restore_downgrades_remain_inert_after_reopen_and_autosave",
+    "terminal_handoff_flush_failure_keeps_all_receipts_pending"
+  ],
+  "contracts": [
+    {
+      "name": "atspi-disabled-state-tests",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 0,
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "accesskit_atspi_common",
+        "--lib",
+        "node::disabled_state_tests::",
+        "--",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": null,
+      "stdout": "atspi-disabled-state-tests.log",
+      "stderr": "atspi-disabled-state-tests.stderr.log"
+    },
+    {
+      "name": "ui-check",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 1,
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--bin",
+        "cagents-ui"
+      ],
+      "selector": null,
+      "stdout": "ui-check.log",
+      "stderr": "ui-check.stderr.log"
+    },
+    {
+      "name": "ui-all-targets-compile",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 2,
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--all-targets",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "selector": null,
+      "stdout": "ui-all-targets-compile.jsonl",
+      "stderr": "ui-all-targets-compile.stderr.log"
+    },
+    {
+      "name": "active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 3,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "stdout": "active_mixed_managed_saved_scope_recovers_healthy_panes_only.log",
+      "stderr": "active_mixed_managed_saved_scope_recovers_healthy_panes_only.stderr.log"
+    },
+    {
+      "name": "hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 4,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "stdout": "hidden_mixed_managed_saved_scope_recovers_healthy_panes_only.log",
+      "stderr": "hidden_mixed_managed_saved_scope_recovers_healthy_panes_only.stderr.log"
+    },
+    {
+      "name": "ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 5,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+      "stdout": "ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection.log",
+      "stderr": "ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection.stderr.log"
+    },
+    {
+      "name": "ranked_snapshot_retires_verified_pane_behind_newer_metadata",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 6,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::ranked_snapshot_retires_verified_pane_behind_newer_metadata",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::ranked_snapshot_retires_verified_pane_behind_newer_metadata",
+      "stdout": "ranked_snapshot_retires_verified_pane_behind_newer_metadata.log",
+      "stderr": "ranked_snapshot_retires_verified_pane_behind_newer_metadata.stderr.log"
+    },
+    {
+      "name": "ranked_snapshot_and_late_create_echo_preserve_closed_durable_denial",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 7,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::ranked_snapshot_and_late_create_echo_preserve_closed_durable_denial",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::ranked_snapshot_and_late_create_echo_preserve_closed_durable_denial",
+      "stdout": "ranked_snapshot_and_late_create_echo_preserve_closed_durable_denial.log",
+      "stderr": "ranked_snapshot_and_late_create_echo_preserve_closed_durable_denial.stderr.log"
+    },
+    {
+      "name": "mixed_scope_verified_retirement_preserves_runtime_only_managed_images",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 8,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::mixed_scope_verified_retirement_preserves_runtime_only_managed_images",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::mixed_scope_verified_retirement_preserves_runtime_only_managed_images",
+      "stdout": "mixed_scope_verified_retirement_preserves_runtime_only_managed_images.log",
+      "stderr": "mixed_scope_verified_retirement_preserves_runtime_only_managed_images.stderr.log"
+    },
+    {
+      "name": "quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 9,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+      "stdout": "quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner.log",
+      "stderr": "quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner.stderr.log"
+    },
+    {
+      "name": "ordinary_closed_retained_chat_history_and_same_process_reopen_dispatch_only_the_explicit_resume",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 10,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::ordinary_closed_retained_chat_history_and_same_process_reopen_dispatch_only_the_explicit_resume",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::ordinary_closed_retained_chat_history_and_same_process_reopen_dispatch_only_the_explicit_resume",
+      "stdout": "ordinary_closed_retained_chat_history_and_same_process_reopen_dispatch_only_the_explicit_resume.log",
+      "stderr": "ordinary_closed_retained_chat_history_and_same_process_reopen_dispatch_only_the_explicit_resume.stderr.log"
+    },
+    {
+      "name": "keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 11,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click",
+      "stdout": "keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click.log",
+      "stderr": "keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click.stderr.log"
+    },
+    {
+      "name": "saved_pane_check_results_survive_transport_recovery_and_follow_the_current_source",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 12,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::saved_pane_check_results_survive_transport_recovery_and_follow_the_current_source",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::saved_pane_check_results_survive_transport_recovery_and_follow_the_current_source",
+      "stdout": "saved_pane_check_results_survive_transport_recovery_and_follow_the_current_source.log",
+      "stderr": "saved_pane_check_results_survive_transport_recovery_and_follow_the_current_source.stderr.log"
+    },
+    {
+      "name": "quarantined_pane_removal_restores_the_surviving_native_control",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 13,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::quarantined_pane_removal_restores_the_surviving_native_control",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::quarantined_pane_removal_restores_the_surviving_native_control",
+      "stdout": "quarantined_pane_removal_restores_the_surviving_native_control.log",
+      "stderr": "quarantined_pane_removal_restores_the_surviving_native_control.stderr.log"
+    },
+    {
+      "name": "peer_remove_retains_ready_image_only_mounted_and_parked_drafts_after_writer_reopen",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 14,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::chat_ui::image_only_peer_remove_tests::peer_remove_retains_ready_image_only_mounted_and_parked_drafts_after_writer_reopen",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::chat_ui::image_only_peer_remove_tests::peer_remove_retains_ready_image_only_mounted_and_parked_drafts_after_writer_reopen",
+      "stdout": "peer_remove_retains_ready_image_only_mounted_and_parked_drafts_after_writer_reopen.log",
+      "stderr": "peer_remove_retains_ready_image_only_mounted_and_parked_drafts_after_writer_reopen.stderr.log"
+    },
+    {
+      "name": "ready_image_only_alias_blocks_canonical_adoption",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 15,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::chat_ui::image_only_peer_remove_tests::ready_image_only_alias_blocks_canonical_adoption",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::chat_ui::image_only_peer_remove_tests::ready_image_only_alias_blocks_canonical_adoption",
+      "stdout": "ready_image_only_alias_blocks_canonical_adoption.log",
+      "stderr": "ready_image_only_alias_blocks_canonical_adoption.stderr.log"
+    },
+    {
+      "name": "ready_image_only_canonical_destination_refuses_draft_rekey",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 16,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::chat_ui::image_only_peer_remove_tests::ready_image_only_canonical_destination_refuses_draft_rekey",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::chat_ui::image_only_peer_remove_tests::ready_image_only_canonical_destination_refuses_draft_rekey",
+      "stdout": "ready_image_only_canonical_destination_refuses_draft_rekey.log",
+      "stderr": "ready_image_only_canonical_destination_refuses_draft_rekey.stderr.log"
+    },
+    {
+      "name": "history_browsing_preserves_unsent_image_stash_without_treating_sent_images_as_local_work",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 17,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::chat_ui::image_only_peer_remove_tests::history_browsing_preserves_unsent_image_stash_without_treating_sent_images_as_local_work",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::chat_ui::image_only_peer_remove_tests::history_browsing_preserves_unsent_image_stash_without_treating_sent_images_as_local_work",
+      "stdout": "history_browsing_preserves_unsent_image_stash_without_treating_sent_images_as_local_work.log",
+      "stderr": "history_browsing_preserves_unsent_image_stash_without_treating_sent_images_as_local_work.stderr.log"
+    },
+    {
+      "name": "explicit_image_removal_and_local_close_keep_their_discard_semantics",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 18,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::chat_ui::image_only_peer_remove_tests::explicit_image_removal_and_local_close_keep_their_discard_semantics",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::chat_ui::image_only_peer_remove_tests::explicit_image_removal_and_local_close_keep_their_discard_semantics",
+      "stdout": "explicit_image_removal_and_local_close_keep_their_discard_semantics.log",
+      "stderr": "explicit_image_removal_and_local_close_keep_their_discard_semantics.stderr.log"
+    },
+    {
+      "name": "pending_images_and_text_remain_local_work_while_an_empty_draft_does_not",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 19,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::chat_ui::image_only_peer_remove_tests::pending_images_and_text_remain_local_work_while_an_empty_draft_does_not",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::chat_ui::image_only_peer_remove_tests::pending_images_and_text_remain_local_work_while_an_empty_draft_does_not",
+      "stdout": "pending_images_and_text_remain_local_work_while_an_empty_draft_does_not.log",
+      "stderr": "pending_images_and_text_remain_local_work_while_an_empty_draft_does_not.stderr.log"
+    },
+    {
+      "name": "notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 20,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::notification_ui::tests::notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::notification_ui::tests::notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot",
+      "stdout": "notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot.log",
+      "stderr": "notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot.stderr.log"
+    },
+    {
+      "name": "model_read_publishes_new_managed_chat_before_initialized_view_projection",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 21,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::workspace_model_sync::tests::model_read_publishes_new_managed_chat_before_initialized_view_projection",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::workspace_model_sync::tests::model_read_publishes_new_managed_chat_before_initialized_view_projection",
+      "stdout": "model_read_publishes_new_managed_chat_before_initialized_view_projection.log",
+      "stderr": "model_read_publishes_new_managed_chat_before_initialized_view_projection.stderr.log"
+    },
+    {
+      "name": "create_publisher_keeps_the_complete_canonical_rank_response",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 22,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::workspace_model_sync::tests::create_publisher_keeps_the_complete_canonical_rank_response",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::workspace_model_sync::tests::create_publisher_keeps_the_complete_canonical_rank_response",
+      "stdout": "create_publisher_keeps_the_complete_canonical_rank_response.log",
+      "stderr": "create_publisher_keeps_the_complete_canonical_rank_response.stderr.log"
+    },
+    {
+      "name": "delayed_rank_receipts_preserve_newer_metadata_and_do_not_revive_deleted_channels",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 23,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::workspace_model_sync::tests::delayed_rank_receipts_preserve_newer_metadata_and_do_not_revive_deleted_channels",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::workspace_model_sync::tests::delayed_rank_receipts_preserve_newer_metadata_and_do_not_revive_deleted_channels",
+      "stdout": "delayed_rank_receipts_preserve_newer_metadata_and_do_not_revive_deleted_channels.log",
+      "stderr": "delayed_rank_receipts_preserve_newer_metadata_and_do_not_revive_deleted_channels.stderr.log"
+    },
+    {
+      "name": "provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 24,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::chat_ui::view::provider_context_tests::provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::chat_ui::view::provider_context_tests::provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure",
+      "stdout": "provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure.log",
+      "stderr": "provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure.stderr.log"
+    },
+    {
+      "name": "provider_context_closed_widget_and_catalog_preserve_literal_body",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 25,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::chat_ui::view::provider_context_tests::provider_context_closed_widget_and_catalog_preserve_literal_body",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::chat_ui::view::provider_context_tests::provider_context_closed_widget_and_catalog_preserve_literal_body",
+      "stdout": "provider_context_closed_widget_and_catalog_preserve_literal_body.log",
+      "stderr": "provider_context_closed_widget_and_catalog_preserve_literal_body.stderr.log"
+    },
+    {
+      "name": "provider_context_find_reveals_selected_scope_and_restores_disclosure",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 26,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::chat_ui::view::provider_context_tests::provider_context_find_reveals_selected_scope_and_restores_disclosure",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::chat_ui::view::provider_context_tests::provider_context_find_reveals_selected_scope_and_restores_disclosure",
+      "stdout": "provider_context_find_reveals_selected_scope_and_restores_disclosure.log",
+      "stderr": "provider_context_find_reveals_selected_scope_and_restores_disclosure.stderr.log"
+    },
+    {
+      "name": "composer_attachment_tooltip_preserves_native_image_and_remove_ownership",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 27,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::chat_ui::view::tests::composer_attachment_tooltip_preserves_native_image_and_remove_ownership",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::chat_ui::view::tests::composer_attachment_tooltip_preserves_native_image_and_remove_ownership",
+      "stdout": "composer_attachment_tooltip_preserves_native_image_and_remove_ownership.log",
+      "stderr": "composer_attachment_tooltip_preserves_native_image_and_remove_ownership.stderr.log"
+    },
+    {
+      "name": "recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 28,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::chat_ui::view::tests::recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::chat_ui::view::tests::recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers",
+      "stdout": "recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers.log",
+      "stderr": "recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers.stderr.log"
+    },
+    {
+      "name": "file_row_discussion_tooltip_preserves_native_count_and_actions",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 29,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "pull_request_review::discussion_ui::tests::file_row_discussion_tooltip_preserves_native_count_and_actions",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "pull_request_review::discussion_ui::tests::file_row_discussion_tooltip_preserves_native_count_and_actions",
+      "stdout": "file_row_discussion_tooltip_preserves_native_count_and_actions.log",
+      "stderr": "file_row_discussion_tooltip_preserves_native_count_and_actions.stderr.log"
+    },
+    {
+      "name": "rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 30,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+      "stdout": "rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement.log",
+      "stderr": "rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement.stderr.log"
+    },
+    {
+      "name": "coherent_quarantine_still_isolates_refused_content_and_closed_tombstones",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 31,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "persistence::tests::coherent_quarantine_still_isolates_refused_content_and_closed_tombstones",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "persistence::tests::coherent_quarantine_still_isolates_refused_content_and_closed_tombstones",
+      "stdout": "coherent_quarantine_still_isolates_refused_content_and_closed_tombstones.log",
+      "stderr": "coherent_quarantine_still_isolates_refused_content_and_closed_tombstones.stderr.log"
+    },
+    {
+      "name": "restored_terminal_quarantine_still_isolates_content_and_tombstone_refusals",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 32,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "persistence::tests::restored_terminal_quarantine_still_isolates_content_and_tombstone_refusals",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "persistence::tests::restored_terminal_quarantine_still_isolates_content_and_tombstone_refusals",
+      "stdout": "restored_terminal_quarantine_still_isolates_content_and_tombstone_refusals.log",
+      "stderr": "restored_terminal_quarantine_still_isolates_content_and_tombstone_refusals.stderr.log"
+    },
+    {
+      "name": "a_rebased_quarantine_retains_its_exact_snapshot_across_writer_retries",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 33,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "session::tests::a_rebased_quarantine_retains_its_exact_snapshot_across_writer_retries",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "session::tests::a_rebased_quarantine_retains_its_exact_snapshot_across_writer_retries",
+      "stdout": "a_rebased_quarantine_retains_its_exact_snapshot_across_writer_retries.log",
+      "stderr": "a_rebased_quarantine_retains_its_exact_snapshot_across_writer_retries.stderr.log"
+    },
+    {
+      "name": "runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 34,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+      "stdout": "runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat.log",
+      "stderr": "runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat.stderr.log"
+    },
+    {
+      "name": "an_unstarted_chat_saves_new_launch_options_with_the_window",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 35,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "persistence::tests::an_unstarted_chat_saves_new_launch_options_with_the_window",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "persistence::tests::an_unstarted_chat_saves_new_launch_options_with_the_window",
+      "stdout": "an_unstarted_chat_saves_new_launch_options_with_the_window.log",
+      "stderr": "an_unstarted_chat_saves_new_launch_options_with_the_window.stderr.log"
+    },
+    {
+      "name": "a_refused_pane_keeps_its_stored_content_while_the_window_saves",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 36,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "persistence::tests::a_refused_pane_keeps_its_stored_content_while_the_window_saves",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "persistence::tests::a_refused_pane_keeps_its_stored_content_while_the_window_saves",
+      "stdout": "a_refused_pane_keeps_its_stored_content_while_the_window_saves.log",
+      "stderr": "a_refused_pane_keeps_its_stored_content_while_the_window_saves.stderr.log"
+    },
+    {
+      "name": "a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 37,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "session::tests::a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "session::tests::a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown",
+      "stdout": "a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown.log",
+      "stderr": "a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown.stderr.log"
+    },
+    {
+      "name": "closing_a_card_drops_its_refused_relaunch",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 38,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "session::tests::closing_a_card_drops_its_refused_relaunch",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "session::tests::closing_a_card_drops_its_refused_relaunch",
+      "stdout": "closing_a_card_drops_its_refused_relaunch.log",
+      "stderr": "closing_a_card_drops_its_refused_relaunch.stderr.log"
+    },
+    {
+      "name": "a_refused_card_is_named_with_its_remedy",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 39,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::tests::a_refused_card_is_named_with_its_remedy",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::tests::a_refused_card_is_named_with_its_remedy",
+      "stdout": "a_refused_card_is_named_with_its_remedy.log",
+      "stderr": "a_refused_card_is_named_with_its_remedy.stderr.log"
+    },
+    {
+      "name": "a_draft_account_choice_survives_the_next_shared_projection",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 40,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::published_card_edits::a_draft_account_choice_survives_the_next_shared_projection",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::published_card_edits::a_draft_account_choice_survives_the_next_shared_projection",
+      "stdout": "a_draft_account_choice_survives_the_next_shared_projection.log",
+      "stderr": "a_draft_account_choice_survives_the_next_shared_projection.stderr.log"
+    },
+    {
+      "name": "a_chat_handed_to_its_terminal_stays_a_terminal_after_the_next_shared_projection",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 41,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::published_card_edits::a_chat_handed_to_its_terminal_stays_a_terminal_after_the_next_shared_projection",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::published_card_edits::a_chat_handed_to_its_terminal_stays_a_terminal_after_the_next_shared_projection",
+      "stdout": "a_chat_handed_to_its_terminal_stays_a_terminal_after_the_next_shared_projection.log",
+      "stderr": "a_chat_handed_to_its_terminal_stays_a_terminal_after_the_next_shared_projection.stderr.log"
+    },
+    {
+      "name": "a_chat_card_takes_a_new_conversation_only_through_its_replacement",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 42,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "persistence::tests::a_chat_card_takes_a_new_conversation_only_through_its_replacement",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "persistence::tests::a_chat_card_takes_a_new_conversation_only_through_its_replacement",
+      "stdout": "a_chat_card_takes_a_new_conversation_only_through_its_replacement.log",
+      "stderr": "a_chat_card_takes_a_new_conversation_only_through_its_replacement.stderr.log"
+    },
+    {
+      "name": "ownership_recovery_rolls_back_the_transfer_when_the_full_snapshot_is_refused",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 43,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "persistence::tests::ownership_recovery_rolls_back_the_transfer_when_the_full_snapshot_is_refused",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "persistence::tests::ownership_recovery_rolls_back_the_transfer_when_the_full_snapshot_is_refused",
+      "stdout": "ownership_recovery_rolls_back_the_transfer_when_the_full_snapshot_is_refused.log",
+      "stderr": "ownership_recovery_rolls_back_the_transfer_when_the_full_snapshot_is_refused.stderr.log"
+    },
+    {
+      "name": "history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 44,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+      "stdout": "history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata.log",
+      "stderr": "history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata.stderr.log"
+    },
+    {
+      "name": "quarantined_terminal_restore_downgrades_remain_inert_after_reopen_and_autosave",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 45,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "persistence::tests::quarantined_terminal_restore_downgrades_remain_inert_after_reopen_and_autosave",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "persistence::tests::quarantined_terminal_restore_downgrades_remain_inert_after_reopen_and_autosave",
+      "stdout": "quarantined_terminal_restore_downgrades_remain_inert_after_reopen_and_autosave.log",
+      "stderr": "quarantined_terminal_restore_downgrades_remain_inert_after_reopen_and_autosave.stderr.log"
+    },
+    {
+      "name": "terminal_handoff_flush_failure_keeps_all_receipts_pending",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 46,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::tests::terminal_handoff_flush_failure_keeps_all_receipts_pending",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::tests::terminal_handoff_flush_failure_keeps_all_receipts_pending",
+      "stdout": "terminal_handoff_flush_failure_keeps_all_receipts_pending.log",
+      "stderr": "terminal_handoff_flush_failure_keeps_all_receipts_pending.stderr.log"
+    },
+    {
+      "name": "verified_retirement_survives_repeated_refresh_without_borrowing_metadata_sequence",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 47,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::verified_retirement_survives_repeated_refresh_without_borrowing_metadata_sequence",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::verified_retirement_survives_repeated_refresh_without_borrowing_metadata_sequence",
+      "stdout": "verified_retirement_survives_repeated_refresh_without_borrowing_metadata_sequence.log",
+      "stderr": "verified_retirement_survives_repeated_refresh_without_borrowing_metadata_sequence.stderr.log"
+    },
+    {
+      "name": "verified_retirement_never_borrows_rejected_ambiguous_or_changed_sources",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 48,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::verified_retirement_never_borrows_rejected_ambiguous_or_changed_sources",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::verified_retirement_never_borrows_rejected_ambiguous_or_changed_sources",
+      "stdout": "verified_retirement_never_borrows_rejected_ambiguous_or_changed_sources.log",
+      "stderr": "verified_retirement_never_borrows_rejected_ambiguous_or_changed_sources.stderr.log"
+    },
+    {
+      "name": "closed_retirement_history_still_requires_exact_proof_and_scope",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 49,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+      "stdout": "closed_retirement_history_still_requires_exact_proof_and_scope.log",
+      "stderr": "closed_retirement_history_still_requires_exact_proof_and_scope.stderr.log"
+    },
+    {
+      "name": "verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 50,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+      "stdout": "verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof.log",
+      "stderr": "verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof.stderr.log"
+    },
+    {
+      "name": "retirement_witness_binds_canonical_metadata_and_issuer_separately",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 51,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::retirement_witness_binds_canonical_metadata_and_issuer_separately",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::retirement_witness_binds_canonical_metadata_and_issuer_separately",
+      "stdout": "retirement_witness_binds_canonical_metadata_and_issuer_separately.log",
+      "stderr": "retirement_witness_binds_canonical_metadata_and_issuer_separately.stderr.log"
+    },
+    {
+      "name": "verified_terminal_retirement_preserves_exact_ended_and_archived_sources",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 52,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "app::shared_views::tests::startup_admission::verified_terminal_retirement_preserves_exact_ended_and_archived_sources",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "app::shared_views::tests::startup_admission::verified_terminal_retirement_preserves_exact_ended_and_archived_sources",
+      "stdout": "verified_terminal_retirement_preserves_exact_ended_and_archived_sources.log",
+      "stderr": "verified_terminal_retirement_preserves_exact_ended_and_archived_sources.stderr.log"
+    },
+    {
+      "name": "migration_session_inventory_budget_spans_windows_and_precedes_json_decode",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 53,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "persistence::tests::migration_session_inventory_budget_spans_windows_and_precedes_json_decode",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "persistence::tests::migration_session_inventory_budget_spans_windows_and_precedes_json_decode",
+      "stdout": "migration_session_inventory_budget_spans_windows_and_precedes_json_decode.log",
+      "stderr": "migration_session_inventory_budget_spans_windows_and_precedes_json_decode.stderr.log"
+    },
+    {
+      "name": "systemd_scope_preserves_environment_arguments_and_isolates_cgroup",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 54,
+      "argv": [
+        "$SELECTED_UI_TEST",
+        "--exact",
+        "terminal::hosted::tests::systemd_scope_preserves_environment_arguments_and_isolates_cgroup",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "selector": "terminal::hosted::tests::systemd_scope_preserves_environment_arguments_and_isolates_cgroup",
+      "stdout": "systemd_scope_preserves_environment_arguments_and_isolates_cgroup.log",
+      "stderr": "systemd_scope_preserves_environment_arguments_and_isolates_cgroup.stderr.log"
+    },
+    {
+      "name": "cli-check",
+      "origin": "retained_cli_host",
+      "old_original_index": 55,
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "selector": null,
+      "stdout": "cli-check.log",
+      "stderr": "cli-check.stderr.log"
+    },
+    {
+      "name": "host-check",
+      "origin": "retained_cli_host",
+      "old_original_index": 56,
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--bin",
+        "cagentsd"
+      ],
+      "selector": null,
+      "stdout": "host-check.log",
+      "stderr": "host-check.stderr.log"
+    },
+    {
+      "name": "cli-all-targets-suite",
+      "origin": "retained_cli_host",
+      "old_original_index": 57,
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--all-targets",
+        "--",
+        "--test-threads=1"
+      ],
+      "selector": null,
+      "stdout": "cli-all-targets-suite.log",
+      "stderr": "cli-all-targets-suite.stderr.log"
+    },
+    {
+      "name": "host-helper-build",
+      "origin": "retained_cli_host",
+      "old_original_index": 58,
+      "argv": [
+        "cargo",
+        "build",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--bin",
+        "cagentsd",
+        "--message-format=json"
+      ],
+      "selector": null,
+      "stdout": "host-helper-build.jsonl",
+      "stderr": "host-helper-build.stderr.log"
+    },
+    {
+      "name": "host-all-targets-suite",
+      "origin": "retained_cli_host",
+      "old_original_index": 59,
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--all-targets",
+        "--",
+        "--test-threads=1"
+      ],
+      "selector": null,
+      "stdout": "host-all-targets-suite.log",
+      "stderr": "host-all-targets-suite.stderr.log"
+    },
+    {
+      "name": "ui-all-targets-suite",
+      "origin": "fresh_ui_and_native",
+      "old_original_index": 60,
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--all-targets",
+        "--",
+        "--test-threads=1"
+      ],
+      "selector": null,
+      "stdout": "ui-all-targets-suite.log",
+      "stderr": "ui-all-targets-suite.stderr.log"
+    }
+  ],
+  "fresh_order": [
+    "atspi-disabled-state-tests",
+    "ui-check",
+    "ui-all-targets-compile",
+    "active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+    "hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+    "ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+    "ranked_snapshot_retires_verified_pane_behind_newer_metadata",
+    "ranked_snapshot_and_late_create_echo_preserve_closed_durable_denial",
+    "mixed_scope_verified_retirement_preserves_runtime_only_managed_images",
+    "quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+    "ordinary_closed_retained_chat_history_and_same_process_reopen_dispatch_only_the_explicit_resume",
+    "keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click",
+    "saved_pane_check_results_survive_transport_recovery_and_follow_the_current_source",
+    "quarantined_pane_removal_restores_the_surviving_native_control",
+    "peer_remove_retains_ready_image_only_mounted_and_parked_drafts_after_writer_reopen",
+    "ready_image_only_alias_blocks_canonical_adoption",
+    "ready_image_only_canonical_destination_refuses_draft_rekey",
+    "history_browsing_preserves_unsent_image_stash_without_treating_sent_images_as_local_work",
+    "explicit_image_removal_and_local_close_keep_their_discard_semantics",
+    "pending_images_and_text_remain_local_work_while_an_empty_draft_does_not",
+    "notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot",
+    "model_read_publishes_new_managed_chat_before_initialized_view_projection",
+    "create_publisher_keeps_the_complete_canonical_rank_response",
+    "delayed_rank_receipts_preserve_newer_metadata_and_do_not_revive_deleted_channels",
+    "provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure",
+    "provider_context_closed_widget_and_catalog_preserve_literal_body",
+    "provider_context_find_reveals_selected_scope_and_restores_disclosure",
+    "composer_attachment_tooltip_preserves_native_image_and_remove_ownership",
+    "recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers",
+    "file_row_discussion_tooltip_preserves_native_count_and_actions",
+    "rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+    "coherent_quarantine_still_isolates_refused_content_and_closed_tombstones",
+    "restored_terminal_quarantine_still_isolates_content_and_tombstone_refusals",
+    "a_rebased_quarantine_retains_its_exact_snapshot_across_writer_retries",
+    "runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+    "an_unstarted_chat_saves_new_launch_options_with_the_window",
+    "a_refused_pane_keeps_its_stored_content_while_the_window_saves",
+    "a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown",
+    "closing_a_card_drops_its_refused_relaunch",
+    "a_refused_card_is_named_with_its_remedy",
+    "a_draft_account_choice_survives_the_next_shared_projection",
+    "a_chat_handed_to_its_terminal_stays_a_terminal_after_the_next_shared_projection",
+    "a_chat_card_takes_a_new_conversation_only_through_its_replacement",
+    "ownership_recovery_rolls_back_the_transfer_when_the_full_snapshot_is_refused",
+    "history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+    "quarantined_terminal_restore_downgrades_remain_inert_after_reopen_and_autosave",
+    "terminal_handoff_flush_failure_keeps_all_receipts_pending",
+    "verified_retirement_survives_repeated_refresh_without_borrowing_metadata_sequence",
+    "verified_retirement_never_borrows_rejected_ambiguous_or_changed_sources",
+    "closed_retirement_history_still_requires_exact_proof_and_scope",
+    "verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+    "retirement_witness_binds_canonical_metadata_and_issuer_separately",
+    "verified_terminal_retirement_preserves_exact_ended_and_archived_sources",
+    "migration_session_inventory_budget_spans_windows_and_precedes_json_decode",
+    "systemd_scope_preserves_environment_arguments_and_isolates_cgroup",
+    "ui-all-targets-suite"
+  ],
+  "retained_order": [
+    "cli-check",
+    "host-check",
+    "cli-all-targets-suite",
+    "host-helper-build",
+    "host-all-targets-suite"
+  ],
+  "counts": {
+    "logical": 61,
+    "fresh": 56,
+    "retained": 5,
+    "focused_ui": 52,
+    "atspi_parents": 2,
+    "successor": 20,
+    "image_custody": 7
+  },
+  "owning_routes": {
+    "count_rule": "5upgrade+4context+6inherited old owning parents preserved; Linear6 assertions split4old+2fresh; all fresh exact parent/AT-SPI gates independently required, no child doublecount.",
+    "fresh_focused_only": {
+      "all52": "Actual controller exact selectors at dd6f held-scope.py:212-277; new UI compile binding required.",
+      "image_custody7": {
+        "explicit_image_removal_and_local_close_keep_their_discard_semantics": "app::chat_ui::image_only_peer_remove_tests::explicit_image_removal_and_local_close_keep_their_discard_semantics",
+        "history_browsing_preserves_unsent_image_stash_without_treating_sent_images_as_local_work": "app::chat_ui::image_only_peer_remove_tests::history_browsing_preserves_unsent_image_stash_without_treating_sent_images_as_local_work",
+        "mixed_scope_verified_retirement_preserves_runtime_only_managed_images": "app::shared_views::tests::startup_admission::mixed_scope_verified_retirement_preserves_runtime_only_managed_images",
+        "peer_remove_retains_ready_image_only_mounted_and_parked_drafts_after_writer_reopen": "app::chat_ui::image_only_peer_remove_tests::peer_remove_retains_ready_image_only_mounted_and_parked_drafts_after_writer_reopen",
+        "pending_images_and_text_remain_local_work_while_an_empty_draft_does_not": "app::chat_ui::image_only_peer_remove_tests::pending_images_and_text_remain_local_work_while_an_empty_draft_does_not",
+        "ready_image_only_alias_blocks_canonical_adoption": "app::chat_ui::image_only_peer_remove_tests::ready_image_only_alias_blocks_canonical_adoption",
+        "ready_image_only_canonical_destination_refuses_draft_rekey": "app::chat_ui::image_only_peer_remove_tests::ready_image_only_canonical_destination_refuses_draft_rekey"
+      },
+      "successor20": {
+        "a_chat_card_takes_a_new_conversation_only_through_its_replacement": "persistence::tests::a_chat_card_takes_a_new_conversation_only_through_its_replacement",
+        "a_chat_handed_to_its_terminal_stays_a_terminal_after_the_next_shared_projection": "app::shared_views::tests::published_card_edits::a_chat_handed_to_its_terminal_stays_a_terminal_after_the_next_shared_projection",
+        "a_draft_account_choice_survives_the_next_shared_projection": "app::shared_views::tests::published_card_edits::a_draft_account_choice_survives_the_next_shared_projection",
+        "a_rebased_quarantine_retains_its_exact_snapshot_across_writer_retries": "session::tests::a_rebased_quarantine_retains_its_exact_snapshot_across_writer_retries",
+        "a_refused_card_is_named_with_its_remedy": "app::tests::a_refused_card_is_named_with_its_remedy",
+        "a_refused_pane_keeps_its_stored_content_while_the_window_saves": "persistence::tests::a_refused_pane_keeps_its_stored_content_while_the_window_saves",
+        "a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown": "session::tests::a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown",
+        "an_unstarted_chat_saves_new_launch_options_with_the_window": "persistence::tests::an_unstarted_chat_saves_new_launch_options_with_the_window",
+        "closing_a_card_drops_its_refused_relaunch": "session::tests::closing_a_card_drops_its_refused_relaunch",
+        "coherent_quarantine_still_isolates_refused_content_and_closed_tombstones": "persistence::tests::coherent_quarantine_still_isolates_refused_content_and_closed_tombstones",
+        "composer_attachment_tooltip_preserves_native_image_and_remove_ownership": "app::chat_ui::view::tests::composer_attachment_tooltip_preserves_native_image_and_remove_ownership",
+        "file_row_discussion_tooltip_preserves_native_count_and_actions": "pull_request_review::discussion_ui::tests::file_row_discussion_tooltip_preserves_native_count_and_actions",
+        "history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata": "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+        "ownership_recovery_rolls_back_the_transfer_when_the_full_snapshot_is_refused": "persistence::tests::ownership_recovery_rolls_back_the_transfer_when_the_full_snapshot_is_refused",
+        "quarantined_terminal_restore_downgrades_remain_inert_after_reopen_and_autosave": "persistence::tests::quarantined_terminal_restore_downgrades_remain_inert_after_reopen_and_autosave",
+        "rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement": "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+        "recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers": "app::chat_ui::view::tests::recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers",
+        "restored_terminal_quarantine_still_isolates_content_and_tombstone_refusals": "persistence::tests::restored_terminal_quarantine_still_isolates_content_and_tombstone_refusals",
+        "runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat": "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+        "terminal_handoff_flush_failure_keeps_all_receipts_pending": "app::tests::terminal_handoff_flush_failure_keeps_all_receipts_pending"
+      }
+    },
+    "fresh_ui_all_targets": {
+      "linear2": [
+        "linear::api::tests::environment_overrides_keyring_and_keyring_works_without_environment",
+        "linear::api::tests::invalid_environment_encoding_refuses_before_keyring_without_exposing_the_key"
+      ]
+    },
+    "retained_cli_all_targets": {
+      "inherited2": [
+        "control::tests::terminal_close_keeps_confirmed_completion_when_detach_connection_ends",
+        "control::tests::terminal_close_preserves_unconfirmed_outcomes_and_other_detach_errors"
+      ],
+      "linear2": [
+        "linear::api::tests::environment_overrides_keyring_and_keyring_works_without_environment",
+        "linear::api::tests::invalid_environment_encoding_refuses_before_keyring_without_exposing_the_key"
+      ]
+    },
+    "retained_host_all_targets": {
+      "context4": [
+        "chat::runtime::store::text_copy::tests::provider_context_copy_reads_unloaded_body_and_revokes_stale_authority",
+        "chat::runtime::child_text_copy::tests::provider_context_copy_keeps_child_identity_and_rejects_rewrite_trim_and_user_notice",
+        "chat::protocol::claude::tests::synthetic_context_live_preserves_skill_calls_results_and_user_quotes",
+        "chat::protocol::claude::tests::synthetic_context_history_preserves_opaque_context_without_rewriting_source"
+      ],
+      "inherited4": [
+        "host::client::tests::agent_close_reply_drains_before_ordinary_exit_seals_delivery",
+        "host::chat::capacity::tests::recovery_reservation_counts_existing_resident_once_above_lowered_limit",
+        "host::chat::retained_actor_tests::pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown",
+        "host::chat::retained_admission_tests::installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry"
+      ],
+      "linear2": [
+        "linear::api::tests::environment_overrides_keyring_and_keyring_works_without_environment",
+        "linear::api::tests::invalid_environment_encoding_refuses_before_keyring_without_exposing_the_key"
+      ],
+      "upgrade5": [
+        "host::state::tests::upgrade_commit_failure_preserves_live_control_authority",
+        "host::state::tests::upgrade_rejects_stale_inventory_and_pending_reservations_without_shutdown",
+        "host::state::tests::committed_upgrade_fences_control_and_retains_checkpoint_until_close",
+        "host::state::tests::a_handoff_no_window_can_still_save_stops_refusing_the_upgrade",
+        "host::state::tests::restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint"
+      ]
+    }
+  },
+  "atspi_parents": [
+    "node::disabled_state_tests::disabled_action_controls_do_not_advertise_enabled_or_sensitive",
+    "node::disabled_state_tests::read_only_text_state_behavior_is_preserved"
+  ],
+  "native_verifier": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/verify-native-inspections-tooltip-coherence-v11.py",
+    "sha256": "07107b6a18702d96906b060f4d7f7bef1d9260977778424da4a3c2c64d78507e",
+    "bytes": 94522
+  },
+  "acceptance_identity": {
+    "decision": "ACTUAL_COMPLETED_C_RETURN_ACCEPTED",
+    "allocation": "6e4acf9b-5f2a-4ed5-8556-0377e4fc70a2",
+    "run": 41071089029,
+    "attempt": 1,
+    "job": 124115086503,
+    "executor": "15d9368d-fe36-405f-831f-3f2c680da354",
+    "return_message": "81363c94-fab7-4afe-9c3d-5dde2f0e7495",
+    "acceptor_lineage": "ec204421-6a6d-4edc-a23d-c8f8fc1b5ab1",
+    "acceptance_message": "1ae8310c-82ad-4f24-b795-0414b7ed0b3e"
+  },
+  "future_bundle_contract": {
+    "kind": "independently-reviewed-two-origin-actual-bindings-v12r2",
+    "decision": "ACCEPTED_FOR_READ_ONLY_INSPECTION",
+    "trusted_sha256": "Supplied independently at invocation; never inferred from a bundle self-declaration. The independent source review must bind checker source hash.",
+    "required_keys": [
+      "kind",
+      "decision",
+      "checker_sha256",
+      "plan_sha256",
+      "native_verifier_sha256",
+      "fresh"
+    ],
+    "fresh_required_keys": [
+      "root",
+      "run",
+      "attempt",
+      "job",
+      "artifact_id",
+      "artifact_name",
+      "download",
+      "whole_terminal",
+      "terminal_run",
+      "terminal_job",
+      "terminal_evidence"
+    ],
+    "reference_shape": {
+      "path": "Absolute canonical regular file with no symlink component",
+      "sha256": "Exact externally reviewed lowercase SHA256",
+      "bytes": "Actual length"
+    },
+    "actual_data_rule": "Populate only from future official original final download and whole-terminal collection after the job is terminal; plan remains unchanged. No future packet exists at source-freeze.",
+    "terminal_evidence": "Exactly null for the unchanged complete-API route; otherwise a required exact external {path,sha256,bytes} sole RAW reference only when metadata is missing/stale. No ignored extra official endpoint metadata, artifact self-declaration or future facts."
+  },
+  "qualification_scope": "61 logical contracts only: 56 actual fresh UI commands plus 5 functional retained CLI/HOST commands. Native only from fresh origin. Independent UX review, sole RAW, CI/merge gates and resource authority remain external. No grant, lease, release, availability or final-head CLI/HOST execution claim.",
+  "terminal_evidence_contract": {
+    "kind": "Bounded original terminal API-or-external-RAW evidence contract v12",
+    "design_reference": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/b3e14c-terminal-evidence-alternative-design-v12.json",
+      "sha256": "cd368a09a126fd157c29ca659611e454016e9eebbf2f1dccc05099015d35487d",
+      "bytes": 19438
+    },
+    "mandatory_format_addendum": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/b3e14c-terminal-evidence-alternative-design-v12-format-addendum-v1.json",
+      "sha256": "8aa2939f69de5f9367eba55a643e84a70a72a47411b6d47981734cded3b83a63",
+      "bytes": 6484
+    },
+    "focused_test_design": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/b3e14c-terminal-evidence-focused-test-design-v12.json",
+      "sha256": "5d719be8282f13df3188f837f29b87bc61109a53796cce05bd3826f6dde7da74",
+      "bytes": 12389
+    },
+    "phase_group_headers": {
+      "user_guard": "##[group]Run test \"$RUNNER_ENVIRONMENT\" = github-hosted",
+      "cache_gate": "##[group]Run python3 control/.github/qualification/cache-restore-gate.py \"$GITHUB_WORKSPACE/product\"",
+      "focus": "##[group]Run python3 control/.github/qualification/held-scope.py \"$GITHUB_WORKSPACE/product\" \"$GITHUB_WORKSPACE/control\" --focused-only",
+      "native": "##[group]Run xvfb-run --auto-servernum --server-args=\"-screen 0 1280x800x24 -nolisten tcp -dpi 96\" dbus-run-session -- /usr/bin/python3 control/.github/qualification/native-driver.py \"$GITHUB_WORKSPACE/control\" \"$GITHUB_WORKSPACE/before\" \"$GITHUB_WORKSPACE/product\" \"$GITHUB_WORKSPACE/before-main\" \"$GITHUB_WORKSPACE/before-image\"",
+      "native_upload": "##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+      "ui_broad": "##[group]Run test -f \"$QUALIFICATION_EVIDENCE/native/cleanup-complete\"",
+      "checksums": "##[group]Run if [ -d \"$QUALIFICATION_EVIDENCE\" ]; then",
+      "final_upload": "##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+    },
+    "phase_literals": {
+      "user_guard": [
+        "RUNNER_ENVIRONMENT",
+        "github-hosted",
+        "CAGENTS_AGENT_AUTHORITY"
+      ],
+      "cache_gate": [
+        "control/.github/qualification/cache-restore-gate.py"
+      ],
+      "focus": [
+        "control/.github/qualification/held-scope.py",
+        "--focused-only"
+      ],
+      "native": [
+        "xvfb-run",
+        "control/.github/qualification/native-driver.py"
+      ],
+      "native_upload": [],
+      "ui_broad": [
+        "native/cleanup-complete",
+        "cleanup.json",
+        "control/.github/qualification/held-scope.py",
+        "--ui-suites-only"
+      ],
+      "checksums": [
+        "find . -type f",
+        "sha256sum",
+        "sha256.txt"
+      ],
+      "final_upload": []
+    },
+    "cache_condition": "        if: always() && steps.cache.outcome == 'success' && steps.warm_cache.outcome == 'success' && steps.native.outcome == 'skipped'",
+    "cache_prefix": "held1922-Linux-X64-rust193-bca4125b50134707a8afdb92ce04572c6ca6b3d3e43d177c5c679cecbc89c91b-",
+    "cache_gate_sha256": "3e06d35461148ca7fd32d9240dffbc4d9e1ba304e9feda7ba8990248acbcd281",
+    "known_runner_warning_bodies": [
+      "##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830, actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683, actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+      "##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830, actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830, actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683, actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/"
+    ],
+    "route_scope": "Terminal eligibility only. Missing/stale API rows remain unchanged; explicit failures veto. Source-inferred cache inapplicability is distinct from observed runner execution. Full56+5/native/ZIP/source/custody/authority and external actual return/UX gates remain.",
+    "future_actual_evidence": null,
+    "post_command_bodies": [
+      "[command]/usr/bin/git config --local --name-only --get-regexp core\\.sshCommand",
+      "[command]/usr/bin/git submodule foreach --recursive sh -c \"git config --local --name-only --get-regexp 'core\\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\"",
+      "[command]/usr/bin/git config --local --name-only --get-regexp http\\.https\\:\\/\\/github\\.com\\/\\.extraheader",
+      "[command]/usr/bin/git submodule foreach --recursive sh -c \"git config --local --name-only --get-regexp 'http\\.https\\:\\/\\/github\\.com\\/\\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+    ]
+  }
+}

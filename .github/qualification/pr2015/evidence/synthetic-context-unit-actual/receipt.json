@@ -1,0 +1,42 @@
+{
+  "kind": "ACTUAL_BOUNDED_SYNTHETIC_HOSTED_CONTEXT_UNIT_TEST_ONLY",
+  "started_utc": "2026-10-30T21:25:15.647047+00:00",
+  "finished_utc": "2026-10-30T21:25:15.746601+00:00",
+  "elapsed_seconds": 0.0974743909901008,
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-hosted-attempt1-control",
+  "head": "143555931ca118d023b6ddeb8b7071f8bde5d98c",
+  "tree": "730a4787d4f3d9c18dffd602212dd7b87d8cce7b",
+  "argv": [
+    "python3",
+    "-B",
+    ".github/qualification/pr2015/test-original-attempt-context.py",
+    "-v"
+  ],
+  "original_exit": 0,
+  "actual_stdout_bytes": 0,
+  "actual_stderr_bytes": 734,
+  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "stderr_sha256": "a817992c43993ea0c3ed95ebb44f3f33a4f63f9e0a7020aed73e1dab03c5cea7",
+  "original_stdout": "/tmp/fw16-issue2015-attempt1-pure-unit-actual-ew1z_qhd/stdout.log",
+  "original_stderr": "/tmp/fw16-issue2015-attempt1-pure-unit-actual-ew1z_qhd/stderr.log",
+  "freeze": {
+    "path": "/tmp/issue2015-hosted-attempt1-source-freeze-v2.json",
+    "sha256": "2bd0c301526fd9b9190518f1f4c1a3afc800bcffc25c87e7739ba4809928109a"
+  },
+  "independent_source_reviews": {
+    "/tmp/fw16-issue2015-hosted-attempt1-14355593-scoped-source-CLEAR.json": "bca2054a85b241763e071074b2354714f3b85e1de8a193f85b11c5edb889c178",
+    "/tmp/issue2015-hosted-attempt1-runner-independent-source-review-v2.json": "eb6fe78ace86e9e760544bb6a37d587ef33805c39ddd97f0b1c7efb66a356e2e"
+  },
+  "all42_source_members_before_after_unchanged": true,
+  "scope": "Four actual unittest parent methods,17 nested synthetic context subcases nonadditive. Only AST-extracted hosted_context function bodies under separate fake dictionary/MemoryPath; no controller entry or product/harness/guard-as-real-admission execution. No real environment/authority read, modification, copy or stripping; ordinary inherited environment unchanged.",
+  "not_evidence_of": [
+    "actual hosted User provenance",
+    "actual once-only scheduling or C authority",
+    "cache visibility or payload",
+    "Cargo/tool/product build/test",
+    "installer/host/provider/native acceptance",
+    "original or future C return/availability",
+    "PR readiness/mergeability or productive token uplift"
+  ],
+  "old_v1": "Independent source HOLD preserved; no old-source unit wrapper executed or negative reclassification"
+}

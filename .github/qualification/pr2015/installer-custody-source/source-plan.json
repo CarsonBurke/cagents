@@ -1,0 +1,206 @@
+{
+  "kind": "READ_ONLY_FINITE_INSTALLER_SUCCESSOR_SOURCE_PLAN_NOT_IMPLEMENTATION_REVIEW_OR_GRANT",
+  "created_utc": "2026-10-31T17:58:19.714064+00:00",
+  "verdict": "SOURCE_INPUTS_AVAILABLE; narrow installer-only custody successor is feasible using existing interfaces. Actual implementation/review/cache/fixture/hosted qualification remain future gates.",
+  "scope": "Next installer task only, not re-review of source-clear producer. Port canonical9004 and robust exception/ordinary-negative-return custody retention to the original ten-phase/five-parent installer controller; preserve genuine warm restore/no cold fallback/no save and existing caller/fixture boundaries.",
+  "identities": {
+    "observed_source_control": "26603cdeb870a571a95f0516bde52b2b2717be33",
+    "observed_source_tree": "66cfade901bd232f81b90f58a83656b7d48fe8a1",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1921-cli-cache-producer-enumeration",
+    "immutable_original_control": "ac4bbf446957317d022a987e20887af4b3f70481",
+    "immutable_original_tree": "080df4b11b539f89def8207db283f052df2bca18",
+    "prospective_current_product": "375c37ff01aab0b226c58f547012af74e93a8643",
+    "prospective_current_product_tree": "acb2cc6e049562469643e49a1ee5f7abc179c28b",
+    "product_scope_note": "375 is the available current binding; actual future task must freeze its chosen product explicitly. Same17 bytes do not retarget historical6dc records."
+  },
+  "original_exact_source_pins": [
+    {
+      "path": ".github/qualification/pr2015/run-packet.py",
+      "blob": "21abf34a7f38dcbb4ccd08e80e4d95e8bcc329b1",
+      "sha256": "1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20",
+      "bytes": 62066
+    },
+    {
+      "path": ".github/qualification/pr2015/plan.json",
+      "blob": "6222907cb69dbf7b978de7501115362436c51691",
+      "sha256": "b617f0a06e4548b5157acc28fba52bec7d10a76484554b27d1187a491a97dbdb",
+      "bytes": 32449
+    },
+    {
+      "path": ".github/qualification/pr2015/manifest.json",
+      "blob": "8aa8243c3fab0a56a604eb7983d9ed26e91ba18e",
+      "sha256": "ce9a12cb0dd3c41e5f254851aa79d779c0bfc238c67d83ff6ea88e2953d25a22",
+      "bytes": 19645
+    },
+    {
+      "path": ".github/qualification/pr2015/source-review-binding.json",
+      "blob": "4b21bca9ad74c8ce2d7f698f92a5ea77a826844d",
+      "sha256": "137abfaddf843a76597c03d7f9b0f10405ce732393d91d2f6d8958f5d21b3e87",
+      "bytes": 1281
+    },
+    {
+      "path": ".github/qualification/pr2015/cache-restore-gate.py",
+      "blob": "a1c5e5471976941d827e5c91377f2b9dee9aa972",
+      "sha256": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
+      "bytes": 14139
+    }
+  ],
+  "original_case": {
+    "path": ".github/qualification/pr2015/case.json",
+    "blob": "5f0219be245078658017ad0beb9491b756aaa692",
+    "sha256": "9af20ec84ffb12ac682df8cf8767d670cf25a9b9f2970bc248ab8f8833ec103f",
+    "bytes": 2943
+  },
+  "original_case_archived_exact_at_current": ".github/qualification/pr2015/lineage/installer2015-case-ac4.json",
+  "canonical": {
+    "path": ".github/qualification/pr2015/cli-cache-producer-source/canonical_function.py",
+    "blob": "fd31b863db8bb4ef36c3a328624e9f02e87884fa",
+    "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "bytes": 877
+  },
+  "original_function_pins": {
+    "settle_children": {
+      "line": 220,
+      "end_line": 264,
+      "sha256_lines_including_final_newline": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b"
+    },
+    "execute_contracts": {
+      "line": 410,
+      "end_line": 448,
+      "sha256_lines_including_final_newline": "11a3da9e934474392175d2298456ac3792ca1cfeba723a89a236a40e0e1a967b"
+    },
+    "safe_lane_handoff": {
+      "line": 457,
+      "end_line": 473,
+      "sha256_lines_including_final_newline": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329"
+    },
+    "parent_accounting": {
+      "line": 476,
+      "end_line": 520,
+      "sha256_lines_including_final_newline": "790f4874837914d32eb67e9347c3681e2061b9180d6d65cace368a4466ce7d22"
+    },
+    "final_observations": {
+      "line": 523,
+      "end_line": 547,
+      "sha256_lines_including_final_newline": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a"
+    },
+    "retain_uncertain_lane": {
+      "line": 561,
+      "end_line": 580,
+      "sha256_lines_including_final_newline": "5e7d6f0627744c5c5ce5bc13190822f99b61361c9fd55c3913a8b674d2a344c9"
+    },
+    "hosted_context": {
+      "line": 591,
+      "end_line": 628,
+      "sha256_lines_including_final_newline": "7d608c3c8fedf183bd3cbf01aefecd516c474729b2ae0a1a2eef07ba56988cb0"
+    },
+    "materialize_plan": {
+      "line": 631,
+      "end_line": 680,
+      "sha256_lines_including_final_newline": "7276b8aa16c20fd61cc9eaf5aaa0d1c7df92e8911ae72922686f9984bdc801b0"
+    },
+    "main": {
+      "line": 683,
+      "end_line": 1034,
+      "sha256_lines_including_final_newline": "bcfdac9ccd9b8d48acb1e02909fbbeffedb56ee7b8bfb156a93cc231b7cf39f5"
+    }
+  },
+  "minimal_recommended_task_shape": [
+    {
+      "step": 1,
+      "action": "Use a separate installer successor branch/task only after Root ownership coordination and applicable producer progress; do not edit/publish while the current original producer allocation is active. Keep all ac4/26603 immutable references and original41136465523 attempt1 cache-miss negative. No automatic producer-to-installer chain."
+    },
+    {
+      "step": 2,
+      "action": "Prefer new installer-specific runner/plan/command-manifest/source-binding paths copied from ac4, for example installer-custody-runner.py, installer-custody-plan.json, installer-custody-manifest.json and installer-custody-source-binding.json under the same pr2015 directory. This keeps original run-packet.py/plan/manifest/source-review-binding and the frozen producer archive references byte-exact; it adds no generic engine or new transport. Existing shared case/selector/workflow installer references route only the new task. An in-place port would also invalidate the producer plan archive reference to original-hosted-driver.py and needs extra truthful archival repinning, so it is not the smallest conservation surface."
+    },
+    {
+      "step": 3,
+      "action": "In the copied installer runner replace ONLY old settle_children220-264 (8cb801...) with exact canonical9004. Preserve its3s natural observation and leave unproven adopted survivors unsignaled under existing HOLD. Keep original direct-Popen held-pidfd TERM/wait3s and KILL/wait3s behavior; do not copy the old fresh adopted-pidfd SIGKILL loop."
+    },
+    {
+      "step": 4,
+      "action": "Port only the proven task-local ownership wrapper pattern: EVIDENCE_OUT, OWNERSHIP_INITIALIZED and actual shared PROCESS_PHASES; rename owning main to installer_main; initialize save location/handlers/subreaper before first source child; outer main catches all post-ownership exceptions, performs two natural observations and unchanged safe_lane_handoff, catches emergency-write/assessment failures and enters existing retain_uncertain_lane on unknown. Protect original prelease failure/baseline writes. At old main974 require retention for every unconfirmed handoff independently of acquired; this covers normal failed-acquisition status1 returns. Preserve original close-once/no LOCK_UN and ambiguous-close behavior. Do not import producer3-phase/zero-parent executor or producer target/tool initialization."
+    },
+    {
+      "step": 5,
+      "action": "Keep execute_contracts410-448, parent_accounting476-520, cargo_test_artifacts/ELF/inventory/parent_pass, safe_lane_handoff, final_observations and strict source/Git guards exact. The installer still has10 serial phases and5 distinct parents, fresh full inventories36/11, exact singleton1P0F0I0M/N-1 and the source-pinned refusal diagnostic exception. Reuse existing cache-gate physical tool receipts; materialize_plan631-680 may remain byte-exact if the new plan supplies its existing ABI. No producer_tools/raw-return/fresh mkdir/warm-receipt fabrication is needed."
+    },
+    {
+      "step": 6,
+      "action": "For product375 explicitly update copied PLAN/PLAN_SHA/runner path and hosted_context hardcoded product tuple, new plan product/controller-review contract, new command manifest product identity and author source-binding identity. All17 recorded source bytes match375 already, but the original manifest/binding still declare6dc and remain historical. Obtain genuine fresh independent installer controller/code and current command-data/conservation review; producer0-parent review cannot approve5 installer parents. Keep authored binding labelled non-independent, not a fabricated clear receipt."
+    },
+    {
+      "step": 7,
+      "action": "Change only shared case/selector installer branch/workflow installer references needed for exact chosen product, new runner/plan/manifest and genuine installer review. Current selector59-61 and workflow605 still pin6dc; selector122 hardcodes old manifest, workflow664-668 old runner/review. Retain case ID installer2015 and existing authentic same-repository/head-ref/original-attempt/event checks; freeze the actual allowed future carrier/action rather than inventing rerun/dispatch. Refresh dependent case/selector/checksum fields accurately. Producer and legacy heavy jobs must be deselected/skipped, no new case/job/framework is necessary."
+    },
+    {
+      "step": 8,
+      "action": "Retain cache-restore-gate.py exactf184, restore action/key/prefix/orderedpaths and original no-start/no-target-creation/no-cold-fallback/no-save installer semantics. Warm gate must independently accept the later actual restore before ANY Cargo (including version); gate success/actual payload remains required even after independently qualified save. Preserve finite step/job/whole-original-RAW scope. Source-only creation does not grant trigger publication or C."
+    }
+  ],
+  "plan_metadata_correction": "Copied bounded_failure_cleanup must remove the10s adopted-forced window and26s two-final-window claim, replacing them with two3s natural grace windows/unsignaled unknown HOLD; do not claim6s whole-finalization hard bound because source checks/IO and indefinite HOLD remain separate. Existing phase caps600/900/30/120 and shared2400 workload cap/ten-phase/five-parent budget remain unchanged unless separately reviewed.",
+  "parent_contract": {
+    "groups": [
+      {
+        "group": "installer_lifecycle_contract",
+        "inventory_N_source_predicted": 36,
+        "names": [
+          "fresh_install_uses_the_verified_archive_cli_and_matched_inspector",
+          "unsupported_installed_cli_uses_the_verified_archive_pair_without_external_forwarding",
+          "unsupported_coordinators_refuse_before_mutating_the_installation"
+        ]
+      },
+      {
+        "group": "installer_guard_contract",
+        "inventory_N_source_predicted": 11,
+        "names": [
+          "external_installer_saves_closes_and_reopens_windows_even_on_failure",
+          "inherited_fence_requires_exact_locked_description_and_closed_windows"
+        ]
+      }
+    ],
+    "phase_order": [
+      "cli-binary-check",
+      "compile-installer_lifecycle_contract",
+      "inventory-installer_lifecycle_contract",
+      "parent-installer_lifecycle_contract-1",
+      "parent-installer_lifecycle_contract-2",
+      "parent-installer_lifecycle_contract-3",
+      "compile-installer_guard_contract",
+      "inventory-installer_guard_contract",
+      "parent-installer_guard_contract-1",
+      "parent-installer_guard_contract-2"
+    ],
+    "phase_count": 10,
+    "outer_parents": 5,
+    "nonadditive": "Inline success/refusal pairs, guard seven cases, ignored coordinator guardian/lease helpers are not extra passes or selected owning parents. Preserve exact strict parser and original filtered-count rules.",
+    "scope": "Cargo-built CLI with controlled same-archive Python inspector/local archives, not real-HOST/native/provider or installed-product qualification."
+  },
+  "caller_and_fixture_gates": [
+    "Require genuine GitHub-hosted LinuxX64 User context with every inherited CAGENTS_ name absent; presence-only refusal remains before workload. Do not read/copy/scrub authority, synthesize User, alter account/HOME for controller admission or infer permission from engine flags alone. Original authenticated GitHub run/job/source/log/artifact RAW remains required.",
+    "The five selected parent source callgraphs preserve authority inheritance and declared private fixture HOME/XDG. Guard guardian copies only explicit command overrides/removals and inherits original caller unchanged at tests/installer_guard_contract.rs:251-277. No selected-parent rewrite is needed to make canonical custody work.",
+    "tests/support/user_fixture.rs contains an explicit env_clear synthetic User helper, but the only enter() call in this inspected guard file is at1377 under unselected staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner. It is not invoked by the five chosen parents and must not become a way to admit a delegated outer caller. Compilation of that helper is not invocation. Keep it and the tests byte-exact.",
+    "Current guarded source still includes source-pane/refused-inspector cause assertions. Keep no provider/production-daemon operations, no fixture bypass, no relaxed inspector-fence authority, and no stronger source/native role claim than these CLI fixtures establish."
+  ],
+  "conservation_expectations": [
+    "Freeze the actual successor head/tree, exact changed/new tracked paths and modes. For each source adaptation retain actual forward unified diff bytes and TRUE inverse diff bytes (or exact JSON-string payloads), not self-claimed hashes. Reconstruct old->new and new->old tracked entries/modes independently.",
+    "When using the recommended new paths, preserve all original ac4 installer files and26603 producer runner/plan/source/review/canonical bytes, original archived case and all history; shared case/selector/workflow/README changes plus new installer files are the finite allowlist. Outside it require exact entries/blobs/modes and a clean frozen tree.",
+    "For the new runner compare every copied function source body to ac4. Expected owning function deltas are settle_children, main->installer_main/wrapper and hosted_context product tuple for375; module path/hash/ownership constants are explicit. All other28 original top-level functions can remain exact. Document any additional required difference instead of silently widening scope.",
+    "All product tracked entries/modes remain untouched. Verify17 current source pins plus whole chosen HEAD/tree/clean source; preserve original test bodies/assertions/selectors/inventories/counts and fixture ownership.",
+    "Genuine new exact-runner/plan/product review is copied only after it exists; refresh final assembled bindings and independent wrapper/conservation review afterward. Source-clear producer receipts and old ac4 installer reviews remain their original scopes, not new installer approval."
+  ],
+  "remaining_prerequisites": [
+    "Applicable original producer/cache-save qualification and later actual independent installer restore/payload gate; none is inferred from preparation/source clear or key equality.",
+    "Root ownership coordination and fresh actual C before any publication triggering the selected heavy installer job; no autorun/queue/dispatch in this plan.",
+    "Actual new installer source with precise product/manifest/review bindings, independent semantic/conservation review and genuine copied receipt/final wrapper review.",
+    "Original ten-phase/five-parent run, complete job/post/stream/RAW custody and external return/acceptance, all still future."
+  ],
+  "missing_interface_or_policy_blocker": "No missing general supervisor/transport or repository-wide source-policy prohibition was established for this narrow successor. Existing helpers suffice. Current literal6dc bindings and absent genuine new installer review block running375 as-is; these require explicit new task artifacts, not policy weakening.",
+  "limits": {
+    "actions": "Source/Git reads and this task-owned /tmp receipt only; no imports/candidate execution/builds/tests/resources/cache/process/environment/account/DB probes, publication or children.",
+    "status": "Design feasibility only, not actual successor code-clear, cache/test/parent/native qualification or grant.",
+    "original_negative": "ac4/run41136465523 attempt1 cache-miss beforeCargo/five parentsUNRUN remains immutable; no force-branch/result history rewritten.",
+    "allocation": "Root supplied current producer C6d9398c7/B9worker21 context only; not measured or altered by this review."
+  }
+}

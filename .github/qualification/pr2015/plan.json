@@ -1,0 +1,519 @@
+{
+  "prepared_only": true,
+  "status": "HOSTED_SOURCE_PREPARED_PENDING_NEW_INDEPENDENT_REVIEW_AND_CACHE_ADMISSION_UNRUN",
+  "product_issue": 2015,
+  "product_head": "6dc09b9a1b5d205650e244401da0938b653d16da",
+  "product_tree": "aaab67a21378958066103707baf3abe8850577d6",
+  "worktree": "@product",
+  "runner_path": ".github/qualification/pr2015/run-packet.py",
+  "source_review": ".github/qualification/pr2015/source-review-binding.json",
+  "source_review_sha256": "137abfaddf843a76597c03d7f9b0f10405ce732393d91d2f6d8958f5d21b3e87",
+  "command_data": {
+    "path": ".github/qualification/pr2015/manifest.json",
+    "sha256": "ce9a12cb0dd3c41e5f254851aa79d779c0bfc238c67d83ff6ea88e2953d25a22"
+  },
+  "source_paths_sha256": {
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/companion.rs": "76d991bd5ff1cd73a4252d6f5961bc1b19e50b0936dc4d00b699fbf56d93af00",
+    "src/install_guard.rs": "b735f0b9564a0e7f4b90e496af57fe06319e07ee64477073a377f9517849356a",
+    "src/instance.rs": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+    "src/update.rs": "48a9c75b73a3948063f4fca76e0ecf3159e0065a3a9ab19d6d8749a8446eec55",
+    "src/app.rs": "c405ea52503acc5076a5e77d3bc81d5e9ab341b1a78e313147e9ca70dfc67e77",
+    "src/app/update_ui.rs": "5bae66ddb5fd6ef6bb50de4add827f5212e390aa8d0d495a1678b225e8748e2f",
+    "install.sh": "7b49493d90d0aeeb627b488c8c4fd372b005a038af83098860780b19c0134d07",
+    "tests/installer_lifecycle_contract.rs": "ca9bb7034feddd8f21f303dea1ebcab2125315d8bf66a52964fe66df4fe05dec",
+    "tests/installer_guard_contract.rs": "a4413f4a235ef796438d32fa538f0e1d46fa5221283a588e1f36aaac01d92a00",
+    "tests/support/user_fixture.rs": "a016d99771e4ffdd6d413fcb89a0671462c56dda32956e0b89c09bd50b848079"
+  },
+  "binary_checks": [
+    {
+      "label": "cli-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "seconds": 600
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "installer_lifecycle_contract",
+      "features": [],
+      "manifest": "Cargo.toml",
+      "target_kind": [
+        "test"
+      ],
+      "target_name": "installer_lifecycle_contract",
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_lifecycle_contract",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_full_names": [
+        "uninstall_accepts_current_and_legacy_cli_status_envelopes",
+        "uninstall_preserves_installation_when_daemon_status_is_untrusted",
+        "installer_entrypoints_refuse_inherited_callers_before_tools_or_purge",
+        "candidate_coordinator_supports_upgrading_an_older_installed_cli",
+        "fresh_install_uses_the_verified_archive_cli_and_matched_inspector",
+        "unsupported_installed_cli_uses_the_verified_archive_pair_without_external_forwarding",
+        "candidate_startup_lock_without_handshake_defers_to_the_verified_owner",
+        "unsupported_coordinators_refuse_before_mutating_the_installation",
+        "interrupting_the_outer_installer_waits_for_inner_rollback",
+        "rejected_outer_signal_injection_cannot_count_as_delivered",
+        "an_unconfirmed_update_cannot_interrupt_sessions_created_after_preflight",
+        "compatible_switch_preserves_terminals_without_any_shutdown_request",
+        "incompatible_install_defers_daemon_replacement_without_stopping_sessions",
+        "failed_compatible_switch_rolls_back_without_stopping_live_sessions",
+        "interrupted_switch_preserves_sessions_and_rolls_back_version",
+        "incompatible_empty_switch_failure_restarts_previous_version_once",
+        "explicit_restart_checkpoints_before_replacing_even_a_compatible_daemon",
+        "failed_checkpoint_preparation_preserves_old_installation_and_sessions",
+        "legacy_restart_refuses_without_checkpoint_or_shutdown",
+        "installer_passes_relaunch_acceptance_only_to_a_supporting_installed_cli",
+        "installer_passes_a_declined_relaunch_only_to_a_cli_that_would_otherwise_accept",
+        "checkpointed_publication_failure_restarts_previous_version_from_handoff",
+        "checkpointed_publication_interruption_restarts_previous_version_from_handoff",
+        "checkpointed_start_failure_restarts_previous_version_from_handoff",
+        "ambiguous_candidate_start_preserves_replacement_and_never_restarts_old_writer",
+        "interrupted_candidate_start_preserves_replacement_writer",
+        "restart_option_rejects_uninstall_and_extra_values_without_creating_installation",
+        "authenticated_private_release_resolves_and_downloads_with_existing_gh_account",
+        "authenticated_pinned_release_downloads_only_requested_tag",
+        "authenticated_download_failure_preserves_installation_without_public_fallback",
+        "public_release_download_works_without_an_authenticated_gh_account",
+        "private_authentication_failure_preserves_installation_without_anonymous_downloads",
+        "staging_preserves_daemons_and_rolls_back_publication_without_control_calls",
+        "staging_rejects_destructive_options_before_touching_installation",
+        "staging_keeps_both_trees_when_current_cannot_be_safely_rolled_back",
+        "staging_cannot_borrow_candidate_support_from_an_installed_coordinator"
+      ],
+      "source_predicted_ignored_names": [],
+      "source_predicted_full_test_count": 36,
+      "selectors": [
+        {
+          "name": "fresh_install_uses_the_verified_archive_cli_and_matched_inspector",
+          "source": "tests/installer_lifecycle_contract.rs",
+          "line": 1125,
+          "seconds": 120,
+          "expected_child_reexecutions": 0,
+          "expected_stdout_diagnostics": [],
+          "required_diagnostic_markers": []
+        },
+        {
+          "name": "unsupported_installed_cli_uses_the_verified_archive_pair_without_external_forwarding",
+          "source": "tests/installer_lifecycle_contract.rs",
+          "line": 1132,
+          "seconds": 120,
+          "expected_child_reexecutions": 0,
+          "expected_stdout_diagnostics": [],
+          "required_diagnostic_markers": []
+        },
+        {
+          "name": "unsupported_coordinators_refuse_before_mutating_the_installation",
+          "source": "tests/installer_lifecycle_contract.rs",
+          "line": 1144,
+          "seconds": 120,
+          "expected_child_reexecutions": 0,
+          "expected_stdout_diagnostics": [],
+          "required_diagnostic_markers": []
+        }
+      ]
+    },
+    {
+      "id": "installer_guard_contract",
+      "features": [],
+      "manifest": "Cargo.toml",
+      "target_kind": [
+        "test"
+      ],
+      "target_name": "installer_guard_contract",
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_guard_contract",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_full_names": [
+        "coordinator_fixture::guardian",
+        "coordinator_fixture::failed_readiness_deadline_and_leaked_installers_cannot_escape_custody_or_pass",
+        "coordinator_fixture::rejected_receipt_or_parent_retirement_retains_namespace_without_unwinding",
+        "staged_window_lease_fixture",
+        "external_installer_saves_closes_and_reopens_windows_even_on_failure",
+        "inherited_fence_requires_exact_locked_description_and_closed_windows",
+        "staging_never_contacts_or_reopens_live_windows_even_on_failure_or_cancel",
+        "staged_candidate_startup_authenticates_the_inherited_coordinator_fence",
+        "staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner",
+        "staged_native_ui_owner_fixture",
+        "sealed_anonymous_update_probe_does_not_require_installed_routing"
+      ],
+      "source_predicted_ignored_names": [
+        "coordinator_fixture::guardian"
+      ],
+      "source_predicted_full_test_count": 11,
+      "selectors": [
+        {
+          "name": "external_installer_saves_closes_and_reopens_windows_even_on_failure",
+          "source": "tests/installer_guard_contract.rs",
+          "line": 742,
+          "seconds": 120,
+          "expected_child_reexecutions": 0,
+          "expected_stdout_diagnostics": [
+            "inspector-refused",
+            "inspector-missing"
+          ],
+          "required_diagnostic_markers": [
+            "fixture source panes refused",
+            "The matched source inspector is unavailable",
+            "source windows remain usable",
+            "Reinstall the matched CLI and daemon together",
+            "(os error 2)"
+          ]
+        },
+        {
+          "name": "inherited_fence_requires_exact_locked_description_and_closed_windows",
+          "source": "tests/installer_guard_contract.rs",
+          "line": 1011,
+          "seconds": 120,
+          "expected_child_reexecutions": 0,
+          "expected_stdout_diagnostics": [],
+          "required_diagnostic_markers": []
+        }
+      ]
+    }
+  ],
+  "planned_phase_order": [
+    "cli-binary-check",
+    "compile-installer_lifecycle_contract",
+    "inventory-installer_lifecycle_contract",
+    "parent-installer_lifecycle_contract-1",
+    "parent-installer_lifecycle_contract-2",
+    "parent-installer_lifecycle_contract-3",
+    "compile-installer_guard_contract",
+    "inventory-installer_guard_contract",
+    "parent-installer_guard_contract-1",
+    "parent-installer_guard_contract-2"
+  ],
+  "planned_phase_count": 10,
+  "counts": {
+    "checks": 1,
+    "integration_compilations": 2,
+    "ELF_inventories": 2,
+    "qualifying_outer_parents": 5,
+    "unique_source_parents": 5,
+    "cli_assigned_outer_parents": 5,
+    "host_assigned_outer_parents": 0,
+    "ui_assigned_outer_parents": 0,
+    "expected_outer_stream_child_results": 0,
+    "total_phases": 10
+  },
+  "packet_deadline_seconds": 2400,
+  "lane": {
+    "target": "@restored-target",
+    "lock": "@hosted-job-custody-lock",
+    "jobs": 2,
+    "new_cache": false,
+    "scope": "Job-local owned custody fd only; actual global C remains external Root coordination, not proved or returned by this fd."
+  },
+  "physical_tool_bin": "@cache-gate-admitted-physical-toolbin",
+  "archive_bindings": [
+    {
+      "name": "lineage-local-e3-source-freeze.json",
+      "path": ".github/qualification/pr2015/lineage/local-e3-source-freeze.json",
+      "sha256": "4b1e22554562a4e12e83199541bd84dc09430ca16f85aebabb9164a982937905",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-main15-source-plan-v12r2.json",
+      "path": ".github/qualification/pr2015/lineage/main15/source-plan-v12r2.json",
+      "sha256": "a047be44fa464120b50b642fc68ba35e3103685c59c7a12b7c93eff7f61b3d28",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-main15-qualify-held-scope.yml",
+      "path": ".github/qualification/pr2015/lineage/main15/qualify-held-scope.yml",
+      "sha256": "c44afb360a5306da40b317bfdff9b39fded4b32018522d2165a2443b6944d8c7",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-main15-cache-restore-gate.py",
+      "path": ".github/qualification/pr2015/lineage/main15/cache-restore-gate.py",
+      "sha256": "3e06d35461148ca7fd32d9240dffbc4d9e1ba304e9feda7ba8990248acbcd281",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-run-packet.py",
+      "path": ".github/qualification/pr2015/lineage/local-e3/run-packet.py",
+      "sha256": "6fb2456472135952a7855dd1fb7f2089d9d9b8679ed23476a2626d0d063c351e",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-plan.json",
+      "path": ".github/qualification/pr2015/lineage/local-e3/plan.json",
+      "sha256": "43b2b230e45a1f1e8fe4b3b4736788bfa9f5b046e5b39353c82001c67a336314",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-source-review-binding.json",
+      "path": ".github/qualification/pr2015/lineage/local-e3/source-review-binding.json",
+      "sha256": "2fb1b8529ee45233741c49939564ebf6259eacb29e422eb4f1c0d3a01c6e380e",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-command-data-6dc.json",
+      "path": ".github/qualification/pr2015/lineage/local-e3/command-data-6dc.json",
+      "sha256": "e4dc07796afbbdbb40095128fdfcbdf24f7b3a1cfcbb60087060a9c1ec4f3938",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-SHA256SUMS",
+      "path": ".github/qualification/pr2015/lineage/local-e3/SHA256SUMS",
+      "sha256": "dca4b1a412382d09103606d274132d5ea1d15054687d2df1c37e3a65b68ab417",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-donor-diff.patch",
+      "path": ".github/qualification/pr2015/lineage/local-e3/donor-diff.patch",
+      "sha256": "46b5fd9a132edba3684959574175dc7679d00498e0b0373c69ad1bbe9b78cb50",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-source-ready.json",
+      "path": ".github/qualification/pr2015/lineage/local-e3/source-ready.json",
+      "sha256": "b4995b513f58997714c9d8fd215861241a32d43a6cb01359fa718568a04ec881",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-source-conservation.json",
+      "path": ".github/qualification/pr2015/lineage/local-e3/source-conservation.json",
+      "sha256": "f3c876c9e9121366739893822fceaeb65918b9412382fccb48f3e1079c7ba924",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-README.md",
+      "path": ".github/qualification/pr2015/lineage/local-e3/README.md",
+      "sha256": "25934c0e4cd79ea1a96f7603c0e372164838f1fe92ea795b68d7c04d7ad6077e",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-product-user_fixture.rs",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/product-user_fixture.rs",
+      "sha256": "a016d99771e4ffdd6d413fcb89a0671462c56dda32956e0b89c09bd50b848079",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-product-installer_guard_contract.rs",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/product-installer_guard_contract.rs",
+      "sha256": "a4413f4a235ef796438d32fa538f0e1d46fa5221283a588e1f36aaac01d92a00",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-product-installer_lifecycle_contract.rs",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/product-installer_lifecycle_contract.rs",
+      "sha256": "ca9bb7034feddd8f21f303dea1ebcab2125315d8bf66a52964fe66df4fe05dec",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-product-install_guard.rs",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/product-install_guard.rs",
+      "sha256": "b735f0b9564a0e7f4b90e496af57fe06319e07ee64477073a377f9517849356a",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-product-update.rs",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/product-update.rs",
+      "sha256": "48a9c75b73a3948063f4fca76e0ecf3159e0065a3a9ab19d6d8749a8446eec55",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-product-install.sh",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/product-install.sh",
+      "sha256": "7b49493d90d0aeeb627b488c8c4fd372b005a038af83098860780b19c0134d07",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-historical-git-guard-HOLD.json",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/historical-git-guard-HOLD.json",
+      "sha256": "72b0db3ab2695e81d3acba9d14b216403a4971d482ab91013b8ed98c4863a83d",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-git-policy-source.py",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/git-policy-source.py",
+      "sha256": "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-donor-controller-source-review.json",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/donor-controller-source-review.json",
+      "sha256": "276aa51159c327c96fb5f978211e18f3186eeb3a639638d432d115201f2d32dc",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-donor-plan.json",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/donor-plan.json",
+      "sha256": "18c66b50a740e4c71999d03bec40954cba04d91b079cfd1a3b78230f32183e7c",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-donor-run-packet.py",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/donor-run-packet.py",
+      "sha256": "ce724709493e94e5514fec52c4c02f596fad40be2846d96172f2502b48a703a8",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-cause-guard-correction-freeze.json",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/cause-guard-correction-freeze.json",
+      "sha256": "9b3bb550982922098cb15695a60a30251374eadbf52ec22c421c70901f59ab33",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-command-data-independent-review.md",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/command-data-independent-review.md",
+      "sha256": "b8298607a7932d0da9f2175e6a4feeb4b4f867ac65cddb8dd3cedaf1f961f928",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "lineage-local-e3-dependencies-historical-command-data-5a4.json",
+      "path": ".github/qualification/pr2015/lineage/local-e3/dependencies/historical-command-data-5a4.json",
+      "sha256": "feb23120adabb815ba07c657d0eade56499a78fa38fcd5f264b6c5fdb80e80db",
+      "interpretation": "Historical source provenance only; nested Root-local paths remain archived text and are never runtime routing. No pass/authority transfer."
+    },
+    {
+      "name": "source-review-binding.json",
+      "path": ".github/qualification/pr2015/source-review-binding.json",
+      "sha256": "137abfaddf843a76597c03d7f9b0f10405ce732393d91d2f6d8958f5d21b3e87",
+      "interpretation": "Exact hosted source/data dependency."
+    },
+    {
+      "name": "manifest.json",
+      "path": ".github/qualification/pr2015/manifest.json",
+      "sha256": "ce9a12cb0dd3c41e5f254851aa79d779c0bfc238c67d83ff6ea88e2953d25a22",
+      "interpretation": "Exact hosted source/data dependency."
+    },
+    {
+      "name": "cache-restore-gate.py",
+      "path": ".github/qualification/pr2015/cache-restore-gate.py",
+      "sha256": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
+      "interpretation": "Exact hosted source/data dependency."
+    }
+  ],
+  "environment": "Natural GitHub-hosted User account/auth/environment/policy retained; reject every inherited CAGENTS_ name by presence, without reading values or stripping. Only reviewed Rust/compiler target/jobs/physical tool overrides. Fixture-owned HOME/XDG changes stay in test source.",
+  "natural_caller_precondition": "Authentic original hosted run is required, with empty inherited CAGENTS name set and pinned same-repository PR1921 source. Environment flags are checked but are not independent authenticated provenance; RAW must bind actual GitHub run/job/event/code/log artifacts.",
+  "fixture_contract": {
+    "scope": "CLI installer regression only. Actual Cargo-built CLI from CARGO_BIN_EXE_cagents with controlled same-archive Python inspector and local archives. No production HOST inspector/daemon/native/provider qualification.",
+    "outer_parents": 5,
+    "lifecycle_assigned": 3,
+    "guard_assigned": 2,
+    "source_predicted_full_inventory": {
+      "installer_lifecycle_contract": 36,
+      "installer_guard_contract": 11
+    },
+    "ignored_guardian": "coordinator_fixture::guardian is present in guard inventory but never selected as an owning parent.",
+    "nested_helpers": "Guardian/lease processes and success/refusal inline cases are nonadditive. Their own source assertions/receipts remain operative; no extra controller pass is awarded.",
+    "diagnostic_stdout": "Only external_installer_saves_closes_and_reopens_windows_even_on_failure emits the two source-pinned refusal diagnostics. Its outer libtest result must still be exactly one pass with same-inventory N-1."
+  },
+  "controller_review_contract": {
+    "required_fields": {
+      "verdict": "CONTROLLER_SOURCE_CLEAR",
+      "head": "6dc09b9a1b5d205650e244401da0938b653d16da",
+      "tree": "aaab67a21378958066103707baf3abe8850577d6",
+      "runner_sha256": "<actual frozen hosted runner SHA256>",
+      "plan_sha256": "<actual frozen hosted plan SHA256>"
+    },
+    "runtime_arguments": [
+      "--controller-review",
+      ".github/qualification/pr2015/independent-review.json",
+      "--controller-review-sha256",
+      "<actual copied independent receipt SHA256>"
+    ],
+    "note": "Existing exact source-review contract only. No author-created clear receipt. Root copies the genuine new independent receipt after review and records its original hash before publication; no code change or role substitution. Source plan/runner pins must match."
+  },
+  "bounded_failure_cleanup": {
+    "direct_child_TERM_wait_seconds": 3,
+    "direct_child_KILL_wait_seconds": 3,
+    "adopted_natural_seconds": 3,
+    "adopted_forced_window_seconds": 10,
+    "qualification": "Any timeout, nonzero exit, unresolved wait, forced custody or inspection uncertainty stops dependencies and prevents qualification; cleanup grace is not extra test budget.",
+    "read_only_source_check_seconds": 10,
+    "source_check_TERM_wait_seconds": 3,
+    "source_check_KILL_wait_seconds": 3,
+    "final_custody_passes": 2,
+    "final_custody_order": "before final source/context and again afterward, before lock release; all earlier uncertainty/forced state prevents qualification",
+    "maximum_two_final_custody_windows_seconds": 26
+  },
+  "budget": "Same original2400-second controller cap starts after job-local custody fd acquisition; CLI check600, each integration compile900, inventory30, parent120 share it. Cache/tool/setup metadata steps precede this controller cap and retain independent workflow step deadlines; no compilation before cache admission.",
+  "limits": "Only10 serial phases and5 distinct CLI integration parents. Stop first negative/timeout/unknown/missing evidence. Full current --list sets must equal source-predicted36/11 names; runtime actualN is derived from each full inventory and every raw singleton summary must enforce1P0F0I/0M and N-1. Passive helpers/guardians/inline cases and compilation/inventory are not passes. Keep supported Git configuration/index/attribute refusal guards and cooperative source/context observations. No HOST/UI/default/full/integrated/broad/native/provider/live-install/release/WHOLE/SeedView/merge qualification. Natural unsupported authority context remains a real negative. Historical5a4 stale diagnostic/source-oracle finding and donor Git HOLD remain intact. Hosted-only User context. Actual PR1921 cache visibility and CLI payload are UNKNOWN. Exact existing Main15 cache namespace with same lock is reused, but UI-only cache cannot pass CLI features[] admission; a miss or incomplete payload fails before ANY Cargo invocation. Pre-controller setup/cache/action processes are outside controller-owned subreaper evidence and require original whole-job terminal/RAW accounting. Job-local fd closure does not return global C. Published legacy1726 source is deselected and UNRUN for this case; unpublished1951 branch is untouched. Never merge research scope; no suppressed required-check or mergeability assertion.",
+  "negative_path_ELF_hash_limit": "Donor limitation retained: failed invoke can skip the following post-use CLI/harness digest/identity check. Original raw error remains nonqualifying; do not claim failed-use immutability or archived full ELF bytes.",
+  "grant_binding_limit": "Hosted run-binding is immutable GitHub run/attempt/control correlation, not global C authority or once-only allocation. External actual Root grant/publication/return and independent hosted RAW remain required; no new permission system is invented.",
+  "lineage": {
+    "local_e3_commit": "e3c531d6669fc38dd718e7fc59eddb4f08a9fdf9",
+    "local_e3_runner_sha256": "6fb2456472135952a7855dd1fb7f2089d9d9b8679ed23476a2626d0d063c351e",
+    "local_e3_plan_sha256": "43b2b230e45a1f1e8fe4b3b4736788bfa9f5b046e5b39353c82001c67a336314",
+    "local_e3_source_freeze_sha256": "4b1e22554562a4e12e83199541bd84dc09430ca16f85aebabb9164a982937905",
+    "donor_controller": "9714214306b5952b41008f157e02bcd912e64bb5",
+    "main15_cache_gate_sha256": "3e06d35461148ca7fd32d9240dffbc4d9e1ba304e9feda7ba8990248acbcd281",
+    "scope": "Preserve20 low-level supervision/Git/custody helpers and existing strict CLI parser/artifact logic. Adapt only actual hosted paths/tool receipts/provenance/job-owned fd and immutable source routing. All local-e3 receipts retained byte-exact; none execute as a hosted plan."
+  },
+  "terminal_output": "Full summary/process attempts/states remain on disk. A separate compact terminal-receipt.json is checksummed, and terminal prints only bounded progress plus compact final JSON containing receipt/evidence paths and receipt/checksum hashes.",
+  "actual_grant": null,
+  "actual_execution": null,
+  "actual_release": null,
+  "request": "Hosted research qualification SOURCE ONLY, never merge. No push/dispatch/build/provider/target/lock/cache/capacity probe under current Main15 C. No product PR is created or product-PR approval rejection bypassed.",
+  "hosted": {
+    "repository": "CarsonBurke/cagents",
+    "research_pr": 1921,
+    "research_head_ref": "research/pr1853-bd88-qualification-20261028",
+    "event": "pull_request",
+    "os": "Linux",
+    "arch": "X64",
+    "runtime_product_dir": "product",
+    "control_dir": "research",
+    "evidence_relative_to_runner_temp": "issue2015-hosted-evidence",
+    "restored_target_relative_to_runner_temp": "held-scope-target",
+    "cache_gate": {
+      "path": ".github/qualification/pr2015/cache-restore-gate.py",
+      "sha256": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4"
+    },
+    "physical_tool_policy": "Record physical Rust1.93 release/native-host/commit identities and exact bytes from successful cache-gate receipt; rehash every phase. No Root-local path or unobserved hosted tool hash is preclaimed.",
+    "provenance": "Check actual hosted engine/event metadata and empty inherited CAGENTS name set. Future independent RAW must bind actual authenticated GitHub run/job/source/log/artifact metadata; local environment flags alone cannot qualify provenance.",
+    "C_scope": "Source preparation allocates nothing. Root must authorize global C for the complete original workflow after current Main15 return; actual external return/acceptance stays external."
+  },
+  "cache": {
+    "donor_gate_sha256": "3e06d35461148ca7fd32d9240dffbc4d9e1ba304e9feda7ba8990248acbcd281",
+    "donor_controller": "14c7e18663ccae5a9309a83e35b1c96972a9fd12",
+    "donor_workflow_sha256": "c44afb360a5306da40b317bfdff9b39fded4b32018522d2165a2443b6944d8c7",
+    "donor_plan_sha256": "a047be44fa464120b50b642fc68ba35e3103685c59c7a12b7c93eff7f61b3d28",
+    "trusted_prefix": "held1922-Linux-X64-rust193-bca4125b50134707a8afdb92ce04572c6ca6b3d3e43d177c5c679cecbc89c91b-",
+    "same_Cargo_lock_sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "target_relative_to_runner_temp": "held-scope-target",
+    "scope": "Restore exactly the existing trusted namespace/protocol, then require existing features[] native cagents root-library rmeta+rlib and complete Cargo fingerprints before ANY Cargo command, including version. UI-only markers do not admit this packet. No new target, guessed key, miss fallback or warmth claim.",
+    "unknowns": [
+      "Cache visibility from PR1921/current research branch is unverified.",
+      "Actual restored CLI payload is unknown and unprobed.",
+      "No integration-harness warmth or Cargo freshness is established by library cache presence."
+    ]
+  }
+}

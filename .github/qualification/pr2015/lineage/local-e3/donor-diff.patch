@@ -1,0 +1,321 @@
+--- /home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/dependencies/donor-run-packet.py	2026-10-30 13:07:25.649001991 -0700
++++ /home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/run-packet.py	2026-10-30 13:12:01.815612226 -0700
+@@ -1 +1 @@
+-"""Prepared PR1287 exact-head serial HOST4/UI12 C packet. No execution without fresh cagents grant and independent controller review."""
++"""Prepared issue2015 exact-head CLI integration C packet. Source only until new independent review and fresh actual grant."""
+@@ -19 +19 @@
+-WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-bounded-inspection')
++WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install')
+@@ -23 +23 @@
+-PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/plan.json')
++PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/plan.json')
+@@ -28 +28 @@
+-PLAN_SHA = '18c66b50a740e4c71999d03bec40954cba04d91b079cfd1a3b78230f32183e7c'
++PLAN_SHA = '43b2b230e45a1f1e8fe4b3b4736788bfa9f5b046e5b39353c82001c67a336314'
+@@ -269,2 +269,2 @@
+-def cargo_test_artifact(text, manifest_path, expected_features):
+-    artifacts, finished = [], []
++def cargo_test_artifacts(text, manifest_path, expected_target):
++    harnesses, clis, finished, root_executables = [], [], [], []
+@@ -278,5 +278,9 @@
+-        if (item.get('reason') == 'compiler-artifact' and item.get('profile', {}).get('test')
+-                and item.get('target', {}).get('kind') == ['lib']
+-                and item.get('target', {}).get('name') == 'cagents' and item.get('executable')
+-                and Path(item.get('manifest_path', '')).resolve() == Path(manifest_path).resolve()):
+-            artifacts.append(item)
++        if (item.get('reason') != 'compiler-artifact' or not item.get('executable')
++                or Path(item.get('manifest_path', '')).resolve() != Path(manifest_path).resolve()):
++            continue
++        root_executables.append(item)
++        target, profile = item.get('target', {}), item.get('profile', {})
++        if target.get('kind') == ['test'] and target.get('name') == expected_target and profile.get('test') is True:
++            harnesses.append(item)
++        if target.get('kind') == ['bin'] and target.get('name') == 'cagents' and profile.get('test') is False:
++            clis.append(item)
+@@ -284,5 +288,30 @@
+-    assert len(artifacts) == 1, 'Exact root cagents library test artifact missing/ambiguous'
+-    artifact = artifacts[0]
+-    assert artifact.get('features') == expected_features, 'Wrong or unified feature graph'
+-    assert set(expected_features) in (set(), {'host'}, {'ui'}), 'Only isolated CLI/HOST/UI graphs permitted'
+-    return artifact
++    assert len(harnesses) == 1 and len(clis) == 1 and len(root_executables) == 2, 'Exact integration harness/CLI artifacts missing or ambiguous'
++    assert all(item.get('features') == [] for item in root_executables), 'Only isolated no-default-features CLI permitted'
++    return harnesses[0], clis[0]
++
++
++def elf_record(artifact):
++    exe = Path(artifact['executable'])
++    assert exe.is_absolute() and exe == exe.resolve(strict=True)
++    assert exe.is_relative_to(TARGET.resolve(strict=True)) and not exe.is_symlink()
++    before = exe.lstat()
++    assert stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid()
++    with exe.open('rb') as stream:
++        assert stream.read(4) == b'\x7fELF'
++    value = digest(exe)
++    after = exe.lstat()
++    fields = ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_size', 'st_mtime_ns')
++    identity = {name: getattr(before, name) for name in fields}
++    assert identity == {name: getattr(after, name) for name in fields}, 'ELF identity changed during hash'
++    return {'path': str(exe), 'sha256': value, 'file_identity': identity, 'features': artifact['features'],
++            'artifact': artifact, 'limits': 'Original Cargo-reported ELF identity and digest guarded during successful use; full ELF bytes not archived.'}
++
++
++def verify_elf(record):
++    exe = Path(record['path'])
++    assert exe.is_absolute() and exe == exe.resolve(strict=True) and not exe.is_symlink()
++    before = exe.lstat()
++    assert record['file_identity'] == {name: getattr(before, name) for name in record['file_identity']}, 'ELF identity changed'
++    assert digest(exe) == record['sha256'], 'ELF bytes changed'
++    after = exe.lstat()
++    assert record['file_identity'] == {name: getattr(after, name) for name in record['file_identity']}, 'ELF identity changed during verification'
+@@ -306,0 +336 @@
++    assert not benchmarks, 'Integration inventory unexpectedly contains benchmarks'
+@@ -312,8 +342,13 @@
+-    children = contract['expected_child_reexecutions']
+-    assert children in (0, 1), 'Only the source-pinned one-child helper is supported'
+-    wrapped_names = (
+-        'app::project_ui::tests::foreign_nested_worktree_refuses_before_closing_sessions_or_removing_files',
+-        'app::project_ui::tests::absent_registered_worktree_can_retire_its_exact_prunable_registration',
+-    )
+-    assert (children == 1) == (name in wrapped_names), 'Child-count exception belongs only to the two source-pinned helper parents'
+-    events, summaries = [], []
++    assert contract['expected_child_reexecutions'] == 0, 'Nested fixture helpers are nonadditive, not outer libtest summaries'
++    count, filtered = contract['actual_inventory_N'], contract['expected_filtered_out']
++    assert count > 0 and filtered == count - 1, 'Fresh same-harness inventory required'
++    expected_diagnostics = contract['expected_stdout_diagnostics']
++    special = name == 'external_installer_saves_closes_and_reopens_windows_even_on_failure'
++    assert expected_diagnostics == (['inspector-refused', 'inspector-missing'] if special else []), 'Diagnostic exception belongs only to exact source-pinned parent'
++    events, summaries, diagnostics = [], [], []
++
++    def diagnostic(line):
++        found = re.fullmatch(r'source inspection (inspector-refused|inspector-missing): (.*)', line)
++        assert special and found, 'Unexpected fixture diagnostic shape'
++        diagnostics.append(found.group(1))
++
+@@ -322,2 +357,2 @@
+-            found = re.fullmatch(r'test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; 0 measured; \d+ filtered out(?:; finished in \d+(?:\.\d+)?s)?', line)
+-            assert found and found.groups() == ('ok', '1', '0', '0'), 'Each outer/child result must be exactly1P0F0I'
++            found = re.fullmatch(r'test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; 0 measured; (\d+) filtered out(?:; finished in \d+(?:\.\d+)?s)?', line)
++            assert found and found.groups() == ('ok', '1', '0', '0', str(filtered)), 'Owning result must be exactly1P0F0I with actualN-1'
+@@ -333 +368 @@
+-            assert found and found.group(1) == name, 'Unexpected parent/child name or result shape'
++            assert found and found.group(1) == name, 'Unexpected owning name or result shape'
+@@ -335,2 +370,11 @@
+-            assert tail in ('', 'ok'), 'Failure/ignored/unexpected parent result'
+-            events.append('named-ok' if tail == 'ok' else 'named-prefix')
++            if tail == 'ok':
++                events.append('named-ok')
++            elif tail == '' and special:
++                events.append('named-prefix')
++            elif special and tail.startswith('source inspection inspector-refused: '):
++                events.append('named-prefix')
++                diagnostic(tail)
++            else:
++                raise AssertionError('Failure/ignored/unexpected owning result')
++        elif line.startswith('source inspection '):
++            diagnostic(line)
+@@ -337,0 +382 @@
++            assert special
+@@ -341,8 +386,8 @@
+-    expected = (['run1', 'named-ok', 'summary'] if children == 0 else
+-                ['run1', 'named-prefix', 'run1', 'named-ok', 'summary', 'bare-ok', 'summary'])
+-    assert events == expected, 'Missing outer/child completion, duplicate summary, or unexpected interleaving'
+-    assert len(summaries) == children + 1
+-    return {'outer_passed': 1, 'outer_failed': 0, 'outer_ignored': 0,
+-            'expected_child_reexecutions': children,
+-            'nonadditive_child_results': ([{'name': name, 'passed': 1, 'failed': 0, 'ignored': 0}] if children else []),
+-            'source_derived_event_shape': events}
++    expected = ['run1', 'named-prefix', 'bare-ok', 'summary'] if special else ['run1', 'named-ok', 'summary']
++    assert events == expected and len(summaries) == 1, 'Missing/duplicate/interleaved owning result'
++    assert diagnostics == expected_diagnostics, 'Missing/duplicate/out-of-order source refusal diagnostics'
++    assert all(marker in text for marker in contract['required_diagnostic_markers']), 'Missing source-pinned recovery/cause diagnostic'
++    return {'outer_passed': 1, 'outer_failed': 0, 'outer_ignored': 0, 'measured': 0,
++            'actual_inventory_N': count, 'filtered_out': filtered, 'expected_child_reexecutions': 0,
++            'nonadditive_child_results': [], 'source_derived_event_shape': events,
++            'source_refusal_diagnostics': diagnostics}
+@@ -367,0 +413,2 @@
++    check = plan['binary_checks'][0]
++    invoke(check['label'], [str(TOOL / 'cargo'), *check['argv'][1:]], check['seconds'])
+@@ -371,2 +417,0 @@
+-        check = next(check for check in plan['binary_checks'] if check['artifact_group'] == gid)
+-        invoke(check['label'], [str(TOOL / 'cargo'), *check['argv'][1:]], check['seconds'])
+@@ -374,13 +419,12 @@
+-        artifact = cargo_test_artifact((compiled / 'stdout.log').read_text(), WT / group['manifest'], group['features'])
+-        exe = Path(artifact['executable'])
+-        assert exe.is_absolute() and exe == exe.resolve(strict=True)
+-        assert exe.is_relative_to(TARGET.resolve(strict=True)) and exe.is_file() and not exe.is_symlink()
+-        with exe.open('rb') as stream:
+-            assert stream.read(4) == b'\x7fELF'
+-        elf = {'path': str(exe), 'sha256': digest(exe), 'features': artifact['features'], 'artifact': artifact,
+-               'limits': 'Original Cargo-reported ELF is hashed before and after use; full ELF bytes are not archived.'}
+-        artifacts[gid] = elf
+-        save('test-elf-' + gid + '.json', elf)
+-        assert digest(exe) == elf['sha256']
+-        inventory = invoke('inventory-' + gid, [str(exe), '--list', '--color=never'], group['inventory_seconds'])
+-        assert digest(exe) == elf['sha256'], 'ELF changed during inventory'
++        test_artifact, cli_artifact = cargo_test_artifacts((compiled / 'stdout.log').read_text(), WT / group['manifest'], group['target_name'])
++        harness, cli = elf_record(test_artifact), elf_record(cli_artifact)
++        artifacts[gid] = {'harness': harness, 'cli': cli}
++        save('test-elf-' + gid + '.json', artifacts[gid])
++        verify_elf(harness)
++        verify_elf(cli)
++        inventory = invoke('inventory-' + gid, [harness['path'], '--list', '--color=never'], group['inventory_seconds'])
++        verify_elf(harness)
++        verify_elf(cli)
++        predicted = group['source_predicted_full_names']
++        actual = inventory_names((inventory / 'stdout.log').read_text() + '\n' + (inventory / 'stderr.log').read_text(), predicted)
++        assert len(actual) == group['source_predicted_full_test_count'] and set(actual) == set(predicted), 'Fresh full integration inventory differs from source contract'
+@@ -388,5 +432 @@
+-        compiled_selected = group['source_predicted_compiled_names']
+-        absent = group['source_predicted_absent_names']
+-        actual = inventory_names((inventory / 'stdout.log').read_text() + '\n' + (inventory / 'stderr.log').read_text(), compiled_selected)
+-        assert set(selected).issubset(compiled_selected), 'Assigned execution is absent from source-pinned compilation contract'
+-        assert not set(absent).intersection(actual), 'Source-pinned excluded feature selectors unexpectedly compiled'
++        assert set(selected).issubset(actual)
+@@ -394 +434 @@
+-             'source_predicted_compiled_selected_names': compiled_selected, 'source_predicted_absent_names': absent,
++             'source_predicted_full_names': predicted, 'source_predicted_ignored_names': group['source_predicted_ignored_names'],
+@@ -396 +436 @@
+-             'compiled_selected_count': len(compiled_selected), 'not_passes': True})
++             'not_passes': True, 'harness_sha256': harness['sha256'], 'cli_sha256': cli['sha256']})
+@@ -398 +438,3 @@
+-            assert digest(exe) == elf['sha256']
++            observed = dict(contract, actual_inventory_N=len(actual), expected_filtered_out=len(actual) - 1)
++            verify_elf(harness)
++            verify_elf(cli)
+@@ -400,4 +442,5 @@
+-                       [str(exe), contract['name'], '--exact', '--nocapture', '--test-threads=1', '--color=never'],
+-                       contract['seconds'], contract)
+-            assert digest(exe) == elf['sha256'], 'ELF changed during owning parent'
+-            proof = parent_pass((d / 'stdout.log').read_text() + '\n' + (d / 'stderr.log').read_text(), contract)
++                       [harness['path'], contract['name'], '--exact', '--nocapture', '--test-threads=1', '--color=never'],
++                       contract['seconds'], observed)
++            verify_elf(harness)
++            verify_elf(cli)
++            proof = parent_pass((d / 'stdout.log').read_text() + '\n' + (d / 'stderr.log').read_text(), observed)
+@@ -405 +448 @@
+-                            'elf_sha256': elf['sha256'], **proof})
++                            'elf_sha256': harness['sha256'], 'cli_sha256': cli['sha256'], **proof})
+@@ -455 +498 @@
+-    assert 0 <= len(parents) <= count <= 16
++    assert 0 <= len(parents) <= count <= 5
+@@ -469 +512 @@
+-             'unrun_phase_count': 22 - len(phase_attempts),
++             'unrun_phase_count': 10 - len(phase_attempts),
+@@ -474 +517 @@
+-             'requested_parent_count': 16, 'passed_parent_count': len(parents),
++             'requested_parent_count': 5, 'passed_parent_count': len(parents),
+@@ -479 +522 @@
+-             'nonqualifying_parent_count': count - len(parents), 'unrun_parent_count': 16 - count}, raw, errors)
++             'nonqualifying_parent_count': count - len(parents), 'unrun_parent_count': 5 - count}, raw, errors)
+@@ -563,37 +606,29 @@
+-    assert review['kind'] == 'AUTHOR_ASSEMBLED_IMMUTABLE_PR1287_MANIFEST_STATUS_BINDING_NOT_A_NEW_REVIEW'
+-    assert review['verdict'] == 'BOUND_SOURCE_PLAN_AND_REPORTED_SCRIPT_STATUS_ONLY'
+-    assert review['owning_parent_count'] == 16
+-    # Authored source-plan/status binding, not an independent product review or grant.
+-    # The exact independent controller receipt below still owns admission review.
+-    manifest_ref = review['source_manifest']
+-    assert digest(manifest_ref['path']) == manifest_ref['sha256']
+-    manifest = json.loads(Path(manifest_ref['path']).read_bytes())
+-    assert manifest['head'] == plan['product_head'] and manifest['tree'] == plan['product_tree']
+-    assert manifest['queue_assignments'] == {'cli': 0, 'host': 4, 'ui': 12}
+-    assert manifest['source_predicted_compiled_selected_counts'] == {'cli': 0, 'host': 16, 'ui': 12}
+-    assert plan['source_paths_sha256'] == {path: value['sha256'] for path, value in manifest['current_leaf_pins'].items()}
+-    assert [group['id'] for group in plan['artifact_groups']] == ['host-lib', 'ui-lib']
+-    assert [group['features'] for group in plan['artifact_groups']] == [['host'], ['ui']]
+-    assert [check['artifact_group'] for check in plan['binary_checks']] == ['host-lib', 'ui-lib']
+-    for lane, group in zip(('host', 'ui'), plan['artifact_groups']):
+-        assert [contract['name'] for contract in group['selectors']] == manifest['lanes'][lane]['assigned_selectors']
+-        assert all(contract['expected_child_reexecutions'] == 0 for contract in group['selectors'])
+-        assert group['source_predicted_compiled_names'] == manifest['lanes'][lane]['source_predicted_compiled_selected_names']
+-        assert group['source_predicted_absent_names'] == manifest['lanes'][lane]['source_predicted_selected_names_absent']
+-    freeze_ref = review['composition_freeze']
+-    assert digest(freeze_ref['path']) == freeze_ref['sha256'] == manifest['freeze']['sha256']
+-    freeze = json.loads(Path(freeze_ref['path']).read_bytes())
+-    assert freeze['head'] == plan['product_head'] and freeze['tree'] == plan['product_tree']
+-    assert all(plan['source_paths_sha256'][path] == sha for path, sha in freeze['leaves'].items())
+-    status_ref = review['script_status_companion']
+-    assert digest(status_ref['path']) == status_ref['sha256']
+-    companion = json.loads(Path(status_ref['path']).read_bytes())
+-    assert companion['same_head'] == plan['product_head'] and companion['manifest_sha256'] == manifest_ref['sha256']
+-    assert companion['script_status_update']['status'] == 'COMPLETED'
+-    assert companion['script_status_update']['conclusion'] == 'SUCCESS'
+-    script_ref = review['script_success_readback']
+-    assert digest(script_ref['path']) == script_ref['sha256'] == companion['script_status_update']['sha256']
+-    script_receipt = json.loads(Path(script_ref['path']).read_bytes())
+-    assert script_receipt['headRefOid'] == plan['product_head']
+-    assert any(check.get('name') == 'Script contracts' and check.get('status') == 'COMPLETED'
+-               and check.get('conclusion') == 'SUCCESS' for check in script_receipt['statusCheckRollup'])
++    assert review['kind'] == 'AUTHOR_ASSEMBLED_ISSUE2015_CORRECTED_SOURCE_DATA_BINDING_NOT_INDEPENDENT_REVIEW'
++    assert review['verdict'] == 'BOUND_CORRECTED_SOURCE_DATA_ONLY' and review['owning_parent_count'] == 5
++    data_ref = review['command_data']
++    assert digest(data_ref['path']) == data_ref['sha256'] == plan['command_data']['sha256']
++    assert data_ref['path'] == plan['command_data']['path']
++    command_data = json.loads(Path(data_ref['path']).read_bytes())
++    assert command_data['product']['head'] == plan['product_head'] and command_data['product']['tree'] == plan['product_tree']
++    assert plan['source_paths_sha256'] == {item['path']: item['sha256'] for item in command_data['source_pins']}
++    assert [group['id'] for group in plan['artifact_groups']] == ['installer_lifecycle_contract', 'installer_guard_contract']
++    assert len(plan['binary_checks']) == 1 and plan['binary_checks'][0]['argv'] == ['cargo', 'check', '--locked', '--no-default-features', '--bin', 'cagents']
++    expected_order = ['cli-binary-check']
++    for group in plan['artifact_groups']:
++        target = group['id']
++        assert group['features'] == [] and group['target_kind'] == ['test'] and group['target_name'] == target
++        assert group['compile_argv'] == ['cargo', 'test', '--locked', '--no-default-features', '--test', target, '--no-run', '--message-format=json']
++        expected_names = [item['name'] for item in command_data['owning_integration_parents'] if item['target'] == target]
++        assert [item['name'] for item in group['selectors']] == expected_names
++        predicted = next(item for item in command_data['core_cli_command_data'] if item['id'] == 'inventory-' + target)['required_future_oracle']
++        assert group['source_predicted_full_names'] == predicted['expected_names']
++        assert group['source_predicted_ignored_names'] == predicted['ignored_names']
++        assert group['source_predicted_full_test_count'] == len(predicted['expected_names'])
++        assert all(item['expected_child_reexecutions'] == 0 for item in group['selectors'])
++        expected_order.extend(['compile-' + target, 'inventory-' + target])
++        expected_order.extend('parent-' + target + '-' + str(index) for index in range(1, len(expected_names) + 1))
++    assert plan['planned_phase_order'] == expected_order
++    for key in ('independent_source_review', 'correction_freeze', 'historical_data'):
++        assert digest(review[key]['path']) == review[key]['sha256']
++    correction = json.loads(Path(review['correction_freeze']['path']).read_bytes())
++    assert all(plan['source_paths_sha256'][path] == value for path, value in correction['leaves'].items())
+@@ -602,2 +637,2 @@
+-    assert plan['packet_deadline_seconds'] == 2400 and plan['planned_phase_count'] == 22
+-    assert plan['counts']['qualifying_outer_parents'] == 16
++    assert plan['packet_deadline_seconds'] == 2400 and plan['planned_phase_count'] == 10
++    assert plan['counts']['qualifying_outer_parents'] == 5
+@@ -619 +654 @@
+-    out = Path('/tmp/fw16-pr1287-4fa33705-host4-ui12-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))
++    out = Path('/tmp/fw16-issue2015-6dc09b9a-cli-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))
+@@ -700,0 +736,6 @@
++        receipt = {'state': 'PRELEASE_SOURCE_FAILURE', 'qualified': False, 'lock_acquired': False,
++                   'error_type': type(prelease_error).__name__, 'evidence': str(out),
++                   'failure_path': str(out / 'prelease-source-failure.json'), 'at': now()}
++        save('terminal-receipt.json', receipt)
++        print(json.dumps({**receipt, 'receipt_path': str(out / 'terminal-receipt.json'),
++                          'receipt_sha256': digest(out / 'terminal-receipt.json')}), flush=True)
+@@ -783 +824 @@
+-        print(json.dumps({'phase': label, 'exit': state['exit'], 'seconds': record['seconds'], 'custody': custody}), flush=True)
++        print(json.dumps({'phase': label, 'exit': state['exit'], 'seconds': record['seconds'], 'custody_clean': custody_clean(custody), 'custody_forced': custody.get('forced'), 'custody_observed_count': len(custody.get('observed', []))}), flush=True)
+@@ -862 +903 @@
+-             'qualified': error is None and not CANCELLATION_SIGNALS and len(tests) == 16 and [phase['label'] for phase in phases] == plan['planned_phase_order'] and actual_release,
++             'qualified': error is None and not CANCELLATION_SIGNALS and len(tests) == 5 and [phase['label'] for phase in phases] == plan['planned_phase_order'] and actual_release,
+@@ -865,0 +907,13 @@
++        terminal = {'state': 'FINISHED', 'head': summary['head'], 'tree': summary['tree'], 'grant': args.grant,
++                    'runner_sha256': args.runner_sha256, 'plan_sha256': PLAN_SHA,
++                    'qualified': summary['qualified'], 'error_present': summary['error'] is not None,
++                    'attempted_phase_count': summary['attempted_phase_count'],
++                    'passed_parent_count': summary['passed_parent_count'],
++                    'unknown_process_count': summary['unknown_process_count'],
++                    'all_original_waits_complete': summary['all_original_waits_complete'],
++                    'custody_clean': custody_clean(custody), 'custody_forced': custody['forced'],
++                    'actual_release': summary['actual_release'], 'lock_closed': summary['lock_closed'],
++                    'lock_unlocked': summary['lock_unlocked'], 'lock_close_error_present': summary['lock_close_error'] is not None,
++                    'evidence': str(out), 'summary_path': str(out / 'summary.json'),
++                    'summary_sha256': digest(out / 'summary.json'), 'finished': summary['finished']}
++        save('terminal-receipt.json', terminal)
+@@ -868,4 +922,4 @@
+-        # Root owns coordination; this runner never sends a message or starts another agent.
+-        print(json.dumps(summary), flush=True)
+-        print('EVIDENCE ' + str(out), flush=True)
+-        print('RELEASE_STATUS ' + ('ACTUAL_CLEAN_C_RELEASE' if summary['actual_release'] else 'NO_SAFE_RELEASE_CLAIM'), flush=True)
++        # Full original ledger remains on disk; terminal output stays bounded.
++        print(json.dumps({**terminal, 'receipt_path': str(out / 'terminal-receipt.json'),
++                          'receipt_sha256': digest(out / 'terminal-receipt.json'),
++                          'checksum_sha256': digest(out / 'SHA256SUMS')}), flush=True)
