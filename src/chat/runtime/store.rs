@@ -3015,10 +3015,23 @@ mod tests {
         let once = content.clone();
         shrink(&mut content);
         assert_eq!(content, once);
-        if let ItemContent::Changes { omitted_files, .. } = &mut content {
+        if let ItemContent::Changes {
+            changes,
+            omitted_files,
+            ..
+        } = &mut content
+        {
+            changes.extend(changes.clone());
             *omitted_files = usize::MAX;
         }
         shrink(&mut content);
+        assert!(matches!(
+            content,
+            ItemContent::Changes {
+                omitted_files: usize::MAX,
+                ..
+            }
+        ));
     }
 
     #[test]
