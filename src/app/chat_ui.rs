@@ -491,7 +491,6 @@ pub enum Action {
     ModelPicker(Target, bool),
     ReasoningPicker(Target, bool),
     PermissionPicker(Target, bool),
-    FooterPicker(Target, bool),
     ModelQuery(Target, String),
 }
 
@@ -2397,7 +2396,6 @@ pub(super) struct Runtime {
     failure_ui: failure::State,
     reasoning_picker: bool,
     permission_picker: bool,
-    footer_picker: bool,
     permissions_form: permissions::Form,
     /// Whether the account choice is open.
     account_picker: bool,
@@ -3352,7 +3350,6 @@ impl Runtime {
             failure_ui: failure::State::default(),
             reasoning_picker: false,
             permission_picker: false,
-            footer_picker: false,
             permissions_form: permissions::Form::default(),
             account_picker: false,
             picker_focus: 0,
@@ -6832,7 +6829,6 @@ impl Cagents {
             runtime.account_picker = false;
             runtime.reasoning_picker = false;
             runtime.permission_picker = false;
-            runtime.footer_picker = false;
             runtime.snapshot = Arc::new(fresh);
         } else if rehomed {
             Arc::make_mut(&mut runtime.snapshot).skills.clear();
@@ -7249,13 +7245,11 @@ impl Cagents {
         let open = runtime.model_picker.take().is_some()
             || runtime.reasoning_picker
             || runtime.permission_picker
-            || runtime.footer_picker
             || runtime.account_picker
             || runtime.composer_actions
             || runtime.branch_picker;
         runtime.reasoning_picker = false;
         runtime.permission_picker = false;
-        runtime.footer_picker = false;
         runtime.account_picker = false;
         runtime.composer_actions = false;
         runtime.branch_picker = false;
@@ -9466,7 +9460,6 @@ impl Cagents {
         let restore = match &action {
             Action::AccountPicker(target, false)
             | Action::PermissionPicker(target, false)
-            | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
             | Action::SelectSubagent(target, _)
             | Action::ChooseAccount(target, _)
@@ -9748,7 +9741,6 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.reasoning_picker = false;
                     runtime.permission_picker = false;
-                    runtime.footer_picker = false;
                 }
             }
             Action::DispatchQueued(target) => {
@@ -11414,23 +11406,12 @@ impl Cagents {
                     runtime.recall(true);
                 }
             }
-            Action::FooterPicker(target, open) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.footer_picker = open;
-                    runtime.model_picker = None;
-                    runtime.reasoning_picker = false;
-                    runtime.account_picker = false;
-                    runtime.permission_picker = false;
-                    runtime.composer_actions = false;
-                }
-            }
             Action::PermissionPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
                     runtime.permission_picker = open;
-                    runtime.footer_picker = false;
                     if open {
                         runtime.model_picker = None;
                         runtime.reasoning_picker = false;
@@ -11490,7 +11471,6 @@ impl Cagents {
                     runtime.history_attachment_stash = None;
                     runtime.replace_draft(text_editor::Content::with_text(&draft));
                     runtime.permission_picker = false;
-                    runtime.footer_picker = false;
                     return iced::widget::operation::focus(card_control_id(
                         target.card,
                         "chat-composer",
@@ -12758,7 +12738,6 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.permission_picker = false;
-                runtime.footer_picker = false;
                 runtime.composer_actions = false;
                 if !runtime
                     .snapshot
@@ -13178,7 +13157,6 @@ impl Cagents {
                 runtime.reasoning_picker = false;
                 runtime.account_picker = false;
                 runtime.permission_picker = false;
-                runtime.footer_picker = false;
                 if open {
                     // The field takes focus with the popup, so opening the
                     // picker and naming a model are one gesture.
@@ -13204,7 +13182,6 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.account_picker = false;
                     runtime.permission_picker = false;
-                    runtime.footer_picker = false;
                 }
             }
         }
