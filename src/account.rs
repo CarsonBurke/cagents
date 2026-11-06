@@ -545,15 +545,54 @@ impl Account {
         self.home_directory(&|name| std::env::var(name).ok())
     }
 
-    /// The environment a probe of this account sets on the CLI.
+    /// The home a conversation, terminal or sign-in on this account exports
+    /// through its provider's home variable, or `None` when it exports none
+    /// and the CLI resolves its own default.
     ///
-    /// The system account sets nothing, so the CLI resolves its default
-    /// exactly as it would in the user's own shell.
+    /// A managed, linked or selected device's home is always exported. The
+    /// system account's home is exported when cagents itself was started
+    /// with one. Otherwise Claude Code's default is exported only while
+    /// `~/.claude.json` does not exist: Claude Code keeps who a login
+    /// belongs to in its global configuration, which an explicit
+    /// `CLAUDE_CONFIG_DIR` moves from `~/.claude.json` into that directory -
+    /// even when the variable names the default `~/.claude`. Exporting the
+    /// default beside an existing `~/.claude.json` therefore gives one login
+    /// two records of who it is: one that the reader's own `claude` and an
+    /// outside sign-in keep, and one that only cagents' launches see.
+    pub fn launch_home(&self) -> Option<PathBuf> {
+        self.launch_home_in(&|name| std::env::var(name).ok(), &|path| path.exists())
+    }
+
+    /// [`Self::launch_home`] against `environment`, with `exists` saying
+    /// whether a file is there.
+    pub fn launch_home_in(
+        &self,
+        environment: &dyn Fn(&str) -> Option<String>,
+        exists: &dyn Fn(&Path) -> bool,
+    ) -> Option<PathBuf> {
+        let home = self.home_directory(environment)?;
+        if !matches!(self.home, AccountHome::System) || self.provider != Provider::Claude {
+            return Some(home);
+        }
+        let variable = home_variable(self.provider)?;
+        let explicit = environment(variable).is_some_and(|value| !value.is_empty())
+            && !inherited_selections(environment).contains(&variable);
+        if explicit {
+            return Some(home);
+        }
+        let user_home = environment("HOME").filter(|value| !value.is_empty())?;
+        (!exists(&Path::new(&user_home).join(".claude.json"))).then_some(home)
+    }
+
+    /// The environment a probe of this account sets on the CLI: the same
+    /// home its launches export (see [`Self::launch_home`]), so the probe
+    /// reads the record of the login that its conversations and sign-ins
+    /// keep. A system account that exports nothing sets nothing, and the
+    /// CLI resolves its default exactly as it would in the user's own shell.
     pub fn probe_environment(&self) -> Option<(&'static str, PathBuf)> {
         match &self.home {
-            AccountHome::System | AccountHome::SystemAt { .. } | AccountHome::Brokered { .. } => {
-                None
-            }
+            AccountHome::SystemAt { .. } | AccountHome::Brokered { .. } => None,
+            AccountHome::System => Some((home_variable(self.provider)?, self.launch_home()?)),
             AccountHome::Managed { path, .. } | AccountHome::Linked { path, .. } => {
                 Some((home_variable(self.provider)?, path.clone()))
             }
@@ -586,6 +625,19 @@ pub struct Identity {
     /// The provider's plan identifier (`max`, `prolite`), not a display name;
     /// see [`plan_label`].
     pub plan: Option<String>,
+    /// The login another record of the same credentials names, when the
+    /// records disagree.
+    ///
+    /// Claude Code keeps who a login is in its global configuration file,
+    /// apart from its credentials, and `claude auth status` reports that
+    /// record without asking the service. One set of credentials can therefore be
+    /// described by two records naming two logins (see
+    /// [`Account::launch_home`]); nothing a probe can read without a token
+    /// says which is right, so the probe reports both rather than vouch for
+    /// either. Only the system account's default home can have a second
+    /// record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disputed_by: Option<String>,
 }
 
 impl Identity {
@@ -597,7 +649,17 @@ impl Identity {
     /// compared where both sides name one, because one person can belong to
     /// a personal and a team organization under the same address, and those
     /// are separate allowances.
+    ///
+    /// Nor can a login whose records disagree about who it is (see
+    /// [`Self::disputed_by`]): it claims a login, which
+    /// [`Self::claims_same_login`] compares, but is not known to be it.
     pub fn same_login(&self, other: &Identity) -> bool {
+        self.disputed_by.is_none() && other.disputed_by.is_none() && self.claims_same_login(other)
+    }
+
+    /// Whether `self` and `other` name the same login, as [`Self::same_login`]
+    /// compares them, whether or not either is disputed.
+    pub fn claims_same_login(&self, other: &Identity) -> bool {
         let (Some(mine), Some(theirs)) = (self.email.as_deref(), other.email.as_deref()) else {
             return false;
         };
@@ -794,6 +856,10 @@ pub struct UsageSnapshot {
     pub detail: Option<String>,
 }
 
+/// How far apart, in seconds, two reports of one weekly allowance may place
+/// its reset: providers round it, and report it at different moments.
+pub const RESET_TOLERANCE: u64 = 3_600;
+
 impl UsageSnapshot {
     /// A snapshot that reports a state rather than figures.
     pub fn state(status: UsageStatus, detail: impl Into<String>, observed_at: u64) -> Self {
@@ -820,6 +886,26 @@ impl UsageSnapshot {
             .iter()
             .find(|window| window.binding)
             .or_else(|| tightest(&self.windows))
+    }
+
+    /// When the weekly allowance shared by everything the account does next
+    /// resets, in Unix seconds, if it resets after `now`.
+    pub fn weekly_reset(&self, now: i64) -> Option<i64> {
+        self.windows
+            .iter()
+            .filter(|window| window.kind == WindowKind::Weekly)
+            .find_map(|window| window.resets_at)
+            .filter(|resets_at| *resets_at > now)
+    }
+
+    /// Whether `self` and `other` are the figures of two separate
+    /// allowances, as of `now`: their weekly allowances both still run and
+    /// reset more than [`RESET_TOLERANCE`] apart. One login seen through two
+    /// homes draws on one allowance, which resets once.
+    pub fn separate_allowance(&self, other: &UsageSnapshot, now: i64) -> bool {
+        self.weekly_reset(now)
+            .zip(other.weekly_reset(now))
+            .is_some_and(|(mine, theirs)| mine.abs_diff(theirs) > RESET_TOLERANCE)
     }
 
     /// Recomputes the status from the windows after they changed, keeping a
@@ -1338,7 +1424,42 @@ mod tests {
             Some(PathBuf::from("/home/a/.codex"))
         );
         assert_eq!(codex.home_directory(&environment(&[])), None);
-        assert_eq!(claude.probe_environment(), None);
+        // The system Claude home is exported only where exporting it
+        // cannot split the login's record of who it is: beside an existing
+        // `~/.claude.json`, an explicit `CLAUDE_CONFIG_DIR=~/.claude` would
+        // have the CLI read and write `~/.claude/.claude.json` instead.
+        let global =
+            |present: bool| move |path: &Path| present && path == Path::new("/home/a/.claude.json");
+        let user = environment(&[("HOME", "/home/a")]);
+        assert_eq!(claude.launch_home_in(&user, &global(true)), None);
+        assert_eq!(
+            claude.launch_home_in(&user, &global(false)),
+            Some(PathBuf::from("/home/a/.claude"))
+        );
+        // A directory the reader started cagents with is theirs, and kept.
+        let chosen = environment(&[
+            ("HOME", "/home/a"),
+            ("CLAUDE_CONFIG_DIR", "/home/a/.claude"),
+        ]);
+        assert_eq!(
+            claude.launch_home_in(&chosen, &global(true)),
+            Some(PathBuf::from("/home/a/.claude"))
+        );
+        // Codex keeps its login in its home either way.
+        assert_eq!(
+            codex.launch_home_in(&user, &global(true)),
+            Some(PathBuf::from("/home/a/.codex"))
+        );
+        // Every other home is the account's own and always exported.
+        let linked = Account::linked(
+            Provider::Claude,
+            uuid::Uuid::from_u128(2),
+            "/home/a/.claude-work".into(),
+        );
+        assert_eq!(
+            linked.launch_home_in(&user, &global(true)),
+            Some(PathBuf::from("/home/a/.claude-work"))
+        );
         let key = uuid::Uuid::from_u128(1);
         let managed = Account::managed(Provider::Codex, key, "/data/accounts/codex/1".into());
         assert_eq!(
@@ -1496,6 +1617,7 @@ mod tests {
             email: email.map(str::to_owned),
             organization: organization.map(str::to_owned),
             plan: None,
+            disputed_by: None,
         };
         let work = identity(Some("Me@Example.com"), Some("Acme"));
         assert!(work.same_login(&identity(Some("me@example.com "), Some("Acme"))));
@@ -1503,6 +1625,45 @@ mod tests {
         assert!(!work.same_login(&identity(Some("me@example.com"), Some("Personal"))));
         assert!(!work.same_login(&identity(Some("you@example.com"), Some("Acme"))));
         assert!(!identity(None, None).same_login(&identity(None, None)));
+        // A login whose records disagree claims an address, but is not known
+        // to be it.
+        let disputed = Identity {
+            disputed_by: Some("other@example.com".into()),
+            ..identity(Some("me@example.com"), Some("Acme"))
+        };
+        assert!(disputed.claims_same_login(&work) && work.claims_same_login(&disputed));
+        assert!(!disputed.same_login(&work) && !work.same_login(&disputed));
+    }
+
+    #[test]
+    fn one_allowance_resets_once_and_only_running_windows_are_compared() {
+        let snapshot = |weekly: Option<i64>, session: Option<i64>| {
+            let window = |kind: WindowKind, resets_at: Option<i64>| UsageWindow {
+                key: format!("{kind:?}"),
+                kind,
+                label: String::new(),
+                used: 0.5,
+                resets_at,
+                span_secs: None,
+                binding: false,
+            };
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", 0);
+            snapshot.windows = vec![
+                window(WindowKind::Session, session),
+                window(WindowKind::Weekly, weekly),
+            ];
+            snapshot
+        };
+        let now = 1_000_000;
+        let week = snapshot(Some(now + 86_400), Some(now + 60));
+        // Reported a moment apart, or rounded: one allowance.
+        assert!(!week.separate_allowance(&snapshot(Some(now + 86_400 + 1_800), None), now));
+        assert!(week.separate_allowance(&snapshot(Some(now + 3 * 86_400), Some(now + 60)), now));
+        // The session window says nothing about the weekly allowance.
+        assert!(!week.separate_allowance(&snapshot(None, Some(now + 9_000)), now));
+        // A window that has already reset is a figure from before it.
+        assert!(!week.separate_allowance(&snapshot(Some(now - 3 * 86_400), None), now));
+        assert_eq!(week.weekly_reset(now), Some(now + 86_400));
     }
 
     #[test]

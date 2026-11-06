@@ -42,7 +42,117 @@ pub fn parse_auth_status(status: &Value) -> Result<Identity, UsageStatus> {
         email: text("email"),
         organization: text("orgName"),
         plan: text("subscriptionType"),
+        disputed_by: None,
     })
+}
+
+/// The largest global configuration [`recorded_login`] reads. Claude Code's
+/// grows with every project it has opened; one this size is not its.
+const RECORD_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// The email the Claude Code global configuration at `path` records for its
+/// login, if it records one.
+///
+/// Only the login's display address is taken. Serde skips every other
+/// field, so nothing else the file holds outlives the read.
+pub fn recorded_login(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    #[derive(Deserialize)]
+    struct Global {
+        #[serde(rename = "oauthAccount")]
+        account: Option<Account>,
+    }
+    #[derive(Deserialize)]
+    struct Account {
+        #[serde(rename = "emailAddress")]
+        email: Option<String>,
+    }
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(RECORD_LIMIT + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > RECORD_LIMIT {
+        return None;
+    }
+    let global: Global = serde_json::from_slice(&bytes).ok()?;
+    global
+        .account?
+        .email
+        .map(|email| email.trim().to_owned())
+        .filter(|email| !email.is_empty())
+}
+
+/// The login a second record of the system home's credentials names, when it
+/// is not the one the CLI reported: `reported` was read with `CLAUDE_CONFIG_DIR`
+/// unset, from `~/.claude.json`, while the credentials it describes are in
+/// `~/.claude`, whose own `.claude.json` is the record every launch that
+/// exported `CLAUDE_CONFIG_DIR=~/.claude` read and wrote instead.
+pub fn disputing_record(user_home: &std::path::Path, reported: &Identity) -> Option<String> {
+    let other = recorded_login(&user_home.join(".claude").join(".claude.json"))?;
+    let reported = reported.email.as_deref()?.trim();
+    (!other.eq_ignore_ascii_case(reported)).then_some(other)
+}
+
+/// What a probe reports of the system login's two records, and how the
+/// settlement recorded for them changes: `reported` is the record the CLI
+/// read, `other` the login the second record names where it disagrees,
+/// `previous` the identity the last probe reported and `settled` the
+/// settlement on record.
+///
+/// A disagreement is reported until it is settled, and settled in favour of
+/// the CLI's record when that record is known to be newer than the other:
+/// when a sign-in that cagents ran has just finished, or when the CLI's
+/// record has changed login since the last probe while the other stayed as
+/// it was. Only signing in rewrites the login a record names.
+///
+/// The second element is `None` to leave the settlement as it is, or the
+/// settlement to record in its place.
+pub fn settle_dispute(
+    reported: &Identity,
+    other: Option<String>,
+    previous: Option<&Identity>,
+    settled: Option<&super::cache::Settled>,
+) -> (Option<String>, Option<Option<super::cache::Settled>>) {
+    use super::cache::Settled;
+    let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+    let (Some(other), Some(email)) = (other, reported.email.as_deref()) else {
+        // The records agree: nothing is left to settle.
+        return (None, settled.is_some().then_some(None));
+    };
+    let settle = Some(Some(Settled::Reported {
+        reported: email.trim().to_owned(),
+        other: other.clone(),
+    }));
+    let known_other = match settled {
+        Some(Settled::SignedIn) => return (None, settle),
+        Some(Settled::Reported {
+            reported: settled_reported,
+            other: settled_other,
+        }) => {
+            if same(settled_reported, email) && same(settled_other, &other) {
+                return (None, None);
+            }
+            Some(settled_other.as_str())
+        }
+        None => None,
+    };
+    let rewritten = previous.is_some_and(|previous| {
+        previous
+            .email
+            .as_deref()
+            .is_some_and(|before| !same(before, email))
+            && previous
+                .disputed_by
+                .as_deref()
+                .or(known_other)
+                .is_some_and(|before| same(before, &other))
+    });
+    if rewritten {
+        return (None, settle);
+    }
+    (Some(other), None)
 }
 
 /// The snapshot a `get_usage` control response describes.
@@ -505,6 +615,129 @@ pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at:
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn login(email: &str, disputed_by: Option<&str>) -> Identity {
+        Identity {
+            email: Some(email.into()),
+            disputed_by: disputed_by.map(str::to_owned),
+            ..Identity::default()
+        }
+    }
+
+    #[test]
+    fn only_the_recorded_address_is_read_from_a_global_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        std::fs::create_dir(home.join(".claude")).unwrap();
+        let record = home.join(".claude").join(".claude.json");
+        // Nothing is recorded yet, so nothing disagrees.
+        assert_eq!(recorded_login(&record), None);
+        assert_eq!(disputing_record(home, &login("me@example.com", None)), None);
+        std::fs::write(
+            &record,
+            json!({
+                "numStartups": 4,
+                "projects": {"/work": {"hasTrustDialogAccepted": true}},
+                "oauthAccount": {
+                    "emailAddress": " other@example.com ",
+                    "accountUuid": "00000000-0000-0000-0000-000000000002",
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            recorded_login(&record).as_deref(),
+            Some("other@example.com")
+        );
+        assert_eq!(
+            disputing_record(home, &login("me@example.com", None)).as_deref(),
+            Some("other@example.com")
+        );
+        // The same login, however it is spelled, is no disagreement.
+        assert_eq!(
+            disputing_record(home, &login("Other@Example.com", None)),
+            None
+        );
+        // A record without a login, or one that is not JSON, says nothing.
+        std::fs::write(&record, json!({"numStartups": 4}).to_string()).unwrap();
+        assert_eq!(recorded_login(&record), None);
+        std::fs::write(&record, "{not json").unwrap();
+        assert_eq!(recorded_login(&record), None);
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        assert_eq!(recorded_login(&record), None);
+    }
+
+    #[test]
+    fn a_disagreement_is_reported_until_a_sign_in_is_known_to_have_settled_it() {
+        use super::super::cache::Settled;
+        let me = login("me@example.com", None);
+        let other = || Some("other@example.com".to_owned());
+        let settled = Settled::Reported {
+            reported: "me@example.com".into(),
+            other: "other@example.com".into(),
+        };
+        // First seen: reported, and nothing recorded.
+        assert_eq!(settle_dispute(&me, other(), None, None), (other(), None));
+        assert_eq!(
+            settle_dispute(&me, other(), Some(&login("me@example.com", None)), None),
+            (other(), None)
+        );
+        // Seen again with neither record changed: still reported.
+        let seen = login("me@example.com", Some("other@example.com"));
+        assert_eq!(
+            settle_dispute(&me, other(), Some(&seen), None),
+            (other(), None)
+        );
+        // A sign-in cagents ran has just finished: its record wins.
+        assert_eq!(
+            settle_dispute(&me, other(), Some(&seen), Some(&Settled::SignedIn)),
+            (None, Some(Some(settled.clone())))
+        );
+        // Once settled, exactly that disagreement stays settled.
+        assert_eq!(
+            settle_dispute(&me, other(), Some(&me), Some(&settled)),
+            (None, None)
+        );
+        // The CLI's record changed login while the other stayed: a sign-in
+        // outside cagents rewrote it, so it is the newer one.
+        let before = login("old@example.com", Some("other@example.com"));
+        assert_eq!(
+            settle_dispute(&me, other(), Some(&before), None),
+            (None, Some(Some(settled.clone())))
+        );
+        let after_settling = Settled::Reported {
+            reported: "old@example.com".into(),
+            other: "other@example.com".into(),
+        };
+        assert_eq!(
+            settle_dispute(
+                &me,
+                other(),
+                Some(&login("old@example.com", None)),
+                Some(&after_settling)
+            ),
+            (None, Some(Some(settled.clone())))
+        );
+        // The other record changed instead: it may be the newer one, and the
+        // disagreement is shown again.
+        assert_eq!(
+            settle_dispute(
+                &me,
+                Some("third@example.com".into()),
+                Some(&me),
+                Some(&settled)
+            ),
+            (Some("third@example.com".into()), None)
+        );
+        // Records that agree leave nothing to settle.
+        assert_eq!(
+            settle_dispute(&me, None, Some(&seen), Some(&settled)),
+            (None, Some(None))
+        );
+        assert_eq!(settle_dispute(&me, None, None, None), (None, None));
+    }
 
     fn fixture(name: &str) -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

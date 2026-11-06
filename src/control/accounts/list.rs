@@ -70,7 +70,7 @@ pub(super) fn output(report: &Report) -> CommandOutput {
                         "{}{}",
                         account.name.unwrap_or("identity unknown"),
                         if account.identity_conflict {
-                            " (identity changed)"
+                            " (identity conflict)"
                         } else {
                             ""
                         }

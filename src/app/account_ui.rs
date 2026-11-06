@@ -392,7 +392,7 @@ impl State {
     }
 
     pub(super) fn set_registry(&mut self, registry: Registry) {
-        if registry.revision() < self.registry.revision() {
+        if !registry::supersedes(&registry, &self.registry) {
             return;
         }
         self.registry_ready = true;
@@ -434,10 +434,19 @@ impl State {
                 .unwrap_or_else(|| "existing".into())
         });
         if let Some(email) = account.email(&self.registry) {
+            // A login whose records disagree is named by both.
+            let email = match account
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.disputed_by.as_deref())
+            {
+                Some(other) => format!("{email} or {other}"),
+                None => email.to_owned(),
+            };
             if let Some(hint) = linked_hint {
                 return format!("{hint} · {email}");
             }
-            return email.to_owned();
+            return email;
         }
         if let Some(hint) = linked_hint {
             return format!("{} · {hint}", account.name());
@@ -458,6 +467,15 @@ impl State {
             return None;
         }
         let current = account.identity.as_ref();
+        if let Some(identity) = current
+            && let (Some(reported), Some(other)) =
+                (identity.email.as_deref(), identity.disputed_by.as_deref())
+        {
+            return Some(LoginConflict::Disputed {
+                reported: reported.to_owned(),
+                other: other.to_owned(),
+            });
+        }
         if let (Some(registered), Some(current)) = (
             account
                 .account
@@ -496,15 +514,43 @@ impl State {
                     with: self.display_name(other),
                 });
             }
-            if let (Some(mine), Some(theirs)) = (current, other.identity.as_ref())
-                && mine.same_login(theirs)
-            {
-                return Some(LoginConflict::SameLogin {
-                    with: self.display_name(other),
+            let (Some(mine), Some(theirs)) = (current, other.identity.as_ref()) else {
+                continue;
+            };
+            if !mine.claims_same_login(theirs) {
+                continue;
+            }
+            let with = self.display_name(other);
+            if !mine.same_login(theirs) {
+                return Some(LoginConflict::Contradicted {
+                    with,
+                    because: Contradiction::Disputed,
                 });
             }
+            if let (Some(mine), Some(theirs)) = (&account.snapshot, &other.snapshot)
+                && mine.separate_allowance(theirs, (self.now_ms / 1000) as i64)
+            {
+                return Some(LoginConflict::Contradicted {
+                    with,
+                    because: Contradiction::SeparateAllowances,
+                });
+            }
+            return Some(LoginConflict::SameLogin { with });
         }
         None
+    }
+
+    /// Whether `account`'s login is trusted to be the one it is listed as,
+    /// which archiving a duplicate of it relies on.
+    fn login_trusted(&self, account: &AccountState) -> bool {
+        !matches!(
+            self.login_conflict(account),
+            Some(
+                LoginConflict::Changed { .. }
+                    | LoginConflict::Disputed { .. }
+                    | LoginConflict::Contradicted { .. }
+            )
+        )
     }
 
     fn reported_login_action(&self, account: &AccountState) -> Option<Action> {
@@ -538,10 +584,7 @@ impl State {
     /// System homes are always kept; prefer them over other registered homes.
     fn duplicate_to_keep(&self, account: &AccountState) -> Option<&AccountState> {
         account.account.registry_key()?;
-        if matches!(
-            self.login_conflict(account),
-            Some(LoginConflict::Changed { .. })
-        ) {
+        if !self.login_trusted(account) {
             return None;
         }
         let identity = account.identity.as_ref()?;
@@ -553,10 +596,7 @@ impl State {
                         .identity
                         .as_ref()
                         .is_some_and(|known| identity.same_login(known))
-                    && !matches!(
-                        self.login_conflict(other),
-                        Some(LoginConflict::Changed { .. })
-                    )
+                    && self.login_trusted(other)
             })
             .min_by_key(|other| !other.account.is_system())
     }
@@ -742,6 +782,24 @@ enum LoginConflict {
     SameHome { with: String },
     /// Its home is signed in to the same login as another row's.
     SameLogin { with: String },
+    /// Two records of its credentials name different logins: `reported`,
+    /// the one its CLI reads, and `other`.
+    Disputed { reported: String, other: String },
+    /// It reports the same login as another row, `with`, which other
+    /// evidence contradicts.
+    Contradicted {
+        with: String,
+        because: Contradiction,
+    },
+}
+
+/// What contradicts two rows reporting one login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Contradiction {
+    /// One of them is disputed: its records name two logins.
+    Disputed,
+    /// Their weekly allowances reset at different times.
+    SeparateAllowances,
 }
 
 impl LoginConflict {
@@ -750,6 +808,7 @@ impl LoginConflict {
             Self::Changed { .. } => "Login changed",
             Self::SameHome { .. } => "Same home",
             Self::SameLogin { .. } => "Same login",
+            Self::Disputed { .. } | Self::Contradicted { .. } => "Identity conflict",
         }
     }
 
@@ -763,6 +822,21 @@ impl LoginConflict {
             }
             Self::SameLogin { with } => format!(
                 "Signed in to the same login as {with}. Both draw on one allowance. Use Archive duplicate in the extra home's menu to keep its files, or sign it in to another login."
+            ),
+            Self::Disputed { reported, other } => format!(
+                "Claude Code has two records of who this login is. One names {reported}; the other, which conversations started by earlier versions of cagents read, names {other}. Only one is right, so these figures may be {other}'s. Sign in again to settle which login this is."
+            ),
+            Self::Contradicted {
+                with,
+                because: Contradiction::Disputed,
+            } => format!(
+                "Reports the same login as {with}, but {with}'s records disagree about who it is, so neither is known to be a duplicate. Sign in again on {with} to settle it."
+            ),
+            Self::Contradicted {
+                with,
+                because: Contradiction::SeparateAllowances,
+            } => format!(
+                "Reports the same login as {with}, but their weekly limits reset at different times, so they are separate logins and at least one of them is named wrongly. Sign each in again to settle which login it is."
             ),
         }
     }
@@ -814,6 +888,11 @@ struct AccountState {
     /// This window's explicit re-login intent lasts through its terminal,
     /// including browser handoffs that outlive the usual polling grace.
     sign_in_terminal: Option<TerminalId>,
+    /// Whether this window's sign-in terminal for the account has just
+    /// finished signing in, which the next probe records as settling any
+    /// disagreement between two records of its login (see
+    /// [`Identity::disputed_by`]).
+    settle_records: bool,
 }
 
 impl AccountState {
@@ -842,6 +921,7 @@ impl AccountState {
             queued: None,
             signing_in_from: None,
             sign_in_terminal: None,
+            settle_records: false,
         }
     }
 
@@ -1586,7 +1666,7 @@ fn login_launch_with_path(
     let mut environment = BTreeMap::new();
     if let (Some(variable), Some(account_home)) = (
         account::home_variable(account.provider),
-        account.resolved_home(),
+        account.launch_home(),
     ) {
         environment.insert(variable.to_owned(), account_home.display().to_string());
     }
@@ -1609,6 +1689,39 @@ fn login_launch_with_path(
         working_directory: home,
         environment,
     })
+}
+
+/// Whether the sign-in `recipe` signs `account` in: whether it names the
+/// home a sign-in on the account exports (see [`Account::launch_home`]), or
+/// the account's home itself, as a sign-in started before cagents stopped
+/// exporting the system default named it.
+fn signs_in(account: &Account, recipe: &LaunchRecipe) -> bool {
+    let Some(variable) = account::home_variable(account.provider) else {
+        return false;
+    };
+    let named = recipe
+        .environment
+        .get(variable)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    match named {
+        Some(named) => account.resolved_home() == Some(named),
+        None => account.is_system() && account.launch_home().is_none(),
+    }
+}
+
+/// Whether the sign-in terminal `session` ended with its login finished:
+/// its CLI exited cleanly, rather than being closed or failing.
+fn signed_in(session: &TerminalSession) -> bool {
+    let exit = match &session.continuity {
+        TerminalContinuity::RelaunchAvailable {
+            last_exit: Some(exit),
+            ..
+        }
+        | TerminalContinuity::Exited { last_exit: exit } => exit,
+        _ => return false,
+    };
+    exit.code == Some(0) && exit.signal.is_none()
 }
 
 /// Whether `recipe` runs a provider's sign-in, as [`login_launch`] builds
@@ -2167,7 +2280,24 @@ impl Cagents {
         let account = state.account.clone();
         let id = state.id.clone();
         let owner = state.owner;
+        // Only the system Claude login can have a second record.
+        let settle = (std::mem::take(&mut state.settle_records)
+            && account.provider == Provider::Claude
+            && matches!(account.home, account::AccountHome::System))
+        .then(|| cache.clone().zip(account.cache_key()))
+        .flatten();
         let probe = cosmic::task::future(async move {
+            if let Some((cache, key)) = settle
+                && !crate::device::is_remote()
+            {
+                let settled = tokio::task::spawn_blocking(move || {
+                    cache.settle(&key, Some(account::cache::Settled::SignedIn))
+                })
+                .await;
+                if let Ok(Err(error)) = settled {
+                    tracing::debug!(%error, "cannot record the finished sign-in");
+                }
+            }
             let outcome = if crate::device::is_remote() {
                 tokio::task::spawn_blocking(move || {
                     match crate::device_service::request(
@@ -3557,6 +3687,11 @@ impl Cagents {
                 && matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal && !terminal_ended(session))
                 && !matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
         });
+        let succeeded = !running
+            && self.durable.cards.iter().any(|card| {
+                matches!(&card.kind, CardKind::Terminal(session)
+                    if session.id == terminal && signed_in(session))
+            });
         if let Some(state) = self.account_ui.account_mut(id) {
             if running {
                 state.schedule.extend_login_watch(now);
@@ -3567,6 +3702,9 @@ impl Cagents {
                 // Give the completed or cancelled terminal one final fresh
                 // verification window, then release its explicit intent.
                 state.sign_in_terminal = None;
+                // The login it finished wrote the record the CLI reads,
+                // which settles a disagreement with an older one.
+                state.settle_records = succeeded;
             }
         }
     }
@@ -3605,20 +3743,13 @@ impl Cagents {
         }) {
             return true;
         }
-        let (Some(variable), Some(home)) = (
-            account::home_variable(account.provider),
-            account.resolved_home(),
-        ) else {
-            return false;
-        };
         self.durable.cards.iter().any(|card| {
             card.existence.is_open()
                 && !matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
                 && matches!(&card.kind, CardKind::Terminal(session)
                     if is_sign_in(&session.launch)
                         && !terminal_ended(session)
-                        && session.launch.environment.get(variable)
-                            .is_some_and(|value| Path::new(value) == home))
+                        && signs_in(account, &session.launch))
         })
     }
 
@@ -5053,9 +5184,14 @@ impl Cagents {
                     .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                     .into(),
             );
-            if let LoginConflict::Changed { added_as, .. } = &conflict {
+            let sign_in = match &conflict {
+                LoginConflict::Changed { added_as, .. } => Some(format!("Sign in as {added_as}")),
+                LoginConflict::Disputed { .. } => Some("Sign in again".to_owned()),
+                _ => None,
+            };
+            if let Some(sign_in) = sign_in {
                 rows.push(
-                    crate::ui_controls::button::secondary(format!("Sign in as {added_as}"))
+                    crate::ui_controls::button::secondary(sign_in)
                         .on_press_maybe(
                             (!self.account_sign_in_running(&account.account))
                                 .then(|| Message::AccountUi(Action::SignIn(account.id.clone()))),
@@ -6328,11 +6464,14 @@ mod tests {
                 .environment
                 .get("CLAUDE_CONFIG_DIR")
                 .map(String::as_str),
+            // The home every system launch exports: none beside an existing
+            // `~/.claude.json`, which an explicit default would move.
             Account::system(Provider::Claude)
-                .resolved_home()
+                .launch_home()
                 .as_deref()
                 .and_then(Path::to_str)
         );
+        assert!(signs_in(&Account::system(Provider::Claude), &launch));
         assert_eq!(Provider::recognize_launch(&launch), None);
         assert!(is_sign_in(&launch));
 
@@ -6507,6 +6646,43 @@ mod app_tests {
                 .login_conflict(app.account_ui.account(&id).unwrap()),
             Some(LoginConflict::Changed { .. })
         ));
+    }
+
+    /// Only a sign-in whose CLI exited cleanly is taken to have written the
+    /// record its login is read from; a closed or failed one settles nothing.
+    #[test]
+    fn a_finished_sign_in_settles_the_next_disagreement_and_a_closed_one_does_not() {
+        for (code, signal, settles) in [
+            (Some(0), None, true),
+            (Some(1), None, false),
+            (None, Some("SIGHUP"), false),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let id = app.account_ui.add_managed_fixture(Provider::Claude, 515);
+            let home = app
+                .account_ui
+                .account(&id)
+                .unwrap()
+                .account
+                .resolved_home()
+                .unwrap();
+            let _ = app.open_login(&id, Provider::Claude, false, Ok("/tools/claude".into()));
+            let card = app.sign_in_card(Provider::Claude, &home).unwrap();
+            let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+                unreachable!()
+            };
+            session.continuity = TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code,
+                    signal: signal.map(str::to_owned),
+                    occurred_at_unix_ms: 42,
+                },
+            };
+            app.refresh_login_watch(&id, NOW);
+            let state = app.account_ui.account(&id).unwrap();
+            assert!(state.sign_in_terminal.is_none());
+            assert_eq!(state.settle_records, settles, "{code:?} {signal:?}");
+        }
     }
 
     #[test]
@@ -7808,6 +7984,199 @@ mod app_tests {
         let _ = app.accounts_pane();
     }
 
+    /// The answer a probe of `id` gives: `identity`, with a weekly allowance
+    /// that resets at `weekly_reset`, in Unix seconds.
+    fn answered(
+        app: &mut Cagents,
+        id: &AccountId,
+        identity: Identity,
+        weekly_reset: Option<i64>,
+    ) -> Message {
+        let (owner, ticket) = app.account_ui.begin_probe_for_test(id, Trigger::Focus, NOW);
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", NOW);
+        snapshot.detail = None;
+        snapshot.windows = weekly_reset
+            .map(|resets_at| UsageWindow {
+                key: "weekly_all".into(),
+                kind: account::WindowKind::Weekly,
+                label: "Weekly".into(),
+                used: 0.1,
+                resets_at: Some(resets_at),
+                span_secs: Some(7 * 86_400),
+                binding: false,
+            })
+            .into_iter()
+            .collect();
+        Message::AccountUi(Action::Probed {
+            owner,
+            ticket,
+            id: id.clone(),
+            outcome: Outcome::Answered {
+                catalog: None,
+                identity: Some(identity),
+                snapshot,
+            },
+        })
+    }
+
+    fn email(address: &str) -> Identity {
+        Identity {
+            email: Some(address.into()),
+            ..Identity::default()
+        }
+    }
+
+    #[test]
+    fn a_login_whose_records_disagree_is_an_identity_conflict_and_never_a_duplicate() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let accounts = linked_logins(
+            &mut app,
+            directory.path(),
+            &["same@example.com", "same@example.com"],
+        );
+        let disputed = Identity {
+            disputed_by: Some("other@example.com".into()),
+            ..email("same@example.com")
+        };
+        let reply = answered(&mut app, &accounts[0].1, disputed, None);
+        let _ = app.update(reply);
+        let reply = answered(&mut app, &accounts[1].1, email("same@example.com"), None);
+        let _ = app.update(reply);
+        let state = |index: usize| app.account_ui.account(&accounts[index].1).unwrap();
+        assert_eq!(
+            app.account_ui.login_conflict(state(0)),
+            Some(LoginConflict::Disputed {
+                reported: "same@example.com".into(),
+                other: "other@example.com".into(),
+            })
+        );
+        // Both names it might be are shown, wherever the row is named.
+        assert_eq!(
+            app.account_ui.display_name(state(0)),
+            "same@example.com or other@example.com"
+        );
+        // The row reporting the same login is not taken for its duplicate.
+        assert_eq!(
+            app.account_ui.login_conflict(state(1)),
+            Some(LoginConflict::Contradicted {
+                with: app.account_ui.display_name(state(0)),
+                because: Contradiction::Disputed,
+            })
+        );
+        for index in [0, 1] {
+            assert_eq!(
+                app.account_ui.login_conflict(state(index)).unwrap().label(),
+                "Identity conflict"
+            );
+            assert!(app.account_ui.duplicate_to_keep(state(index)).is_none());
+        }
+        let _ = app.accounts_pane();
+    }
+
+    #[test]
+    fn one_login_reported_by_homes_with_separate_weekly_limits_is_an_identity_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let now = (NOW / 1000) as i64;
+        for (second_reset, separate) in [
+            (now + 5 * 86_400, true),
+            // Rounded, or reported a moment apart: still one allowance.
+            (now + 2 * 86_400 + 1_800, false),
+        ] {
+            let accounts = linked_logins(
+                &mut app,
+                directory.path().join(second_reset.to_string()).as_path(),
+                &["same@example.com", "same@example.com"],
+            );
+            let reply = answered(
+                &mut app,
+                &accounts[0].1,
+                email("same@example.com"),
+                Some(now + 2 * 86_400),
+            );
+            let _ = app.update(reply);
+            let reply = answered(
+                &mut app,
+                &accounts[1].1,
+                email("same@example.com"),
+                Some(second_reset),
+            );
+            let _ = app.update(reply);
+            app.account_ui.now_ms = NOW;
+            let state = |index: usize| app.account_ui.account(&accounts[index].1).unwrap();
+            let with = app.account_ui.display_name(state(0));
+            if separate {
+                assert_eq!(
+                    app.account_ui.login_conflict(state(1)),
+                    Some(LoginConflict::Contradicted {
+                        with,
+                        because: Contradiction::SeparateAllowances,
+                    })
+                );
+                assert!(app.account_ui.duplicate_to_keep(state(1)).is_none());
+            } else {
+                assert_eq!(
+                    app.account_ui.login_conflict(state(1)),
+                    Some(LoginConflict::SameLogin { with })
+                );
+                assert!(app.account_ui.duplicate_to_keep(state(1)).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn an_accounts_file_written_from_scratch_replaces_the_one_the_window_held() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("registry"));
+        let mut app = context_inspector_test_app(false);
+        for name in ["one", "two", "three"] {
+            store
+                .update(|registry| {
+                    registry.set_label(&Account::system(Provider::Codex), Some(name.into()))
+                })
+                .unwrap();
+        }
+        let held = store.load().unwrap();
+        app.account_ui.set_registry(held.clone());
+        assert_eq!(app.account_ui.registry.revision(), 3);
+        let (earlier, ()) = store
+            .update(|registry| {
+                registry.set_label(&Account::system(Provider::Codex), Some("four".into()))
+            })
+            .unwrap();
+        // An older copy of the same file, answered late, is left alone.
+        app.account_ui.set_registry(earlier.clone());
+        app.account_ui.set_registry(held.clone());
+        assert_eq!(app.account_ui.registry, earlier);
+
+        // The file is lost and written again from scratch, at a revision
+        // below the one the window holds.
+        let path = directory.path().join("registry").join("accounts.toml");
+        std::fs::remove_file(&path).unwrap();
+        let (replaced, ()) = store
+            .update(|registry| {
+                registry.set_label(&Account::system(Provider::Codex), Some("again".into()))
+            })
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let replaced_copy = store.load().unwrap();
+        assert!(replaced.revision() < earlier.revision());
+        app.account_ui.set_registry(replaced_copy.clone());
+        assert_eq!(app.account_ui.registry, replaced_copy);
+        assert_eq!(
+            app.account_ui
+                .registry
+                .label(&Account::system(Provider::Codex)),
+            Some("again")
+        );
+    }
+
     #[test]
     fn archiving_a_duplicate_keeps_existing_session_resolution() {
         let directory = tempfile::tempdir().unwrap();
@@ -7918,6 +8287,7 @@ mod app_tests {
                     email: Some("someone@example.com".into()),
                     organization: None,
                     plan: None,
+                    disputed_by: None,
                 }),
                 snapshot: older,
             },
@@ -10292,6 +10662,7 @@ mod app_tests {
             email: Some("new@example.com".into()),
             organization: None,
             plan: Some("max".into()),
+            disputed_by: None,
         };
         let _ = app.update(Message::AccountUi(Action::LoginSettled {
             key,
@@ -10822,6 +11193,7 @@ mod app_tests {
             email: Some("other-reported-login@example.test".into()),
             organization: None,
             plan: None,
+            disputed_by: None,
         });
         let mut usage = UsageSnapshot::state(UsageStatus::Ok, "", NOW);
         usage.windows = [("session", 0.35), ("weekly", 0.55)]

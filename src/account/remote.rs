@@ -590,7 +590,7 @@ fn login_recipe_with_path(
     let mut environment = std::collections::BTreeMap::new();
     if let (Some(variable), Some(home)) = (
         super::home_variable(account.provider),
-        account.resolved_home(),
+        account.launch_home(),
     ) {
         environment.insert(variable.into(), home.display().to_string());
     }

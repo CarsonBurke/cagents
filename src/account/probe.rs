@@ -145,7 +145,7 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
         probe_cli(&account, &program, search_path.as_deref()),
     )
     .await;
-    let outcome = match probed {
+    let mut outcome = match probed {
         Ok(result) => completed_probe(result),
         Err(_) => Outcome::Failed(format!(
             "{} did not answer within {} seconds",
@@ -153,6 +153,27 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
             TIMEOUT.as_secs()
         )),
     };
+    if let (
+        Outcome::Answered {
+            identity: Some(identity),
+            ..
+        },
+        Some(cache),
+        Some(key),
+        Some(user_home),
+    ) = (
+        &mut outcome,
+        cache.clone(),
+        key.clone(),
+        split_records(&account),
+    ) {
+        let reported = identity.clone();
+        identity.disputed_by =
+            tokio::task::spawn_blocking(move || dispute(&user_home, &cache, &key, &reported))
+                .await
+                .ok()
+                .flatten();
+    }
     if let (
         Outcome::Answered {
             identity,
@@ -892,6 +913,52 @@ async fn probe_claude_with_path(
         "--disable-slash-commands",
     ]);
     join_claude(run_json(status), claude_usage(usage)).await
+}
+
+/// The reader's home, where a second record of `account`'s login may be:
+/// when `account` is the system Claude login whose CLI resolves its default
+/// record, `~/.claude.json`, beside the record that earlier cagents launches
+/// kept in `~/.claude` (see [`Account::launch_home`]).
+fn split_records(account: &Account) -> Option<PathBuf> {
+    if account.provider != Provider::Claude
+        || !matches!(account.home, super::AccountHome::System)
+        || account.probe_environment().is_some()
+    {
+        return None;
+    }
+    // Tests probe with the developer's own home; they reach [`dispute`]
+    // with fixture homes instead.
+    if cfg!(test) {
+        return None;
+    }
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The login a second record under `user_home` names where it disagrees
+/// with `reported` and no settlement filed under `key` in `cache` covers
+/// the disagreement; recording what settles it.
+fn dispute(
+    user_home: &Path,
+    cache: &super::cache::Cache,
+    key: &str,
+    reported: &Identity,
+) -> Option<String> {
+    let other = super::claude::disputing_record(user_home, reported);
+    let settled = cache.settled(key);
+    let previous = cache
+        .load(u64::MAX)
+        .remove(key)
+        .and_then(|entry| entry.identity);
+    let (disputed_by, settle) =
+        super::claude::settle_dispute(reported, other, previous.as_ref(), settled.as_ref());
+    if let Some(settle) = settle
+        && let Err(error) = cache.settle(key, settle)
+    {
+        tracing::debug!(%error, "cannot record how the login's records were settled");
+    }
+    disputed_by
 }
 
 async fn join_claude(
@@ -2232,6 +2299,99 @@ cat >/dev/null
     fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The system Claude login's two records, as the probe reads them: the
+    /// one in `~/.claude`, which earlier cagents launches kept, disputes the
+    /// login the CLI reported until a sign-in settles which is right.
+    #[test]
+    fn a_second_record_disputes_the_reported_login_until_a_sign_in_settles_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let cache = Cache::at(directory.path().join("cache"));
+        let key = "claude:/home/a/.claude";
+        let reported = |email: &str| Identity {
+            email: Some(email.into()),
+            ..Identity::default()
+        };
+        let record = |email: &str| {
+            std::fs::write(
+                home.join(".claude").join(".claude.json"),
+                json!({"oauthAccount": {"emailAddress": email}}).to_string(),
+            )
+            .unwrap();
+        };
+        let observe = |identity: Identity, observed_at: u64| {
+            cache
+                .store(
+                    key,
+                    Entry {
+                        identity: Some(identity),
+                        snapshot: UsageSnapshot::state(UsageStatus::Ok, "", observed_at),
+                    },
+                )
+                .unwrap();
+        };
+        // Without a second record there is nothing to dispute.
+        assert_eq!(
+            dispute(&home, &cache, key, &reported("me@example.com")),
+            None
+        );
+
+        record("other@example.com");
+        let disputed = dispute(&home, &cache, key, &reported("me@example.com"));
+        assert_eq!(disputed.as_deref(), Some("other@example.com"));
+        observe(
+            Identity {
+                disputed_by: disputed,
+                ..reported("me@example.com")
+            },
+            1,
+        );
+        assert_eq!(
+            dispute(&home, &cache, key, &reported("me@example.com")).as_deref(),
+            Some("other@example.com")
+        );
+
+        // A sign-in that cagents ran finishes; the next probe settles it.
+        cache
+            .settle(key, Some(super::super::cache::Settled::SignedIn))
+            .unwrap();
+        assert_eq!(
+            dispute(&home, &cache, key, &reported("me@example.com")),
+            None
+        );
+        observe(reported("me@example.com"), 2);
+        assert_eq!(
+            dispute(&home, &cache, key, &reported("me@example.com")),
+            None
+        );
+
+        // The second record is written by a sign-in of its own: shown again.
+        record("third@example.com");
+        let disputed = dispute(&home, &cache, key, &reported("me@example.com"));
+        assert_eq!(disputed.as_deref(), Some("third@example.com"));
+        observe(
+            Identity {
+                disputed_by: disputed,
+                ..reported("me@example.com")
+            },
+            3,
+        );
+        // A sign-in in the reader's own terminal changes the login the CLI's
+        // record names, which settles it too.
+        assert_eq!(
+            dispute(&home, &cache, key, &reported("new@example.com")),
+            None
+        );
+        // Records that come to agree leave nothing settled behind.
+        record("new@example.com");
+        assert_eq!(
+            dispute(&home, &cache, key, &reported("new@example.com")),
+            None
+        );
+        assert_eq!(cache.settled(key), None);
     }
 
     #[tokio::test]

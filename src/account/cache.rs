@@ -64,6 +64,27 @@ struct Document {
     /// build that predates it reads the rest, and drops it when it writes.
     #[serde(default, deserialize_with = "readable_catalogs")]
     catalogs: BTreeMap<Provider, Catalog>,
+    /// Added after the first version, like `catalogs`: each account's
+    /// settled disagreement between two records of its login, by account
+    /// key. A build that predates it drops it when it writes, which only
+    /// shows a settled disagreement again until it is settled again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    settled: BTreeMap<String, Settled>,
+}
+
+/// How two records of one login's identity, which named different logins,
+/// were settled (see [`Identity::disputed_by`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Settled {
+    /// A sign-in that cagents ran for the account has just finished: the
+    /// record the CLI reads is the one that sign-in wrote, so the next
+    /// disagreement a probe sees is settled in its favour.
+    SignedIn,
+    /// The CLI's record, naming `reported`, was written by a sign-in after
+    /// the other record, naming `other`: the disagreement between exactly
+    /// these two is settled, and any other is shown again.
+    Reported { reported: String, other: String },
 }
 
 /// Each provider's list is read on its own, so one this build cannot read -
@@ -188,6 +209,31 @@ impl Cache {
         self.write(&document)
     }
 
+    /// How the disagreement between two records of the login of the account
+    /// filed under `key` was last settled, if it was.
+    pub fn settled(&self, key: &str) -> Option<Settled> {
+        read_document(&self.path())?.settled.remove(key)
+    }
+
+    /// Records how the disagreement over `key`'s login is settled, or with
+    /// `None`, that nothing is.
+    pub fn settle(&self, key: &str, settled: Option<Settled>) -> io::Result<()> {
+        crate::secure_file::prepare_private_directory(&self.directory)?;
+        let _lock = self.lock(libc::LOCK_EX)?;
+        let mut document = read_document(&self.path()).unwrap_or_default();
+        document.version = VERSION;
+        let changed = match settled {
+            Some(settled) => {
+                document.settled.insert(key.to_owned(), settled.clone()) != Some(settled)
+            }
+            None => document.settled.remove(key).is_some(),
+        };
+        if !changed {
+            return Ok(());
+        }
+        self.write(&document)
+    }
+
     /// Forgets the entries no account in `keep` refers to that are older
     /// than [`ORPHAN_AFTER`]: the figures of an account since removed, or of
     /// a home that moved. A younger one stays, because another window may
@@ -200,6 +246,10 @@ impl Cache {
                 .entries
                 .iter()
                 .any(|(key, entry)| !keep.contains(key) && !current(entry, now))
+                || document
+                    .settled
+                    .keys()
+                    .any(|key| !keep.contains(key) && !document.entries.contains_key(key))
         };
         if !read_document(&path).is_some_and(|document| orphaned(&document)) {
             return Ok(());
@@ -211,6 +261,10 @@ impl Cache {
         document
             .entries
             .retain(|key, entry| keep.contains(key) || current(entry, now));
+        let entries = &document.entries;
+        document
+            .settled
+            .retain(|key, _| keep.contains(key) || entries.contains_key(key));
         self.write(&document)
     }
 
@@ -306,6 +360,7 @@ mod tests {
                 email: Some("user@example.com".into()),
                 organization: None,
                 plan: Some("max".into()),
+                disputed_by: None,
             }),
             snapshot,
         }
@@ -472,6 +527,32 @@ mod tests {
             .prune(&keep, now)
             .unwrap();
         assert!(!empty.path().join("nested").exists());
+    }
+
+    #[test]
+    fn a_settled_disagreement_is_kept_beside_the_figures_until_its_account_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        assert_eq!(cache.settled("system"), None);
+        cache.settle("system", Some(Settled::SignedIn)).unwrap();
+        cache.store("system", entry(1, "figures")).unwrap();
+        assert_eq!(cache.settled("system"), Some(Settled::SignedIn));
+        let settled = Settled::Reported {
+            reported: "me@example.com".into(),
+            other: "other@example.com".into(),
+        };
+        cache.settle("system", Some(settled.clone())).unwrap();
+        cache.settle("gone", Some(Settled::SignedIn)).unwrap();
+        assert_eq!(cache.settled("system"), Some(settled.clone()));
+        assert_eq!(cache.load(10).len(), 1);
+        // An account no one refers to takes its settlement with it.
+        cache
+            .prune(&BTreeSet::from(["system".to_owned()]), 100 * ORPHAN_AFTER)
+            .unwrap();
+        assert_eq!(cache.settled("system"), Some(settled));
+        assert_eq!(cache.settled("gone"), None);
+        cache.settle("system", None).unwrap();
+        assert_eq!(cache.settled("system"), None);
     }
 
     fn catalog(observed_at: u64, id: &str) -> Catalog {

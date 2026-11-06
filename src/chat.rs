@@ -2981,6 +2981,34 @@ mod tests {
         assert!(project_session.launch.recipe.arguments.is_empty());
     }
 
+    /// A conversation on the system login exports the home its sign-in and
+    /// probe use: none beside an existing `~/.claude.json`, so the CLI keeps
+    /// one record of who the login is.
+    #[test]
+    fn a_system_conversation_exports_the_home_its_probe_reads() {
+        let system = crate::account::Account::system(Provider::Claude);
+        let session = fresh_session(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            "/".into(),
+            &system,
+        )
+        .unwrap();
+        assert_eq!(
+            session
+                .launch
+                .recipe
+                .environment
+                .get("CLAUDE_CONFIG_DIR")
+                .map(std::path::PathBuf::from),
+            system.launch_home()
+        );
+        assert_eq!(
+            system.probe_environment().map(|(_, home)| home),
+            system.launch_home()
+        );
+    }
+
     #[test]
     #[cfg(any(feature = "host", feature = "ui"))]
     fn claude_default_permissions_use_the_launch_home_and_account_settings_layer() {
@@ -3341,16 +3369,21 @@ pub(crate) fn fresh_session(
     if account.provider == provider
         && !(crate::device::is_remote()
             && matches!(account.home, crate::account::AccountHome::System))
-        && let (Some(variable), Some(home)) = (
-            crate::account::home_variable(provider),
-            account.resolved_home(),
-        )
+        && let Some(variable) = crate::account::home_variable(provider)
     {
-        let home = home
-            .into_os_string()
-            .into_string()
-            .map_err(|_| "The account's home is not a path a conversation can record".to_owned())?;
-        recipe.environment.insert(variable.to_owned(), home);
+        match account.launch_home() {
+            Some(home) => {
+                let home = home.into_os_string().into_string().map_err(|_| {
+                    "The account's home is not a path a conversation can record".to_owned()
+                })?;
+                recipe.environment.insert(variable.to_owned(), home);
+            }
+            // The CLI resolves its own default, as in the reader's shell,
+            // whatever this process inherited.
+            None => {
+                recipe.environment.remove(variable);
+            }
+        }
     }
     recipe
         .environment

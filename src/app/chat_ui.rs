@@ -6578,7 +6578,7 @@ impl Cagents {
                 .iter()
                 .map(|name| (*name).to_owned()),
         );
-        if let Some(home) = account.resolved_home() {
+        if let Some(home) = account.launch_home() {
             let Some(home) = home.to_str() else {
                 return Task::none();
             };
@@ -27823,6 +27823,7 @@ mod tests {
                         email: Some(email),
                         organization: None,
                         plan: None,
+                        disputed_by: None,
                     }),
                     catalog: None,
                     snapshot: account::UsageSnapshot::state(account::UsageStatus::Ok, "", now),

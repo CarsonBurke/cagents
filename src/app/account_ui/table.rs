@@ -907,7 +907,9 @@ fn account_cell<'a>(
         && renaming.is_none()
     {
         let tone = match conflict {
-            LoginConflict::Changed { .. } => design::destructive_color,
+            LoginConflict::Changed { .. }
+            | LoginConflict::Disputed { .. }
+            | LoginConflict::Contradicted { .. } => design::destructive_color,
             LoginConflict::SameHome { .. } | LoginConflict::SameLogin { .. } => {
                 design::warning_color
             }

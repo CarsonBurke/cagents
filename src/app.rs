@@ -6290,7 +6290,7 @@ impl Cagents {
                     .map(|name| (*name).to_owned()),
             );
             if let (Some(variable), Some(home)) =
-                (account::home_variable(provider), account.resolved_home())
+                (account::home_variable(provider), account.launch_home())
             {
                 launch
                     .environment
