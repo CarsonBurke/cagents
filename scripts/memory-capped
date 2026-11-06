@@ -13,7 +13,9 @@ import time
 PROGRAM = "memory-capped"
 DEFAULT_MAX = "16G"
 DEFAULT_SWAP_MAX = "4G"
-USAGE = f"""usage: {PROGRAM} COMMAND [ARGUMENT...]
+USAGE = f"""usage: {PROGRAM} [--name NAME] COMMAND [ARGUMENT...]
+
+NAME is what to call COMMAND if it goes over the limit (default: its file name).
 
 Environment:
   CAGENTS_MEMORY_MAX       Memory limit for COMMAND and its children, such as
@@ -135,6 +137,21 @@ def went_over(unit, killed):
     return result.stdout.strip() == "oom-kill"
 
 
+def amount(size):
+    return f"{size // 2**30} GiB" if size % 2**30 == 0 else f"{size // 2**20} MiB"
+
+
+def over_limit_notice(name, limit, swap):
+    """This can appear where a person expects a working app, so it says what
+    happened and what to do, and doesn't read as the app crashing by itself."""
+    larger = limit * 2 // 2**20
+    setting = f"{larger // 2**10}G" if larger % 2**10 == 0 else f"{larger}M"
+    return (f"{PROGRAM}: stopped {name} because it and the processes it started went over the "
+            f"limit of {amount(limit)} of memory and {amount(swap)} of swap. This is the limit "
+            "acting, not a crash. If this is normal use rather than a runaway, run it again with "
+            f"a higher limit, such as CAGENTS_MEMORY_MAX={setting}.")
+
+
 def end_as(status):
     """Ends as the command did, so a calling script stops on Ctrl-C too."""
     if status >= 0:
@@ -147,6 +164,12 @@ def end_as(status):
 
 def main():
     command = sys.argv[1:]
+    name = None
+    if command[:1] == ["--name"]:
+        if len(command) < 3:
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+        name, command = command[1], command[2:]
     if not command or command[0] in ("-h", "--help"):
         print(USAGE, end="", file=sys.stdout if command else sys.stderr)
         return 0 if command else 2
@@ -181,9 +204,7 @@ def main():
         except (OSError, subprocess.SubprocessError):
             pass
     if went_over(unit, status == -signal.SIGKILL):
-        print(f"{PROGRAM}: stopped `{command[0]}`, which went over its limit of {limit // 2**20} MiB "
-              f"of memory and {swap // 2**20} MiB of swap. If it isn't running away, raise "
-              "CAGENTS_MEMORY_MAX.", file=sys.stderr)
+        print(over_limit_notice(name or os.path.basename(command[0]), limit, swap), file=sys.stderr)
         return 137
     return end_as(status)
 

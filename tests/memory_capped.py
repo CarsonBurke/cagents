@@ -28,6 +28,11 @@ def real_scopes_work():
 class WithoutAScope(unittest.TestCase):
     """A host with no user manager, through a stand-in systemd-run that fails."""
 
+    def test_a_name_needs_a_command(self):
+        result = subprocess.run([TOOL, "--name", "the app"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage:", result.stderr)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="memory-capped-")
         self.addCleanup(temporary.cleanup)
@@ -107,7 +112,10 @@ class InARealScope(unittest.TestCase):
         started = time.monotonic()
         result = self.run_tool(sys.executable, "-I", "-c", script)
         self.assertEqual(result.returncode, 137, result.stderr)
-        self.assertIn("went over its limit of 256 MiB", result.stderr)
+        self.assertIn(f"stopped {Path(sys.executable).name} because it and the processes "
+                      "it started went over the limit of 256 MiB", result.stderr)
+        self.assertIn("not a crash", result.stderr)
+        self.assertIn("CAGENTS_MEMORY_MAX=512M", result.stderr)
         self.assertLess(time.monotonic() - started, 60)
         pid = int(survivor.read_text())
         self.wait_for(lambda: not Path(f"/proc/{pid}").exists(), "a child outlived the scope")
@@ -144,7 +152,7 @@ class InARealScope(unittest.TestCase):
         wrapper.terminate()
         _, errors = wrapper.communicate(timeout=20)
         self.wait_for(lambda: not Path(f"/proc/{pid}").exists(), "it outlived the scope")
-        self.assertNotIn("over its limit", errors)
+        self.assertNotIn("over the limit", errors)
         self.assert_not_left_failed(unit.read_text().strip())
 
     def test_an_interrupted_command_ends_a_calling_script_too(self):
@@ -218,9 +226,9 @@ class InARealScope(unittest.TestCase):
         result = self.run_tool("sh", "-c", 'echo "${DBUS_SESSION_BUS_ADDRESS-unset}"')
         self.assertEqual(result.stdout.strip(), "unset", result.stderr)
         ceiling = "chunks = [bytearray(b'x') * (16 * 2**20) for _ in range(64)]"
-        result = self.run_tool(sys.executable, "-I", "-c", ceiling)
+        result = self.run_tool("--name", "the app", sys.executable, "-I", "-c", ceiling)
         self.assertEqual(result.returncode, 137, result.stderr)
-        self.assertIn("over its limit", result.stderr)
+        self.assertIn("stopped the app because", result.stderr)
 
     def test_a_missing_command_fails_as_it_would_alone(self):
         result = self.run_tool(str(self.root / "absent"))

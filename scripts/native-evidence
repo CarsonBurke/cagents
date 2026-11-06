@@ -262,7 +262,10 @@ live_session() {
 }
 
 current_side() {
-    live_session || die 'no session is running; run: start SIDE'
+    if ! live_session; then
+        [ ! -e "$state/over-limit" ] || die "$(cat "$state/over-limit")"
+        die 'no session is running; run: start SIDE'
+    fi
     cat "$state/side"
 }
 
@@ -417,6 +420,14 @@ wait_for_native_lock() {
 
 # Holds the native lock for the life of the session. No child inherits its
 # descriptor, so nothing that outlives or wedges the session can keep the lock.
+# Over its limit a session goes all at once, so nothing inside it can say why.
+report_over_limit() {
+    local notice
+    notice=$(grep -m 1 '^memory-capped: stopped' "$logs/kwin-$1.log" 2>/dev/null) || return 0
+    printf '%s\n' "$notice" | tee "$state/over-limit"
+    [ -e "$state/ready" ] || printf '%s\n' "$notice" >"$state/failed"
+}
+
 run_session() {
     local side=$1 width=$2 keep_state=$3 wait_lock=$4 limit=$5 starter=$6
     load_side "$side" "$state/source"
@@ -457,7 +468,7 @@ run_session() {
     # and desktop settings must not feed into the evidence. Each stage dies with
     # its parent, so a killed supervisor does not leave a compositor behind.
     # Its memory limit is made here, with the user manager still reachable.
-    "$tool_root/scripts/memory-capped" env -u DISPLAY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u NIRI_HARNESS_STATE \
+    "$tool_root/scripts/memory-capped" --name 'the native evidence session' env -u DISPLAY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u NIRI_HARNESS_STATE \
         -u XDG_SESSION_TYPE -u XDG_CURRENT_DESKTOP -u XCURSOR_THEME -u XCURSOR_SIZE \
         HOME="$compositor_home/home" XDG_RUNTIME_DIR="$runtime" \
         XDG_CONFIG_HOME="$compositor_home/config" XDG_DATA_HOME="$compositor_home/data" \
@@ -489,6 +500,7 @@ run_session() {
         sleep 1
     done
     trap - TERM INT HUP
+    report_over_limit "$side"
     [ -e "$state/ready" ] || [ -e "$state/failed" ] ||
         printf 'the compositor exited before the session was ready; see %s\n' "$logs/kwin-$side.log" >"$state/failed"
     end_session
@@ -620,7 +632,7 @@ cmd_start() {
     live_session && die 'a session is already running for this task; stop it first'
     load_side "$side"
     source_is_current || die "$checkout changed since its build; run: build $side $checkout"
-    rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env"
+    rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env" "$state/over-limit"
     # Fix what this session runs: everything it reports reads this copy.
     cp -- "$(target_of "$side")/evidence-source" "$state/source"
     printf '%s\n' "$side" >"$state/side"
@@ -735,6 +747,7 @@ cmd_status() {
         printf 'session: lost, its supervisor is gone but processes remain; run: stop\n'
     else
         printf 'session: none\n'
+        [ ! -e "$state/over-limit" ] || printf 'last session: %s\n' "$(cat "$state/over-limit")"
     fi
     if (exec 9>"$native_lock" && flock -n 9); then
         printf 'native lock: free\n'

@@ -36,6 +36,16 @@ STUBS = {
             shift
         done
         export WAYLAND_DISPLAY=evidence DBUS_SESSION_BUS_ADDRESS=stub
+        over_limit() {
+            printf 'memory-capped: stopped the native evidence session because of the stub\\n' >&2
+            exit 137
+        }
+        [ "${STUB_OVER_LIMIT:-}" != at-start ] || over_limit
+        if [ "${STUB_OVER_LIMIT:-}" = later ]; then
+            $session &
+            until [ -e "$STUB_LOG/go-over" ]; do sleep 0.1; done
+            over_limit
+        fi
         $session
     """,
     "niri-harness": """
@@ -254,7 +264,35 @@ class Evidence(unittest.TestCase):
 
     def test_a_session_has_a_memory_limit_made_before_its_private_environment(self):
         source = (REPOSITORY / "scripts/native-evidence").read_text()
-        self.assertIn('"$tool_root/scripts/memory-capped" env -u DISPLAY', source)
+        self.assertIn(
+            """"$tool_root/scripts/memory-capped" --name 'the native evidence session' env -u DISPLAY""",
+            source)
+
+    def test_a_session_over_its_limit_at_start_says_so(self):
+        self.built()
+        result = self.run_tool("start", "after", check=False, extra={"STUB_OVER_LIMIT": "at-start"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("memory-capped: stopped the native evidence session", result.stderr)
+        self.assertNotIn("the compositor exited", result.stderr)
+
+    def test_a_session_over_its_limit_later_says_so_to_whoever_comes_next(self):
+        self.built()
+        self.run_tool("start", "after", extra={"STUB_OVER_LIMIT": "later"})
+        (self.logs / "go-over").touch()
+        for _ in range(100):
+            if self.lock_is_free(self.native_lock):
+                break
+            time.sleep(0.2)
+        self.assertTrue(self.lock_is_free(self.native_lock))
+        notice = "memory-capped: stopped the native evidence session"
+        self.assertIn(f"last session: {notice}", self.run_tool("status").stdout)
+        driven = self.run_tool("drive", "observe", check=False)
+        self.assertNotEqual(driven.returncode, 0)
+        self.assertIn(notice, driven.stderr)
+        # The next session starts clean.
+        self.run_tool("start", "after")
+        self.assertNotIn(notice, self.run_tool("status").stdout)
+        self.run_tool("stop")
 
     def test_inherited_authority_is_refused_and_never_removed(self) -> None:
         for name in AUTHORITY_NAMES:

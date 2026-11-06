@@ -576,14 +576,16 @@ exit 83
     def test_the_app_runs_under_a_memory_limit(self):
         ran = self.root / "limited"
         limit = self.runner.with_name("memory-capped")
-        limit.write_text(f'#!/bin/sh\necho "$1" >"{ran}"\nexec "$@"\n')
+        limit.write_text(f'#!/bin/sh\necho "$2" >"{ran}"\nshift 2\necho "$1" >>"{ran}"\nexec "$@"\n')
         limit.chmod(0o755)
         self.assert_built("--browserless")
-        self.assertTrue(ran.read_text().strip().endswith("/cagents-ui"))
+        name, program = ran.read_text().splitlines()
+        self.assertEqual(name, "cagents-ui")
+        self.assertTrue(program.endswith("/cagents-ui"))
 
     def test_an_instance_runs_under_a_memory_limit(self):
         limit = self.runner.with_name("memory-capped")
-        limit.write_text('#!/bin/sh\nexec "$@"\n')
+        limit.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
         limit.chmod(0o755)
         started = self.root / "started"
         harness = self.root / "bin/niri-harness"
@@ -592,11 +594,12 @@ exit 83
         self.launch("--browserless", "--instance", "capped")
         words = started.read_text().splitlines()
         program = words.index(str(limit))
-        self.assertTrue(words[program + 1].endswith("/cagents-ui"), words)
+        self.assertEqual(words[program + 1:program + 3], ["--name", "cagents-ui"])
+        self.assertTrue(words[program + 3].endswith("/cagents-ui"), words)
 
     def test_the_memory_limit_speaks_to_the_terminal_and_the_app_to_the_log(self):
         limit = self.runner.with_name("memory-capped")
-        limit.write_text('#!/bin/sh\n"$@"\necho limit-message >&2\n')
+        limit.write_text('#!/bin/sh\nshift 2\n"$@"\necho limit-message >&2\n')
         limit.chmod(0o755)
         log = self.root / "ui.log"
         result, _ = self.launch("--browserless", "--log-file", str(log))
