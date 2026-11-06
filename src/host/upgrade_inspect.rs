@@ -530,9 +530,10 @@ impl ExecutionEvidence {
 /// in its arguments, or a socket is still bound at one of `sockets`. A
 /// process between `execve` and publishing its new arguments briefly shows
 /// none; it is read again for a bounded moment. One that still shows none is
-/// evidence of absence only when it is a zombie, or an exiting single-thread
-/// process (a PID-namespace init waiting in `do_exit`, or one blocked closing
-/// files after releasing its memory), which can no longer write anything.
+/// evidence of absence only when its last thread is a zombie or exiting (a
+/// PID-namespace init waiting in `do_exit`, or one blocked closing files after
+/// releasing its memory), which can no longer write anything. A zombie group
+/// leader whose other threads still run shows no arguments either.
 fn codex_listener_survives(
     processes: &Path,
     pane: crate::model::TerminalId,
@@ -581,12 +582,12 @@ fn codex_listener_survives_with(
                 .rsplit_once(')')
                 .map(|(_, fields)| fields.split_whitespace().collect::<Vec<_>>())
                 .unwrap_or_default();
-            let exiting = fields.get(17) == Some(&"1")
-                && fields
-                    .get(6)
-                    .and_then(|flags| flags.parse::<u64>().ok())
-                    .is_some_and(|flags| flags & 0x4 != 0);
-            if matches!(fields.first(), Some(&"Z" | &"X")) || exiting {
+            let exiting = fields
+                .get(6)
+                .and_then(|flags| flags.parse::<u64>().ok())
+                .is_some_and(|flags| flags & 0x4 != 0);
+            let ended = matches!(fields.first(), Some(&"Z" | &"X")) || exiting;
+            if ended && fields.get(17) == Some(&"1") {
                 return Ok(None);
             }
             if Instant::now() >= deadline {
@@ -1367,7 +1368,9 @@ mod tests {
         absent.processes = root.path().join("absent");
         assert_eq!(absent.classify(&card), SavedExecution::Unproved);
         // A process that has not published its arguments might be the
-        // server; a zombie cannot be.
+        // server. One whose last thread is a zombie, or exiting (PF_EXITING,
+        // like a PID-namespace init waiting in do_exit), can write nothing; a
+        // zombie group leader or exiting thread with live threads still can.
         let processes = tempfile::tempdir_in("/var/tmp").unwrap();
         std::fs::create_dir_all(processes.path().join("net")).unwrap();
         std::fs::write(
@@ -1378,23 +1381,30 @@ mod tests {
         let process = processes.path().join("4242");
         std::fs::create_dir(&process).unwrap();
         std::fs::write(process.join("cmdline"), b"").unwrap();
-        std::fs::write(process.join("stat"), b"4242 (codex) Z 1 4242 4242").unwrap();
         let mut table = evidence(holders.path(), Vec::new());
         table.processes = processes.path().into();
-        assert_eq!(table.classify(&card), SavedExecution::Ended);
-        std::fs::write(process.join("stat"), b"4242 (codex) R 1 4242 4242").unwrap();
-        assert_eq!(table.classify(&card), SavedExecution::Unproved);
-        // An exiting single-thread process (PF_EXITING) can write nothing,
-        // like a PID-namespace init waiting in do_exit; one with live threads
-        // still can.
-        let stat = |flags: u64, threads: u32| {
-            format!("4242 (a) b) D 1 4242 4242 0 0 {flags} 0 0 0 0 0 0 0 0 20 0 {threads} 0 1")
+        let stat = |state: char, flags: u64, threads: u32| {
+            format!(
+                "4242 (a) b) {state} 1 4242 4242 0 0 {flags} 0 0 0 0 0 0 0 0 20 0 {threads} 0 1"
+            )
         };
-        std::fs::write(process.join("stat"), stat(0x4, 1)).unwrap();
-        assert_eq!(table.classify(&card), SavedExecution::Ended);
-        std::fs::write(process.join("stat"), stat(0x4, 2)).unwrap();
-        assert_eq!(table.classify(&card), SavedExecution::Unproved);
-        std::fs::write(process.join("stat"), stat(0, 1)).unwrap();
+        for (state, flags, threads, expected) in [
+            ('Z', 0, 1, SavedExecution::Ended),
+            ('X', 0, 1, SavedExecution::Ended),
+            ('D', 0x4, 1, SavedExecution::Ended),
+            ('Z', 0, 2, SavedExecution::Unproved),
+            ('D', 0x4, 2, SavedExecution::Unproved),
+            ('R', 0, 1, SavedExecution::Unproved),
+        ] {
+            std::fs::write(process.join("stat"), stat(state, flags, threads)).unwrap();
+            assert_eq!(
+                table.classify(&card),
+                expected,
+                "{state} {flags:#x} {threads}"
+            );
+        }
+        // A truncated status line proves nothing.
+        std::fs::write(process.join("stat"), b"4242 (codex) Z 1 4242 4242").unwrap();
         assert_eq!(table.classify(&card), SavedExecution::Unproved);
         std::fs::remove_dir_all(&process).unwrap();
         assert_eq!(table.classify(&card), SavedExecution::Ended);
