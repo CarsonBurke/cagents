@@ -22,7 +22,9 @@ pub(in crate::host) struct Live {
     pub(super) surface: Surface,
     pub(in crate::host) provider: Option<Provider>,
     pub(in crate::host) title: Option<String>,
+    /// Everything the session is doing, delegated work included.
     pub(in crate::host) state: ActivityState,
+    pub(super) activity: crate::agent_execution::ProviderActivity,
     pub(in crate::host) directory: PathBuf,
 }
 
@@ -153,7 +155,9 @@ pub(super) fn read(
                     .and_then(|channel| model.channel(channel))
                     .map(|channel| channel.title.clone())
             }),
-            state: live.state,
+            state: live.activity.turn,
+            background_agents: live.activity.background_agents,
+            waiting_agents: live.activity.waiting_agents,
             directory: Some(live.directory),
             worktree,
             project_name: project
@@ -241,6 +245,7 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
             // Resident metadata only; a directory read never loads a transcript.
             title: record.handle.title(),
             state: record.handle.activity(),
+            activity: record.handle.provider_activity(),
             directory: record.session.launch.recipe.working_directory.clone(),
         });
     }
@@ -254,12 +259,19 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
             continue;
         }
         let activity = record.handle.agent_activity();
+        let state = activity.map_or(ActivityState::Unknown, |activity| activity.state);
         live.push(Live {
             id: *id,
             surface: Surface::Terminal,
             provider: activity.map(|activity| activity.provider),
             title: record.conversation_title().map(str::to_owned),
-            state: activity.map_or(ActivityState::Unknown, |activity| activity.state),
+            state,
+            // A provider in a terminal reports no delegated work apart.
+            activity: crate::agent_execution::ProviderActivity {
+                turn: state,
+                background_agents: 0,
+                waiting_agents: 0,
+            },
             directory: record.current_directory().to_path_buf(),
         });
     }

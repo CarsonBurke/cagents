@@ -125,6 +125,21 @@ pub(crate) enum Rejection {
     Unacknowledged(String),
 }
 
+/// The actor's refusal of a run's prompt because another turn holds the
+/// conversation, checked before anything reaches the provider.
+const NOT_IDLE_FOR_RUN: &str = "The provider is no longer idle for the accepted run";
+
+/// The actor's refusal to interrupt a run that it isn't running, whether that
+/// run ended or its prompt never reached the provider.
+pub(crate) const NOT_ACTIVE_RUN: &str = "The requested run is no longer the provider's active turn";
+
+impl Rejection {
+    /// Whether this is that refusal, so the prompt provably was not sent.
+    pub(crate) fn lost_idle_to_another_turn(&self) -> bool {
+        matches!(self, Self::Refused(error) if error == NOT_IDLE_FOR_RUN)
+    }
+}
+
 impl From<Rejection> for String {
     fn from(rejection: Rejection) -> Self {
         match rejection {
@@ -756,6 +771,24 @@ impl LocalHandle {
         self.submit_actor_command(ActorCommand::IdlePrompt(text))
     }
 
+    /// Starts an accepted run's turn. The actor refuses it unless the
+    /// conversation is idle at that moment.
+    pub(crate) fn prompt_for_run(
+        &self,
+        run: crate::model::RunId,
+        text: String,
+    ) -> Result<(), Rejection> {
+        self.submit_command(
+            Some(run),
+            Command::Prompt {
+                text,
+                attachments: Vec::new(),
+                mode: super::PromptMode::Send,
+            },
+            false,
+        )
+    }
+
     pub(crate) fn command_for_run(
         &self,
         run: crate::model::RunId,
@@ -1303,6 +1336,16 @@ impl LocalHandle {
             .activity()
     }
 
+    /// The main turn and delegated work apart, without loading the transcript.
+    pub(crate) fn provider_activity(&self) -> crate::agent_execution::ProviderActivity {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        crate::agent_execution::ProviderActivity {
+            turn: state.turn_activity(),
+            background_agents: state.background_agents(),
+            waiting_agents: state.waiting_agents(),
+        }
+    }
+
     /// Update preflights need activity without loading the transcript window.
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1322,6 +1365,20 @@ impl LocalHandle {
     pub(crate) fn is_idle(&self) -> bool {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         accepts_prompt(&state) && !self.is_completed() && !self.0.draining.load(Ordering::Acquire)
+    }
+    /// Whether the main turn is running, apart from any delegated work.
+    pub(crate) fn turn_is_busy(&self) -> bool {
+        self.0.state.lock().unwrap_or_else(|p| p.into_inner()).busy
+    }
+    /// Whether the provider is gone, which no later turn can change.
+    pub(crate) fn has_exited(&self) -> bool {
+        self.is_completed()
+            || self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .exited
     }
     /// Pending questions and approvals, read without loading the transcript.
     pub(crate) fn requests(&self) -> Vec<super::Request> {
@@ -2521,7 +2578,7 @@ impl Actor {
                         };
                         if !valid {
                             let _ = reply.send(Err(
-                                "A settled run may only decline a current pending request".into(),
+                                "Without an active run, you may only decline a current pending request".into(),
                             ));
                             continue;
                         }
@@ -2565,9 +2622,7 @@ impl Actor {
                     including_subagents,
                 } => {
                     if run.is_some_and(|run| self.execution.active() != Some(run)) {
-                        let _ = reply.send(Err(
-                            "The requested run is no longer the provider's active turn".into(),
-                        ));
+                        let _ = reply.send(Err(NOT_ACTIVE_RUN.into()));
                         continue;
                     }
                     if !including_subagents {
@@ -2660,9 +2715,7 @@ impl Actor {
             if run.is_some() && starts_turn {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
-                    let _ = reply.send(Err(
-                        "The provider is no longer idle for the accepted run".into()
-                    ));
+                    let _ = reply.send(Err(NOT_IDLE_FOR_RUN.into()));
                     continue;
                 }
             }

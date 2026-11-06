@@ -202,7 +202,10 @@ use crate::{
 /// appended `StartupState` request and response, which this format doesn't
 /// have. The number alone cannot identify a format, so never reuse one that a
 /// build may have shipped.
-pub const PROTOCOL_VERSION: u16 = 146;
+///
+/// Version 147 carries a provider's current activity and a prompt's queued state
+/// in agent replies, what an interrupt did, and a way to withdraw only the prompt.
+pub const PROTOCOL_VERSION: u16 = 147;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

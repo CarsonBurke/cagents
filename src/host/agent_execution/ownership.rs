@@ -85,7 +85,19 @@ pub(in crate::host) fn interactive(
             return Ok(ServerResponse::Accepted);
         }
     }
-    apply(request)
+    let stops_turn = matches!(
+        &request,
+        ClientRequest::ChatCommand {
+            command: Command::Interrupt,
+            ..
+        }
+    );
+    let response = apply(request)?;
+    if stops_turn {
+        // Otherwise the prompt waiting behind this turn starts as it ends.
+        super::withdraw_latest_queued(host, &registry, agent.id).map_err(unavailable)?;
+    }
+    Ok(response)
 }
 
 /// Reconcile only the exact finished firing inspected by the scheduler. A

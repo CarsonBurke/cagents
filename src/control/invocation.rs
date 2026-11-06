@@ -489,6 +489,7 @@ mod tests {
             started_ms: Some(1),
             finished_ms: Some(2),
             provider_key: None,
+            queued_ms: None,
             result: ResultSummary {
                 text: "Reviewed.".into(),
                 ..Default::default()
